@@ -6813,3 +6813,160 @@ fn b330_the_cross_module_pair_is_refused_under_the_filter_with_the_selector_name
         "a file that took one of the two has already chosen: {chosen:?}"
     );
 }
+
+/// B338 — a selector that admits NO implementation is a row at the IMPORT.
+///
+/// `import a::{ (impl Nothing) }` is almost certainly a typo, and it used to be
+/// silent: the mistake surfaced later, as the admission refusal at the first
+/// call that wanted the block, in a message about a member rather than about
+/// the selector that dropped it.
+#[test]
+fn b338_a_selector_that_admits_no_impl_is_a_row_at_the_import() {
+    let missed = analyze_boxed(
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl i32) };\n\n\
+         fun main() {\n\tlet _ = Boxed::make(1);\n}\n",
+    );
+    assert!(
+        missed.iter().any(|message| message
+            .contains("no `impl` this statement carries has a subject `i32` admits")
+            && message.contains("`(impl _)` admits every block they declare")),
+        "a selector admitting nothing should be reported at the import: {missed:?}"
+    );
+    // The `(impl _)` control: the whole-module form admits every block the
+    // statement carries, so it never earns this row.
+    let control = analyze_boxed(
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl _) };\n\n\
+         fun main() {\n\tlet _ = Boxed::make(1).tag();\n}\n",
+    );
+    assert!(control.is_empty(), "`(impl _)` admits: {control:?}");
+}
+
+/// The other shape: the subject reaches a block, and the `::` tail names a
+/// member that block does not declare.
+#[test]
+fn b338_a_method_selector_naming_no_member_is_reported_too() {
+    let missed = analyze_boxed(
+        "import pkg::item::Boxed;\nimport pkg::ext::{ (impl Boxed<i32>)::nowhere };\n\n\
+         fun main() {\n\tlet _ = Boxed::make(1);\n}\n",
+    );
+    assert!(
+        missed.iter().any(|message| message
+            .contains("no `impl Boxed<i32>` this statement carries declares `nowhere`")),
+        "a method selector naming nothing should be reported: {missed:?}"
+    );
+}
+
+/// B336 — `export(in <general PATH>)` is ENFORCED.
+///
+/// S1 shipped the form parsing, storing, formatting and reprinting, and
+/// ADMITTING: `mod` and `pkg` are answerable from the walk, a general path is a
+/// question about file PATHS, and those live on `Program`. The two arms the
+/// item names: reached from `pkg::b` it warns, reached from `pkg::a::c` it is
+/// silent.
+#[test]
+fn b336_a_general_export_scope_narrows_to_its_own_subtree() {
+    let files = &[
+        ("a/thing.vl", "export(in pkg::a) fun inside(): i32 { 1 }\n"),
+        (
+            "a/c.vl",
+            "import pkg::a::thing::inside;\n\nexport fun near(): i32 { inside() }\n",
+        ),
+        (
+            "b.vl",
+            "import pkg::a::thing::inside;\n\nexport fun far(): i32 { inside() }\n",
+        ),
+        (
+            "app.vl",
+            "import pkg::a::c::near;\nimport pkg::b::far;\n\nfun main() { let _ = near() + far(); }\n",
+        ),
+    ];
+    let warnings = analyze_package_warnings(files, "app.vl", Platform::default());
+    let scoped: Vec<&String> = warnings
+        .iter()
+        .filter(|message| message.contains("is exported only into `pkg::a`"))
+        .collect();
+    assert_eq!(
+        scoped.len(),
+        1,
+        "exactly the outside reach should warn: {warnings:?}"
+    );
+    assert!(
+        scoped[0].contains("`pkg::a::thing::inside` is exported only into `pkg::a`")
+            && scoped[0].contains("this file is outside it"),
+        "unexpected wording: {}",
+        scoped[0]
+    );
+}
+
+/// B335 — `source_of` on a module that owns BOTH a file and a directory answers
+/// the module's own file, not the importer's.
+///
+/// `x.vl` beside `x/y.vl` is legal (the flat file is `x`'s body; the directory
+/// holds its children), and the loader reaches `x` twice: once as the parent
+/// NAMESPACE of `x::y`, which mints an entity with a one-id range attributed to
+/// the entry because a namespace has no file, and once as a real body, which
+/// adopted that entity and pushed a SECOND range for the same id. `source_of`
+/// takes the first range containing an id, so it kept answering the entry — and
+/// `import_module_is_used` (E168/E169) asks exactly that, which is why Organize
+/// Imports was probably wrong for such a module.
+#[test]
+fn b335_a_module_owning_a_file_and_a_directory_reports_its_own_file() {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir =
+        std::env::temp_dir().join(format!("vilan_modres_b335_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in [
+        ("x.vl", "export fun body(): i32 { 1 }\n"),
+        ("x/y.vl", "export fun child(): i32 { 2 }\n"),
+        (
+            "app.vl",
+            "import pkg::x;\nimport pkg::x::y;\n\nfun main() { let _ = x::body() + y::child(); }\n",
+        ),
+    ] {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join("app.vl");
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(Platform::default()),
+        &Workspace::default(),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let program = program.expect("the package analyzes");
+    assert!(errors.is_empty(), "the exhibit should be clean: {errors:?}");
+
+    let (module_id, _) = program
+        .modules
+        .iter()
+        .find(|(_, module)| module.name == "x")
+        .expect("`x` is a module");
+    let source = program
+        .source_of(*module_id)
+        .expect("the module entity has a file");
+    let path = &program.sources[source.0 as usize];
+    assert_eq!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("x.vl"),
+        "`source_of` on `x` should answer `x.vl`, not the importer: {path:?}"
+    );
+    // And the ranges stay disjoint, which is what keeps `source_lookup` on its
+    // binary search rather than M27's linear scan.
+    let mut ranges: Vec<(u32, u32)> = program
+        .source_ranges
+        .iter()
+        .map(|range| (range.start, range.end))
+        .collect();
+    ranges.sort();
+    assert!(
+        ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0),
+        "a duplicate one-id range would demote `source_lookup`"
+    );
+}

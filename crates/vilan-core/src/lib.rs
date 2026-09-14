@@ -783,6 +783,10 @@ pub fn post_analysis_passes(
     // immediately for a program whose files wrote neither `only` nor a
     // selector, which is the whole estate.
     analyzer::build_impl_admission(program);
+    // B336: `export(in <general PATH>)`, decided where the source paths are —
+    // the subtree test the analyzer's own walk cannot make. Returns immediately
+    // for a program that wrote no general narrowing, which is the whole estate.
+    analyzer::check_scoped_exports(program);
     // M26's POST-PASS boundary, the outermost of the three the phase line names
     // (`contexts+graph`, `const-pass`, `dispatch-refine`; the last is a slice
     // through the first two, so cancelling either cancels it). The passes are

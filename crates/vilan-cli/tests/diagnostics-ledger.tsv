@@ -498,3 +498,7 @@ NEW	-	'{member}' is already defined for '{subject}' by module '{other}', which t
 NEW	-	'{member}' is declared for '{subject}' by two blanket impls whose bounds OVERLAP, one of them module '{other}''s, and this file imports both: a type satisfying both clauses matches both impls, and an inherent member is taken from the first without ranking. Select one — {fix} — or drop an import
 NEW	-	'{member}' is provided by an `impl` in module `{module}` that `{module}` does not export, so it contributes no methods here. Reach it — `import {module}::{{ #(impl {subject}) }};` — or write `export` on the block
 NEW	-	this receiver satisfies the bounds of TWO blanket `impl` blocks that both declare '{member}', and an inherent member is taken from the first declared without ranking — swapping the two blocks would change which body runs: {fix}
+NEW	-	no `impl` this statement carries has a subject `{subject}` admits, so the selector admits nothing. The modules it walks are {modules}; `(impl _)` admits every block they declare
+NEW	-	no `impl {subject}` this statement carries declares {named}: the selector admits nothing
+NEW	-	`{module}::{leaf}` is exported only into `{scope}`, and this file is outside it. Importing it anyway is allowed — mark the reach: `import {module}::{{ #{leaf} }};`
+NEW	-	`{module}::{leaf}` is exported only into `{scope}`, and this path reaches it from outside. The spelling that says so is a marked import: `import {module}::{{ #{leaf} }};`, and then `{leaf}` on its own

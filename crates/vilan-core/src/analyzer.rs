@@ -517,6 +517,34 @@ pub enum SubjectCollision {
     OverlappingBounds,
 }
 
+/// B336 — one reach past an `export(in <general PATH>)` narrowing, banked by
+/// the plain-reach walk and decided by [`check_scoped_exports`].
+///
+/// `mod` and `pkg` are answered where they are asked: one is "the declaring
+/// file", the other "the item's own package", and the analyzer holds both. A
+/// GENERAL path names a module SUBTREE, and a subtree is a question about file
+/// paths — `Program::canonical_sources` — so the row travels to where the paths
+/// are.
+#[derive(Clone, Debug)]
+pub struct ScopedReachCheck {
+    /// The `(in PATH)` segments: `["pkg", "a"]`.
+    pub scope: Vec<String>,
+    /// The file the exported item is DECLARED in — where the subtree is
+    /// resolved from, since the declaring file is inside its own narrowing by
+    /// definition.
+    pub declared_in: SourceId,
+    /// The file doing the reaching, and the leaf it reached.
+    pub importer: SourceId,
+    pub leaf_span: Span,
+    /// The module path as the import spelled it, and the leaf name — the two
+    /// halves of the warning's own sentence.
+    pub module: String,
+    pub leaf: String,
+    /// Whether the reach was a qualified PATH rather than an import leaf, which
+    /// picks the second of the warning's two wordings.
+    pub qualified: bool,
+}
+
 /// B330 — two BLANKET impls, bounded differently, declaring one inherent member
 /// name: the pair `generic_bounds_overlap` deliberately admits, banked at the
 /// declaration and decided at the CALL.
@@ -3526,6 +3554,9 @@ pub struct Analyzer<'src> {
     /// B330: the differently-bounded blanket pairs the duplicate family admits,
     /// for the CALL-site refusal ([`BlanketResidue`]).
     blanket_residues: Vec<BlanketResidue>,
+    /// B336: reaches past an `export(in <general PATH>)` narrowing, for the
+    /// post-build pass that has the source paths ([`ScopedReachCheck`]).
+    scoped_reach_checks: Vec<ScopedReachCheck>,
     trait_by_declaration: HashMap<Id, Id>,
     module_id_by_name: HashMap<&'src str, Id>,
     // Multi-package namespace isolation (P2). `packages[i]` is a loaded package —
@@ -5492,6 +5523,7 @@ impl<'src> Analyzer<'src> {
             import_impl_restrictions: Vec::new(),
             cross_module_collisions: Vec::new(),
             blanket_residues: Vec::new(),
+            scoped_reach_checks: Vec::new(),
             trait_by_declaration: HashMap::default(),
             module_id_by_name: HashMap::default(),
             packages: Vec::new(),
@@ -40256,12 +40288,17 @@ impl<'src> Analyzer<'src> {
         // A narrowing beats `export *;` — which is what makes `export(in mod)`
         // the way to hold one item back under a module-wide export.
         if let Some(scope) = self.export_scopes.get(&target) {
-            return match scope.first() {
+            // The two reserved heads are reserved as WHOLE paths: `export(in
+            // pkg)` is the package and `export(in pkg::a)` is a module subtree
+            // under it, which is a different question and a different answer
+            // (B336). Matching on the first segment alone read the second as
+            // the first.
+            return match scope.as_slice() {
                 // "this module and its inline `mod` blocks" — the declaring
                 // FILE, which is the only reader of a file-private item.
-                Some(&"mod") => self.source_of_id(target) == Some(importer),
+                ["mod"] => self.source_of_id(target) == Some(importer),
                 // "the item's own package".
-                Some(&"pkg") => {
+                ["pkg"] => {
                     let declared_in = self.source_of_id(target);
                     declared_in.is_some_and(|declared_in| {
                         self.package_of_source.get(&declared_in)
@@ -40269,12 +40306,14 @@ impl<'src> Analyzer<'src> {
                     })
                 }
                 // A general path (`export(in pkg::a)`) names a module SUBTREE,
-                // and a subtree is a question about file paths, which the
-                // analyzer does not hold (`sources` lives on `Program`). S1
-                // parses, stores, formats and reprints the form and admits it
-                // here — the conservative direction, since being wrong the other
-                // way is a warning about a program that is correct. Zero
-                // occurrences in the estate; the subtree test is a follow-up.
+                // and a subtree is a question about FILE PATHS, which the
+                // analyzer does not hold — `sources` is a parameter of the
+                // commit, not a field of the walk. B336: admitted here and
+                // decided by [`check_scoped_exports`] in the post-build family,
+                // where `Program::canonical_sources` is in hand. Admitted
+                // rather than refused because being wrong this way is silence
+                // about a program that is wrong, and being wrong the other way
+                // is a warning about one that is right.
                 _ => true,
             };
         }
@@ -40336,6 +40375,19 @@ impl<'src> Analyzer<'src> {
                 .reach_marked_spans
                 .contains(&(reach.source, reach.leaf_span));
             let visible = self.export_reaches_file(reach.target, module_scope, reach.source);
+            // B336: `export(in pkg::a)` names a module SUBTREE, and a subtree
+            // is a question about FILE PATHS, which this walk does not hold —
+            // `sources` is a parameter of the commit, not a field of the
+            // analyzer. `export_reaches_file` admits the form; the decision is
+            // banked here and made by [`check_scoped_exports`] after the build.
+            // Only the general form: `mod` and `pkg` are enforced exactly,
+            // right where they are asked.
+            let general_scope: Option<Vec<&'src str>> = self
+                .export_scopes
+                .get(&reach.target)
+                .filter(|scope| !matches!(scope.as_slice(), ["mod"] | ["pkg"]))
+                .cloned();
+            let visible = visible && general_scope.is_none();
             let module = reach.path.join("::");
             // A qualified path carries no marker (there is no leaf to write one
             // on), so the redundancy question does not arise for it.
@@ -40371,6 +40423,21 @@ impl<'src> Analyzer<'src> {
             }
             if self.package_of_source.get(&declared_in) != self.package_of_source.get(&reach.source)
             {
+                continue;
+            }
+            // B336: the banked row carries everything the message needs, so the
+            // post-build pass composes the SAME two sentences rather than a
+            // third wording for one form.
+            if let Some(scope) = general_scope {
+                self.scoped_reach_checks.push(ScopedReachCheck {
+                    scope: scope.iter().map(|segment| (*segment).to_string()).collect(),
+                    declared_in,
+                    importer: reach.source,
+                    leaf_span: reach.leaf_span,
+                    module: module.clone(),
+                    leaf: reach.leaf.to_string(),
+                    qualified: reach.qualified,
+                });
                 continue;
             }
             sites.push((
@@ -48219,6 +48286,9 @@ pub struct Program<'src> {
     /// B330: the differently-bounded blanket pairs the duplicate family admits,
     /// refused at a CALL whose receiver satisfies both ([`BlanketResidue`]).
     pub blanket_residues: Vec<BlanketResidue>,
+    /// B336: reaches past an `export(in <general PATH>)` narrowing, decided by
+    /// [`check_scoped_exports`] where the source paths are in hand.
+    pub scoped_reach_checks: Vec<ScopedReachCheck>,
     /// B318 S3: per `(importing file, selector span)`, the impl MEMBERS that
     /// selector admitted — the answer Organize Imports asks for when it decides
     /// whether a selector is used (`visibility.md` §7.2). Filled by
@@ -54978,12 +55048,32 @@ fn analyze_inner<'src>(
             // Give the module entity a location (its file, at the top) so a path
             // segment naming it can go-to-definition. A one-id range maps it to its
             // source; the span is the file start.
+            //
+            // B335: an ADOPTED node already HAS a one-id range — the namespace
+            // placeholder `ensure_module_node` attributed to the entry, because
+            // a namespace has no file of its own. Pushing a second range for
+            // the same id left `source_of` (which takes the FIRST range that
+            // contains an id) answering the ENTRY for every module that owns
+            // both `x.vl` and `x/`, so `program.source_of(segment)` named the
+            // importing file — and `import_module_is_used` (E168/E169) asks
+            // exactly that, so Organize Imports was reading the wrong file. It
+            // also made `source_ranges` non-disjoint, which silently demoted
+            // `source_lookup` to the linear scan M27 exists to avoid. Corrected
+            // IN PLACE: the module has a file now, and the placeholder is the
+            // row that should say so.
             analyzer.span_map.insert(module_id, &EMPTY_SPAN);
-            analyzer.source_ranges.push(SourceRange {
-                start: module_id.0,
-                end: module_id.0 + 1,
-                source: module_source_id,
-            });
+            match analyzer
+                .source_ranges
+                .iter_mut()
+                .find(|range| range.start == module_id.0 && range.end == module_id.0 + 1)
+            {
+                Some(placeholder) => placeholder.source = module_source_id,
+                None => analyzer.source_ranges.push(SourceRange {
+                    start: module_id.0,
+                    end: module_id.0 + 1,
+                    source: module_source_id,
+                }),
+            }
             analyzer
                 .expr_id_to_expr_map
                 .insert(module_id, Expr::Module(module_id));
@@ -57317,6 +57407,7 @@ fn analyze_over_world<'src>(
         import_impl_restrictions: std::mem::take(&mut analyzer.import_impl_restrictions),
         cross_module_collisions: std::mem::take(&mut analyzer.cross_module_collisions),
         blanket_residues: std::mem::take(&mut analyzer.blanket_residues),
+        scoped_reach_checks: std::mem::take(&mut analyzer.scoped_reach_checks),
         impl_selector_members: HashMap::default(),
         impl_admission: ImplAdmission::default(),
         generic_bounds: analyzer.generic_bounds,
@@ -57624,6 +57715,9 @@ pub fn build_impl_admission(program: &mut Program) {
     let mut selector_of: HashMap<(SourceId, SourceId), String> = HashMap::default();
     let mut selector_members: HashMap<(SourceId, Span), Vec<Id>> = HashMap::default();
     let mut unrestricted: HashSet<(SourceId, SourceId)> = HashSet::default();
+    // B338: selectors that admitted nothing, reported once the walk is done so
+    // the diagnostics come back in source order.
+    let mut selector_misses: Vec<(SourceId, Span, String)> = Vec::new();
     // Per statement, the files its walk carried — the input the collision
     // refusal reads, and the same answer the admission loop below computes.
     // Built for EVERY statement only when a collision is banked; otherwise only
@@ -57668,12 +57762,14 @@ pub fn build_impl_admission(program: &mut Program) {
         let mut admitted: HashSet<Id> = HashSet::default();
         for selector in &row.selectors {
             let mut members: Vec<Id> = Vec::new();
+            let mut subject_reached = false;
             for implementation in &program.implementations {
                 if !sources.contains(&implementation.source)
                     || !selector_admits(program, implementation.subject, selector.subject)
                 {
                     continue;
                 }
+                subject_reached = true;
                 for (name, member_id) in &implementation.declarations {
                     if selector.members.is_empty()
                         || selector.members.iter().any(|(taken, _)| taken == name)
@@ -57681,6 +57777,40 @@ pub fn build_impl_admission(program: &mut Program) {
                         members.push(*member_id);
                     }
                 }
+            }
+            // B338: a selector that admits NOTHING is almost certainly a typo,
+            // and it used to be silent — the mistake surfaced later, as the
+            // admission refusal at the first call that wanted the block, in a
+            // message about a member rather than about the selector that
+            // dropped it. Said HERE, at the selector, where the fix is. Two
+            // shapes: a subject no block in the module has, and a subject that
+            // reaches a block whose members the `::` tail then misses.
+            if !subject_reached || members.is_empty() {
+                let subject = &selector.text;
+                let modules = sources
+                    .iter()
+                    .map(|source| format!("`{}`", module_stem(program, *source)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let claim = if subject_reached {
+                    let named = selector
+                        .members
+                        .iter()
+                        .map(|(name, _)| format!("`{name}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "no `impl {subject}` this statement carries declares {named}: the \
+                         selector admits nothing"
+                    )
+                } else {
+                    format!(
+                        "no `impl` this statement carries has a subject `{subject}` admits, so \
+                         the selector admits nothing. The modules it walks are {modules}; \
+                         `(impl _)` admits every block they declare"
+                    )
+                };
+                selector_misses.push((row.source, selector.span, claim));
             }
             admitted.extend(members.iter().copied());
             selector_members.insert((row.source, selector.span), members);
@@ -57702,6 +57832,18 @@ pub fn build_impl_admission(program: &mut Program) {
         selector_of.remove(&key);
     }
     program.impl_selector_members = selector_members;
+    selector_misses.sort_by_key(|(source, span, _)| (source.0, span.start, span.end));
+    for (source, span, msg) in selector_misses {
+        program.push_diagnostic(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg,
+            },
+            source,
+        );
+    }
     program.impl_admission = ImplAdmission {
         restricting,
         admitted: restricted,
@@ -57883,6 +58025,101 @@ fn refuse_imported_member_collisions(
     for (mut error, source, note) in violations {
         error.note = note;
         program.push_diagnostic(error, source);
+    }
+}
+
+/// B336 — `export(in <general PATH>)`, ENFORCED.
+///
+/// S1 shipped the form parsing, storing, formatting and reprinting, and
+/// ADMITTING: `mod` and `pkg` were enforced exactly (the declaring file, and
+/// the item's own package — both answerable from the walk), while a general
+/// path was let through because the subtree test needs source PATHS and those
+/// live on [`Program`]. This is that test, in the post-build family, over the
+/// rows the plain-reach walk banked.
+///
+/// **A module subtree IS a directory.** `names.md`'s layout gives every module
+/// exactly two spellings — `<dir>/<name>.vl` and `<dir>/<name>/lib.vl` — so a
+/// file is inside the subtree `pkg::a` when it IS `a.vl` or sits under `a/`.
+/// A path this file is not under at all is admitted, deliberately: the
+/// narrowing may name a module elsewhere in the package, and a warning about a
+/// subtree the compiler cannot locate would be unactionable.
+pub fn check_scoped_exports(program: &mut Program) {
+    let checks = std::mem::take(&mut program.scoped_reach_checks);
+    if checks.is_empty() {
+        return;
+    }
+    let mut sites: Vec<(Span, SourceId, String)> = Vec::new();
+    for check in &checks {
+        let Some(root) = subtree_root(program, check) else {
+            continue;
+        };
+        let Some(importer) = program.canonical_sources.get(check.importer.0 as usize) else {
+            continue;
+        };
+        // Inside the subtree: the module's own body file, or anything under the
+        // directory that holds it.
+        if importer == &root.with_extension("vl") || importer.starts_with(&root) {
+            continue;
+        }
+        let module = &check.module;
+        let leaf = &check.leaf;
+        let scope = check.scope.join("::");
+        sites.push((
+            check.leaf_span,
+            check.importer,
+            if check.qualified {
+                format!(
+                    "`{module}::{leaf}` is exported only into `{scope}`, and this path reaches \
+                     it from outside. The spelling that says so is a marked import: \
+                     `import {module}::{{ #{leaf} }};`, and then `{leaf}` on its own"
+                )
+            } else {
+                format!(
+                    "`{module}::{leaf}` is exported only into `{scope}`, and this file is \
+                     outside it. Importing it anyway is allowed — mark the reach: \
+                     `import {module}::{{ #{leaf} }};`"
+                )
+            },
+        ));
+    }
+    sites.sort_by_key(|(span, source, _)| (source.0, span.start, span.end));
+    sites.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1 && left.2 == right.2);
+    for (span, source, msg) in sites {
+        program.warnings.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span,
+            msg,
+        });
+        program.warning_sources.push(source);
+    }
+}
+
+/// The path an `export(in PATH)` subtree roots at — `<dir>/a` for a narrowing
+/// whose last segment is `a`, such that the module's own body file is
+/// `<dir>/a.vl` and everything below it is `<dir>/a/…`.
+///
+/// Resolved from the DECLARING file rather than from a package root, because
+/// the declaring file is inside its own narrowing by definition and its path is
+/// the one piece of layout this pass can be sure of: an item written in
+/// `a/thing.vl` under `export(in pkg::a)` has `a` as a directory above it, and
+/// one written in `a.vl` itself has `a` as its own stem. `None` when neither
+/// holds — the narrowing names a module this file is not under, which is a
+/// program the compiler has nothing useful to say about and admits.
+fn subtree_root(program: &Program, check: &ScopedReachCheck) -> Option<std::path::PathBuf> {
+    let declared = program
+        .canonical_sources
+        .get(check.declared_in.0 as usize)?;
+    let last = check.scope.last()?;
+    if declared.file_stem().and_then(|stem| stem.to_str()) == Some(last.as_str()) {
+        return Some(declared.with_extension(""));
+    }
+    let mut current = declared.parent()?;
+    loop {
+        if current.file_name().and_then(|name| name.to_str()) == Some(last.as_str()) {
+            return Some(current.to_path_buf());
+        }
+        current = current.parent()?;
     }
 }
 
