@@ -77,12 +77,13 @@ fn code_tokens(source: &str) -> Option<Vec<Token<'_>>> {
 }
 
 /// The formatter's token-level canonicalization, used to check a reprint changed
-/// nothing but trivia and the four canonical orders. Five order-insensitivities
+/// nothing but trivia and the five canonical orders. Six order-insensitivities
 /// are folded in so the safety check accepts them: insignificant trailing commas
 /// (dropped), the canonical ordering of a top-level import run (see the
 /// canonical-import-order section below), the canonical ordering of an ELEMENT
 /// HEAD's items (see the canonical-element-head-order section), the canonical
-/// ordering of a `style()` builder chain's links (see the
+/// ordering of an `on` HEAD's condition values (see the canonical-on-head-order
+/// section), the canonical ordering of a `style()` builder chain's links (see the
 /// canonical-style-chain-order section), and the canonical ordering of a `css`
 /// block's items (see the canonical-css-block-order section). Everything else
 /// must match token for token, so the net still catches every *other*
@@ -92,9 +93,11 @@ fn code_tokens(source: &str) -> Option<Vec<Token<'_>>> {
 /// canonical when a block's items are permuted around it — the block scan then
 /// moves whole, already-canonical items.
 fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
-    sort_css_blocks(sort_style_chains(sort_element_heads(sort_import_runs(
-        &drop_redundant_import_aliases(canonicalize_declaration_clauses(
-            drop_anonymous_binder_keywords(collapse_field_shorthands(drop_trailing_commas(tokens))),
+    sort_css_blocks(sort_style_chains(sort_on_heads(sort_element_heads(
+        sort_import_runs(&drop_redundant_import_aliases(
+            canonicalize_declaration_clauses(drop_anonymous_binder_keywords(
+                collapse_field_shorthands(drop_trailing_commas(tokens)),
+            )),
         )),
     ))))
 }
@@ -980,18 +983,25 @@ pub enum StyleCategory {
     Accessibility,
 }
 
-/// The four condition axes, in the order the selector nests them (and therefore
-/// the order the condition combinators require at the call site — see
-/// `render_rule` in `vilan/std/src/style.vl`). `Relation` is the axis
-/// `within`/`children`/`divide` write (ui-styling.md §0bis.6) — it holds the
-/// grammar seat the deleted `dark` held.
+/// The condition axes, in the order a selector writes them — which is both the
+/// order the nesting SUGAR requires at the call site and the canonical order the
+/// canonicaliser sorts a condition SET into (`token_axis` and `render_rule` in
+/// `vilan/std/src/style.vl`, style-conditions.md §2.1).
+///
+/// `Guard` and `Child` were one `Relation` axis while a relation was one slot.
+/// A95 splits them, because they are not the same position: an ancestor guard
+/// is a PREFIX (`[data-theme="dark"] .sX`) and a child relation a SUFFIX
+/// (`.sX > *`), and one set may hold both. `Element` is the pseudo-ELEMENT,
+/// which CSS puts last in a compound with nothing after it.
 #[doc(hidden)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum ConditionAxis {
     Media,
-    Relation,
+    Guard,
+    Child,
     Attribute,
     Pseudo,
+    Element,
 }
 
 /// One row of the canonical order table: a `Style` property method, the
@@ -1110,11 +1120,27 @@ pub const STYLE_PROPERTY_METHODS: &[StyleMethod] = &[
     StyleMethod { name: "user_select",           category: StyleCategory::Interactivity,        family: "user-select",           properties: &["user-select"] },
 ];
 
-/// The condition combinators, each with the axis it writes. Every condition
-/// sorts after every property method; among themselves they sort by axis, and
-/// two conditions on the SAME axis keep their written order (which is what lets
-/// `media`'s arbitrary min-width sit among `sm`/`md`/`lg`/`xl` without the
-/// formatter having to read its argument).
+/// The condition names, each with the axis it writes — read TWICE, and that is
+/// A95 S3's whole change to it (style-conditions.md §2.6).
+///
+/// As the **combinator** table it ranks a `.name(…)` LINK of a `style()` chain:
+/// every condition sorts after every property method, and among themselves by
+/// axis. As the **value** table it ranks the condition VALUES inside an
+/// `.on(<set>, …)` head, so `vilan fmt` rewrites `.on(md() + hover() +
+/// attribute("x"), ..)` to `.on(md() + attribute("x") + hover(), ..)` — the same
+/// order, one level down. One table for both because the free constructor and
+/// the `Style` method of a name are two spellings of one condition
+/// (`hover()` and `style().hover(inner)`), and a second table would be a second
+/// thing to keep in step.
+///
+/// Two conditions on the SAME axis keep their written order, which is what lets
+/// `media`'s arbitrary min-width sit among `sm`/`md`/`lg`/`xl`, and two
+/// `attribute(..)`s stay as written, without the formatter having to read an
+/// argument.
+///
+/// `element` is a VALUE with no method twin — there is no `Style::element` — and
+/// it is here because the value table needs it; a chain can never carry a link
+/// by that name, so the row costs the combinator reading nothing.
 #[doc(hidden)]
 #[rustfmt::skip]
 pub const STYLE_CONDITION_METHODS: &[(&str, ConditionAxis)] = &[
@@ -1123,9 +1149,9 @@ pub const STYLE_CONDITION_METHODS: &[(&str, ConditionAxis)] = &[
     ("lg",        ConditionAxis::Media),
     ("xl",        ConditionAxis::Media),
     ("media",     ConditionAxis::Media),
-    ("within",    ConditionAxis::Relation),
-    ("children",  ConditionAxis::Relation),
-    ("divide",    ConditionAxis::Relation),
+    ("within",    ConditionAxis::Guard),
+    ("children",  ConditionAxis::Child),
+    ("divide",    ConditionAxis::Child),
     ("attribute", ConditionAxis::Attribute),
     ("hover",     ConditionAxis::Pseudo),
     ("focus",     ConditionAxis::Pseudo),
@@ -1134,7 +1160,38 @@ pub const STYLE_CONDITION_METHODS: &[(&str, ConditionAxis)] = &[
     ("first",     ConditionAxis::Pseudo),
     ("last",      ConditionAxis::Pseudo),
     ("pseudo",    ConditionAxis::Pseudo),
+    ("element",   ConditionAxis::Element),
 ];
+
+/// The canonical rank of ONE condition value written in an `on` head, by the
+/// constructor that opens it. `None` for a name the table does not know — a
+/// `let`-bound set (`interactive`), a user's own helper — which is a BARRIER
+/// exactly as an unknown chain link is: values sort only within the runs
+/// between barriers, so nothing known can cross something unknown.
+fn condition_value_rank(name: &str) -> Option<StyleLinkRank> {
+    STYLE_CONDITION_METHODS
+        .iter()
+        .find(|(condition, _)| *condition == name)
+        .map(|(_, axis)| StyleLinkRank::Condition(*axis))
+}
+
+/// The permutation that puts the condition values of one `on` head into the
+/// canonical order, or `None` when they are already in it (so an unchanged head
+/// stays on its existing code path, byte for byte) or when there is nothing to
+/// sort.
+///
+/// The reorder cannot change what is emitted, and the reason is the model's
+/// rather than a bet: a condition SET has no order. `canonical_condition` sorts
+/// the tokens itself before the slot key is built, so two spellings of one set
+/// already mint one class — which is exactly why the formatter can put the
+/// SOURCE in the order the selector reads in.
+fn condition_set_permutation(names: &[&str]) -> Option<Vec<usize>> {
+    let ranks: Vec<Option<StyleLinkRank>> = names
+        .iter()
+        .map(|name| condition_value_rank(name))
+        .collect();
+    canonical_permutation(&ranks)
+}
 
 /// The breakpoint combinators' own min-widths, as `style.vl` spells them: `md`
 /// is `self.media("768px", inner)`. Every row delegates to `media`, so this is
@@ -1383,6 +1440,148 @@ pub fn sort_style_chains<'src>(tokens: Vec<Token<'src>>) -> Vec<Token<'src>> {
         index += 1;
     }
     result
+}
+
+// --- Canonical `on` head order ------------------------------------------------
+//
+// A95 S3. `Style::on(conditions, inner)` takes a condition SET, and a set has no
+// order — `canonical_condition` in `vilan/std/src/style.vl` sorts the tokens
+// itself before the slot key is built, so `md() + hover()` and `hover() + md()`
+// already mint one class. That is what lets the formatter put the SOURCE in the
+// order the selector reads in: the reorder cannot change the emitted stylesheet,
+// because the emitted stylesheet was never a function of the written order.
+//
+// The order is `STYLE_CONDITION_METHODS`' own, one level down from the chain
+// links it ranks (style-conditions.md §2.6). The degradation is the chain's:
+// a value the table does not know — a `let`-bound set, a helper of the author's
+// — is a BARRIER, so values sort only within the runs between barriers and
+// nothing known crosses something unknown.
+
+/// One `+`-separated segment of an `on` head, as the TOKEN scan sees it: the
+/// constructor name that opens it (`""` when the segment does not open with a
+/// path and a `(`, which makes it a barrier), and its token range.
+type ConditionSegment<'src> = (&'src str, std::ops::Range<usize>);
+
+/// The `+`-separated segments of the condition head that begins at `start` and
+/// ends before `end`, in written order. `None` when the run holds fewer than
+/// two segments, which is the overwhelmingly common single-condition head.
+fn condition_head_segments<'src>(
+    tokens: &[Token<'src>],
+    start: usize,
+    end: usize,
+) -> Option<Vec<ConditionSegment<'src>>> {
+    let mut segments = Vec::new();
+    let mut segment_start = start;
+    let mut depth = 0usize;
+    let mut scan = start;
+    while scan < end {
+        match tokens[scan] {
+            Token::Ctrl('(') | Token::Ctrl('[') | Token::Ctrl('{') => depth += 1,
+            Token::Ctrl(')') | Token::Ctrl(']') | Token::Ctrl('}') => {
+                depth = depth.checked_sub(1)?
+            }
+            Token::Op("+") if depth == 0 => {
+                segments.push((
+                    condition_segment_name(tokens, segment_start),
+                    segment_start..scan,
+                ));
+                segment_start = scan + 1;
+            }
+            _ => {}
+        }
+        scan += 1;
+    }
+    segments.push((
+        condition_segment_name(tokens, segment_start),
+        segment_start..end,
+    ));
+    (segments.len() > 1).then_some(segments)
+}
+
+/// The constructor a head segment opens with — the last name of its leading
+/// path, when that path is immediately called (`hover(`, `style::hover(`).
+/// `""` for anything else, which [`condition_value_rank`] reads as a barrier.
+fn condition_segment_name<'src>(tokens: &[Token<'src>], start: usize) -> &'src str {
+    let mut scan = start;
+    loop {
+        let Some(Token::Ident(segment)) = tokens.get(scan) else {
+            return "";
+        };
+        match tokens.get(scan + 1) {
+            Some(Token::Op("::")) => scan += 2,
+            Some(Token::Ctrl('(')) => return segment,
+            _ => return "",
+        }
+    }
+}
+
+/// Reorders the condition values of every `.on(<set>, …)` head into the
+/// canonical order, so that a source head and the printer's reordered reprint
+/// reduce to the same token sequence. Every other token keeps its position, so
+/// the safety net still catches every other reordering.
+///
+/// The head is the FIRST argument — up to the first top-level `,` — and the `css`
+/// block's own `.on(<set>) { … }` head is the same shape with no comma after it,
+/// so one scan covers both spellings.
+// `pub` (doc-hidden) for the same reason [`sort_style_chains`] is: the external
+// corpus tripwire mirrors the net's canonicalization through this ONE
+// implementation. Not part of the supported API.
+#[doc(hidden)]
+pub fn sort_on_heads<'src>(tokens: Vec<Token<'src>>) -> Vec<Token<'src>> {
+    let mut result: Vec<Token<'src>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let permuted = on_head_span(&tokens, index).and_then(|(head_start, head_end)| {
+            let segments = condition_head_segments(&tokens, head_start, head_end)?;
+            let names: Vec<&str> = segments.iter().map(|(name, _)| *name).collect();
+            condition_set_permutation(&names).map(|order| (segments, order))
+        });
+        if let Some((segments, order)) = permuted {
+            // `.`, the name, `(` — everything up to the head itself.
+            result.extend_from_slice(&tokens[index..segments[0].1.start]);
+            for (at, segment) in order.into_iter().enumerate() {
+                if at > 0 {
+                    result.push(Token::Op("+"));
+                }
+                let range = segments[segment].1.clone();
+                result.extend(sort_on_heads(tokens[range].to_vec()));
+            }
+            index = segments
+                .last()
+                .map(|(_, range)| range.end)
+                .expect("a permutation implies at least two segments");
+            continue;
+        }
+        result.push(tokens[index].clone());
+        index += 1;
+    }
+    result
+}
+
+/// The token range of the condition head of the `. on (` that starts at
+/// `index` — from just after the `(` to the first top-level `,`, or to the `)`
+/// when the call takes no second argument (the `css` block's head).
+fn on_head_span(tokens: &[Token<'_>], index: usize) -> Option<(usize, usize)> {
+    if !matches!(tokens.get(index), Some(Token::Ctrl('.')))
+        || !matches!(tokens.get(index + 1), Some(Token::Ident("on")))
+        || !matches!(tokens.get(index + 2), Some(Token::Ctrl('(')))
+    {
+        return None;
+    }
+    let close = balanced_end(tokens, index + 2)?;
+    let start = index + 3;
+    let mut depth = 0usize;
+    for (offset, token) in tokens[start..close].iter().enumerate() {
+        match token {
+            Token::Ctrl('(') | Token::Ctrl('[') | Token::Ctrl('{') => depth += 1,
+            Token::Ctrl(')') | Token::Ctrl(']') | Token::Ctrl('}') => {
+                depth = depth.checked_sub(1)?
+            }
+            Token::Ctrl(',') if depth == 0 => return Some((start, start + offset)),
+            _ => {}
+        }
+    }
+    Some((start, close))
 }
 
 // --- Canonical `css` block order ---------------------------------------------
@@ -4520,6 +4719,66 @@ impl<'src> Printer<'src> {
         Some(links)
     }
 
+    /// The condition VALUES of an `on` head in the canonical order, or `None`
+    /// when the head is not a sortable `+` run of condition constructors or is
+    /// already canonical — so an unchanged head stays on its existing code
+    /// path, byte for byte (A95 S3, style-conditions.md §2.6).
+    ///
+    /// Refused outright, like a chain: a head with a comment anywhere inside it.
+    /// A reordered head would carry its comments to the wrong value, and the
+    /// comment cursor only moves forward.
+    fn sorted_condition_values<'ast>(
+        &self,
+        head: &'ast Spanned<Node<'src>>,
+    ) -> Option<Vec<&'ast Spanned<Node<'src>>>> {
+        let values = Self::condition_sum_operands(head);
+        if values.len() < 2 {
+            return None;
+        }
+        let span = head.1.into_range();
+        if self.has_comment_in(span.start, span.end) {
+            return None;
+        }
+        let names: Vec<&str> = values
+            .iter()
+            .map(|value| Self::condition_value_name(value).unwrap_or(""))
+            .collect();
+        let order = condition_set_permutation(&names)?;
+        Some(order.into_iter().map(|value| values[value]).collect())
+    }
+
+    /// The operands of a left-nested `+` sum, in written order. A node that is
+    /// not a sum is a sum of one, which is what makes the single-condition head
+    /// fall out of the same walk.
+    fn condition_sum_operands<'ast>(
+        expr: &'ast Spanned<Node<'src>>,
+    ) -> Vec<&'ast Spanned<Node<'src>>> {
+        match &expr.0 {
+            Node::Binary(BinaryOp::Add, left, right) => {
+                let mut operands = Self::condition_sum_operands(left);
+                operands.push(right);
+                operands
+            }
+            _ => vec![expr],
+        }
+    }
+
+    /// The constructor one condition value opens with — the bare call at the
+    /// head of its postfix spine, so `active().not()` and
+    /// `attribute("x").eq("v").not()` both answer with the name that decides
+    /// the axis. `None` for anything else, which ranks as a barrier.
+    fn condition_value_name(expr: &Spanned<Node<'src>>) -> Option<&'src str> {
+        let (subject, _) = Self::postfix_spine(expr);
+        match &subject.0 {
+            Node::Call(callee, None, _) => match &callee.0 {
+                Node::Accessor(name) => Some(name),
+                Node::StaticAccessor(_, member, None) => Some(member),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// How many `.name(…)` call links `expr`'s postfix spine carries — the unit
     /// the split form gives its own line, and the number the split doors are
     /// graded on.
@@ -5693,7 +5952,15 @@ impl<'src> Printer<'src> {
     /// the line stays long, because breaking there needs argument-list layout.
     /// A [`Split::Statement`] arming stops here too — a chain nested in an
     /// argument of a statement that is not itself a chain stays inline.
-    fn print_call_arguments(&mut self, arguments: &[Spanned<Node<'src>>], split: Split) {
+    /// `head`, when present, replaces the FIRST argument with its own operands
+    /// printed as a `+` sum — the canonical order of an `on` head's condition
+    /// values (A95 S3). Every other argument prints exactly as it always did.
+    fn print_call_arguments(
+        &mut self,
+        arguments: &[Spanned<Node<'src>>],
+        split: Split,
+        head: Option<&[&Spanned<Node<'src>>]>,
+    ) {
         for (index, argument) in arguments.iter().enumerate() {
             if index > 0 {
                 self.out.push_str(", ");
@@ -5705,7 +5972,18 @@ impl<'src> Printer<'src> {
             if split != Split::Off && index + 1 == arguments.len() {
                 self.split = Split::Tail;
             }
-            self.print_expr(argument);
+            match head {
+                Some(values) if index == 0 => {
+                    let precedence = Self::binary_precedence(BinaryOp::Add);
+                    for (at, value) in values.iter().enumerate() {
+                        if at > 0 {
+                            self.out.push_str(" + ");
+                        }
+                        self.print_operand(value, precedence + 1);
+                    }
+                }
+                _ => self.print_expr(argument),
+            }
         }
     }
 
@@ -5912,8 +6190,15 @@ impl<'src> Printer<'src> {
                     }
                     self.out.push('>');
                 }
+                // An `on` head's condition values print in the canonical order,
+                // not the written one (A95 S3) — the same rule a `style()`
+                // chain's links follow, one level down.
+                let head = matches!(callee.0, Node::Accessor("on"))
+                    .then(|| arguments.0.first())
+                    .flatten()
+                    .and_then(|first| self.sorted_condition_values(first));
                 self.out.push('(');
-                self.print_call_arguments(&arguments.0, split);
+                self.print_call_arguments(&arguments.0, split, head.as_deref());
                 self.out.push(')');
             }
             Node::Binary(operator, left, right) => {
@@ -11814,16 +12099,26 @@ mod style_chain_order {
         );
     }
 
-    /// The three relations share one axis, so they keep their written order —
-    /// `children`/`divide` never cross `within` or each other.
+    /// The two CHILD relations share one axis, so `children` and `divide` keep
+    /// their written order and never cross each other.
+    ///
+    /// The ancestor GUARD is a different axis from A95 S2 on, and sorts ahead of
+    /// them — a guard is a PREFIX (`[data-theme="dark"] .sX`) and a child
+    /// relation a SUFFIX (`.sX > *`), so the order the selector writes them in is
+    /// the order the links take. It is safe for the rule every condition link
+    /// follows: the two write different slots, so neither can override the
+    /// other, and `crates/vilan-cli/tests/style_chain_order.rs` proves the
+    /// emitted CSS is identical across the permutation.
     #[test]
-    fn relations_keep_their_written_order() {
-        for chain in [
+    fn child_relations_keep_their_written_order_and_the_guard_leads_them() {
+        assert_construct(
             "let s = const style().children(a).divide(b);\n",
+            "let s = const style().children(a).divide(b);\n",
+        );
+        assert_construct(
             "let s = const style().divide(a).within(\"data-theme\", \"dark\", b);\n",
-        ] {
-            assert_construct(chain, chain);
-        }
+            "let s = const style().within(\"data-theme\", \"dark\", b).divide(a);\n",
+        );
     }
 
     /// Two conditions on the SAME axis keep their written order, which is what
@@ -12204,6 +12499,99 @@ mod style_chain_order {
                 method.name
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod on_head_order {
+    //! A95 S3 — `vilan fmt` sorts the condition VALUES inside an `.on(<set>, …)`
+    //! head into the canonical order, which is `STYLE_CONDITION_METHODS`' own
+    //! order read one level down from the chain links it ranks
+    //! (style-conditions.md §2.6).
+    //!
+    //! The reorder is safe for a reason the model gives rather than a bet a test
+    //! has to make: a condition SET has no order. `canonical_condition` in
+    //! `vilan/std/src/style.vl` sorts the tokens before the slot key is built,
+    //! so `md() + hover()` and `hover() + md()` already mint one class, and the
+    //! formatter is putting the SOURCE in the order the selector reads in.
+    //! `crates/vilan-core/tests/style_table_sync.rs` gate 6 holds the axis
+    //! column to the token each constructor actually builds.
+    use super::bailing_constructs::assert_construct;
+
+    #[test]
+    fn the_condition_values_sort_into_the_canonical_slot_order() {
+        // Written in exactly reverse slot order: the pseudo-element, a
+        // pseudo-class, an attribute, a child relation, an ancestor guard and a
+        // breakpoint. Out comes the order a selector is written in.
+        assert_construct(
+            "let s = const style().on(element(\"x\") + hover() + attribute(\"a\") + children() \
+             + within(attribute(\"t\")) + md(), inner);\n",
+            "let s = const style().on(md() + within(attribute(\"t\")) + children() \
+             + attribute(\"a\") + hover() + element(\"x\"), inner);\n",
+        );
+    }
+
+    #[test]
+    fn two_values_on_one_axis_keep_their_written_order() {
+        // The sort is STABLE, which is what lets two `attribute(..)`s and a
+        // negated pseudo-class stay exactly as the author wrote them — the
+        // formatter never reads an argument to rank a value.
+        assert_construct(
+            "let s = const style().on(hover() + active().not(), inner);\n",
+            "let s = const style().on(hover() + active().not(), inner);\n",
+        );
+        assert_construct(
+            "let s = const style().on(attribute(\"b\") + attribute(\"a\"), inner);\n",
+            "let s = const style().on(attribute(\"b\") + attribute(\"a\"), inner);\n",
+        );
+    }
+
+    #[test]
+    fn a_value_the_table_does_not_know_is_a_barrier() {
+        // A `let`-bound set, or a helper of the author's: values sort only
+        // within the runs BETWEEN barriers, so nothing known crosses it. The
+        // degradation is the chain's, for the same reason — the formatter
+        // cannot know what an unknown name contributes.
+        assert_construct(
+            "let s = const style().on(hover() + interactive + md(), inner);\n",
+            "let s = const style().on(hover() + interactive + md(), inner);\n",
+        );
+    }
+
+    #[test]
+    fn a_single_condition_head_is_left_exactly_as_written() {
+        assert_construct(
+            "let s = const style().on(hover(), inner);\n",
+            "let s = const style().on(hover(), inner);\n",
+        );
+    }
+
+    #[test]
+    fn a_sum_that_is_not_an_on_head_never_sorts() {
+        // `Style + Style` is a MERGE and its order is semantic — right wins.
+        // Only the first argument of `on` is a condition set.
+        assert_construct(
+            "let s = const hover_style + base_style;\n",
+            "let s = const hover_style + base_style;\n",
+        );
+        assert_construct(
+            "let s = const style().when(flag, md() + hover());\n",
+            "let s = const style().when(flag, md() + hover());\n",
+        );
+    }
+
+    #[test]
+    fn a_comment_inside_the_head_refuses_the_reorder() {
+        // A reordered head would carry its comments to the wrong value, and the
+        // comment cursor only moves forward — the refusal a chain makes, for
+        // the same reason.
+        let source =
+            "let s = const style().on(\n\thover() // the state\n\t\t+ md(),\n\tinner,\n);\n";
+        let formatted = super::format(source);
+        assert!(
+            formatted.contains("hover()") && formatted.find("hover()") < formatted.find("md()"),
+            "the head must keep its written order beside a comment: {formatted}"
+        );
     }
 }
 

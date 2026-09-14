@@ -8,7 +8,7 @@
 //! `grammar_sync` shape (Order 11): the source of truth is read out of the real
 //! artefact, and the hand-written table is held to it in BOTH directions.
 //!
-//! Five gates, each derived from `style.vl` rather than restated:
+//! Six gates, each derived from `style.vl` rather than restated:
 //!
 //!   1. **Completeness** — every `fun name(self, …)` in an `impl Style` block is
 //!      claimed by exactly one of the three tables, and every table row names a
@@ -29,6 +29,12 @@
 //!      must be the min-width its body actually delegates with, and every
 //!      delegating media combinator must have a row. The language server's
 //!      `@media` quickfix (css-block.md §7.2) reads that map.
+//!   6. **Condition VALUES** — the same table is read a second way under A95 S3
+//!      (the canonical order over the condition values inside an `on` head), so
+//!      every row must name a free `fun name(…): Condition`, and the axis the
+//!      row records must be the axis `token_axis` gives the token that
+//!      constructor actually builds. Both directions, so a constructor added
+//!      without a row (which would make a head quietly stop sorting) reds too.
 //!
 //! The behaviour the table drives is pinned in `formatter.rs`'s
 //! `mod style_chain_order`; the proof that a reorder preserves the rendered
@@ -44,6 +50,13 @@ use vilan_core::formatter::{
 
 /// The std style surface this table describes.
 const STYLE_SOURCE: &str = "vilan/std/src/style.vl";
+
+/// Condition rows with a free constructor and no `Style` METHOD of the same
+/// name — the value reading's rows, exempt from the completeness gate's method
+/// direction and held by gate 6 instead. The list is an exemption, so it is
+/// checked in the inverse direction too (a name here that DOES have a method is
+/// an exemption subtracting a check for nothing).
+const VALUE_ONLY_CONDITIONS: &[&str] = &["element"];
 
 /// The five `Style` methods that actually write a slot. Every other property
 /// method is spelled in terms of one of them, which is what makes the slot a
@@ -351,7 +364,18 @@ fn every_table_row_names_a_method_that_exists() {
     for name in STYLE_PROPERTY_METHODS
         .iter()
         .map(|row| row.name)
-        .chain(STYLE_CONDITION_METHODS.iter().map(|(name, _)| *name))
+        .chain(
+            STYLE_CONDITION_METHODS
+                .iter()
+                .map(|(name, _)| *name)
+                // A row the VALUE reading needs and the combinator reading has
+                // no method for. `element("selection")` is a condition with no
+                // `Style::element` sugar — CSS puts a pseudo-element last in a
+                // compound and lets nothing follow it, so there is nothing for a
+                // wrapping combinator to mean — and gate 6 holds it to the free
+                // constructor instead.
+                .filter(|name| !VALUE_ONLY_CONDITIONS.contains(name)),
+        )
         .chain(STYLE_BARRIER_METHODS.iter().copied())
     {
         if !declared.contains(name) {
@@ -543,7 +567,7 @@ fn a_delegating_condition_is_recorded_on_the_axis_it_delegates_to() {
         for (delegate, expected) in [
             ("pseudo", ConditionAxis::Pseudo),
             ("media", ConditionAxis::Media),
-            ("within", ConditionAxis::Relation),
+            ("within", ConditionAxis::Guard),
             ("attribute", ConditionAxis::Attribute),
         ] {
             if name != delegate
@@ -602,6 +626,170 @@ fn every_breakpoint_width_is_the_one_std_delegates_to() {
                 .iter()
                 .any(|(name, _)| name == condition),
             "`{condition}` is a breakpoint with no width in STYLE_BREAKPOINT_WIDTHS"
+        );
+    }
+}
+
+// --- 6. Condition VALUES, held to the canonicaliser --------------------------
+//
+// A95 S3 reads `STYLE_CONDITION_METHODS` twice: as the combinator table (gate 4)
+// and as the canonical order over the condition VALUES inside an `on` head. The
+// second reading has its own source of truth — `token_axis` in `style.vl`, which
+// reads a token's axis off its FIRST BYTE — so the axis column has to agree with
+// the byte each constructor actually builds, or `vilan fmt` would put a source
+// head in an order the canonicaliser does not sort into.
+//
+// Derived, not restated: the byte comes out of the constructor's own body.
+
+/// Every free `fun name(…): Condition` in `style.vl`, with the raw lines of its
+/// body — the constructors a condition SET is summed from, and the internal
+/// helpers they delegate to.
+fn free_condition_constructors(source: &str) -> BTreeMap<String, Vec<String>> {
+    let mut constructors = BTreeMap::new();
+    let mut current: Option<(String, Vec<String>)> = None;
+    for line in source.lines() {
+        if line.starts_with("fun ") && line.ends_with("): Condition {") {
+            if let Some((name, body)) = current.take() {
+                constructors.insert(name, body);
+            }
+            let name = line["fun ".len()..]
+                .split('(')
+                .next()
+                .expect("a `fun` header names something")
+                .to_string();
+            current = Some((name, Vec::new()));
+        } else if line == "}" {
+            if let Some((name, body)) = current.take() {
+                constructors.insert(name, body);
+            }
+        } else if let Some((_, body)) = current.as_mut() {
+            body.push(line.to_string());
+        }
+    }
+    assert!(
+        constructors.len() > 15,
+        "suspiciously few condition constructors parsed out of {STYLE_SOURCE}: {}",
+        constructors.len()
+    );
+    constructors
+}
+
+/// The axis `token_axis` gives the token `name`'s constructor builds, read off
+/// the first byte of the `condition_of(…)` argument in its body — following a
+/// delegation to another constructor when the body makes one.
+///
+/// The byte table IS `token_axis`'s, restated here in the one direction a test
+/// can check it: `@` a breakpoint, `^` an ancestor guard, `>` a child relation,
+/// `[` an attribute, `%` a pseudo-element, anything else a pseudo-class.
+fn constructed_axis(
+    name: &str,
+    constructors: &BTreeMap<String, Vec<String>>,
+    hops: usize,
+) -> Option<ConditionAxis> {
+    assert!(hops > 0, "`{name}` delegates in a cycle");
+    let body = constructors.get(name)?;
+    for line in body {
+        let Some((_, rest)) = line.split_once("condition_of(") else {
+            continue;
+        };
+        let token = rest.trim_start_matches('i').trim_start_matches('"');
+        return Some(match token.chars().next()? {
+            '@' => ConditionAxis::Media,
+            '^' => ConditionAxis::Guard,
+            '>' => ConditionAxis::Child,
+            '[' => ConditionAxis::Attribute,
+            '%' => ConditionAxis::Element,
+            _ => ConditionAxis::Pseudo,
+        });
+    }
+    // No token of its own: the body's last statement calls another constructor.
+    let delegate = body
+        .iter()
+        .rev()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            let (callee, _) = trimmed.split_once('(')?;
+            constructors
+                .contains_key(callee)
+                .then(|| callee.to_string())
+        })
+        .unwrap_or_else(|| panic!("`{name}` builds no condition token and delegates to nothing"));
+    constructed_axis(&delegate, constructors, hops - 1)
+}
+
+#[test]
+fn every_condition_row_names_a_free_constructor_on_the_axis_it_builds() {
+    let source = style_source();
+    let constructors = free_condition_constructors(&source);
+    let mut wrong = Vec::new();
+    for (name, axis) in STYLE_CONDITION_METHODS {
+        let Some(built) = constructed_axis(name, &constructors, 4) else {
+            wrong.push(format!(
+                "`{name}` is a condition row with no free `fun {name}(…): Condition` in {STYLE_SOURCE}"
+            ));
+            continue;
+        };
+        if built != *axis {
+            wrong.push(format!(
+                "`{name}()` builds a {built:?} token, but the table records it on {axis:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[test]
+fn every_free_condition_constructor_has_a_row() {
+    // The other direction: a constructor added to std without a row would be a
+    // BARRIER in an `on` head — the head would quietly stop sorting rather than
+    // fail — which is the exact drift this file exists to catch.
+    let source = style_source();
+    let rows: BTreeSet<&str> = STYLE_CONDITION_METHODS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    let mut unrowed = Vec::new();
+    for name in free_condition_constructors(&source).keys() {
+        // The internal helpers a constructor delegates to are not surface: the
+        // `_condition` twins exist only because a bare call inside `impl Style`
+        // resolves to the METHOD of that name, and `condition_of`/
+        // `canonical_condition`/`condition_from_slot` are the canonicaliser's.
+        if name.ends_with("_condition")
+            || name.starts_with("condition_")
+            || name.starts_with("canonical_")
+        {
+            continue;
+        }
+        if !rows.contains(name.as_str()) {
+            unrowed.push(name.clone());
+        }
+    }
+    assert!(
+        unrowed.is_empty(),
+        "{STYLE_SOURCE} declares condition constructor(s) with no STYLE_CONDITION_METHODS row: {unrowed:?}"
+    );
+}
+
+#[test]
+fn every_value_only_condition_really_has_no_method() {
+    // N42's rule applied to `VALUE_ONLY_CONDITIONS`: an exemption that stopped
+    // being needed subtracts a check for nothing and stays green forever.
+    let source = style_source();
+    let declared: BTreeSet<String> = declared_methods(&source)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    for name in VALUE_ONLY_CONDITIONS {
+        assert!(
+            !declared.contains(*name),
+            "`{name}` is exempt from the method direction, but {STYLE_SOURCE} declares \
+             `fun {name}(self, …)` — drop the exemption"
+        );
+        assert!(
+            STYLE_CONDITION_METHODS
+                .iter()
+                .any(|(condition, _)| condition == name),
+            "`{name}` is exempt from a table it has no row in"
         );
     }
 }

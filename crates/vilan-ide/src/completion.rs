@@ -737,7 +737,17 @@ fn css_block_completions(position: CssPosition) -> Vec<Completion> {
         }
         CssPosition::Condition => STYLE_CONDITION_METHODS
             .iter()
+            .filter(|(condition, _)| *condition != "element")
             .map(|(condition, _)| Completion::bare(condition.to_string(), CompletionKind::Method))
+            .collect(),
+        // The same rows, as the free CONSTRUCTORS a set is summed from. They
+        // are functions here and methods above, which is exactly the difference
+        // between `hover()` (the condition) and `.hover { … }` (the sugar that
+        // puts a style under it) — and `element` appears only here, because it
+        // is a value with no combinator twin.
+        CssPosition::ConditionValue => STYLE_CONDITION_METHODS
+            .iter()
+            .map(|(condition, _)| Completion::bare(condition.to_string(), CompletionKind::Function))
             .collect(),
         // Both v1 blanks (Q4), and blank rather than absent: falling through to
         // the enclosing scope is what an element head refuses for the same
@@ -838,6 +848,14 @@ fn css_position(
     let mut depth = 0usize;
     let mut dotted = false;
     let mut after_colon = false;
+    // The one place inside a head's arguments whose vocabulary is known (A95
+    // S3): `combinator` is the dotted item's name, `on_head` says the cursor is
+    // inside THAT name's argument list, and the two trailing tokens say whether
+    // the cursor sits where a condition value goes.
+    let mut combinator: Option<&str> = None;
+    let mut on_head = false;
+    let mut previous: Option<&Token<'_>> = None;
+    let mut last: Option<&Token<'_>> = None;
     for (token, span) in tokens {
         let range = span.into_range();
         if range.start < body_start {
@@ -845,6 +863,20 @@ fn css_position(
         }
         if range.start >= offset {
             break;
+        }
+        if on_head && depth == 1 {
+            previous = last;
+            last = Some(token);
+        }
+        if dotted && depth == 0 {
+            if let Token::Ident(name) = token {
+                combinator = Some(name);
+            }
+            if matches!(token, Token::Ctrl('(')) && combinator == Some("on") {
+                on_head = true;
+                previous = None;
+                last = None;
+            }
         }
         match token {
             Token::Ctrl('(' | '[' | '{') => depth += 1,
@@ -860,6 +892,8 @@ fn css_position(
             Token::Ctrl(';') if depth == 0 => {
                 dotted = false;
                 after_colon = false;
+                combinator = None;
+                on_head = false;
             }
             // The declaration's separator is an OPERATOR token, not a control
             // one (`parse_css_declaration` reads it with `peek_is_op`).
@@ -867,6 +901,9 @@ fn css_position(
             Token::Ctrl('.') if depth == 0 && !after_colon => dotted = true,
             _ => {}
         }
+    }
+    if depth == 1 && on_head && at_condition_value(previous, last) {
+        return Some(CssPosition::ConditionValue);
     }
     if depth != 0 {
         return None;
@@ -893,6 +930,20 @@ fn css_position(
     } else {
         CssPosition::Property
     })
+}
+
+/// Whether the cursor sits where a condition VALUE goes inside an `on` head:
+/// directly after the head's `(`, after a `+`, or partway through the name that
+/// follows either. `previous` and `last` are the two tokens before the cursor at
+/// the head's own depth, youngest last.
+fn at_condition_value(previous: Option<&Token<'_>>, last: Option<&Token<'_>>) -> bool {
+    let opens = |token: Option<&Token<'_>>| {
+        matches!(token, None | Some(Token::Ctrl('(')) | Some(Token::Op("+")))
+    };
+    match last {
+        Some(Token::Ident(_)) => opens(previous),
+        other => opens(other),
+    }
 }
 
 /// The body start (one past the `{`) of the innermost `css` block body
@@ -1049,6 +1100,12 @@ enum CssPosition {
     CustomProperty,
     /// An item's head after the `.` that commits it to a condition combinator.
     Condition,
+    /// Inside an `.on(<set>)` head, at a place a condition VALUE goes: directly
+    /// after the `(`, or after a `+` (A95 S3). The head's arguments are
+    /// ordinary expression ground everywhere else, and this is the one place in
+    /// one head where the vocabulary is known — the same rows the combinator
+    /// list reads, as the free constructors the set is built from.
+    ConditionValue,
     /// After the `:` — the declaration's value. Empty in v1 (Q4): offering
     /// `flex` after `display:` needs a property->enum map that does not exist,
     /// and the enclosing scope is not an answer either (a value is source text,
