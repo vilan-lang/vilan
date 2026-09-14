@@ -381,6 +381,42 @@ fn field_read_clause(program: &Program, expr: &Expr<'_>) -> Option<Vec<Id>> {
     clause_of_type(program, type_id).map(<[Id]>::to_vec)
 }
 
+/// The clause a CALL's own value carries (B333): the clause written on the
+/// CALLEE's declared return type.
+///
+/// `expr_type_ids` holds the type an expression PRODUCES, and a clause is not
+/// part of it — the solver records the clause against the binding's annotation,
+/// never against the call that fills it — so `let body: (|| void) context c =
+/// make();` was refused even where `make` declares exactly that return. The
+/// declaration is the answer and it is right here: a function's return type is
+/// a promise about the value it hands back, and a clause on it is part of that
+/// promise.
+///
+/// Only a DIRECT call to a named function. A call through a value has no
+/// declaration to read, which is the same reason `value_type_of` prefers a
+/// declaration over a recorded type.
+fn call_return_clause(program: &Program, entity: Id) -> Option<Vec<Id>> {
+    let Some(Expr::Call(call_id)) = program.entity_map.get(&entity) else {
+        return None;
+    };
+    let target = call_target(program, *call_id)?;
+    let return_type_id = program.functions.get(&target)?.return_type_id?;
+    clause_of_type(program, return_type_id).map(<[Id]>::to_vec)
+}
+
+/// A binding with NO clause of its own whose initializer is a closure LITERAL —
+/// the shape that ADOPTS the clause of the position it lands in (B333). The
+/// literal is then born under the clause's extent exactly as one written at the
+/// landing would be, which is what makes `let wire = || { .. };` and `let wire:
+/// (|| void) context owner_scope = || { .. };` the same program.
+fn adoptable_closure(program: &Program, source: Id) -> Option<Id> {
+    let initial = program.variables.get(&source)?.initial?;
+    match program.entity_map.get(&initial) {
+        Some(Expr::Closure(closure_id)) => Some(*closure_id),
+        _ => None,
+    }
+}
+
 /// The clause a VALUE carries wherever this pass can see one (B309): a
 /// reference to a clause-typed binding or parameter, or a read of a
 /// clause-typed field. `None` is an ordinary value.
@@ -392,7 +428,13 @@ fn clause_carried_by(
 ) -> Option<Vec<Id>> {
     match program.entity_map.get(&entity) {
         Some(Expr::Local(source)) => value_contexts.get(source).cloned(),
-        _ => injected_values.get(&entity).cloned(),
+        // B333: a call carries what its callee's DECLARED return promises, so
+        // a MISMATCHED one names both clauses instead of being told what the
+        // position takes.
+        _ => injected_values
+            .get(&entity)
+            .cloned()
+            .or_else(|| call_return_clause(program, entity)),
     }
 }
 
@@ -1210,6 +1252,13 @@ fn analyze(
                         deferred.entry(context).or_default().insert(*closure_id);
                     }
                 }
+                // B333: a CALL to a function whose declared return carries
+                // this clause. `make()` promises an injected closure, and the
+                // promise is the declaration — so the binding takes it exactly
+                // as a same-clause value does.
+                _ if call_return_clause(program, initial).as_deref() == Some(&clause[..]) => {
+                    allowed_forwards.insert(initial);
+                }
                 // B325: an UNANNOTATED binding's clause came FROM the
                 // initializer — there is no annotation for the value to
                 // disagree with, so the binding is a forward by construction
@@ -1279,7 +1328,28 @@ fn analyze(
                 Some(Expr::Local(source)) if value_contexts.get(source) == Some(&clause) => {
                     allowed_forwards.insert(value);
                 }
+                // B333: an UNANNOTATED local closure binding adopts the
+                // field's clause, exactly as an argument binding has adopted a
+                // parameter's since B309. The literal is then born under the
+                // clause's extent — which is what makes std's own `let wire:
+                // (|| void) context owner_scope = || { .. };` and the same
+                // line without its annotation one program.
+                Some(Expr::Local(source))
+                    if !value_contexts.contains_key(source)
+                        && adoptable_closure(program, *source).is_some() =>
+                {
+                    let closure_id = adoptable_closure(program, *source).expect("just matched");
+                    value_contexts.insert(*source, clause.clone());
+                    for &context in &clause {
+                        deferred.entry(context).or_default().insert(closure_id);
+                    }
+                    allowed_forwards.insert(value);
+                }
                 Some(expr) if field_read_clause(program, expr).as_deref() == Some(&clause[..]) => {
+                    allowed_forwards.insert(value);
+                }
+                // B333: the callee's declared return, as at a binding.
+                _ if call_return_clause(program, value).as_deref() == Some(&clause[..]) => {
                     allowed_forwards.insert(value);
                 }
                 _ => {
@@ -1318,7 +1388,26 @@ fn analyze(
                 Some(Expr::Local(source)) if value_contexts.get(source) == Some(&clause) => {
                     allowed_forwards.insert(value);
                 }
+                // B333: the same adoption at a RETURN — one rule at all three
+                // landings, so where a closure literal may be written a local
+                // binding holding one may be handed on.
+                Some(Expr::Local(source))
+                    if !value_contexts.contains_key(source)
+                        && adoptable_closure(program, *source).is_some() =>
+                {
+                    let closure_id = adoptable_closure(program, *source).expect("just matched");
+                    value_contexts.insert(*source, clause.clone());
+                    for &context in &clause {
+                        deferred.entry(context).or_default().insert(closure_id);
+                    }
+                    allowed_forwards.insert(value);
+                }
                 Some(expr) if field_read_clause(program, expr).as_deref() == Some(&clause[..]) => {
+                    allowed_forwards.insert(value);
+                }
+                // B333: the callee's declared return — a function handing on
+                // what another function promised.
+                _ if call_return_clause(program, value).as_deref() == Some(&clause[..]) => {
                     allowed_forwards.insert(value);
                 }
                 _ => {
@@ -1335,15 +1424,10 @@ fn analyze(
         }
 
         // Adoption: an argument binding with NO clause of its own, whose
-        // initial is a closure literal, adopts the parameter's clause.
-        let adoptable = |source: Id| -> Option<Id> {
-            let variable = program.variables.get(&source)?;
-            let initial = variable.initial?;
-            match program.entity_map.get(&initial) {
-                Some(Expr::Closure(closure_id)) => Some(*closure_id),
-                _ => None,
-            }
-        };
+        // initial is a closure literal, adopts the parameter's clause. The
+        // predicate is `adoptable_closure`, shared with the field and return
+        // landings since B333 — one rule, one spelling.
+        let adoptable = |source: Id| adoptable_closure(program, source);
         for (&call_id, function_call) in &program.function_calls {
             let Some(target) = call_target(program, call_id) else {
                 continue;
@@ -1380,6 +1464,11 @@ fn analyze(
                     Some(expr)
                         if field_read_clause(program, expr).as_deref() == Some(&clause[..]) =>
                     {
+                        allowed_forwards.insert(*argument);
+                    }
+                    // B333: the callee's declared return, at the fourth
+                    // landing.
+                    _ if call_return_clause(program, *argument).as_deref() == Some(&clause[..]) => {
                         allowed_forwards.insert(*argument);
                     }
                     _ => {

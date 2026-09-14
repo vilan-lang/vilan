@@ -4612,6 +4612,129 @@ main();
     );
 }
 
+// B333, shape 1: the call's own type carries the clause its CALLEE DECLARED.
+// The pin above stays red because `make(): || void` promises nothing; this one
+// is the same program with the promise written, and it runs — the threading
+// follows the declaration, which is the only place a call's clause is stated.
+#[test]
+fn a_context_typed_binding_takes_a_call_whose_callee_declares_the_clause() {
+    assert_compiles_and_runs(
+        r#"
+import std::context::Context;
+import std::io::print;
+import std::display::Display;
+
+let current: Context<i32> = Context::new();
+
+fun read(): i32 {
+    current.get()
+}
+
+fun make(): (|| void) context current {
+    || { print(read().to_string()); }
+}
+
+fun main() {
+    let body: (|| void) context current = make();
+    current.run(1, || { body() });
+}
+main();
+        "#,
+        "1\n",
+    );
+}
+
+// B333, shape 1's control: a callee whose declared return carries a DIFFERENT
+// clause is refused, and the refusal names both — the call is a value with a
+// clause now, so it earns the mismatch message rather than the "takes a
+// closure literal" one.
+#[test]
+fn a_context_typed_binding_refuses_a_call_carrying_a_different_clause() {
+    assert_fails_with(
+        r#"
+import std::context::Context;
+
+let a_ctx: Context<i32> = Context::new();
+let b_ctx: Context<i32> = Context::new();
+
+fun read(): i32 {
+    b_ctx.get()
+}
+
+fun make(): (|| void) context b_ctx {
+    || { let n = read(); }
+}
+
+fun main() {
+    let body: (|| void) context a_ctx = make();
+    a_ctx.run(1, || { body() });
+}
+main();
+        "#,
+        "an injected closure forwards only to a position carrying the SAME `context` clause",
+    );
+}
+
+// B333, shape 2: an UNANNOTATED local closure binding adopts the clause of the
+// FIELD it lands in — the rule an argument binding has had since B309, at the
+// other landing. std's own route gate is the exhibit: `browser/ui.vl` writes
+// `let wire: (|| void) context owner_scope = || { .. };` and stores it into
+// `Swap`'s `wire` field, and the annotation was doing the work the landing can
+// do on its own.
+#[test]
+fn an_unannotated_closure_binding_adopts_the_clause_of_the_field_it_lands_in() {
+    assert_compiles_and_runs(
+        r#"
+import std::context::Context;
+import std::io::print;
+import std::display::Display;
+
+let current: Context<i32> = Context::new();
+
+struct Held {
+    body: (|| void) context current,
+}
+
+fun read(): i32 {
+    current.get()
+}
+
+fun main() {
+    let wire = || { print(read().to_string()); };
+    let held = Held { body = wire };
+    current.run(1, || { (held.body)() });
+}
+main();
+        "#,
+        "1\n",
+    );
+}
+
+// B333, shape 2's control: the adoption is for a binding with no clause of its
+// OWN. One that carries a different clause is still the mismatch.
+#[test]
+fn an_annotated_closure_binding_with_the_wrong_clause_is_still_refused_at_a_field() {
+    assert_fails_with(
+        r#"
+import std::context::Context;
+
+let a_ctx: Context<i32> = Context::new();
+let b_ctx: Context<i32> = Context::new();
+
+struct Held {
+    body: (|| void) context a_ctx,
+}
+
+fun main() {
+    let wire: (|| void) context b_ctx = || {};
+    let held = Held { body = wire };
+}
+main();
+        "#,
+        "an injected closure forwards only to a position carrying the SAME `context` clause",
+    );
+}
+
 // A clause parameter's argument must be a closure literal, a same-clause
 // value, or an adoptable local closure binding — anything else (here a call
 // result) cannot receive the threaded context (ledger row 220).
