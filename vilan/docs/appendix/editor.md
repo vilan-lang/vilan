@@ -177,7 +177,7 @@ sees it.
 
 ## Quick fixes
 
-Eleven, each attached to the diagnostic that earns it:
+Twelve, each attached to the diagnostic that earns it:
 
 | Action | Offered on |
 |---|---|
