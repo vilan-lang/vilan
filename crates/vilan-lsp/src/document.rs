@@ -16796,7 +16796,13 @@ fun main() {
         let nested = e152_workspace();
         for (label, (dir, document), expected) in [
             ("a single-file package", single, Vec::new()),
-            ("nested bodiless directories", nested, vec!["lib", "ui"]),
+            // B335: `lib` is NOT one of these — it has a body file
+            // (`lib/lib.vl`) and reports it. It used to appear here because a
+            // module reached first as the parent NAMESPACE of `lib::ui` kept
+            // the entry-attributed placeholder range its namespace node was
+            // minted with, even after its body loaded and adopted the node. The
+            // set is now exactly what the name says: directories with no body.
+            ("nested bodiless directories", nested, vec!["ui"]),
         ] {
             let program = document.program.as_ref().expect("program");
             let mut namespaces: Vec<&str> = Vec::new();
@@ -16868,13 +16874,20 @@ fun main() {
             "the namespace's first child's file: {landed:?}",
         );
         assert_eq!(span, Span::from(0..0), "line 1 — nothing there spells `ui`");
-        // And the namespace ABOVE it, `lib`, whose body this program never
-        // loaded, walks down through `ui` to the same file.
+        // B335: the module ABOVE it, `lib`, has a body file of its own and
+        // lands on IT. It used to land on `widget.vl` with `ui` — the module
+        // was reached first as the parent namespace of `lib::ui`, and the
+        // entry-attributed placeholder that mint left behind outlived the body
+        // that adopted the node, so `source_of` never said `lib/lib.vl`.
         let above = E152_ENTRY.find("::lib").expect("the `lib` segment") + 2;
-        assert_eq!(
-            document.definition(above),
-            Some((source, Span::from(0..0))),
-            "a namespace of namespaces still answers with a file",
+        let (above_source, above_span) = document
+            .definition(above)
+            .expect("a module segment has a definition");
+        assert_eq!(above_span, Span::from(0..0));
+        let above_landed = program.canonical_sources[above_source.0 as usize].clone();
+        assert!(
+            above_landed.ends_with("lib/lib.vl"),
+            "`lib` has a body and go-to-definition lands in it: {above_landed:?}",
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -16887,11 +16900,11 @@ fun main() {
             document.hover(offset).as_deref(),
             Some("```vilan\nnamespace ui\n```\n\nHolds `widget`."),
         );
+        // B335: `lib` has a body file, so it hovers as the MODULE it is — it
+        // read as a namespace only because the entry-attributed placeholder
+        // from its namespace mint outlived the body that adopted the node.
         let above = E152_ENTRY.find("::lib").expect("the `lib` segment") + 2;
-        assert_eq!(
-            document.hover(above).as_deref(),
-            Some("```vilan\nnamespace lib\n```\n\nHolds `ui`."),
-        );
+        assert_eq!(document.hover(above).as_deref(), Some("module lib"),);
         // A module with a file of its own is unmoved: it has a declaration,
         // and `namespace` is not what it is.
         let leaf = E152_ENTRY.find("::widget").expect("the `widget` segment") + 2;
