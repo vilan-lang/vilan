@@ -460,7 +460,7 @@ row	flagship	key
 428	-	`[rpc]` method `{method_name}` takes a name the `[service]` expansion generates on `{owner}`
 429	-	`[rpc]` method `{method_name}` returns a keyed handle whose key `{rendered}` is {missing}: the client names the key in every keyed `Subscribe`, each `Delta` the channel forwards carries it, and the mirror indexes by it
 430	-	'{member_name}' is declared by two blanket impls whose bounds OVERLAP{elsewhere}: a type satisfying both clauses matches both impls, and an inherent member is taken from the first matching impl without ranking. Narrow one bound so the two are disjoint, or declare '{member_name}' on a trait
-431	-	`{name}` is ambiguous in module `{module_name}`: `{module_name}` declares `{name}`, and its directory holds a `{name}.vl` that is the module `{module_name}::{name}` — the declaration wins, so the file cannot be reached by any import; rename one of them
+431	-	`{name}` is ambiguous in module `{module_name}`: `{module_name}` declares `{name}`, and its directory holds a `{child}` that is the module `{module_name}::{name}` — the declaration wins, so the module cannot be reached by any import; rename one of them
 432	-	`{type}::{member}` takes `self` — a method is called on a value, not imported
 433	-	this value carries `{found}` and this {position} demands `{expected}`: an injected closure forwards only to a position carrying the SAME `context` clause
 434	-	`[derive({derive})]` needs std's `{module}`, and the std this package resolves to does not carry one
