@@ -5489,6 +5489,7 @@ impl<'src> Transformer<'src> {
                                 parameters: Vec::new(),
                                 body: thunk_block,
                                 is_async: false,
+                                origin: None,
                             }),
                         ],
                     )
@@ -6768,6 +6769,7 @@ impl<'src> Transformer<'src> {
                     parameters: Vec::new(),
                     body,
                     is_async: false,
+                    origin: None,
                 }),
             ],
         ))
