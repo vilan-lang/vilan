@@ -124,6 +124,38 @@ body becomes the program's top-level statements, so the parameter was a
 free name and the program died at its first use.)
 → [Process modules](../std/process.md)
 
+**"`pkg::a::hidden` is not exported by `pkg::a` …"** — a WARNING
+A plain import of an item the declaring module keeps to itself. It still
+compiles — visibility never blocks access — and the message names the
+spelling that says you meant it: `import pkg::a::{ #hidden };`, the
+**reach** marker. Two ways out, and neither is "work around it": mark the
+reach, or export the item if it is yours to export. The same warning
+fires at a *qualified* reach — `a::hidden()` after `import pkg::a;` —
+where there is no leaf to mark, and there the fix is to import the item
+with the marker and call it bare. Reaching a **dependency's** unexported
+item says nothing at all: whether an item should be exported is its
+author's judgement, and your need is evidence against it. The mirror
+image is a warning too — a `#` on an item that IS exported says something
+untrue, and deleting the character is the whole fix.
+→ [spec §4.8](../spec/names.md)
+
+**"`my_fun` is exported, but `S` is not …"** — a WARNING
+An exported item whose signature names a type the module keeps private: a
+consumer can call `my_fun` and cannot name what it hands back. The
+sentence ahead of that one names the position — "`S` is returned here",
+"`S` is a field's type here", "`S` is a parameter type here", "`S` is a
+declared bound here" — and the one after it says what the consumer loses.
+It is
+reported once at the declaration, whatever the number of positions, and
+only for signature positions — a `let`'s type, a parameter, a return
+type, an exported struct's field types, an enum variant's payloads, a
+declared bound, a generic argument in any of those. A private type used
+inside an exported function's **body** is exactly the encapsulation the
+marker exists to permit and is never reported. The fix is to export the
+type; when `S` belongs to a dependency there is no fix and the message
+says so — the shape has to change, or the dependency has to export it.
+→ [spec §4.8](../spec/names.md)
+
 ## Types and generics
 
 **"Expected …, but got … instead."**
@@ -1001,10 +1033,15 @@ program nobody wrote. The marker vilan does have is **`export`**: write
 own — completion does not offer it, the add-import fix does not propose
 it, and a plain import of it from another file of the same package warns
 — but it is never *blocked*: an importer who needs it anyway writes the
-reach, `import pkg::util::{ #helper };`. `export` also *re-exports*
-something this module imported (`export import pkg::io::panic;`), so
-importers of this module see that name as if it were declared here.
-→ [spec §4.3](../spec/names.md)
+reach, `import pkg::util::{ #helper };`. There is no second marker to
+learn: the default IS private, `export *;` marks a whole module at once,
+and `export(in mod)` / `export(in pkg)` narrow one item. `export` also
+*re-exports* something this module imported
+(`export import pkg::io::panic;`), so importers of this module see that
+name as if it were declared here. Unlike `pub`, it goes ahead of the
+attributes as well as the keyword — `export [derive(Wire)] struct Handle`
+— because it wraps the whole declaration.
+→ [spec §4.8](../spec/names.md)
 
 **"a mutable binding is spelled `mut x = …` …"**
 `let mut x = 1` is the Rust spelling. `let` and `mut` are vilan's two

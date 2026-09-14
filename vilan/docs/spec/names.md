@@ -45,6 +45,16 @@ above) has nothing to load and costs nothing. Emission is unaffected: it
 follows reachability, so a parent body nothing references contributes no
 output.
 
+**What a parent DOES contribute is its `impl` blocks.** Items are reached
+by a module's own path and nothing below it; implementations are not
+items, and a plain `import pkg::a::b;` admits every block declared along
+the path — `a`'s as well as `a::b`'s. So an extension impl written in a
+directory's body arrives in any file that imports a module beneath it,
+without that file naming `a`, and `a.vl` is the place to put one that
+every child's importer should have. `only` declines them all and an impl
+selector takes the blocks it names (§4.3); a block the declaring module
+does not `export` is not admitted at all (§4.8).
+
 ## 4.2 The three namespaces
 
 A path's first segment selects a namespace:
@@ -153,21 +163,9 @@ path, and the difference is only that `use` loads nothing, the type being
 in scope already. `export statement` re-exports: importers of this module
 see the exported names as if declared here.
 
-**Visibility.** `export` before a declaration marks it as this module's
-surface; an unmarked top-level item is the module's own. `export *;` at a
-module's top level marks every item of that module, and
-`export(in PATH)` narrows one — `export(in mod)` keeps an item private
-under an `export *;`, `export(in pkg)` publishes to the item's own
-package. The bit is consulted by completion, by the add-import fix and by
-the "import it first" steer, and by nothing in resolution: **visibility
-never blocks access.** A plain `import pkg::a::hidden;` of an unmarked
-item warns and names the marked spelling; `import pkg::a::{ #hidden };`
-is that spelling, and says "I know this is not exported and I want it
-anyway". Reaching a *dependency's* unmarked item is no diagnostic at all
-— whether an item should be exported is its author's judgement, and a
-consumer's need is evidence against it. An exported item whose signature
-names an unmarked type warns too: a consumer can call it and cannot name
-what it takes or returns.
+**Visibility** is §4.8. In an import path it shows up as one token: `#`
+before a leaf is the **reach** marker, `import pkg::a::{ #hidden };`,
+which takes an item the module does not export and says so.
 
 Platform gating is not checked at the import: a module outside the
 current platform's layers (e.g. `std::ui` in a Node build) still loads,
@@ -259,10 +257,31 @@ variants, the static functions of the type's impls (those without `self`),
 and the type's own `self`-methods. Generic statics take their arguments at
 the path head: `List<str>::new()`.
 
-A type has **one** namespace, and receiver position is not part of a
-name. Two impls of one type declaring the same name — two statics, two
-methods, or one of each — are a compile error at the declaration, since
-nothing ranks them and one would simply never be reachable.
+A type has **one namespace per importing file**, and receiver position is
+not part of a name. The namespace is the union of the `impl` blocks that
+file's own import statements admit (§4.3): a plain `import a::b;` admits
+every block declared in `a`'s file and in every file on the path to it,
+`import a::b only;` admits none, and
+`import a::{ (impl T) }` admits exactly the blocks whose subject unifies
+with `T`.
+
+Two impls declaring the same name for one subject — two statics, two
+methods, or one of each — are refused, and *where* depends on how far
+apart they are declared:
+
+- **In one module**, at the declaration. Nothing ranks them and one would
+  simply never be reachable, so the file that writes both is told so.
+- **In two modules**, at the **import**, spanned on the second import
+  statement and naming both blocks. Each module stays importable on its
+  own; it is the file that takes both that has to choose. The fix is an
+  impl selector, which is why the refusal is reported where selectors are
+  written: `import pkg::z::{ (impl Thing)::tag };` takes one member from
+  one block and leaves the other module's alone.
+
+That is what lets two independent extension modules declare the same
+method for the same type and both ship: a file that never imports both
+never sees a conflict, and the refusal is a fact about the FILE's imports
+rather than about the order modules happened to load in.
 
 It is also the **whole** namespace of the path that names it: `Type::`
 replaces what the rest of the path resolves against rather than adding to
@@ -322,6 +341,14 @@ provider to use, and works on a concrete receiver or a trait-bounded
 generic one. `Type::member(receiver, args…)` means the type's own member
 or nothing.
 
+The **impl selector** is the other disambiguator, and it answers a
+different question: `Trait::member` picks between two providers both of
+which the file can see, while a selector decides which blocks the file
+sees at all. A file that would otherwise take one name from two modules
+writes `import pkg::z::{ (impl Thing)::tag };` and the rest of `z`'s
+blocks stay out of its namespace. Both spellings are per file, and
+neither changes what any other file resolves.
+
 ## 4.7 The prelude
 
 Two sets of names are in scope without imports.
@@ -375,3 +402,65 @@ the module and qualifying through it — `import std::io;` then
 
 The standard library itself declares `prelude = false`, so its own
 resolution stays greppable.
+
+## 4.8 Visibility
+
+Every top-level item carries one bit: **exported**, or the module's own.
+The default is the module's own — a declaration with no marker is
+private.
+
+**The four forms.**
+
+| form | means |
+|---|---|
+| `export fun helper()` | this item is the module's surface. Any declaration takes it: `fun`, `struct`, `enum`, `trait`, `impl`, a module-level `let`, a `macro`, a `mod` block |
+| `export *;` | every item of this module is exported. One bare statement at the module's top level; `vilan fmt` puts it just below the file's leading import run |
+| `export(in PATH) item` | narrower than `export`. `export(in mod)` keeps one item private under an `export *;`; `export(in pkg)` publishes it to its own package and no further |
+| `export import pkg::io::print;` | a **re-export**: importers of this module see `print` as if it were declared here. This is how a prelude module is written (§4.7) |
+
+`export` on an `impl` block means what it means on every other
+declaration. A block a consumer cannot see contributes **no methods** to
+that consumer — not even as an ambient impl arriving along a path — so a
+curated module writes `export impl Thing { … }` for the blocks it means
+to publish. A module with no marker anywhere is **uncurated** and offers
+everything, which is what keeps a package that has never thought about
+visibility compiling exactly as it did.
+
+**Visibility never blocks access.** The bit is consulted by completion,
+by the add-import fix, by the "import it first" steer and by the
+per-importer method namespace (§4.6) — and by nothing in name resolution.
+An importer who needs a private item writes the **reach**:
+
+```text
+import pkg::util::{ #helper };     // "not exported, and I want it anyway"
+```
+
+A plain `import pkg::util::helper;` of an unexported item still compiles
+and **warns**, naming the marked spelling; so does a qualified reach
+through the module (`util::helper()` after `import pkg::util;`), which
+has no leaf to mark. The reach marker on an item that IS exported warns
+the other way — it says something about the author's belief that is not
+true — and the fix is to delete one character.
+
+Reaching a **dependency's** unexported item is no diagnostic at all, at
+any release. Whether an item should be exported is its author's
+judgement, and a consumer's need is real evidence against it; the marker
+is available there too and says the same thing, but nothing asks for it.
+
+**The second warning is about signatures.** An exported item whose
+signature names an unexported type is reported once at the declaration:
+
+> `S` is returned here. `my_fun` is exported, but `S` is not. A consumer
+> can call `my_fun` but cannot name the return type.
+
+Its reach is the signature positions and only those — a module-level
+`let`'s type, a parameter type, a return type, an exported struct's field
+types, an exported enum's variant payloads, a declared bound, and a
+generic argument in any of them. A private type used inside an exported
+function's **body** is exactly the encapsulation the bit exists to
+permit, and is never reported. The fix is to export the type; when the
+type belongs to a dependency there is no fix, and the message says so.
+
+The standard library is curated: its modules export what they publish and
+keep their own machinery private, which is why `vilan check` on a program
+that reaches into std's internals tells you so.

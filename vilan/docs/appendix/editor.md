@@ -133,6 +133,15 @@ Where the cursor is decides what is offered.
   ordinary answers come back.
 - **Inside a string or a comment** nothing is offered. A caption is text, not
   code, and a `.` in one is not a member access.
+- **Visibility filters the list, once the module has an opinion.** A module
+  that carries `export` anywhere is *curated*, and completion offers only
+  what it exports — the same filter the add-import fix and the "import it
+  first" steer use. A module with **no marker anywhere** is uncurated and
+  offers everything, so a package that has never thought about visibility
+  is unchanged. The filter is presentation only: nothing here blocks a
+  name, and an importer who wants a private item writes the reach
+  (`import pkg::a::{ #helper };`) and gets it. std is curated, which is why
+  `std::rpc::` offers its surface rather than its dispatcher internals.
 - **Inside a `css` block** the vocabulary is CSS, and nothing in scope is
   offered at all. An undotted item completes **property names** — every slot
   a `Style` method writes, so the list is std's own surface rather than an
@@ -196,7 +205,7 @@ and two source actions:
 
 | Action | Does |
 |---|---|
-| **Organize Imports** | sorts each top-level import run into canonical order (the same key `vilan fmt` uses), prunes unused leaves (shrinking a brace set rather than deleting it), and strips imports the prelude already covers. A statement whose every leaf is unused is *rewritten* rather than deleted when the module's file is where an `impl` the code calls a method from lives — `impl`s travel with any import that reaches the module, so deleting the statement would break the build. The rewrite is the narrowest statement that keeps it: an impl SELECTOR (`import pkg::a::b;` becomes `import pkg::a::{ (impl Style) };`) when everything the file uses from that module is one subject's blocks, and the bare module import (`import pkg::a;`) when it is not. A selector is a leaf like any other: one whose implementation the file never calls a method from fades and prunes, one it does use stays. Offered only when it would change something |
+| **Organize Imports** | sorts each top-level import run into canonical order (the same key `vilan fmt` uses), prunes unused leaves (shrinking a brace set rather than deleting it), and strips imports the prelude already covers. A statement whose every leaf is unused is *rewritten* rather than deleted when the module's file is where an `impl` the code calls a method from lives — `impl`s travel with any import that reaches the module, so deleting the statement would break the build. The rewrite is the narrowest statement that keeps it: an impl SELECTOR (`import pkg::a::b;` becomes `import pkg::a::{ (impl Style) };`) when everything the file uses from that module is one subject's blocks, and the bare module import (`import pkg::a;`) when it is not. A selector is a leaf like any other: one whose implementation the file never calls a method from fades and prunes, one it does use stays. Visibility spellings are preserved verbatim, never rewritten: a reach marker (`#helper`) stays on its leaf, a trailing `only` stays on its statement, and a selector keeps the type it was written with. The module-level `export *;` is not an import and does not move — a NEW leading import is inserted above it, so the marker keeps the slot `vilan fmt` gives it, just below the file's import run. Offered only when it would change something |
 | **Add All Missing Imports** | applies every unambiguous import quickfix in the file at once, skipping the ambiguous ones |
 
 An import the **prelude** covers is stripped for the same reason an unused
