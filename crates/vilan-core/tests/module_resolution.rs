@@ -6645,3 +6645,99 @@ fn b318_an_uncurated_module_still_offers_every_impl() {
         "an uncurated module offers everything: {diagnostics:?}"
     );
 }
+
+/// E178 — the `Program` surface vilan-ide's fourth completion consumer reads,
+/// held to `module_importables`' answer.
+///
+/// `auto_import_completions` runs OUTSIDE `owned_modules::collecting()`, so
+/// asking `module_importables` there parses every open buffer into the
+/// process-global cache once per keystroke. The analyzer has already decided
+/// this while walking, and `Program::exported_entities` / `curated_modules`
+/// carry the decision instead. The pin is the AGREEMENT: for a curated module
+/// and an uncurated one, the predicate the two fields spell —
+/// `exported_entities.contains(id) || !curated_modules.contains(scope)` —
+/// answers what the row's own bit says.
+#[test]
+fn e178_the_program_visibility_fields_agree_with_module_importables() {
+    use vilan_core::analyzer::module_importables;
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir =
+        std::env::temp_dir().join(format!("vilan_modres_e178_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let files = [
+        (
+            "curated.vl",
+            "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n",
+        ),
+        ("wide.vl", "export *;\n\nfun opened(): i32 { 3 }\n"),
+        ("plain.vl", "fun offered(): i32 { 4 }\n"),
+        (
+            "app.vl",
+            "import pkg::curated::shown;\nimport pkg::wide::opened;\nimport pkg::plain::offered;\n\n\
+             fun main() {\n\tlet _ = shown() + opened() + offered();\n}\n",
+        ),
+    ];
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join("app.vl");
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, _errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(Platform::default()),
+        &Workspace::default(),
+    );
+    let program = program.expect("the package analyzes");
+
+    // Asked the way `AutoImportOrder::build` asks it: walk each module's BODY
+    // SCOPE, which is the handle that consumer already holds, and read the name
+    // out of it.
+    let offered = |module_name: &str, name: &str| -> bool {
+        let (_, module) = program
+            .modules
+            .iter()
+            .find(|(_, module)| module.name == module_name)
+            .unwrap_or_else(|| panic!("no module {module_name}"));
+        let scope = program
+            .scopes
+            .get(&module.body.1)
+            .unwrap_or_else(|| panic!("no scope for {module_name}"));
+        let id = scope
+            .name_to_id_map
+            .get(name)
+            .unwrap_or_else(|| panic!("no `{name}` in {module_name}"));
+        program.exported_entities.contains(id) || !program.curated_modules.contains(&module.body.1)
+    };
+    for (module, name, expected) in [
+        ("curated", "shown", true),
+        ("curated", "hidden", false),
+        ("wide", "opened", true),
+        ("plain", "offered", true),
+    ] {
+        let rows = module_importables(&dir.join(format!("{module}.vl")));
+        let row = rows
+            .iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("no row for {name}"));
+        let by_source =
+            row.exported.is_exported() || !vilan_core::analyzer::module_is_curated(&rows);
+        assert_eq!(
+            by_source, expected,
+            "`module_importables` should offer `{name}`: {expected}"
+        );
+        assert_eq!(
+            offered(module, name),
+            expected,
+            "`Program`'s answer for `{name}` must match `module_importables`'"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -48121,6 +48121,25 @@ pub struct Program<'src> {
     /// them. Keyed by the block's own entity id. Empty for an uncurated module
     /// and therefore for the whole estate.
     pub hidden_impls: HashSet<Id>,
+    /// B318 (E178) — every top-level declaration a CURATED module publishes:
+    /// marked `export`, `export(in PATH)`, or covered by its module's
+    /// `export *;`.
+    ///
+    /// Here for vilan-ide's completion filters. Their other route,
+    /// [`module_importables`], parses the module's file into the process-global
+    /// cache, which is free inside `owned_modules::collecting()` and a
+    /// per-keystroke leak outside it — `auto_import_completions` runs outside.
+    /// The analyzer has already answered this while walking; the answer travels
+    /// rather than being recomputed from source.
+    pub exported_entities: HashSet<Id>,
+    /// B318 (E178) — the module BODY SCOPES that carry any `export` marker at
+    /// all: the uncurated-module exemption's complement, and the other half of
+    /// the predicate [`exported_entities`](Self::exported_entities) serves.
+    ///
+    /// Read together: a name is offered when `exported_entities` holds it OR
+    /// its module's scope is absent here, which is `Analyzer::is_exported_in`
+    /// exactly — a module that has curated nothing offers everything.
+    pub curated_modules: HashSet<Id>,
     /// Every generic parameter's bound list, by constraint type id — a
     /// multi-bound's entries, where a single bound is the constraint id
     /// itself. Carried out of the analyzer because the specificity order
@@ -57122,8 +57141,28 @@ fn analyze_over_world<'src>(
         .map(|implementation| implementation.impl_id)
         .collect();
 
+    // B318 (E178): the visibility answers the walk already has, for vilan-ide's
+    // completion filters. `export *;` marks the MODULE rather than each of its
+    // names, so the module-wide form is resolved onto its own declarations here
+    // — the consumer asks about a name, and the name is what has to answer.
+    let declaring_scopes = analyzer.module_declaration_scopes();
+    let exported_entities: HashSet<Id> = analyzer
+        .exported_entities
+        .keys()
+        .copied()
+        .chain(
+            declaring_scopes
+                .iter()
+                .filter(|(_, (scope, _))| analyzer.export_all_modules.contains(scope))
+                .map(|(id, _)| *id),
+        )
+        .collect();
+    let curated_modules = analyzer.curated_modules.clone();
+
     Some(Program {
         hidden_impls,
+        exported_entities,
+        curated_modules,
         platform,
         closures: analyzer.closures,
         diagnostics: analyzer.diagnostics,
