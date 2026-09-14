@@ -23,6 +23,17 @@ use crate::transformer;
 use crate::type_::{Type, TypeId};
 use sha2::{Digest, Sha256};
 
+/// G24's R2 steer on the RUNTIME-BINDING refusal, as its own constant: the
+/// analyzer writes it and the editor's "Declare it `const let`" quick fix
+/// reads it, so the two cannot drift into disagreeing about which diagnostic
+/// the fix belongs to (the `REACH_IS_UNMARKED` discipline).
+pub const CONST_LET_STEER_RUNTIME: &str = "to make it compile-time-known";
+
+/// Its twin on the PLAIN-DATA refusal, at a `let x = const ..` whose result is
+/// a closure.
+pub const CONST_LET_STEER_CLOSURE: &str =
+    "A compile-time CLOSURE is spelled as a declaration: write";
+
 /// The budgets the EXPLICIT form evaluates under (const-eval.md §9.3). A miss
 /// here is a diagnostic (§4's "did not finish within the compile-time budget"),
 /// so the user can see it and act — which is what lets them be generous.
@@ -829,6 +840,10 @@ pub struct Evaluated {
     /// program asked — the provenance `vilan build --explain` reads (G11).
     /// Nothing consumes it during a build; see [`ConstFact`].
     pub facts: Vec<ConstFact>,
+    /// G24: the const world's generated name for every entity it named — what
+    /// the emitter resolves a closure snapshot's name-keyed captures through.
+    /// Empty when nothing was evaluated.
+    pub snapshot_bindings: HashMap<String, Id>,
 }
 
 pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) -> Evaluated {
@@ -848,6 +863,7 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
             input_files: Vec::new(),
             bundled: Vec::new(),
             facts: Vec::new(),
+            snapshot_bindings: HashMap::default(),
         };
     }
     let reader = ProjectReader {
@@ -865,6 +881,10 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
     let mut world = transformer::ConstWorld::new(program, options);
     let mut state = State::new(program, Mode::Explicit, HashSet::default(), Some(&reader));
     state.check_const_only(graph);
+    // G24: the `const fun` promise, checked at each declaration before any
+    // site is evaluated — so a body that cannot fold is reported where it was
+    // promised rather than at the first call that tried.
+    state.check_const_functions(graph);
     for &expr_id in &program.const_exprs {
         state.evaluate_one(&mut world, expr_id);
     }
@@ -889,11 +909,15 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
     inputs.sort();
     inputs.dedup();
     let facts = reader.facts.into_inner();
+    // G24: taken AFTER evaluation, so every name the world minted for a
+    // snapshot's captures is in it.
+    let snapshot_bindings = world.emitted_binding_names();
     Evaluated {
         results,
         assets,
         errors,
         facts,
+        snapshot_bindings,
         input_files: inputs,
         // Insertion order, NOT sorted: a build log that names the files in the
         // order the program asked for them reads as the program does, and the
@@ -953,6 +977,13 @@ fn live_tokens_of(results: &HashMap<Id, interpreter::ConstValue>) -> Liveness {
                 // A separator no token can span, so a token is never found
                 // straddling two unrelated results.
                 into.text.push('\u{1}');
+            }
+            // G24: a snapshot's own body is code, not a token source; its
+            // CAPTURES are values like any other and are walked.
+            interpreter::ConstValue::Callable { captures, .. } => {
+                for (_, value) in captures {
+                    collect(value, into);
+                }
             }
             interpreter::ConstValue::Array(items) | interpreter::ConstValue::Set(items) => {
                 for item in items {
@@ -1698,13 +1729,14 @@ impl<'p, 'src> State<'p, 'src> {
                     }
                 }
                 Known::Runtime(name) => {
+                    let steer = self.declare_it_const_steer(binding);
                     let error = Error {
                         trace: Vec::new(),
                         note: None,
                         span: self.span_of(reference_id),
                         msg: format!(
                             "`{name}` is a runtime value; a `const` expression reads only \
-                             compile-time-known bindings"
+                             compile-time-known bindings{steer}"
                         ),
                     };
                     self.report(reference_id, error);
@@ -1776,7 +1808,13 @@ impl<'p, 'src> State<'p, 'src> {
                     let reader = self
                         .reader
                         .map(|reader| reader as &dyn interpreter::AssetReader);
-                    let evaluated = interpreter::eval_const(&site, EXPLICIT_LIMITS, reader);
+                    // G24: only a `const let` binding's initializer may
+                    // evaluate to a closure (`const-eval.md` §11). Every other
+                    // const site keeps §1's plain-data rule, and its refusal
+                    // now steers to the declaration that admits one.
+                    let snapshots = self.program.const_let_initializers.contains(&expr_id);
+                    let evaluated =
+                        interpreter::eval_const(&site, EXPLICIT_LIMITS, snapshots, reader);
                     phase_add(&PHASE_INTERP, interp_started);
                     match evaluated {
                         Ok(outcome) => {
@@ -1833,6 +1871,147 @@ impl<'p, 'src> State<'p, 'src> {
                     }
                 }
             };
+        }
+    }
+
+    /// **G24 — the `const fun` declaration gate.** A `const fun` PROMISES its
+    /// body is const-evaluable, and the point of the promise is that it is
+    /// checked where it is made: at the declaration, spanned on the name,
+    /// naming the capability — not at whichever distant `const` site first
+    /// tried to fold a call to it and reported a failure the reader has to
+    /// trace back.
+    ///
+    /// What disqualifies a body is what disqualifies any const evaluation: a
+    /// HOST BINDING (an `[extern]` — `fetch`, the DOM, `console` by another
+    /// name), or one of the five IMPURE intrinsics the const interpreter
+    /// deliberately has no answer for (`scan`, `args`, `env`, the two
+    /// randoms). Both are read off the CALL GRAPH, transitively, so a body
+    /// that reaches one three calls down is refused at its own declaration and
+    /// each `const fun` on the path is told what it reaches.
+    ///
+    /// NOT a colouring requirement (`const-eval.md` §1's Zig-shaped rule
+    /// stands): a plain `fun` is still const-callable, and a `const fun` is
+    /// still an ordinary function at runtime with runtime arguments. This is
+    /// the opt-in guarantee, and this is where it is kept.
+    fn check_const_functions(&mut self, graph: &CallGraph) {
+        if self.program.const_functions.is_empty() {
+            return;
+        }
+        // Reachability over the graph, memoized: the first capability each
+        // node reaches, by the entity that names it. First-in wins — the
+        // message names ONE capability, and the walk is deterministic because
+        // `calls_of` is in source order.
+        let mut reaches: HashMap<Id, Option<Id>> = HashMap::default();
+        let mut declarations: Vec<Id> = self.program.const_functions.iter().copied().collect();
+        declarations.sort_by_key(|id| id.0);
+        for function_id in declarations {
+            let mut visiting: HashSet<Id> = HashSet::default();
+            let Some(capability) =
+                self.capability_reached(graph, function_id, &mut reaches, &mut visiting)
+            else {
+                continue;
+            };
+            let Some(function) = self.program.functions.get(&function_id) else {
+                continue;
+            };
+            let name = function.name;
+            let capability_label = self.capability_label(capability);
+            self.errors.push((
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: function.name_span,
+                    msg: format!(
+                        "`{name}` is declared `const fun`, but its body reaches \
+                         {capability_label}, which has no compile-time answer: a `const fun` \
+                         promises its body is const-evaluable, and that promise is checked \
+                         here rather than at a call site. Drop the `const` to keep an \
+                         ordinary function, or move the capability out of the body"
+                    ),
+                },
+                self.source_of(function_id),
+            ));
+        }
+    }
+
+    /// The first compile-time-impossible capability `node` reaches, by the
+    /// entity that names it — itself when `node` IS one. Memoized across the
+    /// declarations, and cycle-safe (a recursive body answers `None` on the
+    /// re-entry and the outer frame's own findings still stand).
+    fn capability_reached(
+        &self,
+        graph: &CallGraph,
+        node: Id,
+        reaches: &mut HashMap<Id, Option<Id>>,
+        visiting: &mut HashSet<Id>,
+    ) -> Option<Id> {
+        if let Some(answer) = reaches.get(&node) {
+            return *answer;
+        }
+        if !visiting.insert(node) {
+            return None;
+        }
+        let mut answer = None;
+        for call in graph.calls_of(node) {
+            match call.target {
+                CallTarget::External(target) => {
+                    if self.is_compile_time_impossible(target) {
+                        answer = Some(target);
+                        break;
+                    }
+                }
+                CallTarget::Function(target) | CallTarget::Closure(target) => {
+                    if let Some(found) = self.capability_reached(graph, target, reaches, visiting) {
+                        answer = Some(found);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        visiting.remove(&node);
+        reaches.insert(node, answer);
+        answer
+    }
+
+    /// Whether this external is one the const interpreter cannot answer: a
+    /// host binding, or one of the five impure intrinsics it closes off.
+    fn is_compile_time_impossible(&self, target: Id) -> bool {
+        if self
+            .program
+            .external_functions
+            .get(&target)
+            .is_some_and(|external| external.extern_binding.is_some())
+        {
+            return true;
+        }
+        matches!(
+            self.program.intrinsics.get(&target),
+            Some(
+                crate::analyzer::Intrinsic::Scan
+                    | crate::analyzer::Intrinsic::Args
+                    | crate::analyzer::Intrinsic::Env
+                    | crate::analyzer::Intrinsic::RandomInt
+                    | crate::analyzer::Intrinsic::RandomFloat
+            )
+        )
+    }
+
+    /// How a capability names itself in the `const fun` refusal: its host
+    /// SYMBOL where it has one (`fetch`, not the vilan wrapper's name), and
+    /// its declared name otherwise.
+    fn capability_label(&self, capability: Id) -> String {
+        let external = self.program.external_functions.get(&capability);
+        let symbol = external.and_then(|external| match &external.extern_binding {
+            Some(crate::node::ExternBinding::Function { symbol, .. }) => Some(symbol.to_string()),
+            _ => None,
+        });
+        match symbol {
+            Some(symbol) => format!("the host binding `{symbol}`"),
+            None => match external.map(|external| external.name) {
+                Some(name) => format!("`{name}`"),
+                None => "a runtime capability".to_string(),
+            },
         }
     }
 
@@ -1905,7 +2084,8 @@ impl<'p, 'src> State<'p, 'src> {
             .reader
             .map(|reader| reader as &dyn interpreter::AssetReader);
         let interp_started = crate::PhaseClock::now();
-        let evaluated = interpreter::eval_const(&site, EXPLICIT_LIMITS, reader);
+        // A finaliser's result is discarded, so it never needs a snapshot.
+        let evaluated = interpreter::eval_const(&site, EXPLICIT_LIMITS, false, reader);
         phase_add(&PHASE_INTERP, interp_started);
         match evaluated {
             Ok(outcome) => {
@@ -2447,8 +2627,68 @@ impl<'p, 'src> State<'p, 'src> {
             trace: Vec::new(),
             note,
             span: self.span_of(expr_id),
-            msg: format!("{headline}{subject}: {}", failure.message),
+            msg: format!(
+                "{headline}{subject}: {}{}",
+                failure.message,
+                self.const_let_steer(expr_id, &failure.message)
+            ),
         }
+    }
+
+    /// **G24's R2 steer, on the runtime-binding refusal.** A `const` expression
+    /// reading a plain `let` is refused, correctly — and where that `let` is an
+    /// immutable binding with an initializer, the fix is one keyword, so the
+    /// refusal says which. Silent for a parameter, a `mut`, or a binding with
+    /// no initializer, where `const let` is not the answer and an impossible
+    /// steer is worse than none (B83).
+    fn declare_it_const_steer(&self, binding: Id) -> String {
+        let Some(variable) = self.program.variables.get(&binding) else {
+            return String::new();
+        };
+        if variable.mutable || variable.initial.is_none() {
+            return String::new();
+        }
+        format!(
+            ". Declare it `const let {} = ..;` {CONST_LET_STEER_RUNTIME} — the build \
+             computes it, and a closure over plain data is admitted there \
+             (`const-eval.md` §11)",
+            variable.name
+        )
+    }
+
+    /// **G24's R2 steer, on the plain-data refusal.** "a `const` result must be
+    /// plain data; this evaluates to a closure" is true and, at a `let x =
+    /// const ..`, unhelpful: the author wanted a compile-time closure, the
+    /// language now has one, and the only thing between them is which keyword
+    /// the declaration carries. So the refusal names it — and names the
+    /// binding, so the steer is the line to write and not a shape to derive.
+    ///
+    /// Only at a BINDING's initializer, because that is the only place the
+    /// replacement declaration exists: a `const` result in an argument or a
+    /// tail has no `let` to promote.
+    fn const_let_steer(&self, expr_id: Id, message: &str) -> String {
+        if !message.contains("evaluates to a closure") {
+            return String::new();
+        }
+        let Some(name) = self.binding_initialized_by(expr_id) else {
+            return String::new();
+        };
+        format!(
+            ". {CONST_LET_STEER_CLOSURE} \
+             `const let {name} = ..;` — a `const let` admits a closure over plain \
+             data (`const-eval.md` §11), and every later `const` expression can \
+             call it"
+        )
+    }
+
+    /// The name of the immutable binding `expr_id` initializes, if it is one —
+    /// what both of G24's steers are written against.
+    fn binding_initialized_by(&self, expr_id: Id) -> Option<&'src str> {
+        self.program
+            .variables
+            .values()
+            .find(|variable| variable.initial == Some(expr_id) && !variable.mutable)
+            .map(|variable| variable.name)
     }
 
     /// The file an anchor entity's span indexes into — the file its diagnostic

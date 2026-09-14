@@ -21,6 +21,7 @@ mod backed_enums;
 mod borrows;
 mod bounds;
 mod callable;
+mod const_eval;
 mod generics;
 mod hmr;
 mod iterators;

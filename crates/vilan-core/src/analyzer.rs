@@ -4268,6 +4268,18 @@ pub struct Analyzer<'src> {
     // `const`-marked expression ids, in walk order (innermost-first for
     // nesting) — the const pass's worklist.
     const_exprs: Vec<Id>,
+    /// G24: the INITIALIZER expression of every `const let NAME = EXPR;`, a
+    /// subset of `const_exprs`. The binding is an ordinary `let` whose value
+    /// the build computes; what the marker adds over `let x = const e` is the
+    /// CLOSURE admission (`const-eval.md` §11: plain data, or a closure over
+    /// plain data), and this set is what tells the two forms apart at the
+    /// result check — and what the steer on the other form points at.
+    const_let_initializers: HashSet<Id>,
+    /// G24: every `const fun` declaration, by function entity id. The body is
+    /// run through the const capability check AT THE DECLARATION rather than
+    /// at a distant call site; the function is otherwise an ordinary `fun`,
+    /// callable at runtime with runtime arguments.
+    const_functions: HashSet<Id>,
     // The phase-1 walk's recursion depth against `WALK_DEPTH_LIMIT` (B138),
     // and whether the bound already refused once — one diagnostic per
     // analysis, not one per refused sibling subtree.
@@ -4606,9 +4618,15 @@ fn item_visibility<'a, 'src>(item: &'a Spanned<Node<'src>>) -> (Visibility<'src>
                 };
                 node = &inner.0;
             }
+            // G24: `const let` / `const fun` is an ITEM under a marker, exactly
+            // as `export` is — so a module's importable rows name it and the
+            // completion filter offers it. A `const` over a plain EXPRESSION
+            // peels to the expression, which names no item and is skipped by
+            // the row builder like any other statement.
             Node::Derive(_, inner)
             | Node::Service(_, inner)
-            | Node::MacroAttribute(_, _, _, inner) => node = &inner.0,
+            | Node::MacroAttribute(_, _, _, inner)
+            | Node::Const(inner) => node = &inner.0,
             _ => return (visibility, node),
         }
     }
@@ -4748,7 +4766,8 @@ fn unwrap_item<'a, 'src>(item: &'a Spanned<Node<'src>>) -> &'a Node<'src> {
     while let Node::Export(_, inner)
     | Node::Derive(_, inner)
     | Node::Service(_, inner)
-    | Node::MacroAttribute(_, _, _, inner) = node
+    | Node::MacroAttribute(_, _, _, inner)
+    | Node::Const(inner) = node
     {
         node = &inner.0;
     }
@@ -5463,6 +5482,8 @@ impl<'src> Analyzer<'src> {
             print_fn_id: None,
             asset_channel_fns: Vec::new(),
             const_exprs: Vec::new(),
+            const_let_initializers: HashSet::default(),
+            const_functions: HashSet::default(),
             walk_depth: 0,
             walk_depth_refused: false,
             option_enum_id: None,
@@ -26684,6 +26705,49 @@ impl<'src> Analyzer<'src> {
         id
     }
 
+    /// G24 — `const let NAME[: T] = EXPR;`. The binding walks as an ordinary
+    /// `let`, and its INITIALIZER is marked const: `const let x = e;` folds
+    /// exactly as `let x = const e;` does, which is what makes the binding
+    /// compile-time-known to every later `const` expression (`classify`
+    /// already answers `Known::Const` for a binding whose initializer is
+    /// marked). The mark is recorded a second time in `const_let_initializers`
+    /// so the result check can admit a CLOSURE here and refuse one there.
+    ///
+    /// A destructuring `const let (a, b) = e;` marks the same expression — the
+    /// value the pattern takes apart — so the two spellings fold alike.
+    fn walk_const_let(&mut self, declaration: &'src Spanned<Node<'src>>, scope_id: Id) -> Id {
+        let id = self.walk_expr_node(declaration, scope_id);
+        let initializer = self
+            .variables
+            .get(&id)
+            .and_then(|variable| variable.initial)
+            .or_else(|| match self.expr_id_to_expr_map.get(&id) {
+                Some(Expr::Destructure(value_id, _)) => Some(*value_id),
+                _ => None,
+            });
+        if let Some(initializer) = initializer {
+            self.const_exprs.push(initializer);
+            self.const_let_initializers.insert(initializer);
+        }
+        id
+    }
+
+    /// G24 — `const fun NAME(..) { .. }`. An ordinary function declaration
+    /// plus a recorded promise: its body is const-evaluable, checked at THIS
+    /// declaration rather than wherever someone first tries to fold a call to
+    /// it. Not a colouring requirement — a plain `fun` stays const-callable
+    /// (`const-eval.md` §1's Zig-shaped rule), and a `const fun` stays
+    /// runtime-callable with runtime arguments.
+    fn walk_const_fun(&mut self, declaration: &'src Spanned<Node<'src>>, scope_id: Id) -> Id {
+        let id = self.walk_expr_node(declaration, scope_id);
+        let function_id = match self.expr_id_to_expr_map.get(&id) {
+            Some(Expr::Function(function_id)) => *function_id,
+            _ => id,
+        };
+        self.const_functions.insert(function_id);
+        id
+    }
+
     fn walk_expr_node_inner(&mut self, node: &'src Spanned<Node<'src>>, scope_id: Id) -> Id {
         // `const expr` marks and FORWARDS: the inner expression is the entity
         // (no wrapper), so every downstream pass sees a plain subtree; the
@@ -26703,6 +26767,16 @@ impl<'src> Analyzer<'src> {
                 let id = self.new_entity_id();
                 self.expr_id_to_expr_map.insert(id, Expr::Error);
                 return id;
+            }
+            // G24: the two DECLARATION forms. Each walks its inner node as the
+            // ordinary `let` / `fun` it is, and records what the marker adds
+            // beside the entity — so nothing downstream needs a second shape
+            // for a declaration that happens to be compile-time.
+            if matches!(&inner.0, Node::Let(..) | Node::LetDestructure(..)) {
+                return self.walk_const_let(inner, scope_id);
+            }
+            if matches!(&inner.0, Node::Func(_)) {
+                return self.walk_const_fun(inner, scope_id);
             }
             let inner_id = self.walk_expr_node(inner, scope_id);
             self.const_exprs.push(inner_id);
@@ -48173,6 +48247,20 @@ pub struct Program<'src> {
     /// Computed const results, filled by `const_eval::evaluate` post-analysis;
     /// the transformer serializes these in place of the expressions.
     pub const_results: HashMap<Id, crate::interpreter::ConstValue>,
+    /// G24: the initializer expression of every `const let NAME = EXPR;` — a
+    /// subset of the const-marked set. The const pass reads it to decide
+    /// whether a CLOSURE result is admitted at this site (`const-eval.md`
+    /// §11), and the refusal at every other site steers here.
+    pub const_let_initializers: HashSet<Id>,
+    /// G24: every `const fun`, by function id. Its body is run through the
+    /// const capability check at its DECLARATION, so the diagnostic lands on
+    /// the promise rather than on whichever call first tried to keep it.
+    pub const_functions: HashSet<Id>,
+    /// G24: the const world's generated name for each binding it named, so the
+    /// emitter can resolve a snapshot's name-keyed captures to the bindings it
+    /// will substitute for. Written by the const pass beside `const_results`
+    /// and empty whenever nothing was evaluated.
+    pub const_snapshot_bindings: HashMap<String, Id>,
     /// The contributions `asset::emit` / `asset::emit_keyed` accumulated
     /// during const evaluation; the build deduplicates, orders, and writes
     /// them beside the output.
@@ -57144,6 +57232,9 @@ fn analyze_over_world<'src>(
         asset_channel_fns: analyzer.asset_channel_fns.clone(),
         const_exprs: analyzer.const_exprs.clone(),
         const_results: HashMap::default(),
+        const_let_initializers: analyzer.const_let_initializers.clone(),
+        const_functions: analyzer.const_functions.clone(),
+        const_snapshot_bindings: HashMap::default(),
         const_assets: Vec::new(),
         const_input_files: Vec::new(),
         const_bundled_files: Vec::new(),

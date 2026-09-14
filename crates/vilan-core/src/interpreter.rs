@@ -144,10 +144,34 @@ pub enum ConstValue {
     Array(Vec<ConstValue>),
     Set(Vec<ConstValue>),
     Map(Vec<(ConstValue, ConstValue)>),
+    /// G24's CLOSURE SNAPSHOT — the one result that is not plain data, and is
+    /// admitted only under `const let` (`const-eval.md` §11: "plain data, or a
+    /// closure over plain data"). In the owner's framing it IS plain data: a
+    /// `Callable` record whose fields are the captured compile-time values,
+    /// over a body the emitter already knows how to write.
+    ///
+    /// `body` is the ANALYZER's closure entity, not this world's lowering of
+    /// it. A const site is lowered by a transformer of its own, whose
+    /// generated names are that world's — emitting its arrow into the real
+    /// output would reference declarations the output does not have — so what
+    /// travels is the entity plus the captures, and the real emitter walks the
+    /// closure itself with the captures substituted for its free bindings.
+    ///
+    /// `captures` is keyed by the const world's emitted name for each captured
+    /// binding; `const_eval` hands the emitter the name → binding map it needs
+    /// to finish the translation (`Program::const_snapshot_bindings`).
+    Callable {
+        body: crate::id::Id,
+        captures: Vec<(String, ConstValue)>,
+    },
 }
 
 /// Converts an interpreter value to plain data, or names what blocks it.
-fn value_to_const(value: &Value) -> Result<ConstValue, &'static str> {
+///
+/// `snapshots` admits G24's closure result: a `const let` binding takes one,
+/// every other const site keeps §1's "plain data" rule and the refusal that
+/// steers to `const let`.
+fn value_to_const(value: &Value, snapshots: bool) -> Result<ConstValue, &'static str> {
     Ok(match value {
         Value::Undefined => ConstValue::Undefined,
         Value::Null => ConstValue::Null,
@@ -159,14 +183,14 @@ fn value_to_const(value: &Value) -> Result<ConstValue, &'static str> {
             items
                 .borrow()
                 .iter()
-                .map(value_to_const)
+                .map(|item| value_to_const(item, snapshots))
                 .collect::<Result<_, _>>()?,
         ),
         Value::Set(items) => ConstValue::Set(
             items
                 .borrow()
                 .values()
-                .map(value_to_const)
+                .map(|item| value_to_const(item, snapshots))
                 .collect::<Result<_, _>>()?,
         ),
         Value::Map(entries) => ConstValue::Map(
@@ -174,13 +198,75 @@ fn value_to_const(value: &Value) -> Result<ConstValue, &'static str> {
                 .borrow()
                 .values()
                 .map(|(key, value)| {
-                    Ok::<_, &'static str>((value_to_const(key)?, value_to_const(value)?))
+                    Ok::<_, &'static str>((
+                        value_to_const(key, snapshots)?,
+                        value_to_const(value, snapshots)?,
+                    ))
                 })
                 .collect::<Result<_, _>>()?,
         ),
         Value::Object(_) => return Err("a `Shared` cell"),
-        Value::Closure(_) => return Err("a closure"),
+        Value::Closure(closure) => {
+            if !snapshots {
+                return Err("a closure");
+            }
+            let Some(body) = closure.origin else {
+                // An arrow the EMITTER synthesized (a getter, a thunk), or a
+                // hoisted world declaration: neither is an expression the
+                // program wrote, so neither can be snapshotted.
+                return Err("a closure the compiler synthesized");
+            };
+            ConstValue::Callable {
+                body,
+                captures: closure_captures(closure, snapshots)?,
+            }
+        }
     })
+}
+
+/// The compile-time environment a snapshot closes over: every binding the
+/// closure's body NAMES that its scope chain holds, below the run's root.
+///
+/// The root scope is the const world and this site's prelude — the world's
+/// functions and the module-level bindings, all of which the real emitter
+/// declares for itself — so a name found there is not a capture and is
+/// deliberately skipped. What remains is exactly the frames the evaluation
+/// built: a `const fun`'s parameters, the `let`s of an enclosing block. Those
+/// are the values that must be BAKED, and the ones §11's rule requires to be
+/// plain data.
+fn closure_captures(
+    closure: &ClosureData<'_>,
+    snapshots: bool,
+) -> Result<Vec<(String, ConstValue)>, &'static str> {
+    let mut referenced: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    crate::transformer::collect_references(closure.body, &mut referenced);
+    let mut captures = Vec::new();
+    // Driven by the NAMES the body mentions, in their own sorted order, and
+    // never by walking a scope: `Scope::vars` is `fx`-hashed, so an iteration
+    // taken from it is a stable function of the hash rather than of the
+    // program (`the_scope_map_is_never_iterated` holds exactly this). Looking
+    // each name up instead makes the result's order the source's, which is
+    // what two builds of one program have to agree on.
+    for name in &referenced {
+        let mut scope = Some(closure.env.clone());
+        while let Some(current) = scope {
+            let borrowed = current.borrow();
+            // The root scope (the one with no parent) is the world; a name
+            // bound there is a world declaration the real emitter writes for
+            // itself, not a capture.
+            let Some(parent) = borrowed.parent.clone() else {
+                break;
+            };
+            let found = borrowed.vars.get(name.as_str()).cloned();
+            drop(borrowed);
+            if let Some(value) = found {
+                captures.push((name.clone(), value_to_const(&value, snapshots)?));
+                break;
+            }
+            scope = Some(parent);
+        }
+    }
+    Ok(captures)
 }
 
 impl ConstValue {
@@ -209,6 +295,13 @@ impl ConstValue {
                     5
                 }
             }
+            // G24's snapshot serializes as the closure's own arrow, whose size
+            // is the emitter's to know and not this value's. Answering the
+            // INFERRED cap's ceiling keeps the one caller honest: inference
+            // never admits a closure result (R2 — `const let` is required), so
+            // a snapshot reaching the cap is a bug, and reporting "too large"
+            // makes it a silent decline rather than a wrong fold.
+            ConstValue::Callable { .. } => usize::MAX,
             // The serializer's own special cases, then its shared path.
             ConstValue::Number(number) if number.is_nan() => 3,
             ConstValue::Number(number) if number.is_infinite() => {
@@ -329,10 +422,11 @@ fn run_const<'a>(
     site: &'a ConstSite<'a>,
     limits: Limits,
     allow_assets: bool,
+    snapshots: bool,
     reader: Option<&'a dyn AssetReader>,
 ) -> Result<ConstRun, Failure> {
     check_reach(&site.imports, &site.helpers)?;
-    let mut interpreter = Interpreter::new(limits, allow_assets);
+    let mut interpreter = Interpreter::new(limits, allow_assets, snapshots);
     interpreter.reader = reader;
     let value = interpreter.run_const_site(site);
     // Either arm of `value` is owned plain data (`ConstValue` / `Failure`), and
@@ -376,9 +470,10 @@ pub struct ConstOutcome {
 pub fn eval_const<'a>(
     site: &'a ConstSite<'a>,
     limits: Limits,
+    snapshots: bool,
     reader: Option<&'a dyn AssetReader>,
 ) -> Result<ConstOutcome, Failure> {
-    let run = run_const(site, limits, true, reader)?;
+    let run = run_const(site, limits, true, snapshots, reader)?;
     Ok(ConstOutcome {
         value: run.value,
         assets: run.assets,
@@ -401,7 +496,7 @@ pub fn eval_inferred<'a>(site: &'a ConstSite<'a>, limits: Limits) -> Result<Cons
     // No reader either: `asset::read` is const-only, so a fold that reaches it
     // was already refused statically — and the closed channel keeps that true
     // by construction even for a path the static check cannot see.
-    let run = run_const(site, limits, false, None)?;
+    let run = run_const(site, limits, false, false, None)?;
     if !run.stdout.is_empty() {
         return Err(Failure::unsupported(
             "output during evaluation (an inferred fold must be observably silent)",
@@ -428,7 +523,7 @@ pub struct RunOutput {
 /// macro expansion (Phase 1) drives the same evaluator per `macro fun` call.
 pub fn run_program<'a>(program: &'a JsProgram<'a>, limits: Limits) -> Result<RunOutput, Failure> {
     check_capabilities(program)?;
-    let mut interpreter = Interpreter::new(limits, false);
+    let mut interpreter = Interpreter::new(limits, false, false);
     let globals = interpreter.root_scope();
     let result = interpreter.exec_body(&program.nodes, &globals);
     // Everything read below — stdout, the exit code, the `Flow` variant, a
@@ -605,7 +700,7 @@ pub fn run_entry<'a>(
     limits: Limits,
 ) -> Result<String, Failure> {
     check_capabilities(program)?;
-    let mut interpreter = Interpreter::new(limits, false);
+    let mut interpreter = Interpreter::new(limits, false, false);
     let text = interpreter.run_macro_entry(program, entry, arguments);
     // The expansion is an owned `String` (a `Failure` likewise), and the
     // expansion cache upstream stores only that text — no `Value` from a macro
@@ -684,6 +779,10 @@ struct ClosureData<'a> {
     env: Env<'a>,
     /// The declaration name for named functions (inspect prints it).
     name: Option<&'a str>,
+    /// G24: the analyzer CLOSURE ENTITY this value was made from, carried
+    /// through from the lowered arrow (`js::Closure::origin`) so a const
+    /// result that IS a closure can name the body the real emitter must walk.
+    origin: Option<crate::id::Id>,
 }
 
 // --- Environment ---
@@ -782,6 +881,11 @@ struct Interpreter<'a> {
     /// `asset::emit` is live only under `eval_const`; anywhere else it is a
     /// capability miss.
     allow_assets: bool,
+    /// G24: whether this run's RESULT may be a closure snapshot. Set only for
+    /// a `const let` binding's initializer — every other const site keeps §1's
+    /// "a `const` result must be plain data", and inference never admits one
+    /// (R2: the declaration is required).
+    snapshots: bool,
     /// `asset::read`'s host (docs-port.md §3.3) — present only under
     /// `eval_const` with a project to read from. `None` with `allow_assets`
     /// set means the context has no file channel (the wasm playground outside
@@ -808,7 +912,7 @@ struct Interpreter<'a> {
 }
 
 impl<'a> Interpreter<'a> {
-    fn new(limits: Limits, allow_assets: bool) -> Self {
+    fn new(limits: Limits, allow_assets: bool, snapshots: bool) -> Self {
         Self {
             fuel: limits.fuel,
             depth_left: limits.call_depth,
@@ -816,6 +920,7 @@ impl<'a> Interpreter<'a> {
             exited: None,
             assets: Vec::new(),
             allow_assets,
+            snapshots,
             reader: None,
             scheduled: Vec::new(),
             scopes: Vec::new(),
@@ -896,7 +1001,7 @@ impl<'a> Interpreter<'a> {
                 "the const result binding was not emitted",
             ));
         };
-        value_to_const(&result).map_err(|what| {
+        value_to_const(&result, self.snapshots).map_err(|what| {
             Failure::new(
                 FailureKind::Unsupported,
                 format!("a `const` result must be plain data; this evaluates to {what}"),
@@ -996,6 +1101,7 @@ impl<'a> Interpreter<'a> {
                     body: &function.body,
                     env: env.clone(),
                     name: Some(function.name.as_str()),
+                    origin: None,
                 }));
                 env.borrow_mut()
                     .vars
@@ -1228,6 +1334,7 @@ impl<'a> Interpreter<'a> {
                     body: &closure.body,
                     env: env.clone(),
                     name: None,
+                    origin: closure.origin,
                 })))
             }
             js::Node::Function(function) => {
@@ -1239,6 +1346,7 @@ impl<'a> Interpreter<'a> {
                     body: &function.body,
                     env: env.clone(),
                     name: Some(function.name.as_str()),
+                    origin: None,
                 })))
             }
             js::Node::Await(_) => Err(Failure::unsupported("await (macro bodies are synchronous)")),

@@ -3233,6 +3233,22 @@ impl Document {
                     out.push_str(value);
                     out.push('"');
                 }
+                // G24: a `const let` closure. Hover shows WHAT it is and what
+                // it baked, not the body — the body is on screen already, two
+                // lines up, and the captures are the half the reader cannot
+                // see.
+                ConstValue::Callable { captures, .. } => {
+                    out.push_str("|..| .. (compile-time");
+                    for (index, (_, captured)) in captures.iter().enumerate() {
+                        out.push_str(if index == 0 { ", over " } else { ", " });
+                        render(captured, out);
+                        if out.len() > 120 {
+                            out.push('…');
+                            break;
+                        }
+                    }
+                    out.push(')');
+                }
                 ConstValue::Array(items) => {
                     out.push('[');
                     for (index, item) in items.iter().enumerate() {
@@ -5541,6 +5557,12 @@ impl Document {
                 // §7.2 fix 2, the `#`'s twin: the one at-rule with a
                 // combinator spelling is a min-width media query.
                 fixes.push(fix);
+            } else if let Some((span, replacement)) = self.const_let_fix(program, diagnostic) {
+                fixes.push(QuickFix {
+                    title: "Declare it `const let`".to_string(),
+                    span,
+                    replacement,
+                });
             } else if diagnostic.msg.starts_with(IMPORTANT_HAS_NO_PLACE) {
                 // §7.2 fix 3. The parser excises `!important` from the value
                 // and reports at exactly its span, so the fix is that span
@@ -5859,6 +5881,64 @@ impl Document {
 /// One quickfix's ready-made edit (E54b, E54d, E58c): a menu title and the
 /// `(span, replacement)` this document's own text needs — LIVE space, same
 /// convention as [`Document::organize_import_edits`].
+impl Document {
+    /// **G24's R2 quick fix.** One arm for the two refusals, because they are
+    /// one edit seen from two sides: a `const` expression that reads a plain
+    /// binding, and a `let x = const ..` whose result is a closure. Either
+    /// way the answer is the DECLARATION keyword, and the fix writes it.
+    ///
+    /// Keyed on the two steer constants the analyzer builds its messages from
+    /// (`const_eval::CONST_LET_STEER_*`), never on a second copy of the
+    /// sentence — the `REACH_IS_UNMARKED` discipline, so a reworded steer
+    /// takes the fix with it rather than silently unhooking it.
+    fn const_let_fix(
+        &self,
+        program: &Program,
+        diagnostic: &vilan_core::error::Error,
+    ) -> Option<(Span, String)> {
+        // The plain-data refusal: `let x = const <closure>` becomes
+        // `const let x = <closure>`. The whole edit is the text in FRONT of
+        // the diagnostic's own span — the `const` keyword moves to the head of
+        // the declaration — so it needs no program lookup at all.
+        if diagnostic
+            .msg
+            .contains(vilan_core::const_eval::CONST_LET_STEER_CLOSURE)
+        {
+            let head = self.text.get(..diagnostic.span.start)?;
+            let declaration = head.rfind("let ")?;
+            let slice = self.text.get(declaration..diagnostic.span.start)?;
+            let kept = slice.trim_end().strip_suffix("const")?;
+            return Some((
+                Span::from(declaration..diagnostic.span.start),
+                format!("const {kept}"),
+            ));
+        }
+        // The runtime-binding refusal: the diagnostic is at the READ, and the
+        // edit is at the binding it names — the nearest declaration of that
+        // name ahead of the read, and only when this document's own text still
+        // opens it with `let`, which is what keeps the fix inside the file it
+        // may edit.
+        if !diagnostic
+            .msg
+            .contains(vilan_core::const_eval::CONST_LET_STEER_RUNTIME)
+        {
+            return None;
+        }
+        let name = diagnostic.msg.strip_prefix('`')?.split('`').next()?;
+        let at = program
+            .variables
+            .values()
+            .filter(|variable| variable.name == name)
+            .filter_map(|variable| program.span_map.get(&variable.id).map(|span| **span))
+            .filter(|span| span.end <= diagnostic.span.start)
+            .max_by_key(|span| span.start)?;
+        if !self.text.get(at.start..)?.starts_with("let ") {
+            return None;
+        }
+        Some((Span::from(at.start..at.start), "const ".to_string()))
+    }
+}
+
 pub struct QuickFix {
     pub title: String,
     pub span: Span,
@@ -8001,6 +8081,61 @@ pub(crate) mod tests {
             )),
             "{fixes:?}"
         );
+    }
+
+    /// G24's R2 quick fix, both halves through one arm. The runtime-binding
+    /// refusal is at the READ and the edit is at the binding it names — a
+    /// zero-width `const ` in front of the declaration; the plain-data refusal
+    /// is at the closure and the edit MOVES the keyword to the head of the
+    /// declaration. Two diagnostics, one title, one construction site (which
+    /// is also what `book_sync`'s count of the offered actions holds).
+    #[test]
+    fn quickfix_declares_a_const_let_from_either_steer() {
+        let read = "fun main() {\n\tlet space = |n: f64| n * 2f;\n\tlet a = const space(2f);\n}\n";
+        assert!(
+            const_let_fixes(read).contains(&(
+                "Declare it `const let`".to_string(),
+                String::new(),
+                "const ".to_string(),
+            )),
+            "{:?}",
+            const_let_fixes(read)
+        );
+        let result = "fun main() {\n\tlet add = const |a: f64, b: f64| a + b;\n}\n";
+        assert!(
+            const_let_fixes(result).contains(&(
+                "Declare it `const let`".to_string(),
+                "let add = const ".to_string(),
+                "const let add = ".to_string(),
+            )),
+            "{:?}",
+            const_let_fixes(result)
+        );
+    }
+
+    /// [`quickfix_declares_a_const_let_from_either_steer`]'s driver: every fix
+    /// the whole file offers, as (title, the text it replaces, what it writes).
+    fn const_let_fixes(source: &str) -> Vec<(String, String, String)> {
+        let (directory, document) = analyze_workspace(&[("main.vl", source)]);
+        let program = document.program.as_ref().expect("the fixture analyzes");
+        let text = document.line_index.text().to_string();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document
+            .quickfixes(program, whole_file)
+            .into_iter()
+            .map(|fix| {
+                (
+                    fix.title,
+                    text[fix.span.into_range()].to_string(),
+                    fix.replacement,
+                )
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(&directory);
+        fixes
     }
 
     // §7.2 fix 2. `@` is the `#`'s twin, refused for the same context-free

@@ -184,6 +184,7 @@ spec/const.md h2 92-the-const-environment
 spec/const.md h2 93-failure-and-resource-limits
 spec/const.md h2 94-results
 spec/const.md h2 95-inferred-const
+spec/const.md h2 96-const-let-and-const-fun
 spec/contexts.md h1 spec-8--contexts
 spec/contexts.md h2 81-the-model
 spec/contexts.md h2 82-reads-strict-and-safe
