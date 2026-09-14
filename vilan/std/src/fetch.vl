@@ -72,18 +72,18 @@ export impl Response {
 	external fun body_stream(self): BodyStream;
 }
 
-impl BodyStream {
+export impl BodyStream {
 	[extern(method, "getReader")]
 	external fun reader(self): BodyReader;
 }
 
-impl BodyReader {
+export impl BodyReader {
 	/// Await the next chunk; `finished()` turns true once the stream closes.
 	[extern(method, "read")]
 	async external fun read_chunk(self): ChunkResult;
 }
 
-impl ChunkResult {
+export impl ChunkResult {
 	[extern(get, "done")]
 	external fun finished(self): bool;
 

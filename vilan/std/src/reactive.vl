@@ -778,7 +778,7 @@ export struct SignalCell<T> {
 /// is `Shared::identity`'s now, which takes it on the first ASK — so the twelve
 /// corpus goldens that moved when the field landed are back where they were,
 /// and a program that exposes nothing mints no identities at all.
-fun cell_identity<T>(cell: SignalCell<T>): i32 {
+export fun cell_identity<T>(cell: SignalCell<T>): i32 {
 	cell.value.identity()
 }
 
