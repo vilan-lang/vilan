@@ -21119,6 +21119,132 @@ mod session_growth {
         entries.sort();
         on_big_stack(move || base_cache_miss_cost("kolt_src", &entries, 3));
     }
+    /// M70's per-KEYSTROKE probe, PAIRED: for every file of a package, what one
+    /// edit costs with the base cache holding this file's world and what the
+    /// same edit costs with the cache emptied — the same file, both ways,
+    /// alternately, inside one process.
+    ///
+    /// The miss-cost probe above prices a miss against a hit on the files that
+    /// HAVE both. M70 is about the files that have neither: an import cycle
+    /// reaching the entry's own module sets `entry_alias_module`, file mode
+    /// makes that an OPEN MODULE, and an open module's world was never stored
+    /// — so every keystroke in those files rebuilt the whole pre-entry world,
+    /// and no row in the hit/miss table said which files those were. The
+    /// `served` leg is what M70 buys; the `evicted` leg is what every keystroke
+    /// in those files used to cost, measured beside it rather than in another
+    /// run at another load average.
+    ///
+    /// A file the cache can never serve reads `served_hits: 0` with the two
+    /// legs equal — which is the finding, before and after.
+    fn base_cache_keystroke_walk(label: &str, entries: &[PathBuf], keystrokes: usize) {
+        let std_dir = std_root();
+        let unbounded = usize::MAX;
+        vilan_core::analyzer::set_base_cache_budget(unbounded);
+        for entry in entries {
+            let Ok(base) = std::fs::read_to_string(entry) else {
+                continue;
+            };
+            // The warm analysis: it stores this file's world if this file's
+            // shape can store one, and is itself in neither leg.
+            drop(Document::analyze_on_this_thread(&base, &std_dir, entry));
+            let mut served: Vec<Duration> = Vec::new();
+            let mut evicted: Vec<Duration> = Vec::new();
+            let mut served_hits = 0u64;
+            let mut evicted_hits = 0u64;
+            // One edit, timed in thread CPU, with the cache in whatever state
+            // the caller left it.
+            let edit = |text: &str| -> (Duration, u64) {
+                let (hits_before, _) = vilan_core::analyzer::base_cache_stats();
+                let started = thread_cpu_now();
+                drop(Document::analyze_on_this_thread(text, &std_dir, entry));
+                let ended = thread_cpu_now();
+                let (hits_after, _) = vilan_core::analyzer::base_cache_stats();
+                (
+                    started
+                        .zip(ended)
+                        .map(|(started, ended)| ended.saturating_sub(started))
+                        .unwrap_or_default(),
+                    hits_after - hits_before,
+                )
+            };
+            for keystroke in 0..keystrokes {
+                // A real edit: the entry TEXT differs every time, which is what
+                // an editor hands the analysis. The key does not move — the
+                // seeds are the same import lines — so a file that can be
+                // served is served on every one of these.
+                let (cpu, hits) = edit(&format!("{base}\n// m70 served {keystroke}\n"));
+                served.push(cpu);
+                served_hits += hits;
+                // The eviction, in the currency the budget evicts in (M67's
+                // probe takes the same one): every world goes, so the next edit
+                // pays the whole pre-entry load whatever the key says.
+                vilan_core::analyzer::set_base_cache_budget(0);
+                vilan_core::analyzer::set_base_cache_budget(unbounded);
+                let (cpu, hits) = edit(&format!("{base}\n// m70 evicted {keystroke}\n"));
+                evicted.push(cpu);
+                evicted_hits += hits;
+                // Re-warm, unmeasured, so the next served leg has a world to be
+                // served — on a tree where this file's world is storable at all.
+                drop(Document::analyze_on_this_thread(&base, &std_dir, entry));
+            }
+            served.sort();
+            evicted.sort();
+            let median = |samples: &[Duration]| {
+                samples
+                    .get(samples.len() / 2)
+                    .copied()
+                    .unwrap_or_default()
+                    .as_secs_f64()
+                    * 1000.0
+            };
+            println!(
+                "M70 {{\"section\":\"keystroke\",\"corpus\":\"{label}\",\"profile\":\"{}\",\
+                 \"load\":\"{}\",\"file\":\"{}\",\"bytes\":{},\"keystrokes\":{keystrokes},\
+                 \"served_hits\":{served_hits},\"evicted_hits\":{evicted_hits},\
+                 \"served_median_ms\":{:.2},\"evicted_median_ms\":{:.2},\
+                 \"worlds\":{},\"weight_kib\":{}}}",
+                profile(),
+                loadavg_1m(),
+                entry.file_name().unwrap_or_default().to_string_lossy(),
+                base.len(),
+                median(&served),
+                median(&evicted),
+                vilan_core::analyzer::base_cache_retained(),
+                vilan_core::analyzer::base_cache_retained_weight() / 1024,
+            );
+        }
+        vilan_core::analyzer::set_base_cache_budget(
+            vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET,
+        );
+    }
+
+    /// M70's per-keystroke probe over the owner's own application:
+    ///
+    /// ```text
+    /// VILAN_PERF_KOLT=<checkout> cargo nextest run --release -p vilan-lsp \
+    ///     --run-ignored ignored-only -E 'test(base_cache_keystroke_cost)' --no-capture
+    /// ```
+    #[test]
+    #[ignore = "M70's per-keystroke probe: needs VILAN_PERF_KOLT, run deliberately"]
+    fn base_cache_keystroke_cost_across_a_sibling_checkout() {
+        let _guard = base_cache_guard();
+        let Some(root) = std::env::var_os("VILAN_PERF_KOLT").map(PathBuf::from) else {
+            println!("M70-SKIP keystroke: VILAN_PERF_KOLT is not set");
+            return;
+        };
+        let source = root.join("src");
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&source)
+            .unwrap_or_else(|error| panic!("read {}: {error}", source.display()))
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|extension| extension == "vl"))
+            .collect();
+        entries.sort();
+        let keystrokes = std::env::var("VILAN_M70_KEYSTROKES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3);
+        on_big_stack(move || base_cache_keystroke_walk("kolt_src", &entries, keystrokes));
+    }
 
     /// M68's measurement: what the trim at the analysis-landing seam COSTS, and
     /// what each landing actually hands back for it.

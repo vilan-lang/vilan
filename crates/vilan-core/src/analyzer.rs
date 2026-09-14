@@ -51270,15 +51270,16 @@ pub struct Workspace {
     /// not an entry.
     ///
     /// It rides here, on the resolved project context, for the same reason
-    /// `platform_reason` does, and it is out of the base cache key for a reason
-    /// worth stating: for a DECLARED entry it changes nothing at all — the load
-    /// is byte-for-byte the one it always was, so every world stored before this
+    /// `platform_reason` does. The mode itself is still out of the base cache
+    /// key: for a DECLARED entry it changes nothing at all — the load is
+    /// byte-for-byte the one it always was, so every world stored before this
     /// field existed is still the world its key describes. For an OPEN FILE it
-    /// changes the treatment of the ENTRY's own file and nothing else, and the
-    /// analysis it changes anything for stores no world at all (see
-    /// `entry_is_open_module` in `analyze_inner`): a world whose `pkg::<entry>`
-    /// name aliases the entry's own scope is not a world any other entry may be
-    /// served, so it is never offered.
+    /// changes the treatment of the ENTRY's own file and nothing else, and what
+    /// the key carries is that one difference by name:
+    /// [`BaseCacheKey::entry_open_module`] is the entry's own path, so a world
+    /// whose `pkg::<entry>` aliases the entry's scope is offered to that file
+    /// and to no other (M70; B239 answered the same hazard by storing nothing,
+    /// which cost seven of kolt's files the cache entirely).
     pub entry_mode: EntryMode,
 }
 
@@ -51475,6 +51476,38 @@ struct BaseCacheKey {
     /// go on being shared across packages (the root is irrelevant when no
     /// sibling loads).
     entry_pkg: Option<(PathBuf, Vec<&'static str>)>,
+    /// M70: the OPEN MODULE this world was built for — the canonical path of
+    /// an entry the front end handed us as a MODULE of its own package (file
+    /// mode) whose load can reach a sibling. `None` for a DECLARED entry and
+    /// for an open file that seeds no sibling at all, so every key a world was
+    /// ever stored under before this field existed is unchanged.
+    ///
+    /// It is here because such a world may be MISSING a module — its own. When
+    /// a loaded sibling imports `pkg::<entry>`, the loader does not load the
+    /// entry a second time; it ALIASES the name onto the entry's own (global)
+    /// scope (B226/B239), and the world that comes out has no module `theme` in
+    /// it, only a name pointing at wherever `theme.vl` is about to walk. That
+    /// world is a perfectly good world for `theme.vl` and for nothing else: an
+    /// analysis of a DIFFERENT file with the same seeds needs a real module
+    /// `theme`, and would be handed a name bound to ITS global scope.
+    ///
+    /// So the key says which module the world excludes, and the world becomes
+    /// storable — which is the whole of M70. Seven of kolt's nineteen files
+    /// (`app_context`, `app_overlay`, `prefs`, `sidebar`, `styles`, `theme`,
+    /// and `store` for an unrelated reason) were never served by this cache,
+    /// each paying its package's whole pre-entry load on every keystroke,
+    /// because `entry_is_open_module` suppressed the STORE as well as the
+    /// pre-entry resolve and no other analysis ever minted their key.
+    ///
+    /// It is the entry PATH rather than the module name because the path is
+    /// what the analysis has in hand before it loads anything, and because two
+    /// files under one package root cannot share one. Set for every file-mode
+    /// entry that seeds a sibling, not only for the ones that turn out to be
+    /// aliased — whether a sibling imports us back is not knowable until the
+    /// load has run, and the conservative half costs a file that shares its
+    /// seed set with another file a world of its own (measured on kolt: no
+    /// such pair, 12 worlds before and after).
+    entry_open_module: Option<PathBuf>,
 }
 
 /// One retained base world and the claims that keep its borrows alive (M23).
@@ -53109,9 +53142,14 @@ struct World<'src> {
     /// B239: this world's entry is a MODULE its siblings import (file mode,
     /// and something in the load referenced `pkg::<entry>`), so the pre-entry
     /// `resolve_world` was DEFERRED — nothing here has resolved yet, and the
-    /// post-entry `build()` is the one pass that resolves it all. Such a world
-    /// is never stored, so a world served from the cache always answers
-    /// `false`.
+    /// post-entry `build()` is the one pass that resolves it all.
+    ///
+    /// M70: such a world IS stored, keyed by the module it excludes
+    /// ([`BaseCacheKey::entry_open_module`]), and this flag travels with it —
+    /// which is what makes a hit reproduce the deferred order instead of
+    /// discovering it again. So a world served from the cache answers `true`
+    /// exactly when the analysis that stored it did, and the entry tail reads
+    /// the order off the world rather than off its own load.
     entry_is_open_module: bool,
     global_scope_id: Id,
     module_scopes: HashMap<&'src str, Id>,
@@ -53416,6 +53454,25 @@ fn analyze_inner<'src>(
         names.dedup();
         names
     };
+    // M70: the open-module half of the key (see [`BaseCacheKey::entry_open_module`]).
+    // A file the front end handed us as the entry but which its package owns as
+    // a MODULE builds a world that may be missing that very module — so the
+    // world is keyed by which file it is missing, and becomes storable.
+    //
+    // The condition is "this load can reach a sibling at all", which is the
+    // only way anything can import `pkg::<entry>` and mint the alias: the
+    // entry's own `pkg::` seeds, or an entry prelude rooted at `pkg::` (which
+    // `seed_prelude_module` loads without any import naming it). A file-mode
+    // entry that reaches no sibling builds a std-only world and goes on
+    // sharing it with every other such file, exactly as before.
+    let entry_open_module: Option<PathBuf> =
+        (matches!(workspace.entry_mode, EntryMode::OpenFile { .. })
+            && (!entry_pkg_seeds.is_empty()
+                || workspace
+                    .entry_prelude
+                    .module_path()
+                    .is_some_and(|path| path.starts_with("pkg::"))))
+        .then(|| crate::util::canonical_path(entry_path));
     let entry_is_inside_std = {
         let pkg_root_canonical = crate::util::canonical_path(pkg_root);
         std::iter::once(&std.base_root)
@@ -53437,6 +53494,7 @@ fn analyze_inner<'src>(
                 entry_pkg_seeds.clone(),
             )
         }),
+        entry_open_module: entry_open_module.clone(),
     };
     let base_cacheable = allow_cache
         && !entry_is_inside_std
@@ -53497,15 +53555,14 @@ fn analyze_inner<'src>(
         // M19 T1: a HIT is the one shape §2.1 proves id-stable — the clone
         // hands back a byte-identical module prefix — so it is the only shape
         // the widened seam activates on.
+        //
+        // M70: except for an entry-shaped world, which now hits too. Its
+        // modules resolve in the post-entry `build()` rather than before the
+        // store, so there is no record filed under this key and none to file —
+        // the store path withholds the key for the same reason.
+        let checks_key = (!world.entry_is_open_module).then(|| base_cache_key.clone());
         return analyze_over_world(
-            world,
-            nodes,
-            std,
-            pkg_root,
-            platform,
-            workspace,
-            Some(base_cache_key),
-            true,
+            world, nodes, std, pkg_root, platform, workspace, checks_key, true,
         );
     }
     // `sources[0]` is the entry file; std modules are appended as they load.
@@ -55403,12 +55460,22 @@ fn analyze_inner<'src>(
     // Deferring the whole pre-entry resolution is what makes the cycle an
     // ordinary module cycle again: imports, preludes, `use`s and bare names all
     // resolve once, in the post-entry `build()`, with the entry's declarations
-    // in the scope the alias points at. The world this analysis builds is
-    // therefore an ENTRY-SHAPED world and is not stored (below): a world whose
-    // `pkg::views` means "the entry" is not one an analysis of `client.vl` may
-    // ever be handed. It can still HIT a stored world — but only one that never
-    // loaded this file, and `base_cache_lookup`'s `entry_is_a_loaded_module`
-    // already refuses every world that did.
+    // in the scope the alias points at.
+    //
+    // M70: the world this builds is an ENTRY-SHAPED world — `pkg::views` in it
+    // means "the entry", and it is missing the module `views` altogether — and
+    // that is a reason to KEY it, not a reason to throw it away. B239 threw it
+    // away, and seven of kolt's nineteen files then paid their package's whole
+    // pre-entry load on every keystroke (0.17–0.61 s of CPU each, measured;
+    // 0 cache hits in a 3-keystroke walk with an unbounded cache) because
+    // nothing else ever minted their key. `BaseCacheKey::entry_open_module`
+    // carries the excluded module, so the world is offered back to the file it
+    // was built for and to nothing else; it is stored UNRESOLVED, and the hit
+    // path reproduces this very order from the flag the world carries.
+    //
+    // It can also still hit a world stored for a DIFFERENT entry that never
+    // loaded this file — `base_cache_lookup`'s `entry_is_a_loaded_module`
+    // refuses every world that did.
     let entry_is_open_module =
         entry_alias_module.is_some() && matches!(workspace.entry_mode, EntryMode::OpenFile { .. });
     let phase_base_start = crate::PhaseClock::now();
@@ -55439,7 +55506,15 @@ fn analyze_inner<'src>(
             base: phase_base,
         },
     };
-    if base_cacheable && !entry_is_module && !entry_is_open_module {
+    // M70: an entry-shaped world stores only when the key SAYS it is one —
+    // `entry_open_module` is the field that keeps it off every other entry.
+    // The condition that computes it is a superset of the aliased case, so
+    // this is belt and braces rather than a live branch; if it ever failed,
+    // the analysis would simply store nothing, which is what B239 did.
+    if base_cacheable
+        && !entry_is_module
+        && (!entry_is_open_module || base_cache_key.entry_open_module.is_some())
+    {
         base_cache_store(base_cache_key.clone(), &world);
     }
     // After the store, so the world the cache holds is the pre-entry one it
@@ -55472,9 +55547,13 @@ fn analyze_inner<'src>(
         pkg_root,
         platform,
         workspace,
-        // No key when the world was not stored (B239): M19's per-module check
-        // records are filed under the world's key, and an entry-shaped world's
-        // checks are not another entry's to replay.
+        // No key for an entry-shaped world, even though M70 now STORES one:
+        // M19's per-module records are of checks that ran over a RESOLVED
+        // world, and an open module's world resolves inside the post-entry
+        // `build()` — every analysis of it, hit or miss. Recording those as
+        // this key's is a claim the seam has not been proved to support, and a
+        // saving on top of a saving is the wrong place to take that risk
+        // (recorded as a follow-up on M70).
         (base_cacheable && !entry_is_module && !entry_is_open_module).then_some(base_cache_key),
         false,
     )
