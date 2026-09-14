@@ -7,20 +7,12 @@ function __clone(value) {
 function __map_values(map) {
 	return [ ...map.values() ].map(__clone);
 }
-function token_is_negated(token) {
-	return token.startsWith("!");
-}
 function class_list(self) {
 	let out = "";
 	for (const entry of $a(self[0])) {
 		const $b = entry;
 		const class2 = $b[0];
 		const _declaration = $b[1];
-		if (token_is_negated(class2)) {
-			(() => {
-				throw "this style carries an unwrapped not(..): `not` marks the condition immediately outside it and emits no rule of its own, so wrap it before applying the style \u{2014} attribute(name, value, not(..)), within(name, value, not(..)), hover(not(..))";
-			})();
-		}
 		if (out === "") {
 			out = class2;
 		} else {
@@ -38,5 +30,6 @@ function $a(self) {
 }
 const card = [ [ new Map([ [ "::padding", [ "::padding", "s1ufvr2", "padding:var(--space-4)" ] ], [ "::color", [ "::color", "s8f74a7", "color:var(--color-ink)" ] ], [ "::background-color", [ "::background-color", "s1caphfa", "background-color:var(--color-ground)" ] ], [ "::border", [ "::border", "syywdmj", "border:1px solid rgb(from var(--color-ink) r g b / 0.2)" ] ] ]) ] ];
 console.log(class_list(card));
+const iron_dark = [ [ "^[data-theme=\"iron-dark\"]" ] ];
 const lifted = [ [ new Map([ [ "::padding", [ "::padding", "s1ufvr2", "padding:var(--space-4)" ] ], [ "::color", [ "::color", "s8f74a7", "color:var(--color-ink)" ] ], [ "::background-color", [ "::background-color", "s1caphfa", "background-color:var(--color-ground)" ] ], [ "::border", [ "::border", "syywdmj", "border:1px solid rgb(from var(--color-ink) r g b / 0.2)" ] ], [ "::box-shadow", [ "::box-shadow", "s1qtu9wx", "box-shadow:0 1px 2px rgba(0, 0, 0, 0.08)" ] ], [ ":^[data-theme=\"iron-dark\"]:box-shadow", [ ":^[data-theme=\"iron-dark\"]:box-shadow", "shy6qhb", "box-shadow:none" ] ], [ ":^[data-theme=\"iron-dark\"] hover:border-color", [ ":^[data-theme=\"iron-dark\"] hover:border-color", "sl22br5", "border-color:var(--color-ink)" ] ] ]) ] ];
 console.log(class_list(lifted));

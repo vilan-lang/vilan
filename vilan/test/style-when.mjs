@@ -20,6 +20,15 @@ function __map_values(map) {
 function hash(self) {
 	return __hash(self);
 }
+function slot_of(key) {
+	const parts = key.split(":");
+	if (parts.length !== 3) {
+		(() => {
+			throw "this style\'s slot key is not one media:condition:property triple (got \"" + key + "\"" + ") \u{2014} every field that reaches a key is fenced against \':\' where it is written, so a key holding another one means a condition token was minted carrying the key\'s own separator; that is the bug, not this read";
+		})();
+	}
+	return [ __at(parts, 0), __at(parts, 1), __at(parts, 2) ];
+}
 function family_longhands(property) {
 	const $g = property;
 	let $h = null;
@@ -57,15 +66,12 @@ function without_covered(rules, media, condition, property) {
 	}
 	let out = __clone(rules);
 	for (const key of $a(rules)) {
-		const parts = key.split(":");
-		if (__at(parts, 0) === media && __at(parts, 1) === condition && longhands.includes(";" + __at(parts, 2) + ";")) {
+		const slot = slot_of(key);
+		if (slot[0] === media && slot[1] === condition && longhands.includes(";" + slot[2] + ";")) {
 			$i(out, key);
 		}
 	}
 	return out;
-}
-function token_is_negated(token) {
-	return token.startsWith("!");
 }
 function when(self, condition, delta) {
 	let $k = null;
@@ -82,11 +88,6 @@ function class_list(self) {
 		const $m = entry;
 		const class2 = $m[0];
 		const _declaration = $m[1];
-		if (token_is_negated(class2)) {
-			(() => {
-				throw "this style carries an unwrapped not(..): `not` marks the condition immediately outside it and emits no rule of its own, so wrap it before applying the style \u{2014} attribute(name, value, not(..)), within(name, value, not(..)), hover(not(..))";
-			})();
-		}
 		if (out === "") {
 			out = class2;
 		} else {
@@ -102,8 +103,8 @@ function add(self, b) {
 		let $f = null;
 		if ($e[0] === 0) {
 			const entry = $e[1];
-			const parts = key.split(":");
-			rules = without_covered(rules, __at(parts, 0), __at(parts, 1), __at(parts, 2));
+			const slot = slot_of(key);
+			rules = without_covered(rules, slot[0], slot[1], slot[2]);
 			$j(rules, key, entry);
 			$f = undefined;
 		} else {

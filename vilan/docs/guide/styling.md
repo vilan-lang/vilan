@@ -90,17 +90,20 @@ fun main() {
 a dotted `.name { … }` is a condition combinator and becomes
 `.name(style() … )`, with the block's own chain as its last argument.
 The dot is the only thing the grammar looks at, so every condition
-method works inside a block — `.hover`, `.md`, `.within("data-theme",
-"dark")`, `.children`, `.attribute("data-open", Some("true"))` — including
-ones added later, and nesting order is combinator order: media outside,
-then the relation, then the attribute, then the pseudo-class.
+method works inside a block — `.hover`, `.md`, `.children` — including ones
+added later, and so does `.on(<set>)`, the head that takes a condition SET and
+has no nesting order to get wrong.
 
 ```vilan,fragment
 let panel = css {
 	color: {Color::gray(900)};
 
-	.within("data-theme", Some("dark")) {
+	.on(within(attribute("data-theme").eq("dark"))) {
 		color: {Color::gray(50)};
+	}
+
+	.on(hover() + active().not()) {
+		color: {Color::blue(600)};
 	}
 
 	.children {
@@ -108,6 +111,9 @@ let panel = css {
 	}
 };
 ```
+
+The condition constructors are ambient inside a block, like the token
+vocabulary below, so a head needs no import.
 
 Values are text and **holes**. Anything you can write in CSS rides
 through verbatim — `repeat(3, 1fr)`, `url("tile.png")`, `50%`, `1.5rem`
@@ -121,9 +127,12 @@ token too: `border: 1px solid {Color::gray(500)};` writes
 
 **Inside a block, the token vocabulary is ambient.** `rem`, `px`, `em`,
 `pct`, `vh`, `vw`, `auto` and `space`; `black`, `white`, `transparent`,
-`hex`, `gray`, `blue`, `red`, `green`, `rgba` and `oklch` — the
-`std::style::prelude` module, in scope inside a `css` block and nowhere
-else, so a hole reads as the CSS it stands for:
+`hex`, `gray`, `blue`, `red`, `green`, `rgba` and `oklch`; and the condition
+constructors a `.on(..)` head takes — `hover`, `focus`, `active`, `disabled`,
+`first`, `last`, `pseudo`, `element`, `attribute`, `within`, `children`,
+`divide`, `media`, `sm`, `md`, `lg`, `xl`. That is the `std::style::prelude`
+module, in scope inside a `css` block and nowhere else, so a hole reads as the
+CSS it stands for:
 
 ```vilan,fragment
 let chip = css {
@@ -444,58 +453,72 @@ let lit = const card + style().border_color(Color::blue(600));
 
 ## States and breakpoints
 
-Hover, focus, and friends take an **inner** style. Everything in the
-inner style applies under that condition:
+A **condition** is a value. `hover()` is one, `active().not()` is one, and
+`+` intersects them into a SET — "both of these at once". `on(conditions,
+inner)` puts a style under a set:
 
 ```vilan,fragment
 let button = const style()
 	.background(Color::blue(600))
-	.hover(style().background(Color::blue(500)))
-	.focus(style().raw("outline", "2px solid"))
-	.disabled(style().opacity(0.5));
+	.on(hover(), style().background(Color::blue(500)))
+	.on(focus(), style().raw("outline", "2px solid"))
+	.on(disabled(), style().opacity(0.5));
 ```
 
-Available: `.hover`, `.focus`, `.active`, `.disabled`, `.first`,
-`.last`, and `.pseudo(name, inner)` for anything else.
+The constructors: `hover()`, `focus()`, `active()`, `disabled()`, `first()`,
+`last()`, and `pseudo(name)` for any other pseudo-class. A pseudo-ELEMENT is
+its own value, `element("selection")` for `::selection` — CSS puts one at the
+end of a compound and lets nothing follow it, which is a rule about the value
+and not about where you wrote it.
 
-Two more conditions round the set out. `.attribute(name, value, inner)`
-conditions on an attribute of the element **itself**, and its value is an
-`Option`: `Some("true")` is the exact match `[data-open="true"]`, `None` is
-**presence** — `[data-selected]`, `[disabled]`, the shape a boolean attribute
-actually has in markup. And `.not(inner)` **negates the condition immediately
-outside it**: it emits nothing on its own, it marks its inner, and the
-enclosing condition renders its own selector negated.
+`attribute(name)` conditions on an attribute of the element **itself**:
+`attribute("data-selected")` is **presence** — `[data-selected]`,
+`[disabled]`, the shape a boolean attribute actually has in markup — and
+`attribute("data-open").eq("true")` is the exact match `[data-open="true"]`.
+`.not()` negates the condition it is written on, which is the whole reason a
+condition is a value:
 
 ```vilan,fragment
 let row = const style()
-	.attribute("data-selected", None, style().background(Color::blue(100)))
-	.attribute("disabled", None, style().not(style().hover(style().background(Color::gray(50)))))
-	.hover(style().not(style().opacity(0.6)));
+	.on(attribute("data-selected"), style().background(Color::blue(100)))
+	.on(attribute("disabled").not() + hover(), style().background(Color::gray(50)))
+	.on(hover().not(), style().opacity(0.6));
 ```
 
 That is `.sX[data-selected]`, `.sX:not([disabled]):hover` — hovered *and* not
-disabled, the pair that had no spelling before — and `.sX:not(:hover)`. Read
-inside-out: `not` negates exactly the next condition out, never its own inner.
-A `not` left unwrapped is refused when the style is applied, a double `not` is
-refused rather than cancelled, and a breakpoint cannot be negated in this
-version.
-Breakpoints work the same way: `.sm(inner)` (640px), `.md(inner)`
-(768px), `.lg(inner)` (1024px), `.xl(inner)` (1280px), or
-`.media(min_width, inner)`. All are `min-width` conditions, so chains are
-mobile-first: in `.sm(grid_cols(2)).lg(grid_cols(3))` the widest matching
+disabled — and `.sX:not(:hover)`. Nothing has to be read inside-out: the
+negation is where the negated thing is.
+
+A set has no ORDER. `hover() + md()` and `md() + hover()` are the same set,
+canonicalise to the same key and mint the same class — so two people who mean
+one rule get one rule. Two conditions that contradict (`hover() +
+hover().not()`) are refused, as are two breakpoints in one set, two ancestor
+guards, two child relations and two pseudo-elements.
+
+**The named combinators stay**, as sugar for exactly one condition:
+`.hover(inner)` is `.on(hover(), inner)`, and the same for `.focus`,
+`.active`, `.disabled`, `.first`, `.last`, `.pseudo(name, inner)`,
+`.children(inner)`, `.divide(inner)`, `.sm`/`.md`/`.lg`/`.xl` and
+`.media(min_width, inner)`. Most rules have one condition, and for those the
+sugar is the shorter spelling. Reach for `.on(..)` when a rule has two.
+
+Breakpoints: `sm()` (640px), `md()` (768px), `lg()` (1024px), `xl()`
+(1280px), or `media(min_width)`. All are `min-width` conditions, so chains
+are mobile-first: in `.sm(grid_cols(2)).lg(grid_cols(3))` the widest matching
 breakpoint wins (the stylesheet emits media rules in ascending min-width
-order, which is what makes that true).
+order, which is what makes that true). A set holds at most one.
 
 ## Theming, and stacking conditions
 
-`.within(name, Some(value), inner)` applies under an **ancestor** carrying the
-attribute — `within("data-theme", "dark", ..)` is the theme condition,
-under a `[data-theme="dark"]` switch you set on the document, not
-`prefers-color-scheme`. That is deliberate: a server can decide the theme
-and write the attribute before a byte of JavaScript runs, and a user's
-toggle is one attribute write. Nothing is special about the theme: any
-ancestor state rides — an n-ary theme id (`within("data-theme",
-"iron-dark", ..)`), a density mode, a `[data-collapsed]` sidebar.
+`within(condition)` applies under an **ancestor** matching `condition`.
+`within(attribute("data-theme").eq("dark"))` is the theme condition, under a
+`[data-theme="dark"]` switch you set on the document, not
+`prefers-color-scheme`. That is deliberate: a server can decide the theme and
+write the attribute before a byte of JavaScript runs, and a user's toggle is
+one attribute write. Nothing is special about the theme: any ancestor state
+rides — an n-ary theme id (`within(attribute("data-theme").eq("iron-dark"))`),
+a density mode, a `[data-collapsed]` sidebar, or a pseudo-class the ancestor
+is in (`within(hover())`).
 
 For colours, the stronger recipe is usually no condition at all: declare
 per-theme custom properties with a [declaration
@@ -504,44 +527,46 @@ block](../std/style.md#declaration-blocks) and read them with
 the variables, and `within` covers the *structural* changes a value swap
 cannot express.
 
-Conditions **stack**, nesting outside-in in the order the CSS nests them:
-a breakpoint outside the guard, the guard outside the pseudo-class.
+Conditions **stack** by being summed, in any order you like:
 
 ```vilan,fragment
 let button = const style()
 	.background(Color::gray(100))
-	.hover(style().background(Color::gray(200)))
-	.within("data-theme", Some("dark"), style().background(Color::gray(800)))
-	.within("data-theme", Some("dark"), style().hover(style().background(Color::gray(700))))
-	.md(style().within("data-theme", Some("dark"), style().hover(style().background(Color::gray(600)))));
+	.on(hover(), style().background(Color::gray(200)))
+	.on(within(attribute("data-theme").eq("dark")), style().background(Color::gray(800)))
+	.on(within(attribute("data-theme").eq("dark")) + hover(), style().background(Color::gray(700)))
+	.on(md() + within(attribute("data-theme").eq("dark")) + hover(), style().background(Color::gray(600)));
 ```
 
-Write them in any other order and the build stops and tells you which
-order it wanted — `hover(within(..))` says to write `within(..,
-hover(..))`. No axis may wrap itself, so one media, one guard and one
-pseudo-class is the whole lattice.
+The emitted selector still nests the way CSS nests it — the breakpoint
+outermost, then the ancestor guard, then the element's own attributes and
+pseudo-classes — and that is the canonicaliser's job, not yours.
 
-Why the order matters beyond spelling: `within(.., hover(..))` produces a
-*more specific* selector than either `within(..)` or `hover(..)`, so it
-beats both. Between a plain `.within(.., x)` and a plain `.hover(y)` on
-the same property the guard wins — a theme shouldn't be undone by a hover
-— so when a dark theme needs its own hover colour, say so with
-`within(.., hover(..))`.
+Why it matters beyond spelling: `within(..) + hover()` produces a *more
+specific* selector than either part, so it beats both. Between a plain
+`within(..)` rule and a plain `hover()` rule on the same property the guard
+wins — a theme shouldn't be undone by a hover — so when a dark theme needs its
+own hover colour, say so with the two conditions in one set.
+
+The NESTED spelling still works and still has exactly one legal order:
+`md(within(attribute(hover(..))))`. Write any other and the build stops and
+names both fixes — the nesting it wanted, and the set that has no order to get
+wrong.
 
 ## Styling children from the parent
 
-`.children(inner)` styles every direct child of the element, and
-`.divide(inner)` every direct child but the first — the parent-owned
-spacing idioms (Tailwind's `space-*` and `divide-*`):
+`children()` conditions on every direct child of the element, and `divide()`
+on every direct child but the first — the parent-owned spacing idioms
+(Tailwind's `space-*` and `divide-*`):
 
 ```vilan,fragment
 let list = const style()
-	.children(style().padding_y(space(2)))
-	.divide(style().border_top(Length::px(1), Color::gray(200)));
+	.on(children(), style().padding_y(space(2)))
+	.on(divide(), style().border_top(Length::px(1), Color::gray(200)));
 ```
 
 Two rules make this safe to use anywhere. First, **a child's own style
-always wins**: a `children`/`divide` rule is emitted in a lower cascade
+always wins**: a rule carrying a child relation is emitted in a lower cascade
 layer, so anything the child says about itself — through its own
 `style()` — overrides what its parent reaches in with, whatever the
 selectors' specificity. They set defaults the child may refuse; they are
@@ -549,8 +574,16 @@ not a way to force a child's hand. Second, where `children` and `divide`
 touch the *same* property, `divide` wins on every child but the first —
 the narrower relation outranks the blanket, whichever you wrote first.
 
-Both take an unconditioned inner style: to give the children a hover
-colour, put the `hover(..)` on the child's own style.
+A guard and a child relation are not the same slot, so they compose:
+`.on(within(attribute("data-theme").eq("dark")) + children(), ..)` is
+`[data-theme="dark"] .sX > *`, a selector the nested form could never spell.
+A rule carrying a child relation is layered whatever else conditions it,
+because it reaches in.
+
+The `.children(inner)` and `.divide(inner)` sugar takes an UNCONDITIONED
+inner style: a pseudo-class under it would bind to the child's compound,
+which is not what it looks like it says. Put a state on the child's own
+style, or write the set.
 
 ## Dynamic values
 

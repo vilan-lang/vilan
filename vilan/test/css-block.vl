@@ -77,23 +77,22 @@ fun values(): Style {
 	}
 }
 
-// The relation axis reads as nesting, and nesting order IS combinator order:
-// media outermost, then the relation, then the attribute, then the
-// pseudo-class. The shape that is legal is the shape that reads correctly —
-// and it is also the shape the formatter sorts sibling conditions into.
+// A dotted head is name-blind (css-block.md §5.3), so `.on(<set>) { … }` is a
+// head like any other: it lowers to `.on(<set>, style() … )` with no new
+// lowering rule, and the constructors are ambient inside a block so it needs no
+// import. The SET has no order — the canonicaliser puts the tokens in the one a
+// selector is written in — while the nesting sugar below it still has exactly
+// one legal order, media outermost. The formatter sorts both: sibling
+// conditions by axis, and the values inside a head by the same axis order.
 fun conditions(): Style {
 	css {
 		color: {Color::gray(900)};
 		.md {
-			.within("data-theme", Some("dark")) {
-				.attribute("data-open", Some("true")) {
-					.hover {
-						color: {Color::gray(50)};
-					}
-				}
+			.on(within(attribute("data-theme").eq("dark")) + attribute("data-open").eq("true") + hover()) {
+				color: {Color::gray(50)};
 			}
 		}
-		.within("data-theme", Some("dark")) {
+		.on(within(attribute("data-theme").eq("dark"))) {
 			color: {Color::gray(50)};
 			.hover {
 				color: {Color::gray(100)};

@@ -13815,6 +13815,50 @@ pub(crate) mod tests {
         );
     }
 
+    // §7.1's new row (A95 S3): inside an `.on(<set>)` head the vocabulary is the
+    // condition VALUES — the same rows the combinator list reads, as the free
+    // constructors a set is summed from. The head's arguments are ordinary
+    // expression ground everywhere else, and the two places that are not are
+    // directly after the `(` and directly after a `+`.
+    #[test]
+    fn css_on_head_offers_the_condition_constructors() {
+        for body in [
+            "\tlet card = css {\n\t\t.on(~\n\t};\n",
+            "\tlet card = css {\n\t\t.on(ho~\n\t};\n",
+            "\tlet card = css {\n\t\t.on(hover() + ~\n\t};\n",
+            "\tlet card = css {\n\t\t.on(hover() + ac~\n\t};\n",
+        ] {
+            let labels = css_block_completions(body);
+            for condition in ["hover", "active", "attribute", "within", "md", "element"] {
+                assert!(
+                    labels.contains(&condition.to_string()),
+                    "`{condition}` is a condition value: {body:?} {labels:?}"
+                );
+            }
+            assert!(
+                !labels.contains(&"display".to_string()),
+                "a head is never the property vocabulary: {body:?} {labels:?}"
+            );
+        }
+        // `element` is a VALUE with no combinator twin, so it appears here and
+        // NOT in the dotted-head list — which is the one difference between the
+        // two readings of the table.
+        let dotted = css_block_completions("\tlet card = css {\n\t\t.~\n\t};\n");
+        assert!(
+            !dotted.contains(&"element".to_string()),
+            "there is no `Style::element` combinator: {dotted:?}"
+        );
+        // The negative that keeps the position honest: a head's OTHER arguments
+        // are ordinary expression ground, exactly as they were.
+        let inner = css_block_completions(
+            "\tlet ink = Color::gray(900);\n\tlet card = css {\n\t\t.on(hover(), i~\n\t};\n",
+        );
+        assert!(
+            !inner.contains(&"element".to_string()),
+            "past the head's comma the condition vocabulary stops: {inner:?}"
+        );
+    }
+
     // §7.1 row 4: a hole is an ordinary expression, and completes as one —
     // "unchanged", which is what makes typed values reachable at all.
     #[test]

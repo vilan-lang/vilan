@@ -383,17 +383,44 @@ fun check_oklch(lightness: f64, chroma: f64, hue: f64) {
 /// variable was never set — which is how real code writes background sizes and
 /// data-URI images. Everything else in a CSS expression is text this language
 /// deliberately does not model.
-/// A pseudo-class NAME's fence. The name is free-form and reaches all of CSS —
-/// including a compound nothing else here can spell — but it may not open with
-/// one of the condition grammar's own marker bytes, because the grammar reads
-/// an axis off that byte and a name claiming one would be read as the axis it
-/// claims rather than as a pseudo-class.
+/// A pseudo-class NAME's fence. The name is free-form and reaches all of CSS,
+/// but it names ONE pseudo-class: it may not open with one of the condition
+/// grammar's own marker bytes, because the grammar reads an axis off that byte
+/// and a name claiming one would be read as the axis it claims; and it may not
+/// carry a `:` at all.
+///
+/// The `:` is B311's whole class (A95 S2). It was the one surface that could
+/// put the slot key's own field separator inside a condition, and it was
+/// reached for because the surface underneath it could not say what the author
+/// meant: `pseudo("hover:not(:active)")` is TWO pseudo-classes written as a
+/// string, and `pseudo(":selection")` is a pseudo-ELEMENT smuggled through a
+/// leading colon. Both now have values of their own — `hover() +
+/// active().not()` and `element("selection")` — so the string form is refused
+/// rather than fenced at the places it could do damage.
 fun check_pseudo_name(name: str) {
+	if name.contains(":") {
+		panic(i"a pseudo-class name cannot contain ':' (got \"{name}\") — one value is one pseudo-class, and ':' is the slot key's own field separator. Two pseudo-classes on one rule are two CONDITIONS — .on(hover() + active().not(), ..) — and a leading colon meant a pseudo-ELEMENT, which is element(name) for `::name`");
+	}
 	if name.starts_with("!") {
-		panic(i"a pseudo-class name cannot start with '!' (got \"{name}\") — a leading '!' is the condition grammar's negation marker; write not(..) inside the condition you want negated");
+		panic(i"a pseudo-class name cannot start with '!' (got \"{name}\") — a leading '!' is the condition grammar's negation marker; write `.not()` on the condition you want negated (pseudo(\"focus-visible\").not())");
 	}
 	if name.starts_with("%") {
 		panic(i"a pseudo-class name cannot start with '%' (got \"{name}\") — a leading '%' is the condition grammar's pseudo-ELEMENT marker; write element(name) for `::name`, which is its own axis because a pseudo-element comes last in a compound selector and only one may appear");
+	}
+}
+
+/// A written PROPERTY's fence, shared by `Style::raw` and `Declarations::raw`
+/// (B322). `:` and `;` are the declaration's own delimiters — `raw("color:red",
+/// "x")` is a whole declaration smuggled into the property position — and `:`
+/// is also the slot key's, which is why `Style::raw` has to pay this and not
+/// only the declaration writer: the key joins `media:condition:property` for
+/// the content hash and for the map index, and a property carrying one would
+/// make that join stop naming exactly one triple.
+fun check_property_name(property: str) {
+	for banned in [":", ";"] {
+		if property.contains(banned) {
+			panic(i"a declaration's property cannot contain '{banned}' (got \"{property}\") — it separates the property from its value and from the next declaration; pass the value as the second argument");
+		}
 	}
 }
 
@@ -776,10 +803,66 @@ fun encode36(value: u32): str {
 
 // --- Style ----------------------------------------------------------------------
 
+/// ONE SLOT'S IDENTITY, as a RECORD: the breakpoint, the condition set's
+/// rendered token list, and the CSS property — the three fields a rule is
+/// keyed by.
+///
+/// **A slot is READ as a record and STORED as the joined key** (A95 S2, R3),
+/// and the split of those two jobs is the whole of B311's and B322's fix.
+/// Every reader used to `key.split(":")` for itself and index the pieces
+/// positionally, so a field carrying the separator mis-aligned all three: the
+/// condition stopped at the first `:`, the rest was read as the PROPERTY, and
+/// the wrapping combinator re-minted a strictly weaker selector in silence.
+/// There is now ONE reader ([`slot_of`]) and it is TOTAL — every field is
+/// fenced against the separator where it enters (an attribute's name and
+/// value, a pseudo-class name, a breakpoint's width, a written property), and
+/// the one thing the fences cannot promise about a field that has not been
+/// invented yet, the reader asserts: a key that does not name exactly one
+/// triple fails the build instead of being mis-read.
+///
+/// The key stays the JOINED spelling because the class name is a content hash
+/// of it — keeping those bytes is what keeps every already-minted class name
+/// exactly as it was — and because it is what a `Style` CARRIES: the record is
+/// const-time reading, and a slot's identity would otherwise be three strings
+/// per slot in the emitted bundle for facts the runtime never asks about
+/// (`class_list` reads the class, and nothing else survives to run). Measured
+/// on kolt before this shape was settled: storing the triple beside each slot
+/// cost 26,201 B of client bundle, 9.4 %.
+struct Slot {
+	media: str,
+	condition: str,
+	property: str,
+}
+
+/// The three identifying fields, joined — a slot's key, the map index, and the
+/// string the class hash is taken over. [`slot_of`] is its inverse.
+fun slot_key(media: str, condition: str, property: str): str {
+	media + ":" + condition + ":" + property
+}
+
+/// A slot key read back as a record — the ONLY place a key is taken apart, and
+/// total by construction.
+///
+/// The assertion is not defensive clutter, it is the fence that cannot be
+/// forgotten. `:` is banned from an attribute's name and value
+/// (`check_attribute_name`/`check_attribute_value`), from a pseudo-class name
+/// (`check_pseudo_name`, B311), from a breakpoint's width (`media_condition`)
+/// and from a written property (`check_property_name`, B322) — so today the
+/// join names exactly one triple. A condition token invented later has one
+/// place to get that wrong, and here it fails the build loudly rather than
+/// re-minting a weaker selector in silence, which is what B311 actually was.
+fun slot_of(key: str): Slot {
+	let parts = key.split(":");
+	if parts.len() != 3 {
+		panic(i"this style's slot key is not one media:condition:property triple (got \"{key}\") — every field that reaches a key is fenced against ':' where it is written, so a key holding another one means a condition token was minted carrying the key's own separator; that is the bug, not this read");
+	}
+	Slot { media = parts[0], condition = parts[1], property = parts[2] }
+}
+
 struct Style {
-	// Slot key `media:condition:property` -> (class name, declaration). The
-	// declaration is kept so condition combinators can re-emit it under
-	// their selector.
+	// The slot key (`slot_key`) -> (class name, declaration). The declaration
+	// is kept so a condition combinator can re-mint it under its own selector;
+	// the key's three fields are read through `slot_of`, never split by hand.
 	rules: Map<str, (str, str)>,
 }
 
@@ -848,49 +931,14 @@ fun without_covered(
 	}
 	mut out = rules;
 	for key in rules.keys() {
-		let parts = key.split(":");
-		if parts[0] == media && parts[1] == condition && longhands.contains(";" + parts[2] + ";") {
+		let slot = slot_of(key);
+		if slot.media == media && slot.condition == condition && longhands.contains(";"
+			+ slot.property
+			+ ";") {
 			out.remove(key);
 		}
 	}
 	out
-}
-
-/// The condition grammar carries the NEGATION marker (A89) in two shapes, and
-/// keeping them apart is what lets a negation nest inside a condition that is
-/// itself negated:
-///
-/// - **Pending**, a `!` as the condition's own FIRST TOKEN (`"!"`, `"! hover"`).
-///   `not(inner)` leaves it: `not` names no selector of its own, so it cannot
-///   emit, and the condition combinator immediately OUTSIDE it is the one that
-///   knows which selector to negate. A pending mark never reaches
-///   [`render_rule`] — the enclosing combinator consumes it, or one of the three
-///   refusals fires.
-/// - **Applied**, a `!` PREFIXING one token (`![data-open="true"]`, `!hover`,
-///   `!^[data-theme="dark"]`). That is the negation already placed on its axis,
-///   and it is what `render_rule` turns into `:not(..)`.
-fun condition_is_marked(condition: str): bool {
-	condition == "!" || condition.starts_with("! ")
-}
-
-/// The condition a pending mark was left on — `"! hover"` is a marked `"hover"`.
-fun condition_unmarked(condition: str): str {
-	if condition == "!" {
-		""
-	} else if condition.starts_with("! ") {
-		condition.substring(2, condition.len())
-	} else {
-		condition
-	}
-}
-
-/// `condition_unmarked`'s inverse: the condition with a pending mark on it.
-fun condition_marked(condition: str): str {
-	if condition == "" {
-		"!"
-	} else {
-		"! " + condition
-	}
 }
 
 /// Whether a condition TOKEN carries an applied negation, and the token without
@@ -948,32 +996,6 @@ fun condition_pseudo(condition: str): str {
 		""
 	} else {
 		last
-	}
-}
-
-/// A slot key is THREE fields — `media:condition:property` — and every
-/// condition combinator re-reads an inner style's keys by splitting on `:`.
-/// `pseudo`'s name is free-form, so a name carrying a `:`
-/// (`"hover:not(:active)"`) is the one way a condition can hold the key's own
-/// delimiter, and the split then mis-aligns: the second field stops at the
-/// first `:` and the rest of the compound is read as the PROPERTY. A wrapping
-/// combinator re-mints the slot from those pieces, so it emits a strictly
-/// WEAKER selector and says nothing — B311's miscompile,
-/// `attribute("data-open", Some("true"), pseudo("hover:not(:active)", s))`
-/// emitting `.sX[data-open="true"]:hover` with the `:not(:active)` gone.
-///
-/// The fence is on the WRAP rather than on the name, because UNWRAPPED the raw
-/// token is sound and is in use: `rule` renders the condition it was handed
-/// verbatim and nothing ever re-splits it, so `pseudo("hover:not(:active)", s)`
-/// at the top of a chain emits exactly what it says. `+` is not a wrap either —
-/// it replays a slot under its own key — so a style carrying a raw token still
-/// merges.
-///
-/// A95 is the real fix: a condition becomes a VALUE, two pseudo-classes on one
-/// rule become two values, and no condition is ever a string to split.
-fun check_wrappable_slot(key: str, outer: str) {
-	if key.split(":").len() != 3 {
-		panic(i"{outer} cannot wrap a condition containing ':' — a slot key is media:condition:property, every condition combinator re-reads the inner style's keys by splitting on ':', and a pseudo-class name that carries one (hover:not(:active)) mis-aligns the split, so the wrapped rule would silently lose everything after it. UNWRAPPED the raw token still emits verbatim — nothing re-splits a condition that is only rendered — so write the whole compound in one pseudo(..) with no condition around it; two conditions on one rule is what A95 redesigns, not this spelling.");
 	}
 }
 
@@ -1042,6 +1064,18 @@ fun token_axis(token: str): i32 {
 /// construction: every value handed out below has been through
 /// [`canonical_condition`], so nothing downstream re-sorts, re-checks or
 /// wonders.
+///
+/// **`PartialEq` is never derived here, and `.eq(..)` is the attribute
+/// condition's value** (A95 S2, R2). The two spellings would collide —
+/// `attribute("data-open").eq("true")` is "narrow this attribute condition to
+/// that value", and `PartialEq::eq` would be "are these two conditions the same
+/// value" — and of the two, only the first is a thing anyone writes. A
+/// condition is never compared by user code: the canonicaliser compares TOKENS
+/// internally (`compare_condition_tokens`, `List::contains` over `str`), which
+/// is where equality actually lives and is exactly why the type does not need
+/// it. So the rule is written here rather than discovered later: if `Condition`
+/// ever needs structural equality it gets a named method, and `.eq(..)` keeps
+/// the meaning the surface was learned with.
 struct Condition {
 	tokens: List<str>,
 }
@@ -1171,7 +1205,7 @@ fun check_condition_set(tokens: List<str>) {
 }
 
 /// A token with its negation flipped ON — the form the contradiction check
-/// looks for and the form a pending `not(..)` mark applies.
+/// looks for, and the form `Condition::not` applies.
 fun negated_token(token: str): str {
 	if token_is_negated(token) {
 		token
@@ -1213,14 +1247,56 @@ fun within_condition(condition: Condition): Condition {
 		panic("within(..) guards on ONE condition and was given a set — an ancestor carrying several conditions is a selector this version does not spell; guard on the one that identifies the ancestor");
 	}
 	let token = condition.tokens[0];
-	if token_axis(token) != 3 {
-		panic(i"within(..) guards on an ancestor's ATTRIBUTE in this version and was given {token} — the ancestor's selector travels inside the slot key, where a ':' mis-aligns every split of it (B311), so a pseudo-class or a relation cannot ride there yet; write within(attribute(name)) or within(attribute(name).eq(value))");
+	let axis = token_axis(token);
+	// A guard holds a condition that selects an ELEMENT: an attribute on it, or
+	// a pseudo-class it is in. The other three axes are not element selectors at
+	// all — a breakpoint conditions the VIEWPORT, a relation says where a rule
+	// reaches rather than what it matches, and a pseudo-element is a piece of a
+	// box no ancestor can be.
+	//
+	// The guard carries the inner TOKEN and not its rendered selector, which is
+	// what makes `within(hover())` land (A95 S2, R3): `^hover` holds no `:`, and
+	// `render_rule` renders it through the same per-axis rendering every other
+	// token gets. Storing `^:hover` was S1's shape and was refused for exactly
+	// that byte.
+	if axis == 0 {
+		panic("within(..) guards on an ANCESTOR and was given a breakpoint — a media query conditions the viewport, not an element, so it belongs beside the guard in the set rather than inside it: .on(md() + within(attribute(name)), ..)");
+	}
+	if axis == 1 {
+		panic("within(..) guards on ONE ancestor and was given another guard — a grandparent chain is a selector this version does not spell; guard on the ancestor that identifies the state");
+	}
+	if axis == 2 {
+		panic("within(..) guards on an ancestor's own condition and was given a child relation — children() and divide() say where a rule REACHES, not what an ancestor matches, so they belong beside the guard in the set: .on(within(attribute(name)) + children(), ..)");
+	}
+	if axis == 5 {
+		panic("within(..) guards on an ancestor and was given a pseudo-element — `::selection` is a piece of a box CSS paints, never an element something can be inside of; guard on an attribute or a pseudo-class");
 	}
 	condition_of(i"^{token}")
 }
 
+/// The ANCESTOR's own selector, rendered from the token a guard carries — the
+/// same per-axis rendering `render_rule` gives the element's own compound, one
+/// level out. An attribute token is already selector syntax; a pseudo-class
+/// token takes its `:`.
+fun guard_selector(token: str): str {
+	let bare = token_bare(token);
+	let negated = token_is_negated(token);
+	let selector = if token_axis(bare) == 4 { ":" + bare } else { bare };
+	if negated {
+		i":not({selector})"
+	} else {
+		selector
+	}
+}
+
 fun media_condition(min_width: str): Condition {
 	check_not_blank("a breakpoint", min_width);
+	// B322's other latent half: the width is field 0 of the joined slot key, so
+	// a `:` in it would make the join stop naming one triple. `sm`/`md`/`lg`/`xl`
+	// could never reach this; `media(min_width)` takes whatever it is given.
+	if min_width.contains(":") {
+		panic(i"a breakpoint's min-width cannot contain ':' (got \"{min_width}\") — it is the slot key's own field separator, and a width is a CSS length (media(\"768px\"), or the named sm/md/lg/xl)");
+	}
 	condition_of("@" + min_width)
 }
 
@@ -1282,6 +1358,10 @@ fun within(condition: Condition): Condition {
 /// idiom. Its rule emits inside `@layer vilan`, so a child's own `Style`
 /// always wins against a rule reaching in from an ancestor.
 fun children(): Condition {
+	children_condition()
+}
+
+fun children_condition(): Condition {
 	condition_of(">*")
 }
 
@@ -1289,6 +1369,10 @@ fun children(): Condition {
 /// its argument's specificity so divide outranks children on a property both
 /// touch, whatever the authoring order.
 fun divide(): Condition {
+	divide_condition()
+}
+
+fun divide_condition(): Condition {
 	condition_of(">*+*")
 }
 
@@ -1407,11 +1491,17 @@ fun condition_from_slot(media: str, condition: str): Condition {
 // --- the sugar's nesting fences ---
 //
 // Under a condition SET there is no nesting order to get wrong, and the six
-// refusals below say there is — which is exactly right for as long as the
-// SUGAR is the documented surface: `md(within(attribute(hover(..))))` has one
-// legal spelling today and an author who writes another meets a message naming
-// the fix rather than a silently different rule. They are the sugar's fences,
-// not the model's, and they go when the new surface is documented.
+// refusals below say there is. They are KEPT (A95 S2, R1) and their steers are
+// rewritten: they are the SUGAR's fences, and the sugar is still a documented
+// surface (§6 — 278 of the estate's call sites are single-condition shapes that
+// want nothing else). Deleting them would make a formerly refused program
+// compile with nothing to steer to; keeping them costs one message that now
+// names the spelling which HAS no order to get wrong.
+//
+// Every one of them therefore ends the same way: write the set. `.on(md() +
+// within(attribute("data-theme").eq("dark")) + hover(), ..)` is one rule, in
+// any written order, and `md(within(attribute(.., hover(..))))` is the only
+// nesting that spells it.
 //
 // Each runs as a PASS over the inner style's slots before any rule is minted,
 // so the message an author meets is the message the interleaved form gave: the
@@ -1419,111 +1509,81 @@ fun condition_from_slot(media: str, condition: str): Condition {
 
 fun fence_within(inner: Style) {
 	for key in inner.rules.keys() {
-		check_wrappable_slot(key, "within");
-		let parts = key.split(":");
-		let rest = condition_unmarked(parts[1]);
-		if parts[0] != "" {
-			panic("nest conditions as md(within(..)) — within cannot wrap a media-conditioned style");
+		let slot = slot_of(key);
+		if slot.media != "" {
+			panic("within cannot wrap a media-conditioned style — nest it as md(within(..)), or write the set and stop nesting: .on(md() + within(attribute(name)), ..)");
 		}
-		if condition_relation(rest) != "" {
-			panic("within cannot wrap an already relation-conditioned style — one within, children or divide per slot");
+		if condition_relation(slot.condition) != "" {
+			panic("within cannot wrap an already relation-conditioned style — one within, children or divide per slot. A guard and a child relation are not the same slot and DO compose, as a set: .on(within(attribute(name)) + children(), ..)");
 		}
 	}
 }
 
 fun fence_child_relation(inner: Style, name: str) {
 	for key in inner.rules.keys() {
-		check_wrappable_slot(key, name);
-		let parts = key.split(":");
-		if parts[0] != "" {
-			panic(i"nest conditions as md({name}(..)) — {name} cannot wrap a media-conditioned style");
+		let slot = slot_of(key);
+		if slot.media != "" {
+			panic(i"{name} cannot wrap a media-conditioned style — nest it as md({name}(..)), or write the set and stop nesting: .on(md() + {name}(), ..)");
 		}
-		if parts[1] != "" {
-			panic(i"{name} takes an unconditioned style — a hover, attribute or within condition belongs on the child's own style; for a state on the element ITSELF, condition it with attribute(..) rather than reaching for a child relation");
+		if slot.condition != "" {
+			panic(i"{name} takes an unconditioned style — a hover, attribute or within condition belongs on the child's own style; for a state on the element ITSELF, condition it with attribute(..), and for a condition BESIDE the relation write the set: .on(attribute(name) + {name}(), ..)");
 		}
 	}
 }
 
 fun fence_attribute(inner: Style) {
 	for key in inner.rules.keys() {
-		check_wrappable_slot(key, "attribute");
-		let parts = key.split(":");
-		let rest = condition_unmarked(parts[1]);
-		if parts[0] != "" {
-			panic("nest conditions as md(attribute(..)) — attribute cannot wrap a media-conditioned style");
+		let slot = slot_of(key);
+		if slot.media != "" {
+			panic("attribute cannot wrap a media-conditioned style — nest it as md(attribute(..)), or write the set and stop nesting: .on(md() + attribute(name), ..)");
 		}
-		if condition_relation(rest) != "" {
-			panic("nest the relation OUTSIDE the attribute — within(.., attribute(..)), not attribute(within(..))");
+		if condition_relation(slot.condition) != "" {
+			panic("nest the relation OUTSIDE the attribute — within(.., attribute(..)), not attribute(within(..)); or write the set, which has no order to get wrong: .on(within(attribute(guard)) + attribute(name), ..)");
 		}
-		if condition_attribute(rest) != "" {
-			panic("attribute cannot wrap an already attribute-conditioned style");
+		if condition_attribute(slot.condition) != "" {
+			panic("attribute cannot wrap an already attribute-conditioned style — two attributes on one rule are two conditions: .on(attribute(a) + attribute(b), ..)");
 		}
 	}
 }
 
 fun fence_pseudo(inner: Style, name: str) {
 	for key in inner.rules.keys() {
-		check_wrappable_slot(key, name);
-		let parts = key.split(":");
-		let rest = condition_unmarked(parts[1]);
-		if parts[0] != "" {
-			panic(i"nest conditions as md(hover(..)) — {name} cannot wrap a media-conditioned style");
+		let slot = slot_of(key);
+		if slot.media != "" {
+			panic(i"{name} cannot wrap a media-conditioned style — nest it as md({name}(..)), or write the set and stop nesting: .on(md() + {name}(), ..)");
 		}
-		if condition_relation(rest) != "" {
-			panic(i"nest the relation OUTSIDE the pseudo — within(.., {name}(..)), not {name}(within(..))");
+		if condition_relation(slot.condition) != "" {
+			panic(i"nest the relation OUTSIDE the pseudo — within(.., {name}(..)), not {name}(within(..)); or write the set, which has no order to get wrong: .on(within(attribute(guard)) + {name}(), ..)");
 		}
-		if condition_attribute(rest) != "" {
-			panic(i"nest the attribute OUTSIDE the pseudo — attribute(.., {name}(..)), not {name}(attribute(..))");
+		if condition_attribute(slot.condition) != "" {
+			panic(i"nest the attribute OUTSIDE the pseudo — attribute(.., {name}(..)), not {name}(attribute(..)); or write the set, which has no order to get wrong: .on(attribute(name) + {name}(), ..)");
 		}
-		if rest != "" {
-			panic(i"{name} cannot wrap an already pseudo-conditioned style");
+		if slot.condition != "" {
+			panic(i"{name} cannot wrap an already pseudo-conditioned style — two pseudo-classes on one rule are two conditions: .on(hover() + active().not(), ..)");
 		}
 	}
 }
 
 fun fence_media(inner: Style) {
 	for key in inner.rules.keys() {
-		check_wrappable_slot(key, "a breakpoint");
-		let parts = key.split(":");
-		if parts[0] != "" {
-			panic("a breakpoint cannot wrap another media-conditioned style");
-		}
-		if condition_is_marked(parts[1]) {
-			panic("a media condition cannot be negated in this version — `not` negates the condition immediately outside it, and `@media not (..)` is a grammar of its own; negate the relation, attribute or pseudo-class INSIDE the breakpoint instead");
+		let slot = slot_of(key);
+		if slot.media != "" {
+			panic("a breakpoint cannot wrap another media-conditioned style — a rule holds ONE min-width, and a set says so in one place: .on(md() + hover(), ..)");
 		}
 	}
 }
 
-/// The INTERSECTION `Style::on` applies: the outer set, plus the inner slot's
-/// own conditions, canonicalised into one — which is what makes `a.on(X,
-/// b.on(Y, s))` give `s` the set `X ∪ Y` and makes every nesting order the
-/// same set.
-///
-/// A89's PENDING MARK is consumed here, and it is the one thing a condition
-/// STRING can carry that a condition value cannot: `not(..)` names no selector
-/// of its own, so the condition immediately enclosing it is negated instead.
-/// With a value that question does not arise — `.not()` is written on what it
-/// negates — so the mark is only ever met coming from the sugar, where the
-/// enclosing set is exactly one condition.
+/// There is no pending MARK to consume here any more, and that is A95 S2's
+/// whole argument made mechanical. A89's `not(inner)` had to leave a `!` on the
+/// inner condition for the combinator OUTSIDE it to apply, because a wrapper
+/// cannot say which of its selectors is negated; a value can, so `.not()` is
+/// written on the condition it negates and the composition is a plain union.
 fun compose_condition(outer: Condition, media: str, condition: str): Condition {
-	let marked = condition_is_marked(condition);
-	let rest = condition_unmarked(condition);
-	let held = outer.tokens.len();
 	mut tokens = List::new();
 	for token in outer.tokens {
-		if marked {
-			if held != 1 {
-				panic(i"not(..) negates the condition immediately outside it, and this one carries {held} conditions — which of them is negated is not decided by anything; negate the condition itself with `.not()`");
-			}
-			if token_axis(token) == 0 {
-				panic("a media condition cannot be negated in this version — `not` negates the condition immediately outside it, and `@media not (..)` is a grammar of its own; negate the relation, attribute or pseudo-class INSIDE the breakpoint instead");
-			}
-			tokens.push(negated_token(token));
-		} else {
-			tokens.push(token);
-		}
+		tokens.push(token);
 	}
-	let inner = condition_from_slot(media, rest);
+	let inner = condition_from_slot(media, condition);
 	for token in inner.tokens {
 		tokens.push(token);
 	}
@@ -1594,7 +1654,8 @@ fun render_rule(media: str, condition: str, property: str, class: str, declarati
 				// NEGATED guard and a plain pseudo rule, which now falls to the
 				// pseudo (ui-styling.md §0bis.6's ledger reads the un-negated
 				// case).
-				let guard = bare.substring(1, bare.len());
+				let inner = bare.substring(1, bare.len());
+				let guard = guard_selector(inner);
 				prefix = (if negated { i":not({guard})" } else { guard }) + " ";
 			}
 			if axis == 2 {
@@ -1678,7 +1739,7 @@ impl Style {
 	/// it yet: `flush_stylesheet` above writes the staged rules whose class
 	/// survived, once, at the end of const evaluation.
 	fun rule(self, media: str, condition: str, property: str, declaration: str): Style {
-		let key = media + ":" + condition + ":" + property;
+		let key = slot_key(media, condition, property);
 		let class = class_hash(key + "|" + declaration);
 		stage_rule(class, render_rule(media, condition, property, class, declaration));
 		mut rules = without_covered(self.rules, media, condition, property);
@@ -1691,6 +1752,7 @@ impl Style {
 	/// whose theme token carries its own `:root` line onto the sheet, so
 	/// `.raw("padding", space(4))` is never a dangling `var()`.
 	fun raw<V: CssValue>(self, property: str, value: V): Style {
+		check_property_name(property);
 		let root = value.css_root();
 		if root != "" {
 			emit("css", root);
@@ -2081,13 +2143,12 @@ impl Style {
 		let set = conditions.conditions();
 		mut out = self;
 		for key in inner.rules.keys() {
-			check_wrappable_slot(key, "on");
+			let slot = slot_of(key);
 			match inner.rules.get(key) {
 				Some(let entry) => {
 					let (_class, declaration) = entry;
-					let parts = key.split(":");
-					let composed = compose_condition(set, parts[0], parts[1]);
-					out = out.rule(condition_set_media(composed), condition_set_text(composed), parts[2], declaration);
+					let composed = compose_condition(set, slot.media, slot.condition);
+					out = out.rule(condition_set_media(composed), condition_set_text(composed), slot.property, declaration);
 				}
 				None => {}
 			}
@@ -2115,10 +2176,11 @@ impl Style {
 	// no nesting order of its own — it sits directly inside the condition it
 	// negates, on whichever axis that is.
 	//
-	// Every combinator here WRAPS: it re-reads the inner style's slot keys and
-	// re-mints each slot under its own condition. That re-read is a split on
-	// `:`, so a condition carrying one cannot be wrapped at all — see
-	// `check_wrappable_slot` (B311). `+` is not a wrap and is unaffected.
+	// Every combinator here WRAPS: it re-reads the inner style's slots and
+	// re-mints each under its own condition. That re-read is a FIELD read of
+	// the `Slot` record, so a condition holding the joined key's separator
+	// cannot mis-align it (B311, closed structurally by A95 S2's record). `+`
+	// is not a wrap and never was.
 
 	fun hover(self, inner: Style): Style {
 		self.pseudo("hover", inner)
@@ -2144,67 +2206,6 @@ impl Style {
 		self.pseudo("last-child", inner)
 	}
 
-	/// NEGATION, as a MARKER on the inner style (A89). `not` names no selector
-	/// of its own — which selector is being negated is a fact about the
-	/// condition OUTSIDE it — so it emits nothing: it marks each of `inner`'s
-	/// slots, and the condition combinator immediately enclosing it emits its
-	/// own selector NEGATED and clears the mark.
-	///
-	///     style().attribute("disabled", None, style().not(style().hover(s)))
-	///     // .sX:not([disabled]):hover{…}
-	///     style().hover(style().not(s))
-	///     // .sX:not(:hover){…}
-	///     style().within("data-theme", Some("dark"), style().not(s))
-	///     // :not([data-theme="dark"]) .sX{…}
-	///
-	/// Reading inside-out, `not` negates exactly the next condition OUT, so the
-	/// first form keeps the hover and negates the attribute. In a `css` block it
-	/// is the nested rule `.not { … }` by the name-blind lowering, like every
-	/// other combinator.
-	///
-	/// Specificity is unchanged by negating a part: `:not(x)` counts as `x`, so
-	/// `.sX:not([disabled]):hover` is (0,3,0) over both of its (0,2,0)
-	/// components, exactly as `.sX[disabled]:hover` is.
-	///
-	/// Three refusals, all at const time. A `not` that reaches APPLICATION
-	/// unwrapped is caught by `class_list` — nothing emitted a rule for it, so
-	/// applying it would be silence. `not(not(..))` is refused rather than
-	/// cancelled: a double negation is a spelling mistake, never an intent. And
-	/// a media condition cannot be negated in v1 — `@media not (..)` is its own
-	/// grammar and no ruling has reached it.
-	fun not(self, inner: Style): Style {
-		mut rules = self.rules;
-		for key in inner.rules.keys() {
-			check_wrappable_slot(key, "not");
-			match inner.rules.get(key) {
-				Some(let entry) => {
-					let parts = key.split(":");
-					if condition_is_marked(parts[1]) {
-						panic("not(not(..)) — a double negation is a spelling mistake rather than a cancellation: drop both, or negate the condition you meant");
-					}
-					if parts[0] != "" {
-						panic("a media condition cannot be negated in this version — `not` negates the condition immediately outside it, and `@media not (..)` is a grammar of its own; negate the relation, attribute or pseudo-class INSIDE the breakpoint instead");
-					}
-					let (class, declaration) = entry;
-					let condition = condition_marked(parts[1]);
-					rules = without_covered(rules, parts[0], condition, parts[2]);
-					// The mark is written TWICE, deliberately, and `not` is the only
-					// writer of either. On the CONDITION it is the slot's identity, so
-					// a negated slot and its plain twin coexist and the enclosing
-					// combinator can read which it is. On the CLASS it is the same fact
-					// placed where `class_list` already walks: application runs once per
-					// element per render, and a second walk to read the keys cost 3.1 us
-					// per call on a 25-slot style (78% of `class_list`) when it was
-					// measured. The class of a marked slot is never used for anything
-					// else — the enclosing combinator re-mints it through `rule`.
-					rules.insert(parts[0] + ":" + condition + ":" + parts[2], ("!" + class, declaration));
-				}
-				None => {}
-			}
-		}
-		Style { rules }
-	}
-
 	/// The ancestor guard — `[name="value"] .sX`: the element's own slots,
 	/// conditioned on an ANCESTOR carrying the attribute. The theme condition
 	/// is its motivating instance — `within("data-theme", "dark", ..)` under a
@@ -2227,6 +2228,19 @@ impl Style {
 	/// same reading (A89): `Some(v)` guards on the exact value
 	/// (`[name="v"] .sX`), `None` on the ancestor merely CARRYING the attribute
 	/// (`[name] .sX`) — a `[data-collapsed]` sidebar, a `[data-print]` root.
+	///
+	/// This SUGAR guards on an attribute and nothing else, which is the
+	/// signature's whole limit. The condition value takes any condition an
+	/// ancestor can match, a pseudo-class included:
+	/// `.on(within(hover()), inner)`.
+	///
+	/// **Deprecated for one release** (A95 S5, style-conditions.md §12 (iv)).
+	/// The `Option<str>` A89 gave it is the thing a condition VALUE spells
+	/// properly: `attribute(name)` is presence and `attribute(name).eq(value)`
+	/// the exact match, so the argument that every call site has had to spell
+	/// since A89 disappears from the surface rather than staying as a second
+	/// way to say the same thing.
+	[deprecated("use .on(within(attribute(name)), inner), with .eq(value) for the exact form")]
 	fun within(self, name: str, value: Option<str>, inner: Style): Style {
 		check_attribute_name(name);
 		let guarded = match value {
@@ -2246,7 +2260,8 @@ impl Style {
 	/// unlayered declaration, so this is a default the child may refuse, not
 	/// an escape hatch.
 	fun children(self, inner: Style): Style {
-		self.child_relation(">*", "children", inner)
+		fence_child_relation(inner, "children");
+		self.on(children_condition(), inner)
 	}
 
 	/// Styles every direct child BUT THE FIRST — the between-children slot
@@ -2257,29 +2272,8 @@ impl Style {
 	/// order, instead of tying and falling to the class-hash line order
 	/// (§0bis.6). Layered like `children`, with the same standing.
 	fun divide(self, inner: Style): Style {
-		self.child_relation(">*+*", "divide", inner)
-	}
-
-	/// The two child-side relations' shared chokepoint. Their inner style is
-	/// UNCONDITIONED in v1 — a pseudo or attribute under a child combinator
-	/// would bind to the child's compound (`.sX > *:hover`), semantics no
-	/// ruling has settled — and media wraps from outside as ever.
-	///
-	/// The TOKEN is `children`'s and `divide`'s, and the fence says so (A93).
-	/// This method is reachable from outside std only because the language has
-	/// no visibility yet, and the token it takes goes into the slot key
-	/// unexamined — so a token that is neither `>*` nor `>*+*` landed in the
-	/// PSEUDO slot, skipped the `@layer vilan` wrap and the `> *` suffix, and
-	/// rendered a rule about the element ITSELF from a child-relation method
-	/// (`child_relation("not([hidden])", ..)` rendering `.sX:not([hidden])`).
-	/// That is a raw-selector hatch, not a relation, and A89 gave what it was
-	/// reached for a real spelling: `attribute(name, value, not(..))`.
-	fun child_relation(self, token: str, name: str, inner: Style): Style {
-		if token != ">*" && token != ">*+*" {
-			panic(i"child_relation takes one of the two shipped relations — >* (children) or >*+* (divide) — and got {token}: it is those two methods' shared chokepoint, not a raw-selector hatch. A condition on the element ITSELF is attribute(name, value, ..) or within(name, value, ..), and a negated one is not(..) inside the condition it negates.");
-		}
-		fence_child_relation(inner, name);
-		self.on(condition_of(token), inner)
+		fence_child_relation(inner, "divide");
+		self.on(divide_condition(), inner)
 	}
 
 	/// An attribute condition on the element ITSELF — `.sX[data-open="true"]`
@@ -2291,14 +2285,15 @@ impl Style {
 	/// `Some(v)` is the exact match `[name="v"]`, and `None` is PRESENCE,
 	/// `[name]` — the form a boolean attribute actually has in markup
 	/// (`[disabled]`, `[data-selected]`), which before A89 had no spelling at
-	/// all and pushed authors onto `child_relation` as a raw-selector escape
-	/// hatch. Under `not(..)` the presence form is the other half of the pair:
-	/// `attribute("disabled", None, not(hover(s)))` is `.sX:not([disabled]):hover`.
+	/// all and pushed authors onto the deleted `child_relation` as a
+	/// raw-selector escape hatch. Negated, the presence form is the other half
+	/// of the pair: `.on(attribute("disabled").not() + hover(), s)` is
+	/// `.sX:not([disabled]):hover`.
 	/// Its own slot in the condition axis, between
 	/// the relation and the pseudo-class —
 	/// `md(within(.., attribute(.., hover(..))))` — so a theme guard composes
-	/// with an element's state; every other order is refused naming the fix,
-	/// and one attribute per slot, like one relation and one pseudo-class.
+	/// with an element's state; every other nesting order is refused naming the
+	/// fix, and one attribute per slot, like one relation and one pseudo-class.
 	/// The composed rule outranks its parts on SPECIFICITY:
 	/// `.sX[..]:hover` is (0,3,0) over both (0,2,0) components.
 	///
@@ -2308,6 +2303,12 @@ impl Style {
 	/// no spaces, no `:` — those delimit the machinery underneath (the slot
 	/// key, the condition grammar, the selector's own quoting), and a styling
 	/// hook is a single token in practice.
+	///
+	/// **Deprecated for one release** (A95 S5, style-conditions.md §12 (iv)),
+	/// with `within`'s twin and for the same reason: the `Option<str>` is what
+	/// a condition value spells without an argument — `attribute(name)` is the
+	/// presence form, `attribute(name).eq(value)` the exact one.
+	[deprecated("use .on(attribute(name), inner), with .eq(value) for the exact form")]
 	fun attribute(self, name: str, value: Option<str>, inner: Style): Style {
 		check_attribute_name(name);
 		let selected = match value {
@@ -2326,12 +2327,11 @@ impl Style {
 	/// The name is free-form and reaches all of CSS, including a compound
 	/// nothing else here can spell (`"hover:not(:active)"`, `":selection"`):
 	/// the condition is RENDERED verbatim, so the rule it emits says exactly
-	/// what was written. What such a name cannot survive is being WRAPPED — the
-	/// `:` is the slot key's own field separator and a wrapping combinator
-	/// re-reads the key by splitting on it — so `check_wrappable_slot` refuses
-	/// that at const time (B311) rather than emitting the weaker selector the
-	/// mis-aligned split produced. Two conditions on one rule is A95's
-	/// redesign; the raw token is the spelling until then.
+	/// what was written, and a wrapping combinator now re-reads the slot's
+	/// FIELDS rather than splitting its key, so the compound survives being
+	/// wrapped (B311's miscompile, closed structurally). Two conditions on one
+	/// rule is what A95's condition values spell properly —
+	/// `.on(hover() + active().not(), ..)`.
 	fun pseudo(self, name: str, inner: Style): Style {
 		check_pseudo_name(name);
 		fence_pseudo(inner, name);
@@ -2398,22 +2398,17 @@ impl Style {
 	/// The rendered class attribute: every slot's class, space-joined.
 	/// Runtime-legal (no emission) — selection and merging stay ordinary code.
 	///
-	/// It is also where an UNWRAPPED `not(..)` is caught (A89). A marked slot
-	/// emitted no rule — `not` cannot know which selector to negate until the
-	/// enclosing condition tells it — so its class would name nothing on the
-	/// sheet, and applying the style would be silence rather than a wrong
-	/// colour. Application is the last place that can still say so: every path
-	/// that dresses an element (`styled`, `bind_styled`, the element syntax's
-	/// class attribute) renders its classes through here. It costs one prefix
-	/// test per slot inside the walk that was already happening, which is why
-	/// `not` marks the class as well as the condition.
+	/// It used to be where an UNWRAPPED `not(..)` was caught (A89): a marked
+	/// slot emitted no rule, so its class named nothing on the sheet and
+	/// applying the style was silence rather than a wrong colour. A95 S2
+	/// retires the marker for `Condition::not`, and with it that whole class of
+	/// mistake — a negation is applied to the condition it negates at the
+	/// moment it is written, so no slot can reach application half-built and
+	/// nothing has to be tested for here.
 	fun class_list(self): str {
 		mut out = "";
 		for entry in self.rules.values() {
 			let (class, _declaration) = entry;
-			if token_is_negated(class) {
-				panic("this style carries an unwrapped not(..): `not` marks the condition immediately outside it and emits no rule of its own, so wrap it before applying the style — attribute(name, value, not(..)), within(name, value, not(..)), hover(not(..))");
-			}
 			if out == "" {
 				out = class;
 			} else {
@@ -2440,8 +2435,8 @@ impl Style with Add {
 		for key in b.rules.keys() {
 			match b.rules.get(key) {
 				Some(let entry) => {
-					let parts = key.split(":");
-					rules = without_covered(rules, parts[0], parts[1], parts[2]);
+					let slot = slot_of(key);
+					rules = without_covered(rules, slot.media, slot.condition, slot.property);
 					rules.insert(key, entry);
 				}
 				None => {}
@@ -2773,9 +2768,5 @@ fun check_declaration(property: str, value: str) {
 			panic(i"the declaration \"{property}\" cannot contain '{banned}' — declare writes the block's braces");
 		}
 	}
-	for banned in [":", ";"] {
-		if property.contains(banned) {
-			panic(i"a declaration's property cannot contain '{banned}' (got \"{property}\") — it separates the property from its value and from the next declaration; pass the value as the second argument");
-		}
-	}
+	check_property_name(property);
 }

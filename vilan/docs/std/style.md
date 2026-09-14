@@ -208,7 +208,65 @@ token.
 
 ## Conditions
 
-Each takes an inner `Style` and conditions all of its slots:
+A condition is a **value**, and a set of them is the same value. `on` puts a
+style under a set; every named combinator below is one condition's worth of
+sugar over it.
+
+```vilan,fragment
+fun on<C: IntoConditions>(self, conditions: C, inner: Style): Style
+```
+
+### The condition values
+
+Free functions in `std::style` (and in `std::style::prelude`, which is ambient
+inside a `css` block):
+
+```vilan,fragment
+fun hover(): Condition          // :hover
+fun focus(): Condition          // :focus
+fun active(): Condition         // :active
+fun disabled(): Condition       // :disabled
+fun first(): Condition          // :first-child
+fun last(): Condition           // :last-child
+fun pseudo(name: str): Condition        // any other pseudo-class; no ':' in the name
+fun element(name: str): Condition       // ::selection — a pseudo-ELEMENT, always last
+fun attribute(name: str): Condition     // [name] — PRESENCE on the element itself
+fun within(condition: Condition): Condition   // an ANCESTOR matching `condition`
+fun children(): Condition       // > * — every direct child
+fun divide(): Condition         // > :not(:first-child) — every child but the first
+fun media(min_width: str): Condition
+fun sm(): Condition             // 640px
+fun md(): Condition             // 768px
+fun lg(): Condition             // 1024px
+fun xl(): Condition             // 1280px
+```
+
+Two methods on a condition:
+
+```vilan,fragment
+fun not(self): Condition             // the condition negated, where it is written
+fun eq(self, value: str): Condition  // an attribute condition's exact value
+```
+
+`attribute("data-open")` is presence, `attribute("data-open").eq("true")` is
+`[data-open="true"]`. `.eq(..)` is deliberately not `PartialEq::eq`: a
+condition value is never compared by user code, and `PartialEq` is never
+derived on `Condition` so the two readings cannot collide.
+
+`+` is the **intersection** — "both of these at once" — and a set is a value
+you can name:
+
+```vilan,fragment
+let interactive = const hover() + active().not() + attribute("disabled").not();
+let panel = const style().on(interactive, style().opacity(1.0));
+```
+
+The binding is itself `const`: a `const` expression reads only
+compile-time-known bindings, so a named set has to be one.
+
+### The sugar
+
+Each of these is `.on(<that one condition>, inner)`:
 
 ```vilan,fragment
 fun hover(self, inner: Style): Style
@@ -217,13 +275,11 @@ fun active(self, inner: Style): Style
 fun disabled(self, inner: Style): Style
 fun first(self, inner: Style): Style      // :first-child
 fun last(self, inner: Style): Style       // :last-child
-fun within(self, name: str, value: Option<str>, inner: Style): Style     // [name="value"] .sX — an ancestor guard
-fun children(self, inner: Style): Style   // @layer vilan{.sX > *} — every direct child
-fun divide(self, inner: Style): Style     // @layer vilan{.sX > :not(:first-child)} — every child but the first
-fun attribute(self, name: str, value: Option<str>, inner: Style): Style  // .sX[name="value"] — the element itself
 fun pseudo(self, name: str, inner: Style): Style
-fun not(self, inner: Style): Style        // negates the condition IMMEDIATELY OUTSIDE it
-
+fun children(self, inner: Style): Style   // @layer vilan{.sX > *}
+fun divide(self, inner: Style): Style     // @layer vilan{.sX > :not(:first-child)}
+fun attribute(self, name: str, value: Option<str>, inner: Style): Style
+fun within(self, name: str, value: Option<str>, inner: Style): Style
 fun sm(self, inner: Style): Style          // breakpoints (min-width):
 fun md(self, inner: Style): Style          // 640px, 768px, 1024px, 1280px
 fun lg(self, inner: Style): Style
@@ -231,109 +287,108 @@ fun xl(self, inner: Style): Style
 fun media(self, min_width: str, inner: Style): Style
 ```
 
+The free constructor and the method of the same name coexist: `hover()` is the
+condition, `style().hover(inner)` is the sugar that puts a style under it.
+
+`Style::attribute` and `Style::within` take the `Option<str>` A89 gave them —
+`Some(v)` the exact match, `None` presence — and both are **deprecated**: the
+`Option` folds into the condition value, so write
+`.on(attribute(name).eq(value), inner)` and
+`.on(within(attribute(name).eq(value)), inner)`. They stay for one release.
+
 ### Stacking
 
-The four condition axes nest **outside-in, in the order the selector
-nests them** — media, then the relation (`within`, `children`, `divide`),
-then the attribute, then the pseudo-class:
+A set has no order. `hover() + md()` and `md() + hover()` are the same set,
+mint the same class, and emit one rule — the canonicaliser sorts the tokens
+into the order a selector is written in (breakpoint, ancestor guard, child
+relation, attributes, pseudo-classes, pseudo-element) and hashes that:
 
 ```vilan,fragment
-style().md(style().within("data-theme", Some("dark"), style().hover(style().opacity(0.8))))
+style().on(md() + within(attribute("data-theme").eq("dark")) + hover(), style().opacity(0.8))
 // @media (min-width: 768px){[data-theme="dark"] .sX:hover{opacity:0.8}}
 
-style().md(style().within("data-theme", Some("dark"), style().attribute("data-open", Some("true"), style().hover(style().opacity(0.8)))))
-// @media (min-width: 768px){[data-theme="dark"] .sX[data-open="true"]:hover{opacity:0.8}}
+style().on(hover() + active().not(), style().opacity(0.8))
+// .sX:not(:active):hover{opacity:0.8}
+
+style().on(within(attribute("data-theme").eq("dark")) + children(), style().opacity(0.8))
+// @layer vilan{[data-theme="dark"] .sX > *{opacity:0.8}}
 ```
 
-Every other order is a compile-time-evaluation panic naming the fix
-(`hover(within(..))` says to write `within(.., hover(..))`), and no axis
-can wrap itself — one media, one relation, one attribute, one
-pseudo-class per slot. Media rules emit in ascending min-width order, so
-a chain like `.sm(x).lg(y)` is mobile-first: the widest matching
-breakpoint wins.
+Nesting `on` intersects: `a.on(X, b.on(Y, s))` gives `s` the set `X ∪ Y`.
+Media rules emit in ascending min-width order, so `.sm(x).lg(y)` is
+mobile-first — the widest matching breakpoint wins.
 
-`attribute` conditions on the element **itself** — `.sX[data-open="true"]`
-— where `within` is the ancestor form. It is the general spelling of state
-carried in markup: `data-state`, `data-open`, `aria-expanded` — any
-attribute rides, `aria-*` included. The
-app owns *setting* the attribute on the element; the style only selects
-on it. Name and value refuse quotes, spaces and `:` at const time (they
-delimit the machinery underneath), and a styling hook is a single token
-in practice — the same fences guard `within`'s name and value.
+Five sets are refused at const time, each because it can never match or is not
+a selector CSS admits: a condition **and its negation**; two **breakpoints**;
+two **ancestor guards**; two **child relations**; two **pseudo-elements**.
+Two different values of one attribute (`attribute("x").eq("a") +
+attribute("x").eq("b")`) is admitted in this version and recorded — it matches
+nothing, and catching it would need the canonicaliser to reason about value
+equality.
 
-The value is an `Option`, and it says **which** of CSS's two attribute
-conditions you mean: `Some(v)` is the exact match `[name="v"]`, `None` is
-**presence**, `[name]` — the shape a boolean attribute actually has in
-markup. `within`'s value reads the same way, on the ancestor.
+The SUGAR keeps its own nesting order, and that order is still the only legal
+one: `md(within(attribute(hover(..))))`. Any other order is refused naming
+both fixes — the nesting it wanted, and the set that has none.
 
-```vilan,fragment
-style().attribute("data-selected", None, style().opacity(1.0))
-// .sX[data-selected]{opacity:1}
+### Negation
 
-style().within("data-collapsed", None, style().display(Display::Hidden))
-// [data-collapsed] .sX{display:none}
-```
-
-### Negation: `not`
-
-`not(inner)` **marks** its inner style and emits nothing of its own — which
-selector is being negated is a fact about the condition *outside* it. The
-condition immediately enclosing the mark emits **its own** selector negated
-and clears it, so reading inside-out, `not` negates exactly the next
-condition out:
+`.not()` is written on the condition it negates:
 
 ```vilan,fragment
-style().attribute("disabled", None, style().not(style().hover(style().opacity(0.8))))
-// .sX:not([disabled]):hover{opacity:0.8}   — the hover is KEPT, the attribute negated
+style().on(attribute("disabled").not() + hover(), style().opacity(0.8))
+// .sX:not([disabled]):hover{opacity:0.8}   — hovered AND not disabled
 
-style().hover(style().not(style().opacity(0.8)))
+style().on(hover().not(), style().opacity(0.8))
 // .sX:not(:hover){opacity:0.8}
 
-style().within("data-theme", Some("dark"), style().not(style().opacity(0.8)))
+style().on(within(attribute("data-theme").eq("dark")).not(), style().opacity(0.8))
 // :not([data-theme="dark"]) .sX{opacity:0.8}
 ```
 
 `:not(x)` carries `x`'s own specificity, so nothing about the cascade story
 changes: `.sX:not([disabled]):hover` is (0,3,0) over both of its (0,2,0)
-parts, exactly as `.sX[disabled]:hover` is.
+parts, exactly as `.sX[disabled]:hover` is. A NEGATED ancestor guard is the
+one case that moves a rule's cascade *band*: the line opens with `:` rather
+than `[`, so it sorts among the pseudo rules.
 
-Three refusals fence it. A `not` that reaches **application** unwrapped fails
-there, naming the wrap it needed — it emitted no rule, so applying it would be
-silence. `not(not(..))` is refused rather than cancelled. And a **media**
-condition cannot be negated in this version: `@media not (..)` is a grammar of
-its own, so negate the relation, attribute or pseudo-class inside the
-breakpoint instead.
-
-`within` prepends an ancestor selector, so a composed
-`within(.., hover(..))` rule is more specific than either `within(..)` or
-`hover(..)` alone and wins against both — and the same holds along the
-attribute axis: `attribute(.., hover(..))` outranks both of its parts.
-Between an *un*composed `within(.., x)` and `hover(y)` on the same
-property the guard wins — a theme shouldn't be undone by a hover — so use
-`within(.., hover(..))` when a dark theme needs its own hover.
+Three refusals: a **double** negation (`x.not().not()`) is a spelling mistake
+rather than a cancellation; a **breakpoint** cannot be negated (`@media not
+(..)` is a grammar of its own and no ruling has reached it); and a
+**pseudo-element** cannot be negated (`:not(::selection)` is not a selector
+CSS admits). `.not()` on a SET refuses too, naming the per-condition form.
 
 ### Relations
 
-`within` guards the element's own slots on an **ancestor's** attribute —
-the theme condition (`within("data-theme", "dark", ..)`, or any theme id
-under kolt-style n-ary theming) and every other "when an ancestor says
-so" state. Its rule is unlayered and beats the element's own base rule
-exactly when the guard matches. For colours, prefer declaring per-theme
+`within(condition)` guards the element's own slots on an **ancestor** matching
+`condition` — the theme condition
+(`within(attribute("data-theme").eq("dark"))`, or any theme id under
+kolt-style n-ary theming), an ancestor's presence flag
+(`within(attribute("data-collapsed"))`), or a pseudo-class the ancestor is in
+(`within(hover())`). Its rule is unlayered and beats the element's own base
+rule exactly when the guard matches. For colours, prefer declaring per-theme
 custom properties with a [declaration block](#declaration-blocks) and
 reading them with `Color::var(..)`; `within` covers the structural
 changes a value swap cannot.
 
-`children` and `divide` style the element's **children** — the
-parent-owned spacing idioms (Tailwind's `space-*`/`divide-*`). Their
-rules emit inside `@layer vilan`, and that is the whole cascade story:
-**a child's own `Style` always wins against a rule reaching in from an
-ancestor**, whatever the specificity — they set defaults the child may
-refuse, never force. (The cost is symmetric: a `children`/`divide` rule
-cannot override *any* unlayered CSS.) Where both touch one property,
+A guard holds ONE condition, and it must be one that selects an element: a
+breakpoint, another guard, a child relation and a pseudo-element are each
+refused naming where they belong instead.
+
+`children()` and `divide()` condition on the element's **children** — the
+parent-owned spacing idioms (Tailwind's `space-*`/`divide-*`). A rule carrying
+a child relation emits inside `@layer vilan` whatever else conditions it, and
+that is the whole cascade story: **a child's own `Style` always wins against a
+rule reaching in from an ancestor**, whatever the specificity — they set
+defaults the child may refuse, never force. (The cost is symmetric: such a
+rule cannot override *any* unlayered CSS.) Where both touch one property,
 `divide` outranks `children` on every child but the first, whichever was
-written first. Both take an **unconditioned** inner style in this
-version — a hover or attribute condition belongs on the child's own
-style — and a breakpoint wraps either (`md(children(..))`).
+written first.
+
+A guard and a child relation are not the same slot, so one set may hold both:
+`within(attribute("data-theme").eq("dark")) + children()` is
+`[data-theme="dark"] .sX > *`. The `.children(inner)`/`.divide(inner)` SUGAR
+still takes an unconditioned inner style — a pseudo-class under it would bind
+to the child's compound — and a breakpoint wraps either (`md(children(..))`).
 
 ## Declaration blocks
 

@@ -19,7 +19,31 @@
 // `s()` is `style()` under the one-letter name a chain written inside a
 // `const { … }` wants; the builder itself is untouched.
 
-import pkg::style::{ Color, Length, Style, space as scale_step, style as open_style };
+import pkg::style::{
+	Color,
+	Condition,
+	Length,
+	Style,
+	active as active_condition,
+	attribute as attribute_condition,
+	children as children_condition,
+	disabled as disabled_condition,
+	divide as divide_condition,
+	element as element_condition,
+	first as first_condition,
+	focus as focus_condition,
+	hover as hover_condition,
+	last as last_condition,
+	lg as lg_condition,
+	md as md_condition,
+	media as media_condition,
+	pseudo as pseudo_condition,
+	sm as sm_condition,
+	space as scale_step,
+	style as open_style,
+	within as within_condition,
+	xl as xl_condition,
+};
 
 // --- lengths ------------------------------------------------------------------
 
@@ -104,4 +128,96 @@ fun oklch(lightness: f64, chroma: f64, hue: f64): Color {
 /// `style()` under the name a chain written inline wants.
 fun s(): Style {
 	open_style()
+}
+
+// --- the conditions ------------------------------------------------------------
+
+/// The condition VALUES (A95), under the names a `css` block head wants:
+/// `.on(hover() + active().not()) { … }` needs no import, because this module
+/// is ambient inside a block and a head is an ordinary expression list the
+/// lowering passes through.
+///
+/// Each is one line over `std::style`'s own constructor, aliased on the way in
+/// because the free name and the `Style` METHOD of the same name coexist
+/// (`hover()` is the condition, `style().hover(inner)` is the sugar that puts a
+/// style under it) and a file declaring `fun hover()` cannot also call the
+/// import of that name.
+
+fun hover(): Condition {
+	hover_condition()
+}
+
+fun focus(): Condition {
+	focus_condition()
+}
+
+fun active(): Condition {
+	active_condition()
+}
+
+fun disabled(): Condition {
+	disabled_condition()
+}
+
+fun first(): Condition {
+	first_condition()
+}
+
+fun last(): Condition {
+	last_condition()
+}
+
+/// Any pseudo-class by name — `pseudo("focus-visible")`. One value is ONE
+/// pseudo-class: a `:` in the name is refused, because two are two values.
+fun pseudo(name: str): Condition {
+	pseudo_condition(name)
+}
+
+/// A pseudo-ELEMENT — `element("selection")` is `::selection`, and it comes
+/// last in the compound with nothing after it.
+fun element(name: str): Condition {
+	element_condition(name)
+}
+
+/// An attribute on the element itself — PRESENCE (`[name]`); `.eq(value)`
+/// narrows it to the exact form.
+fun attribute(name: str): Condition {
+	attribute_condition(name)
+}
+
+/// The ancestor GUARD: the element's own rule, conditioned on an ANCESTOR
+/// matching `condition` — `within(attribute("data-theme").eq("dark"))`.
+fun within(condition: Condition): Condition {
+	within_condition(condition)
+}
+
+/// Every direct CHILD of the element — `.sX > *`.
+fun children(): Condition {
+	children_condition()
+}
+
+/// Every direct child BUT THE FIRST — `> :not(:first-child)`.
+fun divide(): Condition {
+	divide_condition()
+}
+
+/// An arbitrary min-width breakpoint; `sm`/`md`/`lg`/`xl` are the named ones.
+fun media(min_width: str): Condition {
+	media_condition(min_width)
+}
+
+fun sm(): Condition {
+	sm_condition()
+}
+
+fun md(): Condition {
+	md_condition()
+}
+
+fun lg(): Condition {
+	lg_condition()
+}
+
+fun xl(): Condition {
+	xl_condition()
 }
