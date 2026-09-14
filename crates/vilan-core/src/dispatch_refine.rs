@@ -34,7 +34,7 @@
 //! site-enumeration policy (which calls count as dispatch sites) and pass it
 //! in as [`DispatchSite`]s; this module owns the resolution.
 
-use crate::analyzer::{Expr, GenericDispatch, Program};
+use crate::analyzer::{Expr, GenericDispatch, Program, SourceId};
 use crate::call_graph::{CallGraph, CallTarget};
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
@@ -176,7 +176,7 @@ pub fn member_name_at<'src>(program: &Program<'src>, call_id: Id) -> Option<&'sr
 ///
 /// A consumer that reads the candidate SET as a property of the site — "these
 /// and no others" — must narrow first. There is no third direction.
-pub fn candidates_of(program: &Program, name: &str) -> Vec<Id> {
+pub fn candidates_of(program: &Program, file: Option<SourceId>, name: &str) -> Vec<Id> {
     let mut candidates = Vec::new();
     for trait_ in program.traits.values() {
         let Some(&declaration_id) = trait_.declarations.get(name) else {
@@ -190,10 +190,19 @@ pub fn candidates_of(program: &Program, name: &str) -> Vec<Id> {
         {
             candidates.push(declaration_id);
         }
-        // Every implementation's override of this trait's member.
+        // Every implementation's override of this trait's member — every one
+        // the asking FILE admits (B318 S4). An override in a block this file's
+        // imports declined is not one of its candidates, which is the same
+        // narrowing the rest of the module already applies by receiver and by
+        // bound, applied by import instead.
         for implementation in &program.implementations {
             if implementation.trait_ids.contains(&trait_.id)
                 && let Some(&member_id) = implementation.declarations.get(name)
+                && file.is_none_or(|file| {
+                    program
+                        .impl_admission
+                        .admits_member(file, implementation.source, member_id)
+                })
             {
                 candidates.push(member_id);
             }
@@ -217,8 +226,13 @@ pub fn candidates_of(program: &Program, name: &str) -> Vec<Id> {
 /// `impl type T with Trait` into view, B158's body that these consumers could
 /// not see at all. The extra impls only ever add members, which is the
 /// direction this module's guarantee allows.
-pub fn impl_members_for(program: &Program, subject_type_id: TypeId, member: &str) -> Vec<Id> {
-    impl_members_for_bound(program, subject_type_id, member, &[])
+pub fn impl_members_for(
+    program: &Program,
+    file: Option<SourceId>,
+    subject_type_id: TypeId,
+    member: &str,
+) -> Vec<Id> {
+    impl_members_for_bound(program, file, subject_type_id, member, &[])
 }
 
 /// [`impl_members_for`], narrowed to the impls that provide one of `traits`.
@@ -241,6 +255,7 @@ pub fn impl_members_for(program: &Program, subject_type_id: TypeId, member: &str
 /// back wherever it cannot tell.
 pub fn impl_members_for_bound(
     program: &Program,
+    file: Option<SourceId>,
     subject_type_id: TypeId,
     member: &str,
     traits: &[Id],
@@ -255,6 +270,18 @@ pub fn impl_members_for_bound(
     let mut matching: Vec<&crate::analyzer::Implementation> = program
         .implementations
         .iter()
+        // B318 S4: the per-importer namespace, applied BEFORE the subject test
+        // — the cheap filter first, and the one that says whether this file may
+        // see the block at all.
+        .filter(|implementation| {
+            file.is_none_or(|file| {
+                program.impl_admission.admits_impl(
+                    file,
+                    implementation.source,
+                    implementation.declarations.values(),
+                )
+            })
+        })
         .filter(|implementation| {
             program
                 .type_id_to_type_map
@@ -329,7 +356,11 @@ pub fn known_receiver_candidates(program: &Program, call_id: Id) -> Option<Vec<I
     if !crate::impl_select::is_resolvable(resolved) {
         return None;
     }
-    let selected = impl_members_for(program, receiver, member);
+    // B318 S4: the file the CALL is in, which is where its method namespace is
+    // written (`analyzer.rs`'s invariant: "`call_id` is caller-side always").
+    // `admitting_file` costs one `is_empty` in a program that restricts
+    // nothing, which is the whole estate.
+    let selected = impl_members_for(program, program.admitting_file(call_id), receiver, member);
     (!selected.is_empty()).then_some(selected)
 }
 
@@ -581,7 +612,13 @@ fn refined_edges_timed(
                 return selected.clone();
             }
             SELECTION_COUNT.with(|count| count.set(count.get() + 1));
-            let selected = impl_members_for_bound(program, resolved, member, &constraint_traits);
+            let selected = impl_members_for_bound(
+                program,
+                program.admitting_file(site.call),
+                resolved,
+                member,
+                &constraint_traits,
+            );
             let selected = if selected.is_empty() {
                 site.candidates.clone()
             } else {

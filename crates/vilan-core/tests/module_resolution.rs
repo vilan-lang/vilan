@@ -6166,3 +6166,229 @@ fn b318_a_selector_only_statement_refuses_a_module_that_is_not_there() {
         "the selector's own path should be walked and reported: {diagnostics:?}"
     );
 }
+
+/// Writes `files` into a fresh temp package, analyzes `entry` against it and
+/// then TRANSFORMS the program — the only way to observe a decision
+/// `impl_select::select_member` makes at MONOMORPHIZATION, which is emission's
+/// and not analysis's (B318 §3.5). Returns the emitted JavaScript, or the first
+/// failure's message.
+fn transform_package(
+    files: &[(&str, &str)],
+    entry: &str,
+    platform: Platform,
+) -> Result<String, String> {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("vilan_modres_tx_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join(entry);
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(platform),
+        &Workspace::default(),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let program = match program {
+        Some(program) if errors.is_empty() => program,
+        _ => {
+            return Err(errors
+                .into_iter()
+                .map(|error| error.msg)
+                .collect::<Vec<_>>()
+                .join("; "));
+        }
+    };
+    vilan_core::transform(&program, &vilan_core::options::BuildOptions::default())
+        .map_err(|error| error.msg)
+}
+
+/// The §3.5 exhibit's modules, with `a.vl`'s and the entry's selector supplied
+/// per case. A generic body in `a.vl` calls `value.tag()` through a bound; the
+/// two blocks that answer it live in `ext.vl`, one per element type.
+fn monomorphization_files(a_selector: &str, entry_selector: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("t.vl", "export trait Tagged {\n\tfun tag(self): i32;\n}\n".to_string()),
+        (
+            "item.vl",
+            "export struct Boxed<T> { value: T }\n\n\
+             export impl Boxed<type T> {\n\tfun make(value: T): Boxed<T> { Boxed { value = value } }\n}\n"
+                .to_string(),
+        ),
+        (
+            "ext.vl",
+            "import pkg::item::Boxed;\nimport pkg::t::Tagged;\n\n\
+             export impl Boxed<i32> with Tagged {\n\tfun tag(self): i32 { 1 }\n}\n\n\
+             export impl Boxed<str> with Tagged {\n\tfun tag(self): i32 { 2 }\n}\n"
+                .to_string(),
+        ),
+        (
+            "a.vl",
+            format!(
+                "import pkg::t::Tagged;\nimport pkg::item::Boxed;\nimport pkg::ext::{{ (impl {a_selector}) }};\n\n\
+                 export fun label<type T: Tagged>(value: T): i32 {{ value.tag() }}\n"
+            ),
+        ),
+        (
+            "c.vl",
+            format!(
+                "import pkg::a::label;\nimport pkg::item::Boxed;\nimport pkg::ext::{{ (impl {entry_selector}) }};\n\n\
+                 fun main() {{\n\tlet _ = label(Boxed::make(\"a\"));\n}}\n"
+            ),
+        ),
+    ]
+}
+
+fn transform_monomorphization(a_selector: &str, entry_selector: &str) -> Result<String, String> {
+    let owned = monomorphization_files(a_selector, entry_selector);
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    transform_package(&files, "c.vl", Platform::default())
+}
+
+/// B318 S4, `visibility.md` §3.5 — **the file a monomorphized body resolves
+/// under is the file the body was DECLARED in, not the file that instantiated
+/// it.** THE PIN THAT FAILS IF ANYONE IMPLEMENTS "the instantiating file's
+/// set".
+///
+/// `a.vl` admits only `ext.vl`'s `Boxed<i32>` block; the entry admits only its
+/// `Boxed<str>` block and instantiates `a.vl`'s generic `label` at
+/// `Boxed<str>`. Under the declaring file's set the body finds no `tag` it may
+/// take and emission refuses; under the instantiating file's set it would
+/// quietly emit `ext.vl`'s `str` block — one source text meaning two different
+/// things in two callers, which is `prelude.md` §7's rule ("a consumer cannot
+/// change what a dependency's source means") read backwards.
+#[test]
+fn b318_a_monomorphized_body_resolves_under_the_file_that_declared_it() {
+    let refused = transform_monomorphization("Boxed<i32>", "Boxed<str>")
+        .expect_err("the entry's own selector must not answer `a.vl`'s body");
+    assert!(
+        refused.contains("'tag' is provided by an `impl` in module `ext`")
+            && refused.contains("module `a` does not admit it")
+            && refused.contains("resolves under the file it was DECLARED in"),
+        "the refusal should name the member, the declaring module and the rule: {refused}"
+    );
+    // The control, one character apart: widen `a.vl`'s own selector and the
+    // same instantiation emits. Nothing about the entry changed.
+    let emitted = transform_monomorphization("Boxed<_>", "Boxed<str>")
+        .expect("`a.vl` admitting both blocks resolves its own body");
+    assert!(
+        emitted.contains("function"),
+        "expected an emitted program: {emitted}"
+    );
+}
+
+/// B279's consumer list, re-asserted under B318 S4's file filter.
+///
+/// `candidates_of` is NAME-keyed and program-wide — the over-approximation
+/// whose consumers B279 swept — and S4 gives it a FILE. Two claims hold the
+/// change honest, and they are the two directions a mistake could go.
+///
+/// **It narrows only where a file said so.** A file that wrote neither `only`
+/// nor a selector gets the list it always got, byte for byte, which is what
+/// makes the slice additive over an estate that writes neither.
+///
+/// **Where a file did say so, it narrows and does not widen.** The restricting
+/// file's list is a SUBSET of the program-wide one: the filter can only
+/// subtract, so every consumer that reads an edge as a DEMAND or as a REFUSAL
+/// keeps its direction — the candidate it loses is one that file cannot reach.
+#[test]
+fn b279_the_file_filter_narrows_the_candidate_list_and_never_widens_it() {
+    use vilan_core::dispatch_refine::candidates_of;
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir =
+        std::env::temp_dir().join(format!("vilan_modres_b279_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let files = [
+        ("t.vl", "export trait Tagged {\n\tfun tag(self): i32;\n}\n"),
+        (
+            "item.vl",
+            "export struct Boxed<T> { value: T }\n\n\
+             export impl Boxed<type T> {\n\tfun make(value: T): Boxed<T> { Boxed { value = value } }\n}\n",
+        ),
+        (
+            "ext.vl",
+            "import pkg::item::Boxed;\nimport pkg::t::Tagged;\n\n\
+             export impl Boxed<i32> with Tagged {\n\tfun tag(self): i32 { 1 }\n}\n\n\
+             export impl Boxed<str> with Tagged {\n\tfun tag(self): i32 { 2 }\n}\n",
+        ),
+        (
+            "open.vl",
+            "import pkg::t::Tagged;\nimport pkg::item::Boxed;\nimport pkg::ext;\n\n\
+             export fun open_label<type T: Tagged>(value: T): i32 { value.tag() }\n",
+        ),
+        (
+            "narrow.vl",
+            "import pkg::t::Tagged;\nimport pkg::item::Boxed;\nimport pkg::ext::{ (impl Boxed<i32>) };\n\n\
+             export fun narrow_label<type T: Tagged>(value: T): i32 { value.tag() }\n",
+        ),
+        (
+            "app.vl",
+            "import pkg::open::open_label;\nimport pkg::narrow::narrow_label;\nimport pkg::item::Boxed;\n\n\
+             fun main() {\n\tlet _ = open_label(Boxed::make(1)) + narrow_label(Boxed::make(1));\n}\n",
+        ),
+    ];
+    for (relative, contents) in files {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join("app.vl");
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(Platform::default()),
+        &Workspace::default(),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let program = program.expect("the package analyzes");
+    assert!(errors.is_empty(), "the exhibit should be clean: {errors:?}");
+
+    // The two files, found by the function each one declares.
+    let file_of = |name: &str| {
+        let (id, _) = program
+            .functions
+            .iter()
+            .find(|(_, function)| function.name == name)
+            .expect("the function is declared");
+        program.source_of(*id).expect("it has a file")
+    };
+    let program_wide = candidates_of(&program, None, "tag");
+    assert_eq!(
+        program_wide.len(),
+        2,
+        "the name-keyed list should hold both of `ext.vl`'s overrides"
+    );
+    assert_eq!(
+        candidates_of(&program, Some(file_of("open_label")), "tag"),
+        program_wide,
+        "a file that restricts nothing must get the list it always got"
+    );
+    let narrowed = candidates_of(&program, Some(file_of("narrow_label")), "tag");
+    assert_eq!(
+        narrowed.len(),
+        1,
+        "the selector admits one of the two blocks: {narrowed:?}"
+    );
+    assert!(
+        narrowed.iter().all(|id| program_wide.contains(id)),
+        "the filter must SUBTRACT: {narrowed:?} vs {program_wide:?}"
+    );
+}

@@ -7783,7 +7783,11 @@ fn dispatch_selections(source: &str) -> (usize, usize, usize) {
                     sites.push(DispatchSite {
                         owner: RefinedCaller::Node(node.id()),
                         call: call.call_id,
-                        candidates: candidates_of(&program, name),
+                        candidates: candidates_of(
+                            &program,
+                            program.admitting_file(call.call_id),
+                            name,
+                        ),
                     });
                 }
             }

@@ -2077,7 +2077,14 @@ impl<'p, 'src> State<'p, 'src> {
         // with; under-refusing ships the capability into a runtime path in
         // silence, which is the whole failure this check exists to prevent.
         // The context pass narrows the same lists because it reads an edge as
-        // a property of the site (B258); nothing here does.
+        // a property of the site (B258); nothing here narrows by RECEIVER.
+        //
+        // B318 S4's file scope is the one narrowing this check does take, and
+        // it survives the direction argument above because it is not a guess
+        // about what a site selects: an `impl` the calling file's imports did
+        // not admit is one that file CANNOT reach at all, so no runtime path
+        // through it exists here to refuse. Dropping it removes a refusal that
+        // could only ever have been about another file's program.
         let mut refinement_sites: Vec<DispatchSite> = Vec::new();
         for node in graph.nodes() {
             for call in graph.calls_of(node.id()) {
@@ -2090,7 +2097,11 @@ impl<'p, 'src> State<'p, 'src> {
                 refinement_sites.push(DispatchSite {
                     owner: RefinedCaller::Node(node.id()),
                     call: call.call_id,
-                    candidates: crate::dispatch_refine::candidates_of(self.program, name),
+                    candidates: crate::dispatch_refine::candidates_of(
+                        self.program,
+                        self.program.admitting_file(call.call_id),
+                        name,
+                    ),
                 });
             }
         }
@@ -2111,7 +2122,11 @@ impl<'p, 'src> State<'p, 'src> {
                 refinement_sites.push(DispatchSite {
                     owner: RefinedCaller::TopLevel,
                     call: call.call_id,
-                    candidates: crate::dispatch_refine::candidates_of(self.program, name),
+                    candidates: crate::dispatch_refine::candidates_of(
+                        self.program,
+                        self.program.admitting_file(call.call_id),
+                        name,
+                    ),
                 });
             }
         }
@@ -2130,7 +2145,11 @@ impl<'p, 'src> State<'p, 'src> {
             refinement_sites.push(DispatchSite {
                 owner: RefinedCaller::TopLevel,
                 call: *call_id,
-                candidates: crate::dispatch_refine::candidates_of(self.program, name),
+                candidates: crate::dispatch_refine::candidates_of(
+                    self.program,
+                    self.program.admitting_file(*call_id),
+                    name,
+                ),
             });
         }
         let mut refined_callers: HashMap<Id, Vec<(RefinedCaller, Id)>> = HashMap::default();

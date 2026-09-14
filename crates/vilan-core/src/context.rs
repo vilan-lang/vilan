@@ -887,8 +887,12 @@ fn analyze(
     // `known_receiver_candidates` below (B258), and COVERAGE by
     // `refined_edges` further down. B279's guard after the coverage fixpoint
     // holds those two narrowings honest against this list.
-    let dispatch_candidates =
-        |name: &str| -> Vec<Id> { crate::dispatch_refine::candidates_of(program, name) };
+    // B318 S4: name-keyed AND file-scoped. The file is the CALLER's — a
+    // dispatch site's candidates are the ones that site's own file admits — so
+    // it is threaded per site rather than captured here.
+    let dispatch_candidates = |call_id: Id, name: &str| -> Vec<Id> {
+        crate::dispatch_refine::candidates_of(program, program.admitting_file(call_id), name)
+    };
     // (caller node, call id, candidate callees) per dispatch site.
     let mut dispatch_sites: Vec<(Id, Id, Vec<Id>)> = Vec::new();
     // callee -> the nodes that may reach it through dispatch.
@@ -906,7 +910,7 @@ fn analyze(
             };
             let candidates =
                 crate::dispatch_refine::known_receiver_candidates(program, call.call_id)
-                    .unwrap_or_else(|| dispatch_candidates(name));
+                    .unwrap_or_else(|| dispatch_candidates(call.call_id, name));
             for &candidate in &candidates {
                 dispatch_callers
                     .entry(candidate)
@@ -1065,8 +1069,12 @@ fn analyze(
             Some(crate::analyzer::GenericDispatch::OnType(Some(receiver), member)) => {
                 match program.type_id_to_type_map.get(&receiver) {
                     Some(resolved) if crate::impl_select::is_resolvable(resolved) => {
-                        let selected =
-                            crate::dispatch_refine::impl_members_for(program, receiver, member);
+                        let selected = crate::dispatch_refine::impl_members_for(
+                            program,
+                            program.admitting_file(call_id),
+                            receiver,
+                            member,
+                        );
                         selected.is_empty() || selected.contains(&candidate)
                     }
                     _ => true,

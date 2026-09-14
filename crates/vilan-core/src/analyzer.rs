@@ -5046,6 +5046,82 @@ pub(crate) type NamespaceEntry<'src> = (
     Option<(&'src str, Span)>,
 );
 
+/// B318 S4 — the per-importer method namespace, resolved once after `build()`
+/// and read by everything that asks what a type PROVIDES.
+///
+/// `visibility.md` §3.2's rule, stated as a table: *a file's method namespace
+/// for a type is the union of the impls that file's import statements admit.*
+/// A plain `import a::b;` admits every impl on the path (today's meaning, and
+/// the reason absence means "unrestricted" rather than "nothing"); `only`
+/// admits none; `(impl T)` admits the blocks whose subject unifies with `T`,
+/// and `(impl T)::{ m, n }` narrows that to two members.
+///
+/// **Inverted from §3.3's `file_impls`, deliberately.** The paper wrote
+/// `HashMap<SourceId, Vec<usize>>` — per importing file, the impls it admits —
+/// which every lookup would have to SEARCH. The question every consumer
+/// actually asks is "may THIS file take THIS member", and the map that answers
+/// it in one probe is keyed by the pair. An entry exists only for a
+/// (file, module) pair the file restricted, so the estate — which writes
+/// neither `only` nor a selector anywhere — stores nothing and every lookup
+/// short-circuits on [`ImplAdmission::is_empty`] before it even asks which
+/// file a call is in.
+#[derive(Debug, Clone, Default)]
+pub struct ImplAdmission {
+    /// The importing files whose own statements restrict anything at all.
+    /// Everything about this map is gated on membership here, so a file that
+    /// wrote no `only` and no selector keeps today's meaning EXACTLY.
+    restricting: HashSet<SourceId>,
+    /// (importing file, declaring file) -> the member ids the importer's
+    /// selectors admitted out of that file. An entry's absence is
+    /// "unrestricted"; an entry that is EMPTY is `only`.
+    admitted: HashMap<(SourceId, SourceId), HashSet<Id>>,
+    /// (importing file, declaring file) -> the selector's subject as written,
+    /// for the refusal that names it. Absent where the restriction is `only`.
+    selector_of: HashMap<(SourceId, SourceId), String>,
+}
+
+impl ImplAdmission {
+    /// Whether NO file in the program restricts anything — the estate's answer,
+    /// and the guard every consumer asks before it pays for a file lookup.
+    pub fn is_empty(&self) -> bool {
+        self.restricting.is_empty()
+    }
+
+    /// Whether the file `importer` admits `member_id`, declared by an `impl`
+    /// block whose own file is `declared_in`.
+    ///
+    /// Three ways to be admitted and they are all "the file did not say
+    /// otherwise": the block is this file's own, the file restricts nothing, or
+    /// the file restricted that module and this member is in what it took.
+    pub fn admits_member(&self, importer: SourceId, declared_in: SourceId, member_id: Id) -> bool {
+        if declared_in == importer || !self.restricting.contains(&importer) {
+            return true;
+        }
+        match self.admitted.get(&(importer, declared_in)) {
+            Some(members) => members.contains(&member_id),
+            None => true,
+        }
+    }
+
+    /// Whether `importer` admits ANY member of a block declaring `members` —
+    /// the whole-block question [`crate::impl_select::applying_implementations`]
+    /// asks, which does not know which member is being looked up.
+    pub fn admits_impl<'a>(
+        &self,
+        importer: SourceId,
+        declared_in: SourceId,
+        members: impl Iterator<Item = &'a Id>,
+    ) -> bool {
+        if declared_in == importer || !self.restricting.contains(&importer) {
+            return true;
+        }
+        match self.admitted.get(&(importer, declared_in)) {
+            Some(admitted) => members.into_iter().any(|member| admitted.contains(member)),
+            None => true,
+        }
+    }
+}
+
 /// B318 S3 — one `import` statement's claim on the implementations its walk
 /// carries, banked by the import walk and resolved after `build()` by
 /// [`check_impl_selector_admission`].
@@ -47874,14 +47950,19 @@ pub struct Program<'src> {
     pub global_scope_id: Id,
     pub implementations: Vec<Implementation<'src>>,
     /// B318 S3: the `only` modifiers and `(impl …)` selectors the program's
-    /// files wrote, resolved by [`check_impl_selector_admission`] after the
-    /// program is built. Empty for a program that writes neither.
+    /// files wrote, DRAINED by [`build_impl_admission`] after the program is
+    /// built. Empty for a program that writes neither.
     pub import_impl_restrictions: Vec<ImportImplRestriction>,
     /// B318 S3: per `(importing file, selector span)`, the impl MEMBERS that
     /// selector admitted — the answer Organize Imports asks for when it decides
     /// whether a selector is used (`visibility.md` §7.2). Filled by
-    /// [`check_impl_selector_admission`].
+    /// [`build_impl_admission`].
     pub impl_selector_members: HashMap<(SourceId, Span), Vec<Id>>,
+    /// B318 S4: the per-importer method namespace — which `impl` blocks each
+    /// file admits. Built by [`build_impl_admission`] BEFORE the post-build
+    /// passes that read it, because `dispatch_refine`'s candidate lists and
+    /// emission's `impl_select` are two of its consumers.
+    pub impl_admission: ImplAdmission,
     /// Every generic parameter's bound list, by constraint type id — a
     /// multi-bound's entries, where a single bound is the constraint id
     /// itself. Carried out of the analyzer because the specificity order
@@ -48461,6 +48542,21 @@ impl<'src> Program<'src> {
     /// The source file an entity originated from, by locating the walk range
     /// that produced its id. `None` for synthetic entities minted outside any
     /// file walk (e.g. during post-analysis passes).
+    /// B318 S4 — the file an impl lookup anchored at `id` runs under, or `None`
+    /// when NO file in the program restricts anything.
+    ///
+    /// The `None` is not a fallback: it is the estate's answer, and it is what
+    /// keeps the per-importer namespace free for every program that writes
+    /// neither `only` nor a selector. `source_of` is a linear scan of
+    /// `source_ranges` (M27's whole-program-loop hazard) and the dispatch
+    /// consumers ask it once per SITE, so the guard has to come first.
+    pub fn admitting_file(&self, id: Id) -> Option<SourceId> {
+        if self.impl_admission.is_empty() {
+            return None;
+        }
+        self.source_of(id)
+    }
+
     pub fn source_of(&self, id: Id) -> Option<SourceId> {
         self.source_ranges
             .iter()
@@ -56881,6 +56977,7 @@ fn analyze_over_world<'src>(
         implementations: analyzer.implementations,
         import_impl_restrictions: std::mem::take(&mut analyzer.import_impl_restrictions),
         impl_selector_members: HashMap::default(),
+        impl_admission: ImplAdmission::default(),
         generic_bounds: analyzer.generic_bounds,
         backed_value_members,
         list_new_fn_id,
@@ -57154,7 +57251,7 @@ pub fn check_view_suspensions(program: &mut Program, graph: &crate::call_graph::
 /// `impl List<i32>` that the forward test refuses (a constructor-headed subject
 /// does not match a hole), and `(impl _)` reaches every block there is. One
 /// predicate, both readings, and no new type machinery.
-pub fn check_impl_selector_admission(program: &mut Program) {
+pub fn build_impl_admission(program: &mut Program) {
     let statements = std::mem::take(&mut program.import_impl_restrictions);
     // The estate's path: nothing wrote `only` and nothing wrote a selector, so
     // there is no file whose method surface differs from today's.
@@ -57217,11 +57314,39 @@ pub fn check_impl_selector_admission(program: &mut Program) {
     }
     for key in unrestricted {
         restricted.remove(&key);
+        selector_of.remove(&key);
     }
     program.impl_selector_members = selector_members;
     if restricted.is_empty() {
         return;
     }
+    program.impl_admission = ImplAdmission {
+        restricting,
+        admitted: restricted,
+        selector_of,
+    };
+}
+
+/// B318 S3/S4 — the refusal a CALL earns when the method it resolved to comes
+/// from an `impl` the calling file did not admit.
+///
+/// The analyzer's own method lookup ([`Analyzer::impl_member_candidates`]) runs
+/// during the walk, where the admission map does not exist yet: the question a
+/// selector asks is `impl_select::subject_applies`, which reads a FINISHED
+/// program. So the lookup stays program-wide and the call is corrected here —
+/// which is also where the message can name the selector that would fix it.
+/// The per-importer namespace proper ([`ImplAdmission`], read by
+/// `dispatch_refine` and by emission's `impl_select`) is the same map asked by
+/// the consumers that DO run after the build.
+pub fn check_call_site_admission(program: &mut Program) {
+    if program.impl_admission.is_empty() {
+        return;
+    }
+    let ImplAdmission {
+        restricting,
+        admitted: restricted,
+        selector_of,
+    } = program.impl_admission.clone();
     // Which implementation declares a member — `declarations` read backwards,
     // built once for the pass rather than scanned per call.
     let mut declaring: HashMap<Id, usize> = HashMap::default();
