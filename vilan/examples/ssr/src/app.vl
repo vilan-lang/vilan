@@ -41,12 +41,12 @@ fun heading(): View {
 
 // The signal-fed list: one `<li>` per task, read once on the server.
 fun task_list(tasks: SignalCell<List<str>>): View {
-	view("ul").bind_each(tasks, |task| task, |task| view("li").text(task))
+	view("ul").child(each(tasks, |task| task, |task| view("li").text(task)))
 }
 
 // A conditional note — `when` renders the taken branch on the server.
 fun note(show: SignalCell<bool>): View {
-	view("section").when(show, || view("p").text("server-rendered, then replaced"))
+	view("section").child(when(show, || view("p").text("server-rendered, then replaced")))
 }
 
 // A button whose click writes `label`, which is bound to its own text: inert on

@@ -1,6 +1,6 @@
 //! Route-chunk planning — bundle splitting's S1, analysis only
 //! (proposal/bundle-splitting.md). Finds the splittable route matches (a
-//! `match` on a `View.swap` render closure's parameter), attributes each
+//! `match` on a `swap` render closure's parameter), attributes each
 //! arm's calls by SPAN NESTING (a call belongs to the arm whose body span
 //! contains it — no expression walker needed), and partitions the call
 //! graph: reachable from the eager root (`main` + module bindings, with
@@ -40,16 +40,16 @@ pub struct ChunkPlan {
     pub shared_functions: usize,
     pub chunks: Vec<Chunk>,
     /// Where a split build wires the route gate: the recognized `swap` calls
-    /// and the two methods involved. `None` when nothing splits — and then the
-    /// emitter changes no call, which is what makes the flag's absence
-    /// byte-identical (`bundle-splitting.md` §4).
+    /// and the pair of free functions involved. `None` when nothing splits —
+    /// and then the emitter changes no call, which is what makes the flag's
+    /// absence byte-identical (`bundle-splitting.md` §4).
     pub gate: Option<Gate>,
 }
 
-/// The gate wiring for one entry (`bundle-splitting.md` §2). `View.swap`'s
-/// render closure is `sync` and cannot await a chunk, so the wait moves
-/// upstream: the recognized calls are emitted against `View.swap_split`, which
-/// holds a gated signal and advances it only once the arm's chunk has landed.
+/// The gate wiring for one entry (`bundle-splitting.md` §2). `swap`'s render
+/// closure is `sync` and cannot await a chunk, so the wait moves upstream: the
+/// recognized calls are emitted against `std::ui::swap_split`, which holds a
+/// gated signal and advances it only once the arm's chunk has landed.
 pub struct Gate {
     /// The `swap` call ids the emitter retargets.
     pub calls: Vec<Id>,
@@ -57,12 +57,13 @@ pub struct Gate {
     /// resolves to in a split build, and WHICH ARGUMENT of the emitted call is
     /// the route source (the boot preload reads it by position).
     ///
-    /// Two entries since A85, because `swap` is two things: the `View.swap`
-    /// METHOD, whose emitted call carries the receiver first, so its source is
-    /// argument 1; and the free `swap` VALUE form (`{swap(route, render)}` in a
-    /// child hole), whose source is argument 0. Both retarget to their own
-    /// `swap_split`, which declares the same generics in the same order — so
-    /// the call's own type binding carries over by position.
+    /// ONE entry since A99: `swap` is the free VALUE form
+    /// (`{swap(route, render)}` in a child hole) and nothing else — the
+    /// `View.swap` METHOD, whose emitted call carried its receiver first and so
+    /// read its route source at argument 1, is retired. The free form's source
+    /// is argument 0, and it retargets to the free `swap_split`, which declares
+    /// the same generics in the same order — so the call's own type binding
+    /// carries over by position.
     pub retarget: Vec<(Id, Id, usize)>,
     /// `std::ui::chunk_preload` — the boot preload the emitter plants ahead of
     /// the statement that mounts the swap (`bundle-splitting.md` §S3). Declares
@@ -93,15 +94,12 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
         chunks: Vec::new(),
         gate: None,
     };
-    // The two shapes a route swap is written in: the `View.swap` METHOD and,
-    // since A85, the free `swap` VALUE placed in a child hole. A value-form
-    // route match that the recognizer did not know would still BUILD — and
-    // would simply stop splitting, silently, which is the worst failure this
-    // gate has — so both are recognized here and both are retargeted below.
+    // The ONE shape a route swap is written in since A99: the free `swap`
+    // VALUE placed in a child hole. The `View.swap` method it used to share the
+    // name with was retired, so name alone is an answer again — but the lookup
+    // still excludes impl members, because a user type is free to declare a
+    // `swap` method of its own and it is not this one.
     let mut recognized: Vec<Id> = Vec::new();
-    if let Some(method) = view_method(program, "swap") {
-        recognized.push(method);
-    }
     if let Some(value) = std_free_function(program, "swap") {
         recognized.push(value);
     }
@@ -235,14 +233,11 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
     }
     chunks.retain(|chunk| !chunk.functions.is_empty());
 
-    // The retarget table, in the order the two shapes were recognized above:
-    // the method's emitted call carries its receiver first (source at 1), the
-    // value form's does not (source at 0). A shape whose gated twin is missing
-    // simply degrades away rather than breaking a build.
+    // The retarget table for the one shape recognized above: the value form's
+    // emitted call carries no receiver, so its route source is argument 0. A
+    // shape whose gated twin is missing simply degrades away rather than
+    // breaking a build.
     let mut retarget: Vec<(Id, Id, usize)> = Vec::new();
-    if let Some((from, to)) = view_method(program, "swap").zip(view_method(program, "swap_split")) {
-        retarget.push((from, to, 1));
-    }
     if let Some((from, to)) =
         std_free_function(program, "swap").zip(std_free_function(program, "swap_split"))
     {
@@ -316,29 +311,10 @@ impl SplitCost {
     }
 }
 
-/// A std `View` method by name, when the browser layer is loaded.
-fn view_method(program: &Program<'_>, name: &str) -> Option<Id> {
-    let view_struct = program.structs.iter().find_map(|(id, struct_)| {
-        (struct_.name == "View"
-            && program
-                .source_of(*id)
-                .is_some_and(|source| program.std_sources.contains(&source)))
-        .then_some(*id)
-    })?;
-    program.implementations.iter().find_map(|implementation| {
-        matches!(
-            program.type_id_to_type_map.get(&implementation.subject),
-            Some(crate::type_::Type::Struct(id, _)) if *id == view_struct
-        )
-        .then(|| implementation.declarations.get(name).copied())
-        .flatten()
-    })
-}
-
 /// A free std function by name that is NOT an impl member — `std::ui::swap`,
-/// A85's value form, as distinct from the `View.swap` METHOD of the same name.
-/// Both live in std and both are called `swap`, so name alone stopped being an
-/// answer the day the value form existed.
+/// A85's value form. A99 retired the `View.swap` METHOD it used to share the
+/// name with, but the member exclusion stays: a USER type may declare a `swap`
+/// method of its own, and an impl member is never the function this gate wires.
 fn std_free_function(program: &Program<'_>, name: &str) -> Option<Id> {
     let members: HashSet<Id> = program
         .implementations

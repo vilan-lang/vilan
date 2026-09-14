@@ -47,13 +47,13 @@ fn reactive_map_sub_and_set_with() {
 
 #[test]
 fn owner_disposes_subscriptions_across_re_renders() {
-    // A2: the leak fix. Mimics `bind_each` — `source` drives re-renders; each
+    // A2: the leak fix. Mimics `each` — `source` drives re-renders; each
     // render disposes the previous rows' subscriptions and creates fresh ones
     // under a FRESH owner. After several renders only the *current* rows fire,
     // so the count stays bounded (a leak would give 6, not 2).
     //
     // The fresh owner per render is `std::ui`'s own discipline — every
-    // boundary in `browser/ui.vl` (`bind_each`'s rows, `when`, `swap`) disposes
+    // boundary in `browser/ui.vl` (`each`'s rows, `when`, `swap`) disposes
     // the old owner and mints a new one, never refilling the disposed one — and
     // since B291 it is the only shape that works: an `Owner` has a disposed
     // state, and a `take` on a disposed owner releases the item on the spot
@@ -304,7 +304,7 @@ fn method_closure_param_inferred_from_argument_generic() {
     // A method's own generic bound from a (nested) argument must reach its closure
     // parameters: `pick<T, K>(rows: List<List<T>>, key: |T| K, get: |T| i32)` typed
     // `|p| p.id`'s `p` as the abstract `T` until the own-generic binding ran first.
-    // This is the `bind_each(source: SignalCell<List<T>>, |todo| todo.id, ..)` shape.
+    // This is the `each(source: SignalCell<List<T>>, |todo| todo.id, ..)` shape.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -9441,7 +9441,7 @@ fn b257_a_write_through_a_shared_view_copies_its_source() {
     // P5. The form B255 came in through: `h.write() = c` is an assignment whose
     // target `rewrite_view_assignment_targets` has already turned into a
     // `Dereference`, and whose value is a live local. It lowered to `h.v = c`,
-    // so a later `c.push(4)` grew the cell — which is how `bind_each`'s
+    // so a later `c.push(4)` grew the cell — which is how `each`'s
     // `row_items.write() = list` came to hold the reconciler's own input.
     let source = r#"
         import std::io::print;
@@ -9582,7 +9582,7 @@ fn b256_a_shared_read_in_temporary_position_stays_free() {
 
 #[test]
 fn b267_a_read_of_a_cell_only_rebound_keeps_the_cells_storage() {
-    // `bind_each`'s per-notify shape, reduced: a cell whose only writes REPLACE
+    // `each`'s per-notify shape, reduced: a cell whose only writes REPLACE
     // the slot, read into a binding that is walked and nothing more. A rebind
     // installs a fresh value and leaves the old one exactly as it was, so
     // nothing can ever reach back into what the read handed out and the copy

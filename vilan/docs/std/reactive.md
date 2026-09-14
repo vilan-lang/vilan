@@ -178,7 +178,7 @@ fun main() {
 }
 ```
 - `map`'s result is a live derived signal, and its internal subscription is
-  **detachable**: made inside a boundary — a mounted view, a `bind_each` row —
+  **detachable**: made inside a boundary — a mounted view, an `each` row —
   it is registered with the ambient owner and dies when that boundary is
   disposed. `combine` and `flatten` register theirs the same way (`flatten`
   also releases whichever inner subscription is live at disposal).
@@ -289,7 +289,7 @@ fun main() {
 
 **Anything that only reads takes a `Source`, not a `Signal`.** Every read-only
 binding in [`std::ui`](browser.md#view-methods) — `bind_text`, `bind_class`,
-`bind_attr`, `bind_styled`, `style_var`, `bind_each`, `when`, `show`, `swap`
+`bind_attr`, `bind_styled`, `style_var`, `each`, `when`, `show`, `swap`
 and `swap_split` — is generic over `Source<T>`, so `Stored<str>` above drives
 them exactly like a signal does, on the browser layer and on the SSR twin
 alike. `ReactiveServer`'s `expose` is generic the same way, and so are the
@@ -320,18 +320,18 @@ impl Selector<type T: Hashable + PartialEq> {
 
 ```vilan,browser
 import std::reactive::{ Signal, SignalCell, selector };
-import std::ui::{ View, mount_root, view };
+import std::ui::{ View, each, mount_root, view };
 
 fun main() {
 	let rows: SignalCell<List<i32>> = Signal::new([1, 2, 3]);
 	let current: SignalCell<i32> = Signal::new(1);
 	let selected = selector(current);
 	let _root = mount_root("app", || {
-		view("ul").bind_each(rows, |id| id, |id| {
+		view("ul").child(each(rows, |id| id, |id| {
 			view("li").text(i"row {id}").bind_class(selected.of(id).map(|on| {
 				if on { "row current" } else { "row" }
 			}))
-		})
+		}))
 	});
 }
 ```
@@ -339,7 +339,7 @@ fun main() {
 `of(key)` creates the key's cell on first ask (seeded against the source's
 current value) and hands back that same cell every time after, so it is safe to
 call in a row's render body. The entry's **removal** is deferred to the ambient
-owner — which inside a `bind_each` row is the row's own — so the map stays the
+owner — which inside an `each` row is the row's own — so the map stays the
 size of the live list rather than of every list the session ever showed.
 
 `Selector` is a handle with a method rather than the bare closure Solid's
@@ -506,12 +506,12 @@ fun comp<T>(body: (sync || T) context owner_scope): (T, Owner)     // fresh owne
 implicitly: your component functions thread ownership without mentioning it.
 Establish owners at **disposal boundaries** (places where a subtree can die),
 not per object; in UI code the framework's boundaries (`mount_root`,
-`bind_each` rows, `when`/`swap` bodies) already do this.
+`each` rows, `when`/`swap` bodies) already do this.
 
 An owner has a **disposed state**, and it is what makes ownership hold across
 `await`. A registration is a promise to release, and an async continuation
 registers whenever it happens to run — a route switched away before a handle's
-reply, a `bind_each` row rebuilt while its first fetch is in flight. `take` and
+reply, an `each` row rebuilt while its first fetch is in flight. `take` and
 `defer` on an owner that is already disposed therefore run the cleanup **now**
 rather than parking it: the extent it would have belonged to is over, so the
 only way left to keep the promise is to keep it immediately. `dispose` itself is
@@ -746,12 +746,12 @@ fun reconcile<T, K: PartialEq>(
 ): ReconcilePlan
 ```
 
-The pure engine under `ui.bind_each`; duplicate keys claim the first
+The pure engine under `ui::each`; duplicate keys claim the first
 surviving row once. Reach for it directly only when building a custom
 list-rendering primitive.
 
 **"Unchanged" is the caller's predicate, not `T: PartialEq`.** The key decides
 identity and whether the row moves; `same` decides, for a surviving key, reuse
-against dispose-and-rebuild. `bind_each` passes `|a, b| a == b`;
-`bind_each_by` passes `|_a, _b| true`, which is why it never emits a `Refresh`
+against dispose-and-rebuild. `each` passes `|a, b| a == b`;
+`each_by` passes `|_a, _b| true`, which is why it never emits a `Refresh`
 and asks nothing of `T`.

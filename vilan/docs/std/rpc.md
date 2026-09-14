@@ -71,7 +71,7 @@ A mirror is a **`Source<Option<T>>`** (tracker A52), so `on_change`, `effect`,
 `effect_on_change` and every generic `S: Source<…>` consumer — `selector`
 among them — take one. The trait argument is `Option<T>` because that is what
 a mirror holds, so a `RemoteSource<List<Note>>` is *not* a `Source<List<Note>>`
-and `bind_each` takes `mirror.or([])`. `sub` has one spelling per view of the
+and `each` takes `mirror.or([])`. `sub` has one spelling per view of the
 value: the inherent one hands the observer a present `T`, the trait's hands it
 the `Option<T>`, and the observer's own parameter type picks between them.
 
@@ -149,7 +149,7 @@ A keyed mirror is a **`Source<Option<List<T>>>`** (tracker A55), on the same
 counted lease and with the same reading as `RemoteSource`'s: the trait argument
 is the `Option` because a mirror that has been told nothing is not an empty
 collection, so a `KeyedSource<K, T>` is *not* a `Source<List<T>>` and
-`bind_each` takes `mirror.or([])`. `sub` has one spelling per view of the
+`each` takes `mirror.or([])`. `sub` has one spelling per view of the
 value — the inherent one hands the observer a present `List<T>`, the trait's
 hands it the `Option<List<T>>`, and the observer's own parameter type picks
 between them.
@@ -219,7 +219,7 @@ impl KeyedCell<type K: Hashable, type T: Keyed<K>> with Source<List<T>> {
 
 It is a `Source<List<T>>` with no `Option` in it — a cell always holds a
 collection, where a mirror may not have been told one yet — so
-`bind_each(cell, …)` takes it directly and the `or([])` a `KeyedSource` needs
+`each(cell, …)` takes it directly and the `or([])` a `KeyedSource` needs
 has nothing to say here.
 
 `[expose] items: KeyedCell<str, Task>` is a keyed channel. The cell names both

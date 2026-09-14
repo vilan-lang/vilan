@@ -125,11 +125,11 @@ fun authed_panel(
 ): View {
 	view("div")
 		.styled(shell)
-		.swap(route, |current| match current {
+		.child(swap(route, |current| match current {
 			Route::Home => home_page(client, notes, token),
 			Route::Note(let id) => note_page(client, id, notes, token),
 			Route::NotFound => not_found_page(),
-		})
+		}))
 		.show(token.map(|current| current != ""))
 }
 
@@ -167,7 +167,7 @@ fun home_page(
 				.attr("placeholder", "New note")
 				.bind_value(composing))
 			.child(view("button").styled(button).text("Add").on("click", add)))
-		.child(view("ul").bind_each(notes, |note| note.id, |note| note_row(client, note, token)))
+		.child(view("ul").child(each(notes, |note| note.id, |note| note_row(client, note, token))))
 }
 
 fun note_row(client: NotesClient<SocketTransport>, note: Note, token: SignalCell<str>): View {
@@ -203,7 +203,7 @@ fun note_page(
 		.styled(shell)
 		.child(view("p").child(link("← All notes", Route::Home)))
 		.child(view("p").styled(muted).text("loading…").show(present.map(|has| !has)))
-		.when(present, || note_editor(client, note_id, entry, token))
+		.child(when(present, || note_editor(client, note_id, entry, token)))
 }
 
 // LOCAL-FIRST: each field commits through its own rpc as the user types.

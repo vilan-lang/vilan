@@ -5541,6 +5541,10 @@ impl Document {
                 // §7.2 fix 2, the `#`'s twin: the one at-rule with a
                 // combinator spelling is a min-width media query.
                 fixes.push(fix);
+            } else if let Some(fix) = self.retired_slot_method_fix(diagnostic) {
+                // A99, the one arm: `parent.swap(s, r)` names a `View` method
+                // that no longer exists, and the value form is one edit away.
+                fixes.push(fix);
             } else if diagnostic.msg.starts_with(IMPORTANT_HAS_NO_PLACE) {
                 // §7.2 fix 3. The parser excises `!important` from the value
                 // and reports at exactly its span, so the fix is that span
@@ -5593,6 +5597,46 @@ impl Document {
             }
         }
         fixes
+    }
+
+    /// A99's quick fix: `parent.bind_each(a, b, c)` names one of the six `View`
+    /// methods the order RETIRED, and the repair is the free slot value of the
+    /// same idea, in place — `parent.child(each(a, b, c))`.
+    ///
+    /// One contiguous edit, which is what a [`QuickFix`] can express: the whole
+    /// call node (`bind_each(a, b, c)`) is replaced by `child(each(a, b, c))`,
+    /// so the receiver, the chain around it and the arguments are untouched
+    /// text. The `{each(..)}` hole the diagnostic's second half names is NOT
+    /// offered as a fix: whether a hole is right is a question about the markup
+    /// around the call, and E58c's rule is that a fix applies the one edit that
+    /// certainly resolves the diagnostic.
+    ///
+    /// Read from a RAW parse, like the css queries: the desugar has already
+    /// retired element syntax by analysis time, and the fix must work on the
+    /// text the user is looking at. The table is
+    /// [`vilan_core::analyzer::retired_slot_value_name`] — the analyzer's steer
+    /// reads the same one, so the sentence and the edit cannot name different
+    /// functions.
+    fn retired_slot_method_fix(&self, diagnostic: &Error) -> Option<QuickFix> {
+        if !diagnostic.msg.contains(HAS_NO_METHOD) {
+            return None;
+        }
+        let source = self.text.as_str();
+        let (tree, _errors) = vilan_core::parsing::parse(source);
+        let root = tree?;
+        let mut found = None;
+        for item in &root.0 {
+            retired_slot_method_call(item, diagnostic.span.start, &mut found);
+        }
+        let (member, method_name) = found?;
+        let value = vilan_core::analyzer::retired_slot_value_name(method_name)?;
+        let written = source.get(member.1.into_range())?;
+        let arguments = written.strip_prefix(method_name)?;
+        Some(QuickFix {
+            title: format!("Rewrite as `child({value}(…))`"),
+            span: member.1,
+            replacement: format!("child({value}{arguments})"),
+        })
     }
 
     /// The `css`-spelling conversion offered over `range` (LIVE space, and the
@@ -5863,6 +5907,43 @@ pub struct QuickFix {
     pub title: String,
     pub span: Span,
     pub replacement: String,
+}
+
+/// The anchor of the analyzer's method-lookup refusal (`analyzer.rs`'s
+/// `MethodLookup::NoMethod` arm), and the key A99's quick fix reads it by — a
+/// fragment of the compiler's own message rather than a second copy of it.
+const HAS_NO_METHOD: &str = " has no method '";
+
+/// The method CALL node of a retired `View` method whose own name starts at
+/// `offset` — the diagnostic anchors on the member NAME, which is the callee's
+/// span, so the two meet exactly there and no enclosing chain link can be
+/// mistaken for the one that failed.
+///
+/// Returns the MEMBER node (the `bind_each(a, b, c)` half of the accessor), not
+/// the accessor, because the receiver and the dot are the text A99's rewrite
+/// leaves alone.
+fn retired_slot_method_call<'a, 'src>(
+    node: &'a vilan_core::Spanned<vilan_core::node::Node<'src>>,
+    offset: usize,
+    out: &mut Option<(
+        &'a vilan_core::Spanned<vilan_core::node::Node<'src>>,
+        &'src str,
+    )>,
+) {
+    if out.is_some() {
+        return;
+    }
+    if let Node::MemberAccessor(_, member) = &node.0
+        && let Node::Call(callee, None, _) = &member.0
+        && let Node::Accessor(name) = callee.0
+        && callee.1.start == offset
+        && vilan_core::analyzer::retired_slot_value_name(name).is_some()
+    {
+        *out = Some((member, name));
+        return;
+    }
+    node.0
+        .for_each_child(&mut |child| retired_slot_method_call(child, offset, out));
 }
 
 /// The sentence B318 §5's plain-reach warning carries, and the key the "mark
@@ -7321,6 +7402,97 @@ pub(crate) mod tests {
         assert!(
             titles.iter().any(|title| title.contains("pkg::topic")),
             "an uncurated module offers everything: {titles:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A99: the six retired `View` methods. The refusal carries the analyzer's
+    // steer, and the editor's half is the ONE fix that rewrites the call in
+    // place — receiver, chain and arguments untouched, `bind_each(..)` swapped
+    // for `child(each(..))`. Applied and re-analyzed, the file is clean, which
+    // is the claim a title alone cannot make.
+    #[test]
+    fn quickfix_rewrites_a_retired_slot_method_to_the_value_form() {
+        let source = "import std::reactive::{ Signal, SignalCell };\n\
+                      import std::ui::{ View, each, mount_root, view };\n\
+                      \n\
+                      fun main() {\n\
+                      \tlet rows: SignalCell<List<str>> = Signal::new([\"a\"]);\n\
+                      \tlet _root = mount_root(\"app\", || view(\"ul\")\n\
+                      \t\t.bind_each(rows, |item: str| item, |item: str| view(\"li\").text(item)));\n\
+                      }\n";
+        let (dir, document) = analyze_workspace(&[("main.vl", source)]);
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        assert!(
+            document
+                .diagnostics
+                .iter()
+                .any(|error| error.msg.contains("is no longer a `View` method (A99)")),
+            "the retired method is refused with its steer: {:#?}",
+            document.diagnostics
+        );
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
+        let rewrite: Vec<_> = fixes
+            .iter()
+            .filter(|fix| fix.title.starts_with("Rewrite as"))
+            .collect();
+        assert_eq!(
+            rewrite.len(),
+            1,
+            "exactly one rewrite is offered: {:?}",
+            fixes.iter().map(|fix| &fix.title).collect::<Vec<_>>()
+        );
+        assert_eq!(rewrite[0].title, "Rewrite as `child(each(…))`");
+        assert_eq!(
+            &text[rewrite[0].span.into_range()],
+            "bind_each(rows, |item: str| item, |item: str| view(\"li\").text(item))",
+            "the edit covers the call and nothing of the receiver",
+        );
+        assert_eq!(
+            rewrite[0].replacement,
+            "child(each(rows, |item: str| item, |item: str| view(\"li\").text(item)))"
+        );
+        let mut applied = text.to_string();
+        applied.replace_range(rewrite[0].span.into_range(), &rewrite[0].replacement);
+        let entry = dir.join("main.vl");
+        std::fs::write(&entry, &applied).unwrap();
+        let reanalyzed = Document::analyze(&applied, &std_root(), &entry);
+        assert!(
+            reanalyzed.diagnostics.is_empty(),
+            "applying the fix should leave the file clean: {:#?}",
+            reanalyzed.diagnostics
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A99's negative: a call that simply misses a method on some OTHER type
+    // draws no rewrite — the fix is keyed on the retired names through the
+    // analyzer's own table, so nothing else can pick it up.
+    #[test]
+    fn quickfix_offers_no_slot_rewrite_for_an_ordinary_missing_method() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "fun main() {\n\tlet n = 1;\n\tlet _x = n.bind_everything();\n}\n",
+        )]);
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let titles: Vec<String> = document
+            .quickfixes(program, whole_file)
+            .into_iter()
+            .map(|fix| fix.title)
+            .collect();
+        assert!(
+            !titles.iter().any(|title| title.starts_with("Rewrite as")),
+            "no slot rewrite for an ordinary miss: {titles:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -12684,7 +12856,7 @@ pub(crate) mod tests {
     #[test]
     fn element_head_dot_offers_the_view_methods() {
         let labels = element_head_completions("\t<div .~></div>\n");
-        for method in ["bind_each", "on", "text", "child", "styled"] {
+        for method in ["bind_text", "on", "text", "child", "styled"] {
             assert!(
                 labels.contains(&method.to_string()),
                 "`{method}` is a View method: {labels:?}"
@@ -12714,7 +12886,7 @@ pub(crate) mod tests {
     fn element_head_offers_the_head_forms_and_nothing_in_scope() {
         let labels = element_head_completions("\tlet caption = \"hi\";\n\t<div ~></div>\n");
         assert!(
-            labels.contains(&".bind_each".to_string()) && labels.contains(&".on".to_string()),
+            labels.contains(&".bind_text".to_string()) && labels.contains(&".on".to_string()),
             "the chain form, dot included: {labels:?}"
         );
         assert!(
@@ -12753,7 +12925,7 @@ pub(crate) mod tests {
     fn element_head_dot_mid_word_offers_the_view_methods() {
         let labels = element_head_completions("\t<div .bi~></div>\n");
         assert!(
-            labels.contains(&"bind_each".to_string())
+            labels.contains(&"bind_text".to_string())
                 && labels.contains(&"bind_value".to_string())
                 && !labels.contains(&"attributes".to_string()),
             "{labels:?}"
@@ -12773,7 +12945,7 @@ pub(crate) mod tests {
             "the Signal's members: {labels:?}"
         );
         assert!(
-            !labels.contains(&"bind_each".to_string()),
+            !labels.contains(&"bind_text".to_string()),
             "not the View's: {labels:?}"
         );
     }
@@ -12787,7 +12959,7 @@ pub(crate) mod tests {
             "the Signal's members: {labels:?}"
         );
         assert!(
-            !labels.contains(&"bind_each".to_string()),
+            !labels.contains(&"bind_text".to_string()),
             "not the View's: {labels:?}"
         );
     }

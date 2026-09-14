@@ -957,6 +957,28 @@ fn view_capture_message(name: &str) -> String {
     )
 }
 
+/// A99's table: the free slot value that replaced a retired `View` method, by
+/// the method's name, or `None` for any other name.
+///
+/// ONE table, read by both halves of the steer — the analyzer's message
+/// (`Analyzer::retired_slot_method_steer`) and the editor's quick fix
+/// (`vilan-lsp::document::retired_slot_method_fix`) — so the sentence a user
+/// reads and the edit an editor applies can never name different functions.
+/// Three of the six kept their name and three did not: `bind_each` became
+/// `each` because the `bind_` prefix means "one property kept in sync" on every
+/// other `View` method, and a value that IS a child has no property to bind.
+pub fn retired_slot_value_name(method_name: &str) -> Option<&'static str> {
+    match method_name {
+        "when" => Some("when"),
+        "swap" => Some("swap"),
+        "swap_split" => Some("swap_split"),
+        "bind_each" => Some("each"),
+        "bind_each_values" => Some("each_values"),
+        "bind_each_by" => Some("each_by"),
+        _ => None,
+    }
+}
+
 /// The precomputed resource sets the affine move scan matches against
 /// (destruction.md §4, R1–R9): the resource-typed binding entities (variables
 /// and parameters), and the resource-typed *place* expressions (a `Field` /
@@ -17622,6 +17644,48 @@ impl<'src> Analyzer<'src> {
                 ))
             }
         }
+    }
+
+    /// The A99 steer: one of the six `View` methods the order RETIRED was
+    /// written, and the fix is the free slot value of the same idea.
+    ///
+    /// `View::when`/`swap`/`swap_split`/`bind_each`/`bind_each_values`/
+    /// `bind_each_by` were one line of sugar each (`self.child(when(..))`), and
+    /// a method could never sit BETWEEN siblings — its content always landed at
+    /// the parent's current end. The values can, so the methods went; the
+    /// rewrite is mechanical and the message spells it, in both spellings,
+    /// because which one a call site wants is a question about the markup
+    /// around it and not about the call.
+    ///
+    /// Keyed on std's OWN `View`: a user type free to declare a `bind_each` of
+    /// its own must not be told it has retired one. `retired_slot_value_name`
+    /// is the whole table, and it is the same mapping the editor's quick fix
+    /// applies (`vilan-lsp::document::retired_slot_method_fix`), so the two
+    /// cannot drift.
+    fn retired_slot_method_steer(
+        &mut self,
+        subject_type: &Type,
+        member_name: &str,
+    ) -> Option<String> {
+        let value = retired_slot_value_name(member_name)?;
+        let Type::Struct(struct_id, _) = subject_type else {
+            return None;
+        };
+        let struct_ = self.structs.get(struct_id)?;
+        if struct_.name != "View" {
+            return None;
+        }
+        let declared_in_std = self
+            .source_of_id(struct_.id)
+            .is_some_and(|source| self.std_sources.contains(&source));
+        if !declared_in_std {
+            return None;
+        }
+        Some(format!(
+            "; `{member_name}` is no longer a `View` method (A99): write \
+             `child({value}(..))` to place it at this element's end, or \
+             `{{{value}(..)}}` in a child hole to place it there"
+        ))
     }
 
     /// Whether an operator (`==`, `<`, `+`, ...) on this type lowers to a native JS
@@ -37984,6 +38048,11 @@ impl<'src> Analyzer<'src> {
                 let import_steer = self
                     .unimported_trait_method_steer(&subject_type, member_name)
                     .unwrap_or_default();
+                // A99: one of the six retired `View` methods, whose fix is the
+                // free slot value and not a definition or an import.
+                let retired_slot_steer = self
+                    .retired_slot_method_steer(&subject_type, member_name)
+                    .unwrap_or_default();
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note: None,
@@ -37993,8 +38062,13 @@ impl<'src> Analyzer<'src> {
                         .copied()
                         .unwrap_or(arguments_span),
                     msg: format!(
-                        "{} has no method '{}'{}{}{}",
-                        type_str, member_name, trait_only_note, field_steer, import_steer
+                        "{} has no method '{}'{}{}{}{}",
+                        type_str,
+                        member_name,
+                        trait_only_note,
+                        field_steer,
+                        import_steer,
+                        retired_slot_steer
                     ),
                 });
                 self.expr_id_to_expr_map.insert(id, Expr::Error);

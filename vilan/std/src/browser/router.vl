@@ -6,7 +6,7 @@
 // its typed route signal itself:
 //
 //     let route = current_path().map(parse);
-//     view("main").swap(route, |current| match current { .. });
+//     view("main").child(swap(route, |current| match current { .. }));
 //
 // Nested layouts are nested functions, guards are `if`s, and `link` takes a
 // route VALUE (`Routable`), so every link's path comes from the enum. Only

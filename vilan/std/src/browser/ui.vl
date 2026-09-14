@@ -15,7 +15,7 @@
 // OWNERSHIP LIVES AT DISPOSAL BOUNDARIES (proposal/ambient-owner.md §4): a
 // subscription must die exactly when its subtree becomes garbage, and
 // subtrees only become garbage at DYNAMIC boundaries — a `mount_root`/`comp`
-// root, a `bind_each` row, a `when` instantiation. Static content shares its
+// root, an `each` row, a `when` instantiation. Static content shares its
 // nearest boundary's lifetime, so `View` carries no owner and bindings
 // register AMBIENTLY into the nearest boundary. Building UI outside every
 // boundary is a COMPILE error (the context coverage fence): every entry
@@ -329,130 +329,11 @@ impl View {
 		self
 	}
 
-	/// A reactive list, KEYED (backlog A3): one child view per element of
-	/// `source`, reconciled by `key` on every change. Each row is a DISPOSAL
-	/// BOUNDARY: `render` is an injected closure (proposal/ambient-owner.md
-	/// §5) run under the row's own fresh owner, so a row's bindings die with
-	/// the row — on refresh, on removal, and when the enclosing boundary goes.
-	/// A row whose key survives is reused (its element MOVES into the new
-	/// order, subscriptions intact); it re-renders only when its item's value
-	/// changed (`T: PartialEq`).
-	///
-	/// This is the KEYED, value-checked form — the one that both moves rows and
-	/// skips unchanged ones, and the only one that needs both bounds. Two
-	/// siblings drop one bound each (A42): `bind_each_values` keys by the item
-	/// itself, and `bind_each_by` keys by `key` and asks nothing of `T` at all.
-	fun bind_each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
-		self,
-		source: S,
-		key: sync |T| K,
-		render: (sync |T| C) context owner_scope,
-	): View {
-		// A85: one line of sugar over the value form. `child` places at this
-		// element's current end, which is where the method's own region always
-		// went — so every call site keeps its meaning, and a run that must sit
-		// BETWEEN siblings is written `{each(..)}` in a child hole instead.
-		self.child(each(source, key, render))
-	}
-
-	/// A reactive list keyed by the ITEM ITSELF — `bind_each` with the key
-	/// function it was going to be given anyway (A42).
-	///
-	/// Every call site in the estate that passed `|x| x` wants this: the item
-	/// decides identity AND change, so writing the identity closure was pure
-	/// ceremony, and hand-writing a `PartialEq` to serve as the key — which is
-	/// what a type carrying a closure has to do — was a second copy of the same
-	/// decision. Semantically identical to `bind_each(source, |item| item,
-	/// render)`, and the same disposal boundary per row.
-	fun bind_each_values<T: PartialEq, S: Source<List<T>>, C: Slot>(
-		self,
-		source: S,
-		render: (sync |T| C) context owner_scope,
-	): View {
-		self.child(each_values(source, render))
-	}
-
-	/// A reactive list keyed by `key`, whose rows UPDATE THROUGH A CELL instead
-	/// of being rebuilt — Solid's `<Index>` beside `bind_each`'s `<For>` (A42).
-	///
-	/// Nothing is asked of `T`: no `PartialEq`, no derive, no hand-written
-	/// equality. A row whose key survives keeps its element, its owner and its
-	/// bindings, and std writes the new item into that row's own
-	/// `SignalCell<T>` — so the row updates through the bindings `render`
-	/// already made rather than through a dispose-and-rebuild. No `Refresh` is
-	/// ever emitted here; a key is either kept, fresh, or gone.
-	///
-	/// The trade is stated plainly: `set` never compares, so every kept row's
-	/// cell is written on every change of the list, and every binding in every
-	/// row re-runs. That is the price of not knowing what changed. Reach for
-	/// `bind_each` when `T` compares cheaply and rows are expensive to rebuild;
-	/// reach for this when `T` cannot compare at all (a struct carrying a
-	/// closure, a handle) or when the row's own bindings are the natural
-	/// update path.
-	///
-	/// `render` receives the row's cell as a `SignalCell<T>` rather than as
-	/// some read-only view of it, because vilan has no trait objects: a closure
-	/// PARAMETER cannot be typed by a trait, only by a concrete type or a
-	/// generic. Treat it as read-only — writing it desynchronizes the row from
-	/// the list until the next reconcile.
-	fun bind_each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
-		self,
-		source: S,
-		key: sync |T| K,
-		render: (sync |SignalCell<T>| C) context owner_scope,
-	): View {
-		self.child(each_by(source, key, render))
-	}
-
-	/// Conditional CONTENT — the state-dropping boundary: while `condition` is
-	/// true the body's view is mounted under a fresh owner; when it turns
-	/// false the owner is disposed and the content removed. Toggling back on
-	/// re-renders from scratch. (For a state-PRESERVING toggle, use `show`.)
-	fun when<S: Source<bool>, C: Slot>(
-		self,
-		condition: S,
-		body: (sync || C) context owner_scope,
-	): View {
-		// A85: sugar over the value form, exactly as `bind_each` is. The
-		// VALUE is constructed here rather than through the free `when`
-		// because a method name shadows a module-level function of the same
-		// name inside its own `impl` block — `when(condition, body)` in here
-		// is this method, one argument short.
-		self.child(Conditional { condition, body })
-	}
-
-	/// The dynamic-subtree SWAP (backlog A10) — `when`, generalized from a
-	/// toggle to a VALUE: whenever `source` CHANGES, the previous subtree is
-	/// disposed (owner and element) and `render` builds the new one under a
-	/// fresh owner. `T: PartialEq` makes an equal value a no-op — navigating to
-	/// the current route re-renders nothing. Each rendered subtree is a
-	/// disposal boundary like a `bind_each` row; whichever is live when the
-	/// enclosing boundary goes is disposed with it. Routing is the first
-	/// customer (`std::router`): `swap(route, |current| match current { .. })`.
-	///
-	/// A `Source<T>` bound like every other read-only binding (A33). This one
-	/// was the sweep's single holdout — a bound whose argument is a BARE
-	/// generic parameter lost its link to the caller's `T` inside a generic
-	/// body, and `swap_split` below calls `self.swap(gated, render)` from
-	/// exactly such a body — until B168 fixed the receiver/subject
-	/// reconciliation that leaked the impl's own parameter there. `swap`,
-	/// `swap_split` and `chunk_preload` declare the same generics in the same
-	/// ORDER, because the split gate rebinds their type arguments by position.
-	fun swap<T: PartialEq, S: Source<T>, C: Slot>(
-		self,
-		source: S,
-		render: (sync |T| C) context owner_scope,
-	): View {
-		// A85: sugar over the value form — the literal, for the shadowing
-		// reason `when` above records.
-		self.child(Swap { source, render, gated = None, armed = Shared::new(true), wire = || {} })
-	}
-
 	/// Run `action` with this element once it is IN THE DOCUMENT (backlog
 	/// A45).
 	///
 	/// Attachment happens at six different places in this module — `mount`,
-	/// `Slot::place`, `children`, `bind_each`'s order pass, `when`, `swap` —
+	/// `Slot::place`, `children`, `each`'s order pass, `when`, `swap` —
 	/// and none of them is a hook a view can reach. So the hook is a
 	/// MICROTASK: the whole synchronous build, and the `mount`/append that
 	/// finishes it, run to completion before any microtask does, so by the
@@ -560,39 +441,6 @@ impl View {
 			}
 		});
 		self
-	}
-
-	/// `swap`, with the route's own code fetched before the view advances
-	/// (proposal/bundle-splitting.md §2). A split build's emitter retargets a
-	/// splittable route match's `swap` to this; nothing else selects it.
-	///
-	/// `render` is `sync` and cannot await, so the wait happens UPSTREAM of the
-	/// swap: this holds a gated signal the underlying `swap` watches, and
-	/// advances it only once the arm's chunk has landed. While a chunk is in
-	/// flight the previous view simply stays — the signal has not moved — and
-	/// `chunk_pending()` reads true. The first arm is the same story with an
-	/// empty previous view: the swap is not wired until its chunk arrives.
-	///
-	/// Overlapping navigations resolve by GENERATION, not by arrival: each
-	/// value taken from `source` claims the next generation, and a chunk that
-	/// lands after a later navigation started is dropped rather than swapped in
-	/// (`Draft::push`'s guard in `std::reactive`, same shape). Without it a slow
-	/// A followed by a fast B would leave A on screen.
-	///
-	/// A failed fetch leaves the route where it was and publishes the reason on
-	/// `chunk_error()`; the next navigation to that arm refetches, since the
-	/// failed attempt is not remembered as in flight.
-	///
-	/// In a build with no chunk map — every single-file build, which is every
-	/// build that did not ask to split — `chunk_ready` is true for every arm
-	/// and this is `swap`, one derived signal deeper.
-	fun swap_split<T: PartialEq, S: Source<T>, C: Slot>(
-		self,
-		source: S,
-		render: (sync |T| C) context owner_scope,
-	): View {
-		// A85: sugar over the value form, which is where the gate now lives.
-		self.child(split_route(source, render))
 	}
 }
 
@@ -702,14 +550,14 @@ fun clear_chunk_error() {
 
 /// A POSITIONAL REGION: a run of sibling nodes that keeps its place among a
 /// parent's other children (A71). Everything reactive in this module owns
-/// such a run — `when`'s instantiation, `swap`'s subtree, `bind_each`'s rows,
+/// such a run — `when`'s instantiation, `swap`'s subtree, `each`'s rows,
 /// a `Source<View>` child's current view — and before this each of them
 /// APPENDED, so the first change moved the run behind whatever static
 /// siblings had been added after it.
 ///
 /// The mechanism is one empty text node. `open` appends it at the parent's
 /// current end, which is the position the caller is standing at — the `when`
-/// / `swap` / `bind_each` call sits in the chain exactly where its content
+/// / `swap` / `each` call sits in the chain exactly where its content
 /// belongs, and a `Slot::place` runs at the `{hole}` it fills. Every later
 /// insertion goes BEFORE that anchor, so the run stays put however the
 /// parent grows afterwards.
@@ -962,11 +810,11 @@ impl List<View> with Slot {
 /// mean the text arm below — a `Signal<View>` reached the `Source<str>` blanket
 /// because a bound's ARGUMENTS were dropped when an impl was matched to a
 /// receiver — and the DOM took the view's runtime shape, `[object Object]`
-/// (B268; kolt views.vl:543 wrote `.swap(signal, |x| view)` to avoid it).
+/// (B268; kolt views.vl:543 wrote `swap(signal, |x| view)` to avoid it).
 ///
 /// OWNERSHIP, exactly (proposal/ambient-owner.md §5). The re-render is an
 /// ambient `effect`, so the SUBSCRIPTION belongs to the nearest boundary and
-/// dies with it: a `{signal}` child inside a `bind_each` row stops replacing
+/// dies with it: a `{signal}` child inside an `each` row stops replacing
 /// anything the moment the row is disposed. What it does NOT own is the views
 /// themselves — each arrived already built, under whatever owner was ambient
 /// where it was CONSTRUCTED, so a replaced view's own bindings die with that
@@ -1004,7 +852,7 @@ impl type S: Source<View> with Slot {
 /// run is replaced on every change: every previous element is removed, every
 /// new one appended, in order.
 ///
-/// Not a reconciler, deliberately. `bind_each` is the keyed form — it moves
+/// Not a reconciler, deliberately. `each` is the keyed form — it moves
 /// surviving rows and rebuilds only what changed, and it is what a list of DATA
 /// wants. This one takes a list of VIEWS, which carries no key and no item to
 /// compare, so there is nothing to reconcile against; it is the grouping arm,
@@ -1039,11 +887,13 @@ impl type S: Source<List<View>> with Slot {
 //
 //     <ul>{header}{each(items, key, row)}{when(more, || footer_row())}</ul>
 //
-// The five METHODS on `View` are one-line sugar over these (`self.child(..)`),
-// and every existing call site keeps its meaning: `child` places at the
-// parent's current end, which is exactly where the method's region went
-// anyway. Reach for the method when this element's content IS the conditional
-// or the run; reach for the value when it is one child among others.
+// They are the WHOLE surface (A99). The five `View` methods that used to be
+// one-line sugar over them — `when`, `swap`, `swap_split`, `bind_each`,
+// `bind_each_values`, `bind_each_by` — are retired: a method's content always
+// landed at the parent's current end, which is the one thing a positional slot
+// exists not to do. Write the value in a child hole where it belongs, or hand
+// it to `child` (`parent.child(each(..))`) for the parent's current end, which
+// is byte-for-byte what the method did.
 //
 // THE CLOSURES ARE FIELDS, not type parameters (positional-slots.md §3a), and
 // that is load-bearing: a helper returning one of these has to be able to NAME
@@ -1059,13 +909,13 @@ impl type S: Source<List<View>> with Slot {
 // this one's control).
 // KEEP IN STEP with the process twin's copy (process/ui.vl).
 
-/// Conditional content as a child — `View::when`'s value form.
+/// Conditional content as a child — the `when` slot value (A85/A99).
 struct Conditional<S: Source<bool>, C: Slot> {
 	condition: S,
 	body: (|| C) context owner_scope,
 }
 
-/// A dynamic subtree as a child — `View::swap`'s value form.
+/// A dynamic subtree as a child — the `swap` slot value (A85/A99).
 ///
 /// `gated`, `armed` and `wire` are the ROUTE GATE's, not a user's
 /// (proposal/bundle-splitting.md §2): a `split = true` build's recognizer
@@ -1091,7 +941,7 @@ struct Swap<T: PartialEq, S: Source<T>, C: Slot> {
 	wire: (|| void) context owner_scope,
 }
 
-/// A keyed reactive run as a child — `View::bind_each`'s value form.
+/// A keyed reactive run as a child — the `each` slot value (A85/A99).
 struct Each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot> {
 	source: S,
 	key: |T| K,
@@ -1113,8 +963,9 @@ struct EachBy<T, K: PartialEq, S: Source<List<T>>, C: Slot> {
 
 /// Conditional CONTENT at THIS position: while `condition` is true the body's
 /// view is mounted under a fresh owner; when it turns false the owner is
-/// disposed and the content removed. The value form of `View::when` — write it
-/// in a child hole when the conditional is one child among siblings.
+/// disposed and the content removed. Write it in a child hole when the
+/// conditional is one child among siblings, or `parent.child(when(..))` when it
+/// belongs at the parent's current end (A99 retired the `View::when` method).
 fun when<S: Source<bool>, C: Slot>(
 	condition: S,
 	body: (sync || C) context owner_scope,
@@ -1123,8 +974,9 @@ fun when<S: Source<bool>, C: Slot>(
 }
 
 /// The dynamic subtree at THIS position: whenever `source` CHANGES the previous
-/// subtree is disposed and `render` builds the new one under a fresh owner. The
-/// value form of `View::swap`.
+/// subtree is disposed and `render` builds the new one under a fresh owner.
+/// Write it in a child hole, or `parent.child(swap(..))` at the parent's current
+/// end (A99 retired the `View::swap` method).
 fun swap<T: PartialEq, S: Source<T>, C: Slot>(
 	source: S,
 	render: (sync |T| C) context owner_scope,
@@ -1132,32 +984,25 @@ fun swap<T: PartialEq, S: Source<T>, C: Slot>(
 	Swap { source, render, gated = None, armed = Shared::new(true), wire = || {} }
 }
 
-/// `swap`, gated on the route's chunk — the value form of `View::swap_split`,
-/// and what the split recognizer retargets a recognized `swap` VALUE to
-/// (`chunks.rs`). It declares the same generics in the same ORDER as `swap`,
-/// because the gate rebinds the call's type arguments by position. An app never
-/// writes it.
+/// `swap`, gated on the route's chunk — what the split recognizer retargets a
+/// recognized `swap` VALUE to (`chunks.rs`). It declares the same generics in
+/// the same ORDER as `swap`, because the gate rebinds the call's type arguments
+/// by position. An app never writes it.
 ///
-/// The gate is BUILT here and run at `place`, so `place` names nothing
+/// A99 folded `split_route` back into this function. The third name existed
+/// only because `View::swap_split` — a method — could not call the free
+/// `swap_split` from inside its own `impl` block, where that name was the
+/// method; the method is gone, so nothing shadows this one and the gate lives
+/// under the name the recognizer already looks for.
+///
+/// The gate is BUILT here and RUN at `place`, so `place` names nothing
 /// chunk-shaped: a build that did not ask to split never reaches this function,
-/// and none of the machinery below is emitted at all.
-fun swap_split<T: PartialEq, S: Source<T>, C: Slot>(
-	source: S,
-	render: (sync |T| C) context owner_scope,
-): Swap<T, S, C> {
-	split_route(source, render)
-}
-
-/// The gate itself, under a name no `View` method shadows — `View::swap_split`
-/// cannot call the free `swap_split` from inside its own `impl` block, where
-/// that name is the method.
-///
-/// The gate is BUILT here and RUN at `place`. Nothing subscribes in this
-/// function, deliberately: the retargeted call must have the same emitted shape
-/// as the `swap` call it replaces, hidden context arguments included, and a
+/// and none of the machinery below is emitted at all. Nothing subscribes here,
+/// deliberately: the retargeted call must have the same emitted shape as the
+/// `swap` call it replaces, hidden context arguments included, and a
 /// needs-context `swap_split` standing in for a context-free `swap` would
 /// arrive one argument short.
-fun split_route<T: PartialEq, S: Source<T>, C: Slot>(
+fun swap_split<T: PartialEq, S: Source<T>, C: Slot>(
 	source: S,
 	render: (sync |T| C) context owner_scope,
 ): Swap<T, S, C> {
@@ -1169,7 +1014,7 @@ fun split_route<T: PartialEq, S: Source<T>, C: Slot>(
 	let generation: Shared<i32> = Shared::new(0);
 	// The clause is written out so the NEED does not leak into this function's
 	// own signature: `advance` writes a signal, which wants the ambient turn,
-	// and a `split_route` that took one would be a wider emitted shape than the
+	// and a `swap_split` that took one would be a wider emitted shape than the
 	// `swap` call the gate replaces. Every call below stands in a turn.
 	let advance: (|T| void) context turn_scope = |value: T| {
 		armed.write() = true;
@@ -1217,12 +1062,13 @@ fun split_route<T: PartialEq, S: Source<T>, C: Slot>(
 	Swap { source, render, gated = Some(gated), armed, wire }
 }
 
-/// A keyed reactive run at THIS position — `View::bind_each`'s rows as a child.
+/// A keyed reactive run at THIS position — one row per element, in a child hole.
 ///
 /// Named `each` and not `bind_each`: the `bind_` prefix means "one property
 /// kept in sync" on every other method in this module, and a value that IS a
 /// child has no property to bind. `{each(items, key, row)}` reads as markup
-/// where `{bind_each(..)}` reads as a setter that has escaped.
+/// where `{bind_each(..)}` read as a setter that had escaped — which is why A99
+/// retired the method and left the value form alone.
 fun each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
 	source: S,
 	key: sync |T| K,
@@ -1334,8 +1180,8 @@ impl EachBy<type T, type K: PartialEq, type S: Source<List<T>>, type C: Slot> wi
 }
 
 /// `swap`'s body, against a region opened at `parent`'s current end — shared by
-/// the value form and, through it, by `View::swap`. `armed` is the route gate's
-/// hold (see `Swap`): `true` for every ordinary swap.
+/// the `swap` and `swap_split` values. `armed` is the route gate's hold (see
+/// `Swap`): `true` for every ordinary swap.
 fun place_swap<T: PartialEq, S: Source<T>, C: Slot>(
 	parent: View,
 	source: S,
@@ -1379,7 +1225,7 @@ fun place_swap<T: PartialEq, S: Source<T>, C: Slot>(
 	});
 }
 
-/// `bind_each`'s body, against a region opened at `parent`'s current end —
+/// `each`'s body, against a region opened at `parent`'s current end —
 /// shared by `Each`, `EachValues` and, through them, by the two methods.
 fun place_each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
 	parent: View,
@@ -1472,7 +1318,7 @@ fun place_each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
 	});
 }
 
-/// `bind_each_by`'s body, against a region opened at `parent`'s current end.
+/// `each_by`'s body, against a region opened at `parent`'s current end.
 fun place_each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
 	parent: View,
 	source: S,

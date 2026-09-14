@@ -6673,7 +6673,7 @@ fn a_user_source_drives_every_read_only_browser_binding() {
         r#"
         import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
         import std::style::{{ Color, Style, style }};
-        import std::ui::{{ View, mount_root, view }};
+        import std::ui::{{ View, each, mount_root, view, when }};
         {A_USER_SOURCE}
         fun main() {{
             let label: Stored<str> = Stored::new("alpha");
@@ -6687,8 +6687,8 @@ fn a_user_source_drives_every_read_only_browser_binding() {
                 .child(view("div").style_var("--w", label))
                 .child(view("span").bind_styled(skin))
                 .child(view("i").show(flag))
-                .child(view("ul").bind_each(items, |item| item, |item| view("li").text(item)))
-                .child(view("aside").when(flag, || view("b").text("here"))));
+                .child(view("ul").child(each(items, |item| item, |item| view("li").text(item))))
+                .child(view("aside").child(when(flag, || view("b").text("here")))));
         }}
         "#
     ));
@@ -6704,7 +6704,7 @@ fn a_user_source_drives_the_process_twin_and_renders() {
         &format!(
             r#"
         import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
-        import std::ui::{{ View, render, view }};
+        import std::ui::{{ View, each, render, view, when }};
         {A_USER_SOURCE}
         fun main() {{
             let label: Stored<str> = Stored::new("alpha");
@@ -6717,8 +6717,8 @@ fn a_user_source_drives_the_process_twin_and_renders() {
                 .child(view("a").bind_attr("href", label))
                 .child(view("div").style_var("--w", label))
                 .child(view("i").show(hidden))
-                .child(view("ul").bind_each(items, |item| item, |item| view("li").text(item)))
-                .child(view("aside").when(shown, || view("b").text("here")))));
+                .child(view("ul").child(each(items, |item| item, |item| view("li").text(item))))
+                .child(view("aside").child(when(shown, || view("b").text("here"))))));
         }}
         main();
         "#
@@ -6838,51 +6838,53 @@ fn element_syntax_still_routes_attributes_through_attr_value() {
 
 // ── B168: the three A33 held back, widened ───────────────────────────────────
 //
-// A33's sweep classified `View::swap` READ-ONLY like every other binding it
-// widened, and held it anyway: a `Source<T>` bound whose argument is a BARE
-// generic parameter lost its link to the caller's `T` inside a generic body,
-// and `swap_split` calls `self.swap(gated, render)` from exactly such a body.
+// A33's sweep classified `swap` READ-ONLY like every other binding it widened,
+// and held it anyway: a `Source<T>` bound whose argument is a BARE generic
+// parameter lost its link to the caller's `T` inside a generic body, and the
+// split gate passes its own `gated: SignalCell<T>` on from exactly such a body.
 // B168 fixed that reconciliation (`tests/inference/generics.rs` carries the
-// minimized pin and its edge cases), so the three that waited — `View::swap`,
-// `View::swap_split` and `ui::chunk_preload` — widened together, in
-// generic-parameter ORDER, which is what the split gate rebinds by position.
+// minimized pin and its edge cases), so the three that waited — `swap`,
+// `swap_split` and `ui::chunk_preload` — widened together, in generic-parameter
+// ORDER, which is what the split gate rebinds by position. A99 retired the
+// `View` methods, so all three are free functions here.
 //
 // Each pin below drives its signature with `A_USER_SOURCE`: a type that is a
 // `Source` and is NOT a `Signal`. Against the held signatures every one of them
 // was a type error naming `Signal`.
 
-/// `View::swap` on the BROWSER twin, driven by a user `Source`.
+/// `ui::swap` on the BROWSER twin, driven by a user `Source`.
 #[test]
 fn a_user_source_drives_the_browser_swap() {
     assert_compiles_browser(&format!(
         r#"
         import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
-        import std::ui::{{ View, mount_root, view }};
+        import std::ui::{{ View, mount_root, swap, view }};
         {A_USER_SOURCE}
         fun main() {{
             let route: Stored<str> = Stored::new("home");
             let _root = mount_root("app", || view("main")
-                .swap(route, |current| view("section").text(current)));
+                .child(swap(route, |current| view("section").text(current))));
         }}
         "#
     ));
 }
 
-/// `View::swap_split` — the split build's gate — driven by the same user
-/// `Source`. It is the signature whose own BODY carries the B168 shape
-/// (`self.swap(gated, render)` with `gated: SignalCell<T>`), so this pin is the
-/// compiler fix read through std rather than through a minimized exhibit.
+/// `ui::swap_split` — the split build's gate — driven by the same user
+/// `Source`. It is the signature whose own BODY carries the B168 shape (its
+/// `gated: SignalCell<T>` travels on as the same bare parameter), so this pin
+/// is the compiler fix read through std rather than through a minimized
+/// exhibit.
 #[test]
 fn a_user_source_drives_the_split_gate() {
     assert_compiles_browser(&format!(
         r#"
         import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
-        import std::ui::{{ View, mount_root, view }};
+        import std::ui::{{ View, mount_root, swap_split, view }};
         {A_USER_SOURCE}
         fun main() {{
             let route: Stored<str> = Stored::new("home");
             let _root = mount_root("app", || view("main")
-                .swap_split(route, |current| view("section").text(current)));
+                .child(swap_split(route, |current| view("section").text(current))));
         }}
         "#
     ));
@@ -6918,12 +6920,12 @@ fn a_user_source_drives_the_process_swap_and_renders() {
         &format!(
             r#"
         import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
-        import std::ui::{{ View, render, view }};
+        import std::ui::{{ View, render, swap, view }};
         {A_USER_SOURCE}
         fun main() {{
             let route: Stored<str> = Stored::new("docs");
             print(render(view("main")
-                .swap(route, |current| view("section").text(current))));
+                .child(swap(route, |current| view("section").text(current)))));
         }}
         main();
         "#
@@ -6941,14 +6943,14 @@ fn a_concrete_signal_still_drives_the_swap_family() {
     assert_compiles_browser(
         r#"
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ chunk_preload, View, mount_root, view };
+        import std::ui::{ View, chunk_preload, mount_root, swap, swap_split, view };
 
         fun main() {
             let route = Signal::new("home");
             chunk_preload(route);
             let _root = mount_root("app", || view("main")
-                .swap(route, |current| view("section").text(current))
-                .swap_split(route, |current| view("aside").text(current)));
+                .child(swap(route, |current| view("section").text(current)))
+                .child(swap_split(route, |current| view("aside").text(current))));
         }
         "#,
     );
@@ -9751,22 +9753,215 @@ fn a91_a_render_closure_may_yield_any_slot() {
     assert_compiles_browser(
         r#"
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ View, mount_root, view, when };
+        import std::ui::{ View, each, each_by, each_values, mount_root, swap, view, when };
         fun main() {
             let rows: SignalCell<List<str>> = Signal::new(["a"]);
             let flag: SignalCell<bool> = Signal::new(true);
             let tab: SignalCell<i32> = Signal::new(1);
             let _root = mount_root("app", || {
                 view("main")
-                    .bind_each_values(rows, |item: str| [view("i").text(item), view("b")])
-                    .bind_each_values(rows, |item: str| item)
-                    .bind_each(rows, |item: str| item, |item: str| when(flag, || view("u")))
-                    .bind_each_by(rows, |item: str| item, |cell: SignalCell<str>| cell)
-                    .when(flag, || [view("p"), view("p")])
-                    .swap(tab, |value: i32| when(flag, || view("section")))
+                    .child(each_values(rows, |item: str| [view("i").text(item), view("b")]))
+                    .child(each_values(rows, |item: str| item))
+                    .child(each(rows, |item: str| item, |item: str| when(flag, || view("u"))))
+                    .child(each_by(rows, |item: str| item, |cell: SignalCell<str>| cell))
+                    .child(when(flag, || [view("p"), view("p")]))
+                    .child(swap(tab, |value: i32| when(flag, || view("section"))))
             });
         }
         "#,
+    );
+}
+
+// --- A99: the six retired `View` methods -------------------------------------
+//
+// `when`, `swap`, `swap_split`, `bind_each`, `bind_each_values` and
+// `bind_each_by` were one line of sugar each over the value form, and a method
+// could never sit BETWEEN siblings — its content always landed at the parent's
+// current end. Order 36 removed them outright, with no deprecation window, and
+// the refusal steers to the two spellings that replace each one.
+//
+// One pin PER METHOD, not one representative: a table of six is exactly the
+// shape that regresses by five and passes.
+
+/// The browser twin's four: the three list forms and `swap_split`, each refused
+/// on `View` with A99's steer naming its free value.
+#[test]
+fn a99_the_retired_browser_methods_are_refused_with_the_slot_steer() {
+    for (method, value) in [
+        ("bind_each", "each"),
+        ("bind_each_values", "each_values"),
+        ("bind_each_by", "each_by"),
+        ("swap_split", "swap_split"),
+    ] {
+        assert_fails_browser_with(
+            &format!(
+                r#"
+        import std::reactive::{{ Signal, SignalCell }};
+        import std::ui::{{ View, mount_root, view }};
+        fun main() {{
+            let rows: SignalCell<List<str>> = Signal::new(["a"]);
+            let _root = mount_root("app", || view("ul")
+                .{method}(rows, |item: str| item, |item: str| view("li").text(item)));
+        }}
+        "#
+            ),
+            &format!("`{method}` is no longer a `View` method (A99)"),
+        );
+        assert_fails_browser_with(
+            &format!(
+                r#"
+        import std::reactive::{{ Signal, SignalCell }};
+        import std::ui::{{ View, mount_root, view }};
+        fun main() {{
+            let rows: SignalCell<List<str>> = Signal::new(["a"]);
+            let _root = mount_root("app", || view("ul")
+                .{method}(rows, |item: str| item, |item: str| view("li").text(item)));
+        }}
+        "#
+            ),
+            &format!("write `child({value}(..))`"),
+        );
+    }
+}
+
+/// `when` and `swap`, whose free values kept the method's own name — so the
+/// steer's two spellings are the only thing that distinguishes the refusal from
+/// "you forgot an import".
+#[test]
+fn a99_the_retired_when_and_swap_methods_are_refused_with_the_slot_steer() {
+    assert_fails_browser_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, mount_root, view };
+        fun main() {
+            let flag: SignalCell<bool> = Signal::new(true);
+            let _root = mount_root("app", || view("div")
+                .when(flag, || view("b").text("here")));
+        }
+        "#,
+        "`when` is no longer a `View` method (A99)",
+    );
+    assert_fails_browser_with(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, mount_root, view };
+        fun main() {
+            let tab: SignalCell<i32> = Signal::new(1);
+            let _root = mount_root("app", || view("div")
+                .swap(tab, |value: i32| view("section").text(i"p{value}")));
+        }
+        "#,
+        "`swap` is no longer a `View` method (A99)",
+    );
+}
+
+/// The PROCESS twin drops the same five (it never had `swap_split`), and its
+/// refusal carries the same steer — so a server-only file is not told the
+/// method exists somewhere else.
+#[test]
+fn a99_the_retired_process_methods_are_refused_with_the_slot_steer() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, render, view };
+        fun main() {
+            let rows: SignalCell<List<str>> = Signal::new(["a"]);
+            print(render(view("ul")
+                .bind_each_values(rows, |item: str| view("li").text(item))));
+        }
+        "#,
+        "`bind_each_values` is no longer a `View` method (A99)",
+    );
+}
+
+/// The steer is keyed on std's OWN `View`, not on the NAME: a user type that
+/// declares a `bind_each` of its own and is called with the wrong arity gets
+/// the ordinary refusal and no advice about a std function it never named.
+#[test]
+fn a99_a_user_types_own_retired_name_draws_no_slot_steer() {
+    let errors = compile_browser(
+        r#"
+        struct Board {
+            label: str,
+        }
+        impl Board {
+            fun bind_each(self, rows: List<str>): str {
+                self.label
+            }
+        }
+        fun main() {
+            let board = Board { label = "b" };
+            let _missing = board.bind_each_values(["a"]);
+        }
+        "#,
+    )
+    .expect_err("the call names no method that exists");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("has no method 'bind_each_values'")),
+        "the ordinary refusal still fires: {errors:#?}"
+    );
+    assert!(
+        !errors.iter().any(|error| error.contains("(A99)")),
+        "a user type's own name must draw no slot steer: {errors:#?}"
+    );
+}
+
+/// The replacement compiles and RENDERS: `parent.child(each(..))` is what the
+/// retired method was, one line of sugar, so the estate's mechanical rewrite
+/// means exactly what it meant.
+#[test]
+fn a99_the_child_rewrite_renders_what_the_method_did() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, each, render, view, when };
+        fun main() {
+            let rows: SignalCell<List<str>> = Signal::new(["a", "b"]);
+            let flag: SignalCell<bool> = Signal::new(true);
+            print(render(view("ul")
+                .child(each(rows, |item: str| item, |item: str| view("li").text(item)))
+                .child(when(flag, || view("li").text("more")))));
+        }
+        main();
+        "#,
+        "<ul><li>a</li><li>b</li><li>more</li></ul>\n",
+    );
+}
+
+/// A99 folded `split_route` back into the free `swap_split`: the third name
+/// existed only because the `View::swap_split` METHOD shadowed the free
+/// function inside its own `impl` block, and the method is gone. The gate is
+/// reachable under the name the recognizer looks for, and it still declares
+/// `swap`'s generics in `swap`'s order.
+#[test]
+fn a99_the_split_gate_lives_under_the_free_swap_split() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, mount_root, swap_split, view };
+        fun main() {
+            let route: SignalCell<str> = Signal::new("home");
+            let _root = mount_root("app", || view("main")
+                .child(swap_split(route, |current: str| view("section").text(current))));
+        }
+        "#,
+    );
+    let errors = compile_browser(
+        r#"
+        import std::ui::{ View, mount_root, split_route, view };
+        fun main() {
+            let _root = mount_root("app", || view("main"));
+        }
+        "#,
+    )
+    .expect_err("`split_route` no longer exists");
+    assert!(
+        errors.iter().any(|error| error.contains("split_route")),
+        "`split_route` is gone, folded into `swap_split`: {errors:#?}"
     );
 }
 

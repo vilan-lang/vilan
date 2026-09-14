@@ -218,7 +218,7 @@ require("./app.js");
 const CYCLE_EXEMPLAR: &str = r#"import std::json::json_codec;
 import std::reactive::{ Disposable, Signal, SignalCell };
 import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
-import std::ui::{ View, mount_root, view };
+import std::ui::{ View, each, mount_root, view };
 
 let path: SignalCell<str> = Signal::new("/");
 let route: SignalCell<str> = path.map(|value| "route" + value);
@@ -235,7 +235,7 @@ fun app(items: SignalCell<List<str>>, draft: SignalCell<str>): View {
 			items.update(|&mut list| { list.push(draft.get()); });
 			draft.set("");
 		}))
-		.child(view("ul").bind_each(items, |item| item, |item| row(item)))
+		.child(view("ul").child(each(items, |item| item, |item| row(item))))
 }
 
 fun main() {
@@ -337,7 +337,7 @@ for (const phase of ["mounted", "unmounted"]) {{
 
 /// The async shape the item names: a scope torn down while a continuation that
 /// registers into it is still in flight — a route switched away before a
-/// handle's reply, a `bind_each` row rebuilt while its first fetch is out.
+/// handle's reply, a `each` row rebuilt while its first fetch is out.
 const LATE_REGISTRATION: &str = r#"import std::io::print;
 import std::reactive::{ Disposable, Owner, Signal, SignalCell, owner_scope };
 

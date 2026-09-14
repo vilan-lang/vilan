@@ -1,6 +1,6 @@
 import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, render, view };
+import std::ui::{ View, each, render, swap, view };
 
 // Server-side rendering (proposal/ssr.md, A7): on `@process`, `std::ui` builds
 // an HTML string tree and `render` serializes it. The component below is the
@@ -15,11 +15,11 @@ enum Page {
 
 fun app(title: SignalCell<str>, todos: SignalCell<List<str>>, page: SignalCell<Page>): View {
 	let heading = view("h1").bind_text(title);
-	let list = view("ul").bind_each(todos, |todo| todo, |todo| view("li").text(todo));
-	let nav = view("nav").swap(page, |current| match current {
+	let list = view("ul").child(each(todos, |todo| todo, |todo| view("li").text(todo)));
+	let nav = view("nav").child(swap(page, |current| match current {
 		Page::Home => view("a").attr("href", "/").text("Home"),
 		Page::About => view("a").attr("href", "/about").text("About & friends"),
-	});
+	}));
 	view("main").attr("id", "app").child(heading).child(list).child(nav)
 }
 

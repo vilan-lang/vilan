@@ -2178,7 +2178,7 @@ fn reconcile_plans_keep_refresh_fresh_and_removals() {
 }
 
 // `reconcile`'s `same` predicate is the CALLER's (A42), not `T: PartialEq`:
-// `bind_each_by` passes "always the same", so a surviving key is kept and no
+// `each_by` passes "always the same", so a surviving key is kept and no
 // `Refresh` is ever produced — over the exact input that refreshes above.
 #[test]
 fn reconcile_never_refreshes_when_every_surviving_key_counts_as_unchanged() {

@@ -337,7 +337,7 @@ exports. `[package] prelude` (and `[library] prelude`) names it:
 | Value | Ambient names |
 |---|---|
 | *omitted* — the default | std's base set: `print`, `Option`, `Some`, `None`, `Result`, `Ok`, `Err` |
-| `"std::web"` | the base set, plus `Signal`, `SignalCell`, `view`, `View`, and the **modules** `style` and `ui` |
+| `"std::web"` | the base set, plus `Signal`, `SignalCell`, `view`, `View`, the five slot values (`when`, `swap`, `each`, `each_values`, `each_by`), and the **modules** `style` and `ui` |
 | any module path (`pkg::…`, `std::…`, a dependency) | that module's exports |
 | `false` | none — only the built-in set above |
 

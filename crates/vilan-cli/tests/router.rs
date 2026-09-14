@@ -29,7 +29,7 @@ fn write(dir: &Path, relative: &str, contents: &str) {
 /// The app under test: the Kolt-shaped route space — nested enums mirroring
 /// nested layouts, a hand-written `parse`/`href` pair over `segments`, typed
 /// `link`s, programmatic `navigate`, and a `swap`-rendered page tree.
-const APP: &str = r#"import std::ui::{ View, view, mount_root };
+const APP: &str = r#"import std::ui::{ View, mount_root, swap, view };
 import std::reactive::{ Signal, SignalCell };
 import std::router::{ current_path, navigate, segments, link, Routable };
 import std::option::Option::{ self, Some, None };
@@ -134,12 +134,12 @@ fun app(route: SignalCell<Route>): View {
 			.child(link("Tasks", Route::Workspace("acme", WorkspaceRoute::Tasks))))
 		.child(view("button").text("go").on("click", || navigate(href(Route::Login))))
 		.child(view("button").attr("id", "widen").text("widen").on("click", || width.set("99px")))
-		.swap(route, |current| match current {
+		.child(swap(route, |current| match current {
 			Route::Home => home_page(),
 			Route::Login => login_page(width),
 			Route::Workspace(let org, let inner) => workspace_layout(org, inner),
 			Route::NotFound => view("section").text("not found"),
-		})
+		}))
 }
 
 fun main() {

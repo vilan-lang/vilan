@@ -296,15 +296,15 @@ routed app `show`s once it isn't. Signing in stores the token; signing
 out removes it and navigates home.
 
 **The list page.** An add form bound to a local signal, and the list
-itself, one keyed `bind_each` over the mirror:
+itself, one keyed `each` over the mirror:
 
 ```vilan,fragment
-.child(view("ul").bind_each(notes, |note| note.id, |note| note_row(client, note, token)))
+.child(view("ul").child(each(notes, |note| note.id, |note| note_row(client, note, token))))
 ```
 
 That single line is the live sync. When any client adds or deletes a
 note, the mirror updates and the keyed rows reconcile
-([Building UI](ui.md#lists-bind_each)).
+([Building UI](ui.md#lists-each)).
 
 **The editor.** The note page finds its note in the mirror, waits for it
 under `when(present)` (so a deep link shows "loading…" until the first
@@ -361,7 +361,7 @@ there is nothing left for one to do.
 | the package, its two entries | [Hello Vilan](../tour/hello-vilan.md), [Platforms](../tour/platforms.md) |
 | `Note`, derives, the enums | [Data & traits](../tour/data-and-traits.md) |
 | signals, effects, drafts | [Reactive state](reactive.md) |
-| views, `bind_each`, `when`, `show` | [Building UI](ui.md) |
+| views, `each`, `when`, `show` | [Building UI](ui.md) |
 | the `const` styles | [Styling](styling.md) |
 | the route enum, `swap`, `link` | [Routing](routing.md) |
 | `[service]`, mirrors, reconnect | [Services & RPC](services.md) |

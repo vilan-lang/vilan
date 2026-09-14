@@ -5324,7 +5324,7 @@ mod snapshot_consistency_tests {
             other => panic!("the array form is expected, got {other:?}"),
         };
         assert!(
-            labels.contains(&"bind_each".to_string()) && labels.contains(&"text".to_string()),
+            labels.contains(&"bind_text".to_string()) && labels.contains(&"text".to_string()),
             "the View chain's methods: {labels:?}",
         );
         assert!(

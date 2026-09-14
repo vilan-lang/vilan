@@ -17,7 +17,7 @@ Here's a small two-level app: a home page, and workspace pages that have
 their own sub-pages.
 
 ```vilan,browser
-import std::ui::{ view, View, mount_root };
+import std::ui::{ swap, view, View, mount_root };
 import std::router::{ current_path, navigate, segments, link, Routable };
 import std::reactive::{ Signal, SignalCell };
 import std::option::Option::{ self, Some, None };
@@ -81,11 +81,11 @@ impl Route with Routable {
 fun main() {
 	let route = current_path().map(parse);
 	let _root = mount_root("app", || {
-		view("div").swap(route, |current| match current {
+		view("div").child(swap(route, |current| match current {
 			Route::Home => view("h1").text("Home"),
 			Route::Workspace(let id, let _inner) => view("h1").text(i"Workspace {id}"),
 			Route::NotFound => view("h1").text("Nothing here"),
-		})
+		}))
 	});
 }
 ```
@@ -190,7 +190,7 @@ coercion from [the tour](../tour/functions-and-closures.md).)
 
 ## Pages swap on the route
 
-`View.swap(route, render)` is the page container. When the route
+`swap(route, render)` is the page container. When the route
 changes, it tears down the old page (disposing all its bindings) and
 builds the new one. When the route *doesn't* change (say the user
 clicks a link to the page they're on), nothing happens at all. That's
@@ -201,8 +201,8 @@ own `WorkspaceRoute` while the outer swap only rebuilds when the
 workspace id changes.
 
 When the page is one child among others — a header above it, a footer below —
-write the [value form](ui.md#putting-one-between-siblings) in a child position
-instead of the dotted link, and the page stays between them:
+write it in a child hole ([position](ui.md#position-and-placing-one-at-the-end))
+and the page stays between them:
 
 ```vilan,fragment
 <main>

@@ -57,11 +57,11 @@ fn write(dir: &Path, relative: &str, contents: &str) {
 /// The shared component — identical bytes in both legs (written to each package).
 /// It exercises every read-once binding form: static `class`/`attr`, `bind_text`,
 /// `bind_class`, `bind_attr`, `bind_styled` (a `SignalCell<Style>` over compiled
-/// atomic classes), `bind_each` (keyed, over a list), `when` (taken),
+/// atomic classes), `each` (keyed, over a list), `when` (taken),
 /// `show` (hidden), `swap` (a value branch), `bind_value`, a discarded `on`
 /// handler, and nested composition — with `&`/`<`/`>`/`"` in the data to drive
 /// escaping on both sides.
-const COMPONENT: &str = r#"import std::ui::{ each, each_values, view, when, View };
+const COMPONENT: &str = r#"import std::ui::{ View, each, each_values, swap, view, when };
 import std::reactive::{ Signal, SignalCell };
 import std::style::{ style, space, Style };
 
@@ -99,13 +99,13 @@ fun app(): View {
 		.attr("id", "root")
 		.child(view("h1").bind_text(title))
 		.child(view("a").bind_class(cls).bind_attr("href", href).text("link"))
-		.child(view("ul").bind_each(rows, |r| r.id, |r| view("li").text(r.label)))
-		.child(view("section").when(show_banner, || view("p").text("banner")))
+		.child(view("ul").child(each(rows, |r| r.id, |r| view("li").text(r.label))))
+		.child(view("section").child(when(show_banner, || view("p").text("banner"))))
 		.child(view("aside").show(hide_note))
-		.child(view("nav").swap(tab, |t| match t {
+		.child(view("nav").child(swap(tab, |t| match t {
 			Tab::Home => view("a").text("home"),
 			Tab::Settings => view("a").text("settings & more"),
-		}))
+		})))
 		// A85/A91: the VALUE forms in child position, and rows that are not
 		// elements — a fragment row, a text row, and a positional `when`. The
 		// browser twin plants markers for every one of them and the server

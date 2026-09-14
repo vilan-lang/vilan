@@ -113,11 +113,11 @@ fun todos(client: TodoClient<SocketTransport>): View {
 			.child(filter_button(filter, "all", "All"))
 			.child(filter_button(filter, "active", "Active"))
 			.child(filter_button(filter, "done", "Done")))
-		// `bind_each` renders one row per element and re-renders as `visible`
+		// `each` renders one row per element and re-renders as `visible`
 		// changes — whether this tab caused the change or another one did.
 		.child(view("ul")
 			.styled(list)
-			.bind_each(visible, |todo| todo.id, |todo| todo_row(client, todo)))
+			.child(each(visible, |todo| todo.id, |todo| todo_row(client, todo))))
 		.child(view("p")
 			.styled(empty_note)
 			.text("Nothing here 🎉")
@@ -143,7 +143,7 @@ fun filter_button(filter: SignalCell<str>, value: str, label: str): View {
 		.on("click", || filter.set(value))
 }
 
-// One row — a snapshot from `bind_each`; any change to the list re-renders it.
+// One row — a snapshot from `each`; any change to the list re-renders it.
 // The checkbox reflects `done` and its edits go through the client stub.
 fun todo_row(client: TodoClient<SocketTransport>, todo: Todo): View {
 	// The done state is a VARIANT: plain `if` over const styles (CVA-free).

@@ -108,14 +108,14 @@ fn the_router_example_splits_into_its_three_routes() {
         .as_ref()
         .expect("the browser layer declares the gate");
     assert_eq!(gate.calls.len(), 1, "the one recognized `swap` call");
-    // Two retarget entries since A85 — the `View.swap` METHOD and the free
-    // `swap` VALUE form — each to a gated twin that is a different function,
-    // and each naming the argument index its emitted call carries the route
-    // source at (1 for the method's receiver-first shape, 0 for the value's).
+    // ONE retarget entry since A99 — the free `swap` VALUE form, the only
+    // spelling a route swap has now that the `View.swap` METHOD is retired —
+    // to a gated twin that is a different function, naming the argument index
+    // its emitted call carries the route source at (0: no receiver).
     assert_eq!(
         gate.retarget.len(),
-        2,
-        "both spellings of a route swap are recognized"
+        1,
+        "the one spelling of a route swap is recognized"
     );
     for (from, to, source_at) in &gate.retarget {
         assert_ne!(from, to, "the gate is a different function");
@@ -129,8 +129,8 @@ fn the_router_example_splits_into_its_three_routes() {
             .iter()
             .map(|(_, _, at)| *at)
             .collect::<Vec<usize>>(),
-        vec![1, 0],
-        "the method carries its receiver first; the value form does not"
+        vec![0],
+        "the value form carries no receiver, so its route source is argument 0"
     );
 }
 
@@ -142,7 +142,7 @@ fn the_router_example_splits_into_its_three_routes() {
 fn a_wildcard_arm_keeps_its_code_eager() {
     let plan = plan_for(
         r#"
-import std::ui::{View, view, mount_root};
+import std::ui::{View, view, mount_root, swap};
 import std::reactive::Signal;
 import std::router::{current_path, segments};
 
@@ -167,10 +167,10 @@ fun fallback_page(): View {
 fun main() {
     let route = current_path().map(parse);
     mount_root("app", || {
-        view("div").swap(route, |current| match current {
+        view("div").child(swap(route, |current| match current {
             Route::Home => home_page(),
             _ => fallback_page(),
-        })
+        }))
     });
 }
 "#,
@@ -193,7 +193,7 @@ fun main() {
 fn a_second_route_match_declines_the_split() {
     let plan = plan_for(
         r#"
-import std::ui::{View, view, mount_root};
+import std::ui::{View, view, mount_root, swap};
 import std::reactive::Signal;
 import std::router::{current_path, segments};
 
@@ -223,14 +223,14 @@ fun main() {
     let tab = Signal::new(Tab::Left);
     mount_root("app", || {
         view("div")
-            .child(view("section").swap(tab, |current| match current {
+            .child(view("section").child(swap(tab, |current| match current {
                 Tab::Left => left_pane(),
                 Tab::Right => right_pane(),
-            }))
-            .swap(route, |current| match current {
+            })))
+            .child(swap(route, |current| match current {
                 Route::Home => home_page(),
                 Route::Other => other_page(),
-            })
+            }))
     });
 }
 "#,
@@ -269,7 +269,7 @@ fn a_chunk_file_name_is_its_arm_reduced_to_a_file_name() {
 fn a_swap_without_a_route_match_is_not_splittable() {
     let plan = plan_for(
         r#"
-import std::ui::{View, view, mount_root};
+import std::ui::{View, view, mount_root, swap};
 import std::reactive::Signal;
 
 fun label(on: bool): View {
@@ -279,7 +279,7 @@ fun label(on: bool): View {
 fun main() {
     let flag = Signal::new(true);
     mount_root("app", || {
-        view("div").swap(flag, |on| label(on))
+        view("div").child(swap(flag, |on| label(on)))
     });
 }
 "#,
@@ -317,7 +317,7 @@ fn a_node_program_plans_nothing() {
 /// eager name is what lets the pin below CALL one under node with an empty
 /// registry.
 const CROSSING_SOURCE: &str = r#"
-import std::ui::{View, view, mount_root};
+import std::ui::{View, view, mount_root, swap};
 import std::router::{current_path, segments};
 
 [derive(PartialEq)]
@@ -349,10 +349,10 @@ fun docs_plus(page: i32): i32 {
 fun main() {
     let route = current_path().map(parse);
     mount_root("app", || {
-        view("div").swap(route, |current| match current {
+        view("div").child(swap(route, |current| match current {
             Route::Home => home_page(),
             Route::Docs => docs_page(),
-        })
+        }))
     });
 }
 "#;

@@ -29,7 +29,16 @@ export import pkg::reactive::SignalCell;
 // tree is dense with `view("div")` calls, which is why these are bare members
 // and not left to `ui::`. `std::ui` is declared by BOTH platform layers, so
 // neither name colors this prelude to one target.
-export import pkg::ui::{ View, view };
+//
+// The five SLOT functions travel with them (A99). They are the whole
+// conditional/dynamic/keyed surface now that the `View` methods are gone, and
+// the owner's spelling for them is BARE — `<div>{when(flag, || body)}</div>`,
+// `{each(rows, |row| row.id, render)}` — so leaving them behind `ui::` would
+// put back the import this set exists to delete. Both platform layers declare
+// all five, so none of them colors this prelude either. E145's rule 0 then
+// FADES an explicit `import std::ui::{ when };` in a `std::web` file, which is
+// the intended reading: the prelude already binds it.
+export import pkg::ui::{ View, each, each_by, each_values, swap, view, when };
 
 // Ambient MODULES (§5.2). A module entry costs one name in the bare namespace —
 // its own — and buys a whole namespace behind one qualifying segment.
