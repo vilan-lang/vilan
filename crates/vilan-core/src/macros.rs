@@ -1712,6 +1712,29 @@ impl Expander<'_, '_> {
                     }
                     if self.scope.get(name).is_some() {
                         self.run_attribute(name, *name_span, item, &[], text, depth);
+                    } else if in_macro_world() {
+                        // B339: inside a macro WORLD the scope is EMPTY BY
+                        // DESIGN (see `IN_MACRO_WORLD`) — a world's own
+                        // analysis must not register macros, or std's prelude
+                        // `macro fun`s would recursively compile worlds of
+                        // their own, unboundedly. So "the macro is not in
+                        // scope" says nothing about the std here, and the two
+                        // sentences below — a load-ordering bug, or a std that
+                        // does not carry the derive — are both false of it.
+                        //
+                        // The reach is empty today, which is why this is a
+                        // guard and not a fix: the entry a world sees is
+                        // BLANKED to its macro definitions, `macro_std`
+                        // declares no derives, and none of the eleven std
+                        // modules a world force-loads (`boolean`, `list`,
+                        // `null`, `promise`, `compare`, `default`, `debug`,
+                        // `json`, `hash`, `number`, `string`) derives anything.
+                        // A derive written into one of them tomorrow is an
+                        // ordinary std change, and it would have been answered
+                        // with a "please report this" about a std that is
+                        // perfectly good. A world needs no derived impl — it
+                        // compiles one file against `macro_std` to read its
+                        // macro bodies — so the expansion is simply skipped.
                     } else if let Some(module) = std_derive_module(name) {
                         // There is no second generator to fall back to (N79).
                         // There used to be — a Rust twin of the `Json`/`Wire`/
