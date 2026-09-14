@@ -6741,3 +6741,75 @@ fn e178_the_program_visibility_fields_agree_with_module_importables() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// B330's pair across two modules, with `app.vl`'s import list supplied per
+/// case: two blankets over one trait, bounded differently, each declaring
+/// `peek`, and a receiver that satisfies both.
+fn b330_files(app: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "base.vl",
+            "import std::debug::Debug;\n\n\
+             export trait Read<T> {\n\tfun get(self): T;\n}\n\n\
+             export trait Tagged {\n\tfun tag(self): str;\n}\n\n\
+             export struct Cell<T> { value: T }\n\n\
+             export impl Cell<type T> with Read<T> {\n\tfun get(self): T { self.value }\n}\n\n\
+             export struct Both { n: i32 }\n\n\
+             export impl Both with Tagged {\n\tfun tag(self): str { \"both\" }\n}\n\n\
+             export impl Both with Debug {\n\tfun debug(self): str { \"Both\" }\n}\n"
+                .to_string(),
+        ),
+        (
+            "debugside.vl",
+            "import std::debug::Debug;\nimport pkg::base::Read;\n\n\
+             export impl type S: Read<type I: Debug> {\n\tfun peek(self): str { \"debug side\" }\n}\n"
+                .to_string(),
+        ),
+        (
+            "tagside.vl",
+            "import pkg::base::{ Read, Tagged };\n\n\
+             export impl type O: Read<type J: Tagged> {\n\tfun peek(self): str { \"tagged side\" }\n}\n"
+                .to_string(),
+        ),
+        ("app.vl", app.to_string()),
+    ]
+}
+
+fn analyze_b330(app: &str) -> Vec<String> {
+    let owned = b330_files(app);
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    analyze_package(&files, "app.vl", Platform::default())
+}
+
+/// B330 across modules, under B318 S4's filter: the file that imports BOTH
+/// blankets is refused at the call, with the SELECTOR named as the fix — and
+/// the file that took one of them is clean, because choosing is the fix.
+#[test]
+fn b330_the_cross_module_pair_is_refused_under_the_filter_with_the_selector_named() {
+    let both = analyze_b330(
+        "import std::debug::Debug;\nimport pkg::base::{ Cell, Both };\n\
+         import pkg::debugside;\nimport pkg::tagside;\n\n\
+         fun main() {\n\tlet cell: Cell<Both> = Cell { value = Both { n = 1 } };\n\
+         \tlet _ = cell.peek();\n}\n",
+    );
+    assert!(
+        both.iter().any(|message| message
+            .contains("this receiver satisfies the bounds of TWO blanket `impl` blocks")
+            && message.contains("select one at the import — `import")
+            && message.contains(")::peek };`")),
+        "expected the call-site refusal naming the selector: {both:?}"
+    );
+    let chosen = analyze_b330(
+        "import std::debug::Debug;\nimport pkg::base::{ Cell, Both };\n\
+         import pkg::debugside;\nimport pkg::tagside only;\n\n\
+         fun main() {\n\tlet cell: Cell<Both> = Cell { value = Both { n = 1 } };\n\
+         \tlet _ = cell.peek();\n}\n",
+    );
+    assert!(
+        chosen.is_empty(),
+        "a file that took one of the two has already chosen: {chosen:?}"
+    );
+}

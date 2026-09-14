@@ -708,6 +708,39 @@ fn inherits_a_default(program: &Program, implementation: &Implementation, member
 /// declares nothing still outranks a blanket that does. Such a winner returns
 /// `None` — it has no member of its own, and the caller reaches its answer
 /// through the trait default, which is the same verdict by the same order.
+/// The maxima of the specificity order among the impls that DECLARE `member`
+/// for `concrete`, under `file`'s admitted set — what [`select_member`] picks
+/// its answer out of.
+///
+/// One maximum is the winner. TWO OR MORE is the unranked residue: nothing in
+/// the order separates them, so `select_member` takes the first in declaration
+/// order and the program's meaning becomes a function of which block was
+/// written first. That is precisely what B57 exists to prevent, and B330's
+/// call-site refusal is what reports it — the question it asks is this
+/// function's length, because only the SITE, which knows the receiver, can ask
+/// it at all.
+pub fn declaring_maxima<'a, 'src>(
+    program: &'a Program<'src>,
+    file: Option<SourceId>,
+    concrete: TypeId,
+    member: &str,
+) -> Vec<&'a Implementation<'src>> {
+    let contenders: Vec<&Implementation> = applying_implementations(program, file, concrete, None)
+        .into_iter()
+        .filter(
+            |implementation| match implementation.declarations.get(member) {
+                Some(member_id) => file.is_none_or(|file| {
+                    program
+                        .impl_admission
+                        .admits_member(file, implementation, *member_id)
+                }),
+                None => false,
+            },
+        )
+        .collect();
+    maxima(program, &contenders)
+}
+
 pub fn select_member(
     program: &Program,
     file: Option<SourceId>,

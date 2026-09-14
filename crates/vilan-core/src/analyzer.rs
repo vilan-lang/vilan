@@ -517,6 +517,31 @@ pub enum SubjectCollision {
     OverlappingBounds,
 }
 
+/// B330 — two BLANKET impls, bounded differently, declaring one inherent member
+/// name: the pair `generic_bounds_overlap` deliberately admits, banked at the
+/// declaration and decided at the CALL.
+///
+/// The declarations cannot answer whether a third type satisfies both clauses —
+/// every pair of traits in the program, and in every program that will ever
+/// import it, is a potential witness — so refusing the pair would refuse two
+/// blankets no type in the estate can bring together. A CALL knows its
+/// receiver, so it knows whether the witness exists, and it is the only place
+/// that can. What is wrong when it does exist is not the declarations: it is
+/// that tier 1 of method resolution takes the first inherent candidate WITHOUT
+/// ranking, so declaration order decides which body runs and swapping the two
+/// blocks changes the answer.
+#[derive(Clone, Debug)]
+pub struct BlanketResidue {
+    /// The member name both blankets declare.
+    pub member: String,
+    /// The earlier declaration and its impl's subject (a bound binder).
+    pub first: Id,
+    pub first_subject: TypeId,
+    /// The later declaration and its subject.
+    pub second: Id,
+    pub second_subject: TypeId,
+}
+
 /// B318 S4 — one INHERENT member name declared for one subject by two impls in
 /// DIFFERENT files, banked at the declaration and decided at the IMPORT.
 ///
@@ -3498,6 +3523,9 @@ pub struct Analyzer<'src> {
     /// in which no two files declare one inherent name for one subject — the
     /// whole estate, which is what keeps the import pass free.
     cross_module_collisions: Vec<MemberCollision>,
+    /// B330: the differently-bounded blanket pairs the duplicate family admits,
+    /// for the CALL-site refusal ([`BlanketResidue`]).
+    blanket_residues: Vec<BlanketResidue>,
     trait_by_declaration: HashMap<Id, Id>,
     module_id_by_name: HashMap<&'src str, Id>,
     // Multi-package namespace isolation (P2). `packages[i]` is a loaded package —
@@ -5463,6 +5491,7 @@ impl<'src> Analyzer<'src> {
             impl_namespaces: Vec::new(),
             import_impl_restrictions: Vec::new(),
             cross_module_collisions: Vec::new(),
+            blanket_residues: Vec::new(),
             trait_by_declaration: HashMap::default(),
             module_id_by_name: HashMap::default(),
             packages: Vec::new(),
@@ -7730,6 +7759,47 @@ impl<'src> Analyzer<'src> {
                     });
                 if let Some((earlier_id, collision)) = earlier {
                     duplicates.push((member_name, earlier_id, *member_id, *subject, collision));
+                    continue;
+                }
+                // B330 (Order 35 R5, documented admission; Order 36's refusal):
+                // two BLANKETS whose bound clauses are neither the same nor
+                // provably overlapping are ADMITTED here, deliberately —
+                // whether some third type carries both `Debug` and `Tagged` is
+                // not a question the DECLARATIONS answer. The consequence is
+                // that a receiver which DOES satisfy both has two inherent
+                // candidates and tier 1 takes the first UNRANKED, so swapping
+                // the two blocks changes which body runs. The site knows the
+                // receiver, so the site is the only place that can tell whether
+                // the witness exists; the pairs are banked here and decided at
+                // the call ([`check_call_site_admission`]).
+                for (_, earlier_id, earlier_subject) in &inherent[..position] {
+                    if !matches!(subject_type, Type::Generic(_))
+                        || !matches!(earlier_subject.get_type(self), Type::Generic(_))
+                    {
+                        continue;
+                    }
+                    // ONLY the pair `bound_argument_positions_overlap`'s
+                    // `(Generic, Generic)` arm admits. Two blankets separated
+                    // at a WRITTEN argument — A86's `Read<type I>` beside
+                    // `Read<Option<type I>>`, std's own `flatten` pair — are
+                    // ranked by tier 1 and are not this; banking them would put
+                    // every `flatten` call through the residue test for
+                    // nothing.
+                    let (Type::Generic(left), Type::Generic(right)) =
+                        (earlier_subject.get_type(self), subject.get_type(self))
+                    else {
+                        continue;
+                    };
+                    if !self.bounds_differ_only_at_binder_bounds(left, right) {
+                        continue;
+                    }
+                    self.blanket_residues.push(BlanketResidue {
+                        member: member_name.to_string(),
+                        first: *earlier_id,
+                        first_subject: *earlier_subject,
+                        second: *member_id,
+                        second_subject: *subject,
+                    });
                 }
             }
         }
@@ -8280,6 +8350,46 @@ impl<'src> Analyzer<'src> {
                     )
             },
         )
+    }
+
+    /// B330 — whether two binders' clauses are the pair
+    /// [`Self::generic_bounds_overlap`] admits for the ONE reason it cannot
+    /// answer: every argument position is either the same type or two BINDERS
+    /// bounded differently, and at least one is the latter.
+    ///
+    /// The distinction matters because it is the whole of the difference
+    /// between B330 and A86. `Read<type I: Debug>` beside `Read<type J:
+    /// Tagged>` leaves the compiler nothing to rank — whether some type carries
+    /// both traits is a question about the future, not about the declarations —
+    /// so the pair is admitted and a receiver that DOES carry both is decided
+    /// by declaration order. `Read<type I>` beside `Read<Option<type I>>` is
+    /// nothing of the sort: one argument is a written constructor, tier 1 ranks
+    /// them, and std's two `flatten` bodies are the exhibit.
+    fn bounds_differ_only_at_binder_bounds(&self, left: TypeId, right: TypeId) -> bool {
+        let left_bounds = self.generic_bound_traits(left);
+        let right_bounds = self.generic_bound_traits(right);
+        if left_bounds.is_empty() || left_bounds.len() != right_bounds.len() {
+            return false;
+        }
+        let mut differs_at_a_binder = false;
+        for ((left_trait, left_arguments), (right_trait, right_arguments)) in
+            left_bounds.iter().zip(right_bounds.iter())
+        {
+            if left_trait != right_trait || left_arguments.len() != right_arguments.len() {
+                return false;
+            }
+            for (left_argument, right_argument) in left_arguments.iter().zip(right_arguments.iter())
+            {
+                if self.same_impl_type(*left_argument, *right_argument, &mut Vec::new()) {
+                    continue;
+                }
+                match (left_argument.get_type(self), right_argument.get_type(self)) {
+                    (Type::Generic(_), Type::Generic(_)) => differs_at_a_binder = true,
+                    _ => return false,
+                }
+            }
+        }
+        differs_at_a_binder
     }
 
     /// Whether one ARGUMENT position of two bound clauses can be filled by one
@@ -48106,6 +48216,9 @@ pub struct Program<'src> {
     /// and refused at the IMPORT of whichever file admits both
     /// ([`refuse_imported_member_collisions`]).
     pub cross_module_collisions: Vec<MemberCollision>,
+    /// B330: the differently-bounded blanket pairs the duplicate family admits,
+    /// refused at a CALL whose receiver satisfies both ([`BlanketResidue`]).
+    pub blanket_residues: Vec<BlanketResidue>,
     /// B318 S3: per `(importing file, selector span)`, the impl MEMBERS that
     /// selector admitted — the answer Organize Imports asks for when it decides
     /// whether a selector is used (`visibility.md` §7.2). Filled by
@@ -57203,6 +57316,7 @@ fn analyze_over_world<'src>(
         implementations: analyzer.implementations,
         import_impl_restrictions: std::mem::take(&mut analyzer.import_impl_restrictions),
         cross_module_collisions: std::mem::take(&mut analyzer.cross_module_collisions),
+        blanket_residues: std::mem::take(&mut analyzer.blanket_residues),
         impl_selector_members: HashMap::default(),
         impl_admission: ImplAdmission::default(),
         generic_bounds: analyzer.generic_bounds,
@@ -57772,6 +57886,24 @@ fn refuse_imported_member_collisions(
     }
 }
 
+/// The type a method call's RECEIVER has, as a post-build pass can see it.
+///
+/// `expr_type_ids` holds a type only where one is PRODUCED, and a plain
+/// `Expr::Local` read of a binding produces nothing — so a receiver written as
+/// a variable has to be answered through its DECLARATION. The same three lines
+/// `context::value_type_of` keeps, for the same reason.
+fn receiver_type_id(program: &Program, receiver: Id) -> Option<TypeId> {
+    if let Some(Expr::Local(target)) = program.entity_map.get(&receiver) {
+        if let Some(parameter) = program.parameters.get(target) {
+            return Some(parameter.type_id);
+        }
+        if let Some(variable) = program.variables.get(target) {
+            return Some(variable.type_id);
+        }
+    }
+    program.expr_type_ids.get(&receiver).copied()
+}
+
 /// The HEAD name of an `impl` block's subject, as a selector spells it —
 /// `Thing` for `impl Thing`, `Boxed` for `impl Boxed<i32>`, and `_` for a
 /// subject with no nominal head (a blanket, a tuple, an array), which is
@@ -57819,9 +57951,10 @@ fn module_stem(program: &Program, source: SourceId) -> String {
 /// `dispatch_refine` and by emission's `impl_select`) is the same map asked by
 /// the consumers that DO run after the build.
 pub fn check_call_site_admission(program: &mut Program) {
-    if program.impl_admission.is_empty() {
+    if program.impl_admission.is_empty() && program.blanket_residues.is_empty() {
         return;
     }
+    let residues = std::mem::take(&mut program.blanket_residues);
     let ImplAdmission {
         restricting,
         admitted: restricted,
@@ -57842,9 +57975,6 @@ pub fn check_call_site_admission(program: &mut Program) {
         let Some(source) = program.source_of(*call_id) else {
             continue;
         };
-        if !restricting.contains(&source) && hidden.is_empty() {
-            continue;
-        }
         // A method call's callee is a fresh local bound to the member the
         // lookup found (`wire_method_call`), which is the one place a call
         // records WHICH implementation answered it.
@@ -57855,6 +57985,84 @@ pub fn check_call_site_admission(program: &mut Program) {
             continue;
         };
         let implementation = &program.implementations[index];
+        // B330's refusal, decided HERE because only the site knows the
+        // receiver. The pair was admitted at the declaration precisely because
+        // the declarations could not say whether a witness exists; this call's
+        // receiver either is one or is not.
+        if let Some(residue) = residues
+            .iter()
+            .find(|residue| residue.first == *member_id || residue.second == *member_id)
+            && let Some(receiver) = function_call
+                .argument_ids
+                .first()
+                .and_then(|receiver| receiver_type_id(program, *receiver))
+            && crate::impl_select::is_resolvable(
+                program.type_id_to_type_map.get(&receiver).unwrap_or(&Type::Unknown),
+            )
+            // The question, asked of the SELECTION ORDER rather than of the
+            // subjects alone: how many maxima declare this member for this
+            // receiver, under THIS FILE's admitted set (B318 S4's filter — a
+            // file that took one of the two with a selector has already
+            // chosen, and choosing is the fix). One is a winner; two is the
+            // unranked residue, and the residue is what declaration order was
+            // silently deciding. Asking the order rather than the bounds is
+            // what keeps two blankets separated at their trait ARGUMENTS
+            // (B268/A86 — std's own `flatten` pair) out of this: tier 1 ranks
+            // them, so there is one maximum and nothing to report.
+            && crate::impl_select::declaring_maxima(
+                program,
+                program.admitting_file(*call_id).or(Some(source)),
+                receiver,
+                &residue.member,
+            )
+            .len()
+                > 1
+        {
+            let member = &residue.member;
+            let other = if residue.first == *member_id {
+                residue.second
+            } else {
+                residue.first
+            };
+            let taken = module_stem(program, implementation.source);
+            let fix = match declaring
+                .get(&other)
+                .map(|index| program.implementations[*index].source)
+            {
+                // Two modules: the file that took both chooses with a selector,
+                // which is the spelling B318 S4 exists to give it.
+                Some(elsewhere) if elsewhere != implementation.source => {
+                    let subject = subject_head_name(program, implementation.subject);
+                    format!(
+                        "select one at the import — `import {taken}::{{ (impl {subject})::{member} }};` \
+                         — or drop an import"
+                    )
+                }
+                // One module: no import separates them, so the declarations are
+                // what has to change (B315's two fixes).
+                _ => {
+                    "narrow one bound so the two are disjoint, or declare it on a trait".to_string()
+                }
+            };
+            violations.push((
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: **program.span_map.get(call_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "this receiver satisfies the bounds of TWO blanket `impl` blocks that both \
+                         declare '{member}', and an inherent member is taken from the first \
+                         declared without ranking — swapping the two blocks would change which \
+                         body runs: {fix}"
+                    ),
+                },
+                source,
+            ));
+            continue;
+        }
+        if !restricting.contains(&source) && hidden.is_empty() {
+            continue;
+        }
         if implementation.source == source {
             continue;
         }
