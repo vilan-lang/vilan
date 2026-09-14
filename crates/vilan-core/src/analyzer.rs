@@ -5193,6 +5193,20 @@ impl ImplAdmission {
         self.restricting.is_empty() && self.hidden.is_empty()
     }
 
+    /// Whether THIS file's method namespace differs from today's at all — it
+    /// wrote `only` or a selector, or some module in the program hides an
+    /// `impl` from it.
+    ///
+    /// The per-IMPLEMENTATION predicates below are asked once per registered
+    /// block per lookup (std registers hundreds), and every one of those asks
+    /// begins by answering this same question about the same file. Hoisted so a
+    /// caller asks it ONCE per lookup: in a program where one file writes a
+    /// selector — kolt's `views.vl`, the estate's first — every other file then
+    /// pays nothing per block rather than a hash probe per block.
+    pub fn restricts(&self, importer: SourceId) -> bool {
+        self.restricting.contains(&importer) || !self.hidden.is_empty()
+    }
+
     /// The EXPORT gate (B318 S4, RULED 2026-09-13): `export` on an `impl` means
     /// what it means on every other declaration, so a block a consumer cannot
     /// SEE contributes nothing to that consumer — no methods, and no ambient

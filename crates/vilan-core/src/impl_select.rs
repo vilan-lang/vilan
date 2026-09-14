@@ -611,11 +611,15 @@ pub fn applying_implementations<'a, 'src>(
     if !is_resolvable(concrete_type) {
         return Vec::new();
     }
+    // B318 S4: the per-importer namespace. Asked once for the FILE here rather
+    // than once per registered block below — a file that restricts nothing has
+    // today's meaning and there is nothing to filter.
+    let scope = file.filter(|file| program.impl_admission.restricts(*file));
     let by_instantiation: Vec<&Implementation> = program
         .implementations
         .iter()
         .filter(|implementation| {
-            file.is_none_or(|file| program.impl_admission.admits_impl(file, implementation))
+            scope.is_none_or(|file| program.impl_admission.admits_impl(file, implementation))
         })
         .filter(|implementation| match wanted {
             Some(wanted) => {
@@ -725,11 +729,12 @@ pub fn declaring_maxima<'a, 'src>(
     concrete: TypeId,
     member: &str,
 ) -> Vec<&'a Implementation<'src>> {
+    let scope = file.filter(|file| program.impl_admission.restricts(*file));
     let contenders: Vec<&Implementation> = applying_implementations(program, file, concrete, None)
         .into_iter()
         .filter(
             |implementation| match implementation.declarations.get(member) {
-                Some(member_id) => file.is_none_or(|file| {
+                Some(member_id) => scope.is_none_or(|file| {
                     program
                         .impl_admission
                         .admits_member(file, implementation, *member_id)
@@ -748,6 +753,7 @@ pub fn select_member(
     member: &str,
     wanted: Option<WantedTrait>,
 ) -> Option<SelectedMember> {
+    let scope = file.filter(|file| program.impl_admission.restricts(*file));
     let contenders: Vec<&Implementation> =
         applying_implementations(program, file, concrete, wanted)
             .into_iter()
@@ -756,7 +762,7 @@ pub fn select_member(
                 // `(impl T)::{ m }` selector takes ONE member out of a block,
                 // so a block this file admits may still not offer `member`.
                 match implementation.declarations.get(member) {
-                    Some(member_id) => file.is_none_or(|file| {
+                    Some(member_id) => scope.is_none_or(|file| {
                         program
                             .impl_admission
                             .admits_member(file, implementation, *member_id)

@@ -177,6 +177,9 @@ pub fn member_name_at<'src>(program: &Program<'src>, call_id: Id) -> Option<&'sr
 /// A consumer that reads the candidate SET as a property of the site — "these
 /// and no others" — must narrow first. There is no third direction.
 pub fn candidates_of(program: &Program, file: Option<SourceId>, name: &str) -> Vec<Id> {
+    // B318 S4: asked once for the FILE — the per-block test below runs inside
+    // two nested loops over every trait and every implementation.
+    let scope = file.filter(|file| program.impl_admission.restricts(*file));
     let mut candidates = Vec::new();
     for trait_ in program.traits.values() {
         let Some(&declaration_id) = trait_.declarations.get(name) else {
@@ -198,7 +201,7 @@ pub fn candidates_of(program: &Program, file: Option<SourceId>, name: &str) -> V
         for implementation in &program.implementations {
             if implementation.trait_ids.contains(&trait_.id)
                 && let Some(&member_id) = implementation.declarations.get(name)
-                && file.is_none_or(|file| {
+                && scope.is_none_or(|file| {
                     program
                         .impl_admission
                         .admits_member(file, implementation, member_id)
@@ -263,6 +266,9 @@ pub fn impl_members_for_bound(
     let Some(resolved) = program.type_id_to_type_map.get(&subject_type_id) else {
         return Vec::new();
     };
+    // B318 S4: asked once for the FILE, not once per registered block (std
+    // registers hundreds, and this loop runs per dispatch site).
+    let scope = file.filter(|file| program.impl_admission.restricts(*file));
     let matches_subject = |subject: &Type| match (subject, resolved) {
         (Type::Struct(a, _), Type::Struct(b, _)) | (Type::Enum(a, _), Type::Enum(b, _)) => a == b,
         (a, b) => a == b,
@@ -274,7 +280,7 @@ pub fn impl_members_for_bound(
         // — the cheap filter first, and the one that says whether this file may
         // see the block at all.
         .filter(|implementation| {
-            file.is_none_or(|file| program.impl_admission.admits_impl(file, implementation))
+            scope.is_none_or(|file| program.impl_admission.admits_impl(file, implementation))
         })
         .filter(|implementation| {
             program
