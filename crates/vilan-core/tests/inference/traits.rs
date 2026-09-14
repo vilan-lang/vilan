@@ -6309,3 +6309,145 @@ fn b279_an_unresolvable_level_above_the_dispatch_still_fences() {
         "context `scope` is read here, but this code can be reached without an enclosing `run`",
     );
 }
+
+// --- B334 (R4): a receiverless call means the FREE function ------------------
+//
+// A method name shadowed a same-named free function inside its own `impl`
+// block, and the call reported the METHOD's arity — with no qualified escape
+// from inside a package (`pkg::ui::when(..)` is "`pkg` is a namespace, not a
+// value", a self-import is a cycle). std's own positional value forms had to
+// build their struct literal inline because of it. R4 ruled the spelling: a
+// method needs a receiver, so a bare call cannot have meant one.
+
+/// The shape, with a USER impl (A99 deleted the std exhibit): the free `tint`
+/// takes one argument, the method takes two beside `self`, and the bare call
+/// inside the method body means the free one — which is what the RESULT says,
+/// since a resolution to the member could only have been an arity error.
+#[test]
+fn b334_a_receiverless_call_inside_an_impl_means_the_free_function() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Board { label: str }
+
+        fun tint(name: str): str { i"free:{name}" }
+
+        impl Board {
+            fun tint(self, name: str, extra: str): str {
+                tint(name) + extra
+            }
+        }
+
+        fun main() {
+            print(Board { label = "b" }.tint("x", "!"));
+        }
+        main();
+        "#,
+        "free:x!\n",
+    );
+}
+
+/// ORDER INDEPENDENCE, and the two controls that keep the rule narrow, in one
+/// program. The method is declared BELOW the body that calls the free function
+/// (the rule reads the impl body's scope, not the walk's progress through it);
+/// `self.tint(..)` is still the method, because a receiver is what a method
+/// needs; and a RECEIVERLESS associated function (`shade`) still shadows the
+/// free one of the same name, because a bare call to it IS a call to it.
+#[test]
+fn b334_the_rule_is_narrow_to_a_receiverless_call_subject() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Board { label: str }
+
+        fun tint(name: str): str { i"free:{name}" }
+        fun shade(): str { "free-shade" }
+
+        impl Board {
+            fun paint(self): str {
+                tint(self.label) + "|" + Board::origin() + "|" + self.tint("m", "!")
+            }
+
+            fun tint(self, name: str, extra: str): str {
+                i"method:{name}{extra}"
+            }
+
+            fun origin(): str {
+                shade()
+            }
+
+            fun shade(): str {
+                "assoc"
+            }
+        }
+
+        fun main() {
+            print(Board { label = "b" }.paint());
+        }
+        main();
+        "#,
+        "free:b|assoc|method:m!\n",
+    );
+}
+
+/// The control the rule must not swallow: with NO free function of that name,
+/// the ordinary walk still answers and the refusal is the method's arity,
+/// exactly as it was. A rule that silently resolved to nothing here would turn
+/// a readable arity error into "cannot find `paint`".
+#[test]
+fn b334_a_receiverless_call_with_no_free_function_still_reports_the_method() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        struct Board { label: str }
+
+        impl Board {
+            fun paint(self, extra: str): str {
+                paint(self)
+            }
+        }
+
+        fun main() {
+            print(Board { label = "b" }.paint("!"));
+        }
+        "#,
+        "`paint` expects 2 arguments, but got 1 instead",
+    );
+}
+
+/// The other control: the name as a VALUE, not a call subject. `let held =
+/// tint;` inside the impl still takes the MEMBER — the rule is about what a
+/// CALL can have meant, and a value mention is not a call. What proves it is
+/// the refusal: a method has no value form, so resolving to the member is
+/// refused where resolving to the free function would have compiled.
+#[test]
+fn b334_a_bare_value_mention_inside_an_impl_still_takes_the_member() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        struct Board { label: str }
+
+        fun tint(name: str): str { i"free:{name}" }
+
+        impl Board {
+            fun tint(self, name: str, extra: str): str {
+                i"method:{name}{extra}"
+            }
+
+            fun taken(self): str {
+                let held = tint;
+                held(self, "v", "!")
+            }
+        }
+
+        fun main() {
+            print(Board { label = "b" }.taken());
+        }
+        "#,
+        "a method has no value form",
+    );
+}

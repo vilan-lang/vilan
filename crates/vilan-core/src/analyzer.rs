@@ -4237,6 +4237,10 @@ pub struct Analyzer<'src> {
     // Names resolve in `resolve_world`'s preamble, before the fixpoint, which
     // is where this is read.
     call_subjects: Vec<(Id, Id)>,
+    // The same pairs' SUBJECT ids as a set (B334/R4): `resolve_prepped_local`
+    // asks "is this name in call position?" once per prepped local, and a scan
+    // of the vector would make name resolution quadratic in the call count.
+    call_subject_ids: HashSet<Id>,
     // [`Divergence`]'s two resolved leaves (B204), recomputed once per
     // resolution phase (in `resolve_world`, after names resolve and before the
     // constraint fixpoint) rather than per query, since each is a scan and
@@ -5447,6 +5451,7 @@ impl<'src> Analyzer<'src> {
             anonymous_binder_scopes: HashMap::default(),
             panic_fn_id: None,
             call_subjects: Vec::new(),
+            call_subject_ids: HashSet::default(),
             divergence_leaves: DivergenceLeaves::default(),
             guard_continuations: Vec::new(),
             source_trait_id: None,
@@ -27820,6 +27825,7 @@ impl<'src> Analyzer<'src> {
                 // the call's own constraint resolves, which would make "does
                 // this body diverge?" depend on fixpoint order.
                 self.call_subjects.push((id, subject_id));
+                self.call_subject_ids.insert(subject_id);
                 let argument_ids = self.walk_expr_nodes(&arguments.0, scope_id);
                 let generic_argument_ids = generic_arguments
                     .as_ref()
@@ -42200,6 +42206,60 @@ impl<'src> Analyzer<'src> {
         self.member_or_submodule(item, scope_id, module_id)
     }
 
+    /// B334, ruled at Order 36's GO (R4): the FREE function wins a call written
+    /// with NO RECEIVER, even inside the `impl` block that declares a method of
+    /// the same name.
+    ///
+    /// A method needs a receiver — `self.when(..)` is the method — so a bare
+    /// `when(condition, body)` inside `impl View`'s own body cannot have meant
+    /// one, and resolving it to the member is not a shadowing decision but a
+    /// resolution that cannot be right. Before this, it was: the call reported
+    /// the METHOD's arity (``  `when` expects 3 arguments, but got 2 ``), and
+    /// there was no qualified escape from inside a package either —
+    /// `pkg::ui::when(..)` answers "`pkg` is a namespace, not a value" and a
+    /// self-import is a cycle. std's own positional value forms had to build
+    /// their struct literal inline because of it (positional-slots.md §3b's
+    /// "sugar", which A99 has since retired along with the methods).
+    ///
+    /// NARROW BY CONSTRUCTION, three ways. It fires only for a CALL SUBJECT
+    /// (`call_subject_ids`), so a bare mention of the name as a VALUE still
+    /// resolves to the member it always did; only when the enclosing `impl`
+    /// body's own declaration TAKES a receiver, so an associated function
+    /// declared without `self` still shadows — a bare call to one IS a call to
+    /// it; and it resolves from the impl body scope's PARENT rather than
+    /// jumping to the module, so an intervening binding is still what wins.
+    /// A name no outer scope binds resolves to nothing here and falls through
+    /// to the ordinary walk, which reports the method's arity exactly as before
+    /// — a program with no free function to mean is not one this rule can fix.
+    fn receiverless_call_subject(
+        &mut self,
+        id: Id,
+        name: &'src str,
+        scope_id: Id,
+        use_offset: usize,
+    ) -> Option<Id> {
+        if !self.call_subject_ids.contains(&id) {
+            return None;
+        }
+        let mut current = Some(scope_id);
+        while let Some(current_id) = current {
+            let scope = self.scopes.get(&current_id)?;
+            let parent_id = scope.parent_id;
+            let declared = scope.name_to_id_map.get(name).copied();
+            let is_impl_body = self.impl_body_subjects.contains_key(&current_id);
+            if is_impl_body
+                && let Some(member_id) = declared
+                && self.expr_id_to_expr_map.contains_key(&member_id)
+                && self.is_self_method(member_id)
+            {
+                return parent_id
+                    .and_then(|parent| self.resolve_value_name_at(name, parent, use_offset));
+            }
+            current = parent_id;
+        }
+        None
+    }
+
     fn resolve_prepped_local(&mut self, id: Id, name: &'src str) {
         let scope_id = self.get_scope_id_for_entity(id);
         // A use resolves at its own byte offset (positional visibility,
@@ -42215,7 +42275,12 @@ impl<'src> Analyzer<'src> {
         // file can be broken by a name added to that module. Resolved here,
         // at the one seam where "the scope has nothing" is already known.
         let resolved = self
-            .resolve_value_name_at(name, scope_id, use_offset)
+            // B334 (R4): a call written with NO RECEIVER means the free
+            // function, even inside an `impl` block declaring a method of the
+            // same name. Asked FIRST because it is a correction to what the
+            // ordinary walk would answer, not a fallback for what it cannot.
+            .receiverless_call_subject(id, name, scope_id, use_offset)
+            .or_else(|| self.resolve_value_name_at(name, scope_id, use_offset))
             .or_else(|| {
                 self.css_scope_locals
                     .contains(&id)
