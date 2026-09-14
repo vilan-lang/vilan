@@ -7,11 +7,6 @@ function __clone(value) {
 function __shared_new(value) {
 	return { v: value };
 }
-function fresh_id() {
-	const id = next_subscriber_id.v;
-	next_subscriber_id.v = id + 1;
-	return id;
-}
 function new2() {
 	return [ __shared_new([  ]), __shared_new(false) ];
 }
@@ -147,7 +142,7 @@ function app(title2, todos2, page2) {
 }
 function $b(value) {
 	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers), fresh_id() ];
+	return [ __shared_new(value), __shared_new(subscribers) ];
 }
 function $a(value) {
 	return $b(value);
@@ -241,7 +236,6 @@ function $M(self, content) {
 	place3(content, self);
 	return __clone(self);
 }
-const next_subscriber_id = __shared_new(0);
 const title = $a("Tasks <live>");
 const todos = $c([ "alpha", "beta & gamma" ]);
 const page = $c([ 1 ]);

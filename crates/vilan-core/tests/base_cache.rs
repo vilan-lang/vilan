@@ -14,7 +14,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use vilan_core::{BuildOptions, PackageSpec, Platform, Workspace, analyze_source, transform};
+use vilan_core::{
+    BuildOptions, EntryMode, PackageSpec, Platform, Workspace, analyze_source, transform,
+};
 
 static CACHE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1196,6 +1198,290 @@ fn a_pkg_importing_entry_hits_the_cache_on_its_second_analysis() {
         (hits_edit, misses_edit),
         (hits_pre_edit, misses_pre_edit + 1),
         "an edited `pkg::` sibling must evict and miss, not serve a stale world"
+    );
+    assert_ne!(
+        edited.1, fresh.1,
+        "the rebuild after a sibling edit must carry the edit"
+    );
+
+    vilan_core::analyzer::base_cache_clear();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// B341: the key carries the modules the entry's own SYNTAX seeds, not only the
+/// ones a `std::` path names.
+///
+/// An element desugars to `std::ui`'s `view`, and a `css` block makes
+/// `std::style::prelude` ambient inside itself — both are pushed into `to_load`
+/// beside the written imports, both load into the world, and neither is named
+/// by any `std::` path in the text. The key was `collect_module_paths(.., "std")`
+/// alone, so a plain entry and an element entry with the same import line minted
+/// the SAME key and the second was served the first's world: a world with no
+/// `std::ui` in it, in which `<div/>` fails with "cannot find 'view' in this
+/// scope". Not a cache curiosity — `vilan build` analyzes a package's entries in
+/// ONE process, so a two-entry package where one entry uses element syntax
+/// failed to build, and WHICH entry failed depended on the order the entries
+/// sorted in. Found by hygiene-36 chasing N84's shared-state flake, where two
+/// `inference` `modules::` tests read red under plain `cargo test` for the same
+/// reason.
+///
+/// Both orders, and both desugars, because the failure is asymmetric: the entry
+/// analyzed SECOND is the one that pays. The assertion is the DIAGNOSTICS and
+/// not a hit/miss delta — an element entry compiles macro worlds, and those
+/// consult the cache on their own account, so the counters here are counting two
+/// things at once (this file's opening note).
+#[test]
+fn an_entrys_desugar_seeds_are_part_of_its_world_key() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    const PLAIN: &str = "import std::io::print;\n\nfun main() {\n\tprint(\"plain\");\n}\n";
+    const ELEMENT: &str =
+        "import std::io::print;\n\nfun main() {\n\tlet _x = <div/>;\n\tprint(\"element\");\n}\n";
+    const CSS: &str = "import std::io::print;\n\nfun main() {\n\tlet _s = css { color: \"red\"; };\n\t\
+         print(\"css\");\n}\n";
+
+    // The repro's own order: the plain entry sorts first, so it builds the
+    // world and the element entry is the one handed it.
+    vilan_core::analyzer::base_cache_clear();
+    let plain = observe(PLAIN);
+    assert_eq!(
+        plain.0, "[]",
+        "the plain entry must analyze clean: {}",
+        plain.0
+    );
+    let element = observe(ELEMENT);
+    assert_eq!(
+        element.0, "[]",
+        "an element entry analyzed after a plain one must analyze clean — it \
+         was served a world with no `std::ui` in it: {}",
+        element.0
+    );
+    assert!(
+        element.2.is_some(),
+        "and it must emit: an element entry served the plain entry's world \
+         produced no program at all"
+    );
+
+    // And the other way round, which is the order that already worked and must
+    // go on working: the element entry builds the world, the plain one misses.
+    vilan_core::analyzer::base_cache_clear();
+    let element = observe(ELEMENT);
+    assert_eq!(
+        element.0, "[]",
+        "the element entry must analyze clean alone"
+    );
+    let plain = observe(PLAIN);
+    assert_eq!(plain.0, "[]", "the plain entry must analyze clean second");
+
+    // The `css` twin, whose seed is `std::style::prelude` and whose failure
+    // said "cannot find 'style' in this scope".
+    vilan_core::analyzer::base_cache_clear();
+    let plain = observe(PLAIN);
+    assert_eq!(
+        plain.0, "[]",
+        "the plain entry must analyze clean: {}",
+        plain.0
+    );
+    let css = observe(CSS);
+    assert_eq!(
+        css.0, "[]",
+        "a `css` entry analyzed after a plain one must analyze clean: {}",
+        css.0
+    );
+    assert!(
+        css.2.is_some(),
+        "and it must emit: a `css` entry served the plain entry's world \
+         produced no program at all"
+    );
+
+    vilan_core::analyzer::base_cache_clear();
+}
+
+// ---------------------------------------------------------------------------
+// The OPEN MODULE's own world (backlog M70)
+// ---------------------------------------------------------------------------
+
+/// M70: a module a front end opened AS the entry, whose own package imports it
+/// back, builds an ENTRY-SHAPED world — `pkg::<entry>` aliases the entry's own
+/// (global) scope and the module itself is in the world nowhere — and B239
+/// answered that hazard by storing nothing at all. Seven of kolt's nineteen
+/// files are that shape, and each paid its package's whole pre-entry load on
+/// every keystroke because no other analysis ever minted their key.
+///
+/// The world is storable once the KEY says which module it excludes
+/// ([`vilan_core::analyzer`]'s `BaseCacheKey::entry_open_module`, the entry's
+/// own path). Three claims, and the third is the one the key exists for:
+///
+///  1. the cycle entry STORES a world and HITS on its second analysis, whose
+///     diagnostics and emitted JS are a fresh build's;
+///  2. an edited SIBLING evicts it by content — the E12 rule is untouched;
+///  3. a DIFFERENT file with the same seeds is NOT served it. Under the old key
+///     the two collide exactly, and `theme.vl`'s `import pkg::views::icon`
+///     would resolve into the second file's own scope, where `icon` is not.
+#[test]
+fn an_open_modules_world_is_stored_under_a_key_that_excludes_it() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let root = std::env::temp_dir().join(format!("vilan_m70_cycle_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("package dir");
+    // THREE modules with a cycle through the entry: the open file `views.vl`,
+    // the sibling `theme.vl` that imports it back, and `palette.vl` beneath
+    // them both (so the world has something in it that the cycle does not
+    // touch, and a sibling edit has somewhere to land that is not the cycle).
+    const THEME: &str = "export *;\n\nimport pkg::palette::base;\nimport pkg::views::icon;\n\n\
+                         fun color(): i32 {\n\tbase() + icon()\n}\n";
+    std::fs::write(root.join("theme.vl"), THEME).expect("write theme");
+    std::fs::write(
+        root.join("palette.vl"),
+        "export *;\n\nfun base(): i32 {\n\t1\n}\n",
+    )
+    .expect("write palette");
+
+    // The open file, twice — a keystroke apart. Its seeds do not move, so the
+    // key does not either.
+    const FIRST: &str = "export *;\n\nimport std::io::print;\nimport pkg::theme::color;\n\n\
+                         fun icon(): i32 {\n\t3\n}\n\n\
+                         fun total(): i32 {\n\tcolor() + icon()\n}\n\n\
+                         fun main() {\n\tprint(total());\n}\n";
+    const SECOND: &str = "export *;\n\nimport std::io::print;\nimport pkg::theme::color;\n\n\
+                          fun icon(): i32 {\n\t3\n}\n\n\
+                          fun total(): i32 {\n\tcolor() + icon() + 1\n}\n\n\
+                          fun main() {\n\tprint(total());\n}\n";
+    // A DIFFERENT file of the same package with the SAME seeds — one `std::io`
+    // reference and one `pkg::theme`, which is a byte-for-byte identical key
+    // everywhere but in the field this item added.
+    const OTHER: &str = "export *;\n\nimport std::io::print;\nimport pkg::theme::color;\n\n\
+                         fun shade(): i32 {\n\tcolor() + 2\n}\n\n\
+                         fun main() {\n\tprint(shade());\n}\n";
+
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    fn observe_open(
+        spec: &PackageSpec,
+        pkg_root: &Path,
+        entry_path: &Path,
+        source: &'static str,
+    ) -> (String, Option<String>) {
+        let spec = spec.clone();
+        let pkg_root = pkg_root.to_path_buf();
+        let entry_path = entry_path.to_path_buf();
+        on_one_thread(move || {
+            // The front end says this file is a MODULE it handed over as the
+            // entry — which is what makes `pkg::views` the alias and the world
+            // entry-shaped (B239).
+            let workspace = Workspace {
+                entry_mode: EntryMode::OpenFile {
+                    declared_entries: Vec::new(),
+                },
+                ..Workspace::default()
+            };
+            let (program, errors) = analyze_source(
+                source,
+                &spec,
+                &pkg_root,
+                &entry_path,
+                Some(Platform::default()),
+                &workspace,
+            );
+            let diagnostics = format!("{errors:?}");
+            let javascript = match program {
+                Some(program) if errors.is_empty() => {
+                    transform(&program, &BuildOptions::default()).ok()
+                }
+                _ => None,
+            };
+            (diagnostics, javascript)
+        })
+    }
+
+    let views = root.join("views.vl");
+    let other = root.join("other.vl");
+    std::fs::write(&other, OTHER).expect("write other");
+    // The open file exists on DISK too — that is what makes `theme.vl`'s
+    // `import pkg::views::icon` resolve to the entry at all, and it is how
+    // every front end that opens a file has it. The analysis still reads the
+    // buffer it is handed; the disk copy is what the loader RESOLVES, and it
+    // recognises the entry by path.
+    std::fs::write(&views, FIRST).expect("write views");
+
+    vilan_core::analyzer::base_cache_clear();
+    let retained_empty = vilan_core::analyzer::base_cache_retained();
+    let first = observe_open(&spec, &root, &views, FIRST);
+    assert_eq!(
+        first.0, "[]",
+        "the cycle fixture must analyze clean: {}",
+        first.0
+    );
+    // (1a) B239 stored NOTHING here. The world is entry-shaped, and the key now
+    // says so rather than the store refusing.
+    assert_eq!(
+        vilan_core::analyzer::base_cache_retained() - retained_empty,
+        1,
+        "an open module's entry-shaped world must be STORED (M70), under the \
+         key that excludes it"
+    );
+
+    // The keystroke lands on disk too, as an editor's save would — the world
+    // is keyed on the entry, whose content it never validates (the entry is
+    // `sources[0]`, and a hit patches it).
+    std::fs::write(&views, SECOND).expect("save views");
+    let (hits_before, misses_before) = stats();
+    let cached = observe_open(&spec, &root, &views, SECOND);
+    let (hits_after, misses_after) = stats();
+    assert_eq!(
+        hits_after,
+        hits_before + 1,
+        "the second analysis of a cycle-reached open module must HIT; it missed"
+    );
+    assert_eq!(misses_after, misses_before, "a hit is not also a miss");
+
+    // (1b) And the cache may not change an answer — the hit re-runs the same
+    // deferred order the miss did, off the flag the world carries.
+    vilan_core::analyzer::base_cache_clear();
+    let fresh = observe_open(&spec, &root, &views, SECOND);
+    assert_eq!(cached.0, fresh.0, "diagnostics differ cached vs fresh");
+    assert_eq!(cached.1, fresh.1, "emitted JS differs cached vs fresh");
+    assert!(cached.1.is_some(), "the fixture must emit");
+
+    // (3) The key's whole job: a DIFFERENT entry with the same seeds is not
+    // served this world. Its own analysis loads `views.vl` as a real module —
+    // which is exactly what the stored world does not have — so being served it
+    // would leave `theme.vl`'s `import pkg::views::icon` pointing at `other`'s
+    // own scope, and `icon` is not in it.
+    let (hits_pre_other, misses_pre_other) = stats();
+    let other_observed = observe_open(&spec, &root, &other, OTHER);
+    let (hits_other, misses_other) = stats();
+    assert_eq!(
+        (hits_other, misses_other),
+        (hits_pre_other, misses_pre_other + 1),
+        "a different file with the same seeds must MISS an open module's \
+         entry-shaped world"
+    );
+    assert_eq!(
+        other_observed.0, "[]",
+        "the sibling entry must analyze clean — it was served a world missing \
+         its own `views` module: {}",
+        other_observed.0
+    );
+
+    // (2) E12 is untouched: an edited sibling evicts by content.
+    std::fs::write(
+        root.join("palette.vl"),
+        "export *;\n\nfun base(): i32 {\n\t2\n}\n",
+    )
+    .expect("edit palette");
+    let (hits_pre_edit, misses_pre_edit) = stats();
+    let edited = observe_open(&spec, &root, &views, SECOND);
+    let (hits_edit, misses_edit) = stats();
+    assert_eq!(
+        (hits_edit, misses_edit),
+        (hits_pre_edit, misses_pre_edit + 1),
+        "an edited sibling must evict an open module's world and miss"
     );
     assert_ne!(
         edited.1, fresh.1,

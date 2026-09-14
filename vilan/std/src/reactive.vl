@@ -758,19 +758,28 @@ trait Signal<T> with Source<T> {
 struct SignalCell<T> {
 	value: Shared<T>,
 	subscribers: Shared<List<Subscriber>>,
-	/// This cell's IDENTITY — stamped once at construction, never compared by
-	/// value. vilan has no reference equality, and a cell is exactly the kind
-	/// of thing two holders need to recognise as the SAME one: `Shared` is
-	/// not deep-copied, so two bindings of one cell are one cell, and nothing
-	/// else in the value says so.
-	///
-	/// The consumer is the rpc runtime's dynamic exposure (A92): a reply
-	/// carrying a source the connection has already exported answers the
-	/// channel it already minted, rather than a second capability and a
-	/// second forward of the same updates. It is a stamp rather than a
-	/// derivation because a derivation would have to be from the value, and
-	/// two cells holding equal values are not one cell.
-	id: i32,
+}
+
+/// This cell's IDENTITY — the same number for every handle to one cell, a
+/// different one for every other cell. vilan has no reference equality, and a
+/// cell is exactly the kind of thing two holders need to recognise as the SAME
+/// one: `Shared` is not deep-copied, so two bindings of one cell are one cell,
+/// and nothing else in the value says so.
+///
+/// The consumer is the rpc runtime's dynamic exposure (A92): a reply carrying a
+/// source the connection has already exported answers the channel it already
+/// minted, rather than a second capability and a second forward of the same
+/// updates. It reads the VALUE cell's identity, which is the cell's: a
+/// `SignalCell` is a struct over two `Shared`s, and copying the struct copies
+/// neither.
+///
+/// A92 stamped this at construction, into an `id` field every `SignalCell` in
+/// every program paid for whether or not anything ever asked (M66). The stamp
+/// is `Shared::identity`'s now, which takes it on the first ASK — so the twelve
+/// corpus goldens that moved when the field landed are back where they were,
+/// and a program that exposes nothing mints no identities at all.
+fun cell_identity<T>(cell: SignalCell<T>): i32 {
+	cell.value.identity()
 }
 
 impl SignalCell<type T> with Source<T> {
@@ -834,11 +843,7 @@ impl SignalCell<type T> with Signal<T> {
 	/// reachable at `SignalCell::new`. They are the same cell either way.
 	fun new(value: T): SignalCell<T> {
 		mut subscribers: List<Subscriber> = [];
-		SignalCell {
-			value = Shared::new(value),
-			subscribers = Shared::new(subscribers),
-			id = fresh_id(),
-		}
+		SignalCell { value = Shared::new(value), subscribers = Shared::new(subscribers) }
 	}
 
 	fun set(self, value: T) {

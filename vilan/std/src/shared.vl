@@ -37,4 +37,20 @@ impl Shared<type T> {
 	/// visible through every handle to the cell. `borrows self`: the view projects
 	/// the cell, so it cannot outlive this handle.
 	external fun write(self): &mut T borrows self;
+
+	/// This CELL's identity: a number that is the same for every handle to one
+	/// cell and different for every other cell, for as long as the program
+	/// runs. `Shared` is the one place reference identity exists in the
+	/// language, so it is the one place that can answer this.
+	///
+	/// It is not derived from the value — two cells holding equal values are
+	/// two cells — and it is not a field: the number is STAMPED on the cell the
+	/// first time anything asks, so a program that never asks pays nothing at
+	/// all (M66; every `SignalCell` used to mint one at construction for the
+	/// rpc runtime's dedup, whether or not the cell was ever exposed).
+	///
+	/// Stable within one process and meaningless outside it: it is a local
+	/// answer to "is this the same cell", never a wire value and never a key
+	/// anything persists.
+	external fun identity(self): i32;
 }

@@ -1275,6 +1275,17 @@ fn helper_source(name: &str) -> &'static str {
              \treturn { v: value };\n\
              }"
         }
+        // `Shared.identity()` — the cell's identity, stamped on the first ask
+        // and kept (M66). `??=` writes only when the property is absent, so the
+        // first caller mints and every later one reads; the counter starts at 1
+        // so no identity is ever `0 - 1`, the sentinel the rpc runtime's
+        // capability table uses for "no cell identity applies".
+        "__shared_identity" => {
+            "let __shared_identity_next = 1;\n\
+             function __shared_identity(cell) {\n\
+             \treturn cell.__id ??= __shared_identity_next++;\n\
+             }"
+        }
         // `process::env(key): Option<str>` — a missing variable reads back
         // `undefined`, which becomes `None`; otherwise `Some(value)`.
         "__env" => {
@@ -7421,6 +7432,17 @@ impl<'src> Transformer<'src> {
             }
             // `shared.clone()` -> the same cell (the receiver, unchanged).
             Intrinsic::SharedClone => args.next().unwrap_or(js::Node::Void),
+            // `shared.identity()` -> the cell's stamped identity, taken on the
+            // first ask (M66). The stamp goes on the cell OBJECT, beside its
+            // `v` slot, so every handle to the cell reads the one number and a
+            // cell nothing ever asks about carries no property at all.
+            Intrinsic::SharedIdentity => {
+                self.used_helpers.insert("__shared_identity");
+                js::Node::Call(
+                    Box::new(js::Node::Local("__shared_identity".to_string())),
+                    vec![args.next().unwrap_or(js::Node::Void)],
+                )
+            }
             // `shared.read()` / `shared.write()` -> the cell's slot, `self.v`.
             // Both name the storage; what separates them is what the ANALYZER
             // does with it. A `read` in a storing position is wrapped in
@@ -11040,6 +11062,7 @@ const RESERVED_NAMES: &[&str] = &[
     "__args",
     "__env",
     "__shared_new",
+    "__shared_identity",
     "__list_get",
     "__list_pop",
     "__list_sort_by",
