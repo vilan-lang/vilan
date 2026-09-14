@@ -483,11 +483,11 @@ function mount(id, view2) {
 	element.appendChild(view2[0]);
 }
 function mount_root(id, body) {
-	const $cx = $q([ 1 ], ($cu) => {
-		return $cv(body);
+	const $cA = $q([ 1 ], ($cx) => {
+		return $cy(body);
 	});
-	const built = $cx[0];
-	const root = $cx[1];
+	const built = $cA[0];
+	const root = $cA[1];
 	mount(id, built);
 	if (__hmr_active()) {
 		const element = document.getElementById(id);
@@ -925,15 +925,18 @@ function $cb(self) {
 	const $cc = self;
 	return $cc[0] === 1;
 }
-function $cq(self, content, $cr, $cs) {
+function $ct(self, content, end, $cu, $cv) {
 	const marker = document.createTextNode("");
-	host(self).insertBefore(marker, self[0]);
+	host(self).insertBefore(marker, end);
 	const staging = document.createDocumentFragment();
-	place(content, [ __clone(staging) ], $cr, $cs);
-	host(self).insertBefore(staging, self[0]);
+	place(content, [ __clone(staging) ], $cu, $cv);
+	host(self).insertBefore(staging, end);
 	return [ marker ];
 }
-function $ct(owner, body) {
+function $cq(self, content, $cr, $cs) {
+	return $ct(self, content, self[0], $cr, $cs);
+}
+function $cw(owner, body) {
 	return body(owner);
 }
 function $bU(parent, source, render, armed, $bV, $bW) {
@@ -984,7 +987,7 @@ function $bU(parent, source, render, armed, $bV, $bW) {
 			}
 			$co;
 			const owner = new3();
-			const row2 = $ct(owner, ($cp) => {
+			const row2 = $cw(owner, ($cp) => {
 				return $cq(region, render(value, $cp), $bV, $cp);
 			});
 			hold_rows(region, [ __clone(row2) ]);
@@ -1011,7 +1014,7 @@ function $bO(self, content, $an, $ao) {
 	$bP(content, self, $an, $ao);
 	return __clone(self);
 }
-function $cv(body) {
+function $cy(body) {
 	const scope = new3();
 	const result = body(scope);
 	return [ result, scope ];

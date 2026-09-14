@@ -337,15 +337,22 @@ impl Region {
 		Row {}
 	}
 
+	/// Places a row before another one — a server render writes in source
+	/// order and never moves anything, so the position is `open_row`'s and the
+	/// bound is dropped (A98). KEEP IN STEP with the browser twin.
+	fun open_row_before<C: Slot>(self, content: C, end: Row): Row {
+		self.open_row(content)
+	}
+
 	/// Cuts a row out of the document — there is no document to cut it out of,
 	/// and nothing that ever moves. Accepted and dropped. KEEP IN STEP.
 	fun cut_row(self, row: Row, end: Row): Row {
 		row
 	}
 
-	/// Puts a cut row back — see `cut_row`: nothing was ever taken out.
-	/// KEEP IN STEP.
-	fun insert_row(self, row: Row, content: Row) {}
+	/// Puts a cut row back — see `cut_row`: nothing was ever taken out, and
+	/// A98's `end` bound has nothing to bound. KEEP IN STEP.
+	fun insert_row(self, row: Row, content: Row, end: Row) {}
 
 	/// Drops a row — a server render has no removal. KEEP IN STEP.
 	fun drop_row(self, row: Row) {}

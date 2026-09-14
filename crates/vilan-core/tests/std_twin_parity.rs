@@ -211,6 +211,23 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
     ),
     (
         "ui",
+        "settled_steps",
+        Side::BrowserOnly,
+        "A98: which rows of a reconcile plan the ORDER PASS can leave where they \
+         are. The process twin has no order pass — a server render is one pass \
+         in source order and nothing it places ever moves — so there is no \
+         order for a row to be already in.",
+    ),
+    (
+        "ui",
+        "row_references",
+        Side::BrowserOnly,
+        "A98, with `settled_steps`: the marker each moved row is threaded in \
+         before. Browser-only for the same reason, and for the reason `Row` is \
+         empty on the process twin — there are no markers there to point at.",
+    ),
+    (
+        "ui",
         "Region.host",
         Side::BrowserOnly,
         "A91: the element a region currently sits in, read off its ANCHOR \

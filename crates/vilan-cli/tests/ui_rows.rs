@@ -2542,6 +2542,178 @@ fun main() {
 main();
 "#;
 
+// --- A98: the order pass leaves an unmoved row alone -------------------------
+
+/// The counting tail. `__cost()` reports, and resets, the two numbers A98 is
+/// about: rows CUT out of the document by the order pass (one `extractContents`
+/// each) and rows BUILT from scratch (one `createElement` each, since every row
+/// here is one `<li>`). Before A98 the cut count was the whole live run on every
+/// pass, whatever the edit was.
+const A98_COST_HARNESS_TAIL: &str = r#"
+global.__cost = (() => {
+    let cut = 0;
+    let built = 0;
+    const element = document.createElement;
+    document.createElement = (tag) => { built += 1; return element(tag); };
+    const proto = Object.getPrototypeOf(document.createRange());
+    const extract = proto.extractContents;
+    proto.extractContents = function (...args) { cut += 1; return extract.apply(this, args); };
+    return () => { const line = `cut=${cut} built=${built}`; cut = 0; built = 0; return line; };
+})();
+global.__tree = () => flatten(documentRoot);
+require("./app.js");
+"#;
+
+/// Eight edits over one four-row run, each driven from the same starting list
+/// so the costs are comparable, and each printed as `pass|tree|cost`. The
+/// starting list is restored between them and that restore's cost is discarded:
+/// what is being measured is the edit, not the round trip.
+const A98_ORDER_PASS: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, each, mount_root, view };
+
+[derive(PartialEq)]
+struct Row {
+	id: i32,
+	text: str,
+}
+
+fun row(id: i32, text: str): Row {
+	Row { id = id, text = text }
+}
+
+fun main() {
+	let base: List<Row> = [row(1, "a"), row(2, "b"), row(3, "c"), row(4, "d")];
+	let rows: SignalCell<List<Row>> = Signal::new(base);
+	let _root = mount_root("app", || {
+		view("ul")
+			.child(view("li").text("H"))
+			.child(each(rows, |item: Row| item.id, |item: Row| view("li").text(item.text)))
+			.child(view("li").text("F"))
+	});
+	let _built = cost();
+
+	rows.set([row(1, "a"), row(2, "b"), row(3, "c"), row(4, "d"), row(5, "e")]);
+	print(i"append|{tree()}|{cost()}");
+	rows.set(base);
+	let _a = cost();
+
+	rows.set([row(0, "z"), row(1, "a"), row(2, "b"), row(3, "c"), row(4, "d")]);
+	print(i"prepend|{tree()}|{cost()}");
+	rows.set(base);
+	let _b = cost();
+
+	rows.set([row(2, "b"), row(3, "c"), row(4, "d")]);
+	print(i"remove-first|{tree()}|{cost()}");
+	rows.set(base);
+	let _c = cost();
+
+	rows.set([row(1, "a"), row(2, "b"), row(4, "d")]);
+	print(i"remove-middle|{tree()}|{cost()}");
+	rows.set(base);
+	let _d = cost();
+
+	rows.set([row(1, "a"), row(2, "B"), row(3, "c"), row(4, "d")]);
+	print(i"relabel|{tree()}|{cost()}");
+	rows.set(base);
+	let _e = cost();
+
+	rows.set([row(4, "d"), row(1, "a"), row(2, "b"), row(3, "c")]);
+	print(i"last-to-front|{tree()}|{cost()}");
+	rows.set(base);
+	let _f = cost();
+
+	rows.set([row(2, "b"), row(3, "c"), row(4, "d"), row(1, "a")]);
+	print(i"first-to-last|{tree()}|{cost()}");
+	rows.set(base);
+	let _g = cost();
+
+	rows.set([row(4, "d"), row(3, "c"), row(2, "b"), row(1, "a")]);
+	print(i"reverse|{tree()}|{cost()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+[extern("__cost")]
+external fun cost(): str;
+
+main();
+"#;
+
+/// A98: the order pass cuts and re-inserts only the rows that MOVED.
+///
+/// Both halves are asserted per pass, and both are needed. The COST is the
+/// claim — an append costs no cut at all where it used to cut the whole run —
+/// and the TREE is what says the cheaper pass still produced the right order,
+/// which a count alone cannot. The eight edits are the shapes a reconciled run
+/// actually takes; `reverse` is the control that is genuinely O(n) and must
+/// stay correct rather than get faster.
+///
+/// Non-vacuity: with the A98 skip removed (every row cut, every row
+/// re-inserted) the seven cheap lines read `cut=4`/`cut=3` and the pin is red
+/// seven times over.
+#[test]
+fn a98_the_order_pass_leaves_an_unmoved_row_alone() {
+    let harness = format!("{DOM_STUB}{A98_COST_HARNESS_TAIL}");
+    let stdout = build_and_run("a98_order_pass", A98_ORDER_PASS, &harness);
+    let seen: Vec<(String, Vec<String>, String)> = stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('|');
+            let name = parts.next()?.to_string();
+            let tree = nodes(parts.next()?);
+            let cost = parts.next()?.to_string();
+            Some((name, tree, cost))
+        })
+        .collect();
+    let tree = |labels: &[&str]| {
+        let mut expected = vec!["root".to_string(), "ul".to_string(), "li'H'".to_string()];
+        for label in labels {
+            expected.push(format!("li'{label}'"));
+        }
+        expected.push("li'F'".to_string());
+        expected
+    };
+    let expected: Vec<(String, Vec<String>, String)> = vec![
+        // An appended row: nothing already in the run moved, so nothing is cut,
+        // and the one new row is built before the anchor.
+        ("append", tree(&["a", "b", "c", "d", "e"]), "cut=0 built=1"),
+        // A prepended row: the four survivors are still in ascending order, so
+        // the new row is threaded in before the first one's marker.
+        ("prepend", tree(&["z", "a", "b", "c", "d"]), "cut=0 built=1"),
+        // A removal cuts exactly the row that is going, wherever it sat.
+        ("remove-first", tree(&["b", "c", "d"]), "cut=1 built=0"),
+        ("remove-middle", tree(&["a", "b", "d"]), "cut=1 built=0"),
+        // A changed value rebuilds that row alone: the cut is its own, and the
+        // three rows around it never move.
+        ("relabel", tree(&["a", "B", "c", "d"]), "cut=1 built=1"),
+        // One row dragged across the whole run, both directions. The backward
+        // scan settles the other three for the first, the forward scan for the
+        // second — which is why both scans exist.
+        (
+            "last-to-front",
+            tree(&["d", "a", "b", "c"]),
+            "cut=1 built=0",
+        ),
+        (
+            "first-to-last",
+            tree(&["b", "c", "d", "a"]),
+            "cut=1 built=0",
+        ),
+        // The control: a reverse genuinely moves everything but one row.
+        ("reverse", tree(&["d", "c", "b", "a"]), "cut=3 built=0"),
+    ]
+    .into_iter()
+    .map(|(name, tree, cost)| (name.to_string(), tree, cost.to_string()))
+    .collect();
+    assert_eq!(
+        seen, expected,
+        "A98: only a row whose position changed may be cut and re-inserted, and \
+         the run must still read in the new order; got:\n{stdout}"
+    );
+}
+
 #[test]
 fn a91_the_ssr_twin_renders_what_each_row_shape_renders() {
     let stdout = build_and_run_process("a91_rows_ssr", A91_ROWS_SSR);
