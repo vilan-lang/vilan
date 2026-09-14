@@ -605,7 +605,7 @@ function eq(self, other) {
 }
 function $a(value) {
 	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers), fresh_id() ];
+	return [ __shared_new(value), __shared_new(subscribers) ];
 }
 function $l(self) {
 	return self.length === 0;
