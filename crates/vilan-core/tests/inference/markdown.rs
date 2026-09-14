@@ -4704,8 +4704,7 @@ fn a_changed_bundled_file_is_seen_by_the_next_analysis() {
     // new hash. If any cache ever keys const results without the bundled
     // inputs, a `--watch` round stops recopying an edited resource and the dev
     // loop serves last round's bytes forever.
-    let dir = std::env::temp_dir().join(format!("vilan-const-bundle-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch_dir(&format!("vilan-const-bundle-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("static")).unwrap();
     let source = r#"
         import std::asset;
@@ -4740,8 +4739,7 @@ fn a_bundled_file_is_not_charged_by_its_size() {
     // program, so charging fuel by size would bound how large an asset may be
     // rather than how much work a build does. A file comfortably past the
     // explicit fuel budget in bytes bundles fine.
-    let dir = std::env::temp_dir().join(format!("vilan-const-bundle-fuel-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch_dir(&format!("vilan-const-bundle-fuel-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("huge.bin"), "a".repeat(17_000_000)).unwrap();
     let (values, _, bundled) = const_bundles(
@@ -4778,8 +4776,7 @@ fn a_bundled_file_is_not_charged_by_its_size() {
 /// directory, written in an order the sort has to undo, so a pin asserting the
 /// listing's ORDER is asserting the sort and not the host's `readdir`.
 fn estate_root(tag: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("vilan-035-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = scratch_dir(&format!("vilan-035-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(root.join("static/icons")).expect("create the estate");
     // Deliberately reverse order, and the nested file first.
     std::fs::write(root.join("static/icons/open.svg"), "open").expect("write");

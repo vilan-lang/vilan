@@ -14,6 +14,112 @@ pub use std::path::{Path, PathBuf};
 
 pub use vilan_core::{BuildOptions, PackageSpec, Platform, Workspace, analyze_source, transform};
 
+/// The directory this binary's scratch files go in — the cargo TARGET
+/// directory's own temp, never `std::env::temp_dir()` (tracker N82).
+///
+/// `/tmp` is a 12 GiB tmpfs shared by every worktree on the owner's machine,
+/// and this binary alone writes one `.mjs` per run-and-assert pin — thousands
+/// across a suite — plus two 17 MB fixtures for the const channel's fuel pins.
+/// A full run under nine lanes filled it: three `No space left on device`
+/// failures in one run, green on the re-run, which is a red indistinguishable
+/// from a real one. `CARGO_TARGET_TMPDIR` is cargo's per-integration-test
+/// scratch under `target/`, so the files land on the same (large) filesystem
+/// the build artifacts already do, and each worktree's harness writes into its
+/// own tree rather than into one shared pool.
+pub fn scratch_root() -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("inference");
+    let _ = std::fs::create_dir_all(&root);
+    root
+}
+
+/// A scratch DIRECTORY named `name` under [`scratch_root`], emptied first —
+/// the drop-in for the `temp_dir().join(..)` + `remove_dir_all` pairs the
+/// fixtures were written with.
+pub fn scratch_dir(name: &str) -> PathBuf {
+    let dir = scratch_root().join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// A scratch file that removes itself — the eager clean N82 asks for.
+///
+/// Every `.mjs` site used to `remove_file` after `node` returned, which leaks
+/// the file on every path that does not get there: an `.expect` between the
+/// write and the run, a panicking assert after it, a test process killed under
+/// load. A `Drop` closes all of those. The write also NAMES THE FREE SPACE
+/// when the filesystem is full, so an ENOSPC red arrives saying what it is
+/// instead of as `Os { code: 28 }` inside a list of diagnostics — which is the
+/// half of N82 that made the spurious reds expensive rather than merely
+/// annoying.
+pub struct ScratchFile {
+    path: PathBuf,
+}
+
+impl ScratchFile {
+    /// Writes `contents` to `name` under [`scratch_root`].
+    pub fn write(name: &str, contents: &str) -> Result<Self, Vec<String>> {
+        let path = scratch_root().join(name);
+        match std::fs::write(&path, contents) {
+            Ok(()) => Ok(Self { path }),
+            Err(error) => Err(vec![storage_failure(&path, &error)]),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ScratchFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// An IO failure on a scratch path, with the free space named when the
+/// filesystem is out of it (N82's guard).
+pub fn storage_failure(path: &Path, error: &std::io::Error) -> String {
+    let full = error.kind() == std::io::ErrorKind::StorageFull || error.raw_os_error() == Some(28);
+    if !full {
+        return format!("{}: {error}", path.display());
+    }
+    format!(
+        "{}: {error} — the harness's scratch filesystem is FULL{}. This is \
+         tracker N82's shape: the red is the disk's, not the compiler's. Free \
+         space and re-run before believing it.",
+        path.display(),
+        free_space(path),
+    )
+}
+
+/// What `df` says is left where `path` lives, as a parenthetical. Empty when
+/// there is no `df` to ask (every non-unix host), because a guard that cannot
+/// answer says nothing rather than guessing.
+fn free_space(path: &Path) -> String {
+    let Some(parent) = path.parent() else {
+        return String::new();
+    };
+    let Ok(output) = std::process::Command::new("df")
+        .arg("-Pk")
+        .arg(parent)
+        .output()
+    else {
+        return String::new();
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let Some(line) = text.lines().nth(1) else {
+        return String::new();
+    };
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let (Some(available), Some(mount)) = (fields.get(3), fields.last()) else {
+        return String::new();
+    };
+    let Ok(kib) = available.parse::<u64>() else {
+        return String::new();
+    };
+    format!(" ({} MiB free on `{mount}`)", kib / 1024)
+}
+
 pub fn std_spec() -> PackageSpec {
     vilan_core::manifest::resolve_std(
         &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std"),
@@ -770,10 +876,11 @@ pub fn run_js(js: &str) -> Result<String, Vec<String>> {
     // runtime classifies before it parses, and a harness that ran its bundles
     // as CommonJS could not see an ESM-only defect at all
     // (`top-level-await.md` §8.1).
-    let path = std::env::temp_dir().join(format!("vilan_test_{}_{unique}.mjs", std::process::id()));
-    std::fs::write(&path, js).map_err(|error| vec![error.to_string()])?;
-    let output = std::process::Command::new("node").arg(&path).output();
-    let _ = std::fs::remove_file(&path);
+    let file = ScratchFile::write(
+        &format!("vilan_test_{}_{unique}.mjs", std::process::id()),
+        js,
+    )?;
+    let output = std::process::Command::new("node").arg(file.path()).output();
     match output {
         Ok(output) if output.status.success() => {
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -792,13 +899,15 @@ pub fn compile_and_run_status(source: &str) -> (String, String, i32) {
 
     let javascript = compile(source).expect("expected a clean compile");
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("vilan_exit_{}_{unique}.mjs", std::process::id()));
-    std::fs::write(&path, javascript).expect("write script");
+    let file = ScratchFile::write(
+        &format!("vilan_exit_{}_{unique}.mjs", std::process::id()),
+        &javascript,
+    )
+    .unwrap_or_else(|why| panic!("write script: {}", why.join("\n")));
     let output = std::process::Command::new("node")
-        .arg(&path)
+        .arg(file.path())
         .output()
         .expect("run node");
-    let _ = std::fs::remove_file(&path);
     (
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -866,10 +975,11 @@ pub fn compile_and_run_capturing_stderr(source: &str) -> Result<(String, String)
 
     let js = compile(source)?;
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("vilan_task_{}_{unique}.mjs", std::process::id()));
-    std::fs::write(&path, js).map_err(|error| vec![error.to_string()])?;
-    let output = std::process::Command::new("node").arg(&path).output();
-    let _ = std::fs::remove_file(&path);
+    let file = ScratchFile::write(
+        &format!("vilan_task_{}_{unique}.mjs", std::process::id()),
+        &js,
+    )?;
+    let output = std::process::Command::new("node").arg(file.path()).output();
     match output {
         Ok(output) if output.status.success() => Ok((
             String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -1087,4 +1197,72 @@ pub fn drop_plan_enrolment(source: &str) -> (usize, usize) {
         .expect("spawn worker")
         .join()
         .expect("worker panicked")
+}
+
+// --- N82: the harness's own scratch ------------------------------------------
+
+#[test]
+fn the_harness_scratch_is_under_the_target_directory_and_not_the_shared_temp() {
+    // The whole of N82: `/tmp` is a 12 GiB tmpfs shared by every worktree on
+    // the owner's machine, and a full run under nine lanes filled it. The
+    // scratch belongs on the filesystem the build artifacts already live on.
+    let root = scratch_root();
+    assert!(
+        root.starts_with(env!("CARGO_TARGET_TMPDIR")),
+        "the harness scratch must sit under cargo's target temp, not {}",
+        root.display()
+    );
+    assert!(
+        root.is_dir(),
+        "and it exists by the time anything writes into it: {}",
+        root.display()
+    );
+}
+
+#[test]
+fn a_scratch_file_removes_itself_when_it_is_dropped() {
+    // The eager clean. Every `.mjs` site used to remove its file after `node`
+    // returned, which leaks it on every path that does not get there — a
+    // panicking assert between the write and the run being the common one.
+    let path = {
+        let file =
+            ScratchFile::write("n82_drop_probe.mjs", "export {};\n").expect("write the probe");
+        let path = file.path().to_path_buf();
+        assert!(path.is_file(), "the probe was written: {}", path.display());
+        path
+    };
+    assert!(
+        !path.exists(),
+        "a dropped scratch file is gone: {}",
+        path.display()
+    );
+}
+
+#[test]
+fn a_full_scratch_filesystem_is_reported_as_the_disks_failure_and_not_the_compilers() {
+    // N82's guard. Three `No space left on device` failures arrived in one run
+    // as bare `Os { code: 28 }` strings inside a list of diagnostics, which is
+    // indistinguishable from a compiler answer nobody expected. The message
+    // says which it is, and names what is left so the reader can act.
+    let full = std::io::Error::from_raw_os_error(28);
+    let message = storage_failure(&scratch_root().join("probe.mjs"), &full);
+    assert!(
+        message.contains("FULL") && message.contains("N82"),
+        "the ENOSPC message must say what it is: {message}"
+    );
+    if cfg!(unix) {
+        assert!(
+            message.contains("MiB free on"),
+            "and name the free space, which is the half a reader acts on: {message}"
+        );
+    }
+
+    // The control: an ordinary IO failure is reported plainly, with no claim
+    // about the disk.
+    let missing = std::io::Error::from_raw_os_error(2);
+    let plain = storage_failure(&scratch_root().join("probe.mjs"), &missing);
+    assert!(
+        !plain.contains("FULL"),
+        "a non-ENOSPC failure is not dressed as one: {plain}"
+    );
 }

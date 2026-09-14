@@ -5944,8 +5944,7 @@ fn a_changed_input_is_seen_by_the_next_analysis() {
     // pipeline (the parse cache, the base cache, the shared const world) may
     // serve the first read's value for the second analysis; if any cache ever
     // keys const results without the read inputs, this goes red.
-    let dir = std::env::temp_dir().join(format!("vilan-const-read-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch_dir(&format!("vilan-const-read-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = r#"
         import std::asset;
@@ -5979,8 +5978,7 @@ fn a_read_bigger_than_the_fuel_budget_is_a_budget_miss() {
     // Reads charge fuel per byte, so the budget bounds input size exactly as
     // it bounds computation — without this, a read was one fuel tick and the
     // budget bounded nothing about it.
-    let dir = std::env::temp_dir().join(format!("vilan-const-read-fuel-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch_dir(&format!("vilan-const-read-fuel-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // Comfortably past the explicit fuel budget in bytes.
     std::fs::write(dir.join("huge.txt"), "a".repeat(17_000_000)).unwrap();

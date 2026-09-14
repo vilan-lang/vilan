@@ -108,8 +108,10 @@ fn deprecation_fixture_std(tag: &str) -> (PathBuf, PackageSpec) {
             }
         }
     }
-    let root =
-        std::env::temp_dir().join(format!("vilan-deprecated-std-{tag}-{}", std::process::id()));
+    let root = scratch_dir(&format!(
+        "vilan-deprecated-std-{tag}-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&root);
     // `macro_std` rides along: the macro world resolves it BESIDE `std`.
     let tree = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan");
