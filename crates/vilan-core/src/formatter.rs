@@ -3069,20 +3069,37 @@ impl<'src> Printer<'src> {
     /// write hundreds of them, so the rule lands first and the sweep's output is
     /// already canonical.
     ///
-    /// The run is measured with the marker LIFTED OUT, which is what makes a
+    /// The block is measured with the marker LIFTED OUT, which is what makes a
     /// marker written above the imports find the same slot as one written below
-    /// them: the imports are the file's leading run either way, and the marker
-    /// was never part of it. A file with no leading import run puts the marker
-    /// before its first item — after the module comment, which is
+    /// them: the imports are the file's leading block either way, and the marker
+    /// was never part of it. A file with no leading import at all puts the
+    /// marker before its first item — after the module comment, which is
     /// [`Self::print_export_all_marker`]'s half of the answer.
+    ///
+    /// **The BLOCK, not the sort RUN.** [`Self::import_run_end`] stops at a
+    /// standalone comment, because imports may not reorder across one; the
+    /// marker's slot is not a sorting question and must not inherit that break.
+    /// kolt's `views.vl` is the exhibit: a `// FIXME:` line sits between its
+    /// first import and its second, so the sort run is ONE statement long and a
+    /// marker written correctly below all thirty of them was moved up into the
+    /// middle of the list — further from the canonical shape than where it
+    /// started. The block is every leading import, comments and blank lines and
+    /// all.
     fn export_all_marker_slot(&self, items: &[Spanned<Node<'src>>], marker: usize) -> usize {
-        let first = usize::from(marker == 0);
-        match items.get(first) {
-            Some(item) if import_kind_and_branch(&item.0).is_some() => {
-                self.import_run_end(items, first)
+        let mut slot = 0;
+        let mut index = 0;
+        while index < items.len() {
+            if index == marker {
+                index += 1;
+                continue;
             }
-            _ => first,
+            if import_kind_and_branch(&items[index].0).is_none() {
+                break;
+            }
+            index += 1;
+            slot = index;
         }
+        slot
     }
 
     /// Prints the marker at its slot, with a paragraph gap above it and its own
@@ -3106,9 +3123,9 @@ impl<'src> Printer<'src> {
         comments: &[&'src str],
     ) -> usize {
         let mut prev_end = prev_end;
-        // No leading import run: the marker is the file's first statement, so
-        // nothing has printed yet and the module comment is still pending.
-        if slot == usize::from(marker == 0) {
+        // No leading import at all: the marker is the file's first statement,
+        // so nothing has printed yet and the module comment is still pending.
+        if slot == 0 {
             let until = self.module_comment_end(items, marker);
             prev_end = self.flush_comments_before(until, prev_end);
         }
@@ -11446,6 +11463,33 @@ mod export_marker_placement {
         assert_places(
             "// what this module is\n\n/// what main does\nfun main() {}\n\nexport *;\n",
             "// what this module is\n\nexport *;\n\n/// what main does\nfun main() {}\n",
+        );
+    }
+
+    // The block is not the sort RUN. `import_run_end` stops at a standalone
+    // comment (imports may not reorder across one), and inheriting that break
+    // here moved a correctly-placed marker UP into the middle of the import
+    // list — kolt's `views.vl`, whose second import carries a `// FIXME:` line
+    // above it and whose marker sits correctly below all thirty. Measured on
+    // the copy: `vilan fmt --check` flagged exactly that one file, and this is
+    // the pin that keeps it flagging nothing.
+    #[test]
+    fn a_comment_inside_the_import_block_does_not_end_it() {
+        let source = "import std::io::print;\n\
+                      // why the next one is here\n\
+                      import pkg::a;\n\n\
+                      export *;\n\n\
+                      fun main() {}\n";
+        assert_eq!(format(source), source, "the marker is already in its slot");
+        // And a marker written ABOVE that same block still lands below all of
+        // it, not between the comment and the import under it.
+        assert_places(
+            "export *;\nimport std::io::print;\n\
+             // why the next one is here\n\
+             import pkg::a;\n\nfun main() {}\n",
+            "import std::io::print;\n\
+             // why the next one is here\n\
+             import pkg::a;\n\nexport *;\n\nfun main() {}\n",
         );
     }
 
