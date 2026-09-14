@@ -1019,6 +1019,7 @@ fn a_handle_method_over_the_connectionless_post_leg_fails_naming_the_method() {
         "src/main.vl",
         r#"import std::io::print;
 import std::process::exit;
+import std::time::sleep;
 import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::json::json_codec;
@@ -1072,11 +1073,26 @@ fun run_client(url: str) {
 	// `status()` reads `Failed(error)`.
 	let note: RemoteSource<str> = client.note("welcome");
 	let watching = note.sub(|_text| print("note -> seeded"));
-	match client.touch() {
-		Ok(let _settle) => {},
-		Err(let _error) => {},
+	// N84: the SETTLE WAIT. The lease is issued on the subscription above and
+	// answered on the transport's own turn, not on this one, so what makes the
+	// failure readable here is a round-trip — and one round-trip was enough on
+	// a quiet box and not enough under lane load, where this printed
+	// `note err Waiting` and nothing in the pin could tell that from a real
+	// regression. Round-trip until the status leaves `Waiting`, bounded: a
+	// genuine hang still fails the assertions below, with the state it is
+	// stuck in printed rather than with a timeout nobody can read.
+	mut settled = note.status().get().debug();
+	mut rounds = 0;
+	for settled.contains("Waiting") && rounds < 100 {
+		match client.touch() {
+			Ok(let _settle) => {},
+			Err(let _error) => {},
+		}
+		sleep(20);
+		settled = note.status().get().debug();
+		rounds = rounds + 1;
 	}
-	print(i"note err {note.status().get().debug()}");
+	print(i"note err {settled}");
 	watching.dispose();
 	exit(0);
 }
