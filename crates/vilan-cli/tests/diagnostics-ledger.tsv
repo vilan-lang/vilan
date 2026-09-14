@@ -493,3 +493,5 @@ row	flagship	key
 461	-	`{path}` is not exported by `{module}`, and this path reaches it through the module. The spelling that says so is a marked import: `import {module}::{ #{leaf} };`, and then `{leaf}` on its own
 462	-	a closure written at this {position} would be born under `{clause}`, a `context` clause the threading cannot follow, and would capture its context at creation instead of taking one at each call: a clause is followed on a parameter, a `let` annotation, a struct field, a return type, and a generic argument the struct binds to a FIELD — not inside a `List`, a `Map`, an `Option`, a tuple or an array
 463	-	'{member}' is provided by an `impl` in module `{module}`, and {claim}: {fix}
+NEW	-	implementing `Callable` requires a `call` method: `{rendered}` declares none, so `value(..)` has nothing to resolve to. The marker carries no signature of its own — write the arity and the types you mean (`fun call(self, ..): ..`), here or in an `impl {rendered}` of its own
+NEW	-	{base}; it declares a `call` method but does not implement `Callable` — write `impl {rendered} with Callable` to call it as a function

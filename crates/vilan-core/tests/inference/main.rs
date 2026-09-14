@@ -20,6 +20,7 @@ mod support;
 mod backed_enums;
 mod borrows;
 mod bounds;
+mod callable;
 mod generics;
 mod hmr;
 mod iterators;

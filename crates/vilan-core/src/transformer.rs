@@ -4012,6 +4012,66 @@ impl<'src> Transformer<'src> {
     }
 
     fn walk_entity(&mut self, id: Id, block: &mut Vec<js::Node<'src>>) -> Option<js::Node<'src>> {
+        let node = self.walk_entity_seams(id, block)?;
+        // B340 Q1: a `Callable` value in a closure-typed position. A struct is
+        // a plain JS array — it cannot be applied — so the coercion IS the
+        // wrapping closure, built here around the finished value so the copy
+        // seams below have already run on the receiver. Outermost on purpose:
+        // what the position receives is the function, and what the function
+        // closes over is whatever the seams decided the value is.
+        if let Some(&(arity, type_id)) = self.program.callable_coercions.get(&id) {
+            if let Some(wrapped) = self.wrap_callable_coercion(type_id, arity, node.clone()) {
+                return Some(wrapped);
+            }
+            return Some(node);
+        }
+        Some(node)
+    }
+
+    /// The wrapping closure a recorded `Callable` coercion lowers to (B340 Q1):
+    /// `(a, b) => <call>(<value>, a, b)`, with `call` resolved against the
+    /// value's own type through the same dispatch every method call uses — so a
+    /// coerced `Callable` and a written `x.call(a, b)` reach the same emitted
+    /// member, including a generic impl's instance.
+    ///
+    /// `None` when `call` does not resolve: the analyzer admitted the coercion,
+    /// so that cannot happen for a program that compiled, and falling back to
+    /// the bare value keeps a compiler bug a wrong answer rather than a panic.
+    fn wrap_callable_coercion(
+        &mut self,
+        type_id: TypeId,
+        arity: usize,
+        value: js::Node<'src>,
+    ) -> Option<js::Node<'src>> {
+        let parameters: Vec<js::Parameter> = (0..arity)
+            .map(|_| js::Parameter {
+                name: self.ng.next_name(),
+            })
+            .collect();
+        let mut arguments = Vec::with_capacity(arity + 1);
+        arguments.push(value);
+        arguments.extend(
+            parameters
+                .iter()
+                .map(|parameter| js::Node::Local(parameter.name.clone())),
+        );
+        let dispatch = self.resolve_dispatch_with(type_id, "call", &[], None)?;
+        let call = self.emit_dispatch(dispatch, arguments, None);
+        Some(js::Node::Closure(js::Closure {
+            parameters,
+            body: vec![js::Node::Return(Box::new(call))],
+            is_async: false,
+        }))
+    }
+
+    /// [`Self::walk_entity`] without B340's coercion wrap: the value itself,
+    /// through the ownership seams (a lifted resource temporary, a scalar view
+    /// read, a return-position copy).
+    fn walk_entity_seams(
+        &mut self,
+        id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> Option<js::Node<'src>> {
         let node = self.walk_entity_inner(id, block)?;
         // C11 (`temporary-drop.md`): a resource value that is neither bound nor
         // moved is owned by its STATEMENT. It has no name of its own, so it is
