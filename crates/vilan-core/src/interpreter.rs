@@ -805,6 +805,13 @@ struct Interpreter<'a> {
     /// extends a scope's life: one that died naturally mid-run costs its slot
     /// and nothing else, and the run's liveness is exactly what it was.
     scopes: Vec<Weak<RefCell<Scope<'a>>>>,
+    /// The next `Shared::identity` stamp this run will mint (M66) — the
+    /// interpreter's half of the emitted `__shared_identity_next`. Per RUN, so
+    /// a const evaluation or a macro expansion answers the same numbers
+    /// whatever ran before it; `1` first, because `0 - 1` is the rpc runtime's
+    /// "no cell identity" sentinel and nothing should be able to collide with
+    /// it. A float because every interpreter number is one.
+    next_shared_identity: f64,
 }
 
 impl<'a> Interpreter<'a> {
@@ -819,6 +826,7 @@ impl<'a> Interpreter<'a> {
             reader: None,
             scheduled: Vec::new(),
             scopes: Vec::new(),
+            next_shared_identity: 1.0,
         }
     }
 
@@ -1582,6 +1590,36 @@ impl<'a> Interpreter<'a> {
                 let mut cell = IndexMap::new();
                 cell.insert(Rc::from("v"), take(0));
                 Ok(Value::Object(Rc::new(RefCell::new(cell))))
+            }
+            // `Shared.identity()` — the JS half is `cell.__id ??= next++`, and
+            // this is the same sentence over an `Object` cell (M66): the stamp
+            // is a property beside `v`, minted on the first ask and read by
+            // every later one, so two handles to one cell answer one number.
+            // The counter is per-EXPANSION rather than per-process: a macro
+            // world is torn down between expansions, and an identity that
+            // outlived one would make the same program answer differently
+            // depending on what ran before it.
+            "__shared_identity" => {
+                let cell = match take(0) {
+                    Value::Object(cell) => cell,
+                    other => {
+                        return Err(Failure::unsupported(format!(
+                            "`Shared::identity` over {}",
+                            type_name(&other)
+                        )));
+                    }
+                };
+                let existing = cell.borrow().get("__id").cloned();
+                match existing {
+                    Some(value) => Ok(value),
+                    None => {
+                        let minted = self.next_shared_identity;
+                        self.next_shared_identity += 1.0;
+                        cell.borrow_mut()
+                            .insert(Rc::from("__id"), Value::Number(minted));
+                        Ok(Value::Number(minted))
+                    }
+                }
             }
             "__list_get" => {
                 let list = expect_array(&take(0))?;

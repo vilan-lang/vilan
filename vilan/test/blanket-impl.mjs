@@ -81,7 +81,7 @@ function $a(label, $b, $c) {
 }
 function $f(value) {
 	let subscribers = [  ];
-	return [ __shared_new(value), __shared_new(subscribers), fresh_id() ];
+	return [ __shared_new(value), __shared_new(subscribers) ];
 }
 function $e(value) {
 	return $f(value);

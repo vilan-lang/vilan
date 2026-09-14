@@ -47156,6 +47156,14 @@ pub enum Intrinsic {
     // `SharedValue`, but distinguished so a write *through* it rebinds the slot
     // (`self.v = x`) rather than replacing the pointee's slots (`__replace`).
     SharedWrite,
+    // `Shared.identity(): i32` -> the cell's stamped identity, taken on the
+    // FIRST ask and kept: `cell.__id ??= next++` (M66). The one place reference
+    // identity exists in the language, and the one place that can answer "is
+    // this the same cell" — a `Shared` is not deep-copied, so two handles to
+    // one cell are one cell and nothing in the value says so. Lazy because
+    // A92's eager `SignalCell.id` field made every program in every corpus
+    // golden mint an id per cell for a dedup almost none of them use.
+    SharedIdentity,
     // `Set::new(): Set<T>` -> `new Set()`.
     SetNew,
     // `Set.insert(value)` -> native `.add(value)`.
@@ -56311,6 +56319,7 @@ fn analyze_over_world<'src>(
                     ("clone", Intrinsic::SharedClone),
                     ("read", Intrinsic::SharedValue),
                     ("write", Intrinsic::SharedWrite),
+                    ("identity", Intrinsic::SharedIdentity),
                 ] {
                     if let Some(id) =
                         external_intrinsic_declaration(&analyzer, implementation, name)

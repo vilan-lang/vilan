@@ -15,6 +15,7 @@ impl Shared<type T> {
 	fun read(self): T                      // a COPY of the contents
 	fun clone(self): Shared<T>             // another handle to the SAME cell
 	fun write(self): &mut T borrows self   // a writable view of the contents
+	fun identity(self): i32                // which CELL this is, stamped on first ask
 }
 ```
 
@@ -39,6 +40,14 @@ fun main() {
   rules (no storing, no holding across `await`).
 - Copying the `Shared` value itself copies the *handle*: both handles see
   one cell. That's the point.
+- `identity()` answers *which cell this is*: the same number for every handle
+  to one cell, a different one for every other cell, for the life of the
+  process. It is the only reference identity the language has — nothing else
+  in a value can say two bindings are one cell — and it is not derived from
+  the contents, so two cells holding equal values are two cells. The number is
+  stamped on the cell the first time anything asks, so a program that never
+  asks pays nothing. Local by construction: never a wire value, never a key to
+  persist.
 
 ## `Arena<T>` + `Handle<T>`
 

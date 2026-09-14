@@ -5700,3 +5700,73 @@ fn b296_a_keyed_and_a_plain_exposed_cell_seeded_empty_both_compile() {
         "#,
     );
 }
+
+/// M66: `Shared::identity` is the language's one answer to "are these two
+/// bindings the same cell", and it is LAZY — the number is stamped on the cell
+/// the first time anything asks.
+///
+/// Four claims in one run, because they are one sentence: a second handle to
+/// one cell answers the same number (a copied `Shared` is a copied HANDLE, and
+/// `identity` is what lets a program say so); two cells built from equal values
+/// answer different numbers (it is not derived from the contents); asking twice
+/// answers the same number (the stamp is kept, not re-minted); and a cell that
+/// is never asked about is never stamped, which is the whole point — every
+/// `SignalCell` in the program used to mint one at construction for the rpc
+/// runtime's dedup, whether or not anything exposed it.
+///
+/// The last claim is the one this program cannot see and the CORPUS can: the
+/// eleven goldens A92 moved are back at their pre-A92 shape, with no
+/// `fresh_id()` in a `SignalCell` constructor and no `__shared_identity` in any
+/// program that asks for none.
+#[test]
+fn shared_identity_is_the_cell_and_is_stamped_on_the_first_ask() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        fun main() {
+            let cell: Shared<i32> = Shared::new(7);
+            let same = cell;
+            let handle = cell.clone();
+            let other: Shared<i32> = Shared::new(7);
+            print(i"same:{cell.identity() == same.identity()}");
+            print(i"clone:{cell.identity() == handle.identity()}");
+            print(i"other:{cell.identity() == other.identity()}");
+            print(i"stable:{cell.identity() == cell.identity()}");
+        }
+        main();
+        "#,
+        "same:true\nclone:true\nother:false\nstable:true\n",
+    );
+}
+
+/// M66: the identity of a `SignalCell` is its VALUE cell's, and copying the
+/// struct copies neither of the two `Shared`s it is made of — so the rpc
+/// runtime's dedup (A92) reads the same number for two bindings of one signal
+/// and a different one for a second signal holding the same value.
+///
+/// This is the shape `expose_dynamic` dedups on: a getter two views call
+/// answers one cell, and minting a second channel for it would cost a second
+/// capability, a second forward and a second copy of every update.
+#[test]
+fn a_signal_cells_identity_is_its_value_cells_and_survives_a_copy() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+
+        struct Holder { source: SignalCell<i32> }
+
+        fun main() {
+            let signal: SignalCell<i32> = Signal::new(1);
+            let held = Holder { source = signal };
+            let twin: SignalCell<i32> = Signal::new(1);
+            print(i"held:{signal.value.identity() == held.source.value.identity()}");
+            print(i"twin:{signal.value.identity() == twin.value.identity()}");
+        }
+        main();
+        "#,
+        "held:true\ntwin:false\n",
+    );
+}

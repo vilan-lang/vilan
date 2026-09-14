@@ -35,6 +35,7 @@ import pkg::reactive::{
 	at_release_settle,
 	at_settle,
 	batch,
+	cell_identity,
 	defer_to_owner,
 	fresh_id,
 	get_owner,
@@ -1798,7 +1799,8 @@ struct Capability {
 	/// positionally, so its `Unsubscribe` stays demand-only (A41).
 	dynamic: bool,
 	/// The SOURCE this channel carries, as the identity of its canonical cell
-	/// (`SignalCell.id`) — `0 - 1` on a channel no cell identity applies to.
+	/// (`cell_identity`, the value cell's `Shared::identity`) — `0 - 1` on a
+	/// channel no cell identity applies to.
 	/// What `expose_dynamic` dedups on (A92): a second reply carrying the
 	/// same cell answers the channel the first one minted, so a getter two
 	/// views call is one capability and one forward rather than two of each.
@@ -1946,14 +1948,14 @@ impl ReactiveServer {
 	/// — the same getter from two views, a re-mint after the last lease left
 	/// — are one source, and minting a second channel for it would cost a
 	/// second capability, a second forward and a second copy of every update
-	/// for a value the client already has. The cell's own `id` is the key;
+	/// for a value the client already has. The cell's own IDENTITY is the key;
 	/// the `sources` table is the index, so nothing is retained past a
 	/// `revoke` that a live capability does not already retain.
 	///
 	/// What dedup obliges is the counting on the other side: a shared channel
 	/// outlives any one mirror's release (`LiveForward.holds`).
 	fun expose_dynamic<T: Wire>(self, source: SignalCell<T>): i32 {
-		match self.dynamic_channel_for(source.id, false) {
+		match self.dynamic_channel_for(cell_identity(source), false) {
 			Some(let held) => held,
 			None => {
 				let channel = fresh_channel();
@@ -1966,7 +1968,7 @@ impl ReactiveServer {
 				});
 				self.sources
 					.write()
-					.push((channel, Capability { start = starter, resolve = None, dynamic = true, identity = source.id }));
+					.push((channel, Capability { start = starter, resolve = None, dynamic = true, identity = cell_identity(source) }));
 				channel
 			},
 		}
@@ -2112,7 +2114,7 @@ impl ReactiveServer {
 		self,
 		cell: KeyedCell<K, T>,
 	): i32 {
-		match self.dynamic_channel_for(cell.elements.id, true) {
+		match self.dynamic_channel_for(cell_identity(cell.elements), true) {
 			Some(let held) => held,
 			None => {
 				let channel = fresh_channel();
@@ -2128,7 +2130,7 @@ impl ReactiveServer {
 				};
 				self.sources
 					.write()
-					.push((channel, Capability { start, resolve = Some(resolve), dynamic = true, identity = cell.elements.id }));
+					.push((channel, Capability { start, resolve = Some(resolve), dynamic = true, identity = cell_identity(cell.elements) }));
 				channel
 			},
 		}
