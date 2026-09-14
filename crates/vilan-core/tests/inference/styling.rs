@@ -6481,45 +6481,42 @@ fn b227_a_printed_event_parameter_still_reads_its_key() {
     );
 }
 
-// --- B311: a condition carrying the slot key's own delimiter cannot be WRAPPED --
-// `Style::rule` builds the slot key `media:condition:property` and every
-// condition combinator re-reads an inner style's keys by splitting on `:`.
-// `pseudo`'s name is free-form, so `pseudo("hover:not(:active)", s)` is the one
-// way a condition can hold that delimiter: the split mis-aligns, the second
-// field stops at the first `:`, the rest of the compound is read as the
-// PROPERTY, and the wrapping combinator re-mints the slot from those pieces —
-// emitting a strictly WEAKER selector and saying nothing. Measured before the
-// fence on the item's own exhibit: `.s2jb016[data-open="true"]:hover
-// {opacity:0.5}`, with the `:not(:active)` gone.
+// --- B311/B322: no condition carries the slot key's own delimiter, and no
+// --- reader splits a key by hand ------------------------------------------------
+// `Style::rule` keys a slot `media:condition:property`, and every reader used to
+// split that string for itself and index the pieces positionally. `pseudo`'s
+// free-form name was the one surface that could put the separator INSIDE a
+// condition: the split mis-aligned, the condition field stopped at the first
+// `:`, the rest of the compound was read as the PROPERTY, and the wrapping
+// combinator re-minted the slot from those pieces — a strictly WEAKER selector,
+// emitted in silence. Measured on the item's own exhibit before the interim
+// fence: `.s2jb016[data-open="true"]:hover{opacity:0.5}`, the `:not(:active)`
+// gone.
 //
-// The fence is on the WRAP, not on the name. Unwrapped the raw token is sound
-// and is in USE (kolt's `styles.vl` writes nine of them): `rule` renders the
-// condition it was handed verbatim and nothing ever re-splits it. `+` is not a
-// wrap either — it replays a slot under its own key — so such a style still
-// merges. A95 is the real fix: a condition becomes a value and no condition is
-// ever a string to split.
+// A95 S2 closes the class from both ends. `pseudo(name)` refuses a `:` outright
+// — a compound is two condition VALUES (`hover() + active().not()`) and a
+// leading colon meant a pseudo-ELEMENT (`element("selection")`) — so no
+// condition token can hold the byte. And every reader goes through `slot_of`,
+// one total reader whose assertion fires loudly if a key ever stops naming
+// exactly one triple, which is what B322's latent halves were: `Style::add`
+// split a key too, and `media`'s width and `raw`'s property were unfenced.
 
 #[test]
-fn b311_a_colon_bearing_pseudo_condition_is_refused_by_every_wrapping_combinator() {
-    // One program per combinator that re-reads an inner style's slot keys. The
-    // list IS the wrapping surface: `attribute`, `within`, `media` (through a
-    // breakpoint), `not`, the child relations (through `children`) and `pseudo`
-    // itself. A seventh combinator added without the check reds nothing here,
-    // which is why `check_wrappable_slot` is one helper called from each rather
-    // than six copies of a condition.
-    for wrapped in [
+fn b311_a_pseudo_name_carrying_the_key_separator_is_refused_at_the_name() {
+    // The fence moved from the WRAP to the NAME, which is what makes the class
+    // closable rather than fenceable: the string form cannot be constructed, so
+    // there is no program shape left for a reader to mis-split. Both spellings
+    // the free-form name was reached for are refused here, wrapped or not.
+    for written in [
+        r#"style().pseudo("hover:not(:active)", style().opacity(0.5))"#,
         r#"style().attribute("data-open", Some("true"), style().pseudo("hover:not(:active)", style().opacity(0.5)))"#,
-        r#"style().within("data-theme", Some("dark"), style().pseudo("hover:not(:active)", style().opacity(0.5)))"#,
-        r#"style().md(style().pseudo("hover:not(:active)", style().opacity(0.5)))"#,
-        r#"style().not(style().pseudo("hover:not(:active)", style().opacity(0.5)))"#,
-        r#"style().children(style().pseudo("hover:not(:active)", style().opacity(0.5)))"#,
-        r#"style().pseudo("focus", style().pseudo("hover:not(:active)", style().opacity(0.5)))"#,
+        r#"style().pseudo(":selection", style().opacity(0.5))"#,
     ] {
         let program = format!(
             r#"
             import std::style::{{ style, Style }};
             fun s(): Style {{
-                {wrapped}
+                {written}
             }}
             let _s = const s();
             fun main() {{}}
@@ -6530,62 +6527,18 @@ fn b311_a_colon_bearing_pseudo_condition_is_refused_by_every_wrapping_combinator
         assert!(
             diagnostics
                 .iter()
-                .any(|(message, _)| message.contains("cannot wrap a condition containing")),
-            "{wrapped}\n{diagnostics:#?}"
+                .any(|(message, _)| message.contains("a pseudo-class name cannot contain ':'")),
+            "{written}\n{diagnostics:#?}"
         );
     }
 }
 
 #[test]
-fn b311_the_miscompiles_own_exhibit_is_refused_instead_of_emitting_a_weaker_selector() {
-    // The item's program, verbatim. Before the fence it compiled and put
-    // `[data-open="true"]:hover` on the sheet — the `:not(:active)` silently
-    // dropped, the rule matching a superset of what was asked for.
-    let diagnostics = failure_diagnostics(
-        r#"
-        import std::style::{ style, Style };
-        fun s(): Style {
-            style().attribute(
-                "data-open",
-                Some("true"),
-                style().pseudo("hover:not(:active)", style().opacity(0.5)),
-            )
-        }
-        let _s = const s();
-        fun main() {}
-        main();
-        "#,
-    );
-    let refusal = diagnostics
-        .iter()
-        .map(|(message, _)| message.as_str())
-        .find(|message| message.contains("cannot wrap a condition containing"))
-        .unwrap_or_else(|| panic!("{diagnostics:#?}"));
+fn b311_the_refusal_names_both_values_the_string_form_was_reached_for() {
     // The two things the message owes an author whose program just stopped
-    // compiling: the spelling that WORKS today, and where the real fix lives.
-    assert!(
-        refusal.contains("UNWRAPPED the raw token still emits verbatim"),
-        "{refusal}"
-    );
-    assert!(
-        refusal.contains("one pseudo(..) with no condition around it"),
-        "{refusal}"
-    );
-    assert!(refusal.contains("A95"), "{refusal}");
-    // And it names the combinator that did the wrapping, so a long chain says
-    // which link to move. (The head is const evaluation's own envelope, which
-    // names `check_wrappable_slot`; the sentence is std's.)
-    assert!(
-        refusal.contains("attribute cannot wrap a condition"),
-        "{refusal}"
-    );
-}
-
-#[test]
-fn b311_an_unwrapped_raw_pseudo_token_still_emits_verbatim() {
-    // The control, and the reason the fence is on the wrap: the compound
-    // reaches the sheet exactly as written when nothing re-reads its key.
-    let assets = collected_assets(
+    // compiling, and they are different fixes for the two different strings the
+    // free-form name was carrying.
+    let diagnostics = failure_diagnostics(
         r#"
         import std::style::{ style, Style };
         fun s(): Style {
@@ -6596,32 +6549,65 @@ fn b311_an_unwrapped_raw_pseudo_token_still_emits_verbatim() {
         main();
         "#,
     );
+    let refusal = diagnostics
+        .iter()
+        .map(|(message, _)| message.as_str())
+        .find(|message| message.contains("a pseudo-class name cannot contain ':'"))
+        .unwrap_or_else(|| panic!("{diagnostics:#?}"));
+    assert!(refusal.contains("hover:not(:active)"), "{refusal}");
+    assert!(
+        refusal.contains(".on(hover() + active().not(), ..)"),
+        "{refusal}"
+    );
+    assert!(refusal.contains("element(name)"), "{refusal}");
+}
+
+#[test]
+fn b311_the_miscompiles_own_exhibit_is_spelled_as_two_condition_values() {
+    // The item's program, rewritten the way the refusal steers — and this is
+    // the whole claim: the selector the mis-aligned split silently dropped is
+    // now the one that reaches the sheet, with the `:not(:active)` in it.
+    let assets = collected_assets(
+        r#"
+        import std::style::{ style, Style, hover, active, attribute };
+        fun s(): Style {
+            style().on(
+                attribute("data-open").eq("true") + hover() + active().not(),
+                style().opacity(0.5),
+            )
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
     assert!(
         assets.iter().any(|(kind, line)| {
             kind == "css"
                 && line.starts_with(".s")
-                && line.ends_with(":hover:not(:active){opacity:0.5}")
+                && line.ends_with(
+                    "[data-open=\"true\"]:not(:active):hover{opacity:0.5}"
+                )
         }),
         "{assets:?}"
     );
 }
 
 #[test]
-fn b311_a_style_carrying_a_raw_pseudo_token_still_merges_and_applies() {
-    // kolt's shape (`styles.vl`: four raw tokens on one chain, then
-    // `button_style(..) + selectable_button_style` at the use site). `+` reads
-    // the key too, but it REPLAYS the slot under that same key rather than
-    // re-minting it under a new condition, so nothing is re-derived from the
-    // mis-aligned split and the fence deliberately does not reach it.
+fn b322_add_merges_a_conditioned_style_through_the_slot_reader() {
+    // B322's first half: `Style::add` split a slot key too, and ran
+    // `without_covered` against the mis-split property. It reads `slot_of` now
+    // like every other reader, and the control that matters is that `+` still
+    // MERGES — kolt merges conditioned styles at its use sites.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, Style };
+        import std::style::{ style, Style, hover, active, pseudo, element };
         fun main() {
             let base = const style()
-                .pseudo("hover:not(:active)", style().opacity(0.5))
-                .pseudo("focus-visible:not(:active)", style().opacity(0.7));
-            let extra = const style().pseudo(":selection", style().opacity(1.0));
+                .on(hover() + active().not(), style().opacity(0.5))
+                .on(pseudo("focus-visible") + active().not(), style().opacity(0.7));
+            let extra = const style().on(element("selection"), style().opacity(1.0));
             print(base.class_list().split(" ").len());
             print((base + extra).class_list().split(" ").len());
         }
@@ -6629,6 +6615,42 @@ fn b311_a_style_carrying_a_raw_pseudo_token_still_merges_and_applies() {
         "#,
         "2\n3\n",
     );
+}
+
+#[test]
+fn b322_a_breakpoint_width_and_a_written_property_are_fenced_against_the_separator() {
+    // B322's other two halves: `media`'s min-width is field 0 of the key and
+    // `raw`'s property is field 2, and neither was fenced — unreachable through
+    // `sm`/`md`/`lg`/`xl` and the typed property methods, reachable by hand.
+    for (written, needle) in [
+        (
+            r#"style().media("768px:1024px", style().opacity(0.5))"#,
+            "a breakpoint's min-width cannot contain ':'",
+        ),
+        (
+            r#"style().raw("color:red", "blue")"#,
+            "a declaration's property cannot contain ':'",
+        ),
+    ] {
+        let program = format!(
+            r#"
+            import std::style::{{ style, Style }};
+            fun s(): Style {{
+                {written}
+            }}
+            let _s = const s();
+            fun main() {{}}
+            main();
+            "#
+        );
+        let diagnostics = failure_diagnostics(&program);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|(message, _)| message.contains(needle)),
+            "{written}\n{diagnostics:#?}"
+        );
+    }
 }
 
 // --- A93: `child_relation`'s token is `children`'s and `divide`'s ---------------
