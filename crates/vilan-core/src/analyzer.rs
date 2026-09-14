@@ -1793,6 +1793,15 @@ struct PreppedIs<'src> {
 #[derive(Debug, Clone)]
 pub struct Implementation<'src> {
     pub subject: TypeId,
+    /// The block's own entity id — what `export impl …` marks, and therefore
+    /// the key the visibility bit is read by (B318 S4). Minted by the walk that
+    /// registers the block, so it is the same id `Expr::Impl(id)` carries.
+    pub impl_id: Id,
+    /// The SCOPE the block was written in — a module's body scope at a file's
+    /// top level, which is what `curated_modules` and `export_all_modules` are
+    /// keyed on. Carried rather than looked up because the visibility question
+    /// is asked once per block and the answer is fixed at registration.
+    pub module_scope: Id,
     /// The file whose text declares this block (B318 §3.3). Stored directly
     /// rather than recovered through `source_of(impl_id)`, which is a linear
     /// scan of `source_ranges` that M27 already flagged as a
@@ -5108,45 +5117,79 @@ pub struct ImplAdmission {
     /// (importing file, declaring file) -> the selector's subject as written,
     /// for the refusal that names it. Absent where the restriction is `only`.
     selector_of: HashMap<(SourceId, SourceId), String>,
+    /// The `impl` BLOCKS a curated module does not export
+    /// ([`Program::hidden_impls`]), keyed by the block's own entity id. These
+    /// reach their own file and nothing else unless a file wrote `#(impl T)`.
+    hidden: HashSet<Id>,
+    /// (importing file, impl block) — a `#(impl T)` selector's reach into a
+    /// hidden block. The ONLY way past the export gate.
+    reached: HashSet<(SourceId, Id)>,
 }
 
 impl ImplAdmission {
-    /// Whether NO file in the program restricts anything — the estate's answer,
-    /// and the guard every consumer asks before it pays for a file lookup.
+    /// Whether NO file in the program restricts anything and no module hides an
+    /// `impl` — the estate's answer, and the guard every consumer asks before
+    /// it pays for a file lookup.
     pub fn is_empty(&self) -> bool {
-        self.restricting.is_empty()
+        self.restricting.is_empty() && self.hidden.is_empty()
     }
 
-    /// Whether the file `importer` admits `member_id`, declared by an `impl`
-    /// block whose own file is `declared_in`.
+    /// The EXPORT gate (B318 S4, RULED 2026-09-13): `export` on an `impl` means
+    /// what it means on every other declaration, so a block a consumer cannot
+    /// SEE contributes nothing to that consumer — no methods, and no ambient
+    /// impls either. Its own file always sees it; a file that wrote
+    /// `#(impl T)` for it sees it; nobody else does.
+    fn export_gate_admits(&self, importer: SourceId, implementation: &Implementation) -> bool {
+        !self.hidden.contains(&implementation.impl_id)
+            || self.reached.contains(&(importer, implementation.impl_id))
+    }
+
+    /// Whether `importer` admits `member_id`, declared by `implementation`.
     ///
-    /// Three ways to be admitted and they are all "the file did not say
-    /// otherwise": the block is this file's own, the file restricts nothing, or
-    /// the file restricted that module and this member is in what it took.
-    pub fn admits_member(&self, importer: SourceId, declared_in: SourceId, member_id: Id) -> bool {
-        if declared_in == importer || !self.restricting.contains(&importer) {
+    /// Two gates in order. The block must be VISIBLE to the file (its module
+    /// exports it, or the file reached it with `#`), and the file's own
+    /// statements must not have declined it — the block is this file's own, the
+    /// file restricts nothing, or the file restricted that module and this
+    /// member is in what it took.
+    pub fn admits_member(
+        &self,
+        importer: SourceId,
+        implementation: &Implementation,
+        member_id: Id,
+    ) -> bool {
+        if implementation.source == importer {
             return true;
         }
-        match self.admitted.get(&(importer, declared_in)) {
+        if !self.export_gate_admits(importer, implementation) {
+            return false;
+        }
+        if !self.restricting.contains(&importer) {
+            return true;
+        }
+        match self.admitted.get(&(importer, implementation.source)) {
             Some(members) => members.contains(&member_id),
             None => true,
         }
     }
 
-    /// Whether `importer` admits ANY member of a block declaring `members` —
-    /// the whole-block question [`crate::impl_select::applying_implementations`]
+    /// Whether `importer` admits ANY member of `implementation` — the
+    /// whole-block question [`crate::impl_select::applying_implementations`]
     /// asks, which does not know which member is being looked up.
-    pub fn admits_impl<'a>(
-        &self,
-        importer: SourceId,
-        declared_in: SourceId,
-        members: impl Iterator<Item = &'a Id>,
-    ) -> bool {
-        if declared_in == importer || !self.restricting.contains(&importer) {
+    pub fn admits_impl(&self, importer: SourceId, implementation: &Implementation) -> bool {
+        if implementation.source == importer {
             return true;
         }
-        match self.admitted.get(&(importer, declared_in)) {
-            Some(admitted) => members.into_iter().any(|member| admitted.contains(member)),
+        if !self.export_gate_admits(importer, implementation) {
+            return false;
+        }
+        if !self.restricting.contains(&importer) {
+            return true;
+        }
+        match self.admitted.get(&(importer, implementation.source)) {
+            Some(admitted) => implementation
+                .declarations
+                .values()
+                .any(|member| admitted.contains(member)),
             None => true,
         }
     }
@@ -5195,6 +5238,10 @@ pub struct ImportImplSelector {
     /// The members the `::` tail named, empty when the selector takes the whole
     /// block.
     pub members: Vec<(String, Span)>,
+    /// `#(impl T)` — the REACH marker on this selector (B318 S4). An `impl`
+    /// block its module does not `export` contributes nothing to a file that
+    /// did not write one; this is that file saying it knows.
+    pub reached: bool,
 }
 
 /// Flattens an `import`/`use` tree into (path, leaf-name, leaf-span, alias)
@@ -5297,9 +5344,14 @@ pub(crate) fn collect_reach_marked_spans(
             }
         },
         ImportBranch::Reach(_, inner) => collect_reach_marked_spans(inner, true, out),
-        // A selector binds no leaf, so a marker on it marks nothing here (S2's
-        // `#(impl T)` seam).
-        ImportBranch::Selector(_) => {}
+        // B318 S4: a selector binds no leaf, but `#(impl T)` is a real reach —
+        // the ONE way into an `impl` block its module does not `export` — and
+        // the selector's own span is what records it.
+        ImportBranch::Selector(selector) => {
+            if marked {
+                out.push(selector.span);
+            }
+        }
         ImportBranch::Set(branches) => {
             for child in branches {
                 collect_reach_marked_spans(child, marked, out);
@@ -28881,6 +28933,8 @@ impl<'src> Analyzer<'src> {
                 }
                 self.implementations.push(Implementation {
                     subject,
+                    impl_id: id,
+                    module_scope: scope_id,
                     source: self.current_source_id,
                     declarations,
                     declared_members,
@@ -34941,6 +34995,9 @@ impl<'src> Analyzer<'src> {
                     path_spans.push(*segment_span);
                 }
             }
+            let reached = self
+                .reach_marked_spans
+                .contains(&(self.current_source_id, selector.span));
             selectors.push(ImportImplSelector {
                 span: selector.span,
                 text: selector.subject_text.to_string(),
@@ -34950,6 +35007,7 @@ impl<'src> Analyzer<'src> {
                     .iter()
                     .map(|(name, span)| ((*name).to_string(), *span))
                     .collect(),
+                reached,
             });
         }
         let only = match modifier {
@@ -48058,6 +48116,11 @@ pub struct Program<'src> {
     /// passes that read it, because `dispatch_refine`'s candidate lists and
     /// emission's `impl_select` are two of its consumers.
     pub impl_admission: ImplAdmission,
+    /// B318 S4: the `impl` BLOCKS a curated module does not export — the ones
+    /// that reach only their own file and whatever file wrote `#(impl T)` for
+    /// them. Keyed by the block's own entity id. Empty for an uncurated module
+    /// and therefore for the whole estate.
+    pub hidden_impls: HashSet<Id>,
     /// Every generic parameter's bound list, by constraint type id — a
     /// multi-bound's entries, where a single bound is the constraint id
     /// itself. Carried out of the analyzer because the specificity order
@@ -57031,7 +57094,36 @@ fn analyze_over_world<'src>(
         .map(|(&id, &type_id)| (id, type_id))
         .collect();
 
+    // B318 S4, the `export impl` ruling (owner, 2026-09-13): `export` on an
+    // `impl` means what it means on every other declaration, so an impl block a
+    // consumer cannot SEE contributes nothing to that consumer — no methods, no
+    // ambient impls — and `#(impl T)` is the only reach.
+    //
+    // Computed here, at the commit, because the three sets it reads are the
+    // analyzer's own and the question is asked per BLOCK rather than per
+    // lookup. The uncurated-module exemption is the first clause and carries
+    // the whole estate: a module with NO marker offers everything, exactly as
+    // it did before B318 (`visibility.md` §14), so a package that has not
+    // curated loses nothing.
+    let hidden_impls: HashSet<Id> = analyzer
+        .implementations
+        .iter()
+        .filter(|implementation| {
+            analyzer
+                .curated_modules
+                .contains(&implementation.module_scope)
+                && !analyzer
+                    .export_all_modules
+                    .contains(&implementation.module_scope)
+                && !analyzer
+                    .exported_entities
+                    .contains_key(&implementation.impl_id)
+        })
+        .map(|implementation| implementation.impl_id)
+        .collect();
+
     Some(Program {
+        hidden_impls,
         platform,
         closures: analyzer.closures,
         diagnostics: analyzer.diagnostics,
@@ -57357,7 +57449,10 @@ pub fn build_impl_admission(program: &mut Program) {
         .filter(|row| row.only.is_some() || !row.selectors.is_empty())
         .map(|row| row.source)
         .collect();
-    if restricting.is_empty() && program.cross_module_collisions.is_empty() {
+    if restricting.is_empty()
+        && program.cross_module_collisions.is_empty()
+        && program.hidden_impls.is_empty()
+    {
         return;
     }
     // `statement_sources` reads a span's definition out of `type_references`,
@@ -57381,8 +57476,26 @@ pub fn build_impl_admission(program: &mut Program) {
     // Built for EVERY statement only when a collision is banked; otherwise only
     // the restricting files' statements are walked, as before.
     let mut carried: Vec<(SourceId, Span, Vec<SourceId>)> = Vec::new();
+    // B318 S4's export gate: which hidden blocks each file reached with
+    // `#(impl T)`. A marked selector is read against the WHOLE program's
+    // implementations rather than against the statement's own files — the
+    // marker's job is to name a block, and the block's module is the one the
+    // statement walked to, which the subject test already decides.
+    let mut reached: HashSet<(SourceId, Id)> = HashSet::default();
     let collisions = std::mem::take(&mut program.cross_module_collisions);
+    let hidden = std::mem::take(&mut program.hidden_impls);
     for row in &statements {
+        if !hidden.is_empty() {
+            for selector in row.selectors.iter().filter(|selector| selector.reached) {
+                for implementation in &program.implementations {
+                    if hidden.contains(&implementation.impl_id)
+                        && selector_admits(program, implementation.subject, selector.subject)
+                    {
+                        reached.insert((row.source, implementation.impl_id));
+                    }
+                }
+            }
+        }
         if !restricting.contains(&row.source) && collisions.is_empty() {
             continue;
         }
@@ -57440,6 +57553,8 @@ pub fn build_impl_admission(program: &mut Program) {
         restricting,
         admitted: restricted,
         selector_of,
+        hidden,
+        reached,
     };
     if !collisions.is_empty() {
         refuse_imported_member_collisions(program, &collisions, &carried);
@@ -57497,15 +57612,26 @@ fn refuse_imported_member_collisions(
             ) else {
                 continue;
             };
-            if !program.impl_admission.admits_member(
-                importer,
-                collision.first_source,
-                collision.first,
-            ) || !program.impl_admission.admits_member(
-                importer,
-                collision.second_source,
-                collision.second,
-            ) {
+            // Both blocks must be in this file's namespace for the pair to be
+            // its problem: the export gate and the file's own selectors are
+            // asked exactly as a call would ask them.
+            let admits = |member_id: Id| -> bool {
+                program
+                    .implementations
+                    .iter()
+                    .find(|implementation| {
+                        implementation
+                            .declarations
+                            .values()
+                            .any(|id| *id == member_id)
+                    })
+                    .is_some_and(|implementation| {
+                        program
+                            .impl_admission
+                            .admits_member(importer, implementation, member_id)
+                    })
+            };
+            if !admits(collision.first) || !admits(collision.second) {
                 continue;
             }
             let member = &collision.member;
@@ -57607,6 +57733,21 @@ fn refuse_imported_member_collisions(
     }
 }
 
+/// The HEAD name of an `impl` block's subject, as a selector spells it —
+/// `Thing` for `impl Thing`, `Boxed` for `impl Boxed<i32>`, and `_` for a
+/// subject with no nominal head (a blanket, a tuple, an array), which is
+/// exactly the placeholder a selector writes for it.
+fn subject_head_name(program: &Program, subject: TypeId) -> String {
+    match program.type_id_to_type_map.get(&subject) {
+        Some(Type::Struct(id, _)) => program.structs.get(id).map(|struct_| struct_.name),
+        Some(Type::Enum(id, _)) => program.enums.get(id).map(|enum_| enum_.name),
+        Some(Type::Trait(id, _)) => program.traits.get(id).map(|trait_| trait_.name),
+        _ => None,
+    }
+    .unwrap_or("_")
+    .to_string()
+}
+
 /// A source's module NAME as a diagnostic spells it — its file stem, which is
 /// what `names.md` makes the module's name for every layout the loader admits
 /// (`<name>.vl`, and `<name>/lib.vl`'s parent directory).
@@ -57646,6 +57787,8 @@ pub fn check_call_site_admission(program: &mut Program) {
         restricting,
         admitted: restricted,
         selector_of,
+        hidden,
+        reached,
     } = program.impl_admission.clone();
     // Which implementation declares a member — `declarations` read backwards,
     // built once for the pass rather than scanned per call.
@@ -57660,7 +57803,7 @@ pub fn check_call_site_admission(program: &mut Program) {
         let Some(source) = program.source_of(*call_id) else {
             continue;
         };
-        if !restricting.contains(&source) {
+        if !restricting.contains(&source) && hidden.is_empty() {
             continue;
         }
         // A method call's callee is a fresh local bound to the member the
@@ -57673,10 +57816,7 @@ pub fn check_call_site_admission(program: &mut Program) {
             continue;
         };
         let implementation = &program.implementations[index];
-        let Some(admitted) = restricted.get(&(source, implementation.source)) else {
-            continue;
-        };
-        if admitted.contains(member_id) {
+        if implementation.source == source {
             continue;
         }
         let member = implementation
@@ -57685,12 +57825,41 @@ pub fn check_call_site_admission(program: &mut Program) {
             .find(|(_, id)| *id == member_id)
             .map(|(name, _)| *name)
             .unwrap_or("the member");
-        let module = program
-            .canonical_sources
-            .get(implementation.source.0 as usize)
-            .and_then(|path: &std::path::PathBuf| path.file_stem())
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("that module");
+        let module = module_stem(program, implementation.source);
+        // The EXPORT gate first (B318 S4, RULED 2026-09-13): a block its module
+        // does not export is INVISIBLE, and no selector the file can write
+        // reaches it except the marked one. Said before the selector arm
+        // because "widen your selector" is bad advice about a block no selector
+        // widens onto.
+        if hidden.contains(&implementation.impl_id)
+            && !reached.contains(&(source, implementation.impl_id))
+        {
+            let subject = subject_head_name(program, implementation.subject);
+            violations.push((
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: **program.span_map.get(call_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "'{member}' is provided by an `impl` in module `{module}` that \
+                         `{module}` does not export, so it contributes no methods here. Reach \
+                         it — `import {module}::{{ #(impl {subject}) }};` — or write `export` \
+                         on the block"
+                    ),
+                },
+                source,
+            ));
+            continue;
+        }
+        if !restricting.contains(&source) {
+            continue;
+        }
+        let Some(admitted) = restricted.get(&(source, implementation.source)) else {
+            continue;
+        };
+        if admitted.contains(member_id) {
+            continue;
+        }
         let claim = match selector_of.get(&(source, implementation.source)) {
             Some(text) => format!("this file's selector `(impl {text})` does not admit it"),
             None => "this file imports that module `only`, which admits none".to_string(),

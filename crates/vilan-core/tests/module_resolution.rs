@@ -6534,3 +6534,114 @@ fn b318_a_files_own_block_colliding_with_an_imported_one_is_refused_at_the_impor
         "expected the import-site refusal naming `shape`: {diagnostics:?}"
     );
 }
+
+/// The `export impl` exhibit: a CURATED module (it exports its struct) whose
+/// extension block carries no marker, and a consumer that reaches it plainly,
+/// with `#(impl T)`, or not at all. The subject lives in its own module so the
+/// consumer can name the type without naming the extension.
+fn export_impl_files(app: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "item.vl",
+            "export struct Thing { x: i32 }\n\n\
+             export impl Thing {\n\tfun make(): Thing { Thing { x = 1 } }\n}\n"
+                .to_string(),
+        ),
+        (
+            "ext.vl",
+            "import pkg::item::Thing;\n\nexport fun anchor(): i32 { 0 }\n\n\
+             impl Thing {\n\tfun tag(self): i32 { self.x + 1 }\n}\n"
+                .to_string(),
+        ),
+        ("app.vl", app.to_string()),
+    ]
+}
+
+fn analyze_export_impl(app: &str) -> Vec<String> {
+    let owned = export_impl_files(app);
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    analyze_package(&files, "app.vl", Platform::default())
+}
+
+/// B318 S4, RULED 2026-09-13 — `export` on an `impl` means what it means on
+/// every other declaration: a block a consumer cannot SEE contributes NO
+/// methods to it. `ext.vl` is curated (it exports `anchor`) and its block is
+/// not marked, so a file that imports `ext` plainly gets the name and not the
+/// implementation.
+#[test]
+fn b318_an_unexported_impl_is_hidden_from_a_consumer_that_did_not_reach_it() {
+    let diagnostics = analyze_export_impl(
+        "import pkg::item::Thing;\nimport pkg::ext::anchor;\n\n\
+         fun main() {\n\tlet _ = Thing::make().tag() + anchor();\n}\n",
+    );
+    assert!(
+        diagnostics.iter().any(|message| message
+            .contains("'tag' is provided by an `impl` in module `ext` that `ext` does not export")
+            && message.contains("`import ext::{ #(impl Thing) };`")),
+        "an unexported block should contribute no methods: {diagnostics:?}"
+    );
+}
+
+/// And `#(impl T)` is the reach — the only one (`#` on the impl selector, built
+/// at the `at_impl_selector` seam on `Token::Hash`).
+#[test]
+fn b318_the_marked_selector_admits_an_unexported_impl() {
+    let diagnostics = analyze_export_impl(
+        "import pkg::item::Thing;\nimport pkg::ext::{ anchor, #(impl Thing) };\n\n\
+         fun main() {\n\tlet _ = Thing::make().tag() + anchor();\n}\n",
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "`#(impl Thing)` should admit the block: {diagnostics:?}"
+    );
+}
+
+/// An UNMARKED selector is not a reach: it says which of the blocks a file can
+/// see it takes, and an invisible block is not one of them.
+#[test]
+fn b318_an_unmarked_selector_does_not_reach_an_unexported_impl() {
+    let diagnostics = analyze_export_impl(
+        "import pkg::item::Thing;\nimport pkg::ext::{ anchor, (impl Thing) };\n\n\
+         fun main() {\n\tlet _ = Thing::make().tag() + anchor();\n}\n",
+    );
+    assert!(
+        diagnostics.iter().any(|message| message
+            .contains("'tag' is provided by an `impl` in module `ext` that `ext` does not export")),
+        "an unmarked selector should not reach past the export gate: {diagnostics:?}"
+    );
+}
+
+/// The uncurated-module exemption, UNCHANGED (`visibility.md` §14): a module
+/// with no marker at all offers everything, so the estate — which has not
+/// curated — loses nothing. Same program, `ext.vl` with its `export` removed.
+#[test]
+fn b318_an_uncurated_module_still_offers_every_impl() {
+    let diagnostics = analyze_package(
+        &[
+            (
+                "item.vl",
+                "export struct Thing { x: i32 }\n\n\
+                 export impl Thing {\n\tfun make(): Thing { Thing { x = 1 } }\n}\n",
+            ),
+            (
+                "ext.vl",
+                "import pkg::item::Thing;\n\nfun anchor(): i32 { 0 }\n\n\
+                 impl Thing {\n\tfun tag(self): i32 { self.x + 1 }\n}\n",
+            ),
+            (
+                "app.vl",
+                "import pkg::item::Thing;\nimport pkg::ext::anchor;\n\n\
+                 fun main() {\n\tlet _ = Thing::make().tag() + anchor();\n}\n",
+            ),
+        ],
+        "app.vl",
+        Platform::default(),
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "an uncurated module offers everything: {diagnostics:?}"
+    );
+}

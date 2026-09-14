@@ -201,7 +201,7 @@ pub fn candidates_of(program: &Program, file: Option<SourceId>, name: &str) -> V
                 && file.is_none_or(|file| {
                     program
                         .impl_admission
-                        .admits_member(file, implementation.source, member_id)
+                        .admits_member(file, implementation, member_id)
                 })
             {
                 candidates.push(member_id);
@@ -274,13 +274,7 @@ pub fn impl_members_for_bound(
         // — the cheap filter first, and the one that says whether this file may
         // see the block at all.
         .filter(|implementation| {
-            file.is_none_or(|file| {
-                program.impl_admission.admits_impl(
-                    file,
-                    implementation.source,
-                    implementation.declarations.values(),
-                )
-            })
+            file.is_none_or(|file| program.impl_admission.admits_impl(file, implementation))
         })
         .filter(|implementation| {
             program

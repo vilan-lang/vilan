@@ -6189,8 +6189,9 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
         // A selector OUTSIDE a set: refused where it is written rather than at
         // column one, and then parsed anyway so the rest of the statement is
-        // still read (`visibility.md` §2.5).
-        if self.at_impl_selector() {
+        // still read (`visibility.md` §2.5). Marked or not — `#(impl T)` is the
+        // same element and earns the same rule.
+        if self.at_impl_selector() || self.at_reach_marked_impl_selector() {
             let span = self.here_span();
             self.errors.push(ParseError {
                 span,
@@ -6198,7 +6199,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 context: Vec::new(),
                 hint: None,
             });
-            return self.parse_impl_selector();
+            return self.parse_namespace_set_element();
         }
         let branch = self.parse_namespace_set();
         if branch.is_none() {
@@ -6216,6 +6217,16 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// left to whatever else may read it.
     fn at_impl_selector(&self) -> bool {
         self.peek_is_ctrl('(') && self.peek_at(1) == Some(&Token::Impl)
+    }
+
+    /// Whether the cursor sits on `# ( impl` — [`Parser::at_impl_selector`]'s
+    /// reach-marked form (B318 S4), which
+    /// [`Parser::parse_namespace_single_path`] reads and which the
+    /// outside-a-set rule has to recognize for itself.
+    fn at_reach_marked_impl_selector(&self) -> bool {
+        self.peek_is(&Token::Hash)
+            && self.peek_at(1) == Some(&Token::Ctrl('('))
+            && self.peek_at(2) == Some(&Token::Impl)
     }
 
     /// `"(" "impl" type ")" ( "::" ( NAME | "{" NAME,* "}" ) )?` — an impl
@@ -6390,7 +6401,18 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.peek_is(&Token::Hash) {
             let marker = self.here_span();
             self.bump();
-            let inner = self.parse_namespace_single_path()?;
+            // B318 S4: `#(impl T)` — the marker on a SELECTOR, which is the one
+            // and only reach to an `impl` block its module does not `export`
+            // (RULED 2026-09-13: an invisible impl contributes no methods and
+            // no ambient impls; `#` is the way in). The selector is not a path,
+            // so the recursion below cannot read it: this is the seam, at
+            // `at_impl_selector`, and the wrapper composes exactly as it does
+            // over a name.
+            let inner = if self.at_impl_selector() {
+                self.parse_impl_selector()?
+            } else {
+                self.parse_namespace_single_path()?
+            };
             return Some(ImportBranch::Reach(marker, Box::new(inner)));
         }
         let start = self.position;
@@ -6453,6 +6475,8 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.at_impl_selector() {
             return self.parse_impl_selector();
         }
+        // `#(impl T)` falls through: the path production owns the marker and
+        // routes back to the selector past it (B318 S4).
         self.parse_namespace_single_path()
     }
 

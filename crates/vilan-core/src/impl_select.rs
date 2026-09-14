@@ -615,13 +615,7 @@ pub fn applying_implementations<'a, 'src>(
         .implementations
         .iter()
         .filter(|implementation| {
-            file.is_none_or(|file| {
-                program.impl_admission.admits_impl(
-                    file,
-                    implementation.source,
-                    implementation.declarations.values(),
-                )
-            })
+            file.is_none_or(|file| program.impl_admission.admits_impl(file, implementation))
         })
         .filter(|implementation| match wanted {
             Some(wanted) => {
@@ -730,11 +724,9 @@ pub fn select_member(
                 // so a block this file admits may still not offer `member`.
                 match implementation.declarations.get(member) {
                     Some(member_id) => file.is_none_or(|file| {
-                        program.impl_admission.admits_member(
-                            file,
-                            implementation.source,
-                            *member_id,
-                        )
+                        program
+                            .impl_admission
+                            .admits_member(file, implementation, *member_id)
                     }),
                     None => inherits_a_default(program, implementation, member),
                 }
