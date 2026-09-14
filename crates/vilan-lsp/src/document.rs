@@ -1305,6 +1305,140 @@ fn find_linked_tags(
         .for_each_child(&mut |child| find_linked_tags(child, offset, out));
 }
 
+/// What Organize Imports does with an import statement whose every leaf pruned
+/// away (E173, E180) — the half of the answer the FADE needs, so that the mark
+/// and the edit can never describe different things.
+enum EmptiedStatement {
+    /// The narrower statement it becomes; the leaf still fades, and the fade
+    /// names this text.
+    Rewritten(String),
+    /// Nothing: the rescue would have bound a name the file has taken, so the
+    /// statement stands as written and its leaves do not fade at all.
+    Kept,
+}
+
+/// The tables one Organize Imports pass judges its module question against
+/// (E169, E180) — built once by [`Document::import_use_context`] and handed to
+/// every leaf.
+///
+/// Three of the four are LAZY. Rule (2) is only ever reached by a leaf rule (1)
+/// could not answer, and the collision guard only by a statement whose every
+/// leaf pruned away — so on the common shape (one unused leaf beside a used
+/// one) nothing here is built at all, which matters because this runs on the
+/// debounced diagnostics path (E114's 6.2 ms budget).
+struct ImportUseContext<'a> {
+    /// The text the pass is reading — the analyzed text for the fades, the live
+    /// text for the action. Both callers already hold it; the collision guard
+    /// needs it to read a module SEGMENT's name.
+    source: &'a str,
+    /// Every definition this file's top-level import LEAVES bind, aliases
+    /// included — E169's exclusion set.
+    bound_by_leaves: HashSet<Definition>,
+    /// The spans in THIS file at which the analyzer resolved a member by
+    /// RECEIVER syntax (E180). `Program::member_name_spans` is written only at
+    /// `Node::MemberAccessor`, so it is exactly the `subject.member` set and a
+    /// `Head::member` path segment is not in it.
+    receiver_members: std::cell::OnceCell<HashSet<Span>>,
+    /// Every definition declared inside an `impl` block or a `trait` — what a
+    /// module import carries beyond its own name (E180).
+    impl_members: std::cell::OnceCell<HashSet<Id>>,
+    /// The names this file ALREADY binds: its top-level declarations and
+    /// everything its import list binds. E180's collision guard — a rescue that
+    /// would take one of these is refused.
+    taken_names: std::cell::OnceCell<HashSet<String>>,
+}
+
+impl ImportUseContext<'_> {
+    fn receiver_members(&self, program: &Program) -> &HashSet<Span> {
+        self.receiver_members.get_or_init(|| {
+            let lookup = program.source_lookup();
+            program
+                .member_name_spans
+                .iter()
+                .filter(|(id, _)| lookup.of(**id) == Some(SourceId(0)))
+                .map(|(_, span)| *span)
+                .collect()
+        })
+    }
+
+    fn impl_members(&self, program: &Program) -> &HashSet<Id> {
+        self.impl_members.get_or_init(|| {
+            program
+                .implementations
+                .iter()
+                .flat_map(|implementation| implementation.declarations.values().copied())
+                .chain(
+                    program
+                        .traits
+                        .values()
+                        .flat_map(|trait_| trait_.declarations.values().copied()),
+                )
+                .collect()
+        })
+    }
+
+    fn taken_names(&self) -> &HashSet<String> {
+        self.taken_names.get_or_init(|| names_bound_in(self.source))
+    }
+}
+
+/// Every name `source` binds at its top level: its own declarations, and what
+/// its import list binds (a leaf's name, or an `as` alias's).
+///
+/// E180's collision guard reads this. Deliberately SYNTACTIC — a parse of the
+/// buffer, no analyzer — because the question is "is this identifier free in
+/// this file", which is answered by what is written and not by what resolved:
+/// a file carrying a broken declaration still has the name taken.
+///
+/// The prelude is deliberately absent. An explicit import beats an ambient
+/// prelude name (`prelude.md` §9.1), so shadowing one is legal and the rescue
+/// may do it; it is the file's OWN bindings that a second binding collides
+/// with.
+fn names_bound_in(source: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    if let (Some(tree), _) = vilan_core::parsing::parse(source) {
+        for item in &tree.0 {
+            // An item under `export`, a derive, a service attribute or a user
+            // macro attribute still declares its own name.
+            let mut node = &item.0;
+            while let Node::Export(_, inner)
+            | Node::Derive(_, inner)
+            | Node::Service(_, inner)
+            | Node::MacroAttribute(_, _, _, inner) = node
+            {
+                node = &inner.0;
+            }
+            let name = match node {
+                Node::Func(function) | Node::MacroFun(function) => function.name.0,
+                Node::Struct(name, ..)
+                | Node::Enum(name, ..)
+                | Node::Trait(name, ..)
+                | Node::Let(name, ..) => name.0,
+                Node::Module(name, _) => name,
+                _ => continue,
+            };
+            names.insert(name.to_string());
+        }
+    }
+    // What the import list binds. `import_leaf_name_spans` offers the ALIAS's
+    // span for an aliased leaf, which is the name the file actually takes
+    // (E142); a `(impl T)` selector is offered at its own span and binds no
+    // name, so the identifier test drops it.
+    for span in vilan_core::formatter::import_leaf_name_spans(source) {
+        let Some(text) = source.get(span.into_range()) else {
+            continue;
+        };
+        if !text.is_empty()
+            && text
+                .chars()
+                .all(|character| character.is_alphanumeric() || character == '_')
+        {
+            names.insert(text.to_string());
+        }
+    }
+    names
+}
+
 /// A type's written HEAD name, for B318 S3's organizer rewrite — `Style` for
 /// `Style`, for `List<i32>` and for a `List<type T>` block alike, because that
 /// is what a selector's subject is spelled with.
@@ -4463,18 +4597,18 @@ impl Document {
                 // the file's import list, so a reference written there is not
                 // mistaken for the file using the import.
                 let import_spans = vilan_core::formatter::import_statement_spans(source);
-                // E169: what this file's OTHER import leaves already bind, so a
-                // whole-module leaf is judged on what the module import ALONE
-                // brings. Computed once for the pass — it is a walk of every
-                // leaf, and asking it per leaf would be that walk squared.
-                let bound = self.definitions_bound_by_import_leaves(program, source);
+                // E169/E180: what this file's OTHER import leaves already
+                // bind, what a receiver resolved, what names are taken. Built
+                // once for the pass — each is a walk, and asking one per leaf
+                // would be that walk squared.
+                let context = self.import_use_context(program, source);
                 let keep = |leaf_span: Span| {
-                    self.import_leaf_is_used(program, leaf_span, &import_spans, &bound)
+                    self.import_leaf_is_used(program, leaf_span, &import_spans, &context)
                 };
                 // E168: the second question, asked only of a statement the
                 // first emptied out.
                 let keep_module = |module_span: Span| {
-                    self.import_module_is_used(program, module_span, &import_spans, &bound)
+                    self.import_module_is_used(program, module_span, &import_spans, &context)
                 };
                 vilan_core::formatter::organize_import_runs(source, &keep, &keep_module)
             }
@@ -4509,6 +4643,12 @@ impl Document {
     /// See [`Document::UNUSED_IMPORT`]. The rewritten statement follows.
     const UNUSED_BUT_THE_MODULE_IS_USED: &str =
         "unused; the module's impls are in use — Organize Imports rewrites this to";
+    /// E180's third text, for the leaf rule (0) pruned: the PRELUDE already
+    /// binds this definition. "unused import" is the one thing it is not — the
+    /// name may be spelled on every line of the file, and a user looking at
+    /// `Option` faded in a file full of `Option::Some` has been told something
+    /// they can see is false. The prelude-bound name follows in backticks.
+    const REDUNDANT_PRELUDE_BINDS: &str = "redundant: the prelude already binds";
 
     /// The top-level import leaves nothing in this file uses (E114) — the spans
     /// the editor FADES, in the analyzed text's coordinates.
@@ -4543,38 +4683,83 @@ impl Document {
         // since a stale document decides nothing above.
         let source = self.analyzed_text();
         let import_spans = vilan_core::formatter::import_statement_spans(source);
-        let bound = self.definitions_bound_by_import_leaves(program, source);
+        let context = self.import_use_context(program, source);
         let leaves: Vec<(Span, bool)> = vilan_core::formatter::import_leaf_name_spans(source)
             .into_iter()
             .map(|leaf| {
-                let used = self.import_leaf_is_used(program, leaf, &import_spans, &bound);
+                let used = self.import_leaf_is_used(program, leaf, &import_spans, &context);
                 (leaf, used)
             })
             .collect();
         if leaves.iter().all(|(_, used)| *used) {
             return Vec::new();
         }
-        let rewrites =
-            self.rewritten_import_statements(program, source, &import_spans, &bound, &leaves);
+        let emptied =
+            self.rewritten_import_statements(program, source, &import_spans, &context, &leaves);
         leaves
             .into_iter()
             .filter(|(_, used)| !used)
-            .map(|(leaf, _)| {
-                let message = rewrites
+            .filter_map(|(leaf, _)| {
+                let fate = emptied
                     .iter()
                     .find(|(statement, _)| spans_contain(*statement, leaf))
-                    .map(|(_, rewrite)| {
+                    .map(|(_, fate)| fate);
+                let message = match fate {
+                    // E180: the collision guard kept the statement exactly as
+                    // written, so the action removes NOTHING here and E114's
+                    // contract says nothing may fade.
+                    Some(EmptiedStatement::Kept) => return None,
+                    Some(EmptiedStatement::Rewritten(rewrite)) => {
                         format!("{} `{rewrite}`", Self::UNUSED_BUT_THE_MODULE_IS_USED)
-                    })
-                    .unwrap_or_else(|| Self::UNUSED_IMPORT.to_string());
-                (leaf, message)
+                    }
+                    // E180: a leaf the PRELUDE already binds is not "unused" in
+                    // any sense its reader would recognize — the name may be
+                    // spelled fifty times in the file. Say what it is instead,
+                    // so a heavily-used name faded is explained rather than
+                    // contradicted (E145's territory).
+                    None => match self.prelude_redundant_name(program, source, leaf) {
+                        Some(name) => format!("{} `{name}`", Self::REDUNDANT_PRELUDE_BINDS),
+                        None => Self::UNUSED_IMPORT.to_string(),
+                    },
+                };
+                Some((leaf, message))
             })
             .collect()
     }
 
-    /// E173: the import statements Organize Imports will REWRITE to
-    /// `import <module>;` rather than delete, as `(statement span, the
-    /// statement it becomes)`.
+    /// The NAME a rule-(0) leaf is redundant with — `Some` exactly when
+    /// [`Self::import_leaf_is_used`]'s rule (0) is what pruned this leaf.
+    ///
+    /// Asked only of a leaf already known unused, and it re-asks rule (0)'s own
+    /// two questions rather than threading a reason out of the leaf walk: the
+    /// pair is a map lookup and a slice search, and a second `bool` returned
+    /// from the predicate would have to be carried through the organizer's
+    /// `keep` closure, which is a `Fn(Span) -> bool` the formatter owns.
+    fn prelude_redundant_name<'a>(
+        &self,
+        program: &Program,
+        source: &'a str,
+        leaf_span: Span,
+    ) -> Option<&'a str> {
+        // An `as` alias renames the thing, so it is never prelude-redundant —
+        // rule (0) declines it too.
+        if program
+            .import_alias_spans
+            .contains_key(&(SourceId(0), leaf_span))
+        {
+            return None;
+        }
+        let definition_id = self.import_path_definition(program, leaf_span)?;
+        program
+            .prelude_bindings
+            .contains(&definition_id)
+            .then(|| source.get(leaf_span.into_range()))
+            .flatten()
+    }
+
+    /// E173: what Organize Imports will do with each import statement its leaf
+    /// question emptied out — `(statement span, its fate)`, for every statement
+    /// the action does something other than delete.
     ///
     /// Asked OF the organizer rather than recomputed beside it. `keep_module`
     /// is E168's second question and it is put only to a statement the leaf
@@ -4592,9 +4777,9 @@ impl Document {
         program: &Program,
         source: &str,
         import_spans: &[Span],
-        bound: &HashSet<Definition>,
+        context: &ImportUseContext<'_>,
         leaves: &[(Span, bool)],
-    ) -> Vec<(Span, String)> {
+    ) -> Vec<(Span, EmptiedStatement)> {
         let emptied = |statement: Span| {
             let mut saw_one = false;
             for (leaf, used) in leaves {
@@ -4621,7 +4806,7 @@ impl Document {
         };
         let widened = std::cell::RefCell::new(Vec::new());
         let keep_module = |module_span: Span| {
-            let rescue = self.import_module_is_used(program, module_span, import_spans, bound);
+            let rescue = self.import_module_is_used(program, module_span, import_spans, context);
             if !matches!(rescue, vilan_core::formatter::ModuleRescue::No) {
                 widened.borrow_mut().push((module_span, rescue.clone()));
             }
@@ -4635,6 +4820,12 @@ impl Document {
                 let statement = *import_spans
                     .iter()
                     .find(|statement| spans_contain(**statement, module_span))?;
+                // E180: a KEPT statement is not rewritten to anything — the
+                // action leaves it exactly as written, and the fade walk reads
+                // this to say nothing at all about its leaves.
+                if matches!(rescue, vilan_core::formatter::ModuleRescue::Keep) {
+                    return Some((statement, EmptiedStatement::Kept));
+                }
                 // The statement's own head, up to and including the module
                 // segment the organizer kept — which is what it prints. A
                 // statement's span ends at its path (the `;` is outside it), so
@@ -4653,7 +4844,7 @@ impl Document {
                     }
                     _ => format!("{};", head.join(" ")),
                 };
-                Some((statement, rewritten))
+                Some((statement, EmptiedStatement::Rewritten(rewritten)))
             })
             .collect()
     }
@@ -4974,7 +5165,7 @@ impl Document {
         program: &Program,
         leaf_span: Span,
         import_spans: &[Span],
-        bound_by_leaves: &HashSet<Definition>,
+        context: &ImportUseContext<'_>,
     ) -> bool {
         let entry = SourceId(0);
         // B318 S3: an `(impl …)` selector is a terminal the organizer prunes,
@@ -5050,12 +5241,7 @@ impl Document {
             crate::references::kind_of(program, Definition::Entity(definition_id)),
             Some(crate::references::DefinitionKind::Module)
         ) {
-            return self.module_import_brings_a_use(
-                program,
-                definition_id,
-                import_spans,
-                bound_by_leaves,
-            );
+            return self.module_import_brings_a_use(program, definition_id, import_spans, context);
         }
         false
     }
@@ -5131,6 +5317,23 @@ impl Document {
             .collect()
     }
 
+    /// The pass-level tables [`Self::import_leaf_is_used`] and the module
+    /// question are judged against, built once for a whole organizer run.
+    ///
+    /// Every one of them is a walk of something whole-file or whole-program, and
+    /// every one of them is asked per LEAF — computing them inside the predicate
+    /// would be that walk squared, which is what E169's own comment says about
+    /// the one table that predates E180.
+    fn import_use_context<'a>(&self, program: &Program, source: &'a str) -> ImportUseContext<'a> {
+        ImportUseContext {
+            source,
+            bound_by_leaves: self.definitions_bound_by_import_leaves(program, source),
+            receiver_members: std::cell::OnceCell::new(),
+            impl_members: std::cell::OnceCell::new(),
+            taken_names: std::cell::OnceCell::new(),
+        }
+    }
+
     /// Rule (2), asked of a MODULE — the one question E168 and E169 share.
     ///
     /// A whole-module import brings more than its own name: every `impl` in that
@@ -5150,7 +5353,7 @@ impl Document {
         program: &Program,
         module_id: Id,
         import_spans: &[Span],
-        bound_by_leaves: &HashSet<Definition>,
+        context: &ImportUseContext<'_>,
     ) -> bool {
         let entry = SourceId(0);
         let Some(home) = program.source_of(module_id) else {
@@ -5159,15 +5362,87 @@ impl Document {
         if home == entry {
             return false;
         }
+        // E180's THIRD subtraction (R9, RULED 2026-09-14). A module the PRELUDE
+        // module itself re-exports — `std/src/web.vl` lines 47-48, `export
+        // import pkg::style;` and `export import pkg::ui;` — is loaded for
+        // every file of the package whatever that file imports, so an import
+        // reaching it carries no `impl` the file would otherwise lack. Rescuing
+        // it is not wrong, it is REDUNDANT, and the redundant statement is one
+        // the organizer would then write into every file of an application:
+        // kolt's `import std::ui::{ (impl View) };`.
+        if program.prelude_bindings.contains(&module_id) {
+            return false;
+        }
         self.reference_index
             .occurrences_in(entry)
             .any(|occurrence| {
-                !import_spans.iter().any(|statement| {
-                    statement.start <= occurrence.span.start && occurrence.span.end <= statement.end
-                }) && !bound_by_leaves.contains(&occurrence.definition)
-                    && crate::references::declaration_source(program, occurrence.definition)
-                        == Some(home)
+                self.module_import_alone_carries(program, context, home, import_spans, occurrence)
             })
+    }
+
+    /// Whether ONE occurrence in this file is something the import reaching
+    /// `home` is ALONE in bringing — rule (2)'s per-occurrence half, shared by
+    /// [`Self::module_import_brings_a_use`] and [`Self::rescuing_subject`] so
+    /// the keep decision and the narrowing can never be read off different
+    /// sets.
+    ///
+    /// Four subtractions, three of them E180's:
+    ///  - a reference written by the file's own IMPORT LIST is not the file
+    ///    using anything (an import path's segments resolve to the definitions
+    ///    its leaves bind, so counting them lets a statement justify itself);
+    ///  - a definition another import LEAF of this file binds is that leaf's
+    ///    contribution, not the module's (E169);
+    ///  - a definition the PRELUDE binds is ambient: the file has it whether or
+    ///    not this statement exists, so the statement does not bring it.
+    ///    `Option::Some` in kolt's generated `src/lucide/lib.vl` is the exhibit
+    ///    — `Some` is declared in std's `option.vl`, and reading it as "the
+    ///    import brings `Some`" is what made the organizer rescue
+    ///    `import std::option;` and bind `option` over the file's own
+    ///    `fun option()`;
+    ///  - and what remains must be an `impl`/trait member resolved by RECEIVER
+    ///    syntax (`x.child(..)`), never a definition spelled as a PATH SEGMENT
+    ///    behind a head (`Option::Some`, `Type::new`). That is the whole of
+    ///    what a module import carries beyond its own name in today's
+    ///    program-global impl model: a path-qualified reach is spelled through
+    ///    a head that is a leaf's, the prelude's, or the module leaf's own, and
+    ///    each of those heads is accounted for somewhere else (rule (1), rule
+    ///    (0), the leaf set above).
+    ///
+    /// Receiver syntax is read from the ANALYZER's own record rather than
+    /// guessed from the text: `Program::member_name_spans` is written only at
+    /// `Node::MemberAccessor`, so a span in it IS a `subject.member` resolution
+    /// and a `Head::member` path is not in it at all. (The reference index
+    /// cannot tell them apart on its own — both arrive as an occurrence of the
+    /// member's definition at the member's own span.)
+    fn module_import_alone_carries(
+        &self,
+        program: &Program,
+        context: &ImportUseContext<'_>,
+        home: SourceId,
+        import_spans: &[Span],
+        occurrence: &crate::references::Occurrence,
+    ) -> bool {
+        if import_spans.iter().any(|statement| {
+            statement.start <= occurrence.span.start && occurrence.span.end <= statement.end
+        }) {
+            return false;
+        }
+        if context.bound_by_leaves.contains(&occurrence.definition) {
+            return false;
+        }
+        if crate::references::declaration_source(program, occurrence.definition) != Some(home) {
+            return false;
+        }
+        // A struct FIELD read through a receiver is not an impl member and
+        // arrives with the type, not with the module import.
+        let Definition::Entity(used) = occurrence.definition else {
+            return false;
+        };
+        if program.prelude_bindings.contains(&used) {
+            return false;
+        }
+        context.impl_members(program).contains(&used)
+            && context.receiver_members(program).contains(&occurrence.span)
     }
 
     /// E168's rescue: whether the MODULE an emptied-out import statement reaches
@@ -5187,7 +5462,7 @@ impl Document {
         program: &Program,
         module_span: Span,
         import_spans: &[Span],
-        bound_by_leaves: &HashSet<Definition>,
+        context: &ImportUseContext<'_>,
     ) -> ModuleRescue {
         let Some(module_id) = self.import_path_definition(program, module_span) else {
             return ModuleRescue::No;
@@ -5198,16 +5473,32 @@ impl Document {
         ) {
             return ModuleRescue::No;
         }
-        if !self.module_import_brings_a_use(program, module_id, import_spans, bound_by_leaves) {
+        if !self.module_import_brings_a_use(program, module_id, import_spans, context) {
             return ModuleRescue::No;
         }
         // B318 S3: the module form is the WIDE rescue, and a selector is the
         // narrow one. When everything this file gets from that module is the
         // members of one subject's `impl` blocks, the selector says exactly
         // that and the module import says more than the file needs.
-        match self.rescuing_subject(program, module_id, import_spans, bound_by_leaves) {
+        match self.rescuing_subject(program, module_id, import_spans, context) {
+            // A selector binds NO name, so it needs no collision guard: it says
+            // which blocks this file admits and adds nothing to the scope.
             Some(subject) => ModuleRescue::Selector(subject),
-            None => ModuleRescue::Module,
+            // E180's collision guard. `import <module>;` BINDS `<module>`, and
+            // the organizer must never write a statement whose new name is
+            // already taken — kolt's generated `src/lucide/lib.vl` declares
+            // `fun option()`, and `import std::option;` bound the module over
+            // it, so the organized file stopped checking. Shadowing an ambient
+            // PRELUDE name is fine and deliberately not guarded: an explicit
+            // import beats the prelude, which is the language's own rule.
+            None => match context
+                .source
+                .get(module_span.into_range())
+                .is_some_and(|name| context.taken_names().contains(name))
+            {
+                true => ModuleRescue::Keep,
+                false => ModuleRescue::Module,
+            },
         }
     }
 
@@ -5224,18 +5515,13 @@ impl Document {
         program: &Program,
         module_id: Id,
         import_spans: &[Span],
-        bound_by_leaves: &HashSet<Definition>,
+        context: &ImportUseContext<'_>,
     ) -> Option<String> {
         let entry = SourceId(0);
         let home = program.source_of(module_id)?;
         let mut subject: Option<String> = None;
         for occurrence in self.reference_index.occurrences_in(entry) {
-            if import_spans.iter().any(|statement| {
-                statement.start <= occurrence.span.start && occurrence.span.end <= statement.end
-            }) || bound_by_leaves.contains(&occurrence.definition)
-                || crate::references::declaration_source(program, occurrence.definition)
-                    != Some(home)
-            {
+            if !self.module_import_alone_carries(program, context, home, import_spans, occurrence) {
                 continue;
             }
             let Definition::Entity(used) = occurrence.definition else {
@@ -15739,6 +16025,223 @@ pub(crate) mod tests {
         );
         let result = organized(&document).expect("a wholly unused module import offers a prune");
         assert_eq!(result, "fun main() {}\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- E180: the organizer broke kolt's generated `src/lucide/lib.vl` -----
+    //
+    // Under `prelude = "std::web"` the file's two imports are both redundant
+    // with the prelude (rule (0), and correct — the file checks clean with both
+    // deleted), but E168's rescue then rewrote them, and `import std::option;`
+    // bound the module name `option` over the file's own `fun option()` icon:
+    // "`option` is a module, not a value" at `Option::Some(option())`. Two
+    // defects, pinned separately below — rule (2) counting a PRELUDE-bound,
+    // PATH-QUALIFIED reach as something the module import brings, and a rescue
+    // introducing a binding with no check that the name was free.
+
+    /// The web prelude, which is what kolt's own manifest declares: it is the
+    /// prelude that binds `Option`/`Some`/`None`, `View`/`view`, and the two
+    /// ambient MODULES (`style`, `ui`) R9's third subtraction is about.
+    const WEB_PRELUDE_MANIFEST: &str = "[package]\nname = \"probe\"\nprelude = \"std::web\"\n\n[entry.main]\ntarget = \"browser\"\n";
+
+    // E180 pin (a). The kolt shape at its smallest: the prelude binds `Option`,
+    // so the import is redundant and rule (0) prunes the leaf — and the module
+    // rescue must NOT then put `import std::option;` back. `Some` IS declared
+    // in std's `option.vl`, which is exactly what rule (2) used to count: a
+    // definition the prelude binds, spelled as a path segment behind a head.
+    // Neither reading survives E180's subtractions, so the statement goes.
+    #[test]
+    fn organize_prunes_a_prelude_redundant_import_a_qualified_variant_reaches_through() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import std::option::Option;\n\nfun pick(): Option<i32> {\n\tOption::Some(1)\n}\n",
+            ),
+            ("vilan.toml", WEB_PRELUDE_MANIFEST),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&document).expect("the prelude-redundant import offers an edit"),
+            // The blank line the run's own paragraph break leaves is the
+            // deletion's pre-existing shape (E168-era): the run takes one line
+            // ending with it, never the separator after it.
+            "\nfun pick(): Option<i32> {\n\tOption::Some(1)\n}\n",
+            "`Option::Some` is a path-qualified reach through a PRELUDE-bound \
+             head — the import brings nothing and no rescue is owed",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E180 pin (b). The same file with the collision actually present: kolt's
+    // generated lookup table calls `option()`, its own icon function, inside
+    // `Option::Some(..)`. Whatever the organizer decides, no edit it writes may
+    // bind `option` — that is the statement the guard makes, and it is asserted
+    // over the organized TEXT rather than over an internal decision, because
+    // the text is what breaks the build.
+    #[test]
+    fn organize_never_binds_a_module_name_the_file_has_taken() {
+        let source = "import std::option::Option;\n\nfun option(): i32 {\n\t1\n}\n\n\
+                      fun pick(): Option<i32> {\n\tOption::Some(option())\n}\n";
+        let (dir, document) =
+            analyze_workspace(&[("main.vl", source), ("vilan.toml", WEB_PRELUDE_MANIFEST)]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        let result = organized(&document).unwrap_or_else(|| source.to_string());
+        assert!(
+            !result.contains("import std::option;"),
+            "the organizer bound `option` over the file's own `fun option()`:\n{result}",
+        );
+        assert_eq!(
+            result,
+            "\nfun option(): i32 {\n\t1\n}\n\nfun pick(): Option<i32> {\n\tOption::Some(option())\n}\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E180 pin (c) — R9's third subtraction, RULED 2026-09-14. `std::web` says
+    // `export import pkg::ui;`, so `std::ui` is loaded for EVERY file of the
+    // package and its impls are there whatever this file imports. `view("div")
+    // .child(..)` is a receiver-syntax use of a member declared in `ui.vl`, so
+    // without the subtraction the rescue fires and writes
+    // `import std::ui::{ (impl View) };` into the file — redundant, and (kolt's
+    // estate) into every file of an application. With it the statement goes.
+    #[test]
+    fn organize_strips_a_ui_import_the_prelude_module_itself_reexports() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import std::ui::{ View, view };\n\nfun page(): View {\n\tview(\"div\").child(view(\"p\"))\n}\n",
+            ),
+            ("vilan.toml", WEB_PRELUDE_MANIFEST),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&document).expect("both leaves are prelude-redundant"),
+            "\nfun page(): View {\n\tview(\"div\").child(view(\"p\"))\n}\n",
+            "`std::ui` is ambient under this prelude — rescuing it as a \
+             selector is redundant, not protective",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [`LEAF_AND_IMPL`]'s two-subject sibling: the module rescue is the WIDE
+    /// form only when the file's uses span more than one `impl` block
+    /// (`visibility.md` §7.2), and the collision guard is about the wide form —
+    /// a SELECTOR binds no name and needs no guard at all.
+    const LEAF_AND_TWO_IMPLS: &str = "fun b(): i32 {\n\t1\n}\n\n\
+         impl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n\n\
+         impl bool {\n\tfun flipped(self): bool {\n\t\tself\n\t}\n}\n";
+
+    // E180's collision guard where the rescue is genuinely WANTED: `a.vl`'s two
+    // `impl` blocks are the only thing bringing `doubled` and `flipped`, so
+    // E168 would rewrite `import pkg::a::b;` to `import pkg::a;` — but the file
+    // declares its own `fun a()`, and that rewrite binds `a` over it. The
+    // organizer keeps the statement exactly as written instead: it may not
+    // break a green build to tidy one.
+    #[test]
+    fn organize_keeps_an_emptied_import_verbatim_when_its_module_name_is_taken() {
+        let source = "import pkg::a::b;\n\nfun a(): i32 {\n\t2\n}\n\n\
+                      fun main(): bool {\n\tlet n = a().doubled();\n\tlet flag = n > 0;\n\t\
+                      flag.flipped()\n}\n";
+        let (dir, document) =
+            analyze_workspace(&[("main.vl", source), ("a.vl", LEAF_AND_TWO_IMPLS)]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&document),
+            None,
+            "`a` is taken by the file's own declaration — the statement stands",
+        );
+        // E114/E173's contract: what fades is what the action removes, and the
+        // action removes nothing here.
+        assert_eq!(
+            faded(&document),
+            Vec::<String>::new(),
+            "a statement the action keeps verbatim must not fade",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The guard's other half: the same shape with the module's name FREE still
+    // rescues, so the guard narrows E168 and does not replace it.
+    #[test]
+    fn organize_still_rescues_when_the_module_name_is_free() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::b;\n\nfun local(): i32 {\n\t2\n}\n\n\
+                 fun main(): bool {\n\tlet n = local().doubled();\n\tlet flag = n > 0;\n\t\
+                 flag.flipped()\n}\n",
+            ),
+            ("a.vl", LEAF_AND_TWO_IMPLS),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&document).expect("the emptied statement is rescued"),
+            "import pkg::a;\n\nfun local(): i32 {\n\t2\n}\n\n\
+             fun main(): bool {\n\tlet n = local().doubled();\n\tlet flag = n > 0;\n\t\
+             flag.flipped()\n}\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E180 pin (e). A rule-(0) leaf is not "unused" in any sense its reader
+    // would recognize — `Option` may be spelled on every line of the file — so
+    // the fade says what it actually is and names the prelude.
+    #[test]
+    fn a_prelude_redundant_faded_leaf_says_the_prelude_binds_it() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import std::option::Option;\n\nfun pick(): Option<i32> {\n\tOption::Some(1)\n}\n",
+            ),
+            ("vilan.toml", WEB_PRELUDE_MANIFEST),
+        ]);
+        assert_eq!(
+            faded_messages(&document),
+            vec![(
+                "Option".to_string(),
+                "redundant: the prelude already binds `Option`".to_string(),
+            )],
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

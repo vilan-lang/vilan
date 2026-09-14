@@ -1642,19 +1642,21 @@ pub struct ImportRunEdit {
     pub replacement: String,
 }
 
-/// A pruned import statement awaiting canonical rendering. A re-export is surface,
-/// not usage, so it is never pruned and renders from its original node; an
-/// `import`/`use` that survived (whole or in part) renders from a node rebuilt to
-/// carry only the leaves `keep` retained.
+/// A pruned import statement awaiting canonical rendering. Two statements
+/// render from their ORIGINAL node — a re-export, which is surface rather than
+/// usage and is never pruned, and E180's collision guard, whose whole answer is
+/// "this statement stands exactly as it was written" — and an `import`/`use`
+/// that survived whole or in part renders from a node rebuilt to carry only the
+/// leaves `keep` retained.
 enum PrunedStatement<'ast, 'src> {
-    ReExport(&'ast Node<'src>),
+    AsWritten(&'ast Node<'src>),
     Rebuilt(Node<'src>),
 }
 
 impl<'src> PrunedStatement<'_, 'src> {
     fn node(&self) -> &Node<'src> {
         match self {
-            PrunedStatement::ReExport(node) => node,
+            PrunedStatement::AsWritten(node) => node,
             PrunedStatement::Rebuilt(node) => node,
         }
     }
@@ -1776,14 +1778,25 @@ pub enum ModuleRescue {
     /// `import <module>::{ (impl <subject>) };` — it uses exactly one block's
     /// members. The string is the subject as it should be rendered.
     Selector(String),
+    /// E180: the module IS needed, but `import <module>;` would BIND the module
+    /// segment's name and the file has already taken it — kolt's generated
+    /// `src/lucide/lib.vl` declares `fun option()`, and the rescue
+    /// `import std::option;` bound `option` over it, so the organized file
+    /// stopped checking ("`option` is a module, not a value"). The organizer may
+    /// never write a statement whose new name collides, and the only edit that
+    /// is certainly safe on a file that builds is no edit: the statement is
+    /// printed exactly as written, and — E114/E173's contract, that what fades
+    /// is what the action removes — its leaves do NOT fade.
+    Keep,
 }
 
 /// E168: the statement `branch` becomes when every one of its leaves pruned
 /// away but `keep_module` says the module it reaches into is still needed —
 /// `import pkg::a;`, rendered through the canonical printer like any other
-/// surviving statement. `None` when the module is not wanted, or when the
-/// truncation would leave an ORIGIN rather than a module (see
-/// [`import_module_branch`]).
+/// surviving statement. [`RescuedImport::Dropped`] when the module is not
+/// wanted, or when the truncation would leave an ORIGIN rather than a module
+/// (see [`import_module_branch`]); [`RescuedImport::Verbatim`] when the rescue
+/// would bind a name this file has already taken (E180).
 ///
 /// The predicate is asked at the module SEGMENT's span, which is the span the
 /// analyzer recorded the module's own reference at — so the editor answers it
@@ -1792,16 +1805,37 @@ pub enum ModuleRescue {
 fn module_only_import_branch<'src>(
     branch: &ImportBranch<'src>,
     keep_module: &dyn Fn(Span) -> ModuleRescue,
-) -> Option<ImportBranch<'src>> {
-    let (module, module_span, depth) = import_module_branch(branch)?;
+) -> RescuedImport<'src> {
+    let Some((module, module_span, depth)) = import_module_branch(branch) else {
+        return RescuedImport::Dropped;
+    };
     if depth < 2 {
-        return None;
+        return RescuedImport::Dropped;
     }
     match keep_module(module_span) {
-        ModuleRescue::No => None,
-        ModuleRescue::Module => Some(module),
-        ModuleRescue::Selector(subject) => Some(attach_selector(module, subject)),
+        ModuleRescue::No => RescuedImport::Dropped,
+        ModuleRescue::Module => RescuedImport::Narrowed(module),
+        ModuleRescue::Selector(subject) => {
+            RescuedImport::Narrowed(attach_selector(module, subject))
+        }
+        // E180's collision guard. The caller has the statement's own node and
+        // reprints that; the truncation computed above is thrown away, which is
+        // the point — a `Keep` is the organizer declining to narrow anything.
+        ModuleRescue::Keep => RescuedImport::Verbatim,
     }
+}
+
+/// What [`module_only_import_branch`] decided about an import statement every
+/// one of whose leaves pruned away — the three-way answer [`ModuleRescue`]
+/// became once E180 added an outcome that is neither a deletion nor a rewrite.
+enum RescuedImport<'src> {
+    /// The module brings the file nothing (or the truncation would leave an
+    /// ORIGIN): the statement goes.
+    Dropped,
+    /// The narrower statement the rescue prints in its place.
+    Narrowed(ImportBranch<'src>),
+    /// The statement stands exactly as written (E180).
+    Verbatim,
 }
 
 /// `<module>` rewritten as `<module>::{ (impl <subject>) }` — the module path's
@@ -3023,16 +3057,25 @@ impl<'src> Printer<'src> {
             let end = item.1.into_range().end;
             let statement = match &item.0 {
                 // A re-export is surface, not usage — never pruned.
-                Node::Export(..) => Some(PrunedStatement::ReExport(&item.0)),
+                Node::Export(..) => Some(PrunedStatement::AsWritten(&item.0)),
                 // E168: an `import` emptied of its leaves is offered to
                 // `keep_module` before it is dropped — the module it reaches
                 // into may be the only thing bringing an `impl` the file calls
                 // a method from. A `use` is not rewritten: it binds a name out
                 // of a namespace into this scope, and a namespace with no name
                 // taken out of it binds nothing at all.
-                Node::Import(branch, modifier) => prune_import_branch(branch, keep)
-                    .or_else(|| module_only_import_branch(branch, keep_module))
-                    .map(|pruned| PrunedStatement::Rebuilt(Node::Import(pruned, *modifier))),
+                Node::Import(branch, modifier) => match prune_import_branch(branch, keep) {
+                    Some(pruned) => Some(PrunedStatement::Rebuilt(Node::Import(pruned, *modifier))),
+                    None => match module_only_import_branch(branch, keep_module) {
+                        RescuedImport::Dropped => None,
+                        RescuedImport::Narrowed(pruned) => {
+                            Some(PrunedStatement::Rebuilt(Node::Import(pruned, *modifier)))
+                        }
+                        // E180: the original node, so the run reprints the
+                        // statement the file already has.
+                        RescuedImport::Verbatim => Some(PrunedStatement::AsWritten(&item.0)),
+                    },
+                },
                 Node::Use(branch) => prune_import_branch(branch, keep)
                     .map(|pruned| PrunedStatement::Rebuilt(Node::Use(pruned))),
                 _ => None,
