@@ -15,8 +15,7 @@ statement = derived-item
           | macro-fun
           | macro-block [ ";" ]
           | macro-invocation [ ";" ]
-          | "export" [ "(" "in" path-branch ")" ] statement
-          | "export" "*" ";"
+          | export         (* the visibility marker, §3.2 *)
           | expression ";"
           | if-expr        (* not before "}" — see below *)
           | for-expr       (* not before "}" *)
@@ -50,17 +49,30 @@ set-element = path-branch | impl-selector ;
 impl-selector = "(" "impl" type ")"
                 [ "::" ( NAME | "{" NAME { "," NAME } [ "," ] "}" ) ] ;
 NAME        = IDENT | "true" | "false" ;   (* variant re-exports *)
+
+export      = "export" [ "(" "in" path-branch ")" ] statement   (* §4.8 *)
+            | "export" "*" ";" ;          (* the whole-module marker *)
 ```
 
 `import` brings names from another module into scope; `use` brings names
 from a type's namespace (e.g. variants) into scope. In a set, `self` names
 the item itself (`Option::{ self, Some, None }` imports the type and its
-variants). Semantics: §4. `export statement` marks a declaration as the
-module's surface, or re-exports an import; `export(in PATH) statement`
-narrows that to a scope subtree (`mod`, `pkg`, or a module path), and
-`export *;` marks every item of the module. A `#` before a path element is
-the **reach** marker: `import pkg::a::{ #hidden };` imports an item the
-module does not export, deliberately (§4.3).
+variants). Semantics: §4.
+
+`export` is a statement WRAPPER, not a declaration kind: it takes the
+statement under it, which is what lets one production cover every
+declaration and the re-export alike. `export statement` marks a
+declaration as the module's surface (or re-exports an import);
+`export(in PATH) statement` narrows that to a scope subtree (`mod`,
+`pkg`, or a module path); `export *;` marks every item of the module and
+is the one form carrying no inner statement. The wrapper does not change
+the statement's own shape, so a wrapped `let` keeps its terminator —
+`export let registry = …;` — and a wrapped `fun` still takes none. A
+declaration carrying attributes is wrapped as a whole, with the marker
+ahead of them: `export [derive(Wire)] struct Handle { … }`. A `#` before
+a path element is the **reach** marker:
+`import pkg::a::{ #hidden };` imports an item the module does not export,
+deliberately (§4.3, §4.8).
 
 `as` renames the LEAF a branch ends at — `import a::b::c as d;` binds
 `d`, and `import a::{ b as x, c }` binds `x` and `c`. It is an

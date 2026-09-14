@@ -74,9 +74,62 @@ ambient scope platform-dependent. Nothing special happens — platform
 coloring still reports at the point the code becomes reachable — but
 "my prelude broke my server build" is a confusing way to learn it.
 
-The standard library declares `prelude = false`: 264 names across 59
-files, where "which module is this from" has to be answerable by reading
-the file.
+The standard library declares `prelude = false`: 741 declarations across
+63 files, where "which module is this from" has to be answerable by
+reading the file.
+
+## What a module exports
+
+A package is a tree of modules, and a module's items are its own until it
+says otherwise. `export` is the marker:
+
+```vilan,fragment
+export *;
+
+fun helper(): i32 {
+	7
+}
+```
+
+`export *;` is the whole-module form — one bare statement below the
+file's imports, saying "everything here is surface". Per-item is the
+other form, and it is what a library grows into:
+
+```vilan,fragment
+export struct Session {
+	token: str,
+}
+
+export fun open(token: str): Session {
+	Session { token = token }
+}
+
+// Not exported: the module's own machinery.
+fun refresh_window(): i32 {
+	300
+}
+```
+
+Two things follow, and the second is the one that surprises people.
+
+- **Nothing is blocked.** An importer who needs `refresh_window` writes
+  the reach — `import pkg::session::{ #refresh_window };` — and it
+  compiles. What the marker changes is completion, the add-import fix and
+  the "import it first" steer: a private item is not offered. A *plain*
+  import of it from another file of the same package warns and names the
+  reach spelling; from a dependency, nothing is said at all.
+- **`impl` blocks carry the bit too.** A block a consumer cannot see
+  contributes no methods to that consumer, so a module that exports
+  per-item writes `export impl Session { … }` for the blocks it means to
+  publish. A module with **no marker anywhere** is uncurated and offers
+  everything — which is why a package that has never thought about
+  visibility keeps compiling exactly as it did.
+
+New packages are uncurated, and that is a fine place to stay. Reach for
+the marker when the package has consumers: `export *;` at the top of each
+module preserves today's behaviour exactly, and per-item curation is the
+step after, when the surface is worth naming. std itself is curated (548
+of its 856 declarations are exported) and is the worked example.
 
 ## Reserved names
 

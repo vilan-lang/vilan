@@ -1,5 +1,7 @@
 import pkg::operators::Add;
 
+export *;
+
 external struct str;
 
 impl str {

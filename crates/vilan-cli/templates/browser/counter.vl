@@ -21,6 +21,8 @@
 // import a member explicitly wherever you would rather write it bare, since an
 // explicit import always beats the prelude.
 
+export *;
+
 fun card_style(): style::Style {
 	style::style()
 		.display(style::Display::Flex)

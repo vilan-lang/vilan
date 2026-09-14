@@ -20,6 +20,8 @@
 // thing in the browser leg and in the node leg, which is what a shared component
 // needs.
 
+export *;
+
 // A signal-fed list, a conditional note, an escaped heading, and a button whose
 // click writes a signal bound to its own text.
 fun app(): View {

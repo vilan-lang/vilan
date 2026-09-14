@@ -3,6 +3,8 @@
 
 import pkg::option::Option::{ self, None, Some };
 
+export *;
+
 /// Terminate the process with `code` (0 = success). Never returns.
 [extern("process.exit")]
 external fun exit(code: i32): void;

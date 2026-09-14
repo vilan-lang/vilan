@@ -43,7 +43,7 @@ import pkg::task::{ CancelSignal, ambient_signal };
 /// survey-flagged lie. No deprecated alias kept (pre-1.0; the sole caller was
 /// `read_file_to_str`, updated in the same commit — `numeric-types.md` §8's
 /// precedent for a rename that fixes a wrong name).
-[extern("node:fs/promises", "readFile")]
+export [extern("node:fs/promises", "readFile")]
 async external fun read_file_encoded(path: str, encoding: str): str;
 
 /// Reads a whole file's raw bytes — the binary read F13 asked for. `readFile`
@@ -51,10 +51,10 @@ async external fun read_file_encoded(path: str, encoding: str): str;
 /// `Uint8Array` (runtime-verified: `buffer instanceof Uint8Array` is `true`),
 /// so it binds directly to `Bytes` with no conversion — the same interop
 /// `std::http`'s `read_request_bytes` already relies on.
-[extern("node:fs/promises", "readFile")]
+export [extern("node:fs/promises", "readFile")]
 async external fun read_bytes(path: str): Bytes;
 
-[extern("node:fs/promises", "writeFile")]
+export [extern("node:fs/promises", "writeFile")]
 async external fun write_file(path: str, contents: str): void;
 
 /// Writes raw bytes to `path`, creating it or truncating what was there — the
@@ -70,12 +70,12 @@ async external fun write_file(path: str, contents: str): void;
 /// character. That is not a small promise — a text round trip through UTF-8
 /// turned kolt's 483-byte favicon into 853 bytes served, one U+FFFD per byte
 /// that was not a legal sequence.
-[extern("node:fs/promises", "writeFile")]
+export [extern("node:fs/promises", "writeFile")]
 async external fun write_bytes(path: str, contents: Bytes): void;
 
 /// Reads a UTF-8 text file to a string. Async (it awaits `readFile`), so callers
 /// implicitly await it.
-fun read_file_to_str(path: str): str {
+export fun read_file_to_str(path: str): str {
 	read_file_encoded(path, "utf8")
 }
 
@@ -86,7 +86,7 @@ fun read_file_to_str(path: str): str {
 /// file or the new one, never a mix. ACROSS filesystems the host raises
 /// `EXDEV` and nothing moves — which is why `write_atomic` below keeps its
 /// temporary a SIBLING of its target rather than putting it in a temp dir.
-[extern("node:fs/promises", "rename")]
+export [extern("node:fs/promises", "rename")]
 async external fun rename(from: str, to: str): void;
 
 /// Writes `contents` to `path` atomically: into a uniquely-named sibling
@@ -105,7 +105,7 @@ async external fun rename(from: str, to: str): void;
 /// one, so a crash can leave a `<path>.<uuid>.tmp` file behind: `vilan` has no
 /// `try`/`catch` to clean it up on the failing path. That is the right trade —
 /// a stray temporary is recoverable by hand, a torn target is not.
-fun write_atomic(path: str, contents: str) {
+export fun write_atomic(path: str, contents: str) {
 	let unique = random_uuid();
 	let temporary = i"{path}.{unique}.tmp";
 	write_file(temporary, contents);
@@ -118,7 +118,7 @@ fun write_atomic(path: str, contents: str) {
 /// about atomicity, durability and the stranded temporary applies here word
 /// for word — the only difference is which of the two `writeFile` bindings
 /// stages the temporary.
-fun write_bytes_atomic(path: str, contents: Bytes) {
+export fun write_bytes_atomic(path: str, contents: Bytes) {
 	let unique = random_uuid();
 	let temporary = i"{path}.{unique}.tmp";
 	write_bytes(temporary, contents);
@@ -134,7 +134,7 @@ fun write_bytes_atomic(path: str, contents: Bytes) {
 /// no `append_bytes` twin — nothing in the tree or in kolt has asked for one,
 /// and §9's rule for this module is to bind a host call when something needs
 /// it rather than to fill in the grid.
-[extern("node:fs/promises", "appendFile")]
+export [extern("node:fs/promises", "appendFile")]
 async external fun append(path: str, contents: str): void;
 
 /// Copies the file at `from` to `to`, replacing `to` if it exists. Copies a
@@ -143,7 +143,7 @@ async external fun append(path: str, contents: str): void;
 /// observe it partially written — so a destination something else reads back
 /// wants `copy` to a temporary plus `rename`, which is `write_atomic`'s shape
 /// spelled out by hand.
-[extern("node:fs/promises", "copyFile")]
+export [extern("node:fs/promises", "copyFile")]
 async external fun copy(from: str, to: str): void;
 
 /// Removes the FILE at `path` (`unlink`). A directory raises host-side
@@ -152,7 +152,7 @@ async external fun copy(from: str, to: str): void;
 /// split is the host's, kept rather than papered over. A missing path throws,
 /// matching every other operation in this module except `stat` — probe with
 /// `stat(path).is_some()` first if a missing file is an ordinary outcome.
-[extern("node:fs/promises", "unlink")]
+export [extern("node:fs/promises", "unlink")]
 async external fun remove(path: str): void;
 
 /// Reads `path` as UTF-8 text, hands it to `revise`, and writes what comes
@@ -173,7 +173,7 @@ async external fun remove(path: str): void;
 /// (async-polymorphism.md): a revision that itself awaits makes this instance
 /// of `update` await too, with nothing to write at either the declaration or
 /// the call site.
-fun update(path: str, revise: |str| str) {
+export fun update(path: str, revise: |str| str) {
 	let current = read_file_to_str(path);
 	write_atomic(path, revise(current));
 }
@@ -190,7 +190,7 @@ fun update(path: str, revise: |str| str) {
 /// file vs. directory calls `scan_dir`, which gets the kind back from the same
 /// host call for free. Throws host-side on a missing or unreadable directory,
 /// matching `read_file_to_str`'s posture above.
-[extern("node:fs/promises", "readdir")]
+export [extern("node:fs/promises", "readdir")]
 async external fun read_dir(path: str): List<str>;
 
 /// Lists EVERY entry under `path` — files and subdirectories alike, however
@@ -216,7 +216,7 @@ async external fun read_dir(path: str): List<str>;
 /// (`__fs_read_dir_all`, `transformer.rs`, the same seam as `__fs_stat`).
 /// Throws host-side on a missing or unreadable directory, matching
 /// `read_dir`.
-[extern("__fs_read_dir_all")]
+export [extern("__fs_read_dir_all")]
 async external fun read_dir_all(path: str): List<str>;
 
 // --- directories ---------------------------------------------------------
@@ -263,7 +263,7 @@ impl FsOptions {
 /// something is already there" is how a process claims a name, and it is the
 /// only exclusive-create primitive this module has until the handle tier's
 /// `create_new` lands (proposal/filesystem.md §3.3).
-[extern("node:fs/promises", "mkdir")]
+export [extern("node:fs/promises", "mkdir")]
 async external fun create_dir(path: str): void;
 
 [extern("node:fs/promises", "mkdir")]
@@ -274,7 +274,7 @@ async external fun mkdir_with(path: str, options: FsOptions): void;
 /// the one thing separating it from `create_dir`: this is the call for "make
 /// sure this place exists before I write into it", and that operation has no
 /// business failing because it already ran.
-fun create_dir_all(path: str) {
+export fun create_dir_all(path: str) {
 	let options = new_fs_options();
 	options.set_recursive(true);
 	mkdir_with(path, options)
@@ -284,7 +284,7 @@ fun create_dir_all(path: str) {
 /// `ENOTEMPTY` and a missing one `ENOENT` — `remove_dir_all` is the recursive
 /// form. The strict version is worth having for the same reason `create_dir`
 /// is: it refuses to destroy anything you did not know was there.
-[extern("node:fs/promises", "rmdir")]
+export [extern("node:fs/promises", "rmdir")]
 async external fun remove_dir(path: str): void;
 
 [extern("node:fs/promises", "rm")]
@@ -301,7 +301,7 @@ async external fun rm_with(path: str, options: FsOptions): void;
 /// (this file's header) applied to a destructive call instead of a probing
 /// one. Every other failure — a permissions error, a busy directory — still
 /// throws. If you need to know whether something WAS there, `stat` first.
-fun remove_dir_all(path: str) {
+export fun remove_dir_all(path: str) {
 	let options = new_fs_options();
 	options.set_recursive(true);
 	options.set_force(true);
@@ -320,7 +320,7 @@ async external fun cp_with(from: str, to: str, options: FsOptions): void;
 ///
 /// The host call is `fs.promises.cp`, which reached stable in node 22.3; on an
 /// older node it works and prints one `ExperimentalWarning` to stderr.
-fun copy_dir(from: str, to: str) {
+export fun copy_dir(from: str, to: str) {
 	let options = new_fs_options();
 	options.set_recursive(true);
 	cp_with(from, to, options)
@@ -344,7 +344,7 @@ fun copy_dir(from: str, to: str) {
 /// this module: a recursive walker that cannot see a link is a walker that
 /// eventually loops. To learn what a link points at, `stat` it — `stat` DOES
 /// follow.
-struct Entry {
+export struct Entry {
 	name: str,
 	is_directory: bool,
 	is_file: bool,
@@ -383,7 +383,7 @@ async external fun raw_scan_dir(path: str, options: FsOptions): List<RawEntry>;
 /// thousand extra stats on a thousand-entry directory, and `read_dir`'s own
 /// comment sends callers to do exactly that. `readdir { withFileTypes: true }`
 /// hands the kind back with the name, for free.
-fun scan_dir(path: str): List<Entry> {
+export fun scan_dir(path: str): List<Entry> {
 	let options = new_fs_options();
 	options.set_with_file_types(true);
 	let raw = raw_scan_dir(path, options);
@@ -419,7 +419,7 @@ impl RawStat {
 
 /// A path's metadata: byte size, last-modified time (milliseconds since the
 /// epoch), and whether it names a directory.
-struct Stat {
+export struct Stat {
 	size: i32,
 	modified_at_ms: f64,
 	is_directory: bool,
@@ -435,7 +435,7 @@ struct Stat {
 async external fun raw_stat(path: str): Option<RawStat>;
 
 /// Probes `path`: `None` if nothing exists there yet, `Some(stat)` otherwise.
-fun stat(path: str): Option<Stat> {
+export fun stat(path: str): Option<Stat> {
 	match raw_stat(path) {
 		Some(let raw) => Some(Stat {
 			size = raw.size(),
@@ -465,7 +465,7 @@ fun stat(path: str): Option<Stat> {
 /// below hands the body its file as a per-call parameter instead), and
 /// `List`/`Map`/`Set` cannot hold one — `Option<File>` is the sanctioned
 /// container, so "a pool of open files" is not expressible in v1.
-resource external struct File;
+export resource external struct File;
 
 /// The raw host open. Kept behind the five named constructors: node's flags
 /// string is an untyped eleven-member enum whose failure mode is a runtime
@@ -494,7 +494,7 @@ impl RawWriteResult {
 	external fun bytes_written(self): i32;
 }
 
-impl File {
+export impl File {
 	/// Opens `path` for reading (host mode `"r"`). The path must exist —
 	/// `ENOENT` otherwise, matching the module's throwing posture; probe with
 	/// `stat` first if absence is an ordinary outcome.
@@ -608,7 +608,7 @@ impl File {
 [extern("__fs_close")]
 external fun close_handle(file: File): void;
 
-impl File with Drop {
+export impl File with Drop {
 	/// Runs at the owner's scope end (or at an explicit `drop(file)`):
 	/// initiates the close through the `&mut self` loan. Synchronous and
 	/// context-free, as a destructor must be — the close itself completes in
@@ -658,7 +658,7 @@ fun scoped_file<T>(own file: File, body: |File| T): T {
 /// suffix IS the constructor this opens with. They earn their place in the
 /// free-function tier by the tier's own admission test — each is a complete
 /// operation on a path (open, act, close) holding no state between calls.
-fun with_file<T>(path: str, body: |File| T): T {
+export fun with_file<T>(path: str, body: |File| T): T {
 	scoped_file(File::open(path), body)
 }
 
@@ -674,14 +674,14 @@ fun with_file<T>(path: str, body: |File| T): T {
 /// carries on believing it wrote; under `with_file_create` it is a failure of
 /// the call, at the call, and the caller cannot miss it. Durability against
 /// power loss is still `sync()`'s job, not the close's.
-fun with_file_create<T>(path: str, body: |File| T): T {
+export fun with_file_create<T>(path: str, body: |File| T): T {
 	scoped_file(File::create(path), body)
 }
 
 /// `File::create_new` scoped: creates `path` and FAILS if anything is already
 /// there, then AWAITS the close — the exclusive claim (a lockfile, a
 /// once-only artifact) with its close error observable.
-fun with_file_create_new<T>(path: str, body: |File| T): T {
+export fun with_file_create_new<T>(path: str, body: |File| T): T {
 	scoped_file(File::create_new(path), body)
 }
 
@@ -689,14 +689,14 @@ fun with_file_create_new<T>(path: str, body: |File| T): T {
 /// missing, and AWAITS the close. Host semantics carry through unchanged —
 /// every write lands at the END and `write_at`'s position is ignored (see
 /// `File::append_to`).
-fun with_file_append<T>(path: str, body: |File| T): T {
+export fun with_file_append<T>(path: str, body: |File| T): T {
 	scoped_file(File::append_to(path), body)
 }
 
 /// `File::modify` scoped: opens `path` for reading AND writing without
 /// truncating it (the path must exist), and AWAITS the close — the scoped
 /// form of editing in place.
-fun with_file_modify<T>(path: str, body: |File| T): T {
+export fun with_file_modify<T>(path: str, body: |File| T): T {
 	scoped_file(File::modify(path), body)
 }
 
@@ -738,12 +738,12 @@ fun with_file_modify<T>(path: str, body: |File| T): T {
 /// file, which is exactly the property the host's hidden cursor would have
 /// destroyed. (R5 keeps the door one-way: the `File` cannot be moved out of a
 /// live `Reader`.)
-resource struct Reader {
+export resource struct Reader {
 	file: File,
 	cursor: Shared<i53>,
 }
 
-impl Reader {
+export impl Reader {
 	/// Takes ownership of `file` and starts reading at byte 0. A move, so the
 	/// `File` binding is dead afterwards and the `Reader` is the one owner —
 	/// `Reader::of(File::open(path))` is the ordinary spelling, and the
@@ -868,7 +868,7 @@ impl Reader {
 /// host timer KEEPS THE PROCESS ALIVE — exactly as `std::time::Timer`
 /// documents for itself. A watcher that is never dropped is a program that
 /// never exits.
-resource external struct Watcher;
+export resource external struct Watcher;
 
 /// What happened to a path between two observations. Three variants and no
 /// catch-all, because comparing two stats leaves no fourth possibility — the
@@ -885,7 +885,7 @@ resource external struct Watcher;
 /// the `Option` ARRAY FORM this module already uses at every other host
 /// boundary (`__fs_stat`, `__db_get`, `std::process::env`), so nothing has to
 /// leak a meaningless integer identity into a public type to get it here.
-enum ChangeKind {
+export enum ChangeKind {
 	Created,
 	Modified,
 	Removed,
@@ -906,7 +906,7 @@ enum ChangeKind {
 /// path, `stat(change.path)` answers live and answers more; for a `Removed`
 /// one the entry is gone and only a REMEMBERED kind exists, and this module
 /// does not hand back remembered facts dressed as current ones.
-struct Change {
+export struct Change {
 	path: str,
 	kind: ChangeKind,
 }
@@ -940,7 +940,7 @@ impl RawChange {
 [extern("__fs_watch")]
 async external fun start_watch(path: str, recursive: bool, interval_ms: i32): Watcher;
 
-impl Watcher {
+export impl Watcher {
 	/// Watches `path` and, when it is a directory, its IMMEDIATE entries —
 	/// `read_dir`'s reach. The path need not exist yet: a watcher on a path
 	/// that is not there reports `Created` when it appears, which is a thing
@@ -1015,7 +1015,7 @@ impl Watcher {
 [extern("__fs_watch_stop")]
 external fun stop_watch(watcher: Watcher): void;
 
-impl Watcher with Drop {
+export impl Watcher with Drop {
 	/// Runs at the owner's scope end (or at an explicit `drop(watcher)`):
 	/// stops the poll through the `&mut self` loan. Synchronous and
 	/// context-free, as a destructor must be — and genuinely synchronous, not

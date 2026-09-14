@@ -4384,6 +4384,15 @@ pub struct Analyzer<'src> {
     // instead of a page of generated-code follow-ons, which is the B182 answer
     // to the same shape.
     attributed_declarations: HashSet<Id>,
+    // B318 S6: a TRANSPARENT wrapper — `[derive(..)]`, `[service(..)]`, a macro
+    // attribute — mints an entity of its own and the DECLARATION under it is
+    // the entity every other reader asks about, so `export [derive(Wire)]
+    // struct Handle` recorded the wrapper's id in `exported_entities` and the
+    // struct stayed private: the marker parsed, formatted and round-tripped
+    // through `Importable.exported` (`item_visibility` walks the wrappers) and
+    // was silently dropped in entity-id space. This maps a wrapper's id to the
+    // declaration's so the `Node::Export` arm marks the thing that was written.
+    transparent_declarations: HashMap<Id, Id>,
     // B184: what a FIELD annotation naming a trait (or naming a struct that
     // carries hidden parameters) resolves to, decided by
     // `resolve_hidden_struct_parameters` BEFORE the drain runs. The pre-pass is
@@ -5824,6 +5833,7 @@ impl<'src> Analyzer<'src> {
             binding_hidden_nominal_constraints: Vec::new(),
             hidden_generic_parameters: HashMap::default(),
             attributed_declarations: HashSet::default(),
+            transparent_declarations: HashMap::default(),
             hidden_annotation_types: HashMap::default(),
             implicit_generic_scopes: HashMap::default(),
             anonymous_binder_parameters: HashMap::default(),
@@ -28234,6 +28244,7 @@ impl<'src> Analyzer<'src> {
                 self.record_macro_reference(name, *name_span, scope_id);
                 let declaration_id = self.walk_expr_node(inner, scope_id);
                 self.attributed_declarations.insert(declaration_id);
+                self.transparent_declarations.insert(id, declaration_id);
                 Some(Expr::Void)
             }
             // A macro invocation: item-position ones already appended their
@@ -28330,7 +28341,15 @@ impl<'src> Analyzer<'src> {
                             .to_string(),
                     });
                 }
-                let declaration_id = self.walk_expr_node(inner, scope_id);
+                let walked = self.walk_expr_node(inner, scope_id);
+                // A transparent wrapper's own entity is not the declaration's
+                // (`transparent_declarations`): `export [derive(Wire)] struct
+                // Handle` must mark `Handle`.
+                let declaration_id = self
+                    .transparent_declarations
+                    .get(&walked)
+                    .copied()
+                    .unwrap_or(walked);
                 // B318 §1.1: the marker is RECORDED now, where it used to be
                 // discarded. An `export import` records too — the re-export is
                 // an act of publication by a module that can see the item, which
@@ -28362,6 +28381,7 @@ impl<'src> Analyzer<'src> {
                 // the struct/enum entity id.
                 let declaration_id = self.walk_expr_node(inner, scope_id);
                 self.attributed_declarations.insert(declaration_id);
+                self.transparent_declarations.insert(id, declaration_id);
                 // A `Wire`/`Json` derive REFUSED for a resource subject (B117)
                 // records nothing: the name must not enter `wire_names` (Wire's
                 // case — a refused `resource struct Conn` would still satisfy
@@ -28406,6 +28426,7 @@ impl<'src> Analyzer<'src> {
                 }
                 let declaration_id = self.walk_expr_node(inner, scope_id);
                 self.attributed_declarations.insert(declaration_id);
+                self.transparent_declarations.insert(id, declaration_id);
                 // B284: a struct that handles and does not serve has no
                 // reactive session for an `[expose]`d field to be mirrored out
                 // of. Recorded AFTER the walk, because the walk is what mints
@@ -41308,23 +41329,24 @@ impl<'src> Analyzer<'src> {
     /// the default flip non-breaking — and its twin, a reach marker on an item
     /// that is exported anyway.
     ///
-    /// Three things it does NOT fire on, each ruled rather than tuned:
+    /// Two things it does NOT fire on, each ruled rather than tuned:
     ///
     /// - a reach into ANOTHER PACKAGE. RULED: whether an item should be exported
     ///   is the author's judgement and the consumer's need is real evidence
     ///   against it, so a dependency's private item reached from here is no
     ///   diagnostic at any release, marked or not.
-    /// - a reach whose importing file is STD's own. std's curation is its own
-    ///   slice (§8: std curates from release N, from the 118 measured cross-file
-    ///   imports up to whatever `docs/std/` documents), and until it runs, every
-    ///   one of those 118 would fire — which would turn
-    ///   `every_std_module_is_clean_under_full_scan`, a release blocker, into a
-    ///   permanent red. It is the `check_deprecated` A2 precedent exactly ("a use
-    ///   inside std itself is silent"), keyed on `std_sources`, which is
-    ///   populated under both scan scopes and so keeps the differential exact.
     /// - a leaf that is not a module's own top-level declaration: an enum
     ///   variant, a type's static (B317), a module FILE. None of those carries a
     ///   marker of its own, and a file has no `export` to write.
+    ///
+    /// STD IS NOT ONE OF THEM ANY MORE. S1 shipped a `std_sources` suppression
+    /// here because std's cross-file imports were all plain reaches into
+    /// unexported items, and every one of them would have fired in front of
+    /// every user (800 warnings in the `todo` example alone). S6 curated std
+    /// instead (visibility.md §8: std curates from release N), so the
+    /// suppression is gone and std is held to exactly the rule every other
+    /// package is held to — `every_std_module_is_clean_under_full_scan` is what
+    /// says so, and it is a release blocker.
     fn check_plain_reaches(&mut self) {
         if self.import_reaches.is_empty() {
             return;
@@ -41391,7 +41413,7 @@ impl<'src> Analyzer<'src> {
                 }
                 continue;
             }
-            if visible || self.std_sources.contains(&reach.source) {
+            if visible {
                 continue;
             }
             let Some(declared_in) = self.source_of_id(reach.target) else {

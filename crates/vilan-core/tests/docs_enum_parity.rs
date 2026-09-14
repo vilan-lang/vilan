@@ -127,10 +127,18 @@ fn enum_declarations(text: &str) -> Vec<(String, Vec<String>)> {
         let start = at + offset;
         at = start + "enum ".len();
         // A declaration, not the word inside a sentence or a type position:
-        // `enum` begins its line (modifiers and attributes sit on their own
-        // lines in both the std sources and the book's fences).
+        // `enum` begins its line, or begins it after the one modifier that
+        // shares the line — B318's `export` (`export(in mod)` narrows it).
+        // Attributes still sit on their own lines in both the std sources and
+        // the book's fences; `resource` does not apply to an enum.
         let line_start = text[..start].rfind('\n').map(|at| at + 1).unwrap_or(0);
-        if !text[line_start..start].trim().is_empty() {
+        let before = text[line_start..start].trim();
+        let before = before.strip_prefix("export").unwrap_or(before).trim();
+        let before = match (before.starts_with("(in "), before.find(')')) {
+            (true, Some(close)) => before[close + 1..].trim(),
+            _ => before,
+        };
+        if !before.is_empty() {
             continue;
         }
         let name: String = text[at..]

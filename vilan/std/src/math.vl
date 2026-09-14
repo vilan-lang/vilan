@@ -10,6 +10,8 @@
 import pkg::compare::{ Ord, PartialEq };
 import pkg::operators::{ Add, Sub };
 
+export *;
+
 // --- Constants -----------------------------------------------------------------
 //
 // Plain module-level values. `EPSILON` is computed (the lexer has no exponent

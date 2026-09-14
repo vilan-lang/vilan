@@ -35,7 +35,7 @@ external fun location_path(): str;
 /// `to_path` prints a pathname would then never compare equal to what the
 /// location says. Read this where the query matters — on load, and in a
 /// `popstate` handler — and keep routing on the path.
-[extern("__router_url")]
+export [extern("__router_url")]
 external fun location_url(): str;
 
 /// Decodes percent-escapes (`decodeURIComponent`): `"hello%20world"` is
@@ -46,13 +46,13 @@ external fun location_url(): str;
 /// stranger chose, so a decoder that can crash is a route that a link can take
 /// down — and the useful answer for a piece that is not an escape sequence is
 /// the piece.
-[extern("__percent_decode")]
+export [extern("__percent_decode")]
 external fun percent_decode(text: str): str;
 
 /// The path-signal singleton (the `std::reactive` module-state pattern) —
 /// created empty at load, wired to the real location on first use.
 let path_signal: SignalCell<str> = SignalCell::new("");
-let wired: Shared<bool> = Shared::new(false);
+export let wired: Shared<bool> = Shared::new(false);
 
 /// Wire the singleton once: read the current location and subscribe
 /// back/forward. A `popstate` is a DOM event, so it dispatches inside a fresh
@@ -72,7 +72,7 @@ fun ensure_wired() {
 
 /// The current `location.pathname`, live across `navigate` and back/forward.
 /// Derive the app's typed route from it: `current_path().map(parse)`.
-fun current_path(): SignalCell<str> {
+export fun current_path(): SignalCell<str> {
 	ensure_wired();
 	path_signal
 }
@@ -80,7 +80,7 @@ fun current_path(): SignalCell<str> {
 /// Programmatic navigation: push a history entry and update the path signal.
 /// Joins the caller's ambient turn — an event handler's writes, this one
 /// included, settle as one wave.
-fun navigate(path: str) {
+export fun navigate(path: str) {
 	ensure_wired();
 	history_push("", "", path);
 	path_signal.set(path);
@@ -94,7 +94,7 @@ fun navigate(path: str) {
 /// `parse_path` is the form that reads a whole URL: same segment rule, plus the
 /// query and the fragment, and every piece percent-DECODED. This one stays raw
 /// so that a caller who wants the URL's own bytes still has them.
-fun segments(path: str): List<str> {
+export fun segments(path: str): List<str> {
 	mut parts: List<str> = [];
 	for part in path.split("/") {
 		if part != "" {
@@ -111,7 +111,7 @@ fun segments(path: str): List<str> {
 /// would turn an escaped separator into a real one (`%2F` is a slash INSIDE a
 /// segment, `%26` an ampersand inside a query value), so the order is: cut, then
 /// decode, once, here.
-struct PathParts {
+export struct PathParts {
 	/// The path's non-empty segments, decoded — `segments`'s rule, so
 	/// `"/w//acme/"` is `["w", "acme"]` and `"/"` is `[]`.
 	segments: List<str>,
@@ -145,7 +145,7 @@ struct PathParts {
 /// Query keys and values additionally read `+` as a space, which is the form a
 /// submitted HTML form produces; a `+` in a path SEGMENT is a literal plus,
 /// because no encoder ever meant it otherwise there.
-fun parse_path(path: str): PathParts {
+export fun parse_path(path: str): PathParts {
 	mut rest = path;
 	mut fragment: Option<str> = None;
 	let hash = rest.split("#");
@@ -180,7 +180,7 @@ fun parse_path(path: str): PathParts {
 /// empty pair is skipped, so `"&&a=1&"` is `{ "a": "1" }`, and a repeated key
 /// keeps the last value — a map, not a multimap, because a route reads one
 /// value per key and the alternative is a `List` at every call site.
-fun parse_query(query: str): Map<str, str> {
+export fun parse_query(query: str): Map<str, str> {
 	mut values: Map<str, str> = Map::new();
 	for pair in query.split("&") {
 		if pair != "" {
@@ -200,7 +200,7 @@ fun parse_query(query: str): Map<str, str> {
 
 /// A value that prints as a history-API path — implement it on the app's
 /// route enum (usually delegating to the app's `href`). What `link` accepts.
-trait Routable {
+export trait Routable {
 	fun to_path(self): str;
 }
 
@@ -229,7 +229,7 @@ trait Routable {
 ///     }
 /// }
 /// ```
-trait FromPath {
+export trait FromPath {
 	fun from_segments(parts: List<str>): Self;
 }
 
@@ -250,7 +250,7 @@ trait FromPath {
 /// ```vilan,fragment
 /// let route: Route = from_path(current_path().get());
 /// ```
-fun from_path<R: FromPath>(path: str): R {
+export fun from_path<R: FromPath>(path: str): R {
 	R::from_segments(parse_path(path).segments)
 }
 
@@ -271,11 +271,11 @@ fun from_path<R: FromPath>(path: str): R {
 /// middle-click, ctrl-click and copy-link-address are untouched, and only the
 /// native "drag this link somewhere" gesture goes. An app that hand-writes
 /// its own `<a href on:click>` should set the attribute too.
-fun link<R: Routable>(label: str, route: R): View {
+export fun link<R: Routable>(label: str, route: R): View {
 	view("a").link_to(route).text(label)
 }
 
-impl View {
+export impl View {
 	/// Make THIS view a navigation link to `route` — `link`'s body, without
 	/// `link`'s `<a>` and label, for an app that builds and styles its own
 	/// anchor: `<a class("nav-item")>{icon}"Tasks"</a>` then `.link_to(route)`.
@@ -307,7 +307,7 @@ impl View {
 
 /// A main-button click with no modifier keys — the only click `link`
 /// intercepts; anything else keeps the anchor's native behavior.
-fun plain_left_click(event: Event): bool {
+export fun plain_left_click(event: Event): bool {
 	let no_modifiers = !event.meta_key()
 		&& !event.ctrl_key()
 		&& !event.shift_key()
@@ -320,7 +320,7 @@ fun plain_left_click(event: Event): bool {
 /// until the chunk lands, so the previous page stays on screen; bind this to
 /// show a spinner over it. Always false in a single-file build, which has no
 /// chunk to wait for.
-fun pending(): SignalCell<bool> {
+export fun pending(): SignalCell<bool> {
 	chunk_pending()
 }
 
@@ -330,6 +330,6 @@ fun pending(): SignalCell<bool> {
 /// happen) and publishes the reason here; the next navigation clears it and
 /// refetches, so a retry is a link click and needs no API. Always `None` in a
 /// single-file build.
-fun chunk_error(): SignalCell<Option<str>> {
+export fun chunk_error(): SignalCell<Option<str>> {
 	chunk_failure()
 }

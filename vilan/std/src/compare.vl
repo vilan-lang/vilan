@@ -1,5 +1,7 @@
 import pkg::option::Option::{ self, None, Some };
 
+export *;
+
 trait PartialEq<B = Self> {
 	fun eq(self, b: B): bool;
 

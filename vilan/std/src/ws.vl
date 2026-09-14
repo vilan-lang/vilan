@@ -12,6 +12,8 @@
 import pkg::bytes::{ Bytes, decode_utf8, encode_utf8 };
 import pkg::shared::Shared;
 
+export *;
+
 // --- Encoding (server → client: FIN set, unmasked) ---------------------------
 
 /// One complete frame: FIN | `opcode`, the length ladder, then the payload.

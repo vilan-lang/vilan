@@ -1,6 +1,8 @@
 import pkg::iterator::Iterator;
 import pkg::option::Option::{ self, None, Some };
 
+export *;
+
 /// A half-open integer range `[start, end)`. Iterate it with
 /// `for i in Range::new(start, end)`, which yields `start, start + 1, ..., end - 1`
 /// lazily — `next` advances the internal cursor rather than materializing a list.

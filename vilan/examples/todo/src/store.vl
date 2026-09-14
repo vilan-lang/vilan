@@ -19,6 +19,8 @@ import std::shared::Shared;
 import std::wire::{ Frame, decode, encode };
 import pkg::todo::Todo;
 
+export *;
+
 // Where the list lives between runs — reloaded on boot, rewritten on change.
 let storage = "todos.json";
 

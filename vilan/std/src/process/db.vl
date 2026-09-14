@@ -19,15 +19,15 @@ import pkg::time::now;
 /// `resource`: it moves rather than copies, and its `Drop` (below) closes the
 /// underlying handle at the owner's scope end. A module-level `Database` is
 /// process-lifetime and never drops — the serve-forever server idiom.
-resource external struct Database;
+export resource external struct Database;
 
 /// A prepared statement (reusable; parameters bind per call).
-external struct Statement;
+export external struct Statement;
 
 /// A result row (a host object; read columns through the typed accessors).
-external struct Row;
+export external struct Row;
 
-impl Database {
+export impl Database {
 	/// Opens (creating if missing) the database at `path`; ":memory:" for an
 	/// ephemeral in-process store.
 	[extern(new, "node:sqlite", "DatabaseSync")]
@@ -48,7 +48,7 @@ impl Database {
 [extern("__db_close")]
 external fun close_handle(database: Database): void;
 
-impl Database with Drop {
+export impl Database with Drop {
 	/// Runs at the owner's scope end (or at an explicit `drop(db)`): closes the
 	/// handle through the `&mut self` loan, before the value is destroyed.
 	/// Synchronous and context-free, as a destructor must be.
@@ -85,7 +85,7 @@ external fun column_real(row: Row, name: str): f64;
 [extern("__db_is_null")]
 external fun column_is_null(row: Row, name: str): bool;
 
-impl Statement {
+export impl Statement {
 	/// Executes with `parameters` bound positionally; returns the inserted
 	/// rowid (0 when the statement inserts nothing). Rowids exceed i32 only
 	/// past 2^31 rows — revisit alongside real i53 needs.
@@ -103,7 +103,7 @@ impl Statement {
 	}
 }
 
-impl Row {
+export impl Row {
 	fun text(self, name: str): str {
 		column_text(self, name)
 	}
@@ -152,7 +152,7 @@ impl Row {
 /// parsing SQL: a comment, a string literal or a `commit_sha` column would all
 /// be refused wrongly, and a line break evades the scan anyway
 /// (`db-migrations.md` §5.5).
-struct Migration {
+export struct Migration {
 	name: str,
 	sql: str,
 }
@@ -174,7 +174,7 @@ external fun exec_guarded(database: Database, sql: str): Option<str>;
 [extern("__db_run_guarded")]
 external fun run_guarded(statement: Statement, parameters: List<any>): Option<str>;
 
-impl Database {
+export impl Database {
 	/// Applies `migrations` in LIST ORDER, recording each in the
 	/// `vilan_migrations` table this module owns, and returns the names it
 	/// applied. A re-run applies nothing and returns an empty list — call it at

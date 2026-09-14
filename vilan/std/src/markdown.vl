@@ -42,7 +42,7 @@ import pkg::result::Result::{ self, Err, Ok };
 /// CommonMark one-space trim applied; `Link` is `(destination, label)`;
 /// `Html` is one raw tag, verbatim (`<a id="…">` or `</a>` — the census's only
 /// passthrough shape).
-enum Inline {
+export enum Inline {
 	Text(str),
 	Code(str),
 	Strong(List<Inline>),
@@ -59,7 +59,7 @@ enum Inline {
 /// bullets carry multi-paragraph bodies and indented fences, so an
 /// inline-only item type cannot represent them (a recorded deviation from
 /// §2's sketch; proposal/markdown.md §10). `Table` is `(header, rows)`.
-enum Block {
+export enum Block {
 	Heading(i32, List<Inline>, str),
 	Paragraph(List<Inline>),
 	CodeFence(str, str),
@@ -69,19 +69,19 @@ enum Block {
 }
 
 /// A parsed document: the block sequence, in source order.
-struct Doc {
+export struct Doc {
 	blocks: List<Block>,
 }
 
 /// A strict-parse refusal: the 1-based source line and a message naming the
 /// out-of-grammar construct. For a block-level construct the line is exact;
 /// for an inline construct it is the line its enclosing block opens on.
-struct ParseError {
+export struct ParseError {
 	line: i32,
 	message: str,
 }
 
-impl ParseError with Display {
+export impl ParseError with Display {
 	fun to_string(self): str {
 		"line " + self.line.to_string() + ": " + self.message
 	}
@@ -653,7 +653,7 @@ fun is_dropped_symbol(c: u32): bool {
 /// kept, each whitespace character its own `-`, HTML entities and everything
 /// else dropped (non-ASCII per the curated rules above). Per-document
 /// `-1`/`-2` dedupe is `parse`'s job, not this function's.
-fun heading_id(content: List<Inline>): str {
+export fun heading_id(content: List<Inline>): str {
 	let text = inline_text(content).trim();
 	let n = text.len();
 	mut out = "";
@@ -1041,7 +1041,7 @@ fun is_reference_definition(trimmed: str): bool {
 /// its line — the ruled failure mode, so the first page to write a footnote
 /// fails loudly instead of rendering wrong. On `Ok`, every heading carries
 /// its mdBook-compatible id, deduped per document.
-fun parse(source: str): Result<Doc, ParseError> {
+export fun parse(source: str): Result<Doc, ParseError> {
 	let blocks = parse_blocks(split_lines(source), 1)!;
 	mut none: List<str> = [];
 	let walked = assign_ids(blocks, none);

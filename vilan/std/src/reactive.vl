@@ -10,13 +10,13 @@ import pkg::time::Timer;
 
 /// A resource that can be released. An `Owner` collects `Disposable`s and releases
 /// them as a group; `Subscription`, `Owner`, and `std::ui`'s `View` are disposable.
-trait Disposable {
+export trait Disposable {
 	fun dispose(self);
 }
 
 /// A registered observer of a signal: `notify` re-runs it when the signal's value
 /// changes; `id` lets a `Subscription` find and remove it.
-struct Subscriber {
+export struct Subscriber {
 	id: i32,
 	notify: || void,
 }
@@ -24,7 +24,7 @@ struct Subscriber {
 /// Monotonic ids for subscribers — module-level, one counter for the program.
 let next_subscriber_id: Shared<i32> = Shared::new(0);
 
-fun fresh_id(): i32 {
+export fun fresh_id(): i32 {
 	let id = next_subscriber_id.read();
 	next_subscriber_id.write() = id + 1;
 	id
@@ -41,7 +41,7 @@ fun fresh_id(): i32 {
 // Context capture-at-creation carries a turn across its own extent's awaits
 // while interleaved extents keep theirs.
 
-enum FlushPolicy {
+export enum FlushPolicy {
 	// Settle when the turn's extent ends — the transactional cadence
 	// (server dispatch).
 	AtEnd,
@@ -56,7 +56,7 @@ enum FlushPolicy {
 // (recorded follow-on); the enum states intent and keeps the API stable.
 
 /// The host's microtask queue — the continuation-settling primitive.
-[extern("queueMicrotask", retains)]
+export [extern("queueMicrotask", retains)]
 external fun queue_microtask(callback: || void);
 
 /// The runtime's `try`/`finally` (tracker B292). vilan has no exception
@@ -75,10 +75,10 @@ external fun with_finally(body: || void, after: || void);
 /// `body` returned; `Some(text)` carrying the host's own diagnosis when it
 /// threw. It costs one `Option` per call, so it belongs where the loop is a
 /// disposal group and not where it is a notification wave.
-[extern("__guarded")]
+export [extern("__guarded")]
 external fun guarded(body: || void): Option<str>;
 
-struct Turn {
+export struct Turn {
 	pending: Shared<List<Subscriber>>,
 	// The ids in `pending`, as a keyed set — `enqueue`'s dedup (A44). Kept in
 	// exact step with `pending`: cleared when a wave is taken out, scrubbed
@@ -91,7 +91,7 @@ struct Turn {
 	scheduled: Shared<bool>,
 }
 
-impl Turn {
+export impl Turn {
 	fun new(): Turn {
 		Turn {
 			pending = Shared::new([]),
@@ -107,7 +107,7 @@ impl Turn {
 /// framework boundaries, `std::ui` event dispatch and the RPC server's
 /// per-message dispatch); read by `set` via `get_safe`, so unscoped code
 /// pays nothing.
-let turn_scope: Context<Turn> = Context::new();
+export let turn_scope: Context<Turn> = Context::new();
 
 /// Drain affinity — the ONE runtime device in the model. A notify fired
 /// during a drain may `set` (a derived recomputing), but that notifier is an
@@ -177,7 +177,7 @@ fun enqueue(turn: Turn, subscribers: List<Subscriber>) {
 /// Re-entrancy-guarded per turn (a `set` from inside a notify only enqueues;
 /// the running loop picks it up) and budget-bounded (a feedback loop that
 /// never converges stops here instead of hanging).
-fun drain(turn: Turn) {
+export fun drain(turn: Turn) {
 	if !turn.draining.read() {
 		turn.draining.write() = true;
 		draining_turns.write().push(turn);
@@ -223,7 +223,7 @@ fun drain(turn: Turn) {
 
 /// Settle the AMBIENT turn's pending notifies now. With no ambient turn there
 /// is nothing pending by construction (every `set` notified inline).
-fun flush() {
+export fun flush() {
 	match turn_scope.get_safe() {
 		Some(let turn) => drain(turn),
 		None => {},
@@ -247,7 +247,7 @@ fun flush() {
 /// `proposal/remote-sources.md` §2a: the `Unsubscribe` a remote mirror owes at
 /// its last release is deferred there, which is what lets a same-segment
 /// re-subscribe cancel it.
-fun at_settle(id: i32, action: || void) {
+export fun at_settle(id: i32, action: || void) {
 	defer_to_turn(turn_scope.get_safe(), id, action)
 }
 
@@ -258,7 +258,7 @@ fun at_settle(id: i32, action: || void) {
 /// Outside a release hook this IS `at_settle` — a direct `mirror.release()`
 /// reads its caller's turn correctly, because nothing stored stands between
 /// them — so the two are one rule with one extra question asked first.
-fun at_release_settle(id: i32, action: || void) {
+export fun at_release_settle(id: i32, action: || void) {
 	match releasing_turns.read().last() {
 		Some(let at_release) => defer_to_turn(at_release, id, action),
 		None => at_settle(id, action),
@@ -295,7 +295,7 @@ fun defer_to_turn(turn: Option<Turn>, id: i32, action: || void) {
 /// writes coalesce to their final value). The held form is the wire turn:
 /// an RPC handler that reads, awaits, and writes publishes one coherent
 /// wave. (`turn_async` was the pre-adaptation spelling of the held form.)
-fun turn<T>(policy: FlushPolicy, body: (|| T) context turn_scope): T {
+export fun turn<T>(policy: FlushPolicy, body: (|| T) context turn_scope): T {
 	// The policies converge for async extents in v1 — see `FlushPolicy`.
 	let _cadence = policy;
 	let fresh = Turn::new();
@@ -318,7 +318,7 @@ fun turn<T>(policy: FlushPolicy, body: (|| T) context turn_scope): T {
 /// `Optimistic::over` and `ui`'s `bind_value`). `Source` declares `get`/`sub`
 /// and no `set`, so the whole point of this function is outside it — and any
 /// impl of the writable trait serves, not only the canonical cell.
-fun optimistic<T, E, S: Signal<T>>(
+export fun optimistic<T, E, S: Signal<T>>(
 	signal: S,
 	value: T,
 	commit: async || Result<T, E>,
@@ -343,7 +343,7 @@ fun optimistic<T, E, S: Signal<T>>(
 /// arms enter the extent through `run`, which supplies the turn to the
 /// deferred literal: the join arm re-establishes the CURRENT turn (same
 /// queue; the outer settle fires once), the fresh arm settles at the end.
-fun batch<T>(body: (sync || T) context turn_scope): T {
+export fun batch<T>(body: (sync || T) context turn_scope): T {
 	match turn_scope.get_safe() {
 		Some(let current) => turn_scope.run(current, body),
 		None => {
@@ -358,7 +358,7 @@ fun batch<T>(body: (sync || T) context turn_scope): T {
 
 /// A live subscription. Dropping it does NOT stop it (an owner scope is
 /// responsible for that — see the proposal); call `dispose` to stop early.
-struct Subscription {
+export struct Subscription {
 	subscribers: Shared<List<Subscriber>>,
 	id: i32,
 	// Extra teardown to run on dispose, once. `Signal::sub` leaves it `None`;
@@ -369,7 +369,7 @@ struct Subscription {
 	release: Shared<Option<|| void>>,
 }
 
-impl Subscription {
+export impl Subscription {
 	/// A subscription over NO signal: `dispose` runs `release` once and does
 	/// nothing else. The registration shape for a source outside the signal
 	/// graph — `std::dom`'s `listen`, whose whole teardown is the call that
@@ -387,7 +387,7 @@ impl Subscription {
 	}
 }
 
-impl Subscription with Disposable {
+export impl Subscription with Disposable {
 	fun dispose(self) {
 		mut kept: List<Subscriber> = [];
 		for subscriber in self.subscribers.read() {
@@ -452,7 +452,7 @@ impl Subscription with Disposable {
 /// and only a SECOND `dispose` released it. With it, the promise is kept the
 /// only way it still can be — the item is disposed ON THE SPOT, because the
 /// extent it would have belonged to is already over.
-struct Owner {
+export struct Owner {
 	cleanups: Shared<List<|| void>>,
 	// Set BEFORE the cleanups run, so a cleanup that registers back into this
 	// owner (a `defer` reached from another `dispose`) is disposed on the spot
@@ -460,7 +460,7 @@ struct Owner {
 	disposed: Shared<bool>,
 }
 
-impl Owner {
+export impl Owner {
 	fun new(): Owner {
 		Owner { cleanups = Shared::new([]), disposed = Shared::new(false) }
 	}
@@ -501,7 +501,7 @@ impl Owner {
 	}
 }
 
-impl Owner with Disposable {
+export impl Owner with Disposable {
 	/// Idempotent: a second `dispose` runs nothing. The flag goes up FIRST, so
 	/// anything a cleanup registers back into this owner is disposed on the
 	/// spot instead of landing on the emptied list.
@@ -557,10 +557,10 @@ impl Owner with Disposable {
 /// user's site, on the context itself. (Sugar that keeps this shape is
 /// possible as a macro, which splices the literal in place — recorded in the
 /// proposal.)
-let owner_scope: Context<Owner> = Context::new();
+export let owner_scope: Context<Owner> = Context::new();
 
 /// The ambient owner established by the nearest enclosing `owner_scope.run`.
-fun get_owner(): Owner {
+export fun get_owner(): Owner {
 	owner_scope.get()
 }
 
@@ -582,7 +582,7 @@ fun get_owner(): Owner {
 /// would be the stronger law ("a derivation must have an owner", the shape
 /// `RemoteSource::map` already enforces), and it is a BREAKING change to a
 /// documented idiom, so it is the owner's call and not this function's.
-fun register_with_owner(subscription: Subscription): Subscription {
+export fun register_with_owner(subscription: Subscription): Subscription {
 	match owner_scope.get_safe() {
 		Some(let owner) => owner.take(subscription),
 		None => subscription,
@@ -592,7 +592,7 @@ fun register_with_owner(subscription: Subscription): Subscription {
 /// `Owner::defer` against the ambient owner when there is one — the
 /// `register_with_owner` shape for teardown that is not a single
 /// `Disposable` (`flatten`'s rolling inner subscription).
-fun defer_to_owner(cleanup: || void) {
+export fun defer_to_owner(cleanup: || void) {
 	match owner_scope.get_safe() {
 		Some(let owner) => owner.defer(cleanup),
 		None => {},
@@ -605,7 +605,7 @@ fun defer_to_owner(cleanup: || void) {
 /// its ambient reads to call-supplied binding instead of capturing at
 /// creation, so the literal may be born at the caller's site. Yields the
 /// body's value, like `run` and `batch`.
-fun run_with_owner<T>(owner: Owner, body: (sync || T) context owner_scope): T {
+export fun run_with_owner<T>(owner: Owner, body: (sync || T) context owner_scope): T {
 	owner_scope.run(owner, body)
 }
 
@@ -614,7 +614,7 @@ fun run_with_owner<T>(owner: Owner, body: (sync || T) context owner_scope): T {
 /// product PAIRED with the disposal handle — `scope.dispose()` tears down
 /// every effect the component registered, stored callbacks and post-`await`
 /// registrations included.
-fun comp<T>(body: (sync || T) context owner_scope): (T, Owner) {
+export fun comp<T>(body: (sync || T) context owner_scope): (T, Owner) {
 	let scope = Owner::new();
 	let result = owner_scope.run(scope, body);
 	(result, scope)
@@ -637,7 +637,7 @@ fun comp<T>(body: (sync || T) context owner_scope): (T, Owner) {
 /// the subscription, and a first change that is silently indistinguishable
 /// from the seeding call. Building the eager form over the lazy one is pure
 /// addition: attach, then make the call. Nothing is swallowed anywhere.
-trait Source<T> {
+export trait Source<T> {
 	fun get(self): T;
 
 	/// Subscribe WITHOUT the immediate first call (backlog A43, made the
@@ -731,7 +731,7 @@ trait Source<T> {
 /// The trait promises NOTHING about notification frequency. `SignalCell`
 /// notifies unconditionally (`set` never compares); an impl that wants "don't
 /// publish an unchanged value" writes that in its own `set`.
-trait Signal<T> with Source<T> {
+export trait Signal<T> with Source<T> {
 	/// The canonical cell, concretely — deliberately not `Self`: a bare
 	/// `Signal::new(1)` has no receiver and no bound in scope to resolve a
 	/// `Self` against.
@@ -755,7 +755,7 @@ trait Signal<T> with Source<T> {
 /// Both a root cell and every derived value share this representation; the
 /// difference is only who may write it (a root, via `set`). The canonical
 /// `Signal` impl — `Signal::new` hands one back.
-struct SignalCell<T> {
+export struct SignalCell<T> {
 	value: Shared<T>,
 	subscribers: Shared<List<Subscriber>>,
 }
@@ -782,7 +782,7 @@ fun cell_identity<T>(cell: SignalCell<T>): i32 {
 	cell.value.identity()
 }
 
-impl SignalCell<type T> with Source<T> {
+export impl SignalCell<type T> with Source<T> {
 	fun get(self): T {
 		self.value.read()
 	}
@@ -823,7 +823,7 @@ impl SignalCell<type T> with Source<T> {
 /// `get`/`sub`, and the whole reason it exists is to attach without the
 /// immediate first call that `sub` makes. There is no `Source` spelling for
 /// that, so `map`, which is built on it, stays a `Signal` method too.
-fun observe<T>(signal: SignalCell<T>, observer: |T| void): Subscription {
+export fun observe<T>(signal: SignalCell<T>, observer: |T| void): Subscription {
 	let id = fresh_id();
 	let cell = signal.value;
 	signal.subscribers.write().push(Subscriber {
@@ -837,7 +837,7 @@ fun observe<T>(signal: SignalCell<T>, observer: |T| void): Subscription {
 
 /// The canonical write side. `set_with` is the trait's default, unchanged —
 /// the body std used to carry here is the body the trait carries now.
-impl SignalCell<type T> with Signal<T> {
+export impl SignalCell<type T> with Signal<T> {
 	/// Declared, not inherited: `Type::func` reads the type's OWN members, so
 	/// the trait's default body is reachable at `Signal::new` and this one is
 	/// reachable at `SignalCell::new`. They are the same cell either way.
@@ -876,7 +876,7 @@ impl SignalCell<type T> with Signal<T> {
 	}
 }
 
-impl SignalCell<type T> {
+export impl SignalCell<type T> {
 	/// Mutate the stored value IN PLACE, then notify once (backlog A18,
 	/// `proposal/signal-update.md`). `mutate` receives a writable view of the
 	/// storage, so a collection grows without the copy-transform-return dance
@@ -925,7 +925,7 @@ impl SignalCell<type T> {
 /// component's subscription dies with the boundary that built it. That is also
 /// why `bind` may only be called under one: the requirement is static, and it
 /// flows through the bound.
-trait MaybeSignal<T> {
+export trait MaybeSignal<T> {
 	fun bind(self, react: |T| void);
 }
 
@@ -933,7 +933,7 @@ trait MaybeSignal<T> {
 ///
 /// A BLANKET (B158) — the least specific tier, so any impl below outranks it
 /// wherever both match.
-impl type T with MaybeSignal<T> {
+export impl type T with MaybeSignal<T> {
 	fun bind(self, react: |T| void) {
 		react(self);
 	}
@@ -946,7 +946,7 @@ impl type T with MaybeSignal<T> {
 ///
 /// The binder in the bound is the impl's own parameter (B165), which is what
 /// makes this one impl rather than one per element type.
-impl type S: Source<type T> with MaybeSignal<T> {
+export impl type S: Source<type T> with MaybeSignal<T> {
 	fun bind(self, react: |T| void) {
 		self.effect(react);
 	}
@@ -967,7 +967,7 @@ impl type S: Source<type T> with MaybeSignal<T> {
 /// has no trait objects, and a `<S: Source<U>>` parameter names ONE type where
 /// the tuple needs a different one per element. `combine` widens when the
 /// mapped-tuple grammar can bind a bound per element, not before.
-fun combine<T: (2..)>(sources: (U in T: SignalCell<U>)): SignalCell<T> {
+export fun combine<T: (2..)>(sources: (U in T: SignalCell<U>)): SignalCell<T> {
 	let snapshot = || (source in sources => source.get());
 	let derived = SignalCell::new(snapshot());
 	// Subscribe each input LAZILY (A43): `derived` was just seeded with the
@@ -1001,7 +1001,7 @@ fun combine<T: (2..)>(sources: (U in T: SignalCell<U>)): SignalCell<T> {
 /// cleanup to whatever owner was ambient where `selector` was CALLED — the
 /// component, never the row. A method call threads the caller's ambient owner
 /// the ordinary way, which is what lets a row's entry die with the row.
-struct Selector<T> {
+export struct Selector<T> {
 	// One cell per key, keyed by `key.hash()` (the canonical key `Map`/`Set`
 	// use). Every `of` for the same key hands back the same cell.
 	cells: Shared<NativeMap<SignalCell<bool>>>,
@@ -1022,7 +1022,7 @@ struct Selector<T> {
 /// The subscription is the AMBIENT OWNER's, like every derivation combinator's
 /// (A28), and it is a LAZY one (A43): the cells are seeded by `of` from
 /// `current`, so there is nothing for a first call to do.
-fun selector<T: Hashable + PartialEq, S: Source<T>>(source: S): Selector<T> {
+export fun selector<T: Hashable + PartialEq, S: Source<T>>(source: S): Selector<T> {
 	let cells: Shared<NativeMap<SignalCell<bool>>> = Shared::new(NativeMap::new());
 	let current: Shared<T> = Shared::new(source.get());
 	let _owned = register_with_owner(source.on_change(|value| {
@@ -1043,7 +1043,7 @@ fun selector<T: Hashable + PartialEq, S: Source<T>>(source: S): Selector<T> {
 	Selector { cells, current }
 }
 
-impl Selector<type T: Hashable + PartialEq> {
+export impl Selector<type T: Hashable + PartialEq> {
 	/// The live answer for one key: `true` exactly while the source holds it.
 	///
 	/// Creates the key's cell on first ask (seeded against the current value)
@@ -1082,7 +1082,7 @@ impl Selector<type T: Hashable + PartialEq> {
 // a join. A default method on `Source<T>` cannot express this — a default
 // cannot add a bound on `T`, and this needs `T` to be a source itself — so the
 // bound-in-the-subject spelling is the honest one.
-impl type S: Source<type I: Source<type U>> {
+export impl type S: Source<type I: Source<type U>> {
 	fun flatten(self): SignalCell<U> {
 		let derived = SignalCell::new(self.get().get());
 		let inner_subscription: Shared<Option<Subscription>> = Shared::new(None);
@@ -1113,7 +1113,7 @@ impl type S: Source<type I: Source<type U>> {
 /// current value, wrapped. The ownership story is `flatten`'s exactly — one
 /// registered outer subscription, one rolling inner one deferred to the
 /// ambient owner.
-impl type S: Source<Option<type I: Source<type U>>> {
+export impl type S: Source<Option<type I: Source<type U>>> {
 	fun flatten(self): SignalCell<Option<U>> {
 		let derived: SignalCell<Option<U>> = SignalCell::new(match self.get() {
 			Some(let inner) => Some(inner.get()),
@@ -1161,7 +1161,7 @@ impl type S: Source<Option<type I: Source<type U>>> {
 // through its own cell instead of rebuilding it.
 
 /// One new-position row's fate. `Keep`/`Refresh` carry the OLD row's index.
-enum RowStep {
+export enum RowStep {
 	Keep(i32),
 	Refresh(i32),
 	Fresh,
@@ -1169,12 +1169,12 @@ enum RowStep {
 
 /// The plan for one reconcile pass: a step per NEW item (in the new order),
 /// then the old indices whose rows are gone entirely.
-struct ReconcilePlan {
+export struct ReconcilePlan {
 	steps: List<RowStep>,
 	removed: List<i32>,
 }
 
-fun reconcile<T, K: PartialEq>(
+export fun reconcile<T, K: PartialEq>(
 	old_keys: List<K>,
 	old_items: List<T>,
 	items: List<T>,
@@ -1232,7 +1232,7 @@ fun reconcile<T, K: PartialEq>(
 // commit instead of one per edit. Both are off unless asked for.
 
 /// The sync status a UI can bind ("saved" / "unsaved" / the failure).
-[derive(PartialEq, Debug)]
+export [derive(PartialEq, Debug)]
 enum DraftState {
 	// `local` matches the last pushed/adopted value.
 	Synced,
@@ -1242,7 +1242,7 @@ enum DraftState {
 	Failed(str),
 }
 
-struct Draft<T> {
+export struct Draft<T> {
 	// Bind inputs to this; read it like any signal.
 	local: SignalCell<T>,
 	state: SignalCell<DraftState>,
@@ -1267,7 +1267,7 @@ struct Draft<T> {
 /// The parameter is `async`-typed so an rpc-calling closure flows in legally
 /// (J2's channel) — a sync commit passes fine too (awaiting a plain value
 /// just resolves).
-fun draft<T: PartialEq>(initial: T, commit: async |T| Option<str>): Draft<T> {
+export fun draft<T: PartialEq>(initial: T, commit: async |T| Option<str>): Draft<T> {
 	Draft {
 		local = SignalCell::new(initial),
 		state = SignalCell::new(DraftState::Synced),
@@ -1279,7 +1279,7 @@ fun draft<T: PartialEq>(initial: T, commit: async |T| Option<str>): Draft<T> {
 	}
 }
 
-impl Draft<type T: PartialEq> {
+export impl Draft<type T: PartialEq> {
 	/// Set locally and commit — the per-keystroke path. LOCAL-FIRST: the
 	/// commit is spawned, never awaited, so `push` (and the input handler
 	/// calling it) returns without riding the wire.
@@ -1469,7 +1469,7 @@ impl Draft<type T: PartialEq> {
 // this cell exists for. The rollback is the recovery; the user re-issues.
 
 /// Where a write made through an `Optimistic` cell stands. Bind it.
-[derive(PartialEq, Debug)]
+export [derive(PartialEq, Debug)]
 enum WriteState {
 	// Nothing in flight; the cell's value is the last confirmed truth.
 	Confirmed,
@@ -1485,7 +1485,7 @@ enum WriteState {
 // naming the signal's type, and `S` is that name. A33's write-back class is
 // what makes it worth the arity — a clamped or persisted cell of the user's
 // own is now wrappable, where before only `SignalCell` was.
-struct Optimistic<T, S: Signal<T>> {
+export struct Optimistic<T, S: Signal<T>> {
 	// The signal being written — the one handed to `over`. Bind it.
 	value: S,
 	// The lifecycle, for the UI.
@@ -1500,7 +1500,7 @@ struct Optimistic<T, S: Signal<T>> {
 	confirmed_generation: Shared<i32>,
 }
 
-impl Optimistic<type T, type S: Signal<T>> {
+export impl Optimistic<type T, type S: Signal<T>> {
 	/// Wrap `signal` in an optimistic-write cell, seeded with its current
 	/// value as the confirmed truth — the value the cell is handed is, by
 	/// definition, the last thing anyone confirmed.

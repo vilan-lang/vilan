@@ -18,6 +18,8 @@ import pkg::fetch::post;
 import pkg::option::Option::{ self, None, Some };
 import pkg::process::env;
 
+export *;
+
 /// Whether this process is the child of a `vilan run --watch` session — the dev
 /// loop (`dev-refresh.md` §5, item 2).
 ///

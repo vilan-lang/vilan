@@ -30,23 +30,23 @@ import pkg::dom::Window;
 import pkg::option::Option::{ self, None, Some };
 
 /// `localStorage.getItem(key)` — "" when absent.
-[extern("__local_get")]
+export [extern("__local_get")]
 external fun get(key: str): str;
 
-[extern("localStorage.setItem")]
+export [extern("localStorage.setItem")]
 external fun set(key: str, value: str): void;
 
-[extern("localStorage.removeItem")]
+export [extern("localStorage.removeItem")]
 external fun remove(key: str): void;
 
 /// The tab-scoped variant (cleared when the tab closes).
-[extern("__session_get")]
+export [extern("__session_get")]
 external fun session_get(key: str): str;
 
-[extern("sessionStorage.setItem")]
+export [extern("sessionStorage.setItem")]
 external fun session_set(key: str, value: str): void;
 
-[extern("sessionStorage.removeItem")]
+export [extern("sessionStorage.removeItem")]
 external fun session_remove(key: str): void;
 
 // --- The handle ---------------------------------------------------------------
@@ -59,7 +59,7 @@ external fun session_remove(key: str): void;
 /// snapshot of it, so copying it (binding it, passing it, keeping it in a field)
 /// shares the store rather than the strings in it. Reads see whatever was last
 /// written, from anywhere, including another tab.
-external struct Storage;
+export external struct Storage;
 
 // The two reader verbs sit on `Window` rather than being free functions,
 // because that is where the host puts them and where kolt reached for them —
@@ -68,7 +68,7 @@ external struct Storage;
 // It does mean a call site imports BOTH: `std::dom`'s `window` for the handle
 // and `std::storage` for this impl, since an impl is in scope only where its
 // module is.
-impl Window {
+export impl Window {
 	/// `window.localStorage` — the origin-scoped store that outlives the tab.
 	[extern(get, "localStorage")]
 	external fun local_storage(self): Storage;
@@ -79,7 +79,7 @@ impl Window {
 	external fun session_storage(self): Storage;
 }
 
-impl Storage {
+export impl Storage {
 	/// How many keys the store holds (`storage.length`).
 	[extern(get, "length")]
 	external fun len(self): i32;

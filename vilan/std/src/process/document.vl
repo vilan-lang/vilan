@@ -52,7 +52,7 @@ let default_mount: str = "app";
 ///
 /// The payload is always the thing the fault is ABOUT — the file the build
 /// emitted, or the url the document named — so a report can quote it back.
-enum ShellFault {
+export enum ShellFault {
 	/// The build emitted styles and the document links no stylesheet (F1) — the
 	/// owner's own bug, and the reason this module exists. The payload is the
 	/// sidecar the build wrote.
@@ -78,7 +78,7 @@ enum ShellFault {
 	ModuleScriptWithChunks(str),
 }
 
-impl ShellFault {
+export impl ShellFault {
 	/// One line: what is wrong, and what to do about it.
 	///
 	/// The document's own name is deliberately not in here — a fault is about
@@ -112,7 +112,7 @@ impl ShellFault {
 /// outside the namespace and outside this check's knowledge — it says nothing
 /// about it, which is the only honest answer and the one that keeps a refusal
 /// to boot sound.
-fun check_shell(shell: str, build: LegBuild, mount: str): Result<void, List<ShellFault>> {
+export fun check_shell(shell: str, build: LegBuild, mount: str): Result<void, List<ShellFault>> {
 	mut stylesheets: List<str> = [];
 	mut scripts: List<Tag> = [];
 	mut mounted = false;
@@ -196,7 +196,7 @@ fun check_shell(shell: str, build: LegBuild, mount: str): Result<void, List<Shel
 /// not a reactive tree, nothing binds to it, and it is serialized once per
 /// request — while a `View`-shaped document would reopen `ssr.md` §6(a)'s
 /// ratified fragment-only process layer for no gain.
-struct Document {
+export struct Document {
 	/// The build this document loads: every generated tag is derived from it,
 	/// and a supplied shell was checked against it.
 	build: LegBuild,
@@ -232,7 +232,7 @@ struct Document {
 	splice: i32,
 }
 
-impl Document {
+export impl Document {
 	/// The default document for a build: doctype, `<html lang>`, charset,
 	/// viewport, `<title>`, the stylesheet link IF AND ONLY IF the build
 	/// emitted styles, the mount element, and the bundle's script tag in the
@@ -575,7 +575,7 @@ fun joined_hatch(existing: str, markup: str): str {
 /// `text` with each insertion's markup spliced in at its index. The indices
 /// are into the ORIGINAL text; insertions apply in ascending index order, and
 /// two at the same index keep their list order.
-fun spliced(text: str, insertions: List<(i32, str)>): str {
+export fun spliced(text: str, insertions: List<(i32, str)>): str {
 	// A stable sort by index — at most three insertions ever arrive, so the
 	// quadratic count is fine and the clarity is not.
 	mut ordered: List<(i32, str)> = [];
@@ -610,7 +610,7 @@ fun spliced(text: str, insertions: List<(i32, str)>): str {
 /// void `main` has no residual to carry. The better one is the message — a
 /// `ShellFault` is about markup and cannot know where the markup came from,
 /// while the founding bug's report wants to say `src/app.html` first.
-fun require_shell(path: str, build: LegBuild): Document {
+export fun require_shell(path: str, build: LegBuild): Document {
 	match Document::from_shell(fs::read_file_to_str(path), build) {
 		Ok(let document) => {
 			// The document knows where its markup came from, so the composed
@@ -640,7 +640,7 @@ fun fault_report(source: str, build: LegBuild, faults: List<ShellFault>): str {
 // --- Reading the markup ---------------------------------------------------
 
 /// One tag, as the scanner found it — opening or closing.
-struct Tag {
+export struct Tag {
 	/// The tag name, lowercased — `link`, `script`, `div`. A closing tag's
 	/// name has its `/` stripped: `</head>` scans as `head` with `closing`
 	/// set.
@@ -662,7 +662,7 @@ struct Tag {
 /// The value of `tag`'s `name` attribute, or `""` when it carries none. A bare
 /// attribute (`<script defer>`) has the empty value too — no check here
 /// distinguishes the two, and none should have to.
-fun attribute(tag: Tag, name: str): str {
+export fun attribute(tag: Tag, name: str): str {
 	for entry in tag.attributes {
 		let (attribute_name, value) = entry;
 		if attribute_name == name {
@@ -702,7 +702,7 @@ fun is_local(url: str): bool {
 /// element of a `split("/")`, which differs on a trailing separator —
 /// `"/assets/"` was `""` and is now `"assets"` — the answer a directory URL
 /// deserves either way, since neither can name a file this build emitted.
-fun file_name_of(url: str): str {
+export fun file_name_of(url: str): str {
 	path::basename(url.split("?")[0].split("#")[0])
 }
 
@@ -807,7 +807,7 @@ fun tags_of(markup: str): List<Tag> {
 /// A found index plus `offset`, or `fallback` when the search came up empty —
 /// the "skip past this delimiter, or give up on the rest of the document" step
 /// the scanner takes four times.
-fun past(found: Option<i32>, offset: i32, fallback: i32): i32 {
+export fun past(found: Option<i32>, offset: i32, fallback: i32): i32 {
 	match found {
 		Some(let at) => at + offset,
 		None => fallback,

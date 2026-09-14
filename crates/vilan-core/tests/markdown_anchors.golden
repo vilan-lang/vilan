@@ -272,6 +272,7 @@ spec/names.md h2 44-scopes-and-shadowing
 spec/names.md h2 45-type-position-vs-value-position
 spec/names.md h2 46-statics-and-members
 spec/names.md h2 47-the-prelude
+spec/names.md h2 48-visibility
 spec/platform.md h1 spec-11--the-platform-model--manifests
 spec/platform.md h2 111-layers
 spec/platform.md h2 112-coloring-and-the-reachability-check
@@ -521,6 +522,7 @@ tour/platforms.md h2 assets
 tour/projects.md h1 projects-and-dependencies
 tour/projects.md h2 git-dependencies
 tour/projects.md h2 the-prelude-key
+tour/projects.md h2 what-a-module-exports
 tour/projects.md h2 reserved-names
 tour/projects.md h2 pre-build-commands-and-default-entry
 tour/projects.md h2 workspaces

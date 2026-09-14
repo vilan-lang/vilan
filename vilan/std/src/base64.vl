@@ -6,13 +6,13 @@ import pkg::bytes::Bytes;
 import pkg::option::Option::{ self, None, Some };
 import pkg::range::Range;
 
-let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+export let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 fun char_at(value: i32): str {
 	alphabet.substring(value, value + 1)
 }
 
-fun encode_url(bytes: Bytes): str {
+export fun encode_url(bytes: Bytes): str {
 	let total = bytes.len();
 	mut out = "";
 	for group in Range::new(0, total / 3) {
@@ -60,7 +60,7 @@ fun digit(code: u32): i32 {
 	0 - 1
 }
 
-fun decode_url(text: str): Option<Bytes> {
+export fun decode_url(text: str): Option<Bytes> {
 	let length = text.len();
 	let rest = length % 4;
 	if rest == 1 {

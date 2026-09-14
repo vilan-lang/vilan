@@ -7,6 +7,8 @@
 import pkg::hash::{ Hash, Hashable };
 import pkg::native_map::NativeMap;
 
+export *;
+
 struct Set<T: Hashable> {
 	table: NativeMap<T>,
 }

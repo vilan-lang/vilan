@@ -8,29 +8,29 @@ external fun range_u32(low: u32, high: u32): u32;
 external fun range_f64(low: f64, high: f64): f64;
 
 /// A type that can produce a uniformly random value within an inclusive range.
-trait Random {
+export trait Random {
 	fun range(low: Self, high: Self): Self;
 }
 
-impl i32 with Random {
+export impl i32 with Random {
 	fun range(low: i32, high: i32): i32 {
 		range_i32(low, high)
 	}
 }
 
-impl u32 with Random {
+export impl u32 with Random {
 	fun range(low: u32, high: u32): u32 {
 		range_u32(low, high)
 	}
 }
 
-impl f64 with Random {
+export impl f64 with Random {
 	fun range(low: f64, high: f64): f64 {
 		range_f64(low, high)
 	}
 }
 
 /// A uniformly random value in the inclusive range `[low, high]`.
-fun range<T: Random>(low: T, high: T): T {
+export fun range<T: Random>(low: T, high: T): T {
 	T::range(low, high)
 }

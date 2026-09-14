@@ -1,3 +1,5 @@
+export *;
+
 trait Into<T> {
 	fun into(self): T;
 }

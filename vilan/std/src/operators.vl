@@ -1,5 +1,7 @@
 import pkg::io::panic;
 
+export *;
+
 // === `!` — assert-or-return (proposal/try-and-lift.md) ======================
 
 /// The split a `Try` implementation reports: the value is either good (yielding

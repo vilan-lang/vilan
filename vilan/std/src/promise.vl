@@ -1,3 +1,5 @@
+export *;
+
 /// `std::promise` — `Promise<T>`, the value produced by an `async` expression
 /// and consumed by `await`. It is an opaque handle to a native JS promise; the
 /// compiler types `async e` as `Promise<T>` (T the type of `e`) and `await p` as

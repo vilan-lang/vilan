@@ -9,9 +9,9 @@ import pkg::option::Option;
 /// An opaque canonical key. Its runtime form IS its key — a primitive as-is, an
 /// aggregate as its JSON string — so it keys a native `Map`/`Set` by value. A
 /// `Hash` is itself `Hashable` (a hash is already a canonical key).
-external struct Hash;
+export external struct Hash;
 
-trait Hashable {
+export trait Hashable {
 	fun hash(self): Hash;
 }
 
@@ -19,7 +19,7 @@ trait Hashable {
 /// (JS keys those by value), an aggregate canonicalizes to its JSON string. A
 /// hand-written `impl Hashable` may instead hash by a subset of fields — its
 /// obligation is consistency with the equality the key is used under.
-external fun canonical_hash(value: any): Hash;
+export external fun canonical_hash(value: any): Hash;
 
 /// Native `===` on the two canonical keys — the comparison `Hash`'s `PartialEq`
 /// is. `Hash` is opaque by design (§5 keeps the representation the swap seam),
@@ -27,7 +27,7 @@ external fun canonical_hash(value: any): Hash;
 /// spell the comparison in vilan without dispatching back into itself.
 external fun hashes_equal(a: Hash, b: Hash): bool;
 
-impl Hash with Hashable {
+export impl Hash with Hashable {
 	fun hash(self): Hash {
 		self
 	}
@@ -38,79 +38,79 @@ impl Hash with Hashable {
 /// comparison is native `===`. This is what lets a caller compare two hashes,
 /// and what makes `Hash` satisfy a `T: PartialEq` bound — including the
 /// conditional impls, so `Option<Hash>` and `List<Hash>` compare too.
-impl Hash with PartialEq {
+export impl Hash with PartialEq {
 	fun eq(self, b: Hash): bool {
 		hashes_equal(self, b)
 	}
 }
 
-impl str with Hashable {
+export impl str with Hashable {
 	fun hash(self): Hash {
 		canonical_hash(self)
 	}
 }
 
-impl bool with Hashable {
+export impl bool with Hashable {
 	fun hash(self): Hash {
 		canonical_hash(self)
 	}
 }
 
-impl i8 with Hashable {
+export impl i8 with Hashable {
 	fun hash(self): Hash {
 		canonical_hash(self)
 	}
 }
 
-impl u8 with Hashable {
+export impl u8 with Hashable {
 	fun hash(self): Hash {
 		canonical_hash(self)
 	}
 }
 
-impl i16 with Hashable {
+export impl i16 with Hashable {
 	fun hash(self): Hash {
 		canonical_hash(self)
 	}
 }
 
-impl u16 with Hashable {
+export impl u16 with Hashable {
 	fun hash(self): Hash {
 		canonical_hash(self)
 	}
 }
 
-impl i32 with Hashable {
+export impl i32 with Hashable {
 	fun hash(self): Hash {
 		canonical_hash(self)
 	}
 }
 
-impl u32 with Hashable {
+export impl u32 with Hashable {
 	fun hash(self): Hash {
 		canonical_hash(self)
 	}
 }
 
-impl i53 with Hashable {
+export impl i53 with Hashable {
 	fun hash(self): Hash {
 		canonical_hash(self)
 	}
 }
 
-impl u53 with Hashable {
+export impl u53 with Hashable {
 	fun hash(self): Hash {
 		canonical_hash(self)
 	}
 }
 
-impl f32 with Hashable {
+export impl f32 with Hashable {
 	fun hash(self): Hash {
 		canonical_hash(self)
 	}
 }
 
-impl f64 with Hashable {
+export impl f64 with Hashable {
 	fun hash(self): Hash {
 		canonical_hash(self)
 	}
@@ -118,13 +118,13 @@ impl f64 with Hashable {
 
 // A `List`/`Option` of `Hashable` is itself `Hashable` (used directly as a key,
 // e.g. `Map<List<i32>, V>`): the canonical hash of the whole aggregate.
-impl Option<type T: Hashable> with Hashable {
+export impl Option<type T: Hashable> with Hashable {
 	fun hash(self): Hash {
 		canonical_hash(self)
 	}
 }
 
-impl List<type T: Hashable> with Hashable {
+export impl List<type T: Hashable> with Hashable {
 	fun hash(self): Hash {
 		canonical_hash(self)
 	}
@@ -133,7 +133,7 @@ impl List<type T: Hashable> with Hashable {
 /// The `[derive(Hashable)]` derive: a struct/enum's canonical key is the JSON
 /// string of its value (`canonical_hash`). The analyzer's all-fields-Hashable
 /// check (I1) rejects a non-Hashable field, so this stays a uniform one-liner.
-macro fun Hashable(item: Item): Source {
+export macro fun Hashable(item: Item): Source {
 	import macro_std::option::Option::{ self, Some, None };
 	import macro_std::build::{ impl_of, fun_of };
 

@@ -58,19 +58,19 @@ import pkg::wire::{ Codec, Delta, Deserializer, Frame, Keyed, Serializer, Wire }
 /// infrastructure path, mapped to `RpcError::Transport` by `call`
 /// (proposal/transport-robustness.md §2.4: failure is representable, never a
 /// dangling promise).
-trait Transport {
+export trait Transport {
 	fun call(self, request: Frame): Task<Result<Frame, str>>;
 }
 
 /// The in-process request/response transport: runs a handler in the same process, wrapped
 /// as a settled Task. `handler` is a protocol's frame handler (an `RpcProtocol`).
-struct LocalTransport {
+export struct LocalTransport {
 	/// The protocol's frame handler; calls through it await (J2's typed
 	/// channel, directly on the field).
 	handler: async |Frame| Frame,
 }
 
-impl LocalTransport with Transport {
+export impl LocalTransport with Transport {
 	fun call(self, request: Frame): Task<Result<Frame, str>> {
 		async {
 			Ok((self.handler)(request))
@@ -88,11 +88,11 @@ impl LocalTransport with Transport {
 /// where the string comes from — hardcoded, env, config — is the app's choice.
 /// The server side is a mounted `Service`'s `{mount}rpc` route
 /// (`std::rpc_server`, installed with `ServerBuilder::with_service`).
-struct HttpTransport {
+export struct HttpTransport {
 	url: str,
 }
 
-impl HttpTransport with Transport {
+export impl HttpTransport with Transport {
 	/// The reply is read in the request's format — both sides run one codec
 	/// (deployment-wide, Q6), so the kinds always match. (An unreachable host
 	/// still surfaces as the host fetch's rejection — HTTP-level robustness is
@@ -118,7 +118,7 @@ impl HttpTransport with Transport {
 /// A dumb, bidirectional frame pipe: either end may `send` at any time, so the server can
 /// push unprompted (§5). This is the shape the reactive protocol needs. Frames carry either
 /// format (§6.2) — a text-only transport (`SplitDuplex`) rejects binary loudly.
-trait DuplexTransport {
+export trait DuplexTransport {
 	fun send(self, frame: Frame);
 	fun on_frame(self, handler: |Frame| void);
 }
@@ -126,12 +126,12 @@ trait DuplexTransport {
 /// The in-process duplex end: a settable inbound-handler slot (`me`) and the peer's slot
 /// (`peer`) that our `send` fires into. Two cross-linked ends (`duplex_pair`) form one
 /// connection. `Shared` makes each slot one cell shared by both ends.
-struct DuplexEnd {
+export struct DuplexEnd {
 	peer: Shared<Option<|Frame| void>>,
 	me: Shared<Option<|Frame| void>>,
 }
 
-impl DuplexEnd with DuplexTransport {
+export impl DuplexEnd with DuplexTransport {
 	fun send(self, frame: Frame) {
 		match self.peer.read() {
 			Some(let handler) => handler(frame),
@@ -144,7 +144,7 @@ impl DuplexEnd with DuplexTransport {
 	}
 }
 
-impl DuplexEnd {
+export impl DuplexEnd {
 	/// Forget the inbound handler — `on_frame`'s missing teardown half
 	/// (`proposal/lifetimes.md` §5, V5 / backlog A29).
 	///
@@ -162,7 +162,7 @@ impl DuplexEnd {
 }
 
 /// Create two connected duplex ends: whatever one sends arrives at the other's handler.
-fun duplex_pair(): (DuplexEnd, DuplexEnd) {
+export fun duplex_pair(): (DuplexEnd, DuplexEnd) {
 	let slot_a: Shared<Option<|Frame| void>> = Shared::new(None);
 	let slot_b: Shared<Option<|Frame| void>> = Shared::new(None);
 	let a = DuplexEnd { peer = slot_b, me = slot_a };
@@ -174,7 +174,7 @@ fun duplex_pair(): (DuplexEnd, DuplexEnd) {
 /// ways. The reactive runtime (`ReactiveServer`/`ReactiveClient`) holds a concrete
 /// `DuplexEnd`, so this is how it rides a real wire (`SplitDuplex`, a future
 /// WebSocket) unchanged: hand it `bridge(wire)`.
-fun bridge<Tx: DuplexTransport>(wire: Tx): DuplexEnd {
+export fun bridge<Tx: DuplexTransport>(wire: Tx): DuplexEnd {
 	let (inner, outer) = duplex_pair();
 	outer.on_frame(|frame| wire.send(frame));
 	wire.on_frame(|frame| outer.send(frame));
@@ -188,7 +188,7 @@ fun bridge<Tx: DuplexTransport>(wire: Tx): DuplexEnd {
 /// and client→server frames POST to `{base}/send?c=<connection>`. The server side
 /// is a mounted `Service` (`std::rpc_server`); open one with `connect_split(base_url)`.
 /// A true WebSocket transport becomes a drop-in sibling once it lands.
-struct SplitDuplex {
+export struct SplitDuplex {
 	// The connection id the server announced — apps use it to correlate this
 	// duplex connection with RPC calls (e.g. an `attach(connection)` method).
 	connection: i32,
@@ -199,7 +199,7 @@ struct SplitDuplex {
 	early: Shared<List<Frame>>,
 }
 
-impl SplitDuplex with DuplexTransport {
+export impl SplitDuplex with DuplexTransport {
 	/// Fire-and-forget POST. Ordering across rapid sends is not guaranteed
 	/// (separate requests); the reactive protocol's client→server traffic
 	/// (subscribe/unsubscribe) is insensitive to it.
@@ -251,7 +251,7 @@ fun drain_sse(buffer: str, dispatch: |str| void): str {
 /// waits for the server's connection announcement (`__conn:<id>`, the stream's
 /// first event), then keeps pumping inbound events to the transport's handler in
 /// the background for the connection's lifetime.
-fun connect_split(base_url: str): SplitDuplex {
+export fun connect_split(base_url: str): SplitDuplex {
 	let response = get(i"{base_url}/events").send();
 	let reader = response.body_stream().reader();
 	let decoder = new_text_decoder();
@@ -321,7 +321,7 @@ fun parse_announced(text: str): i32 {
 
 /// The host `WebSocket` class — browser, node (22+), deno, and bun all provide
 /// it globally, framing included; only the SERVER half needs `std::ws`.
-external struct WebSocket;
+export external struct WebSocket;
 
 [extern(new, "WebSocket")]
 external fun new_web_socket(url: str, protocols: List<str>): WebSocket;
@@ -329,7 +329,7 @@ external fun new_web_socket(url: str, protocols: List<str>): WebSocket;
 /// The subprotocol a vilan rpc server selects and echoes on the 101 (RFC 6455
 /// §4.2.2). Named here because both halves need the same string: the client
 /// offers it, the server picks it out of what was offered.
-fun rpc_subprotocol(): str {
+export fun rpc_subprotocol(): str {
 	"vilan-rpc"
 }
 
@@ -342,7 +342,7 @@ fun rpc_subprotocol(): str {
 /// A subprotocol is a token, not a header value: it may not contain a comma,
 /// a space, or a separator, which every JWT already satisfies. A credential
 /// that does not is the app's to encode (base64url) on both sides.
-fun rpc_protocols(credential: str): List<str> {
+export fun rpc_protocols(credential: str): List<str> {
 	[rpc_subprotocol(), "token." + credential]
 }
 
@@ -352,7 +352,7 @@ fun rpc_protocols(credential: str): List<str> {
 // runtime helper (a `typeof` check, safe in any build); `hmr_register_teardown`
 // is a shim global, only ever reached behind the `hmr_active()` guard — inert
 // (and never referenced at runtime) without a dev shim.
-[extern("__hmr_active")]
+export [extern("__hmr_active")]
 external fun hmr_active(): bool;
 
 [extern("__hmr_register_teardown", retains)]
@@ -380,7 +380,7 @@ impl SocketMessage {
 [extern("Object.prototype.toString.call")]
 external fun host_kind(value: JsonValue): str;
 
-impl WebSocket {
+export impl WebSocket {
 	[extern(method, "send")]
 	external fun transmit(self, data: str);
 
@@ -416,7 +416,7 @@ external fun dial_promise(executor: |(|bool| void)| void): Promise<bool>;
 /// Railway's `isReady`, typed (proposal/transport-robustness.md §2.1).
 /// `Closed` is terminal: the retry budget ran out (or the server's contract
 /// drifted); the app decides what a fresh start looks like.
-[derive(PartialEq, Debug)]
+export [derive(PartialEq, Debug)]
 enum ConnectionState {
 	Connected,
 	Reconnecting,
@@ -427,7 +427,7 @@ enum ConnectionState {
 /// resolver its reply completes — with `Err` for a connection lost while the
 /// call was in flight (proposal/transport-robustness.md §2.4: rejected, never
 /// dangling).
-struct PendingCall {
+export struct PendingCall {
 	request: i32,
 	complete: |Result<Frame, str>| void,
 }
@@ -436,13 +436,13 @@ struct PendingCall {
 /// message is `0x64` ('d') + a duplex frame, or `0x72` ('r') + a 4-byte LE
 /// request id + an RPC frame — the byte mirror of the `d:`/`r:<id>:` text
 /// prefixes, shared verbatim with the service upgrade path (`std::rpc_server`).
-fun tag_duplex_bytes(payload: Bytes): Bytes {
+export fun tag_duplex_bytes(payload: Bytes): Bytes {
 	let tag = Bytes::alloc(1);
 	tag.set(0, 0x64);
 	Bytes::concat(tag, payload)
 }
 
-fun tag_rpc_bytes(request: i32, payload: Bytes): Bytes {
+export fun tag_rpc_bytes(request: i32, payload: Bytes): Bytes {
 	let header = Bytes::alloc(5);
 	header.set(0, 0x72);
 	header.set(1, request);
@@ -461,7 +461,7 @@ fun tag_rpc_bytes(request: i32, payload: Bytes): Bytes {
 /// DIFFERENT frame shape, and adding correlation later would then have to move
 /// every byte of every existing recording. Four zero bytes now is the price of
 /// v2 being a change to the handler and not to the format.
-fun tag_client_bytes(request: i32, payload: Bytes): Bytes {
+export fun tag_client_bytes(request: i32, payload: Bytes): Bytes {
 	let header = Bytes::alloc(5);
 	header.set(0, 0x73);
 	header.set(1, request);
@@ -483,7 +483,7 @@ fun tag_client_bytes(request: i32, payload: Bytes): Bytes {
 /// §2.2): everything downstream — `bridge`, `ReactiveClient`, `SocketTransport`,
 /// a generated client — holds this same value across reconnects, and the
 /// reconnect loop swaps the `Shared` cells inside it.
-struct SocketDuplex {
+export struct SocketDuplex {
 	socket: Shared<WebSocket>,
 	// The address to redial.
 	url: str,
@@ -527,7 +527,7 @@ struct SocketDuplex {
 	on_terminal: Shared<List<|| void>>,
 }
 
-impl SocketDuplex with DuplexTransport {
+export impl SocketDuplex with DuplexTransport {
 	/// While not connected, control frames DROP: a `Subscribe` is re-sent by
 	/// the reconnect's rebind, and RPC frames never reach here (fail-fast in
 	/// `SocketTransport.call`).
@@ -551,7 +551,7 @@ impl SocketDuplex with DuplexTransport {
 	}
 }
 
-impl SocketDuplex {
+export impl SocketDuplex {
 	/// The RPC half of the multiplex: a `Transport` over this same socket, so
 	/// calls ride the open connection instead of HTTP requests beside it.
 	fun transport(self): SocketTransport {
@@ -640,11 +640,11 @@ external fun reply_promise(executor: |(|Result<Frame, str>| void)| void): Promis
 /// — and resolves when the reply with the same id lands. Not connected =
 /// fail fast (Railway's rule, typed): the caller gets
 /// `Err(RpcError::Transport("not connected"))` immediately.
-struct SocketTransport {
+export struct SocketTransport {
 	duplex: SocketDuplex,
 }
 
-impl SocketTransport with Transport {
+export impl SocketTransport with Transport {
 	fun call(self, request: Frame): Task<Result<Frame, str>> {
 		async {
 			if self.duplex.state.get() == ConnectionState::Connected {
@@ -668,7 +668,7 @@ impl SocketTransport with Transport {
 	}
 }
 
-impl SocketTransport {
+export impl SocketTransport {
 	/// The duplex's lifecycle, for the UI — bind it ("reconnecting…") or gate
 	/// optimistic writes on it.
 	fun connection_state(self): SignalCell<ConnectionState> {
@@ -785,7 +785,7 @@ fun reject_announcement_prefix(): str {
 /// the browser's `WebSocket` exposes strictly less. So the discrimination
 /// cannot be read off the failure; it has to be SENT, and the server sends it
 /// as one frame on an upgraded socket it then closes.
-[derive(PartialEq, Debug)]
+export [derive(PartialEq, Debug)]
 enum DialFailure {
 	/// The socket never opened, or opened and said nothing: an unreachable
 	/// server, a network error, a non-101 the host will not describe.
@@ -798,7 +798,7 @@ enum DialFailure {
 	Refused(str),
 }
 
-impl DialFailure {
+export impl DialFailure {
 	/// The human sentence — what `connect_socket`'s `Err(str)` carries, so the
 	/// untyped entry point keeps the shape it documented.
 	fun message(self): str {
@@ -816,7 +816,7 @@ impl DialFailure {
 /// socket closes or errors first (an unreachable server) — or when the server
 /// upgrades this client only to refuse it in one `__reject:<status>` frame
 /// (A47), which is the one failure worth telling apart from the rest.
-fun dial(
+export fun dial(
 	url: str,
 	protocols: List<str>,
 	settle: |i32, Frame| void,
@@ -1001,7 +1001,7 @@ fun handle_drop(duplex: SocketDuplex) {
 /// only if the caller writes it. A server that speaks something else selects
 /// the client's first non-credential offer, which is what makes an explicit
 /// list the right seam for a non-vilan peer.
-fun connect_socket(url: str): Result<SocketDuplex, str> {
+export fun connect_socket(url: str): Result<SocketDuplex, str> {
 	connect_socket_with(url, [rpc_subprotocol()])
 }
 
@@ -1009,7 +1009,7 @@ fun connect_socket(url: str): Result<SocketDuplex, str> {
 /// credential rides on, since a browser handshake carries no headers.
 /// `std::rpc::rpc_protocols(token)` writes the documented offer. The same list
 /// is re-presented on every reconnect.
-fun connect_socket_with(url: str, protocols: List<str>): Result<SocketDuplex, str> {
+export fun connect_socket_with(url: str, protocols: List<str>): Result<SocketDuplex, str> {
 	dial_socket(url, protocols).map_err(|failure: DialFailure| failure.message())
 }
 
@@ -1018,7 +1018,7 @@ fun connect_socket_with(url: str, protocols: List<str>): Result<SocketDuplex, st
 /// is the one that can tell a refusal from an unreachable server.
 /// `connect_socket`/`connect_socket_with` keep their `Err(str)` and are this
 /// with the failure flattened to its sentence.
-fun dial_socket(url: str, protocols: List<str>): Result<SocketDuplex, DialFailure> {
+export fun dial_socket(url: str, protocols: List<str>): Result<SocketDuplex, DialFailure> {
 	let inbound: Shared<Option<|Frame| void>> = Shared::new(None);
 	let early: Shared<List<Frame>> = Shared::new([]);
 	let pending: Shared<List<PendingCall>> = Shared::new([]);
@@ -1083,7 +1083,7 @@ fun dial_socket(url: str, protocols: List<str>): Result<SocketDuplex, DialFailur
 /// pulls the NEXT argument — arguments are read in declaration order, exactly
 /// once (the schema-ordered binary format requires it; generated handlers obey
 /// by construction, hand-written ones by contract — proposal §4.1).
-struct RpcRequest {
+export struct RpcRequest {
 	method: str,
 	deserializer: Deserializer,
 	arity: i32,
@@ -1098,7 +1098,7 @@ struct RpcRequest {
 	connection: i32,
 }
 
-impl RpcRequest {
+export impl RpcRequest {
 	/// The same request, tagged with the connection it arrived on. What
 	/// `RpcProtocol::respond` stamps before dispatching; `open_request` alone
 	/// cannot know, because a frame carries no connection.
@@ -1110,7 +1110,7 @@ impl RpcRequest {
 
 /// What a handler returns: a result that describes itself into the reply
 /// envelope (single-pass — no intermediate encoding), or a failure.
-enum RpcOutcome {
+export enum RpcOutcome {
 	Success(|Serializer| void),
 	Failure(RpcError),
 }
@@ -1131,7 +1131,7 @@ enum RpcOutcome {
 /// `RpcError::to_json()` is a shipped surface — `vilan/benchmarks`' rpc legs
 /// print a failed call with it, and a `Result<T, RpcError>` is the value every
 /// generated stub answers — so the derive says so.
-[derive(Wire, Json, Debug, PartialEq)]
+export [derive(Wire, Json, Debug, PartialEq)]
 enum RpcError {
 	Transport(str),
 	Decode(str),
@@ -1154,7 +1154,7 @@ enum RpcError {
 /// One request envelope, written in a single pass: the method, then each
 /// argument described straight into the same serializer. On the JSON codec the
 /// args are plain values (`{"method":"add","args":[1]}` — no escaping).
-fun encode_request(codec: Codec, method: str, args: List<|Serializer| void>): Frame {
+export fun encode_request(codec: Codec, method: str, args: List<|Serializer| void>): Frame {
 	let (serializer, finish) = (codec.writer)();
 	(serializer.begin_struct)(2);
 	(serializer.field)("method");
@@ -1172,7 +1172,7 @@ fun encode_request(codec: Codec, method: str, args: List<|Serializer| void>): Fr
 /// Open a request frame into the handle handlers consume. A corrupt frame
 /// leaves the deserializer poisoned; the protocol turns that into a `Decode`
 /// failure before routing.
-fun open_request(codec: Codec, frame: Frame): RpcRequest {
+export fun open_request(codec: Codec, frame: Frame): RpcRequest {
 	let deserializer = (codec.reader)(frame);
 	(deserializer.begin_struct)();
 	(deserializer.field)("method");
@@ -1184,7 +1184,7 @@ fun open_request(codec: Codec, frame: Frame): RpcRequest {
 
 /// One reply envelope: an externally-tagged `Success` carrying the described
 /// result, or `Failure` carrying the `RpcError`.
-fun encode_reply(codec: Codec, outcome: RpcOutcome): Frame {
+export fun encode_reply(codec: Codec, outcome: RpcOutcome): Frame {
 	let (serializer, finish) = (codec.writer)();
 	match outcome {
 		RpcOutcome::Success(let describe) => {
@@ -1208,7 +1208,7 @@ fun encode_reply(codec: Codec, outcome: RpcOutcome): Frame {
 /// replies — an unknown method or a corrupt frame is a `Failure` envelope, not
 /// silence. `[service(Client)]` generation emits the dispatch routing;
 /// `Dispatcher` below is the hand-written form.
-struct RpcProtocol {
+export struct RpcProtocol {
 	codec: Codec,
 	/// The request handler; an async handler's reply frame is encoded from
 	/// its settled outcome (calls through the field await — a sync one just
@@ -1227,7 +1227,7 @@ struct RpcProtocol {
 	handle_methods: List<str>,
 }
 
-impl RpcProtocol {
+export impl RpcProtocol {
 	/// The same protocol, answering for one connection — the copy
 	/// `accept_socket` makes per upgraded socket. The dispatcher is shared
 	/// (under `Service::new` one instance answers every client); only the
@@ -1255,7 +1255,7 @@ impl RpcProtocol {
 /// to the turn's flush, so a method that mutates subscribed state produces ONE
 /// coalesced `Update` per source alongside its reply, not one per write — even
 /// when the method suspends partway.
-fun local_rpc(protocol: RpcProtocol): LocalTransport {
+export fun local_rpc(protocol: RpcProtocol): LocalTransport {
 	// A78: a handle-returning method's reply is a channel id minted in the
 	// CONNECTION's capability table, and `into_protocol` stamps no connection
 	// (`for_connection` is what does). A `local_rpc` transport over an
@@ -1317,7 +1317,7 @@ fun listed_methods(methods: List<str>): str {
 /// describes itself into the envelope's serializer), await the round-trip, and
 /// decode the reply as `T` (inferred from the call site). Infrastructure
 /// failures — transport, decode, a remote error — surface as `Err(RpcError)`.
-fun call<T: Wire, Tx: Transport>(
+export fun call<T: Wire, Tx: Transport>(
 	transport: Tx,
 	codec: Codec,
 	method: str,
@@ -1356,20 +1356,20 @@ fun call<T: Wire, Tx: Transport>(
 /// position at the call site — reads are positional and once-each; see
 /// `RpcRequest`). A missing/garbled argument poisons the request's
 /// deserializer; check `decode_failed` before running the impl.
-fun arg<T: Wire>(request: RpcRequest, index: i32): T {
+export fun arg<T: Wire>(request: RpcRequest, index: i32): T {
 	T::rebuild(request.deserializer)
 }
 
 /// Whether decoding this request has failed so far — the gate between the
 /// `arg` pulls and the impl call, turning a garbled request into a clean
 /// `RpcError::Decode` instead of an impl run on zero values.
-fun decode_failed(request: RpcRequest): Option<str> {
+export fun decode_failed(request: RpcRequest): Option<str> {
 	(request.deserializer.failed)()
 }
 
 /// Capture a procedure's result as a success outcome — described into the
 /// reply envelope when the protocol encodes it.
-fun reply<T: Wire>(value: T): RpcOutcome {
+export fun reply<T: Wire>(value: T): RpcOutcome {
 	RpcOutcome::Success(|serializer: Serializer| value.describe(serializer))
 }
 
@@ -1504,7 +1504,7 @@ fun reply_source_keyed<K: Wire + Hashable, T: Wire + Keyed<K>>(
 
 /// One route: a method name and the handler that consumes the request handle
 /// and produces an outcome.
-struct Route {
+export struct Route {
 	method: str,
 	/// The method's handler; calls through the field await.
 	handler: async |RpcRequest| RpcOutcome,
@@ -1512,7 +1512,7 @@ struct Route {
 
 /// The server router: register handlers by method name, then route each request to its match
 /// (or an `unknown method` failure). `into_protocol` wraps it as an `RpcProtocol` for a transport.
-struct Dispatcher {
+export struct Dispatcher {
 	routes: Shared<List<Route>>,
 	/// The `[rpc]` methods whose reply is a signal HANDLE (§9.2), by name.
 	/// Recorded by `handles` at the head of the generated chain, and carried
@@ -1523,7 +1523,7 @@ struct Dispatcher {
 	handle_methods: Shared<List<str>>,
 }
 
-impl Dispatcher {
+export impl Dispatcher {
 	fun new(): Dispatcher {
 		Dispatcher { routes = Shared::new([]), handle_methods = Shared::new([]) }
 	}
@@ -1574,7 +1574,7 @@ impl Dispatcher {
 /// process-wide instance `Service::new` mounts; this trait is what lets std
 /// build a dispatcher from an instance it only learns the type of at the
 /// factory's call site.
-trait RpcService {
+export trait RpcService {
 	fun dispatcher_for(self): Dispatcher;
 }
 
@@ -1598,7 +1598,7 @@ trait RpcService {
 /// out a channel per row (A39). `None` is the whole collection — what every
 /// non-keyed channel sends, and what a keyed one sends when a client wants all
 /// of it.
-fun encode_control(codec: Codec, kind: str, channel: i32): Frame {
+export fun encode_control(codec: Codec, kind: str, channel: i32): Frame {
 	let (serializer, finish) = (codec.writer)();
 	(serializer.begin_variant)(kind, 2);
 	(serializer.i32_value)(channel);
@@ -1640,7 +1640,7 @@ fun encode_update(codec: Codec, channel: i32, describe: |Serializer| void): Fram
 /// keyed sibling (A39). An `Update` says "here is the whole value again"; a
 /// `Patch` says only what moved, which is what stops an edit inside a
 /// five-thousand-message channel from costing the channel.
-fun encode_patch(codec: Codec, channel: i32, describe_ops: |Serializer| void): Frame {
+export fun encode_patch(codec: Codec, channel: i32, describe_ops: |Serializer| void): Frame {
 	let (serializer, finish) = (codec.writer)();
 	(serializer.begin_variant)("Patch", 2);
 	(serializer.i32_value)(channel);
@@ -1660,13 +1660,13 @@ let reactive_sessions: Shared<List<(i32, ReactiveServer)>> = Shared::new([]);
 
 /// Adopt a fresh connection: one reactive session on its wire, speaking the
 /// protocol's codec (§6.2 — one codec deployment-wide, Q6).
-fun register_session(connection: i32, wire: DuplexEnd, codec: Codec) {
+export fun register_session(connection: i32, wire: DuplexEnd, codec: Codec) {
 	reactive_sessions.write().push((connection, ReactiveServer::new(wire, codec)));
 }
 
 /// The connection closed: dispose its session so signal changes stop fanning
 /// out to (or retaining) the dead wire.
-fun drop_session(connection: i32) {
+export fun drop_session(connection: i32) {
 	mut kept: List<(i32, ReactiveServer)> = [];
 	for entry in reactive_sessions.read() {
 		let (id, session) = entry;
@@ -1680,7 +1680,7 @@ fun drop_session(connection: i32) {
 }
 
 /// The live session for a connection, if it is still connected.
-fun session_of(connection: i32): Option<ReactiveServer> {
+export fun session_of(connection: i32): Option<ReactiveServer> {
 	for entry in reactive_sessions.read() {
 		let (id, session) = entry;
 		if id == connection {
@@ -1709,13 +1709,13 @@ struct ClientChannel {
 /// service that replaces `on_connect` still has one.
 let client_channels: Shared<List<(i32, ClientChannel)>> = Shared::new([]);
 
-fun register_client_channel(connection: i32, codec: Codec, send: |Frame| void) {
+export fun register_client_channel(connection: i32, codec: Codec, send: |Frame| void) {
 	client_channels.write().push((connection, ClientChannel { send, codec }));
 }
 
 /// The connection closed: forget its reverse channel, so a proxy the app kept
 /// hold of writes into nothing rather than into a dead socket.
-fun drop_client_channel(connection: i32) {
+export fun drop_client_channel(connection: i32) {
 	mut kept: List<(i32, ClientChannel)> = [];
 	for entry in client_channels.read() {
 		let (id, channel) = entry;
@@ -1745,7 +1745,7 @@ fun client_channel_of(connection: i32): Option<ClientChannel> {
 /// drops it — the same treatment a `d:` frame gets while disconnected, and the
 /// only honest one for a message whose whole contract is "if you are there,
 /// here is a fact".
-fun notify(connection: i32, method: str, args: List<|Serializer| void>) {
+export fun notify(connection: i32, method: str, args: List<|Serializer| void>) {
 	match client_channel_of(connection) {
 		Some(let channel) => (channel.send)(encode_request(channel.codec, method, args)),
 		None => {},
@@ -1760,7 +1760,7 @@ fun notify(connection: i32, method: str, args: List<|Serializer| void>) {
 /// `Connection::client()` resolves `Self` from the field's declared type, which
 /// is what makes `client = connection.client()` type without an annotation
 /// while std learns no generated name.
-trait ClientProxy {
+export trait ClientProxy {
 	fun for_connection(connection: i32): Self;
 }
 
@@ -1780,7 +1780,7 @@ fun fresh_channel(): i32 {
 /// whole-value forward `expose` mints. A KEYED channel has `resolve` too: it
 /// can read a subscribed key off an inbound frame *at its own key type* and
 /// start a forward carrying only that key's changes (A39).
-struct Capability {
+export struct Capability {
 	/// The whole-collection forward (`Subscribe(channel, None)`).
 	start: || Subscription,
 	/// Pull the subscribed key at this channel's key type and answer with its
@@ -1807,7 +1807,7 @@ struct Capability {
 	identity: i32,
 }
 
-impl Capability {
+export impl Capability {
 	/// Whether this channel carries element-grained `Patch` frames rather than
 	/// whole-value `Update`s. Read off the key resolver, which is the one
 	/// thing only a keyed exposure has — the frame shape and the ability to
@@ -1823,7 +1823,7 @@ impl Capability {
 /// A resolved per-key subscription: which key (canonically), and how to start
 /// its forward. The starter is LAZY — the `Unsubscribe` path resolves a key the
 /// same way and throws the starter away.
-struct KeySubscription {
+export struct KeySubscription {
 	key: Hash,
 	start: || Subscription,
 }
@@ -1832,7 +1832,7 @@ struct KeySubscription {
 /// collection) and the subscription that stops it. One entry per (channel,
 /// key), which is what makes `Subscribe` idempotent per key rather than per
 /// channel.
-struct LiveForward {
+export struct LiveForward {
 	channel: i32,
 	key: Option<Hash>,
 	subscription: Subscription,
@@ -1878,7 +1878,7 @@ fun same_demand(left: Option<Hash>, right: Option<Hash>): bool {
 /// forwards started by client subscriptions. A `Signal`/`Source` never crosses
 /// as a value — it is exported as an id, and its updates flow as `Update`
 /// frames (proposal §8) or, on a keyed channel, as `Patch` frames (A39).
-struct ReactiveServer {
+export struct ReactiveServer {
 	transport: DuplexEnd,
 	codec: Codec,
 	// Per channel, what a client's subscription starts. Nothing subscribes —
@@ -1887,7 +1887,7 @@ struct ReactiveServer {
 	live: Shared<List<LiveForward>>,
 }
 
-impl ReactiveServer {
+export impl ReactiveServer {
 	fun new(transport: DuplexEnd, codec: Codec): ReactiveServer {
 		let server = ReactiveServer {
 			transport,
@@ -2707,7 +2707,7 @@ fun same_sequence(before: List<Hash>, after: List<Hash>): bool {
 	true
 }
 
-impl ReactiveServer with Disposable {
+export impl ReactiveServer with Disposable {
 	/// Tear the session down: stop every live forward, then let the transport
 	/// forget us. Starters keep no subscription of their own, so clearing the
 	/// tables releases everything this session held on the app's signals — and
@@ -2735,7 +2735,7 @@ impl ReactiveServer with Disposable {
 /// the typed mirror of its subscribed channel. `source<T>` hands out a
 /// `RemoteSource<T>` — the type binds at the call site (an annotated `let`, or
 /// the generated client's mirror wiring).
-struct ReactiveClient {
+export struct ReactiveClient {
 	transport: DuplexEnd,
 	codec: Codec,
 	// Per subscribed channel: the deliverer that decodes an `Update`'s payload
@@ -2757,7 +2757,7 @@ struct ReactiveClient {
 	replays: Shared<List<|| void>>,
 }
 
-impl ReactiveClient {
+export impl ReactiveClient {
 	fun new(transport: DuplexEnd, codec: Codec): ReactiveClient {
 		let client = ReactiveClient {
 			transport,
@@ -3072,7 +3072,7 @@ impl ReactiveClient {
 	}
 }
 
-impl ReactiveClient with Disposable {
+export impl ReactiveClient with Disposable {
 	/// Tear the client half down — `ReactiveServer::dispose`'s mirror (A29).
 	/// `new` installs an inbound handler capturing the whole client, so without
 	/// this the transport holds the client, its routes and every mirror cache
@@ -3105,7 +3105,7 @@ impl ReactiveClient with Disposable {
 /// not answer a channel. Still derived from what the mirror was TOLD, so an
 /// UNWATCHED mirror reads `Waiting` forever, correctly: nothing opened its
 /// channel, and nothing has been asked on its behalf.
-[derive(PartialEq, Debug)]
+export [derive(PartialEq, Debug)]
 enum Status {
 	/// Nothing has arrived yet. This is what an unwatched mirror reads, for
 	/// as long as it stays unwatched — `status` reports, it does not ask.
@@ -3159,7 +3159,7 @@ enum Status {
 /// A `[expose]` field mirror has none: it is minted positionally by `__attach`
 /// and rebound the same way (A41), and re-issuing a call for it would be a
 /// second mechanism for a thing that already has one.
-struct Origin {
+export struct Origin {
 	/// The `[rpc]` method that minted the channel — the name `call` routes on,
 	/// kept as data because a replay is a call and a caller must be able to
 	/// see which one.
@@ -3187,7 +3187,7 @@ struct Origin {
 	reissue: async |str, List<|Serializer| void>| Result<Option<i32>, RpcError>,
 }
 
-struct RemoteSource<T> {
+export struct RemoteSource<T> {
 	// Cells, not plain fields: a reconnect rebind points the mirror at the
 	// fresh connection's channel (the id cell is SHARED with the
 	// `ReactiveClient` route, so routing moves in the same write).
@@ -3254,7 +3254,7 @@ struct RemoteSource<T> {
 /// still `or([])`, exactly as `guide/services.md` writes it. What the impl
 /// buys is everything that reads a source WITHOUT flattening it: `on_change`,
 /// `effect`, `effect_on_change`, and any generic consumer.
-impl RemoteSource<type T> with Source<Option<T>> {
+export impl RemoteSource<type T> with Source<Option<T>> {
 	/// The mirror's current value: `None` until the first update lands.
 	/// Passive — no lease, no frame; an unwatched mirror reads `None`
 	/// forever, which is correct: nothing asked.
@@ -3335,7 +3335,7 @@ impl RemoteSource<type T> with Source<Option<T>> {
 	}
 }
 
-impl RemoteSource<type T> {
+export impl RemoteSource<type T> {
 	/// `map` for the same-type case: `initial` until the first frame, the
 	/// mirrored value after. Counted and owner-released exactly like `map`,
 	/// because it IS `map` — `client.notes.or([])` inside a view replaces the
@@ -3656,7 +3656,7 @@ let keyed_log_limit: i32 = 1024;
 /// One forward's place in a `KeyedCell`'s op log: the sequence number it has
 /// been told through. Identified rather than compared, because two forwards on
 /// the same channel may legitimately sit at the same sequence.
-struct KeyedCursor {
+export struct KeyedCursor {
 	id: i32,
 	at: Shared<i32>,
 }
@@ -3689,7 +3689,7 @@ struct KeyedCursor {
 /// **`PartialEq` is not a bound**, and that is the point. `expose_keyed` needs
 /// `T: PartialEq` because a diff can only learn that an element CHANGED by
 /// comparing it; a cell whose writes are the ops never compares anything.
-struct KeyedCell<K, T> {
+export struct KeyedCell<K, T> {
 	/// The collection, and the one notification every observer rides — the
 	/// `Source<List<T>>` view and the op forwards alike. One signal, so a
 	/// forward that wakes always sees the list the ops it is about to drain
@@ -3711,7 +3711,7 @@ struct KeyedCell<K, T> {
 	cursors: Shared<List<KeyedCursor>>,
 }
 
-impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
+export impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
 	/// A cell holding `initial`. The elements are indexed once here, and the
 	/// index is maintained by the writers from then on.
 	fun new(initial: List<T>): KeyedCell<K, T> {
@@ -3921,7 +3921,7 @@ impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
 /// a cell always holds a collection, where a MIRROR may not have been told one
 /// yet. So `bind_each(cell, …)` takes it directly and the `or([])` that a
 /// `KeyedSource` needs (R5) has nothing to say here.
-impl KeyedCell<type K: Hashable, type T: Keyed<K>> with Source<List<T>> {
+export impl KeyedCell<type K: Hashable, type T: Keyed<K>> with Source<List<T>> {
 	fun get(self): List<T> {
 		self.elements.get()
 	}
@@ -3938,7 +3938,7 @@ impl KeyedCell<type K: Hashable, type T: Keyed<K>> with Source<List<T>> {
 /// and settle id, once per key. The `describe` closure is the key itself, held
 /// so the `Unsubscribe` (and a reconnect's re-`Subscribe`) can name it again at
 /// its own type.
-struct KeyLease {
+export struct KeyLease {
 	key: Hash,
 	describe: |Serializer| void,
 	count: Shared<i32>,
@@ -3964,7 +3964,7 @@ struct KeyLease {
 /// The counted-lease rule is `RemoteSource`'s, per demand rather than per
 /// channel: 0→1 sends `Subscribe`, 1→0 defers an `Unsubscribe` to the turn's
 /// settle so a re-render churns no frames.
-struct KeyedSource<K, T> {
+export struct KeyedSource<K, T> {
 	// A cell, shared with the `ReactiveClient` route, so a reconnect rebind
 	// moves routing and demand in one write.
 	channel: Shared<i32>,
@@ -4026,7 +4026,7 @@ struct KeyedSource<K, T> {
 /// sentence `RemoteSource`'s impl carries: `or([])` is the binding SAYING what
 /// an unseeded list renders as. What the impl buys is everything that reads a
 /// source without flattening it.
-impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> with Source<Option<List<T>>> {
+export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> with Source<Option<List<T>>> {
 	/// The mirror's current contents: `None` until the first patch lands.
 	/// Passive — no lease, no frame.
 	fun get(self): Option<List<T>> {
@@ -4093,7 +4093,7 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> with Source<O
 	}
 }
 
-impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
+export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	/// What is locally KNOWN about this mirror, as a `SignalCell<Status>` —
 	/// `RemoteSource::status`'s sentence, unchanged: it reports, it does not
 	/// ask.
@@ -4646,7 +4646,7 @@ fun dispose_on_close(socket: SocketDuplex, client: ReactiveClient) {
 /// has no dynamic mirrors — `ReactiveClient` is not reachable from it. This is
 /// for the hand-wired shape (`ReactiveClient::new(bridge(socket), codec)`),
 /// where it is one line beside the client's construction.
-fun invalidate_on_reconnect(socket: SocketDuplex, client: ReactiveClient) {
+export fun invalidate_on_reconnect(socket: SocketDuplex, client: ReactiveClient) {
 	socket.on_reconnect.write().push(|| client.invalidate_dynamic());
 }
 
@@ -4728,7 +4728,7 @@ fun reattach_mirrors(
 
 /// djb2 over the canonical contract surface (Q6 v2), rendered as 8 hex digits
 /// — the same fingerprint on both generated sides.
-macro fun service_hash(surface: str): str {
+export macro fun service_hash(surface: str): str {
 	mut hash = 5381u32;
 	mut index = 0;
 	let length = surface.len();
@@ -4748,7 +4748,7 @@ macro fun service_hash(surface: str): str {
 
 /// (i32 loop counter → u32 shift operand; a dedicated conversion keeps the
 /// hash all-u32. Number() is the identity on an in-range integer.)
-macro fun u32_of_nibble(value: i32): u32 {
+export macro fun u32_of_nibble(value: i32): u32 {
 	if value == 0 {
 		ret 0u32;
 	}
@@ -4773,7 +4773,7 @@ macro fun u32_of_nibble(value: i32): u32 {
 	7u32
 }
 
-macro fun nibble_char(digit: u32): str {
+export macro fun nibble_char(digit: u32): str {
 	if digit == 0u32 {
 		ret "0";
 	}
@@ -4826,7 +4826,7 @@ macro fun nibble_char(digit: u32): str {
 /// `reply_source(request, ` (§9.2) — or `notified(|| <call>)` when
 /// the method returns `void` (§9.3, R4 — a notification has no reply payload,
 /// and a `void` call is not an argument).
-macro fun route_outcome(returns_void: bool, replier: str, called: str): str {
+export macro fun route_outcome(returns_void: bool, replier: str, called: str): str {
 	if returns_void {
 		i"rpc::notified(|| {called})"
 	} else {
@@ -4847,7 +4847,7 @@ macro fun route_outcome(returns_void: bool, replier: str, called: str): str {
 /// The `__` prefix is the same reservation the generated `__attach` and
 /// `__contract` routes take: `service`'s statement builders write the identical
 /// literal, and the two halves have to agree.
-macro fun route_block(name: str, statements: List<str>): str {
+export macro fun route_block(name: str, statements: List<str>): str {
 	import macro_std::build::{ quote, indent };
 
 	// The route body runs inside a fresh per-dispatch TURN
@@ -4880,7 +4880,7 @@ macro fun route_block(name: str, statements: List<str>): str {
 /// returning some OTHER `Source` implementation is not read as a handle and
 /// falls to the ordinary `[rpc]` Wire rule, which refuses it by name — loudly,
 /// and in the return type's own vocabulary.
-macro fun handle_element(type_: TypeExpr): str {
+export macro fun handle_element(type_: TypeExpr): str {
 	import macro_std::option::Option::{ Some, None };
 
 	// A `KeyedCell<K, T>` (A79) is a handle too, and its element is the
@@ -4913,7 +4913,7 @@ macro fun handle_element(type_: TypeExpr): str {
 /// A79), or `""` for every other return — a plain handle included, which has
 /// no key. What tells the two handle kinds apart everywhere the generator has
 /// to choose between them.
-macro fun handle_key(type_: TypeExpr): str {
+export macro fun handle_key(type_: TypeExpr): str {
 	import macro_std::option::Option::{ Some, None };
 
 	if type_.name != "KeyedCell" {
@@ -4928,7 +4928,7 @@ macro fun handle_key(type_: TypeExpr): str {
 	}
 }
 
-macro fun service(item: Item): Source {
+export macro fun service(item: Item): Source {
 	import macro_std::option::Option::{ self, Some, None };
 	import macro_std::build::{ impl_of, fun_of, match_of, struct_of, quote, join, indent };
 

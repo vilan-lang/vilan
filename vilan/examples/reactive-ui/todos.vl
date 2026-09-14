@@ -11,6 +11,8 @@
 import std::display::format;
 import std::reactive::combine;
 
+export *;
+
 // `each` reconciles by key and re-renders only CHANGED rows — `Todo`
 // derives `PartialEq` so the reconciler can tell.
 [derive(PartialEq)]

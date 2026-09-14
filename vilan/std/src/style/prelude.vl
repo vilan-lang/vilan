@@ -45,6 +45,8 @@ import pkg::style::{
 	xl as xl_condition,
 };
 
+export *;
+
 // --- lengths ------------------------------------------------------------------
 
 fun rem(value: f64): Length {
