@@ -4322,17 +4322,17 @@ import std::io::print;
 // into was narrow and exact:
 //
 //   * `S: Source<List<T>>` — the bound's argument CONSTRUCTED over the caller's
-//     own `T` — resolved fine inside a generic body. That is `bind_each`, and
-//     it shipped.
+//     own `T` — resolved fine inside a generic body. That is `each`, and it
+//     shipped.
 //   * `S: Source<T>` — the bound's argument the BARE parameter — did not. The
 //     callee's `T` was inferred through the bound to the *impl's* own unbound
 //     parameter instead of to the caller's, so the callee's `T: PartialEq` was
 //     then checked against something that carries no bound and refused.
 //
-// `swap_split` calls `self.swap(gated, render)` from exactly such a body
-// (`gated: SignalCell<T>`, `T` its own parameter), so widening `swap` made std
-// itself uncompilable — with an explicit `self.swap<T, SignalCell<T>>(..)` too, the
-// bound check being downstream of the argument. The value FLOWED correctly:
+// `swap_split` passed `gated: SignalCell<T>` on from exactly such a body (`T`
+// its own parameter), so widening `swap` made std itself uncompilable — with an
+// explicit `swap<T, SignalCell<T>>(..)` too, the bound check being downstream
+// of the argument. The value FLOWED correctly:
 // dropping `T`'s bound entirely compiled and ran the same program, which placed
 // the defect in the bound CHECK rather than in inference.
 //
@@ -4379,7 +4379,7 @@ fn a_bare_parameter_source_bound_resolves_inside_a_generic_body() {
 
 /// The half that ALWAYS worked, kept beside it so the pair localizes the gap to
 /// the bare parameter rather than to `Source` bounds in general — this is
-/// `bind_each`'s shape, and the control the fix must not move.
+/// `each`'s shape, and the control the fix must not move.
 #[test]
 fn a_constructed_source_bound_resolves_inside_a_generic_body() {
     assert_compiles_and_runs(

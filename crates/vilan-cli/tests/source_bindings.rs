@@ -126,7 +126,7 @@ fn build_and_run(tag: &str, app: &str) -> String {
 fn app_source() -> String {
     format!(
         r#"import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
-import std::ui::{{ View, mount_root, view }};
+import std::ui::{{ View, each, mount_root, view, when }};
 {STORED}
 /// The harness serializes the mounted tree under this tag.
 [extern("__dump")]
@@ -147,8 +147,8 @@ fun main() {{
 		.child(view("a").bind_attr("href", href))
 		.child(view("div").style_var("--w", width))
 		.child(view("i").show(visible))
-		.child(view("ul").bind_each(items, |item| item, |item| view("li").text(item)))
-		.child(view("aside").when(present, || view("b").text("here"))));
+		.child(view("ul").child(each(items, |item| item, |item| view("li").text(item))))
+		.child(view("aside").child(when(present, || view("b").text("here")))));
 	dump("mounted");
 
 	label.set("beta");
@@ -226,7 +226,7 @@ fn a_user_source_drives_every_widened_binding_and_keeps_driving_it() {
     );
     assert!(
         !updated.contains("<li>x</li>"),
-        "`bind_each` must reconcile the removed row away; got:\n{updated}"
+        "`each` must reconcile the removed row away; got:\n{updated}"
     );
 }
 
@@ -248,7 +248,7 @@ fn a_user_source_drives_every_widened_binding_and_keeps_driving_it() {
 fn a_user_source_drives_swap_and_keeps_driving_it() {
     let app = format!(
         r#"import std::reactive::{{ Signal, SignalCell, Source, Subscription }};
-import std::ui::{{ View, mount_root, view }};
+import std::ui::{{ View, mount_root, swap, view }};
 {STORED}
 /// The harness serializes the mounted tree under this tag.
 [extern("__dump")]
@@ -258,7 +258,7 @@ fun main() {{
 	let route: Stored<str> = Stored::new("home");
 
 	let _root = mount_root("app", || view("main")
-		.swap(route, |current| view("section").text(i"page {{current}}")));
+		.child(swap(route, |current| view("section").text(i"page {{current}}"))));
 	dump("mounted");
 
 	route.set("docs");

@@ -31,7 +31,7 @@ entries: the [full-stack shape](../tour/platforms.md)); in a workspace, put it
 in a `common` library both packages depend on instead.
 
 ```vilan
-import std::ui::{ view, View, render };
+import std::ui::{ each, view, View, render };
 import std::reactive::{ Signal, SignalCell };
 
 // The one component both legs build.
@@ -39,7 +39,7 @@ fun app(): View {
 	let tasks: SignalCell<List<str>> = Signal::new(["Render on the server", "Replace on boot"]);
 	view("main")
 		.child(view("h1").text("Tasks"))
-		.child(view("ul").bind_each(tasks, |task| task, |task| view("li").text(task)))
+		.child(view("ul").child(each(tasks, |task| task, |task| view("li").text(task))))
 }
 
 // On the server, `render` turns the view into markup.
@@ -112,14 +112,14 @@ mount: mounting is a client entry, not a renderable view, which is why
 the natural factoring is a shared `fun app(): View` with a per-leg `main`.
 
 ```vilan,browser
-import std::ui::{ view, View, mount_root };
+import std::ui::{ each, view, View, mount_root };
 import std::reactive::{ Signal, SignalCell };
 
 fun app(): View {
 	let tasks: SignalCell<List<str>> = Signal::new(["Render on the server", "Replace on boot"]);
 	view("main")
 		.child(view("h1").text("Tasks"))
-		.child(view("ul").bind_each(tasks, |task| task, |task| view("li").text(task)))
+		.child(view("ul").child(each(tasks, |task| task, |task| view("li").text(task))))
 }
 
 fun main() {
@@ -138,7 +138,7 @@ server nodes, addresses them, or reconciles against them.
 
 The server render creates, serializes, and discards: no effects attach, no
 subscriptions survive the request. So the bindings **read once**: `bind_text`,
-`bind_attr`, `bind_each` (with `bind_each_values` and `bind_each_by`), `when`,
+`bind_attr`, `each` (with `each_values` and `each_by`), `when`,
 and `swap` embed the source's value *at render time*. That is the value served,
 and it is the value the client re-derives.
 

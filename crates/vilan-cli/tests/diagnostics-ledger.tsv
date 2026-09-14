@@ -244,7 +244,7 @@ row	flagship	key
 209	flagship	{members} form an initialization cycle: module-level bindings initialize in dependency order, and a cycle has no such order
 210	flagship	a string cannot span lines unless it is triple-quoted: close it before the line break; multi-line text goes in `"""…"""` (`i"""…"""` when interpolating), and a single line break is written `\n`
 211	-	a literal `}` inside an interpolated string is written `\}`: an unescaped brace belongs to a `{expr}` hole
-212	-	{} has no method '{}'{trait_only}{field}{import}
+212	-	{} has no method '{}'{trait_only}{field}{import}{slot}
 213	-	'{member}' is ambiguous on '{type}': {both }{homes} provide it, and '{Trait}::{member}' names only the trait, not which of its instantiations; annotate the type this call must produce to pick one
 214	flagship	'{member}' is ambiguous on '{type}': {both }{subjects} provide it and neither impl subject is more specific than the other; vilan picks the more specific of two overlapping impls, so narrow one subject until it is
 215	-	`{method}` must be called on a context bound to a name

@@ -479,7 +479,7 @@ generic-argument rules use, so nothing about a comparison changes. A
 fragment takes no head items and has no self-closing form. Its type is
 where its uses are: a child position and every position a list fills
 (A46); it is not a `View`, so it is not a `fun …: View` return, a
-`when` body, a `swap` render or a `bind_each` row.
+`when` body, a `swap` render or an `each` row.
 
 A **`css` block** is the same shape on the style side, and it appears in
 atom position too — but where an element occupies grammar space nothing

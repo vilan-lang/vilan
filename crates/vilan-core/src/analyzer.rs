@@ -963,6 +963,28 @@ fn view_capture_message(name: &str) -> String {
     )
 }
 
+/// A99's table: the free slot value that replaced a retired `View` method, by
+/// the method's name, or `None` for any other name.
+///
+/// ONE table, read by both halves of the steer — the analyzer's message
+/// (`Analyzer::retired_slot_method_steer`) and the editor's quick fix
+/// (`vilan-lsp::document::retired_slot_method_fix`) — so the sentence a user
+/// reads and the edit an editor applies can never name different functions.
+/// Three of the six kept their name and three did not: `bind_each` became
+/// `each` because the `bind_` prefix means "one property kept in sync" on every
+/// other `View` method, and a value that IS a child has no property to bind.
+pub fn retired_slot_value_name(method_name: &str) -> Option<&'static str> {
+    match method_name {
+        "when" => Some("when"),
+        "swap" => Some("swap"),
+        "swap_split" => Some("swap_split"),
+        "bind_each" => Some("each"),
+        "bind_each_values" => Some("each_values"),
+        "bind_each_by" => Some("each_by"),
+        _ => None,
+    }
+}
+
 /// The precomputed resource sets the affine move scan matches against
 /// (destruction.md §4, R1–R9): the resource-typed binding entities (variables
 /// and parameters), and the resource-typed *place* expressions (a `Field` /
@@ -4287,6 +4309,10 @@ pub struct Analyzer<'src> {
     // Names resolve in `resolve_world`'s preamble, before the fixpoint, which
     // is where this is read.
     call_subjects: Vec<(Id, Id)>,
+    // The same pairs' SUBJECT ids as a set (B334/R4): `resolve_prepped_local`
+    // asks "is this name in call position?" once per prepped local, and a scan
+    // of the vector would make name resolution quadratic in the call count.
+    call_subject_ids: HashSet<Id>,
     // [`Divergence`]'s two resolved leaves (B204), recomputed once per
     // resolution phase (in `resolve_world`, after names resolve and before the
     // constraint fixpoint) rather than per query, since each is a scan and
@@ -5504,6 +5530,7 @@ impl<'src> Analyzer<'src> {
             anonymous_binder_scopes: HashMap::default(),
             panic_fn_id: None,
             call_subjects: Vec::new(),
+            call_subject_ids: HashSet::default(),
             divergence_leaves: DivergenceLeaves::default(),
             guard_continuations: Vec::new(),
             source_trait_id: None,
@@ -17830,6 +17857,48 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// The A99 steer: one of the six `View` methods the order RETIRED was
+    /// written, and the fix is the free slot value of the same idea.
+    ///
+    /// `View::when`/`swap`/`swap_split`/`bind_each`/`bind_each_values`/
+    /// `bind_each_by` were one line of sugar each (`self.child(when(..))`), and
+    /// a method could never sit BETWEEN siblings — its content always landed at
+    /// the parent's current end. The values can, so the methods went; the
+    /// rewrite is mechanical and the message spells it, in both spellings,
+    /// because which one a call site wants is a question about the markup
+    /// around it and not about the call.
+    ///
+    /// Keyed on std's OWN `View`: a user type free to declare a `bind_each` of
+    /// its own must not be told it has retired one. `retired_slot_value_name`
+    /// is the whole table, and it is the same mapping the editor's quick fix
+    /// applies (`vilan-lsp::document::retired_slot_method_fix`), so the two
+    /// cannot drift.
+    fn retired_slot_method_steer(
+        &mut self,
+        subject_type: &Type,
+        member_name: &str,
+    ) -> Option<String> {
+        let value = retired_slot_value_name(member_name)?;
+        let Type::Struct(struct_id, _) = subject_type else {
+            return None;
+        };
+        let struct_ = self.structs.get(struct_id)?;
+        if struct_.name != "View" {
+            return None;
+        }
+        let declared_in_std = self
+            .source_of_id(struct_.id)
+            .is_some_and(|source| self.std_sources.contains(&source));
+        if !declared_in_std {
+            return None;
+        }
+        Some(format!(
+            "; `{member_name}` is no longer a `View` method (A99): write \
+             `child({value}(..))` to place it at this element's end, or \
+             `{{{value}(..)}}` in a child hole to place it there"
+        ))
+    }
+
     /// Whether an operator (`==`, `<`, `+`, ...) on this type lowers to a native JS
     /// operator: the scalar primitives, `bool`, and BACKED enums (which lower to
     /// their bare backing value, a JS number or string). Such a type needs no
@@ -28255,6 +28324,7 @@ impl<'src> Analyzer<'src> {
                 // the call's own constraint resolves, which would make "does
                 // this body diverge?" depend on fixpoint order.
                 self.call_subjects.push((id, subject_id));
+                self.call_subject_ids.insert(subject_id);
                 let argument_ids = self.walk_expr_nodes(&arguments.0, scope_id);
                 let generic_argument_ids = generic_arguments
                     .as_ref()
@@ -38501,6 +38571,11 @@ impl<'src> Analyzer<'src> {
                 let import_steer = self
                     .unimported_trait_method_steer(&subject_type, member_name)
                     .unwrap_or_default();
+                // A99: one of the six retired `View` methods, whose fix is the
+                // free slot value and not a definition or an import.
+                let retired_slot_steer = self
+                    .retired_slot_method_steer(&subject_type, member_name)
+                    .unwrap_or_default();
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note: None,
@@ -38510,8 +38585,13 @@ impl<'src> Analyzer<'src> {
                         .copied()
                         .unwrap_or(arguments_span),
                     msg: format!(
-                        "{} has no method '{}'{}{}{}",
-                        type_str, member_name, trait_only_note, field_steer, import_steer
+                        "{} has no method '{}'{}{}{}{}",
+                        type_str,
+                        member_name,
+                        trait_only_note,
+                        field_steer,
+                        import_steer,
+                        retired_slot_steer
                     ),
                 });
                 self.expr_id_to_expr_map.insert(id, Expr::Error);
@@ -42643,6 +42723,60 @@ impl<'src> Analyzer<'src> {
         self.member_or_submodule(item, scope_id, module_id)
     }
 
+    /// B334, ruled at Order 36's GO (R4): the FREE function wins a call written
+    /// with NO RECEIVER, even inside the `impl` block that declares a method of
+    /// the same name.
+    ///
+    /// A method needs a receiver — `self.when(..)` is the method — so a bare
+    /// `when(condition, body)` inside `impl View`'s own body cannot have meant
+    /// one, and resolving it to the member is not a shadowing decision but a
+    /// resolution that cannot be right. Before this, it was: the call reported
+    /// the METHOD's arity (``  `when` expects 3 arguments, but got 2 ``), and
+    /// there was no qualified escape from inside a package either —
+    /// `pkg::ui::when(..)` answers "`pkg` is a namespace, not a value" and a
+    /// self-import is a cycle. std's own positional value forms had to build
+    /// their struct literal inline because of it (positional-slots.md §3b's
+    /// "sugar", which A99 has since retired along with the methods).
+    ///
+    /// NARROW BY CONSTRUCTION, three ways. It fires only for a CALL SUBJECT
+    /// (`call_subject_ids`), so a bare mention of the name as a VALUE still
+    /// resolves to the member it always did; only when the enclosing `impl`
+    /// body's own declaration TAKES a receiver, so an associated function
+    /// declared without `self` still shadows — a bare call to one IS a call to
+    /// it; and it resolves from the impl body scope's PARENT rather than
+    /// jumping to the module, so an intervening binding is still what wins.
+    /// A name no outer scope binds resolves to nothing here and falls through
+    /// to the ordinary walk, which reports the method's arity exactly as before
+    /// — a program with no free function to mean is not one this rule can fix.
+    fn receiverless_call_subject(
+        &mut self,
+        id: Id,
+        name: &'src str,
+        scope_id: Id,
+        use_offset: usize,
+    ) -> Option<Id> {
+        if !self.call_subject_ids.contains(&id) {
+            return None;
+        }
+        let mut current = Some(scope_id);
+        while let Some(current_id) = current {
+            let scope = self.scopes.get(&current_id)?;
+            let parent_id = scope.parent_id;
+            let declared = scope.name_to_id_map.get(name).copied();
+            let is_impl_body = self.impl_body_subjects.contains_key(&current_id);
+            if is_impl_body
+                && let Some(member_id) = declared
+                && self.expr_id_to_expr_map.contains_key(&member_id)
+                && self.is_self_method(member_id)
+            {
+                return parent_id
+                    .and_then(|parent| self.resolve_value_name_at(name, parent, use_offset));
+            }
+            current = parent_id;
+        }
+        None
+    }
+
     fn resolve_prepped_local(&mut self, id: Id, name: &'src str) {
         let scope_id = self.get_scope_id_for_entity(id);
         // A use resolves at its own byte offset (positional visibility,
@@ -42658,7 +42792,12 @@ impl<'src> Analyzer<'src> {
         // file can be broken by a name added to that module. Resolved here,
         // at the one seam where "the scope has nothing" is already known.
         let resolved = self
-            .resolve_value_name_at(name, scope_id, use_offset)
+            // B334 (R4): a call written with NO RECEIVER means the free
+            // function, even inside an `impl` block declaring a method of the
+            // same name. Asked FIRST because it is a correction to what the
+            // ordinary walk would answer, not a fallback for what it cannot.
+            .receiverless_call_subject(id, name, scope_id, use_offset)
+            .or_else(|| self.resolve_value_name_at(name, scope_id, use_offset))
             .or_else(|| {
                 self.css_scope_locals
                     .contains(&id)

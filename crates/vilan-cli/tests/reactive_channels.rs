@@ -1759,7 +1759,7 @@ fun main() {
 	print(i"same-turn:up={up.read()} down={down.read()} sources={session.sources.read().len()}");
 
 	// (d) A dispose in one turn and a mount in ANOTHER — two event handlers, a
-	// route change, a `bind_each` rebuilding rows. Different turns, one
+	// route change, a `each` rebuilding rows. Different turns, one
 	// MACROTASK: the settle is the first look and the microtask hop is the
 	// second, so this costs nothing either.
 	up.write() = 0;
@@ -1796,7 +1796,7 @@ fun main() {
 ///
 /// The shipped rule is that a 1→0 defers its `Unsubscribe` to the ambient
 /// turn's settle, so a dispose and a rebuild INSIDE one turn churn nothing.
-/// That covers a `bind_each` row refreshing and nothing else: a dispose in one
+/// That covers a `each` row refreshing and nothing else: a dispose in one
 /// event handler and a mount in the next are two turns, and the settle of the
 /// first has already fired by the time the second runs. Both are one
 /// MACROTASK, and R3 makes the whole macrotask free by taking one microtask

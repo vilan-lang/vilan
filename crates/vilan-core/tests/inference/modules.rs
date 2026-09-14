@@ -1627,15 +1627,15 @@ fn bind_styled_cannot_construct_its_style_at_runtime() {
 }
 
 #[test]
-fn ssr_bind_each_renders_current_list() {
+fn ssr_each_renders_current_list() {
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::ui::{ View, each, render, view };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
             let items: SignalCell<List<str>> = Signal::new(["a", "b", "c"]);
-            print(render(view("ul").bind_each(items, |s| s, |s| view("li").text(s))));
+            print(render(view("ul").child(each(items, |s| s, |s| view("li").text(s)))));
         }
         "#,
         "<ul><li>a</li><li>b</li><li>c</li></ul>\n",
@@ -1643,15 +1643,15 @@ fn ssr_bind_each_renders_current_list() {
 }
 
 #[test]
-fn ssr_bind_each_over_empty_list_renders_no_rows() {
+fn ssr_each_over_empty_list_renders_no_rows() {
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::ui::{ View, each, render, view };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
             let items: SignalCell<List<str>> = Signal::new([]);
-            print(render(view("ul").bind_each(items, |s| s, |s| view("li").text(s))));
+            print(render(view("ul").child(each(items, |s| s, |s| view("li").text(s)))));
         }
         "#,
         "<ul></ul>\n",
@@ -1663,12 +1663,12 @@ fn ssr_when_renders_the_taken_branch_only() {
     // Both branches: true renders the body, false renders nothing.
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::ui::{ View, render, view, when };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun main() {
-            print(render(view("div").when(Signal::new(true), || view("p").text("shown"))));
-            print(render(view("div").when(Signal::new(false), || view("p").text("shown"))));
+            print(render(view("div").child(when(Signal::new(true), || view("p").text("shown")))));
+            print(render(view("div").child(when(Signal::new(false), || view("p").text("shown")))));
         }
         "#,
         "<div><p>shown</p></div>\n<div></div>\n",
@@ -1679,16 +1679,16 @@ fn ssr_when_renders_the_taken_branch_only() {
 fn ssr_swap_renders_the_current_value_branch() {
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::ui::{ View, render, swap, view };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         [derive(PartialEq)]
         enum Tab { A, B }
         fun main() {
-            print(render(view("nav").swap(Signal::new(Tab::B), |t| match t {
+            print(render(view("nav").child(swap(Signal::new(Tab::B), |t| match t {
                 Tab::A => view("a").text("first"),
                 Tab::B => view("a").text("second"),
-            })));
+            }))));
         }
         "#,
         "<nav><a>second</a></nav>\n",
@@ -2570,17 +2570,17 @@ fn a_generic_method_dispatches_a_bound_on_a_closure_parameter() {
 }
 
 #[test]
-fn bind_each_rows_dispatch_slot_children() {
+fn each_rows_dispatch_slot_children() {
     // The same bug's std face, the one every real app hits: a row closure's
     // `.child(t)` dropped the text (empty stub) while a literal child worked.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         import std::reactive::{ Signal, SignalCell };
-        import std::ui::{ View, render, view };
+        import std::ui::{ View, each, render, view };
         fun main() {
             let items: SignalCell<List<str>> = Signal::new(["alpha", "beta"]);
-            print(render(view("ul").bind_each(items, |t| t, |t| view("li").child(t))));
+            print(render(view("ul").child(each(items, |t| t, |t| view("li").child(t)))));
         }
         "#,
         "<ul><li>alpha</li><li>beta</li></ul>\n",
@@ -3257,7 +3257,7 @@ fn ssr_example_app_renders_the_served_markup() {
     // then replaces (proposal/ssr.md §1, §3).
     assert_compiles_and_runs(
         r#"
-        import std::ui::{ view, View, render };
+        import std::ui::{ View, each, render, view, when };
         import std::reactive::{ Signal, SignalCell };
         import std::io::print;
         fun app(): View {
@@ -3267,8 +3267,8 @@ fn ssr_example_app_renders_the_served_markup() {
             view("main")
                 .class("app")
                 .child(view("h1").text("Tasks & <notes>"))
-                .child(view("ul").bind_each(tasks, |task| task, |task| view("li").text(task)))
-                .child(view("section").when(show_note, || view("p").text("server-rendered, then replaced")))
+                .child(view("ul").child(each(tasks, |task| task, |task| view("li").text(task))))
+                .child(view("section").child(when(show_note, || view("p").text("server-rendered, then replaced"))))
                 .child(view("button").bind_text(label).on("click", || label.set("clicked")))
         }
         fun main() {

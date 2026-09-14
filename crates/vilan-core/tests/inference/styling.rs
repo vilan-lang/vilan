@@ -4855,7 +4855,7 @@ fn swap_renders_a_dynamic_subtree_per_route_value() {
     // whose render closure matches the (unannotated) route value.
     assert_compiles_browser(
         r#"
-        import std::ui::{ View, view, mount_root };
+        import std::ui::{ View, mount_root, swap, view };
         import std::reactive::{ Signal, SignalCell };
         import std::router::{ current_path, navigate, segments, link, Routable };
 
@@ -4905,10 +4905,10 @@ fn swap_renders_a_dynamic_subtree_per_route_value() {
             let _root = mount_root("app", || view("main")
                 .child(link("Home", Route::Home))
                 .child(view("button").on("click", || navigate(href(Route::Home))))
-                .swap(route, |current| match current {
+                .child(swap(route, |current| match current {
                     Route::Home => view("section").text("home"),
                     Route::Workspace(let org, let inner) => workspace_layout(org, inner),
-                }));
+                })));
         }
         "#,
     );
@@ -5069,7 +5069,7 @@ fn a_mapped_signal_meets_a_bound_without_annotation() {
     // the retry instead of freezing abstract.
     assert_compiles_browser(
         r#"
-        import std::ui::{ View, view, mount_root };
+        import std::ui::{ View, mount_root, swap, view };
         import std::reactive::{ Signal, SignalCell };
         import std::router::{ current_path, segments };
 
@@ -5086,10 +5086,10 @@ fn a_mapped_signal_meets_a_bound_without_annotation() {
         fun main() {
             let route = current_path().map(|path| parse(path));
             let _root = mount_root("app", || view("main")
-                .swap(route, |current| match current {
+                .child(swap(route, |current| match current {
                     Route::Home => view("section").text("home"),
                     Route::Other => view("section").text("other"),
-                }));
+                })));
         }
         "#,
     );
@@ -5101,7 +5101,7 @@ fn swap_requires_a_comparable_value() {
     // without the impl is rejected at the call.
     assert_fails_browser_with(
         r#"
-        import std::ui::{ View, view, mount_root };
+        import std::ui::{ View, mount_root, swap, view };
         import std::reactive::{ Signal, SignalCell };
 
         struct Opaque {
@@ -5111,7 +5111,7 @@ fn swap_requires_a_comparable_value() {
         fun main() {
             let source: SignalCell<Opaque> = Signal::new(Opaque { tag = "a" });
             let _root = mount_root("app", || view("main")
-                .swap(source, |current| view("p").text(current.tag)));
+                .child(swap(source, |current| view("p").text(current.tag))));
         }
         "#,
         "does not implement trait 'PartialEq'",
@@ -5125,16 +5125,16 @@ fn swap_boundaries_nest() {
     // resolve under the outer's injected extent.
     assert_compiles_browser(
         r#"
-        import std::ui::{ View, view, mount_root };
+        import std::ui::{ View, mount_root, swap, view };
         import std::reactive::{ Signal, SignalCell };
 
         fun main() {
             let outer: SignalCell<i32> = Signal::new(0);
             let inner: SignalCell<str> = Signal::new("a");
             let _root = mount_root("app", || view("main")
-                .swap(outer, |level| view("section")
+                .child(swap(outer, |level| view("section")
                     .child(view("h1").text(i"level {level}"))
-                    .swap(inner, |name| view("p").text(name))));
+                    .child(swap(inner, |name| view("p").text(name))))));
         }
         "#,
     );
@@ -5142,11 +5142,11 @@ fn swap_boundaries_nest() {
 
 #[test]
 fn swap_composes_with_sibling_bindings() {
-    // `swap` alongside `bind_each` and `show` on one element tree — the mixed
+    // `swap` alongside `each` and `show` on one element tree — the mixed
     // form: three boundary kinds registering into the same enclosing owner.
     assert_compiles_browser(
         r#"
-        import std::ui::{ View, view, mount_root };
+        import std::ui::{ View, each, mount_root, swap, view };
         import std::reactive::{ Signal, SignalCell };
 
         fun main() {
@@ -5154,9 +5154,9 @@ fn swap_composes_with_sibling_bindings() {
             let items: SignalCell<List<str>> = Signal::new(["a", "b"]);
             let visible: SignalCell<bool> = Signal::new(true);
             let _root = mount_root("app", || view("main")
-                .child(view("ul").bind_each(items, |item| item, |item| view("li").text(item)))
+                .child(view("ul").child(each(items, |item| item, |item| view("li").text(item))))
                 .child(view("aside").show(visible))
-                .swap(page, |current| view("section").text(i"page {current}")));
+                .child(swap(page, |current| view("section").text(i"page {current}"))));
         }
         "#,
     );

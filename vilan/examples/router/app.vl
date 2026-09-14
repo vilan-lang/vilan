@@ -119,11 +119,11 @@ fun app(route: SignalCell<Route>): View {
 		.child(view("p").class("path").bind_text(current_path()))
 		// The page: swapped per route value; an unchanged route is a no-op,
 		// and a swapped-out page's bindings are disposed with it.
-		.swap(route, |current| match current {
+		.child(swap(route, |current| match current {
 			Route::Home => home_page(),
 			Route::Items(let inner) => items_layout(inner),
 			Route::NotFound => not_found_page(),
-		})
+		}))
 }
 
 fun main() {

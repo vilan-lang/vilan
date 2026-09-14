@@ -5529,7 +5529,7 @@ fn a52_the_inherent_rpc_sub_outranks_the_traits_and_still_skips_the_none() {
 
 /// The boundary the impl does NOT cross, pinned so the sentence in `rpc.vl` is
 /// checkable: a `RemoteSource<List<T>>` is a `Source<Option<List<T>>>`, and
-/// `bind_each` wants a `Source<List<T>>`. The mirror's value IS the option —
+/// `each` wants a `Source<List<T>>`. The mirror's value IS the option —
 /// `get` cannot invent a `T` before the first frame — so the seam into a list
 /// binding is still `or([])`, which the second half of this pin drives.
 #[test]
@@ -5539,7 +5539,7 @@ fn a52_an_rpc_mirror_is_not_a_list_source_and_binds_through_or() {
         import std::json::json_codec;
         import std::reactive::{ Signal, SignalCell };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
-        import std::ui::{ mount_root, view };
+        import std::ui::{ each, mount_root, view };
 
         [derive(Wire, PartialEq, Debug)]
         struct Todo { id: i32, label: str }
@@ -5550,11 +5550,11 @@ fn a52_an_rpc_mirror_is_not_a_list_source_and_binds_through_or() {
             let channel = ReactiveServer::new(server_end, json_codec()).expose(todos);
             let remote: RemoteSource<List<Todo>> = ReactiveClient::new(client_end, json_codec()).source(channel);
             let _root = mount_root("app", || view("ul")
-                .bind_each(remote, |todo: Todo| todo.id, |todo| view("li").text(todo.label)));
+                .child(each(remote, |todo: Todo| todo.id, |todo| view("li").text(todo.label))));
         }
         "#,
         // B304: the bound is named AT ITS INSTANTIATION now (`List<Todo>`, not
-        // the abstract `List<T>`) — `bind_each`'s `T` binds from the key
+        // the abstract `List<T>`) — `each`'s `T` binds from the key
         // closure before the bound is checked, where the render closure's
         // unannotated parameter used to freeze it abstract.
         "'RemoteSource<List<Todo>>' does not implement trait 'Source<List<Todo>>'",
@@ -5564,7 +5564,7 @@ fn a52_an_rpc_mirror_is_not_a_list_source_and_binds_through_or() {
         import std::json::json_codec;
         import std::reactive::{ Signal, SignalCell };
         import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
-        import std::ui::{ mount_root, view };
+        import std::ui::{ each, mount_root, view };
 
         [derive(Wire, PartialEq, Debug)]
         struct Todo { id: i32, label: str }
@@ -5575,7 +5575,7 @@ fn a52_an_rpc_mirror_is_not_a_list_source_and_binds_through_or() {
             let channel = ReactiveServer::new(server_end, json_codec()).expose(todos);
             let remote: RemoteSource<List<Todo>> = ReactiveClient::new(client_end, json_codec()).source(channel);
             let _root = mount_root("app", || view("ul")
-                .bind_each(remote.or([]), |todo: Todo| todo.id, |todo| view("li").text(todo.label)));
+                .child(each(remote.or([]), |todo: Todo| todo.id, |todo| view("li").text(todo.label))));
         }
         "#,
     );

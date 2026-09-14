@@ -396,7 +396,7 @@ const EXPRESSION_FIXTURES: &[&str] = &[
     "<button on:click(|| go())/>",
     "<button on:click(|e| e.prevent_default())/>",
     "<div .styled(card) .show(f)/>",
-    "<ul .bind_each(items, |t| t.id, |t| row(t))/>",
+    "<ul .child(each(items, |t| t.id, |t| row(t)))/>",
     "<p>\"text\"</p>",
     "<p>{value}</p>",
     "<p>i\"a {b}\"</p>",

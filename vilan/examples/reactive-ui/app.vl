@@ -2,7 +2,7 @@
 // `View`, so an app is just composition: build the views and `mount` them.
 //
 // Both components build and run: the counter, and the todo list (`todos.vl`) now
-// that `combine` (variadic generics), `bind_each`, and `show` are implemented.
+// that `combine` (variadic generics), `each`, and `show` are implemented.
 //
 // `ui` is a module the `std::web` prelude puts in scope (vilan.toml), so
 // `ui::mount_root` needs no import. The prelude carries the module and not the

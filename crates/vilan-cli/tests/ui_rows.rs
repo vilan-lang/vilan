@@ -87,10 +87,10 @@ fn build_and_run(tag: &str, app: &str, harness: &str) -> String {
 /// One list under all three bindings at once, driven through the same edits.
 /// `Task` derives `PartialEq` because two of the three forms need it; the
 /// fourth list is over `Handle`, which carries a closure and therefore CANNOT
-/// derive it — the case that has no spelling without `bind_each_by`.
+/// derive it — the case that has no spelling without `each_by`.
 const THREE_FORMS: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view };
+import std::ui::{ View, each, each_by, each_values, mount_root, view };
 
 [derive(PartialEq)]
 struct Task {
@@ -116,18 +116,18 @@ fun main() {
 	]);
 	let _root = mount_root("app", || {
 		view("div")
-			.child(view("ul").bind_each(keyed, |task| task.id, |task| {
+			.child(view("ul").child(each(keyed, |task| task.id, |task| {
 				print(i"keyed renders {task.id}");
 				view("li").text(task.title)
-			}))
-			.child(view("ol").bind_each_values(names, |name| {
+			})))
+			.child(view("ol").child(each_values(names, |name| {
 				print(i"values renders {name}");
 				view("li").text(name)
-			}))
-			.child(view("nav").bind_each_by(handles, |handle| handle.id, |handle| {
+			})))
+			.child(view("nav").child(each_by(handles, |handle: Handle| handle.id, |handle: SignalCell<Handle>| {
 				print(i"by renders {handle.get().id}");
 				view("li").bind_text(handle.map(|current| current.title))
-			}))
+			})))
 	});
 
 	print("--- same keys, one changed value ---");
@@ -154,7 +154,7 @@ main();
 ///
 /// A changed value under a surviving key REBUILDS the row in both `PartialEq`
 /// forms (a fresh `renders` line, a fresh element identity) and KEEPS it under
-/// `bind_each_by`, where the new item is written into the row's own cell and the
+/// `each_by`, where the new item is written into the row's own cell and the
 /// text changes through the binding that was already there. A reorder moves
 /// every row in all three — same identities, new order, no re-render anywhere.
 #[test]
@@ -178,8 +178,8 @@ fn the_three_list_forms_differ_only_in_what_a_changed_row_costs() {
     assert_eq!(
         after_change,
         vec![&"keyed renders 1", &"values renders A"],
-        "a changed value must rebuild the row under `bind_each` and \
-         `bind_each_values` and ONLY under those; got:\n{stdout}"
+        "a changed value must rebuild the row under `each` and \
+         `each_values` and ONLY under those; got:\n{stdout}"
     );
 
     // A reorder rebuilds nothing at all, in any of the three.
@@ -189,7 +189,7 @@ fn the_three_list_forms_differ_only_in_what_a_changed_row_costs() {
         "a reorder must move rows, never rebuild them; got:\n{stdout}"
     );
 
-    // And the final tree: `bind_each_by`'s row kept its identity across the
+    // And the final tree: `each_by`'s row kept its identity across the
     // value change while the other two took fresh ones, and every list is in
     // the reordered order.
     let tree = lines.last().expect("the flattened tree");
@@ -199,11 +199,11 @@ fn the_three_list_forms_differ_only_in_what_a_changed_row_costs() {
     );
 }
 
-/// The row `bind_each_by` keeps is the SAME element — identity, not just
+/// The row `each_by` keeps is the SAME element — identity, not just
 /// content — and the item it now holds reached the row through its own cell.
 const KEPT_IDENTITY: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view };
+import std::ui::{ View, each_by, mount_root, view };
 
 struct Handle {
 	id: i32,
@@ -216,9 +216,9 @@ fun main() {
 		Handle { id = 1, title = "one", act = || "act" },
 	]);
 	let _root = mount_root("app", || {
-		view("ul").bind_each_by(handles, |handle| handle.id, |handle| {
+		view("ul").child(each_by(handles, |handle: Handle| handle.id, |handle: SignalCell<Handle>| {
 			view("li").bind_text(handle.map(|current| current.title))
-		})
+		}))
 	});
 	print(i"before={identity_of_first_row()}");
 	handles.set([Handle { id = 1, title = "ONE", act = || "act" }]);
@@ -231,9 +231,9 @@ external fun identity_of_first_row(): str;
 main();
 "#;
 
-/// `bind_each_by` keeps the row's element across a value change under a
+/// `each_by` keeps the row's element across a value change under a
 /// surviving key: same identity before and after, and the text updated through
-/// the binding rather than through a rebuild. Red under `bind_each` — a
+/// the binding rather than through a rebuild. Red under `each` — a
 /// `PartialEq` change there disposes the row and builds a new element.
 #[test]
 fn the_index_form_keeps_the_rows_element_and_updates_through_its_cell() {
@@ -271,11 +271,11 @@ fn the_index_form_keeps_the_rows_element_and_updates_through_its_cell() {
 
 /// `on_mount` at every attachment site the module has: a statically appended
 /// child, a `when` instantiation that appears in a LATER drain wave, and
-/// `bind_each` rows — the initial one and one appended after the fact.
+/// `each` rows — the initial one and one appended after the fact.
 const MOUNT_HOOK: &str = r#"import std::dom::Element;
 import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view };
+import std::ui::{ View, each_values, mount_root, view, when };
 
 fun main() {
 	let open: SignalCell<bool> = Signal::new(false);
@@ -284,14 +284,14 @@ fun main() {
 		view("div")
 			.child(view("input").on_mount(|element| print(i"static {reachable(element)}")))
 			.child(view("input").autofocus())
-			.when(open, || {
+			.child(when(open, || {
 				view("section").child(view("input").on_mount(|element| {
 					print(i"when {reachable(element)}");
 				}))
-			})
-			.child(view("ul").bind_each_values(rows, |name| {
-				view("li").text(name).on_mount(|element| print(i"row {reachable(element)}"))
 			}))
+			.child(view("ul").child(each_values(rows, |name| {
+				view("li").text(name).on_mount(|element| print(i"row {reachable(element)}"))
+			})))
 	});
 	print("built");
 	open.set(true);
@@ -336,14 +336,14 @@ fn on_mount_hands_over_an_element_that_is_already_in_the_document() {
 
 const AUTOFOCUS: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view };
+import std::ui::{ View, mount_root, view, when };
 
 fun main() {
 	let open: SignalCell<bool> = Signal::new(false);
 	let _root = mount_root("app", || {
 		view("div")
 			.child(view("input").attr("name", "always"))
-			.when(open, || view("input").attr("name", "modal").autofocus())
+			.child(when(open, || view("input").attr("name", "modal").autofocus()))
 	});
 	print("built");
 	open.set(true);
@@ -442,14 +442,14 @@ global.findByName = (name) => {
 /// one-word form.
 const HIDDEN_AUTOFOCUS: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view };
+import std::ui::{ View, mount_root, view, when };
 
 fun main() {
 	let open: SignalCell<bool> = Signal::new(false);
 	let _root = mount_root("app", || {
-		view("div").when(open, || {
+		view("div").child(when(open, || {
 			view("input").attr("name", "modal").attr("data-visibility", "hidden").autofocus()
-		})
+		}))
 	});
 	open.set(true);
 	print("built");
@@ -576,10 +576,10 @@ fn the_ssr_twins_of_the_mount_hook_render_the_same_markup_and_run_nothing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// --- B255: an in-place `update` beside a `bind_each` -------------------------
+// --- B255: an in-place `update` beside a `each` -------------------------
 
 /// Six keyed rows, then a `remove(0)` performed IN PLACE through
-/// `SignalCell::update`. `bind_each` keeps the effect's list as `row_items`,
+/// `SignalCell::update`. `each` keeps the effect's list as `row_items`,
 /// and before B257 that store aliased the cell's own storage — so the next
 /// pass handed `reconcile` an `old_items` that WAS the new array, one shorter
 /// than the `old_keys` beside it, and `same(old_items[5], item)` read past the
@@ -589,14 +589,14 @@ fn the_ssr_twins_of_the_mount_hook_render_the_same_markup_and_run_nothing() {
 const IN_PLACE_REMOVE: &str = r#"import std::compare::PartialEq;
 import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view };
+import std::ui::{ View, each, mount_root, view };
 
 struct Row {
 	id: i32,
 	text: str,
 }
 
-// Hand-written, and narrower than the struct: `bind_each`'s key here is the
+// Hand-written, and narrower than the struct: `each`'s key here is the
 // ITEM, so identity is the id and a surviving row is one whose id survived.
 impl Row with PartialEq {
 	fun eq(self, b: Row): bool {
@@ -614,10 +614,10 @@ fun main() {
 		Row { id = 6, text = "f" },
 	]);
 	let _root = mount_root("app", || {
-		view("ul").bind_each(rows, |row| row, |row| {
+		view("ul").child(each(rows, |row| row, |row| {
 			print(i"render {row.id}");
 			view("li").text(row.text)
-		})
+		}))
 	});
 	print(i"before={tree()}");
 	print("--- remove ---");
@@ -641,7 +641,7 @@ fn row_tokens(line: &str) -> Vec<&str> {
 }
 
 #[test]
-fn b255_an_in_place_remove_under_bind_each_keeps_the_surviving_rows() {
+fn b255_an_in_place_remove_under_each_keeps_the_surviving_rows() {
     let harness = format!(
         "{DOM_STUB}\nglobal.__tree = () => flatten(documentRoot);\nrequire(\"./app.js\");\n"
     );
@@ -693,7 +693,7 @@ fn b255_an_in_place_remove_under_bind_each_keeps_the_surviving_rows() {
 const IN_PLACE_EDIT: &str = r#"import std::compare::PartialEq;
 import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view };
+import std::ui::{ View, each, mount_root, view };
 
 struct Row {
 	id: i32,
@@ -713,10 +713,10 @@ fun main() {
 		Row { id = 2, text = "b" },
 	]);
 	let _root = mount_root("app", || {
-		view("ul").bind_each(rows, |row| row.id, |row| {
+		view("ul").child(each(rows, |row| row.id, |row| {
 			print(i"render {row.id}");
 			view("li").text(row.text)
-		})
+		}))
 	});
 	print("--- edit ---");
 	rows.update(|&mut xs| {
@@ -732,7 +732,7 @@ main();
 "#;
 
 #[test]
-fn b255_an_in_place_element_write_under_bind_each_refreshes_that_row() {
+fn b255_an_in_place_element_write_under_each_refreshes_that_row() {
     let harness = format!(
         "{DOM_STUB}\nglobal.__tree = () => flatten(documentRoot);\nrequire(\"./app.js\");\n"
     );
@@ -766,13 +766,13 @@ fn b255_an_in_place_element_write_under_bind_each_refreshes_that_row() {
     );
 }
 
-/// `bind_each_by` holds `row_items` exactly as `bind_each` does, so the
+/// `each_by` holds `row_items` exactly as `each` does, so the
 /// out-of-bounds half is its too — its `same` is constantly true, so it never
 /// showed the stale-row half. `T` here carries a closure and so cannot compare
 /// at all, which is the shape this form exists for.
 const IN_PLACE_REMOVE_BY: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view };
+import std::ui::{ View, each_by, mount_root, view };
 
 struct Handle {
 	id: i32,
@@ -790,9 +790,9 @@ fun main() {
 		Handle { id = 6, text = "f", act = || "act" },
 	]);
 	let _root = mount_root("app", || {
-		view("ul").bind_each_by(rows, |row| row.id, |row| {
+		view("ul").child(each_by(rows, |row: Handle| row.id, |row: SignalCell<Handle>| {
 			view("li").bind_text(row.map(|current| current.text))
-		})
+		}))
 	});
 	print(i"before={tree()}");
 	rows.update(|&mut xs| {
@@ -808,7 +808,7 @@ main();
 "#;
 
 #[test]
-fn b255_an_in_place_remove_under_bind_each_by_keeps_the_surviving_rows() {
+fn b255_an_in_place_remove_under_each_by_keeps_the_surviving_rows() {
     let harness = format!(
         "{DOM_STUB}\nglobal.__tree = () => flatten(documentRoot);\nrequire(\"./app.js\");\n"
     );
@@ -1077,7 +1077,7 @@ fn a59_observe_resize_fires_on_first_layout_and_stops_with_its_subscription() {
 /// Every arm of `Slot` at once, static and reactive, then the whole root
 /// disposed. The two reactive ELEMENT arms are written in element syntax —
 /// `<main>{panel}</main>` is the kolt shape (views.vl:543), the one that had
-/// no spelling but `.swap(signal, |x| view)`.
+/// no spelling but a `swap(signal, |x| view)` over it.
 const CHILD_CONTRACT: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
 import std::ui::{ View, mount_root, view };
@@ -1742,14 +1742,14 @@ fn a71_the_anchor_is_an_empty_text_node() {
 /// `when` between two static siblings.
 const A71_WHEN: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view };
+import std::ui::{ View, mount_root, view, when };
 
 fun main() {
 	let show: SignalCell<bool> = Signal::new(false);
 	let _root = mount_root("app", || {
 		view("main")
 			.child(view("header").text("head"))
-			.when(show, || view("aside").text("cond"))
+			.child(when(show, || view("aside").text("cond")))
 			.child(view("footer").text("foot"))
 	});
 	print(i"off={tree()}");
@@ -1800,11 +1800,11 @@ fn a71_when_toggles_on_between_the_siblings_it_sits_between() {
     );
 }
 
-/// `bind_each` between a header row and a footer row, under every edit the
+/// `each` between a header row and a footer row, under every edit the
 /// reconciler distinguishes.
 const A71_ROWS: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view };
+import std::ui::{ View, each, mount_root, view };
 
 [derive(PartialEq)]
 struct Row {
@@ -1820,7 +1820,7 @@ fun main() {
 	let _root = mount_root("app", || {
 		view("ul")
 			.child(view("li").text("H"))
-			.bind_each(rows, |row: Row| row.id, |row: Row| view("li").text(row.label))
+			.child(each(rows, |row: Row| row.id, |row: Row| view("li").text(row.label)))
 			.child(view("li").text("F"))
 	});
 	print(i"start={tree()}");
@@ -1849,7 +1849,7 @@ main();
 /// reconciler's order pass can do, each of which used to re-append the whole
 /// run after the footer.
 #[test]
-fn a71_bind_each_rows_stay_between_the_header_and_the_footer() {
+fn a71_each_rows_stay_between_the_header_and_the_footer() {
     let harness = format!("{DOM_STUB}{POSITION_HARNESS_TAIL}");
     let stdout = build_and_run("a71_rows", A71_ROWS, &harness);
     let tree = |labels: &[&str]| {
@@ -1869,7 +1869,7 @@ fn a71_bind_each_rows_stay_between_the_header_and_the_footer() {
             ("reorder".to_string(), tree(&["c", "a"])),
             ("refresh".to_string(), tree(&["C", "a"])),
         ],
-        "`bind_each`'s rows must stay between the header and the footer under \
+        "`each`'s rows must stay between the header and the footer under \
          every edit; got:\n{stdout}"
     );
 }
@@ -1879,7 +1879,7 @@ fn a71_bind_each_rows_stay_between_the_header_and_the_footer() {
 const A71_RUN_AND_SWAP: &str = r#"import std::io::print;
 import std::range::Range;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view };
+import std::ui::{ View, mount_root, swap, view };
 
 fun main() {
 	let count: SignalCell<i32> = Signal::new(1);
@@ -1895,7 +1895,7 @@ fun main() {
 				run
 			}))
 			.child(view("hr"))
-			.swap(page, |n: i32| view("section").text(i"p{n}"))
+			.child(swap(page, |n: i32| view("section").text(i"p{n}")))
 			.child(view("footer").text("foot"))
 	});
 	print(i"start={tree()}");
@@ -2079,7 +2079,7 @@ fn a46_the_ssr_twin_serializes_a_fragment_as_its_run() {
 /// boundary is the thing that goes.
 const A88_PORTAL: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell, comp };
-import std::ui::{ View, mount, view };
+import std::ui::{ View, each, mount, swap, view, when };
 
 [derive(PartialEq)]
 struct Row {
@@ -2109,9 +2109,9 @@ fun main() {
 	let one: SignalCell<View> = Signal::new(view("u").text("u"));
 	let many: SignalCell<List<View>> = Signal::new([view("s").text("s")]);
 	let (_built, scope) = comp(|| {
-		when_host.when(flag, || view("aside").text("cond"));
-		swap_host.swap(page, |n: i32| view("article").text(i"p{n}"));
-		rows_host.bind_each(rows, |row: Row| row.id, |row: Row| view("li").text(row.label));
+		when_host.child(when(flag, || view("aside").text("cond")));
+		swap_host.child(swap(page, |n: i32| view("article").text(i"p{n}")));
+		rows_host.child(each(rows, |row: Row| row.id, |row: Row| view("li").text(row.label)));
 		signal_host.child(one);
 		run_host.child(many)
 	});
@@ -2194,7 +2194,7 @@ fn a88_the_anchors_go_with_the_content() {
             .count()
     };
     // Five region anchors, plus one marker per ROW (A91): the `when`'s
-    // instantiation, the `swap`'s subtree and the two `bind_each` rows are
+    // instantiation, the `swap`'s subtree and the two `each` rows are
     // rows and carry one each; the two reactive CHILD arms place the views
     // they were handed and carry none.
     assert_eq!(
@@ -2352,8 +2352,10 @@ fn a85_a_toggled_off_when_value_disposes_the_body_it_built() {
 
 /// A85 §3d: the server twin's value forms. A render is one pass in source
 /// order, so a value placed in a child hole writes its content exactly there —
-/// and the markup is what the METHOD chain below it produces, which is the
-/// claim the two halves are held to.
+/// and the markup is what the CHAIN below it produces, which is the claim the
+/// two halves are held to. A99 retired the `View` methods, so the second half
+/// is the element-syntax `{hole}` spelling of the same three values rather
+/// than `.each_values(..)`/`.when(..)`/`.swap(..)`.
 const A85_VALUE_FORMS_SSR: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
 import std::ui::{ View, each_values, render, swap, view, when };
@@ -2368,20 +2370,21 @@ fun main() {
 		.child(when(more, || view("b").text("M")))
 		.child(swap(page, |n: i32| view("section").text(i"p{n}")))
 		.child(view("footer").text("F"))));
-	print(render(view("main")
-		.child(view("header").text("H"))
-		.bind_each_values(rows, |item: str| view("li").text(item))
-		.when(more, || view("b").text("M"))
-		.swap(page, |n: i32| view("section").text(i"p{n}"))
-		.child(view("footer").text("F"))));
+	print(render(<main>
+		<header>"H"</header>
+		{each_values(rows, |item: str| view("li").text(item))}
+		{when(more, || view("b").text("M"))}
+		{swap(page, |n: i32| view("section").text(i"p{n}"))}
+		<footer>"F"</footer>
+	</main>));
 }
 
 main();
 "#;
 
-/// The twin renders what the value places, and the value form and the method
-/// form agree byte for byte — which they must, since the method IS the value
-/// form since A85.
+/// The twin renders what the value places, and the `child` spelling and the
+/// `{hole}` spelling agree byte for byte — which they must, since a hole IS a
+/// `child` call after the desugar.
 #[test]
 fn a85_the_ssr_twins_of_the_value_forms_render_what_the_methods_do() {
     let stdout = build_and_run_process("a85_value_forms_ssr", A85_VALUE_FORMS_SSR);
@@ -2391,7 +2394,7 @@ fn a85_the_ssr_twins_of_the_value_forms_render_what_the_methods_do() {
         stdout,
         format!("{expected}\n{expected}\n"),
         "the server twin must render a value form exactly where its hole is, \
-         and exactly as the method form does"
+         and exactly as the `child` form does"
     );
 }
 
@@ -2402,7 +2405,7 @@ fn a85_the_ssr_twins_of_the_value_forms_render_what_the_methods_do() {
 /// follow) — driven through a reorder-with-insert, a toggle and a removal.
 const A91_ROW_SHAPES: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view, when };
+import std::ui::{ View, each_values, mount_root, view, when };
 
 fun main() {
 	let rows: SignalCell<List<str>> = Signal::new(["a", "b"]);
@@ -2410,11 +2413,11 @@ fun main() {
 	let _root = mount_root("app", || {
 		view("main")
 			.child(view("header").text("H"))
-			.bind_each_values(rows, |item: str| [view("i").text(item), view("b").text(item)])
+			.child(each_values(rows, |item: str| [view("i").text(item), view("b").text(item)]))
 			.child(view("hr"))
-			.bind_each_values(rows, |item: str| item)
+			.child(each_values(rows, |item: str| item))
 			.child(view("em").text("E"))
-			.bind_each_values(rows, |item: str| when(flag, || view("u").text(item)))
+			.child(each_values(rows, |item: str| when(flag, || view("u").text(item))))
 			.child(view("footer").text("F"))
 	});
 	print(i"start={tree()}");
@@ -2511,8 +2514,9 @@ fn a91_a_row_costs_one_empty_text_marker() {
 }
 
 /// A91's server twin: the row renders what its `Slot` renders, in place, and a
-/// value-form row is a `when` that the server takes or drops. The method form
-/// and the value form agree, as they must.
+/// value-form row is a `when` that the server takes or drops. The `child`
+/// spelling and the element-syntax `{hole}` spelling agree, as they must (A99
+/// retired the `each_values` method the second half used to write).
 const A91_ROWS_SSR: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
 import std::ui::{ View, each_values, render, view, when };
@@ -2526,16 +2530,189 @@ fun main() {
 		.child(each_values(rows, |item: str| item))
 		.child(each_values(rows, |item: str| when(flag, || view("u").text(item))))
 		.child(view("footer").text("F"))));
-	print(render(view("main")
-		.child(view("header").text("H"))
-		.bind_each_values(rows, |item: str| [view("i").text(item), view("b").text(item)])
-		.bind_each_values(rows, |item: str| item)
-		.bind_each_values(rows, |item: str| when(flag, || view("u").text(item)))
-		.child(view("footer").text("F"))));
+	print(render(<main>
+		<header>"H"</header>
+		{each_values(rows, |item: str| [view("i").text(item), view("b").text(item)])}
+		{each_values(rows, |item: str| item)}
+		{each_values(rows, |item: str| when(flag, || view("u").text(item)))}
+		<footer>"F"</footer>
+	</main>));
 }
 
 main();
 "#;
+
+// --- A98: the order pass leaves an unmoved row alone -------------------------
+
+/// The counting tail. `__cost()` reports, and resets, the two numbers A98 is
+/// about: rows CUT out of the document by the order pass (one `extractContents`
+/// each) and rows BUILT from scratch (one `createElement` each, since every row
+/// here is one `<li>`). Before A98 the cut count was the whole live run on every
+/// pass, whatever the edit was.
+const A98_COST_HARNESS_TAIL: &str = r#"
+global.__cost = (() => {
+    let cut = 0;
+    let built = 0;
+    const element = document.createElement;
+    document.createElement = (tag) => { built += 1; return element(tag); };
+    const proto = Object.getPrototypeOf(document.createRange());
+    const extract = proto.extractContents;
+    proto.extractContents = function (...args) { cut += 1; return extract.apply(this, args); };
+    return () => { const line = `cut=${cut} built=${built}`; cut = 0; built = 0; return line; };
+})();
+global.__tree = () => flatten(documentRoot);
+require("./app.js");
+"#;
+
+/// Eight edits over one four-row run, each driven from the same starting list
+/// so the costs are comparable, and each printed as `pass|tree|cost`. The
+/// starting list is restored between them and that restore's cost is discarded:
+/// what is being measured is the edit, not the round trip.
+const A98_ORDER_PASS: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, each, mount_root, view };
+
+[derive(PartialEq)]
+struct Row {
+	id: i32,
+	text: str,
+}
+
+fun row(id: i32, text: str): Row {
+	Row { id = id, text = text }
+}
+
+fun main() {
+	let base: List<Row> = [row(1, "a"), row(2, "b"), row(3, "c"), row(4, "d")];
+	let rows: SignalCell<List<Row>> = Signal::new(base);
+	let _root = mount_root("app", || {
+		view("ul")
+			.child(view("li").text("H"))
+			.child(each(rows, |item: Row| item.id, |item: Row| view("li").text(item.text)))
+			.child(view("li").text("F"))
+	});
+	let _built = cost();
+
+	rows.set([row(1, "a"), row(2, "b"), row(3, "c"), row(4, "d"), row(5, "e")]);
+	print(i"append|{tree()}|{cost()}");
+	rows.set(base);
+	let _a = cost();
+
+	rows.set([row(0, "z"), row(1, "a"), row(2, "b"), row(3, "c"), row(4, "d")]);
+	print(i"prepend|{tree()}|{cost()}");
+	rows.set(base);
+	let _b = cost();
+
+	rows.set([row(2, "b"), row(3, "c"), row(4, "d")]);
+	print(i"remove-first|{tree()}|{cost()}");
+	rows.set(base);
+	let _c = cost();
+
+	rows.set([row(1, "a"), row(2, "b"), row(4, "d")]);
+	print(i"remove-middle|{tree()}|{cost()}");
+	rows.set(base);
+	let _d = cost();
+
+	rows.set([row(1, "a"), row(2, "B"), row(3, "c"), row(4, "d")]);
+	print(i"relabel|{tree()}|{cost()}");
+	rows.set(base);
+	let _e = cost();
+
+	rows.set([row(4, "d"), row(1, "a"), row(2, "b"), row(3, "c")]);
+	print(i"last-to-front|{tree()}|{cost()}");
+	rows.set(base);
+	let _f = cost();
+
+	rows.set([row(2, "b"), row(3, "c"), row(4, "d"), row(1, "a")]);
+	print(i"first-to-last|{tree()}|{cost()}");
+	rows.set(base);
+	let _g = cost();
+
+	rows.set([row(4, "d"), row(3, "c"), row(2, "b"), row(1, "a")]);
+	print(i"reverse|{tree()}|{cost()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+[extern("__cost")]
+external fun cost(): str;
+
+main();
+"#;
+
+/// A98: the order pass cuts and re-inserts only the rows that MOVED.
+///
+/// Both halves are asserted per pass, and both are needed. The COST is the
+/// claim — an append costs no cut at all where it used to cut the whole run —
+/// and the TREE is what says the cheaper pass still produced the right order,
+/// which a count alone cannot. The eight edits are the shapes a reconciled run
+/// actually takes; `reverse` is the control that is genuinely O(n) and must
+/// stay correct rather than get faster.
+///
+/// Non-vacuity: with the A98 skip removed (every row cut, every row
+/// re-inserted) the seven cheap lines read `cut=4`/`cut=3` and the pin is red
+/// seven times over.
+#[test]
+fn a98_the_order_pass_leaves_an_unmoved_row_alone() {
+    let harness = format!("{DOM_STUB}{A98_COST_HARNESS_TAIL}");
+    let stdout = build_and_run("a98_order_pass", A98_ORDER_PASS, &harness);
+    let seen: Vec<(String, Vec<String>, String)> = stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('|');
+            let name = parts.next()?.to_string();
+            let tree = nodes(parts.next()?);
+            let cost = parts.next()?.to_string();
+            Some((name, tree, cost))
+        })
+        .collect();
+    let tree = |labels: &[&str]| {
+        let mut expected = vec!["root".to_string(), "ul".to_string(), "li'H'".to_string()];
+        for label in labels {
+            expected.push(format!("li'{label}'"));
+        }
+        expected.push("li'F'".to_string());
+        expected
+    };
+    let expected: Vec<(String, Vec<String>, String)> = vec![
+        // An appended row: nothing already in the run moved, so nothing is cut,
+        // and the one new row is built before the anchor.
+        ("append", tree(&["a", "b", "c", "d", "e"]), "cut=0 built=1"),
+        // A prepended row: the four survivors are still in ascending order, so
+        // the new row is threaded in before the first one's marker.
+        ("prepend", tree(&["z", "a", "b", "c", "d"]), "cut=0 built=1"),
+        // A removal cuts exactly the row that is going, wherever it sat.
+        ("remove-first", tree(&["b", "c", "d"]), "cut=1 built=0"),
+        ("remove-middle", tree(&["a", "b", "d"]), "cut=1 built=0"),
+        // A changed value rebuilds that row alone: the cut is its own, and the
+        // three rows around it never move.
+        ("relabel", tree(&["a", "B", "c", "d"]), "cut=1 built=1"),
+        // One row dragged across the whole run, both directions. The backward
+        // scan settles the other three for the first, the forward scan for the
+        // second — which is why both scans exist.
+        (
+            "last-to-front",
+            tree(&["d", "a", "b", "c"]),
+            "cut=1 built=0",
+        ),
+        (
+            "first-to-last",
+            tree(&["b", "c", "d", "a"]),
+            "cut=1 built=0",
+        ),
+        // The control: a reverse genuinely moves everything but one row.
+        ("reverse", tree(&["d", "c", "b", "a"]), "cut=3 built=0"),
+    ]
+    .into_iter()
+    .map(|(name, tree, cost)| (name.to_string(), tree, cost.to_string()))
+    .collect();
+    assert_eq!(
+        seen, expected,
+        "A98: only a row whose position changed may be cut and re-inserted, and \
+         the run must still read in the new order; got:\n{stdout}"
+    );
+}
 
 #[test]
 fn a91_the_ssr_twin_renders_what_each_row_shape_renders() {

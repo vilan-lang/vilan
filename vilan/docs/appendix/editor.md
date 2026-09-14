@@ -177,7 +177,7 @@ sees it.
 
 ## Quick fixes
 
-Ten, each attached to the diagnostic that earns it:
+Eleven, each attached to the diagnostic that earns it:
 
 | Action | Offered on |
 |---|---|
@@ -191,6 +191,7 @@ Ten, each attached to the diagnostic that earns it:
 | ``Use `.md { … }` `` | ``@media (min-width: …)`` in a `css` block. The breakpoint is chosen by the query's own min-width, and an arbitrary one becomes `.media("900px")` rather than no fix. The other at-rules have no combinator spelling, so they get the explanation alone |
 | ``Declare the inferred contexts`` | ``…'s body reads context `b`, which this `context` clause does not declare`` — a `fun`'s declared `context` clause narrower than what its body reads. The refusal spells the clause the body needs and the fix writes exactly that, over the clause's own name list |
 | ``Remove `!important` `` | ``!important`` in a `css` block — a `Style` merges by record update, so a later declaration on the same property already wins. Takes the space before the marker with it |
+| ``Rewrite as `child(each(…))` `` | one of the six `View` methods A99 retired — `when`, `swap`, `swap_split`, `bind_each`, `bind_each_values`, `bind_each_by`. The edit covers the call alone, so the receiver, the chain around it and the arguments are untouched text; the `{each(…)}` hole the diagnostic also names is left to you, since whether a hole is right is a question about the markup around the call |
 
 and two source actions:
 

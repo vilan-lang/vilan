@@ -272,12 +272,6 @@ too.
 | `toggle_attr` | `(name: str, source: S): View`; `S: Source<bool>` | reactive BOOLEAN attribute — presence, not value (`inert`, `disabled`, `hidden`, `open`): present when true, removed when false |
 | `bind_value` | `(signal: SignalCell<str>): View` | two-way input bind — **concrete `Signal`**: it writes back |
 | `bind_draft` | `(draft: Draft<str>): View` | local-first input bind ([drafts](reactive.md#draft--local-first-cells)) |
-| `bind_each` | `(source: S, key: sync \|T\| K, render: (sync \|T\| C) context owner_scope): View`; `T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot` | keyed rows; each row is a disposal boundary |
-| `bind_each_values` | `(source: S, render: (sync \|T\| C) context owner_scope): View`; `T: PartialEq, S: Source<List<T>>, C: Slot` | `bind_each` keyed by the item itself |
-| `bind_each_by` | `(source: S, key: sync \|T\| K, render: (sync \|SignalCell<T>\| C) context owner_scope): View`; `K: PartialEq, S: Source<List<T>>, C: Slot` — **no bound on `T`** | keyed rows that UPDATE through the row's own cell instead of rebuilding |
-| `when` | `(condition: S, body: (sync \|\| C) context owner_scope): View`; `S: Source<bool>, C: Slot` | state-DROPPING conditional |
-| `swap` | `(source: S, render: (sync \|T\| C) context owner_scope): View`; `T: PartialEq, S: Source<T>, C: Slot` | dispose + rebuild per changed value |
-| `swap_split` | same signature as `swap`; `T: PartialEq, S: Source<T>, C: Slot` | `swap` that holds the current page until the next route's chunk has loaded; identical to `swap` in a build with no chunk map |
 | `show` | `(condition: S): View`; `S: Source<bool>` | state-PRESERVING visibility toggle — sets the `hidden` attribute AND an inline `display:none`, restoring the element's own inline `display` when it turns true |
 | `on_mount` | `(action: sync \|Element\| void): View` | run `action` with this element once it is in the document |
 | `autofocus` | `(): View` | focus this element once it is mounted AND rendered — the modal-input form HTML's `autofocus` cannot serve |
@@ -285,12 +279,13 @@ too.
 Semantics, choosing between `show`/`when`/`swap`, and examples: the
 [UI guide](../guide/ui.md).
 
-### Positional value forms
+### The slot values
 
-The five methods above APPEND: their content lands at the parent's current
-end. `std::ui` also exports each of them as a **value** that fills a child
-position, so a conditional or a keyed run can sit between siblings instead of
-after them:
+The conditional, the dynamic subtree and the keyed run are **values**, not
+`View` methods. Each fills a child position, so it sits exactly where it is
+written — between siblings, not after them. They are bare names in the
+`std::web` prelude, and `std::ui::{ when, swap, each, each_values, each_by }`
+otherwise:
 
 | function | signature | returns |
 |---|---|---|
@@ -301,9 +296,12 @@ after them:
 | `each_by` | `(source: S, key: sync \|T\| K, render: (sync \|SignalCell<T>\| C) context owner_scope)`; `K: PartialEq, S: Source<List<T>>, C: Slot` | `EachBy<T, K, S, C>` |
 
 Each returned struct implements `Slot`, so it fills any child
-position — including a `{hole}` in element syntax — and the five methods are
-one-line sugar over it (`self.child(when(..))`). Nothing about an existing
-call site changes; reach for the value where POSITION matters:
+position — including a `{hole}` in element syntax. To place one at the
+parent's current end instead, hand it to `child`: `parent.child(when(..))`.
+
+The `View` methods these replaced — `when`, `swap`, `swap_split`, `bind_each`,
+`bind_each_values`, `bind_each_by` — were retired; `parent.swap(s, r)` is now
+`parent.child(swap(s, r))` or `{swap(s, r)}` in a child hole:
 
 ```vilan,fragment
 view("ul")
@@ -313,7 +311,7 @@ view("ul")
 	.child(view("li").text("Footer"))
 ```
 
-The run named `each` rather than `bind_each`: the `bind_` prefix means "one
+The run is named `each` rather than `bind_each`: the `bind_` prefix means "one
 property kept in sync" everywhere else in the module, and a value that IS a
 child has no property to bind.
 
@@ -322,10 +320,10 @@ child has no property to bind.
 value form, and the run owns whatever the child placed:
 
 ```vilan,fragment
-view("ul").bind_each_values(items, |item: str| [
+view("ul").child(each_values(items, |item: str| [
 	view("li").text(item),
 	view("li").class("sep"),
-])
+]))
 ```
 
 The reconciler moves and removes a row by its SPAN — an empty text marker is
@@ -341,10 +339,9 @@ kind, so a helper that hands one back spells its concrete type —
 last argument being the row shape the closure yields. The closures are FIELDS,
 not type parameters, exactly so that type is nameable.
 
-**Ownership** is the methods' unchanged: the body of a `when`, the subtree of a
-`swap` and every row of an `each` run under a fresh owner established where the
-value is PLACED — not where it was built — and that owner is disposed with the
-instantiation.
+**Ownership**: the body of a `when`, the subtree of a `swap` and every row of an
+`each` run under a fresh owner established where the value is PLACED — not
+where it was built — and that owner is disposed with the instantiation.
 
 **`Region` — how a reactive child keeps its place.**
 
@@ -359,7 +356,7 @@ impl Region {
 ```
 
 Everything reactive above owns a *run* of sibling nodes: `when`'s
-instantiation, `swap`'s subtree, `bind_each`'s rows, a `Source<View>` child's
+instantiation, `swap`'s subtree, `each`'s rows, a `Source<View>` child's
 current view. Each opens a region where it is **called** — an empty text node
 planted at that moment — and inserts its content before that anchor, so the
 run keeps its position however the chain grows afterwards. You rarely name
@@ -394,9 +391,9 @@ impl Stored<type T> with Source<T> {
 ```
 
 `Stored<str>` now feeds `bind_text`, `bind_class`, `bind_attr`,
-`bind_styled`, `style_var`, `bind_each`, `bind_each_values`,
-`bind_each_by`, `when`, `show`, `swap`, `swap_split` and `chunk_preload`
-— on both the browser layer and the SSR twin.
+`bind_styled`, `style_var`, `show`, the five slot values (`when`, `swap`,
+`each`, `each_values`, `each_by`) and `chunk_preload` — on both the browser
+layer and the SSR twin.
 
 Two things deliberately still ask for the concrete type:
 

@@ -499,7 +499,7 @@ takes:
 import std::option::Option::{ None, Some, self };
 import std::reactive::{ Signal, SignalCell };
 import std::router::{ chunk_error, current_path, pending, segments };
-import std::ui::{ View, mount_root, view };
+import std::ui::{ View, mount_root, swap, view };
 
 [derive(PartialEq)]
 enum Route {
@@ -531,10 +531,10 @@ fun main() {
 				Some(let reason) => "Could not load that page: " + reason,
 				None => "",
 			})))
-			.swap(route, |current| match current {
+			.child(swap(route, |current| match current {
 				Route::Home => home_page(),
 				Route::NotFound => missing_page(),
-			})
+			}))
 	});
 }
 ```

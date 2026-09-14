@@ -18,7 +18,7 @@
 //! twin is ANALYZED on its platform, and the surface is read off the resulting
 //! `Program`: the module scope's bindings filtered to those DECLARED in that
 //! twin's own file (so the two halves' differing `import`s never read as
-//! divergence), plus the members of every type declared there — `View.swap_split`
+//! divergence), plus the members of every type declared there — `Region.host`
 //! is a real divergence that only the member half sees.
 //!
 //! **What it does not compare:** signatures. `on_event` is
@@ -195,26 +195,36 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
     ),
     (
         "ui",
-        "View.swap_split",
+        "swap_split",
         Side::BrowserOnly,
         "Emitter-selected, never written: a split build retargets a splittable \
-         route match's `swap` to this, and `chunks.rs` builds that gate only when \
-         the method exists (`view_method(program, \"swap_split\")`). No source \
-         names it and a process build never splits, so its absence degrades the \
-         gate away rather than breaking a build. CONTRAST `chunk_pending`, the \
-         one chunk-machinery name user code DOES bind (through \
-         `std::router::pending`) — it is mirrored on both sides, and its absence \
-         is exactly what E34 was filed for.",
+         route match's `swap` VALUE to this free function, and `chunks.rs` \
+         builds that gate only when it exists \
+         (`std_free_function(program, \"swap_split\")`). No source names it and \
+         a process build never splits, so its absence degrades the gate away \
+         rather than breaking a build. A99 folded `split_route` into it — the \
+         third name existed only because the retired `View.swap_split` METHOD \
+         shadowed this one inside its own `impl` block. CONTRAST \
+         `chunk_pending`, the one chunk-machinery name user code DOES bind \
+         (through `std::router::pending`) — it is mirrored on both sides, and \
+         its absence is exactly what E34 was filed for.",
     ),
     (
         "ui",
-        "swap_split",
+        "settled_steps",
         Side::BrowserOnly,
-        "A85: the VALUE form of `View.swap_split` above, and the same story — \
-         emitter-selected, never written. `chunks.rs` retargets a recognized \
-         `swap(route, |current| match current { .. })` VALUE to this free \
-         function, and builds that gate only when it exists. A process build \
-         never splits.",
+        "A98: which rows of a reconcile plan the ORDER PASS can leave where they \
+         are. The process twin has no order pass — a server render is one pass \
+         in source order and nothing it places ever moves — so there is no \
+         order for a row to be already in.",
+    ),
+    (
+        "ui",
+        "row_references",
+        Side::BrowserOnly,
+        "A98, with `settled_steps`: the marker each moved row is threaded in \
+         before. Browser-only for the same reason, and for the reason `Row` is \
+         empty on the process twin — there are no markers there to point at.",
     ),
     (
         "ui",
@@ -226,15 +236,6 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
          and the row is re-inserted on every order pass). The process twin's \
          `Region` holds its parent directly and has no anchor to read: a server \
          render is one pass in source order, so nothing it places ever moves.",
-    ),
-    (
-        "ui",
-        "split_route",
-        Side::BrowserOnly,
-        "A85, with `swap_split`: the gate's body under a name no `View` method \
-         shadows — `View::swap_split` cannot call the free `swap_split` from \
-         inside its own `impl` block, where that name is the method. Browser-only \
-         for the same reason the gate is.",
     ),
     // --- process-only ------------------------------------------------------
     (

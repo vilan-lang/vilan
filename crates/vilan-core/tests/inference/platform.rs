@@ -10292,7 +10292,7 @@ fn b304_a_generic_bound_by_an_ordinary_argument_still_fills_the_closure() {
     // The shape that must NOT change: `E` is bound by a non-closure argument
     // before the closure is typed, so the fill has a concrete type to give and
     // the parameter needs no annotation. Declining here would starve every
-    // `bind_each`-shaped call in the tree.
+    // `each`-shaped call in the tree.
     assert_compiles_and_runs(
         r#"
         import std::io::print;

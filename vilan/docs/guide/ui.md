@@ -69,23 +69,23 @@ static arms, and a reactive twin for each:
 That pairing is the whole contract: whatever may be a child statically
 may be a child reactively, and `{expr}` in element syntax means the same
 thing either way. The reactive arms register one subscription with the
-nearest boundary, so a `{signal}` child inside a `bind_each` row stops
+nearest boundary, so a `{signal}` child inside an `each` row stops
 replacing anything when the row is disposed — but the views themselves
 arrive already built, so each one's own bindings belong to the scope
-that *constructed* it. Reach for `.swap(source, |value| …)` when every
+that *constructed* it. Reach for `swap(source, |value| …)` when every
 subtree must be built and disposed per value; reach for a `Source<View>`
 child when the views are values the app already holds.
 
 **A reactive child keeps its place.** The replacement lands where the
 `{expr}` is written, not at the end of the parent — and so do `when`'s
-body, `swap`'s subtree and `bind_each`'s rows. Each plants an empty text
+body, `swap`'s subtree and `each`'s rows. Each plants an empty text
 node where it is called and inserts before it, so
 `<nav>{brand}{when(..)}{footer}</nav>` puts the conditional between the
 two, and it is still between them after it toggles off and on. No
 wrapper element, and nothing to remember about ordering.
 
 A `Source<List<View>>` is not a reconciler: it replaces the run rather
-than moving surviving rows. `bind_each` is the keyed form, and it is
+than moving surviving rows. `each` is the keyed form, and it is
 what a list of *data* wants.
 
 Text nodes make mixed content direct: prose around an inline element is
@@ -158,8 +158,8 @@ One rule governs the head — everything between `<tag` and `>`:
   every `data-*`/`aria-*` attribute is written in the same undotted form
   and emitted verbatim.
 - A **leading dot** is the chain, verbatim: `.styled(card)`,
-  `.bind_value(draft)`, `.show(flag)`, `.bind_each(rows, |r| r.id,
-  |r| row(r))`. Every `View` method works in head position — the dot is
+  `.bind_value(draft)`, `.show(flag)`, `.child(each(rows, |r| r.id,
+  |r| row(r)))`. Every `View` method works in head position — the dot is
   what keeps attributes and methods from ever colliding, so a new
   method can never change what existing markup means.
 - `on:click(handler)` is an event. A zero-parameter closure literal
@@ -180,12 +180,12 @@ arms, and takes postfix chains. The two forms mix freely —
 
 ```vilan,browser
 import std::reactive::{ Signal, SignalCell };
-import std::ui::{ View, mount_root, view };
+import std::ui::{ View, each, mount_root, view };
 
 fun panel(items: SignalCell<List<str>>, flag: SignalCell<bool>): View {
 	<section class("panel")>
 		<input placeholder("What needs doing?") />
-		<ul .bind_each(items, |t| t, |t| <li>{t}</li>) />
+		<ul>{each(items, |t| t, |t| <li>{t}</li>)}</ul>
 		<p .show(flag)>"empty"</p>
 	</section>
 }
@@ -230,7 +230,7 @@ Its type is where its uses are, and where its limits are. A fragment is
 a `List<View>`, so it fills a child position and every position a list
 fills, and a `Source<List<View>>` of fragments keeps its place like any
 other reactive child. It is **not** a `View`: a `fun …: View` return, a
-`when` body, a `swap` render and a `bind_each` row all want one view,
+`when` body, a `swap` render and an `each` row all want one view,
 and a fragment there is a type error that says so. It also does not
 flatten — a fragment written directly inside another is a list inside a
 list, which the literal refuses; nest through a child position instead.
@@ -238,8 +238,8 @@ list, which the literal refuses; nest through a child position instead.
 Components stay what they are — functions returning `View` — and are
 called in holes: `{todo_row(items, todo)}`. Reactivity stays explicit:
 an `if` or `match` inside a hole runs once at build, exactly as it does
-in a chain; reactive structure is `.show`/`.when`/`.swap`/`.bind_each`
-in head position, and `Signal` values in slots. The sugar adds no
+in a chain; reactive structure is `.show` in head position and the
+`when`/`swap`/`each` values in holes, with `Signal` values in slots. The sugar adds no
 semantics: an element means `std::ui::view` whatever the file has
 imported, so element syntax needs no `view` import of its own (a `View`
 you write as a TYPE still needs one, and the editor offers it), and
@@ -275,7 +275,7 @@ depth of function calls, registers with the nearest owner automatically
 (the [reactive guide](reactive.md) explains owners).
 
 If you create a reactive binding — a `bind_*`, a `Signal` in a slot, a
-`when`/`swap`/`bind_each` — outside any root, you'll get a compile
+`when`/`swap`/`each` — outside any root, you'll get a compile
 error mentioning `owner_scope`. It means "wrap this in `mount_root`"
 (or `run_with_owner` in a test). Purely static structure needs no
 boundary: `mount("app", view("div").child(view("p").text("hi")))` is
@@ -336,12 +336,13 @@ fun main() {
 }
 ```
 
-## Lists: `bind_each`
+## Lists: `each`
 
-`bind_each(source, key, render)` renders one row per element of any
+`each(source, key, render)` renders one row per element of any
 `Source<List<T>>` — a signal, a derived one, a mirror, a type of your own.
-Rows are **keyed**, like React's `key` prop, and the key does real work
-here:
+It is a **value**: write it in a child hole, or hand it to `child` to place
+the run at the parent's current end. Rows are **keyed**, like React's `key`
+prop, and the key does real work here:
 
 - A row whose key survives a change is reused. Its element moves to
   the new position with its state and subscriptions intact.
@@ -351,7 +352,7 @@ here:
   row's bindings die with the row.
 
 ```vilan,browser
-import std::ui::{ view, View, mount_root };
+import std::ui::{ each, view, View, mount_root };
 import std::reactive::{ Signal, SignalCell };
 
 [derive(PartialEq)]
@@ -365,38 +366,37 @@ fun main() {
 		Todo { id = 1, title = "write docs" },
 	]);
 	let _root = mount_root("app", || {
-		view("ul").bind_each(todos, |todo| todo.id, |todo| {
+		view("ul").child(each(todos, |todo| todo.id, |todo| {
 			view("li").text(todo.title)
-		})
+		}))
 	});
 }
 ```
 
 ```vilan,fragment
-fun bind_each<T: PartialEq, K: PartialEq, S: Source<List<T>>>(
-	self,
+fun each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
 	source: S,
 	key: sync |T| K,
-	render: (sync |T| View) context owner_scope,
-): View
+	render: (sync |T| C) context owner_scope,
+): Each<T, K, S, C>
 ```
 
 ### Three forms, one engine
 
-`bind_each` asks two things of your items — a key **and** an equality —
+`each` asks two things of your items — a key **and** an equality —
 and most lists only have one of them to give. The other two forms each
 drop one bound:
 
 | | Signature | Key | Unchanged row | Asks of `T` |
 |---|---|---|---|---|
-| `.bind_each(source, key, render)` | `render: \|T\| View` | `key(item)` | reused; changed → rebuilt | `PartialEq` |
-| `.bind_each_values(source, render)` | `render: \|T\| View` | the item itself | reused; changed → rebuilt | `PartialEq` |
-| `.bind_each_by(source, key, render)` | `render: \|SignalCell<T>\| View` | `key(item)` | **always** reused; the row's cell is rewritten | nothing |
+| `each(source, key, render)` | `render: \|T\| C` | `key(item)` | reused; changed → rebuilt | `PartialEq` |
+| `each_values(source, render)` | `render: \|T\| C` | the item itself | reused; changed → rebuilt | `PartialEq` |
+| `each_by(source, key, render)` | `render: \|SignalCell<T>\| C` | `key(item)` | **always** reused; the row's cell is rewritten | nothing |
 
-- **`bind_each_values`** is `bind_each(source, |x| x, render)` written
+- **`each_values`** is `each(source, |x| x, render)` written
   once. Reach for it whenever the item *is* the identity — every
   `|x| x` key in the wild is this.
-- **`bind_each_by`** is Solid's `<Index>` beside `bind_each`'s `<For>`.
+- **`each_by`** is Solid's `<Index>` beside `each`'s `<For>`.
   A row whose key survives keeps its element, its owner and its
   bindings, and std writes the new item into that row's own
   `SignalCell<T>`, so the row updates *through* the bindings `render`
@@ -406,12 +406,12 @@ drop one bound:
 
   The trade: `set` never compares, so **every** kept row's cell is
   written on every change of the list, and every binding in every row
-  re-runs. Reach for `bind_each` when `T` compares cheaply and rows are
-  expensive to rebuild; reach for `bind_each_by` when `T` can't compare,
+  re-runs. Reach for `each` when `T` compares cheaply and rows are
+  expensive to rebuild; reach for `each_by` when `T` can't compare,
   or when the row's own bindings are the natural update path.
 
 ```vilan,browser
-import std::ui::{ view, View, mount_root };
+import std::ui::{ each_by, each_values, view, View, mount_root };
 import std::reactive::{ Signal, SignalCell };
 
 struct Task {
@@ -427,11 +427,11 @@ fun main() {
 	let _root = mount_root("app", || {
 		view("div")
 			// the item is the key
-			.child(view("ul").bind_each_values(names, |name| view("li").text(name)))
+			.child(view("ul").child(each_values(names, |name| view("li").text(name))))
 			// `Task` needs no PartialEq: the row updates through its cell
-			.child(view("ol").bind_each_by(tasks, |task| task.id, |task| {
+			.child(view("ol").child(each_by(tasks, |task: Task| task.id, |task: SignalCell<Task>| {
 				view("li").bind_text(task.map(|current| current.title))
-			}))
+			})))
 	});
 }
 ```
@@ -440,8 +440,8 @@ fun main() {
 
 `view(..)` builds an element; it is not in the document until whatever
 appends it does. `.on_mount(action)` runs `action` with the element once
-it *is* — at every attachment site, including a `when` body or a
-`bind_each` row that appears in a later change.
+it *is* — at every attachment site, including a `when` body or an
+`each` row that appears in a later change.
 
 ```vilan,fragment
 view("input").attr("type", "text").on_mount(|element| element.focus())
@@ -510,16 +510,20 @@ outright. Showing again puts back the element's own inline `display`,
 captured before the first toggle. If you write this element's inline
 `display` yourself after binding `show`, the next toggle takes it: style
 through a `Style` and the two never meet.
-| `.when(condition, body)` | unmounted, disposed | dropped | content that shouldn't exist while off (an editor for a missing record) |
-| `.swap(source, render)` | previous subtree disposed on change | per-value | pages on a route signal, any value-driven subtree |
+| `when(condition, body)` | unmounted, disposed | dropped | content that shouldn't exist while off (an editor for a missing record) |
+| `swap(source, render)` | previous subtree disposed on change | per-value | pages on a route signal, any value-driven subtree |
+
+`show` is a `View` method — it binds a property of the element it is written
+on. `when` and `swap` are **values**: each fills a child position, so it lands
+exactly where it is written.
 
 ```vilan,fragment
-.show(open)                             // any Source<bool>
-.when(present, || task_editor(…))       // any Source<bool> + (sync || View)
-.swap(route, |current| match current {  // any Source<T> + (sync |T| View)
+.show(open)                            // any Source<bool>
+{when(present, || task_editor(…))}     // any Source<bool> + (sync || C: Slot)
+{swap(route, |current| match current { // any Source<T> + (sync |T| C: Slot)
 	Route::Home => home_page(),
 	Route::NotFound => not_found(),
-})
+})}
 ```
 
 `when` and `swap` build their content under a fresh owner each time, so
@@ -527,11 +531,10 @@ everything inside cleans up when the content goes away. `swap` re-renders
 only when the value *changes* (`T: PartialEq`), so navigating
 to the page you're already on does nothing.
 
-### Putting one BETWEEN siblings
+### Position, and placing one at the end
 
-Those are methods, so their content lands at the parent's current end. When
-the conditional or the run is one child among others, write it as a **value**
-in a child position instead. `std::ui` exports one per method —
+A value fills a child position, so the conditional or the run sits exactly
+among the siblings it is written between. `std::ui` exports five —
 `when`, `swap`, `each`, `each_values`, `each_by` — and each returns something
 that fills a child slot:
 
@@ -544,11 +547,12 @@ that fills a child slot:
 </ul>
 ```
 
-The methods are one-line sugar over these values, so both forms mean exactly
-the same thing — the method's content simply lands where `child` would have put
-it anyway. The run is called `each` rather than `bind_each` because `bind_`
-means "one property kept in sync" everywhere else, and a value that *is* a
-child has no property to bind.
+To place one at the parent's current *end* — where the retired `View` methods
+put it — hand it to `child`: `view("ul").child(each(rows, key, render))`. That
+is the mechanical rewrite for old code, since `parent.swap(s, r)` was never
+anything but `parent.child(swap(s, r))`. The run is called `each` rather than
+`bind_each` because `bind_` means "one property kept in sync" everywhere else,
+and a value that *is* a child has no property to bind.
 
 A helper that returns one names its type, since vilan has no trait objects —
 the last argument is the shape the closure yields (below):
@@ -593,11 +597,11 @@ many plain function calls sit in between:
 ├── view("header")                     static: no boundary of its own
 │     └─ .bind_text(title)             → registers with the ROOT
 │
-├── ◆ .swap(route, |page| …)           one owner PER PAGE shown
+├── ◆ {swap(route, |page| …)}         one owner PER PAGE shown
 │     └─ home_page()
 │           └─ .bind_text(…)           → registers with the PAGE
 │
-└── ◆ .bind_each(todos, key, |t| …)    one owner PER ROW
+└── ◆ {each(todos, key, |t| …)}        one owner PER ROW
       ├─ row(id = 1)
       │     └─ .bind_class(…)          → registers with ROW 1
       └─ row(id = 2)
@@ -612,7 +616,7 @@ them where subtrees end.
 
 **A boundary also removes what it placed.** Disposing it takes the
 nodes out of the document: `when`'s body, `swap`'s subtree,
-`bind_each`'s rows, a `{signal}` child's view or run or text node, and
+`each`'s rows, a `{signal}` child's view or run or text node, and
 the invisible marker each of them keeps its position with. That is
 usually invisible — the subtree was leaving with its parent anyway —
 and it is the whole story for a **portal**, a container that outlives
@@ -649,7 +653,7 @@ fun main() {
 
 Two rules make one component serve both legs:
 
-- **Bindings read once.** `bind_text`, `bind_attr`, `bind_each`, `when`, and
+- **Bindings read once.** `bind_text`, `bind_attr`, `each`, `when`, and
   `swap` embed the source's value *at render time*: no subscription is created,
   and nothing survives the request (create, serialize, discard). Build pure, bind
   reactive: a component that leans on effect side-channels at build time renders

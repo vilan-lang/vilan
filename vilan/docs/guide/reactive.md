@@ -173,7 +173,7 @@ fun main() {
 
 `selected.of(id)` hands back a `SignalCell<bool>` that drops into
 `.show`, `.when`, `.bind_class` or `.bind_styled`. Call it inside a
-`bind_each` row and the key's entry is released when the row is — the
+`each` row and the key's entry is released when the row is — the
 map stays the size of the live list. Full reference:
 [`std::reactive`](../std/reactive.md#selector--per-key-selection).
 
@@ -517,7 +517,7 @@ catches the cell mid-transition.
 
 `reconcile(old_keys, old_items, new_items, key, same)` computes a
 minimal update plan for keyed lists (keep this row, refresh that one,
-these are gone). It's the pure engine underneath `ui`'s `bind_each`.
+these are gone). It's the pure engine underneath `ui`'s `each`.
 You'd only call it directly to build your own list-rendering primitive.
 `key` decides identity — whether a row survives and moves — and `same`
 decides, for a surviving key, whether the row is reused or rebuilt;

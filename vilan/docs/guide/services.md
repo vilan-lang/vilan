@@ -260,7 +260,7 @@ reason: before the first update lands it has **no value**, and nothing
 about the type pretends otherwise. You read it one of four ways:
 
 - `mirror.or(initial): SignalCell<T>` — the common one, for a view. A plain
-  signal you hand to `bind_each`, `bind_text`, or a `{…}` hole: `initial`
+  signal you hand to `each`, `bind_text`, or a `{…}` hole: `initial`
   until the first sync, the mirrored value after. Write it inside the
   view (not in `main`), because it is a **subscription**: it opens the
   channel, and it is released when the view that created it is unmounted.
@@ -282,7 +282,7 @@ immediate call, and the channel's first frame is a change), `effect` /
 `effect_on_change`, and any generic `S: Source<…>` function, `selector`
 included. The trait argument is `Option<T>` because that is what a mirror
 holds; a `RemoteSource<List<Note>>` is therefore *not* a `Source<List<Note>>`,
-and `bind_each` still takes `mirror.or([])` rather than the mirror. `sub` has
+and `each` still takes `mirror.or([])` rather than the mirror. `sub` has
 one spelling per view of the value: `mirror.sub(|note| …)` is the inherent
 present-only one above, and the trait's `sub` — reached through a generic
 receiver — hands you the `Option<T>`. `map` and `or` stay inherent, which is
@@ -296,7 +296,7 @@ import std::reactive::{ Signal, SignalCell };
 import std::result::Result::{ self, Ok, Err };
 import std::rpc::SocketTransport;
 import std::shared::Shared;
-import std::ui::{ View, mount_root, view };
+import std::ui::{ View, each, mount_root, view };
 
 [derive(Wire, PartialEq, Debug)]
 struct Note {
@@ -315,7 +315,7 @@ fun notes_panel(client: NotesClient<SocketTransport>): View {
 	// open while — and only while — the panel is showing. `[]` until the
 	// first sync; the empty list takes its element type from the mirror.
 	let entries = client.entries.or([]);
-	view("ul").bind_each(entries, |note| note.id, |note| view("li").text(note.text))
+	view("ul").child(each(entries, |note| note.id, |note| view("li").text(note.text)))
 }
 
 async fun main() {
@@ -497,7 +497,7 @@ where two mirrors ended up sharing a channel because they named the same
 source, the first to let go withdraws nothing.
 
 Two consequences worth having in mind. A dispose and a remount anywhere
-inside one macrotask — two event handlers, a route change, a `bind_each`
+inside one macrotask — two event handlers, a route change, an `each`
 rebuilding rows — send **nothing**: a handle's close waits for the
 turn's settle and then one microtask, and a lease returning in that
 window cancels it. (A `[expose]`d field mirror keeps the prompter
@@ -612,7 +612,7 @@ because nothing is compared.
 swap one field for the other without breaking a deployed client. What changes
 is the cost per change per connection: 0.0078 ms at 1,000 rows and 0.0103 at
 10,000, where diffing the same edits costs 0.315 and 3.814 (children CPU).
-Bind it locally with `bind_each(messages, …)` — it is a `Source<List<T>>` with
+Bind it locally with `each(messages, …)` — it is a `Source<List<T>>` with
 no `Option` in it, because a cell always holds a collection.
 
 ### A keyed handle: a method that returns a `KeyedCell`
@@ -633,7 +633,7 @@ impl Board {
 
 // At the client — sync and unleased, exactly like a plain handle:
 let tasks: KeyedSource<i32, Task> = client.tasks_in("alpha");
-view("ul").bind_each(tasks.or([]), |task| task.id, |task| view("li").text(task.title))
+view("ul").child(each(tasks.or([]), |task| task.id, |task| view("li").text(task.title)))
 ```
 
 Everything a plain handle does, this one does at the keyed type: no call
@@ -658,7 +658,7 @@ client subscribed to**, in the server's order. It reads two ways.
 ```vilan,fragment
 fun feed(client: ChatClient<SocketTransport>): View {
 	let messages = client.messages.or([]);
-	view("ul").bind_each(messages, |message| message.id, |message| view("li").text(message.body))
+	view("ul").child(each(messages, |message| message.id, |message| view("li").text(message.body)))
 }
 ```
 
