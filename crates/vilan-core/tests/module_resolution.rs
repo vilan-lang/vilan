@@ -6392,3 +6392,145 @@ fn b279_the_file_filter_narrows_the_candidate_list_and_never_widens_it() {
         "the filter must SUBTRACT: {narrowed:?} vs {program_wide:?}"
     );
 }
+
+/// The P8 module set — two modules each declaring `impl Thing { fun tag }` —
+/// with the entry's body supplied per case.
+fn p8_files(app: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "a.vl",
+            "export struct Thing { x: i32 }\n\n\
+             export impl Thing {\n\tfun make(): Thing { Thing { x = 1 } }\n}\n"
+                .to_string(),
+        ),
+        (
+            "x.vl",
+            "import pkg::a::Thing;\n\nexport impl Thing {\n\tfun tag(self): i32 { 1 }\n}\n"
+                .to_string(),
+        ),
+        (
+            "z.vl",
+            "import pkg::a::Thing;\n\nexport impl Thing {\n\tfun tag(self): i32 { 2 }\n}\n"
+                .to_string(),
+        ),
+        ("app.vl", app.to_string()),
+    ]
+}
+
+fn analyze_p8(app: &str) -> Vec<String> {
+    let owned = p8_files(app);
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    analyze_package(&files, "app.vl", Platform::default())
+}
+
+/// B318 S4, `visibility.md` §3.2 — P8's pair is refused at the SECOND IMPORT of
+/// the file that takes both, with the selector named as the fix.
+///
+/// It used to be refused at the second DECLARATION, which made two independent
+/// packages that each extend one type mutually uninstallable: neither module is
+/// wrong, and neither author can see the other's. The refusal belongs where the
+/// fix is spellable.
+#[test]
+fn b318_p8s_pair_is_refused_at_the_second_import() {
+    let diagnostics = analyze_p8(
+        "import pkg::a::Thing;\nimport pkg::x;\nimport pkg::z;\n\n\
+         fun main() {\n\tlet _ = Thing::make().tag();\n}\n",
+    );
+    assert!(
+        diagnostics.iter().any(|message| message
+            .contains("'tag' is already defined for 'Thing' by module 'x'")
+            && message.contains("which this file also imports; a file may take only one")
+            && message
+                .contains("Select one — `import z::{ (impl Thing)::tag };` — or drop an import")),
+        "expected the import-site refusal naming the selector: {diagnostics:?}"
+    );
+}
+
+/// Each module imported ALONE is clean — the property the declaration-site rule
+/// could not have, since it saw whatever the program happened to load.
+#[test]
+fn b318_each_colliding_module_imported_alone_is_clean() {
+    for module in ["x", "z"] {
+        let diagnostics = analyze_p8(&format!(
+            "import pkg::a::Thing;\nimport pkg::{module};\n\n\
+             fun main() {{\n\tlet _ = Thing::make().tag();\n}}\n"
+        ));
+        assert!(
+            diagnostics.is_empty(),
+            "`{module}` alone should be clean: {diagnostics:?}"
+        );
+    }
+}
+
+/// And a SELECTOR resolves the pair in the file that wants both modules: the
+/// file takes `z`'s names and only `x`'s implementation.
+#[test]
+fn b318_a_selector_resolves_the_imported_pair() {
+    let diagnostics = analyze_p8(
+        "import pkg::a::Thing;\nimport pkg::x;\nimport pkg::z only;\n\n\
+         fun main() {\n\tlet _ = Thing::make().tag();\n}\n",
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "`only` on one of the two should resolve the pair: {diagnostics:?}"
+    );
+}
+
+/// The same-module case STAYS at the declaration (`visibility.md` §10 (i)): no
+/// import can separate two blocks of one file, so there is nothing an import
+/// site could say.
+#[test]
+fn b318_two_blocks_of_one_module_are_still_refused_at_the_declaration() {
+    let diagnostics = analyze_package(
+        &[
+            (
+                "a.vl",
+                "export struct Thing { x: i32 }\n\n\
+                 export impl Thing {\n\tfun tag(self): i32 { 1 }\n}\n\n\
+                 export impl Thing {\n\tfun tag(self): i32 { 2 }\n}\n",
+            ),
+            ("app.vl", "import pkg::a::Thing;\n\nfun main() {}\n"),
+        ],
+        "app.vl",
+        Platform::default(),
+    );
+    assert!(
+        diagnostics.iter().any(
+            |message| message.contains("'tag' is already defined for 'Thing'")
+                && message.contains("remove or rename this one")
+        ),
+        "one module declaring a name twice is still a declaration-site error: {diagnostics:?}"
+    );
+}
+
+/// The B74 geometry under the import-site rule: the file declares one block
+/// ITSELF and imports the other. There is one import, so that is where the
+/// refusal sits — and the note points at the declaration the file wrote, which
+/// is the sentence the duplicate family has always shown.
+#[test]
+fn b318_a_files_own_block_colliding_with_an_imported_one_is_refused_at_the_import() {
+    let diagnostics = analyze_package(
+        &[
+            (
+                "shape.vl",
+                "export struct Bag { n: i32 }\n\nexport impl Bag {\n\tfun new(): Bag { Bag { n = 1 } }\n}\n",
+            ),
+            (
+                "app.vl",
+                "import pkg::shape::Bag;\n\nimpl Bag {\n\tfun new(): Bag { Bag { n = 2 } }\n}\n\n\
+                 fun main() { let _ = Bag::new(); }\n",
+            ),
+        ],
+        "app.vl",
+        Platform::default(),
+    );
+    assert!(
+        diagnostics.iter().any(|message| message
+            .contains("'new' is already defined for 'Bag' by module 'shape'")
+            && message.contains("`import shape::{ (impl Bag)::new };`")),
+        "expected the import-site refusal naming `shape`: {diagnostics:?}"
+    );
+}

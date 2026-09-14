@@ -507,7 +507,7 @@ pub struct ExprMatchLeg {
 /// [`Analyzer::subjects_collide`] answers and what the duplicate-member message
 /// says (B315).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SubjectCollision {
+pub enum SubjectCollision {
     /// One subject written twice: the same type, or two binders bound the same
     /// way. The duplicate the rule has refused since B57.
     Same,
@@ -515,6 +515,31 @@ enum SubjectCollision {
     /// satisfies both, so both impls claim it and tier 1 takes whichever came
     /// first, unranked.
     OverlappingBounds,
+}
+
+/// B318 S4 — one INHERENT member name declared for one subject by two impls in
+/// DIFFERENT files, banked at the declaration and decided at the IMPORT.
+///
+/// The pair is not a defect of either module: two independent packages may each
+/// write `impl Style { fun helper(self) }` and both stay installable, which is
+/// the property `names.md` §4.6 forbade and the whole reason the per-importer
+/// namespace is worth its cost (`visibility.md` §3.7). It becomes a problem
+/// only in a FILE that admits both, so that is where it is reported —
+/// [`refuse_imported_member_collisions`].
+#[derive(Clone, Debug)]
+pub struct MemberCollision {
+    /// The member name both blocks declare.
+    pub member: String,
+    /// The earlier declaration, and the file it is written in.
+    pub first: Id,
+    pub first_source: SourceId,
+    /// The later declaration, and its file.
+    pub second: Id,
+    pub second_source: SourceId,
+    /// The subject as the message prints it.
+    pub subject: String,
+    /// Which way the two subjects claim the same receivers (B315/B330).
+    pub collision: SubjectCollision,
 }
 
 // A fully resolved match pattern, ready for code generation.
@@ -3459,6 +3484,11 @@ pub struct Analyzer<'src> {
     /// that writes neither `only` nor a selector, which is every file in the
     /// estate today.
     import_impl_restrictions: Vec<ImportImplRestriction>,
+    /// B318 S4: the cross-module inherent collisions the declaration-site rule
+    /// banks for the IMPORT pass ([`MemberCollision`]). Empty for every program
+    /// in which no two files declare one inherent name for one subject — the
+    /// whole estate, which is what keeps the import pass free.
+    cross_module_collisions: Vec<MemberCollision>,
     trait_by_declaration: HashMap<Id, Id>,
     module_id_by_name: HashMap<&'src str, Id>,
     // Multi-package namespace isolation (P2). `packages[i]` is a loaded package —
@@ -5380,6 +5410,7 @@ impl<'src> Analyzer<'src> {
             implementation_by_declaration: HashMap::default(),
             impl_namespaces: Vec::new(),
             import_impl_restrictions: Vec::new(),
+            cross_module_collisions: Vec::new(),
             trait_by_declaration: HashMap::default(),
             module_id_by_name: HashMap::default(),
             packages: Vec::new(),
@@ -7650,15 +7681,75 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
-        let duplicates = duplicates
-            .into_iter()
-            .map(|(member_name, first_id, second_id, subject, collision)| {
-                let subject_label =
-                    self.pretty_print_type(&subject.get_type(self), &HashMap::default());
-                (member_name, first_id, second_id, subject_label, collision)
-            })
-            .collect();
-        self.report_duplicate_declarations(duplicates);
+        // B318 S4 — the CROSS-MODULE half leaves here.
+        //
+        // `names.md` §4.6's "a type has ONE namespace" was, in the shipped
+        // compiler, one namespace per PROGRAM: an impl registers when its file
+        // LOADS, so this check saw every block any file happened to pull in and
+        // refused a pair two independent packages could each legitimately
+        // declare. The per-importer namespace moves that question to the file
+        // that actually takes both — `visibility.md` §3.2, refused at the
+        // IMPORT, where the fix (a selector) lives and where the answer is a
+        // DEFINITION-ORDER-INDEPENDENT fact about one file. What stays here is
+        // the SAME-MODULE case (§10 (i)): a module that declares one name twice
+        // for one subject is refused at the declaration, as it always was,
+        // because no import can separate two blocks of one file.
+        //
+        // A COMPILER-SYNTHESIZED member (`DERIVED_SOURCE`) belongs to the file
+        // its attribute was written in, which is what
+        // `declaring_module_source` resolves — a backed enum's `value`/`parse`
+        // colliding with a hand-written one is a same-module pair and must not
+        // be deferred to an import that does not exist.
+        let mut same_module = Vec::new();
+        for (member_name, first_id, second_id, subject, collision) in duplicates {
+            let subject_label =
+                self.pretty_print_type(&subject.get_type(self), &HashMap::default());
+            if self.declaring_module_source(first_id) == self.declaring_module_source(second_id) {
+                same_module.push((member_name, first_id, second_id, subject_label, collision));
+                continue;
+            }
+            // The same frozen-std skip the reporting half keeps (S1), applied
+            // where the row is BANKED so the scoped and full-scan checks agree
+            // about what the import pass will see.
+            if self.frozen_entity(second_id) {
+                continue;
+            }
+            let (Some(first_source), Some(second_source)) = (
+                self.declaring_module_source(first_id),
+                self.declaring_module_source(second_id),
+            ) else {
+                continue;
+            };
+            self.cross_module_collisions.push(MemberCollision {
+                member: member_name.to_string(),
+                first: first_id,
+                first_source,
+                second: second_id,
+                second_source,
+                subject: subject_label,
+                collision,
+            });
+        }
+        self.report_duplicate_declarations(same_module);
+    }
+
+    /// The file a declaration BELONGS TO for the duplicate rules — its own
+    /// file, or, for a compiler-synthesized member, the file whose attribute
+    /// generated it.
+    ///
+    /// [`Self::source_of_id`] answers [`DERIVED_SOURCE`] for generated code,
+    /// which is not a file any import can reach: a synthesized `value` and a
+    /// hand-written one are two declarations of ONE module and have to be
+    /// refused where they are written.
+    fn declaring_module_source(&self, id: Id) -> Option<SourceId> {
+        match self.source_of_id(id) {
+            Some(DERIVED_SOURCE) => self
+                .derived_origins
+                .iter()
+                .find(|(range, _, _)| range.contains(&id.0))
+                .map(|(_, _, source)| *source),
+            other => other,
+        }
     }
 
     /// **One module may declare a name once (B212).** Two `struct N`, two
@@ -47953,6 +48044,10 @@ pub struct Program<'src> {
     /// files wrote, DRAINED by [`build_impl_admission`] after the program is
     /// built. Empty for a program that writes neither.
     pub import_impl_restrictions: Vec<ImportImplRestriction>,
+    /// B318 S4: the cross-module inherent collisions, banked at the declaration
+    /// and refused at the IMPORT of whichever file admits both
+    /// ([`refuse_imported_member_collisions`]).
+    pub cross_module_collisions: Vec<MemberCollision>,
     /// B318 S3: per `(importing file, selector span)`, the impl MEMBERS that
     /// selector admitted — the answer Organize Imports asks for when it decides
     /// whether a selector is used (`visibility.md` §7.2). Filled by
@@ -56976,6 +57071,7 @@ fn analyze_over_world<'src>(
         global_scope_id,
         implementations: analyzer.implementations,
         import_impl_restrictions: std::mem::take(&mut analyzer.import_impl_restrictions),
+        cross_module_collisions: std::mem::take(&mut analyzer.cross_module_collisions),
         impl_selector_members: HashMap::default(),
         impl_admission: ImplAdmission::default(),
         generic_bounds: analyzer.generic_bounds,
@@ -57253,15 +57349,26 @@ pub fn check_view_suspensions(program: &mut Program, graph: &crate::call_graph::
 /// predicate, both readings, and no new type machinery.
 pub fn build_impl_admission(program: &mut Program) {
     let statements = std::mem::take(&mut program.import_impl_restrictions);
-    // The estate's path: nothing wrote `only` and nothing wrote a selector, so
-    // there is no file whose method surface differs from today's.
+    // The estate's path: nothing wrote `only`, nothing wrote a selector, and no
+    // two files declare one inherent name for one subject — so there is no file
+    // whose method surface differs from today's and nothing to decide.
     let restricting: HashSet<SourceId> = statements
         .iter()
         .filter(|row| row.only.is_some() || !row.selectors.is_empty())
         .map(|row| row.source)
         .collect();
-    if restricting.is_empty() {
+    if restricting.is_empty() && program.cross_module_collisions.is_empty() {
         return;
+    }
+    // `statement_sources` reads a span's definition out of `type_references`,
+    // which is a flat `Vec` of every reference the program recorded: asked once
+    // per path segment of every import statement, that product is the pass. One
+    // index, built once, answers each of them in a probe.
+    let mut references: HashMap<(SourceId, Span), Id> = HashMap::default();
+    for (source, span, definition, _) in &program.type_references {
+        if let Some(definition) = definition {
+            references.entry((*source, *span)).or_insert(*definition);
+        }
     }
     // Per (importing file, restricted file): the member ids the file's
     // selectors admitted out of that file. An entry's absence is "unrestricted".
@@ -57269,11 +57376,23 @@ pub fn build_impl_admission(program: &mut Program) {
     let mut selector_of: HashMap<(SourceId, SourceId), String> = HashMap::default();
     let mut selector_members: HashMap<(SourceId, Span), Vec<Id>> = HashMap::default();
     let mut unrestricted: HashSet<(SourceId, SourceId)> = HashSet::default();
+    // Per statement, the files its walk carried — the input the collision
+    // refusal reads, and the same answer the admission loop below computes.
+    // Built for EVERY statement only when a collision is banked; otherwise only
+    // the restricting files' statements are walked, as before.
+    let mut carried: Vec<(SourceId, Span, Vec<SourceId>)> = Vec::new();
+    let collisions = std::mem::take(&mut program.cross_module_collisions);
     for row in &statements {
+        if !restricting.contains(&row.source) && collisions.is_empty() {
+            continue;
+        }
+        let sources = statement_sources(program, &references, row);
+        if !collisions.is_empty() {
+            carried.push((row.source, row.span, sources.clone()));
+        }
         if !restricting.contains(&row.source) {
             continue;
         }
-        let sources = statement_sources(program, row);
         if row.only.is_none() && row.selectors.is_empty() {
             for module in sources {
                 unrestricted.insert((row.source, module));
@@ -57317,14 +57436,195 @@ pub fn build_impl_admission(program: &mut Program) {
         selector_of.remove(&key);
     }
     program.impl_selector_members = selector_members;
-    if restricted.is_empty() {
-        return;
-    }
     program.impl_admission = ImplAdmission {
         restricting,
         admitted: restricted,
         selector_of,
     };
+    if !collisions.is_empty() {
+        refuse_imported_member_collisions(program, &collisions, &carried);
+    }
+}
+
+/// B318 S4, `visibility.md` §3.2 — **two admitted impls declaring one inherent
+/// name for one subject are a refusal at the IMPORT**, spanned on the second
+/// import statement, naming both blocks and the selector that resolves them.
+///
+/// Refused at the import and not at the call, for the paper's three reasons.
+/// (1) The import list is where the file expresses its intent, and it is the
+/// only place the fix lives: the fix IS a selector, and a selector is written
+/// in an import. (2) A call-site refusal fires N times for one mistake and
+/// fires only on the paths a file happens to exercise, so a file can be
+/// half-broken. (3) It keeps the refusal a DEFINITION-ORDER-INDEPENDENT fact
+/// about one file, which is the whole reason B57 exists — "which one dies is
+/// decided by the order the modules happened to load in" is the thing being
+/// removed, not relocated.
+///
+/// A file admits a block when one of its import statements CARRIED the block's
+/// file (today's meaning: the leaf's file and every file on the path to it,
+/// `names.md` §4.1) and its own selectors did not decline the member. So the
+/// same two modules are clean in every file that takes one of them, and in
+/// every file that takes neither — which is the property that lets two
+/// independent packages each extend one type and both stay installable.
+fn refuse_imported_member_collisions(
+    program: &mut Program,
+    collisions: &[MemberCollision],
+    carried: &[(SourceId, Span, Vec<SourceId>)],
+) {
+    let mut violations: Vec<(Error, SourceId, Option<crate::error::Note>)> = Vec::new();
+    for collision in collisions {
+        for importer in program
+            .source_ranges
+            .iter()
+            .map(|range| range.source)
+            .collect::<Vec<_>>()
+        {
+            // The statement that brought each block in. A file DECLARING one of
+            // them needs no import for it: its own blocks are always its own.
+            let statement_for = |source: SourceId| -> Option<Option<Span>> {
+                if source == importer {
+                    return Some(None);
+                }
+                carried
+                    .iter()
+                    .filter(|(file, _, sources)| *file == importer && sources.contains(&source))
+                    .map(|(_, span, _)| Some(*span))
+                    .next()
+            };
+            let (Some(first_at), Some(second_at)) = (
+                statement_for(collision.first_source),
+                statement_for(collision.second_source),
+            ) else {
+                continue;
+            };
+            if !program.impl_admission.admits_member(
+                importer,
+                collision.first_source,
+                collision.first,
+            ) || !program.impl_admission.admits_member(
+                importer,
+                collision.second_source,
+                collision.second,
+            ) {
+                continue;
+            }
+            let member = &collision.member;
+            // Where the refusal sits, and what the C3 note points at. Two
+            // geometries, and they want different notes.
+            //
+            // BOTH BLOCKS IMPORTED: the LATER statement carries the refusal and
+            // the earlier one carries the note, which is the duplicate family's
+            // own shape one construct over — the second occurrence is reported,
+            // naming the first.
+            //
+            // ONE BLOCK THIS FILE'S OWN: there is only one import, so it is
+            // where the message goes, and the note points at the DECLARATION —
+            // the file wrote that block, it can read it, and "already defined
+            // here" is the sentence it has always been shown.
+            let own_declaration = |member_id: Id| -> Option<crate::error::Note> {
+                Some(crate::error::Note {
+                    span: program
+                        .functions
+                        .get(&member_id)
+                        .map(|function| function.name_span)
+                        .or_else(|| program.span_map.get(&member_id).map(|span| **span))?,
+                    msg: format!("'{member}' is already defined here"),
+                    source: Some(importer),
+                })
+            };
+            let arrives_here = |span: Span| -> Option<crate::error::Note> {
+                Some(crate::error::Note {
+                    span,
+                    msg: format!("'{member}' arrives with this import too"),
+                    source: Some(importer),
+                })
+            };
+            // (the refusal's span, the module the SELECTOR fix names, the
+            // module the claim names, the note).
+            let (here, here_source, other_source, note) = match (first_at, second_at) {
+                (Some(first), Some(second)) if first.start > second.start => (
+                    first,
+                    collision.first_source,
+                    collision.second_source,
+                    arrives_here(second),
+                ),
+                (Some(first), Some(second)) => (
+                    second,
+                    collision.second_source,
+                    collision.first_source,
+                    arrives_here(first),
+                ),
+                (Some(first), None) => (
+                    first,
+                    collision.first_source,
+                    collision.first_source,
+                    own_declaration(collision.second),
+                ),
+                (None, Some(second)) => (
+                    second,
+                    collision.second_source,
+                    collision.second_source,
+                    own_declaration(collision.first),
+                ),
+                (None, None) => continue,
+            };
+            let subject = &collision.subject;
+            let other = module_stem(program, other_source);
+            let selected = module_stem(program, here_source);
+            let fix = format!("`import {selected}::{{ (impl {subject})::{member} }};`");
+            let claim = match collision.collision {
+                SubjectCollision::Same => format!(
+                    "'{member}' is already defined for '{subject}' by module '{other}', which \
+                     this file also imports; a file may take only one. Select one — {fix} — or \
+                     drop an import"
+                ),
+                // B315/B330: the two bound clauses differ, so "already defined"
+                // would read as a mistake about what the compiler saw.
+                SubjectCollision::OverlappingBounds => format!(
+                    "'{member}' is declared for '{subject}' by two blanket impls whose bounds \
+                     OVERLAP, one of them module '{other}''s, and this file imports both: a type \
+                     satisfying both clauses matches both impls, and an inherent member is taken \
+                     from the first without ranking. Select one — {fix} — or drop an import"
+                ),
+            };
+            violations.push((
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: here,
+                    msg: claim,
+                },
+                importer,
+                note,
+            ));
+        }
+    }
+    violations.sort_by_key(|(error, source, _)| (source.0, error.span.start, error.span.end));
+    violations.dedup_by_key(|(error, source, _)| (source.0, error.span, error.msg.clone()));
+    for (mut error, source, note) in violations {
+        error.note = note;
+        program.push_diagnostic(error, source);
+    }
+}
+
+/// A source's module NAME as a diagnostic spells it — its file stem, which is
+/// what `names.md` makes the module's name for every layout the loader admits
+/// (`<name>.vl`, and `<name>/lib.vl`'s parent directory).
+fn module_stem(program: &Program, source: SourceId) -> String {
+    program
+        .canonical_sources
+        .get(source.0 as usize)
+        .and_then(|path: &std::path::PathBuf| {
+            match path.file_stem().and_then(|stem| stem.to_str()) {
+                Some("lib") => path
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str()),
+                stem => stem,
+            }
+        })
+        .unwrap_or("that module")
+        .to_string()
 }
 
 /// B318 S3/S4 — the refusal a CALL earns when the method it resolved to comes
@@ -57430,17 +57730,14 @@ pub fn check_call_site_admission(program: &mut Program) {
 /// import brings: `names.md` §4.1's "a child pulls its parent" loads every file
 /// on the way, and probe P7's whole point is that an intermediate module's
 /// `impl` arrives with it. `only` declines the lot.
-fn statement_sources(program: &Program, restriction: &ImportImplRestriction) -> Vec<SourceId> {
+fn statement_sources(
+    program: &Program,
+    references: &HashMap<(SourceId, Span), Id>,
+    restriction: &ImportImplRestriction,
+) -> Vec<SourceId> {
     let mut sources: Vec<SourceId> = Vec::new();
     for span in &restriction.path_spans {
-        let Some(Some(definition)) =
-            program
-                .type_references
-                .iter()
-                .find_map(|(source, at, id, _)| {
-                    (*source == restriction.source && at == span).then_some(*id)
-                })
-        else {
+        let Some(definition) = references.get(&(restriction.source, *span)).copied() else {
             continue;
         };
         let Some(home) = program.source_of(definition) else {
