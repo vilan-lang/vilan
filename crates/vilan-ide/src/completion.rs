@@ -253,6 +253,11 @@ pub const KEYWORD_DOCS: &[(&str, &str, &str)] = &[
         "tour/values-and-types.html#bindings",
     ),
     (
+        "lazy",
+        "Defers a parameter's argument to the callee's first read of it, evaluated at most once.",
+        "tour/functions-and-closures.html#lazy-parameters",
+    ),
+    (
         "mut",
         "Binds a mutable value, one that can be reassigned.",
         "tour/values-and-types.html#bindings",
@@ -399,6 +404,7 @@ pub fn keyword_lexeme(token: &Token) -> Option<&'static str> {
         Token::In => "in",
         Token::Is => "is",
         Token::Jump => "jump",
+        Token::Lazy => "lazy",
         Token::Let => "let",
         Token::Macro => "macro",
         Token::Match => "match",

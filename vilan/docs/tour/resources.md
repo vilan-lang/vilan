@@ -296,6 +296,64 @@ fun main() {
 A *local* resource is different: a closure that captures one would become a
 second owner, so that stays rejected (below).
 
+## Lazy resources
+
+The module-level idiom above opens the database when the module loads —
+before `main` runs, and whether or not anything asks for it. That is
+usually what you want, and it stays the idiom. When it is not — a
+connection a CLI opens only on the subcommands that read, a file a test
+binary never touches — write `lazy` in front of the binding and the
+initializer waits for the first use:
+
+```vilan,norun
+import std::db::{ Database, Row };
+import std::option::Option::{ self, Some, None };
+
+lazy let db: Database = Database::open("app.db");
+
+fun count_items(): i32 {
+	let statement = db.prepare("SELECT COUNT(*) AS n FROM items");
+	match statement.first([]) {
+		Some(let row) => row.integer("n"),
+		None => 0,
+	}
+}
+
+fun main() {
+	print("starting");          // the database is not open yet
+	print(i"items: {count_items()}");
+}
+```
+
+The first statement that reads `db` runs `Database::open` and remembers
+the handle; every later read is the same handle. A program that never
+reads it never opens anything.
+
+**Nothing else about the binding changes.** It is still the module's,
+still process-lifetime, still loan-only and never dropped, closures still
+reach it per call, and it still colors the program's platform from its
+initializer — a `lazy` binding that reaches `std::db` still marks the
+entry as needing the process layer. `lazy` moves *when* one thing happens
+and nothing else.
+
+Two things follow from the initializer running later:
+
+- **It must be self-contained**: synchronous, and reading no ambient
+  context. First use can be anywhere, so the deferred code cannot depend
+  on where that turns out to be.
+- **It runs at most once, even when it fails.** An initializer that
+  panics *poisons* the binding: the panic propagates at the site that
+  touched it, and every later touch re-panics naming the poison, rather
+  than re-running the failed work. An initializer that reads its own
+  binding — directly or through something it calls — panics with `lazy
+  initialization cycle: `db``, instead of hanging.
+
+`lazy` is for module bindings, not locals: a local that might never have
+been initialized has no honest answer for what to destroy at the end of
+its scope. It also defers an *argument*, which is the same idea in the
+other position — see [lazy
+parameters](functions-and-closures.md#lazy-parameters).
+
 ## Owning background work: `OwnedNursery`
 
 A closure can't capture a *local* resource (it would become a second owner),

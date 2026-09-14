@@ -4450,6 +4450,13 @@ impl<'src> Printer<'src> {
             if index > 0 {
                 self.out.push_str(", ");
             }
+            // `lazy` is the outermost prefix: it says what the CALL SITE does
+            // with the argument, ahead of how the callee receives it
+            // (lazy.md §1). Exclusive with every prefix below it by the
+            // grammar, so writing it here cannot double up.
+            if parameter.lazy {
+                self.out.push_str("lazy ");
+            }
             // `mut` (binder mutability) and the conventions are exclusive by
             // the grammar, so at most one prefix prints.
             if parameter.mutable {
@@ -4585,7 +4592,7 @@ impl<'src> Printer<'src> {
             | Node::Await(_)
             | Node::Async(_) => 10,
             Node::Assign(_, _, _)
-            | Node::Let(_, _, _, _)
+            | Node::Let(_, _, _, _, _)
             | Node::Closure(_)
             | Node::If(_)
             | Node::For(_, _)
@@ -6392,7 +6399,14 @@ impl<'src> Printer<'src> {
                 self.out.push_str("const ");
                 self.print_split_operand(inner, 0, split);
             }
-            Node::Let(name, declared_type, value, mutable) => {
+            Node::Let(name, declared_type, value, mutable, lazy) => {
+                // `lazy` precedes the binder word, as it does on a parameter
+                // (lazy.md §2). It is a keyword with no node of its own beyond
+                // the flag, so dropping it here would silently turn a deferred
+                // initializer into a load-time one.
+                if *lazy {
+                    self.out.push_str("lazy ");
+                }
                 self.out.push_str(if *mutable { "mut " } else { "let " });
                 self.out.push_str(name.0);
                 if let Some(declared_type) = declared_type {
@@ -8120,6 +8134,42 @@ mod bailing_constructs {
              \tSignal::new(sources)\n\
              }\n",
         );
+    }
+
+    /// `lazy message: str` — a lazy parameter (lazy.md §1). It is a keyword with
+    /// no node of its own beyond the flag, so a dropped one is silent token
+    /// drift that would change the program's meaning (an argument that ran at
+    /// the call instead of inside the callee). Pinned in all three homes it is
+    /// legal in, and beside an eager parameter so the prefix is not printed for
+    /// the wrong one.
+    #[test]
+    fn lazy_parameters() {
+        assert_construct(
+            "fun expect_positive(value: i32, lazy complaint: str): i32 {\n\tvalue\n}\n",
+            "fun expect_positive(value: i32, lazy complaint: str): i32 {\n\tvalue\n}\n",
+        );
+        assert_construct(
+            "trait Complainer {\n\tfun complain(self, lazy message: str): str;\n}\n",
+            "trait Complainer {\n\tfun complain(self, lazy message: str): str;\n}\n",
+        );
+        assert_construct(
+            "impl Thing {\n\tfun say(self, lazy message: str): str {\n\t\tmessage\n\t}\n}\n",
+            "impl Thing {\n\tfun say(self, lazy message: str): str {\n\t\tmessage\n\t}\n}\n",
+        );
+    }
+
+    /// `lazy let name: T = init;` — a lazy MODULE binding (lazy.md §2). Same
+    /// token-drift risk as the parameter above, with a larger consequence: a
+    /// dropped `lazy` moves the initializer from first use back to module load.
+    #[test]
+    fn lazy_module_bindings() {
+        assert_construct(
+            "lazy let database: Database = Database::open(\"kolt.db\");\n",
+            "lazy let database: Database = Database::open(\"kolt.db\");\n",
+        );
+        assert_construct("lazy let count = 1;\n", "lazy let count = 1;\n");
+        // The eager neighbour is untouched.
+        assert_construct("let count = 1;\n", "let count = 1;\n");
     }
 
     /// `void` written as a VALUE prints as `void`; the `Void` the parser

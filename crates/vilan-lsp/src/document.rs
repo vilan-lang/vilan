@@ -10939,6 +10939,20 @@ pub(crate) mod tests {
         assert!(hover.contains("sep: str"), "{hover}");
     }
 
+    // `lazy` rides the hover for the spread marker's reason (lazy.md §5, "hover
+    // renders `lazy` in signatures like the other effect surface"): it is part
+    // of the signature, and it is precisely what tells the reader whether their
+    // argument runs at the call or inside the callee.
+    #[test]
+    fn hover_shows_a_lazy_parameters_modifier() {
+        let hover = hover_at_cursor(
+            "fun expect_positive(value: i32, lazy complaint: str): i32 {\n\tvalue\n}\n\nfun main() {\n\texpect_pos|itive(1, \"no\");\n}\n",
+        )
+        .expect("hovering `expect_positive` should produce a label");
+        assert!(hover.contains("lazy complaint: str"), "{hover}");
+        assert!(hover.contains("value: i32"), "{hover}");
+    }
+
     // The declaration name carries the requirement too, not just call sites.
     #[test]
     fn hover_on_the_definition_name_carries_the_requirement() {

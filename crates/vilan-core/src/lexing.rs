@@ -76,6 +76,7 @@ pub const KEYWORDS: &[(&str, Token<'static>)] = &[
     ("in", Token::In),
     ("is", Token::Is),
     ("jump", Token::Jump),
+    ("lazy", Token::Lazy),
     ("let", Token::Let),
     ("macro", Token::Macro),
     ("match", Token::Match),

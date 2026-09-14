@@ -261,8 +261,8 @@ fn descend<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
             return_type,
             return_value: desugar_boxed(return_value, source),
         }),
-        Node::Let(name, annotation, value, mutable) => {
-            Node::Let(name, annotation, desugar_opt(value, source), mutable)
+        Node::Let(name, annotation, value, mutable, lazy) => {
+            Node::Let(name, annotation, desugar_opt(value, source), mutable, lazy)
         }
         Node::LetDestructure(pattern, annotation, value, mutable) => {
             Node::LetDestructure(pattern, annotation, desugar_opt(value, source), mutable)

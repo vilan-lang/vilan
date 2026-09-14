@@ -322,7 +322,8 @@ once (`proposal/transport-rpc.md` §9.3).
 ## 3.4 Bindings and assignment
 
 ```text
-let        = ("let" | "mut") binder [ ":" type ] [ "=" expression ] ;
+let        = [ "lazy" ] ("let" | "mut") binder [ ":" type ]
+             [ "=" expression ] ;
 assignment = [ "*" ] place ( "=" | "+=" | "-=" | "*=" | "/=" | "%=" )
              expression ;
 place      = chain ;                 (* an assignable location, §3.6 *)
@@ -332,7 +333,10 @@ jump       = "jump" IDENT ;          (* break | continue *)
 
 `let` binds immutably, `mut` mutably; a tuple binder destructures
 (irrefutably: names and nested tuples only). Both the type and the
-initializer are syntactically optional. A **place** is a chain expression
+initializer are syntactically optional. `lazy` is accepted only on a
+MODULE-LEVEL `let` binding one name to one initializer (§6.10): a `lazy
+mut`, a lazy destructure, a lazy binding with no initializer and a lazy
+local are each refused. A **place** is a chain expression
 (§3.6) denoting a location: a local, a field chain, an index, or a place
 reached through a call (`a.write().count`); the optional leading `*`
 assigns through a view. `jump break` / `jump continue` control the

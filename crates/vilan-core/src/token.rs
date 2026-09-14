@@ -30,6 +30,12 @@ pub enum Token<'src> {
     In,
     Is,
     Jump,
+    // `lazy` — defer to first demand (proposal/lazy.md). A HARD keyword in two
+    // positions: the parameter modifier `fun expect(self, lazy message: str)`
+    // (§1) and the module binding `lazy let database: Database = …;` (§2). One
+    // semantic in both — evaluate at first demand, at most once, memoize — and
+    // one lowering (the memo cell + `__force`, §5).
+    Lazy,
     Let,
     Macro,
     Match,
@@ -82,6 +88,7 @@ impl std::fmt::Display for Token<'_> {
             Token::In => write!(f, "in"),
             Token::Is => write!(f, "is"),
             Token::Jump => write!(f, "jump"),
+            Token::Lazy => write!(f, "lazy"),
             Token::Let => write!(f, "let"),
             Token::Macro => write!(f, "macro"),
             Token::Match => write!(f, "match"),

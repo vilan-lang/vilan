@@ -1578,6 +1578,83 @@ impl<'a> Interpreter<'a> {
             // outside what a macro may evaluate. Named here so the answer is
             // this sentence rather than "unknown host call".
             "__with_finally_async" => Err(Failure::unsupported("`with_finally_async`")),
+            // proposal/lazy.md §5's memo cell and its forcing helper, mirroring
+            // `helper_source`'s JS exactly — the equivalence gate the paper
+            // names ("the helper needs its interpreter arm in the same commit").
+            // The cell is the one object shape emitted code already uses, with
+            // the paper's `{ state, value, thunk }` plus the `name` the cycle
+            // and poison messages say.
+            "__lazy" => {
+                let mut cell = IndexMap::new();
+                cell.insert(Rc::from("name"), take(0));
+                cell.insert(Rc::from("state"), Value::Number(0.0));
+                cell.insert(Rc::from("value"), Value::Undefined);
+                cell.insert(Rc::from("thunk"), take(1));
+                Ok(Value::Object(Rc::new(RefCell::new(cell))))
+            }
+            // 0 pending, 1 running, 2 done, 3 poisoned — `running` is the cycle
+            // trap. Only a vilan `panic` POISONS (`FailureKind::Thrown`), for
+            // `__with_finally`'s reason: fuel, depth, an unsupported capability
+            // and an internal bug are the expansion environment failing rather
+            // than the program throwing, and a cell must not remember those as
+            // the program's own failure.
+            "__force" => {
+                let cell_value = take(0);
+                let Value::Object(cell) = &cell_value else {
+                    return Err(Failure::internal("__force on a non-cell".to_string()));
+                };
+                let slot = |key: &str| cell.borrow().get(key).cloned().unwrap_or(Value::Undefined);
+                let state = match slot("state") {
+                    Value::Number(state) => state,
+                    _ => 0.0,
+                };
+                let name = match slot("name") {
+                    Value::Str(name) => name.to_string(),
+                    _ => String::new(),
+                };
+                if state == 2.0 {
+                    return Ok(slot("value"));
+                }
+                if state == 1.0 {
+                    return Err(Failure::new(
+                        FailureKind::Thrown,
+                        format!("lazy initialization cycle: `{name}`"),
+                    ));
+                }
+                if state == 3.0 {
+                    let poison = match slot("value") {
+                        Value::Str(message) => message.to_string(),
+                        _ => String::new(),
+                    };
+                    return Err(Failure::new(
+                        FailureKind::Thrown,
+                        format!("lazy `{name}` is poisoned: its initializer panicked: {poison}"),
+                    ));
+                }
+                cell.borrow_mut()
+                    .insert(Rc::from("state"), Value::Number(1.0));
+                let thunk = slot("thunk");
+                match self.call_value(&thunk, Vec::new()) {
+                    Ok(value) => {
+                        let mut slots = cell.borrow_mut();
+                        slots.insert(Rc::from("value"), value.clone());
+                        slots.insert(Rc::from("state"), Value::Number(2.0));
+                        slots.insert(Rc::from("thunk"), Value::Null);
+                        Ok(value)
+                    }
+                    Err(failure) if failure.kind == FailureKind::Thrown => {
+                        let mut slots = cell.borrow_mut();
+                        slots.insert(
+                            Rc::from("value"),
+                            Value::Str(Rc::from(failure.message.as_str())),
+                        );
+                        slots.insert(Rc::from("state"), Value::Number(3.0));
+                        drop(slots);
+                        Err(failure)
+                    }
+                    Err(failure) => Err(failure),
+                }
+            }
             "__shared_new" => {
                 let mut cell = IndexMap::new();
                 cell.insert(Rc::from("v"), take(0));

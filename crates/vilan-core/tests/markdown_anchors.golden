@@ -262,6 +262,7 @@ spec/memory.md h3 ownednursery
 spec/memory.md h3 services-and-resources
 spec/memory.md h3 honesty-limits
 spec/memory.md h2 69-closures-capture-bindings
+spec/memory.md h2 610-lazy--a-binding-initialized-at-first-use
 spec/names.md h1 spec-4--names-modules-and-packages
 spec/names.md h2 41-modules
 spec/names.md h2 42-the-three-namespaces
@@ -480,6 +481,7 @@ tour/functions-and-closures.md h1 functions--closures
 tour/functions-and-closures.md h2 functions
 tour/functions-and-closures.md h2 taking-any-number-of-arguments
 tour/functions-and-closures.md h3 passing-a-pack-on
+tour/functions-and-closures.md h2 lazy-parameters
 tour/functions-and-closures.md h2 closures
 tour/functions-and-closures.md h2 named-functions-as-closures
 tour/functions-and-closures.md h2 async-closures
@@ -525,6 +527,7 @@ tour/resources.md h2 teardown-happens-at-the-last-use--and-on-every-exit
 tour/resources.md h2 tearing-down-early-dropx
 tour/resources.md h2 conditional-teardown-optiontake
 tour/resources.md h2 a-real-resource-database
+tour/resources.md h2 lazy-resources
 tour/resources.md h2 owning-background-work-ownednursery
 tour/resources.md h2 traps
 tour/values-and-types.md h1 values-and-types

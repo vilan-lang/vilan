@@ -143,6 +143,97 @@ The bound is checked on what the spread actually contributes, so a
 at a call to a function *without* a spread parameter builds no tuple and
 is an error — write the tuple yourself (`takes_a_tuple((..pair))`).
 
+## Lazy parameters
+
+Prefix a parameter with `lazy` and the call site stops evaluating its
+argument. It packages the expression instead, and the callee runs it the
+first time it *reads* the parameter — at most once, however many times it
+reads, and never at all if it never does:
+
+```vilan
+mut built = 0;
+
+fun describe(): str {
+	built += 1;
+	"seven"
+}
+
+fun expect_positive(value: i32, lazy complaint: str): i32 {
+	if value > 0 {
+		ret value;
+	}
+	print(complaint);
+	print(complaint);
+	0
+}
+
+fun main() {
+	print(expect_positive(7, i"{describe()} is not positive"));
+	print(i"built {built}");                                     // 0
+	expect_positive(-1, i"{describe()} is not positive");
+	print(i"built {built}");                                     // 1
+}
+```
+
+The happy path never reads `complaint`, so the message is never built:
+that is what `lazy` is for. The failing path reads it twice and builds it
+once — a lazy argument is evaluated **at most once, late**, never twice.
+Inside the callee the parameter is an ordinary `str`; nothing about the
+body says which of its parameters are lazy.
+
+`lazy` is part of the **signature**, not a private decision of the body,
+because it is the caller that builds the deferred expression. So an
+`impl` of a trait that declares a lazy parameter must declare it too, and
+hover shows it beside the type.
+
+Passing a lazy parameter on to another lazy position forwards the same
+deferred value rather than forcing it — one evaluation, however long the
+chain. Passing it anywhere else is a read, so it forces there:
+
+```vilan
+fun inner(lazy message: str, read: bool): i32 {
+	if read {
+		print(message);
+	}
+	0
+}
+
+fun outer(lazy message: str, read: bool): i32 {
+	inner(message, read)          // forwarded, not forced
+}
+
+fun eager(message: str): i32 {
+	print(message);
+	0
+}
+
+fun forces(lazy message: str): i32 {
+	eager(message)                // an eager position: forced here
+}
+
+fun main() {
+	outer("never printed", false);
+	outer("printed once", true);
+	forces("printed once too");
+}
+```
+
+Three things a lazy argument may not do, each because the expression runs
+inside the callee rather than where it is written:
+
+- **own a resource.** The package that carries the expression would own
+  it, which is exactly what a closure may not do. Resources stay eager.
+- **suspend.** The forcing point is a plain read, and a read must not be
+  a suspension point. Deferred async has its own spelling: write
+  `async <expr>` and pass the `Task`.
+- **read an ambient context.** By the time it forces, the call site's
+  contexts may be gone — the same self-containment a `drop` body obeys.
+  Pass a closure explicitly and call it where the context is threaded.
+
+`lazy` belongs to a plain `fun`, an `impl` method and a `trait`
+signature. It combines with none of `own`, `&`, `&mut`, `mut` or `...`,
+and it is written first: `fun f(lazy message: str)`.
+
 ## Closures
 
 A closure is an inline function value. Where JavaScript writes

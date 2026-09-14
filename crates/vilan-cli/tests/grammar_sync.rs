@@ -898,6 +898,10 @@ const KEYWORD_ROLES: &[(&str, KeywordRole)] = &[
     ("async", KeywordRole::Modifier),
     ("const", KeywordRole::Modifier),
     ("resource", KeywordRole::Modifier),
+    // `lazy` modifies a parameter (`lazy message: str`) and a module binding
+    // (`lazy let database: …`) — a storage modifier beside `const`/`mut`, not a
+    // word that names a new item.
+    ("lazy", KeywordRole::Modifier),
     ("with", KeywordRole::Other),
     ("borrows", KeywordRole::Other),
     // `css` heads an expression rather than declaring or modifying an item, so

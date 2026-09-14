@@ -432,3 +432,100 @@ main();
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `proposal/lazy.md` §2's motivating line, against the real host database:
+/// `lazy let database: Database = Database::open(..)` — the accessor sketch the
+/// paper was filed to replace, reduced to one declaration.
+///
+/// Four claims in one run, and each of them is what a lazy MODULE-LEVEL
+/// resource is supposed to inherit:
+///
+/// 1. **First use, not load.** "start" prints before "opening", so the file is
+///    not touched until the first statement that reads the binding.
+/// 2. **Memoized.** "opening" prints ONCE across three reads through two
+///    functions, so the handle is one handle — which is also why the row the
+///    first read wrote is visible to the third.
+/// 3. **Loan-only, unchanged.** The reads are method calls on the module
+///    binding, which is the only thing §5's corollary permits; the sibling pin
+///    below is the refusal that says so.
+/// 4. **It never drops.** The process exits with the handle open, exactly as an
+///    eager module-level resource does — there is no scope end to close it at,
+///    and the round trip in `a_dropped_database_closes_and_the_file_reopens`
+///    above is what a resource that DOES have one looks like.
+#[test]
+fn a_lazy_module_level_database_opens_at_its_first_use_and_stays_one_handle() {
+    let dir = migration_project(
+        "lazy",
+        r#"import std::io::print;
+import std::db::Database;
+import std::option::Option::{ self, Some, None };
+
+lazy let database: Database = open_it();
+
+fun open_it(): Database {
+	print("opening");
+	let db = Database::open("lazy.db");
+	db.exec("CREATE TABLE IF NOT EXISTS t (v TEXT)");
+	db
+}
+
+fun write_row(value: str) {
+	database.prepare("INSERT INTO t VALUES (?)").run([value]);
+}
+
+fun read_back(): str {
+	match database.prepare("SELECT v FROM t").first([]) {
+		Some(let row) => row.text("v"),
+		None => "MISSING",
+	}
+}
+
+fun main() {
+	print("start");
+	write_row("one");
+	print(read_back());
+	print(read_back());
+}
+main();
+"#,
+    );
+    let stdout = stdout_of(&run(&dir, &[]), "the lazy database program");
+    assert_eq!(
+        stdout, "start\nopening\none\none\n",
+        "the initializer must run at the FIRST read and exactly once"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The other half of claim 3: a lazy module-level resource is loan-only for the
+/// same reason an eager one is (destruction.md §5's corollary — process
+/// lifetime, so there is no second owner to move it to), and the refusal is the
+/// one the eager form already earns. `lazy` moves the initializer's TIME and
+/// nothing else about the binding.
+#[test]
+fn a_lazy_module_level_database_is_loan_only_like_an_eager_one() {
+    let dir = migration_project(
+        "lazy_move",
+        r#"import std::io::print;
+import std::db::Database;
+import std::drop::drop;
+
+lazy let database: Database = Database::open("lazy_move.db");
+
+fun consume() {
+	drop(database);
+}
+
+fun main() {
+	consume();
+}
+main();
+"#,
+    );
+    let stderr = stderr_of_failure(&run(&dir, &[]), "moving a lazy module-level resource");
+    assert!(
+        stderr.contains("is a module-level resource: it has process lifetime and cannot be moved"),
+        "the loan-only refusal must fire on the lazy binding too:\n{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

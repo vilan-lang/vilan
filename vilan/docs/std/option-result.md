@@ -201,6 +201,16 @@ fun main() {
 
 - Prefer `!` (propagate) and `unwrap_or*` over `unwrap`: `unwrap` is for
   invariants, and it panics.
+- `unwrap_or`'s fallback and `expect`'s message are **evaluated eagerly**
+  today: `opt.unwrap_or(expensive())` runs `expensive()` on the `Some`
+  path too, and `res.expect(i"no row for {key}")` builds the message on
+  the happy path. Use `unwrap_or_else` when the fallback costs something.
+  The language now has [`lazy` parameters](../tour/functions-and-closures.md#lazy-parameters),
+  which is what these positions will eventually take — a `lazy fallback`
+  is deferred to the read that needs it, at most once — and adopting them
+  here changes the observable behaviour of a call site whose fallback has
+  a side effect, so it is a deliberate sweep rather than a quiet one.
+  Until it lands, the two spellings above are the ones that defer.
 - Application errors belong in `Result`'s `E`; only unreachable
   states panic.
 - `match` with `Some(let x)` / `Ok(let x)` patterns is always available

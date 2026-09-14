@@ -828,6 +828,12 @@ pub fn post_analysis_passes(
     let phase_context_drops_start = PhaseClock::now();
     analyzer::check_context_drops(program);
     let phase_context_drops = phase_context_drops_start.elapsed();
+    // lazy.md §1's sync-only and context-free restrictions on a THUNKED
+    // argument, in the same seam and for the same reason as the two `drop`
+    // rules above: a forcing point threads no context and must not suspend,
+    // and both facts are settled only here. Returns immediately for a program
+    // that thunked nothing.
+    analyzer::check_lazy_argument_effects(program);
     let phase_platform_start = PhaseClock::now();
     platform_color::check(program, platform, &call_graph);
     let phase_platform = phase_platform_start.elapsed();

@@ -5423,10 +5423,10 @@ fn a52_an_rpc_mirror_is_a_source_and_drives_a_generic_consumer() {
                 // `on_change` does NOT fire for the value already held (an
                 // unopened mirror holds `None`); the channel's first frame is
                 // a change and does reach it.
-                let lazy = remote.on_change(|value| print(i"lazy:{show(value)}"));
+                let quiet = remote.on_change(|value| print(i"lazy:{show(value)}"));
                 trace(remote, "generic", |value: Option<i32>| show(value));
                 counter.set(2);
-                lazy.dispose();
+                quiet.dispose();
                 counter.set(3);
             });
             scope.dispose();

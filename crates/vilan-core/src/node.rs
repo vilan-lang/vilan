@@ -189,6 +189,15 @@ pub struct Parameter<'src> {
     /// parameter only, at most one, must declare its type, plain name binder,
     /// no rule-3 convention. Unlike `mut`, it IS part of the signature.
     pub spread: bool,
+    /// `lazy message: str` — a LAZY parameter (proposal/lazy.md §1): the call
+    /// site packages the argument as a thunk instead of evaluating it, the
+    /// callee forces it on its first read, and the result memoizes
+    /// (call-by-need — at most once, late; never read, never run). Like
+    /// `spread` and unlike `mut`, it IS part of the signature: laziness changes
+    /// what the CALL SITE builds, so an impl of a lazy-parameter trait
+    /// signature must agree. Exclusive with `own`/`&`/`&mut`, with `mut` and
+    /// with `...`; refused on a closure and on an `external fun`.
+    pub lazy: bool,
     pub span: Span,
 }
 
@@ -783,11 +792,22 @@ pub enum Node<'src> {
     // generator is direction-agnostic, and a struct carrying both attributes is
     // peer-to-peer with ONE dispatcher (§9.3, R1).
     Service(ServiceAttr<'src>, Box<Spanned<Self>>),
-    // `let`/`mut` binding: name, type annotation, value, mutability.
+    // `let`/`mut` binding: name, type annotation, value, mutability, laziness.
+    //
+    // `lazy` (proposal/lazy.md §2) is MODULE-LEVEL only — `lazy let database:
+    // Database = Database::open("kolt.db");` — and the flag says the
+    // initializer runs at the binding's FIRST USE instead of at module load,
+    // then memoizes. Everything else about the binding is unchanged: the module
+    // owns the value, it has process lifetime, a resource is loan-only and
+    // write-frozen, and it never drops. The analyzer refuses a lazy LOCAL (§3:
+    // an end-of-scope drop would need a runtime was-it-initialized flag, and
+    // drop flags are ratified out), so the flag is false for every `let` inside
+    // a body.
     Let(
         Spanned<&'src str>,
         Option<Box<Spanned<Self>>>,
         Option<Box<Spanned<Self>>>,
+        bool,
         bool,
     ),
     // `let`/`mut` binding with a destructuring pattern: `let (a, b) = pair`. The
@@ -1188,7 +1208,7 @@ impl<'src> Node<'src> {
                     visit(member);
                 }
             }
-            Node::Let(_, type_, value, _) => {
+            Node::Let(_, type_, value, _, _) => {
                 if let Some(type_) = type_.as_deref() {
                     visit(type_);
                 }

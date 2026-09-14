@@ -502,3 +502,10 @@ row	flagship	key
 470	-	`{function}` kinds name one file beside the build output; `{kind}` is not one path segment — pass a bare kind like `css`
 471	-	`{function}` kinds name one file beside the build output, and `{kind}` collides with {collision} — pass a kind of the program's own, like `routes`
 472	-	`asset::emit_keyed` cannot order the `{kind}` kind: the style sidecar is ordered by the CSS cascade, not by a contribution's key — write a rule with `asset::emit`, or let `std::style` own the sheet
+473	-	parameter {position} of `{subject}`'s `{member}` is {form}, but `{trait}` declares {declared}; match the declared laziness
+474	-	`{name}` is a `lazy` parameter of the resource type `{type}`: a lazy argument is carried by a thunk, and a thunk owning a resource is what R9 forbids
+475	-	this argument is the resource `{type}`, and it stands in the `lazy` parameter `{name}`: the thunk that carries it would own the resource
+476	-	this argument suspends, and it stands in the `lazy` parameter `{name}`: the thunk forces on the parameter's first read
+477	-	this argument requires an ambient context, and it stands in the `lazy` parameter `{name}`: the thunk forces inside the callee
+478	-	`{name}` is a `lazy` binding inside a body: `lazy` defers a MODULE-LEVEL binding, whose lifetime is the process's
+479	-	this initializer requires an ambient context, and it initializes the `lazy` binding `{name}`: a lazy initializer runs at the binding's first use
