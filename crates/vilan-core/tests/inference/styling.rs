@@ -7274,6 +7274,37 @@ fn an_ancestor_guard_takes_any_condition_that_selects_an_element() {
 }
 
 #[test]
+fn a_negated_condition_inside_a_guard_renders_as_a_negated_ancestor() {
+    // A95 S1 shipped this as a latent MISCOMPILE, and the token form closes it
+    // with the same change that widens the guard. S1 stored the guard as its
+    // ancestor's RENDERED selector prefixed with `^`, and read the negation off
+    // the token's OWN first byte — so `within(attribute("x").not())` became
+    // `^![x]`, whose first byte is `^`, and `render_rule` emitted the `!` into
+    // the selector verbatim: `![x] .sX{opacity:0.5}`, which is not a selector
+    // CSS admits and which nothing said a word about. (Measured at 9b22ec36.)
+    // Nothing in std, the corpus, the examples or kolt wrote one.
+    //
+    // The guard carries its inner TOKEN now and renders it through the same
+    // per-axis rendering every other token gets, negation included.
+    let attribute_guard = style_rules(&conditioned(
+        r#"style().on(within(attribute("x").not()), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(
+        attribute_guard,
+        vec![":not([x]) .sm0ah11{color:var(--gray-50)}".to_string()],
+        "{attribute_guard:?}"
+    );
+    let pseudo_guard = style_rules(&conditioned(
+        r#"style().on(within(hover().not()), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(
+        pseudo_guard,
+        vec![":not(:hover) .syqgpex{color:var(--gray-50)}".to_string()],
+        "{pseudo_guard:?}"
+    );
+}
+
+#[test]
 fn an_ancestor_guard_refuses_a_condition_that_selects_no_element() {
     // A guard holds a condition an ANCESTOR can match. The other four axes are
     // not element selectors at all, and each refusal names where its condition
