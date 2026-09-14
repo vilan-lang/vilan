@@ -460,7 +460,7 @@ row	flagship	key
 428	-	`[rpc]` method `{method_name}` takes a name the `[service]` expansion generates on `{owner}`
 429	-	`[rpc]` method `{method_name}` returns a keyed handle whose key `{rendered}` is {missing}: the client names the key in every keyed `Subscribe`, each `Delta` the channel forwards carries it, and the mirror indexes by it
 430	-	'{member_name}' is declared by two blanket impls whose bounds OVERLAP{elsewhere}: a type satisfying both clauses matches both impls, and an inherent member is taken from the first matching impl without ranking. Narrow one bound so the two are disjoint, or declare '{member_name}' on a trait
-431	-	`{name}` is ambiguous in module `{module_name}`: `{module_name}` declares `{name}`, and its directory holds a `{name}.vl` that is the module `{module_name}::{name}` — the declaration wins, so the file cannot be reached by any import; rename one of them
+431	-	`{name}` is ambiguous in module `{module_name}`: `{module_name}` declares `{name}`, and its directory holds a `{child}` that is the module `{module_name}::{name}` — the declaration wins, so the module cannot be reached by any import; rename one of them
 432	-	`{type}::{member}` takes `self` — a method is called on a value, not imported
 433	-	this value carries `{found}` and this {position} demands `{expected}`: an injected closure forwards only to a position carrying the SAME `context` clause
 434	-	`[derive({derive})]` needs std's `{module}`, and the std this package resolves to does not carry one
@@ -493,3 +493,12 @@ row	flagship	key
 461	-	`{path}` is not exported by `{module}`, and this path reaches it through the module. The spelling that says so is a marked import: `import {module}::{ #{leaf} };`, and then `{leaf}` on its own
 462	-	a closure written at this {position} would be born under `{clause}`, a `context` clause the threading cannot follow, and would capture its context at creation instead of taking one at each call: a clause is followed on a parameter, a `let` annotation, a struct field, a return type, and a generic argument the struct binds to a FIELD — not inside a `List`, a `Map`, an `Option`, a tuple or an array
 463	-	'{member}' is provided by an `impl` in module `{module}`, and {claim}: {fix}
+464	-	`{spelling}` outside a `const` expression
+465	-	`asset::stage` outside a `const` expression
+466	-	`asset::staged` outside a `const` expression
+467	-	`asset::read` outside a `const` expression
+468	-	`asset::digest` outside a `const` expression
+469	-	`asset::schedule_at_end` outside a `const` expression
+470	-	`{function}` kinds name one file beside the build output; `{kind}` is not one path segment — pass a bare kind like `css`
+471	-	`{function}` kinds name one file beside the build output, and `{kind}` collides with {collision} — pass a kind of the program's own, like `routes`
+472	-	`asset::emit_keyed` cannot order the `{kind}` kind: the style sidecar is ordered by the CSS cascade, not by a contribution's key — write a rule with `asset::emit`, or let `std::style` own the sheet

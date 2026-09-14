@@ -25,6 +25,21 @@ vilan/benchmarks/src/main.mjs
 dist/
 vilan/docs/book/
 
+# What a corpus program's BUILD writes beside the corpus sources (N83). The
+# byte gate stages into a work directory and dirties nothing, but regenerating
+# a golden is `vilan build vilan/test/<program>.vl` IN PLACE (`AGENTS.md` §2),
+# and `estate.vl` and `asset_bundle.vl` reach `std::asset` — so the bundled
+# assets and the build's record of them land here, and `git add -A` after a
+# regeneration swept all four into a commit. `corpus.rs`'s
+# `every_asset_a_corpus_build_emits_beside_the_sources_is_gitignored` asks
+# `git check-ignore` about each one, so a new bundled asset reds until this
+# list names it. The sources these are copied FROM live in
+# `vilan/test/estate-static/`, which is tracked and untouched by any of these.
+/vilan/test/.vilan-bundled
+/vilan/test/icons/
+/vilan/test/logo.*.svg
+/vilan/test/robots.txt
+
 # The union-suite log every integration writes beside the tree (three
 # tracked-by-accident incidents in one day; the hygiene gate caught two).
 suite.log

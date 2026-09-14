@@ -3673,12 +3673,11 @@ fn a_library_module_reached_through_a_symlink_is_still_library_territory() {
         .canonicalize()
         .expect("the browser layer is on disk");
 
-    let scratch = std::env::temp_dir().join(format!(
+    let scratch = scratch_dir(&format!(
         "vilan-layer-symlink-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).expect("create the scratch directory");
     let link = scratch.join("layer");
     std::os::unix::fs::symlink(&real, &link).expect("symlink the browser layer");
@@ -3737,9 +3736,7 @@ fn analyze_package(files: &[(&str, &str)], entry: &str) -> PackageOutcome {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let directory =
-        std::env::temp_dir().join(format!("vilan_init_order_{}_{unique}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = scratch_dir(&format!("vilan_init_order_{}_{unique}", std::process::id()));
     for (relative, contents) in files {
         let path = directory.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -3823,13 +3820,11 @@ fn compile_and_run_package(
 
     let js = compile_package(files, entry)?;
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "vilan_init_order_run_{}_{unique}.js",
-        std::process::id()
-    ));
-    std::fs::write(&path, &js).map_err(|error| vec![error.to_string()])?;
-    let output = std::process::Command::new("node").arg(&path).output();
-    let _ = std::fs::remove_file(&path);
+    let file = ScratchFile::write(
+        &format!("vilan_init_order_run_{}_{unique}.js", std::process::id()),
+        &js,
+    )?;
+    let output = std::process::Command::new("node").arg(file.path()).output();
     match output {
         Ok(output) if output.status.success() => {
             Ok((js, String::from_utf8_lossy(&output.stdout).into_owned()))

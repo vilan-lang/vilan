@@ -1827,6 +1827,37 @@ pub(crate) mod gate {
             .unwrap_or_else(|| "?".to_string())
     }
 
+    /// N84: the absolute allowance a RATIO bound over sub-millisecond thread-CPU
+    /// readings is given, widened by the machine's load.
+    ///
+    /// The thread clock is load-proof in the MEAN (M15), and that is what every
+    /// absolute budget in this file rests on. A RATIO of two 0.008 ms readings
+    /// is a different instrument: 8 µs is a handful of scheduler slices, the
+    /// caches between them belong to whatever else is on the box, and the two
+    /// ends of the ratio are not drawn from the same distribution when sixteen
+    /// cores are shared by nine lanes. `the_entity_table_costs_the_edited_buffer_
+    /// not_the_program` went red once under that load and green on a re-run with
+    /// nothing changed, which is exactly the shape a bound too tight for its own
+    /// instrument has.
+    ///
+    /// So the bound is `small × k + allowance`, and the allowance is the noise
+    /// floor scaled by the load average's share of the core count: **0.02 ms** on
+    /// a quiet box, **0.08 ms** at four times the core count and above. Two
+    /// orders of magnitude under the whole-program scan the same run measures
+    /// beside it (5.6–7.4 ms), so the regression the bound guards against — a
+    /// table that follows the codebase, which means reverting to that scan —
+    /// cannot hide inside it. Zero where there is no `/proc/loadavg` to read, on
+    /// the same principle the cost claims decline on Windows: a guard that
+    /// cannot ask its question does not guess.
+    pub(crate) fn cpu_ratio_allowance_ms() -> f64 {
+        const NOISE_FLOOR_MS: f64 = 0.02;
+        let Some(load) = loadavg_1m().parse::<f64>().ok() else {
+            return NOISE_FLOOR_MS;
+        };
+        let cores = std::thread::available_parallelism().map_or(1.0, |count| count.get() as f64);
+        NOISE_FLOOR_MS * (1.0 + (load / cores).clamp(0.0, 3.0))
+    }
+
     pub(crate) fn profile() -> &'static str {
         if cfg!(debug_assertions) {
             "debug"
@@ -3252,14 +3283,20 @@ fun main() {
             );
             return;
         }
-        // (3) Flat across the two exhibits...
+        // (3) Flat across the two exhibits — at a bound the instrument can
+        // actually make (N84). Both readings are ~0.008 ms, so a bare ratio is
+        // asserting about a few scheduler slices; the allowance is what keeps
+        // the claim about the TABLE rather than about the box's load.
+        let allowance = cpu_ratio_allowance_ms();
         assert!(
-            large_cpu < small_cpu * 3.0,
+            large_cpu < small_cpu * 3.0 + allowance,
             "building the entity table cost {large_cpu:.3} ms of thread CPU on \
              the {LARGE}-icon exhibit against {small_cpu:.3} ms on the \
-             {SMALL}-icon one, while the program grew from {small_entities} to \
-             {large_entities} entities — the table is following the codebase, \
-             not the edited buffer (loadavg {})",
+             {SMALL}-icon one (bound {:.3} ms, allowance {allowance:.3} ms), \
+             while the program grew from {small_entities} to {large_entities} \
+             entities — the table is following the codebase, not the edited \
+             buffer (loadavg {})",
+            small_cpu * 3.0 + allowance,
             loadavg_1m(),
         );
         // ...and a large multiple cheaper than the walk it replaced, on each,
@@ -3268,11 +3305,18 @@ fun main() {
             ("small", small_cpu, small_scan_cpu),
             ("large", large_cpu, large_scan_cpu),
         ] {
+            // The same allowance, applied to the side it can hurt here: this
+            // bound fails when the FETCH reads high, and the fetch is the
+            // sub-millisecond half. The headroom is enormous either way — the
+            // scan measures 700-900× the fetch on this exhibit — so the
+            // allowance costs nothing and the shape stays symmetric with the
+            // claim above (N84).
             assert!(
-                scanned > built * 5.0,
+                scanned > (built + allowance) * 5.0,
                 "on the {label} exhibit the whole-program scan cost \
-                 {scanned:.3} ms against the fetch's {built:.3} ms — under 5x, \
-                 so the green above is not measuring the change (loadavg {})",
+                 {scanned:.3} ms against the fetch's {built:.3} ms (allowance \
+                 {allowance:.3} ms) — under 5x, so the green above is not \
+                 measuring the change (loadavg {})",
                 loadavg_1m(),
             );
         }

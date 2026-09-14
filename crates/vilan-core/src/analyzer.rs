@@ -25307,8 +25307,18 @@ impl<'src> Analyzer<'src> {
     /// declaration is the half the author can move. Only a module that was
     /// LOADED has a children scope, which is the same bound the file-level
     /// twin's report has.
+    ///
+    /// B337: the message names the child AS IT IS SPELLED ON DISK. A child
+    /// bodied by `b/lib.vl`, and a pure NAMESPACE child (`a/c/` holding
+    /// `x.vl` and no body of its own), are directories — a reader told to
+    /// look for `a/b.vl` looks for a file that is not there, and the two
+    /// halves of a rename are what this diagnostic exists to name. The shape
+    /// is read from the two records the loader already keeps: a namespace
+    /// child is in [`Self::namespace_only_modules`], a `lib.vl`-bodied one in
+    /// [`Self::modules_bodied_by_a_lib_file`], and anything else is the flat
+    /// `{name}.vl`.
     fn refuse_shadowed_submodules(&mut self) {
-        let mut collisions: Vec<(Id, &'src str, &'src str)> = Vec::new();
+        let mut collisions: Vec<(Id, &'src str, &'src str, String)> = Vec::new();
         for (module_id, children_scope_id) in &self.module_children_scopes {
             let Some(module) = self.modules.get(module_id) else {
                 continue;
@@ -25316,7 +25326,7 @@ impl<'src> Analyzer<'src> {
             let Some(children) = self.scopes.get(children_scope_id) else {
                 continue;
             };
-            for name in children.name_to_id_map.keys() {
+            for (name, child_id) in &children.name_to_id_map {
                 // B331 retired the hand-skip of `lib` that stood here. It was
                 // needed while `pkg::a::lib` resolved `a/lib.vl` a second time
                 // under a second name: the loader registered a `lib` child that
@@ -25328,15 +25338,21 @@ impl<'src> Analyzer<'src> {
                 // declaration named `lib` beside it is the ordinary collision,
                 // which is what this rule is for.
                 if let Some(member_id) = self.member_in_namespace(name, module.body.1) {
-                    collisions.push((member_id, module.name, name));
+                    let directory_shaped = self.namespace_only_modules.contains_key(child_id)
+                        || self.modules_bodied_by_a_lib_file.contains(child_id);
+                    let child = match directory_shaped {
+                        true => format!("{name}/"),
+                        false => format!("{name}.vl"),
+                    };
+                    collisions.push((member_id, module.name, name, child));
                 }
             }
         }
         // The children scopes are a `HashMap`, so the walk order is not one:
         // sorted by the declaration's own id, which is its position in the
         // file, the way every other whole-program check reports.
-        collisions.sort_by_key(|(member_id, _, _)| member_id.0);
-        for (member_id, module_name, name) in collisions {
+        collisions.sort_by_key(|(member_id, _, _, _)| member_id.0);
+        for (member_id, module_name, name, child) in collisions {
             self.push_anchored(
                 Error {
                     trace: Vec::new(),
@@ -25344,8 +25360,8 @@ impl<'src> Analyzer<'src> {
                     span: **self.span_map.get(&member_id).unwrap_or(&&EMPTY_SPAN),
                     msg: format!(
                         "`{name}` is ambiguous in module `{module_name}`: `{module_name}` \
-                         declares `{name}`, and its directory holds a `{name}.vl` that is the \
-                         module `{module_name}::{name}` — the declaration wins, so the file \
+                         declares `{name}`, and its directory holds a `{child}` that is the \
+                         module `{module_name}::{name}` — the declaration wins, so the module \
                          cannot be reached by any import; rename one of them"
                     ),
                 },
@@ -50943,11 +50959,19 @@ fn longest_module_prefix(roots: &[&Path], path: &str) -> Option<String> {
 /// `lib.vl` of its own. `import pkg::lib` where `lib/` holds only `util.vl`
 /// names one, and the refusal that answers it needs to know the children.
 ///
-/// Only consulted when [`longest_module_prefix`] found no body at all, so a
-/// directory that also has a `lib.vl` never reaches here.
-fn longest_namespace_prefix(roots: &[&Path], path: &str) -> Option<String> {
+/// `floor` bounds the walk: only a candidate LONGER than `floor` bytes is
+/// probed, and 0 asks the whole walk. It is what keeps B337's second caller
+/// cheap — the seed already holds a module prefix and only wants to know
+/// whether a DEEPER directory exists, so `import pkg::lib::scale_step` costs
+/// one failed `read_dir` of `lib/scale_step` rather than a full listing of
+/// `lib/` (which, in a package with a thousand-file icon module, is not a
+/// listing anyone wants once per import).
+fn longest_namespace_prefix(roots: &[&Path], path: &str, floor: usize) -> Option<String> {
     let mut candidate = path.to_string();
     loop {
+        if candidate.len() <= floor {
+            return None;
+        }
         if roots
             .iter()
             .any(|root| !submodules_in_directory(&module_directory(root, &candidate)).is_empty())
@@ -50979,6 +51003,36 @@ pub fn submodules_in_roots(roots: &[&Path], path: &str) -> Vec<String> {
     }
     names.sort();
     names
+}
+
+/// B337: the DEEPEST answer to a module request — the longest prefix that names
+/// a module BODY, or the module DIRECTORY the path addresses when that reaches
+/// further.
+///
+/// The two walks used to be tried in order, first-answer-wins, and the module
+/// one answers for almost everything: `a::c` where `a.vl` is a module and
+/// `a/c/` is a pure namespace resolved to `a`, one segment short, and the
+/// namespace walk never ran. Nothing then registered `a::c` as `a`'s child, so
+/// A67's collision rule — which reads the children scope — could not see the
+/// declaration shadowing it, and `a.vl` declaring `c` beside `a/c/x.vl` bound
+/// the declaration in silence. That is the silent winner A67 exists to close,
+/// and it was open for exactly the children a body file does not name.
+///
+/// The shorter answer is a PREFIX of the longer one and loads anyway (the
+/// loader's `ensure_module_node` walks a nested path and ensures every parent),
+/// so taking the deeper one adds the namespace node itself and nothing else; a
+/// namespace contributes no items. The namespace walk is FLOORED at the module
+/// prefix's length, so a request the module walk answers whole costs nothing
+/// extra and one that truncated costs one failed directory probe.
+fn deepest_module_or_namespace(roots: &[&Path], path: &str) -> Option<String> {
+    let module = longest_module_prefix(roots, path);
+    match module.as_deref() {
+        // The whole request is a module: no directory reaches further.
+        Some(found) if found == path => module,
+        _ => {
+            longest_namespace_prefix(roots, path, module.as_deref().map_or(0, str::len)).or(module)
+        }
+    }
 }
 
 /// `root` joined with a module path's segments — the directory a module path
@@ -53369,8 +53423,14 @@ fn analyze_inner<'src>(
     // `import std::io::pri` names the module `io` exactly as the finished line
     // does, so the keystrokes in between store no world of their own (M11).
     // An unresolvable path keys as itself, which is what it always did.
+    // B337: the seed is [`deepest_module_or_namespace`] rather than the module
+    // walk alone — the entry's `pkg::` references are pre-resolved HERE, before
+    // the load loop sees them, so a seed truncated to `a` is a namespace child
+    // the loop can never register. Unchanged for every path whose module prefix
+    // is the whole answer, which is every import in a package with no module
+    // directory, and for an unresolvable path, which still keys as itself.
     let seed_module = |roots: &[&Path], path: &str| -> String {
-        longest_module_prefix(roots, path).unwrap_or_else(|| path.to_string())
+        deepest_module_or_namespace(roots, path).unwrap_or_else(|| path.to_string())
     };
     let entry_seed_names: Vec<String> = {
         let std_roots = std.search_roots(platform);
@@ -54164,14 +54224,34 @@ fn analyze_inner<'src>(
                             Origin::Pkg => vec![pkg_root],
                             Origin::Dep(index) => workspace.packages[index].search_roots(platform),
                         };
-                        longest_module_prefix(&roots, request)
-                            .or_else(|| longest_namespace_prefix(&roots, request))
-                            .map(|path| match path == request {
+                        // B337: the LONGER of the two answers, not the first
+                        // that answers. `a::c` where `a.vl` is a module and
+                        // `a/c/` is a pure namespace resolved to `a` — the
+                        // module prefix truncated by a segment, and the
+                        // namespace fallback never ran because the module one
+                        // had answered. So `a::c` was never registered as `a`'s
+                        // child, and A67's collision rule (which reads the
+                        // children scope) could not see a declaration shadowing
+                        // it: `a.vl` declaring `c` beside `a/c/x.vl` bound the
+                        // declaration in silence, the one silent winner A67
+                        // exists to close. The shorter answer is a PREFIX of the
+                        // longer one and loads anyway — `ensure_module_node`
+                        // walks the path and ensures every parent — so taking
+                        // the longer one only ever adds the namespace node
+                        // itself, which contributes no items.
+                        //
+                        // The second call is made only where the first
+                        // truncated: a request the module walk answers whole is
+                        // the deepest answer there is, and that is every
+                        // `pkg::<module>` in a package with no module directory.
+                        deepest_module_or_namespace(&roots, request).map(|path| {
+                            match path == request {
                                 // The whole request IS the module: keep the caller's
                                 // own slice rather than interning a copy of it.
                                 true => request,
                                 false => interned_display_name(path),
-                            })
+                            }
+                        })
                     });
                 if let Some(resolved) = resolved {
                     to_load.push((origin, resolved));

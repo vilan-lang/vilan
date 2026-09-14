@@ -3551,7 +3551,7 @@ fn analyze_workspace_with_dependencies(
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_e84_{}_{unique}", std::process::id()));
+    let root = scratch_dir(&format!("vilan_e84_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
 
     let app_dir = root.join("app");

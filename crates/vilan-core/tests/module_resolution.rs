@@ -5176,6 +5176,113 @@ fn b331_a_declaration_shadowing_a_real_lib_directory_is_ambiguous() {
     );
 }
 
+// --- B337: what shape the child is, and the namespace child the rule missed --
+//
+// A67's message said "its directory holds a `{name}.vl`" whatever the child
+// was. A child bodied by `b/lib.vl` is a DIRECTORY on disk, and so is a pure
+// NAMESPACE child (`a/c/` holding `x.vl` and no body of its own) — a reader
+// told to look for `a/b.vl` is being sent to a file that does not exist, in a
+// diagnostic whose whole job is to name the two halves of a rename.
+//
+// The namespace child was worse than mis-named: it was invisible. The loader
+// maps each pending request to "the longest prefix that names a module, or
+// failing that the module directory it addresses", and for `a::c` the module
+// walk ANSWERED — with `a`, one segment short — so the directory fallback
+// never ran. `a::c` was never registered as `a`'s child, the children scope
+// this rule reads never held `c`, and `a.vl` declaring `c` beside `a/c/x.vl`
+// bound the declaration in silence. The loader takes the deeper of the two
+// answers now; the shorter is a prefix of it and loads anyway.
+
+#[test]
+fn b337_a_directory_bodied_child_is_named_as_a_directory() {
+    let files = &[
+        ("a.vl", "fun b(): i32 { 1 }\n"),
+        ("a/b/lib.vl", "fun greet(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a::b;\n\nfun main() { let _ = b(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    let refusal = errors
+        .iter()
+        .find(|error| error.contains("is ambiguous in module"))
+        .unwrap_or_else(|| panic!("the collision is refused: {errors:#?}"));
+    assert!(
+        refusal.contains("holds a `b/`") && !refusal.contains("`b.vl`"),
+        "a `b/lib.vl` child is a DIRECTORY, and the message must send the \
+         reader there: {refusal}"
+    );
+}
+
+#[test]
+fn b337_a_flat_child_is_still_named_as_a_file() {
+    // The control that keeps the two spellings apart: `a/b.vl` is a file, and
+    // it still says so.
+    let files = &[
+        ("a.vl", "fun b(): i32 { 1 }\n"),
+        ("a/b.vl", "fun greet(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a::b;\n\nfun main() { let _ = b(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    let refusal = errors
+        .iter()
+        .find(|error| error.contains("is ambiguous in module"))
+        .unwrap_or_else(|| panic!("the collision is refused: {errors:#?}"));
+    assert!(
+        refusal.contains("holds a `b.vl`"),
+        "the flat child keeps the file spelling: {refusal}"
+    );
+}
+
+#[test]
+fn b337_a_declaration_shadowing_a_pure_namespace_child_is_ambiguous() {
+    // The silent winner: `a/c/` holds `x.vl` and no body of its own, so `c` is
+    // a namespace the path walks THROUGH. `import pkg::a::c;` used to bind the
+    // declaration with nothing said, which is exactly what A67 closed for a
+    // file child.
+    let files = &[
+        ("a.vl", "fun c(): i32 { 1 }\n"),
+        ("a/c/x.vl", "fun greet(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a::c;\n\nfun main() { let _ = c(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    let refusal = errors
+        .iter()
+        .find(|error| error.contains("is ambiguous in module"))
+        .unwrap_or_else(|| panic!("the namespace collision is refused: {errors:#?}"));
+    assert!(
+        refusal.contains("`c` is ambiguous in module `a`") && refusal.contains("holds a `c/`"),
+        "and names the directory, not a `c.vl` that does not exist: {refusal}"
+    );
+}
+
+#[test]
+fn b337_a_namespace_child_with_no_colliding_declaration_still_resolves() {
+    // The narrowness control: the same tree with the declaration renamed walks
+    // through the namespace exactly as it always did, and the deeper
+    // resolution the loader now takes adds no diagnostic of its own.
+    let files = &[
+        ("a.vl", "fun surface(): i32 { 1 }\n"),
+        ("a/c/x.vl", "fun greet(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a::c::x::greet;\n\nfun main() { let _ = greet(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        errors.is_empty(),
+        "a namespace child nothing shadows is reached as before: {errors:#?}"
+    );
+}
+
 // --- B332: a type segment REPLACES the walk's namespace ----------------------
 //
 // B317 shipped the struct half the safe way round — a type's namespace asked
