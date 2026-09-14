@@ -2240,7 +2240,7 @@ impl Style {
 	/// the exact match, so the argument that every call site has had to spell
 	/// since A89 disappears from the surface rather than staying as a second
 	/// way to say the same thing.
-	[deprecated("use .on(within(attribute(name)), inner) — or .eq(value) on the attribute for the exact form")]
+	[deprecated("use .on(within(attribute(name)), inner), with .eq(value) for the exact form")]
 	fun within(self, name: str, value: Option<str>, inner: Style): Style {
 		check_attribute_name(name);
 		let guarded = match value {
@@ -2308,7 +2308,7 @@ impl Style {
 	/// with `within`'s twin and for the same reason: the `Option<str>` is what
 	/// a condition value spells without an argument — `attribute(name)` is the
 	/// presence form, `attribute(name).eq(value)` the exact one.
-	[deprecated("use .on(attribute(name), inner) — or .eq(value) on the attribute for the exact form")]
+	[deprecated("use .on(attribute(name), inner), with .eq(value) for the exact form")]
 	fun attribute(self, name: str, value: Option<str>, inner: Style): Style {
 		check_attribute_name(name);
 		let selected = match value {

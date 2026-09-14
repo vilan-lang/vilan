@@ -4095,11 +4095,23 @@ impl<'src> Printer<'src> {
         self.out.push('}');
     }
 
-    /// Prints a function declaration: its `[extern]`/`[must_use]`/`[rpc]`
-    /// attributes (if any) each on their own line, then
+    /// Prints a function declaration: its
+    /// `[deprecated]`/`[extern]`/`[must_use]`/`[rpc]` attributes (if any) each
+    /// on their own line, then
     /// `[async ][external ]fun name[<…>](…)[: T][ borrows p]` followed by the
     /// body block, or a `;` for a signature with no body.
+    ///
+    /// The attribute prefix is ORDERED (`grammar.md` §"Structs and enums", the
+    /// `function` production), and `[deprecated("use …")]` leads it — so it is
+    /// printed first. The steer is the lexer's raw string text, re-emitted
+    /// between quotes exactly as `[extern(..)]`'s symbols are.
     fn print_func(&mut self, func: &Func<'src>) {
+        if let Some(steer) = func.deprecated {
+            self.out.push_str("[deprecated(\"");
+            self.out.push_str(steer);
+            self.out.push_str("\")]");
+            self.line();
+        }
         if let Some(binding) = &func.extern_binding {
             self.print_extern_attribute(binding, func.extern_retains);
             self.line();
@@ -7455,6 +7467,33 @@ mod idempotency {
             "trait_only attribute lost:\n{formatted}"
         );
         assert_fixed_point("attributes", source);
+    }
+
+    /// `[deprecated("use …")]` had no printer arm at all, so `vilan fmt`
+    /// SILENTLY BAILED on any file carrying one — the whole file handed back
+    /// unchanged, and `--check` calling that clean. Nothing in std or the corpus
+    /// declared one until A95 S5 deprecated the `Option<str>` styling sugar,
+    /// which is what surfaced it (`tests/parse_differential.rs`'s
+    /// `formatter_never_silently_bails`, on `style.vl`).
+    ///
+    /// The attribute prefix is ORDERED and this one LEADS it, on a free function
+    /// and on an impl member alike.
+    #[test]
+    fn a_deprecated_attribute_survives_the_reprint() {
+        let source = "[deprecated(\"use two()\")]\nfun one(): i32 {\n\t1\n}\n\
+                      struct S {\n\tn: i32,\n}\n\
+                      impl S {\n\t[deprecated(\"use fresh()\")]\n\t[must_use]\n\
+                      \tfun stale(self): i32 {\n\t\tself.n\n\t}\n}\n";
+        let formatted = format(source);
+        assert!(
+            formatted.matches("[deprecated(").count() == 2,
+            "deprecated attribute lost:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("[deprecated(\"use fresh()\")]\n\t[must_use]"),
+            "the ordered prefix puts `deprecated` first:\n{formatted}"
+        );
+        assert_fixed_point("deprecated", source);
     }
 }
 

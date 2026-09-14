@@ -6651,7 +6651,7 @@ fn a95_the_option_taking_sugar_warns_with_the_condition_value_as_the_steer() {
         assert!(
             messages
                 .iter()
-                .any(|message| message.contains(".eq(value) on the attribute for the exact form")),
+                .any(|message| message.contains("with .eq(value) for the exact form")),
             "{call}\n{messages:#?}"
         );
     }
