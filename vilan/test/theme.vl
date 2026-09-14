@@ -1,5 +1,16 @@
 import std::io::print;
-import std::style::{ Color, Length, Style, declarations, declare, space, style };
+import std::style::{
+	Color,
+	Length,
+	Style,
+	attribute,
+	declarations,
+	declare,
+	hover,
+	space,
+	style,
+	within,
+};
 
 // The theme system a real app hand-rolled through `asset::emit`, expressed
 // entirely in std's surface (kolt.local 009+014, ui-styling.md §0bis.6):
@@ -36,10 +47,11 @@ fun main() {
 	// guard reaches the same slots under the ancestor condition — unlayered
 	// and (0,2,0), so it beats the element's own base rule exactly when the
 	// guard matches, composing with a pseudo-class on one slot.
+	let iron_dark = const within(attribute("data-theme").eq("iron-dark"));
 	let lifted = const card
 		.box_shadow("0 1px 2px rgba(0, 0, 0, 0.08)")
-		.within("data-theme", Some("iron-dark"), style().box_shadow("none"))
-		.within("data-theme", Some("iron-dark"), style().hover(style().border_color(Color::var("--color-ink"))));
+		.on(iron_dark, style().box_shadow("none"))
+		.on(iron_dark + hover(), style().border_color(Color::var("--color-ink")));
 	print(lifted.class_list());
 }
 main();

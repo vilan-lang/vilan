@@ -144,6 +144,7 @@ const wide = [ [ new Map([ [ "::width", [ "::width", "s178hckh", "width:37px" ] 
 console.log(class_list(wide));
 const responsive = [ [ new Map([ [ "640px::padding", [ "640px::padding", "sl8ru5a", "padding:var(--space-2)" ] ], [ "1024px::padding", [ "1024px::padding", "s4x9b8s", "padding:var(--space-3)" ] ] ]) ] ];
 console.log(class_list(responsive));
+const dark = [ [ "^[data-theme=\"dark\"]" ] ];
 const themed = [ [ new Map([ [ "768px:^[data-theme=\"dark\"] hover:background-color", [ "768px:^[data-theme=\"dark\"] hover:background-color", "sayz5ok", "background-color:var(--gray-50)" ] ], [ ":^[data-theme=\"dark\"]:background-color", [ ":^[data-theme=\"dark\"]:background-color", "s120e6x3", "background-color:var(--gray-900)" ] ], [ ":^[data-theme=\"dark\"] hover:background-color", [ ":^[data-theme=\"dark\"] hover:background-color", "ss3fj9l", "background-color:var(--gray-700)" ] ] ]) ] ];
 console.log(class_list(themed));
 const translucent = [ [ new Map([ [ "::color", [ "::color", "s1kwp696", "color:rgb(from var(--gray-900) r g b / 0.08)" ] ], [ "::background-color", [ "::background-color", "s12ne3o2", "background-color:rgba(27, 6, 13, 0.9)" ] ] ]) ] ];
@@ -162,6 +163,7 @@ console.log(class_list(perceptual));
 const squared = [ [ new Map([ [ "::width", [ "::width", "s178h6ec", "width:1rem" ] ], [ "::height", [ "::height", "s22ylrq", "height:1rem" ] ] ]) ] ];
 console.log(class_list(squared));
 console.log("s178h6ec s22zdhz");
+const open = [ [ "[data-open=\"true\"]" ] ];
 const disclosed = [ [ new Map([ [ "768px:^[data-theme=\"dark\"] [data-open=\"true\"] hover:color", [ "768px:^[data-theme=\"dark\"] [data-open=\"true\"] hover:color", "s1dwvy7w", "color:var(--gray-50)" ] ], [ ":^[data-theme=\"dark\"] [data-open=\"true\"]:background-color", [ ":^[data-theme=\"dark\"] [data-open=\"true\"]:background-color", "s1jqpl5k", "background-color:var(--gray-800)" ] ], [ ":[data-open=\"true\"]:display", [ ":[data-open=\"true\"]:display", "s11vlq4c", "display:flex" ] ], [ ":[data-open=\"true\"] hover:background-color", [ ":[data-open=\"true\"] hover:background-color", "s1j5l6ea", "background-color:var(--gray-100)" ] ] ]) ] ];
 console.log(class_list(disclosed));
 const gated = [ [ new Map([ [ ":!^[data-theme=\"dark\"]:background-color", [ ":!^[data-theme=\"dark\"]:background-color", "s1jayb7s", "background-color:var(--gray-900)" ] ], [ ":^[data-collapsed]:display", [ ":^[data-collapsed]:display", "s4ss8fz", "display:none" ] ], [ ":[data-selected]:color", [ ":[data-selected]:color", "st2ig1a", "color:var(--gray-50)" ] ], [ ":![disabled] hover:background-color", [ ":![disabled] hover:background-color", "s1pk9f1d", "background-color:var(--gray-100)" ] ], [ ":!hover:color", [ ":!hover:color", "s6t6iu5", "color:var(--gray-700)" ] ] ]) ] ];

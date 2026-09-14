@@ -10,6 +10,7 @@ import std::style::{
 	declarations,
 	declare,
 	hover,
+	md,
 	space,
 	style,
 	within,
@@ -68,16 +69,21 @@ fun main() {
 	let responsive = const style().sm(style().padding(space(2))).lg(style().padding(space(3)));
 	print(responsive.class_list());
 
-	// Conditions stack outside-in, media > within > pseudo. The golden pins
-	// the composed selectors in bytes: the ancestor guard and the pseudo
-	// suffix in ONE rule, and the whole thing inside a media block. Note the
-	// leading byte — a within rule starts with '[', the LAST unlayered band
-	// (B35 / ui-styling.md §0bis.6), so its (0,2,0) tie against a pseudo rule
+	// Conditions compose as a SET, and the canonicaliser puts the tokens in
+	// the order the selector nests them — media, then the ancestor guard, then
+	// the pseudo-class — whatever order they were written in. The golden pins
+	// the composed selectors in bytes: the guard and the pseudo suffix in ONE
+	// rule, and the whole thing inside a media block. Note the leading byte —
+	// a within rule starts with '[', the LAST unlayered band (B35 /
+	// ui-styling.md §0bis.6), so its (0,2,0) tie against a pseudo rule
 	// resolves to the theme by source order.
+	// A set is a value you can NAME — and the binding is itself `const`, because
+	// a `const` expression reads only compile-time-known bindings.
+	let dark = const within(attribute("data-theme").eq("dark"));
 	let themed = const style()
-		.md(style().within("data-theme", Some("dark"), style().hover(style().background(Color::gray(50)))))
-		.within("data-theme", Some("dark"), style().background(Color::gray(900)))
-		.within("data-theme", Some("dark"), style().hover(style().background(Color::gray(700))));
+		.on(md() + dark + hover(), style().background(Color::gray(50)))
+		.on(dark, style().background(Color::gray(900)))
+		.on(dark + hover(), style().background(Color::gray(700)));
 	print(themed.class_list());
 
 	// The value types (ui-styling.md §0bis.3). A translucent token renders as
@@ -150,14 +156,14 @@ fun main() {
 	// The attribute condition selects on the element ITSELF, where within is
 	// the ancestor form. The golden pins the composed selectors in bytes: the
 	// bare suffix, the suffix before a pseudo-class, under the ancestor
-	// guard, and the full media(within(attribute(pseudo(..)))) stack —
-	// attribute rules start with '.', so they stay in the base cascade band
-	// (B35).
+	// guard, and the full four-condition set — attribute rules start with '.',
+	// so they stay in the base cascade band (B35).
+	let open = const attribute("data-open").eq("true");
 	let disclosed = const style()
-		.md(style().within("data-theme", Some("dark"), style().attribute("data-open", Some("true"), style().hover(style().color(Color::gray(50))))))
-		.within("data-theme", Some("dark"), style().attribute("data-open", Some("true"), style().background(Color::gray(800))))
-		.attribute("data-open", Some("true"), style().display(Display::Flex))
-		.attribute("data-open", Some("true"), style().hover(style().background(Color::gray(100))));
+		.on(md() + within(attribute("data-theme").eq("dark")) + open + hover(), style().color(Color::gray(50)))
+		.on(within(attribute("data-theme").eq("dark")) + open, style().background(Color::gray(800)))
+		.on(open, style().display(Display::Flex))
+		.on(open + hover(), style().background(Color::gray(100)));
 	print(disclosed.class_list());
 
 	// A89's presence form and A95's NEGATION. `attribute(name)` is the presence

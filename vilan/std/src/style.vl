@@ -2233,6 +2233,14 @@ impl Style {
 	/// signature's whole limit. The condition value takes any condition an
 	/// ancestor can match, a pseudo-class included:
 	/// `.on(within(hover()), inner)`.
+	///
+	/// **Deprecated for one release** (A95 S5, style-conditions.md §12 (iv)).
+	/// The `Option<str>` A89 gave it is the thing a condition VALUE spells
+	/// properly: `attribute(name)` is presence and `attribute(name).eq(value)`
+	/// the exact match, so the argument that every call site has had to spell
+	/// since A89 disappears from the surface rather than staying as a second
+	/// way to say the same thing.
+	[deprecated("use .on(within(attribute(name)), inner) — or .eq(value) on the attribute for the exact form")]
 	fun within(self, name: str, value: Option<str>, inner: Style): Style {
 		check_attribute_name(name);
 		let guarded = match value {
@@ -2295,6 +2303,12 @@ impl Style {
 	/// no spaces, no `:` — those delimit the machinery underneath (the slot
 	/// key, the condition grammar, the selector's own quoting), and a styling
 	/// hook is a single token in practice.
+	///
+	/// **Deprecated for one release** (A95 S5, style-conditions.md §12 (iv)),
+	/// with `within`'s twin and for the same reason: the `Option<str>` is what
+	/// a condition value spells without an argument — `attribute(name)` is the
+	/// presence form, `attribute(name).eq(value)` the exact one.
+	[deprecated("use .on(attribute(name), inner) — or .eq(value) on the attribute for the exact form")]
 	fun attribute(self, name: str, value: Option<str>, inner: Style): Style {
 		check_attribute_name(name);
 		let selected = match value {

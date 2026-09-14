@@ -257,9 +257,12 @@ derived on `Condition` so the two readings cannot collide.
 you can name:
 
 ```vilan,fragment
-let interactive = hover() + active().not() + attribute("disabled").not();
+let interactive = const hover() + active().not() + attribute("disabled").not();
 let panel = const style().on(interactive, style().opacity(1.0));
 ```
+
+The binding is itself `const`: a `const` expression reads only
+compile-time-known bindings, so a named set has to be one.
 
 ### The sugar
 

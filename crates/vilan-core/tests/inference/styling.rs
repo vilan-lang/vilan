@@ -6609,6 +6609,89 @@ fn b322_a_breakpoint_width_and_a_written_property_are_fenced_against_the_separat
     }
 }
 
+// --- A95 S5: the `Option<str>` sugar deprecated for one release -----------------
+// `Style::attribute` and `Style::within` take A89's `value: Option<str>`, which
+// is exactly what a condition VALUE spells without an argument:
+// `attribute(name)` is presence and `attribute(name).eq(value)` the exact match.
+// Ruled (style-conditions.md §12 (iv)) as one release of `[deprecated]` and then
+// removal — not a break now, so both still compile and both still emit what they
+// always emitted.
+
+#[test]
+fn a95_the_option_taking_sugar_warns_with_the_condition_value_as_the_steer() {
+    for (call, steer) in [
+        (
+            r#"style().attribute("data-open", Some("true"), style().opacity(0.5))"#,
+            "`attribute` is deprecated; use .on(attribute(name), inner)",
+        ),
+        (
+            r#"style().within("data-theme", Some("dark"), style().opacity(0.5))"#,
+            "`within` is deprecated; use .on(within(attribute(name)), inner)",
+        ),
+    ] {
+        let program = format!(
+            r#"
+            import std::style::{{ style, Style }};
+            fun s(): Style {{
+                {call}
+            }}
+            let _s = const s();
+            fun main() {{}}
+            main();
+            "#
+        );
+        let messages = warnings(&program);
+        assert!(
+            messages.iter().any(|message| message.contains(steer)),
+            "{call}\n{messages:#?}"
+        );
+        // The other half of the steer: `.eq(value)` is where the `Option`'s
+        // `Some` went, and the message says so rather than leaving the exact
+        // form to be guessed.
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains(".eq(value) on the attribute for the exact form")),
+            "{call}\n{messages:#?}"
+        );
+    }
+}
+
+#[test]
+fn a95_the_deprecated_sugar_still_emits_exactly_what_it_always_did() {
+    // Deprecated is not removed: the window is a release long, and a program
+    // that has not migrated yet must keep producing the same stylesheet.
+    let sugar = style_rules(
+        r#"
+        import std::style::{ style, Style, Color };
+        fun s(): Style {
+            style().attribute("data-open", Some("true"), style().color(Color::gray(50)))
+        }
+        let _s = const s();
+        fun main() {}
+        main();
+        "#,
+    );
+    let value = style_rules(&conditioned(
+        r#"style().on(attribute("data-open").eq("true"), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(sugar, value, "{sugar:?}");
+}
+
+#[test]
+fn a95_the_value_form_does_not_warn() {
+    // The control: the spelling the steer names is the one that is clean.
+    let messages = warnings(&conditioned(
+        r#"style().on(within(attribute("data-theme").eq("dark")) + hover(), style().color(Color::gray(50)))"#,
+    ));
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("deprecated")),
+        "{messages:#?}"
+    );
+}
+
 // --- A93: `child_relation` is DELETED -------------------------------------------
 // The method was `children`'s and `divide`'s shared chokepoint, and it was
 // reachable from outside std only because the language had no visibility yet.
