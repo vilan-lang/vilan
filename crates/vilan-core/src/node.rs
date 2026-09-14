@@ -189,6 +189,15 @@ pub struct Parameter<'src> {
     /// parameter only, at most one, must declare its type, plain name binder,
     /// no rule-3 convention. Unlike `mut`, it IS part of the signature.
     pub spread: bool,
+    /// `lazy message: str` — a LAZY parameter (proposal/lazy.md §1): the call
+    /// site packages the argument as a thunk instead of evaluating it, the
+    /// callee forces it on its first read, and the result memoizes
+    /// (call-by-need — at most once, late; never read, never run). Like
+    /// `spread` and unlike `mut`, it IS part of the signature: laziness changes
+    /// what the CALL SITE builds, so an impl of a lazy-parameter trait
+    /// signature must agree. Exclusive with `own`/`&`/`&mut`, with `mut` and
+    /// with `...`; refused on a closure and on an `external fun`.
+    pub lazy: bool,
     pub span: Span,
 }
 

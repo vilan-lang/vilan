@@ -36,11 +36,11 @@ fun main() {
 	// The eager member fires NOW with the current value.
 	let eager = count.sub(|value| print(i"sub {value}"));
 	// The lazy one does not: nothing is printed until `count` changes.
-	let lazy = count.on_change(|value| print(i"on_change {value}"));
+	let quiet = count.on_change(|value| print(i"on_change {value}"));
 	print("attached");
 	count.set(2);
 	eager.dispose();
-	lazy.dispose();
+	quiet.dispose();
 	// Both handles are disposed: this change reaches nobody.
 	count.set(3);
 

@@ -311,13 +311,13 @@ const count = $a(1);
 const eager = $c(count, (value) => {
 	return console.log("sub " + value);
 });
-const lazy = $f(count, (value) => {
+const quiet = $f(count, (value) => {
 	return console.log("on_change " + value);
 });
 console.log("attached");
 $g(count, 2, [ 1 ]);
 dispose(eager, [ 1 ]);
-dispose(lazy, [ 1 ]);
+dispose(quiet, [ 1 ]);
 $g(count, 3, [ 1 ]);
 const $D = $C(($v) => {
 	$w(count, (value) => {

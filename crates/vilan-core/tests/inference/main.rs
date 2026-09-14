@@ -23,6 +23,7 @@ mod bounds;
 mod generics;
 mod hmr;
 mod iterators;
+mod lazy;
 mod lifetimes;
 mod liveness;
 mod macros;

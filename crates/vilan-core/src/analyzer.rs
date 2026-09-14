@@ -834,6 +834,12 @@ pub struct Parameter<'src> {
     /// Only ever the LAST parameter of a free function (the parser refuses it
     /// elsewhere), so a call needs to inspect only that one.
     pub spread: bool,
+    /// `lazy message: str` (proposal/lazy.md §1): the call site packages the
+    /// argument as a thunk, the callee forces it on its first read, and the
+    /// result memoizes. Part of the SIGNATURE — laziness changes what the call
+    /// site builds, so `check_one_conformance` holds an impl to its trait's
+    /// answer, exactly as it holds the conventions.
+    pub lazy: bool,
 }
 
 /// The precomputed view sets the rule-4 scan matches against: origins for
@@ -966,6 +972,28 @@ fn view_capture_message(name: &str) -> String {
 /// resources: process-lifetime, so consuming one (a move / `own`-pass) is
 /// rejected outright (destruction.md §5's loan-only corollary) — empty for the
 /// R11 instantiation scan, whose bindings are all in-body.
+/// What a lazily-thunked argument DOES when it is forced (proposal/lazy.md §1's
+/// second and third v1 restrictions). Collected by [`Analyzer::scan_capture_
+/// body`], which already reaches every call and every `await` of an expression
+/// tree, so laziness asks its two effect questions of the SAME walk that asks
+/// R9's capture question rather than of a second one that could drift from it.
+///
+/// Deliberately conservative in one direction, per §1 ("each the conservative
+/// direction"): the walk descends into a closure the expression merely CREATES,
+/// so an `await` written inside one is attributed to the thunk. Creating a
+/// closure suspends nothing, so this over-approximates — and over-approximating
+/// refuses a program that could have compiled, which is the recoverable
+/// mistake.
+#[derive(Clone, Debug, Default)]
+pub struct ThunkEffects {
+    /// Every call the expression performs, by call id — read against
+    /// `async_functions` and `context_dependent_functions` once the post-passes
+    /// have settled both.
+    pub calls: Vec<Id>,
+    /// The first `await` the expression writes, if any — the refusal's anchor.
+    pub awaits: Option<Id>,
+}
+
 struct MoveScan<'a> {
     resource_bindings: &'a HashSet<Id>,
     resource_value_places: &'a HashSet<Id>,
@@ -2186,6 +2214,12 @@ pub struct ConformanceSignatureCheck {
 /// method.
 struct MemberSignatureShape {
     conventions: Vec<Convention>,
+    /// Whether each position is declared `lazy` (proposal/lazy.md §1). Part of
+    /// the signature for the same reason a convention is — it changes what the
+    /// CALL SITE builds, and a call is monomorphized against the declaration it
+    /// resolved to, so an impl that disagrees would be handed a cell where it
+    /// expects a value (or the reverse).
+    lazy: Vec<bool>,
     types: Vec<TypeId>,
     /// Whether each position's parameter is named `self` (a receiver).
     is_self: Vec<bool>,
@@ -3854,6 +3888,32 @@ pub struct Analyzer<'src> {
     // stays because the LSP re-analyzes per keystroke and an unbounded entity
     // per deferral is a real cost.
     spread_packs: HashMap<Id, Vec<Id>>,
+    // proposal/lazy.md §1 — the three tables the `lazy` lowering needs, filled
+    // by `record_lazy_arguments` once every call has resolved and read by the
+    // transformer through their `Program` twins.
+    //
+    // The ARGUMENTS the call site packages as a thunk, keyed by the argument's
+    // expression id, mapped to the lazy parameter's NAME (what the poison
+    // message says). Every argument standing in a lazy position is here EXCEPT
+    // a forward (below): the two partition the lazy positions.
+    lazy_argument_thunks: IndexMap<Id, &'src str>,
+    // The arguments that FORWARD a cell instead of building one — a bare
+    // reference to a binding that already holds one, standing in another lazy
+    // position (§1, "forwarding"). One memo however deep the chain: the callee's
+    // first read forces the ORIGINAL thunk, and every hop between sees the same
+    // cell. Passing that same reference to an EAGER position is not here: that
+    // read forces, like any other.
+    lazy_argument_forwards: HashSet<Id>,
+    // The bindings that HOLD a memo cell — the `lazy` parameters (§1), and from
+    // S2 the `lazy let` module bindings (§2). A read of one forces it
+    // (`__force`), which is what makes the callee side "a plain `T`, fully
+    // transparent"; the two sets above are the only places a read does not.
+    lazy_cells: HashSet<Id>,
+    // What each thunk DOES when forced (§1's sync-only and context-free
+    // restrictions), keyed by the same argument id. Collected while the thunks
+    // are recorded, judged by `check_lazy_argument_effects` once the post-passes
+    // have settled asyncness and the context threading.
+    lazy_thunk_effects: IndexMap<Id, ThunkEffects>,
     // Expression ids written as a tuple-value spread `..e`
     // (variadic-generics.md §T). The spread FORWARDS to its operand's entity
     // rather than wrapping it, so this set is the whole of the marker: the
@@ -5368,6 +5428,10 @@ impl<'src> Analyzer<'src> {
             trait_qualified_calls: HashMap::default(),
             own_generic_call_bindings: HashMap::default(),
             spread_packs: HashMap::default(),
+            lazy_argument_thunks: IndexMap::default(),
+            lazy_argument_forwards: HashSet::default(),
+            lazy_cells: HashSet::default(),
+            lazy_thunk_effects: IndexMap::default(),
             spread_elements: HashSet::default(),
             spread_spans: HashMap::default(),
             bound_dispatch_traits: HashMap::default(),
@@ -7383,6 +7447,7 @@ impl<'src> Analyzer<'src> {
     fn member_signature_shape(&self, function_id: Id) -> Option<MemberSignatureShape> {
         let function = self.functions.get(&function_id)?;
         let mut conventions = Vec::new();
+        let mut lazy = Vec::new();
         let mut types = Vec::new();
         let mut is_self = Vec::new();
         let mut parameter_spans = Vec::new();
@@ -7391,6 +7456,7 @@ impl<'src> Analyzer<'src> {
                 continue;
             };
             conventions.push(parameter.convention);
+            lazy.push(parameter.lazy);
             types.push(parameter.type_id);
             is_self.push(parameter.name == "self");
             parameter_spans.push(
@@ -7402,6 +7468,7 @@ impl<'src> Analyzer<'src> {
         }
         Some(MemberSignatureShape {
             conventions,
+            lazy,
             types,
             is_self,
             parameter_spans,
@@ -8532,6 +8599,41 @@ impl<'src> Analyzer<'src> {
                         note,
                         span: anchor,
                         msg,
+                    },
+                    check.impl_function_id,
+                );
+            }
+
+            // lazy.md §1's trait rule: a `lazy` parameter is part of the
+            // signature, so the impl must agree. The paper asked for a targeted
+            // check because B29 had not landed; B29 HAS landed, so the agreement
+            // is one more position-wise comparison here, beside the convention
+            // it is the twin of. Enforced rather than inferred deliberately:
+            // laziness changes the CALLER's codegen, and the caller only ever
+            // sees the declaration it resolved to.
+            if trait_shape.lazy[position] != impl_shape.lazy[position] {
+                let note = self.conformance_note(check.trait_function_id, &check.member_name);
+                let (impl_form, trait_form) = if impl_shape.lazy[position] {
+                    ("`lazy`", "it eager")
+                } else {
+                    ("eager", "it `lazy`")
+                };
+                self.push_anchored(
+                    Error {
+                        trace: Vec::new(),
+                        note,
+                        span: anchor,
+                        msg: format!(
+                            "parameter {} of `{}`'s `{}` is {}, but `{}` declares {}; match \
+                             the declared laziness — `lazy` is part of the signature, because \
+                             it is the CALL SITE that builds the thunk",
+                            position,
+                            check.subject_name,
+                            check.member_name,
+                            impl_form,
+                            check.trait_name,
+                            trait_form
+                        ),
                     },
                     check.impl_function_id,
                 );
@@ -12874,6 +12976,17 @@ impl<'src> Analyzer<'src> {
             &mut violations,
         );
 
+        // lazy.md §1: "every existing capture rule applies to that closure
+        // unchanged". The thunk a lazy argument lowers to owns whatever its free
+        // variables are, so R9 runs over it with the same sets and produces the
+        // same violation — a resource LOCAL is refused, a module-level resource
+        // is exempt by the same corollary.
+        self.scan_lazy_thunk_captures(
+            scan.resource_bindings,
+            scan.module_level_bindings,
+            &mut violations,
+        );
+
         violations
     }
 
@@ -13991,6 +14104,7 @@ impl<'src> Analyzer<'src> {
             &mut declared_inside,
             &mut captured,
             &mut visited,
+            &mut ThunkEffects::default(),
         );
         for reference_id in captured {
             if let Some(Expr::Local(binding)) = self.expr_id_to_expr_map.get(&reference_id)
@@ -14001,6 +14115,48 @@ impl<'src> Analyzer<'src> {
                     reference_id,
                     binding: *binding,
                 });
+            }
+        }
+    }
+
+    /// R9 over the thunks (lazy.md §1). A lazy ARGUMENT's expression becomes a
+    /// closure at the call site, so a resource binding it names from the
+    /// enclosing body would be owned by that closure — R9's case exactly, and
+    /// reported in R9's words. Reuses `scan_capture_body`, the same walk
+    /// `scan_one_closure_captures` runs, with nothing seeded as declared inside:
+    /// a thunk has no parameters, so every binding it names comes from outside.
+    fn scan_lazy_thunk_captures(
+        &self,
+        resource_bindings: &HashSet<Id>,
+        module_level_bindings: &HashSet<Id>,
+        violations: &mut Vec<ResourceMoveViolation>,
+    ) {
+        for argument_id in self.lazy_argument_thunks.keys() {
+            // M19 T1: the capture is judged inside the argument's own body.
+            if self.reusable_entity(*argument_id) {
+                continue;
+            }
+            let mut declared_inside: HashSet<Id> = HashSet::default();
+            let mut captured: Vec<Id> = Vec::new();
+            let mut visited: HashSet<Id> = HashSet::default();
+            self.scan_capture_body(
+                *argument_id,
+                resource_bindings,
+                &mut declared_inside,
+                &mut captured,
+                &mut visited,
+                &mut ThunkEffects::default(),
+            );
+            for reference_id in captured {
+                if let Some(Expr::Local(binding)) = self.expr_id_to_expr_map.get(&reference_id)
+                    && !declared_inside.contains(binding)
+                    && !module_level_bindings.contains(binding)
+                {
+                    violations.push(ResourceMoveViolation::Capture {
+                        reference_id,
+                        binding: *binding,
+                    });
+                }
             }
         }
     }
@@ -14032,6 +14188,7 @@ impl<'src> Analyzer<'src> {
             &mut declared_inside,
             &mut Vec::new(),
             &mut HashSet::default(),
+            &mut ThunkEffects::default(),
         );
         declared_inside
     }
@@ -14047,6 +14204,7 @@ impl<'src> Analyzer<'src> {
         declared_inside: &mut HashSet<Id>,
         captured: &mut Vec<Id>,
         visited: &mut HashSet<Id>,
+        effects: &mut ThunkEffects,
     ) {
         if !visited.insert(expr_id) {
             return;
@@ -14056,7 +14214,14 @@ impl<'src> Analyzer<'src> {
         };
         macro_rules! recurse {
             ($id:expr) => {
-                self.scan_capture_body($id, resource_bindings, declared_inside, captured, visited)
+                self.scan_capture_body(
+                    $id,
+                    resource_bindings,
+                    declared_inside,
+                    captured,
+                    visited,
+                    effects,
+                )
             };
         }
         match expr {
@@ -14086,8 +14251,14 @@ impl<'src> Analyzer<'src> {
             Expr::Reference(operand, _)
             | Expr::Dereference(operand)
             | Expr::Unary(_, operand)
-            | Expr::Await(operand)
             | Expr::TryAssert(operand) => recurse!(operand),
+            // The one arm that is here for the EFFECTS sink rather than for a
+            // capture: lazy.md §1's sync-only restriction needs the `await` a
+            // thunked argument writes, and this walk already reaches every one.
+            Expr::Await(operand) => {
+                effects.awaits.get_or_insert(expr_id);
+                recurse!(operand);
+            }
             Expr::Binary(_, lhs, rhs) => {
                 recurse!(lhs);
                 recurse!(rhs);
@@ -14103,6 +14274,7 @@ impl<'src> Analyzer<'src> {
             }
             Expr::FunctionReturn(Some(value)) => recurse!(value),
             Expr::Call(call_id) => {
+                effects.calls.push(call_id);
                 if let Some(function_call) = self.function_calls.get(&call_id) {
                     recurse!(function_call.subject_id);
                     for argument in function_call.argument_ids.clone() {
@@ -14183,6 +14355,7 @@ impl<'src> Analyzer<'src> {
                 declared_inside,
                 captured,
                 visited,
+                effects,
             ),
             _ => {}
         }
@@ -14195,6 +14368,7 @@ impl<'src> Analyzer<'src> {
         declared_inside: &mut HashSet<Id>,
         captured: &mut Vec<Id>,
         visited: &mut HashSet<Id>,
+        effects: &mut ThunkEffects,
     ) {
         match branch {
             ExprIfBranch::If(condition, (statements, tail), else_branch) => {
@@ -14204,6 +14378,7 @@ impl<'src> Analyzer<'src> {
                     declared_inside,
                     captured,
                     visited,
+                    effects,
                 );
                 for statement in statements {
                     self.scan_capture_body(
@@ -14212,6 +14387,7 @@ impl<'src> Analyzer<'src> {
                         declared_inside,
                         captured,
                         visited,
+                        effects,
                     );
                 }
                 self.scan_capture_body(
@@ -14220,6 +14396,7 @@ impl<'src> Analyzer<'src> {
                     declared_inside,
                     captured,
                     visited,
+                    effects,
                 );
                 if let Some(else_branch) = else_branch {
                     self.scan_capture_if(
@@ -14228,6 +14405,7 @@ impl<'src> Analyzer<'src> {
                         declared_inside,
                         captured,
                         visited,
+                        effects,
                     );
                 }
             }
@@ -14239,6 +14417,7 @@ impl<'src> Analyzer<'src> {
                         declared_inside,
                         captured,
                         visited,
+                        effects,
                     );
                 }
                 self.scan_capture_body(
@@ -14247,6 +14426,7 @@ impl<'src> Analyzer<'src> {
                     declared_inside,
                     captured,
                     visited,
+                    effects,
                 );
             }
         }
@@ -17982,9 +18162,13 @@ impl<'src> Analyzer<'src> {
                 // A spread parameter's `...` is part of the signature
                 // (variadic-generics.md §S) — it is what tells a reader whether
                 // to write the arguments out flat or as one tuple. `mut`,
-                // which is not, stays unrendered.
+                // which is not, stays unrendered. `lazy` renders for the same
+                // reason `...` does (lazy.md §5, "hover renders `lazy` in
+                // signatures like the other effect surface"): it tells a reader
+                // whether their argument runs here or inside the callee.
                 let mut label = format!(
-                    "{}{}: {}",
+                    "{}{}{}: {}",
+                    if parameter.lazy { "lazy " } else { "" },
                     if parameter.spread { "..." } else { "" },
                     parameter.name,
                     self.declaration_type_label_for(parameter.type_id, subject)
@@ -22453,6 +22637,45 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+        // lazy.md §1: the thunk a lazy argument lowers to is a closure, so rule
+        // 3's capture ban is its rule too — the SAME scan, the same message, no
+        // new refusal. A lazy argument cannot await (`check_lazy_argument_
+        // effects` refuses one that would), so the `saw_await` answer here is
+        // always `false` and the pending list earns the plain capture text.
+        let thunks: Vec<Id> = self.lazy_argument_thunks.keys().copied().collect();
+        for argument_id in thunks {
+            // S1: the capture diagnostic anchors inside the argument expression.
+            if self.reusable_entity(argument_id) {
+                continue;
+            }
+            let mut saw_await = false;
+            let mut declared_inside: HashSet<Id> = HashSet::default();
+            let mut captured: Vec<Id> = Vec::new();
+            let mut visited: HashSet<Id> = HashSet::default();
+            self.scan_closure_view_captures(
+                argument_id,
+                view_bindings,
+                &mut saw_await,
+                &mut declared_inside,
+                &mut captured,
+                &mut visited,
+            );
+            for reference_id in captured {
+                let Some(Expr::Local(binding_id)) = self.expr_id_to_expr_map.get(&reference_id)
+                else {
+                    continue;
+                };
+                if declared_inside.contains(binding_id) {
+                    continue;
+                }
+                let name = self
+                    .variables
+                    .get(binding_id)
+                    .map(|variable| variable.name)
+                    .unwrap_or("the view");
+                pending.push((argument_id, reference_id, name));
+            }
+        }
         self.view_suspension_checks.captures = pending;
         for (reference_id, name) in errors {
             self.push_anchored(
@@ -23207,6 +23430,161 @@ impl<'src> Analyzer<'src> {
                     target_id,
                 );
             }
+        }
+    }
+
+    /// proposal/lazy.md §1 — decide, for every resolved call, which arguments
+    /// the call site THUNKS and which FORWARD a cell they already hold.
+    ///
+    /// One shape serves free functions and methods alike: `wire_method_call`
+    /// normalizes a method into a `subject -> Expr::Local(member)` call with the
+    /// receiver prepended, so the positional zip below lines arguments up with
+    /// parameters in both. (`check_mutable_arguments` reads the same shape for
+    /// the same reason; a dispatched callee that resolves to no declaration is
+    /// conservatively skipped, and a `lazy` parameter is never reached through
+    /// one — the three homes are all declarations.)
+    ///
+    /// Records only: the refusals are `check_lazy_arguments` (declaration and
+    /// resource), `check_lazy_argument_effects` (async / context, which need the
+    /// post-passes' settled facts), and the two capture scans that already own
+    /// R9 and rule 3. This runs OUTSIDE the Class A window deliberately — the
+    /// tables are the lowering's input, not a diagnostic, and a module whose
+    /// checks are replayed still has to emit.
+    fn record_lazy_arguments(&mut self) {
+        // Every program that writes no `lazy` parameter pays one set lookup.
+        if self.lazy_cells.is_empty() {
+            return;
+        }
+        let calls: Vec<(Id, Vec<Id>)> = self
+            .function_calls
+            .values()
+            .map(|call| (call.subject_id, call.argument_ids.clone()))
+            .collect();
+        for (subject_id, argument_ids) in calls {
+            let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
+                continue;
+            };
+            let Some(parameter_ids) = self
+                .functions
+                .get(callee_id)
+                .map(|function| function.parameters.clone())
+            else {
+                continue;
+            };
+            for (parameter_id, argument_id) in parameter_ids.iter().zip(argument_ids.iter()) {
+                let Some(parameter) = self.parameters.get(parameter_id) else {
+                    continue;
+                };
+                if !parameter.lazy {
+                    continue;
+                }
+                let name = parameter.name;
+                // A bare reference to a binding that already holds a cell is a
+                // FORWARD: pass the cell, do not force it and do not wrap it in
+                // a second one. Anything else — including a reference wrapped in
+                // so much as a field access — is an expression to defer.
+                if matches!(
+                    self.expr_id_to_expr_map.get(argument_id),
+                    Some(Expr::Local(binding)) if self.lazy_cells.contains(binding)
+                ) {
+                    self.lazy_argument_forwards.insert(*argument_id);
+                } else {
+                    self.lazy_argument_thunks.insert(*argument_id, name);
+                }
+            }
+        }
+        // The effects half, in a second loop so the borrow of `self` the walk
+        // takes does not fight the insert above.
+        let thunks: Vec<Id> = self.lazy_argument_thunks.keys().copied().collect();
+        for argument_id in thunks {
+            let mut effects = ThunkEffects::default();
+            self.scan_capture_body(
+                argument_id,
+                &HashSet::default(),
+                &mut HashSet::default(),
+                &mut Vec::new(),
+                &mut HashSet::default(),
+                &mut effects,
+            );
+            self.lazy_thunk_effects.insert(argument_id, effects);
+        }
+    }
+
+    /// lazy.md §1's first v1 restriction, at both ends: **data only**.
+    ///
+    /// A lazy argument is carried by a thunk, and a thunk owning a resource is
+    /// exactly what R9 forbids — so resources stay eager. The DECLARATION is
+    /// refused when its declared type is concretely a resource (a signature
+    /// nobody calls is still wrong), and the ARGUMENT is refused when the value
+    /// standing in the lazy position resolves to one, which is the same rule
+    /// reaching the generic case (`lazy fallback: T` at a resource `T`).
+    fn check_lazy_arguments(&mut self) {
+        if self.lazy_cells.is_empty() {
+            return;
+        }
+        let parameters: Vec<(Id, &'src str, TypeId)> = self
+            .parameters
+            .values()
+            .filter(|parameter| parameter.lazy)
+            .map(|parameter| (parameter.id, parameter.name, parameter.type_id))
+            .collect();
+        for (parameter_id, name, type_id) in parameters {
+            // S1: the refusal anchors at the parameter's own declaration.
+            if self.reusable_entity(parameter_id) {
+                continue;
+            }
+            if !self.type_is_resource(type_id) {
+                continue;
+            }
+            let rendered = self.pretty_print_type(&type_id.get_type(self), &HashMap::default());
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: **self.span_map.get(&parameter_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "`{name}` is a `lazy` parameter of the resource type `{rendered}`: a \
+                         lazy argument is carried by a thunk, and a thunk owning a resource is \
+                         what R9 forbids. Resources stay eager — drop the `lazy`, and defer \
+                         what you compute FROM the resource instead"
+                    ),
+                },
+                parameter_id,
+            );
+        }
+        // Only the THUNKED arguments: a forward is a bare reference to a cell
+        // whose own declaration the loop above already judged.
+        let arguments: Vec<(Id, &'src str)> = self
+            .lazy_argument_thunks
+            .iter()
+            .map(|(argument_id, name)| (*argument_id, *name))
+            .collect();
+        for (argument_id, name) in arguments {
+            // S1: the refusal anchors at the argument the caller wrote.
+            if self.reusable_entity(argument_id) {
+                continue;
+            }
+            let Some(type_id) = self.expr_id_to_type_id_map.get(&argument_id).copied() else {
+                continue;
+            };
+            if !self.type_is_resource(type_id) {
+                continue;
+            }
+            let rendered = self.pretty_print_type(&type_id.get_type(self), &HashMap::default());
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: **self.span_map.get(&argument_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "this argument is the resource `{rendered}`, and it stands in the \
+                         `lazy` parameter `{name}`: the thunk that carries it would own the \
+                         resource, which is what R9 forbids. Resources stay eager — pass the \
+                         resource to an eager parameter"
+                    ),
+                },
+                argument_id,
+            );
         }
     }
 
@@ -29043,6 +29421,7 @@ impl<'src> Analyzer<'src> {
             convention,
             mutable,
             spread,
+            lazy,
             span,
         } = parameter;
         let parameter_id = self.new_entity_id();
@@ -29150,8 +29529,16 @@ impl<'src> Analyzer<'src> {
                 convention: *convention,
                 mutable: *mutable,
                 spread: *spread,
+                lazy: *lazy,
             },
         );
+        // lazy.md §1: the parameter binds a memo CELL, so every read of it in
+        // the body forces. Recorded at the declaration — before any call is
+        // resolved — because `record_lazy_arguments` asks this set whether an
+        // argument is a forward.
+        if *lazy {
+            self.lazy_cells.insert(parameter_id);
+        }
         self.expr_id_to_expr_map
             .insert(parameter_id, Expr::Parameter(parameter_id));
         // The name span makes the parameter go-to-definable and hoverable, and a
@@ -48181,6 +48568,20 @@ pub struct Program<'src> {
     /// `async_infer` fills [`Self::suspending_calls`] — whether a call
     /// suspends is a call-graph property, not a token.
     pub view_suspension_checks: ViewSuspensionChecks<'src>,
+    /// proposal/lazy.md §1/§2 — the `lazy` lowering's three tables, decided by
+    /// `record_lazy_arguments` (arguments) and the declarations themselves
+    /// (cells). The transformer reads all three: an id in `lazy_argument_thunks`
+    /// emits as `__lazy(<name>, () => <expr>)`, one in `lazy_argument_forwards`
+    /// emits as the bare cell, and a read of a binding in `lazy_cells` emits as
+    /// `__force(<cell>)`.
+    pub lazy_argument_thunks: IndexMap<Id, &'src str>,
+    /// The lazy arguments that forward a cell they already hold (§1).
+    pub lazy_argument_forwards: HashSet<Id>,
+    /// The bindings that hold a memo cell: `lazy` parameters (§1) and `lazy let`
+    /// module bindings (§2). A read of one forces it.
+    pub lazy_cells: HashSet<Id>,
+    /// What each thunk does when forced, for `check_lazy_argument_effects`.
+    pub lazy_thunk_effects: IndexMap<Id, ThunkEffects>,
     /// Every call site the emission will `await` — the `function_calls` key of
     /// each. Filled by `async_infer::infer` from the same per-call test its
     /// fixpoint propagates over, so this is the RUNTIME truth about suspension
@@ -55813,6 +56214,13 @@ fn analyze_over_world<'src>(
         // rides here with the rest rather than at the declaration's walk (where
         // "which `main` is the entry" is not yet a question the walk can answer).
         analyzer.check_entry_main_parameters(global_scope_id);
+        // lazy.md §1: which arguments the call sites thunk and which forward a
+        // cell. OUTSIDE the Class A window on purpose — the tables are the
+        // lowering's input rather than a diagnostic, so a module whose checks
+        // are replayed still has to produce them. Before the Class A checks
+        // because two of them (the R9 capture scan and rule 3's view-capture
+        // ban) read the thunk set.
+        analyzer.record_lazy_arguments();
     }
     // ------------------------------------------------------------------
     // M19 T1's Class A window (`per-module-analysis-reuse.md` §3.3).
@@ -55845,6 +56253,7 @@ fn analyze_over_world<'src>(
     class_a_checks! {
         analyzer.check_readonly_mutation();
         analyzer.check_mutable_arguments();
+        analyzer.check_lazy_arguments();
         analyzer.check_mutable_references();
         analyzer.check_view_bindings();
         analyzer.check_view_arguments();
@@ -56888,6 +57297,10 @@ fn analyze_over_world<'src>(
         async_functions: HashSet::default(),
         drop_method_checks: std::mem::take(&mut analyzer.drop_method_checks),
         view_suspension_checks: std::mem::take(&mut analyzer.view_suspension_checks),
+        lazy_argument_thunks: std::mem::take(&mut analyzer.lazy_argument_thunks),
+        lazy_argument_forwards: std::mem::take(&mut analyzer.lazy_argument_forwards),
+        lazy_cells: std::mem::take(&mut analyzer.lazy_cells),
+        lazy_thunk_effects: std::mem::take(&mut analyzer.lazy_thunk_effects),
         suspending_calls: HashSet::default(),
         async_values: analyzer.async_values.clone(),
         sync_values: analyzer.sync_values.clone(),
@@ -57422,6 +57835,101 @@ pub fn check_async_drops(program: &mut Program) {
             )
         })
         .collect();
+    for (error, source) in violations {
+        program.push_diagnostic(error, source);
+    }
+}
+
+/// proposal/lazy.md §1's second and third v1 restrictions, over the arguments
+/// the call sites thunked.
+///
+/// **Sync only.** An awaiting argument would smuggle asyncness into the callee
+/// at an invisible forcing point — the callee's signature says `str`, and the
+/// suspension would happen at whatever line first reads it. Deferred async
+/// already has a spelling (`async expr` → pass the `Task`), which the refusal
+/// steers to. Both spellings of the suspension count, exactly as E3 counts
+/// them: the `await` the author wrote, and the implicit one a call to an async
+/// callee performs.
+///
+/// **Context-free.** The thunk forces inside the callee, where the call site's
+/// ambient contexts may be gone — the self-containment rule `drop` bodies (§8
+/// of destruction.md) and §2's lazy initializers obey, for the same reason: the
+/// forcing site threads no context. The steer is to pass a closure explicitly,
+/// which takes its context at each call instead of at creation.
+///
+/// Runs in `post_analysis_passes` rather than inside `analyze()` because both
+/// facts are settled there: `async_infer::infer` fills `async_functions` (so a
+/// transitively-async callee counts without a walk of its own), and
+/// `context::thread_contexts` fills `context_dependent_functions`.
+pub fn check_lazy_argument_effects(program: &mut Program) {
+    if program.lazy_thunk_effects.is_empty() {
+        return;
+    }
+    let mut violations: Vec<(Error, SourceId)> = Vec::new();
+    for (argument_id, effects) in program.lazy_thunk_effects.iter() {
+        let name = program
+            .lazy_argument_thunks
+            .get(argument_id)
+            .copied()
+            .unwrap_or("");
+        let callees: Vec<Id> = effects
+            .calls
+            .iter()
+            .filter_map(|call_id| program.function_calls.get(call_id))
+            .filter_map(
+                |function_call| match program.entity_map.get(&function_call.subject_id) {
+                    Some(Expr::Local(callee_id)) => Some(*callee_id),
+                    _ => None,
+                },
+            )
+            .collect();
+        // The explicit token anchors at the `await`; an implicit suspension has
+        // no token to point at, so it anchors at the argument.
+        let suspension = effects.awaits.or_else(|| {
+            callees
+                .iter()
+                .any(|callee| program.async_functions.contains(callee))
+                .then_some(*argument_id)
+        });
+        if let Some(anchor) = suspension {
+            violations.push(program.anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: **program.span_map.get(&anchor).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "this argument suspends, and it stands in the `lazy` parameter \
+                         `{name}`: the thunk forces on the parameter's first read, so the \
+                         suspension would happen at a line that does not look like a call. \
+                         Deferred async has its own spelling — write `async <expr>` and pass \
+                         the `Task`"
+                    ),
+                },
+                anchor,
+            ));
+            continue;
+        }
+        if callees
+            .iter()
+            .any(|callee| program.context_dependent_functions.contains(callee))
+        {
+            violations.push(program.anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: **program.span_map.get(argument_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "this argument requires an ambient context, and it stands in the \
+                         `lazy` parameter `{name}`: the thunk forces inside the callee, where \
+                         the call site's contexts may be gone — the self-containment a `drop` \
+                         body obeys, for the same reason. Pass a closure explicitly and call \
+                         it where the context is threaded"
+                    ),
+                },
+                *argument_id,
+            ));
+        }
+    }
     for (error, source) in violations {
         program.push_diagnostic(error, source);
     }

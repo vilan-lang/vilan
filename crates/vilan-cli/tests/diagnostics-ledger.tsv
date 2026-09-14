@@ -493,3 +493,8 @@ row	flagship	key
 461	-	`{path}` is not exported by `{module}`, and this path reaches it through the module. The spelling that says so is a marked import: `import {module}::{ #{leaf} };`, and then `{leaf}` on its own
 462	-	a closure written at this {position} would be born under `{clause}`, a `context` clause the threading cannot follow, and would capture its context at creation instead of taking one at each call: a clause is followed on a parameter, a `let` annotation, a struct field, a return type, and a generic argument the struct binds to a FIELD — not inside a `List`, a `Map`, an `Option`, a tuple or an array
 463	-	'{member}' is provided by an `impl` in module `{module}`, and {claim}: {fix}
+NEW	-	parameter {position} of `{subject}`'s `{member}` is {form}, but `{trait}` declares {declared}; match the declared laziness
+NEW	-	`{name}` is a `lazy` parameter of the resource type `{type}`: a lazy argument is carried by a thunk, and a thunk owning a resource is what R9 forbids
+NEW	-	this argument is the resource `{type}`, and it stands in the `lazy` parameter `{name}`: the thunk that carries it would own the resource
+NEW	-	this argument suspends, and it stands in the `lazy` parameter `{name}`: the thunk forces on the parameter's first read
+NEW	-	this argument requires an ambient context, and it stands in the `lazy` parameter `{name}`: the thunk forces inside the callee

@@ -4654,6 +4654,14 @@ impl<'a, 'src> Parser<'a, 'src> {
                  be annotated, stored, or passed anywhere. Take a tuple parameter \
                  (`|items: T|`) and call it with one",
             );
+            parser.reject_lazy_position(
+                &parameters,
+                "a closure cannot take a `lazy` parameter: a closure TYPE \
+                 (`sync |A| B`) has no lazy form, so the thunking would be invisible \
+                 to every position the closure is annotated, stored or passed in. \
+                 Take a closure parameter (`|make: sync || T|`) and call it where the \
+                 value is wanted",
+            );
             let parameters = (parameters, parser.span_from(start));
             let return_type = if parser.eat_op(":") {
                 Some(Box::new(parser.parse_type()?))
@@ -5375,6 +5383,12 @@ impl<'a, 'src> Parser<'a, 'src> {
                 "an `external fun` binds a host function, whose calling convention is \
                  the host's; declare a tuple parameter (`items: T`) instead",
             );
+            self.reject_lazy_position(
+                &parameters.0,
+                "an `external fun` binds a host function, whose calling convention is \
+                 the host's: nothing on that side forces a thunk. Take the value \
+                 eagerly, or a closure the host calls",
+            );
         }
         if self.in_member_body {
             self.reject_spread_position(
@@ -5538,15 +5552,22 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some((parameters, self.span_from(start)))
     }
 
-    /// One function parameter: `(mut | own | & mut?)? "..."? binder (: type)?`.
-    /// The convention is the explicit prefix, else inferred from a `&T` /
-    /// `&mut T` type, else `Bare`. A leading `mut` is binder mutability, not a
-    /// convention (proposal/mut-parameters.md): the body may rebind and
-    /// field-write its by-value copy, invisibly to the caller. A `...` marks a
-    /// SPREAD parameter (proposal/variadic-generics.md §S) — a call convention
-    /// over an ordinary tuple parameter.
+    /// One function parameter:
+    /// `"lazy"? (mut | own | & mut?)? "..."? binder (: type)?`. The convention
+    /// is the explicit prefix, else inferred from a `&T` / `&mut T` type, else
+    /// `Bare`. A leading `mut` is binder mutability, not a convention
+    /// (proposal/mut-parameters.md): the body may rebind and field-write its
+    /// by-value copy, invisibly to the caller. A `...` marks a SPREAD parameter
+    /// (proposal/variadic-generics.md §S) — a call convention over an ordinary
+    /// tuple parameter. A leading `lazy` marks a LAZY parameter
+    /// (proposal/lazy.md §1): the argument is thunked at the call site and
+    /// forced on the parameter's first read. `lazy` is first because it is what
+    /// the CALL SITE does with the argument, before any question of how the
+    /// callee receives it — and it composes with none of the answers to that
+    /// question (the three rules below).
     fn parse_function_parameter(&mut self) -> Option<Parameter<'src>> {
         let start = self.position;
+        let lazy = self.eat(&Token::Lazy);
         let mutable = self.eat(&Token::Mut);
         let prefix = if self.eat(&Token::Own) {
             Some(Convention::Own)
@@ -5562,6 +5583,13 @@ impl<'a, 'src> Parser<'a, 'src> {
         // `own mut x` / `&mut mut x` — a stray `mut` after the convention,
         // consumed here so the binder still parses and the rule below fires.
         let misplaced_mut = prefix.is_some() && self.eat(&Token::Mut);
+        // `own lazy x` / `mut lazy x` — `lazy` written AFTER the prefix it
+        // belongs in front of. Consumed for `misplaced_mut`'s reason: `lazy`
+        // composes with neither, so the binder still parses and one of the
+        // composition rules below names the real problem, instead of the
+        // backtrack throwing "expected an expression" at the next declaration
+        // (diagnostics-standard B5).
+        let lazy = lazy | self.eat(&Token::Lazy);
         let spread = self.eat_spread();
         let (pattern, pattern_span) = self.parse_binder()?;
         let parameter_type = if self.eat_op(":") {
@@ -5597,6 +5625,57 @@ impl<'a, 'src> Parser<'a, 'src> {
             });
         }
         self.reject_mut_destructure(mutable, &pattern, pattern_span);
+        if lazy {
+            // A lazy argument is a THUNK the call site builds — there is no
+            // caller-side place for `own` to transfer or for a view to alias,
+            // and the value does not exist until the callee forces it
+            // (lazy.md §1). The inferred-convention arm catches `lazy x: &T`
+            // too.
+            if convention != Convention::Bare {
+                self.errors.push(ParseError {
+                    span: self.span_from(start),
+                    reason: ParseErrorReason::Rule(
+                        "a `lazy` parameter receives a thunk the call site builds, and \
+                         the value does not exist until the callee forces it, so there \
+                         is nothing for `own` or a view (`&`, `&mut`) to transfer or \
+                         alias",
+                    ),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+            // `mut` makes the callee's by-value copy writable; a lazy parameter
+            // reads through its memo cell on every use, so there is no copy to
+            // rebind. `mut x = <the parameter>` in the body is the spelling.
+            if mutable {
+                self.errors.push(ParseError {
+                    span: self.span_from(start),
+                    reason: ParseErrorReason::Rule(
+                        "a `lazy` parameter is forced on its first read and memoized, so \
+                         there is no by-value copy for `mut` to make writable; bind the \
+                         forced value in the body (`mut value = name;`)",
+                    ),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+            // The pack is built by the CALL SITE out of the collected
+            // arguments — one thunk cannot stand for a variable number of
+            // argument expressions.
+            if spread {
+                self.errors.push(ParseError {
+                    span: self.span_from(start),
+                    reason: ParseErrorReason::Rule(
+                        "a spread parameter collects a variable number of argument \
+                         expressions into one pack, and `lazy` defers ONE expression; \
+                         declare a tuple parameter, or make the pack's elements lazy \
+                         where they are read",
+                    ),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+        }
         if spread {
             // A spread parameter's argument is a value the CALL SITE builds out
             // of the collected arguments — there is no caller-side tuple to
@@ -5648,6 +5727,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             convention,
             mutable,
             spread,
+            lazy,
             span: pattern_span,
         })
     }
@@ -5713,6 +5793,24 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// calling convention has no pack form).
     fn reject_spread_position(&mut self, parameters: &[Parameter<'src>], reason: &'static str) {
         for parameter in parameters.iter().filter(|parameter| parameter.spread) {
+            self.errors.push(ParseError {
+                span: parameter.span,
+                reason: ParseErrorReason::Rule(reason),
+                context: Vec::new(),
+                hint: None,
+            });
+        }
+    }
+
+    /// A `lazy` parameter is refused wherever the thunk has no caller that could
+    /// build it or no callee that could force it (lazy.md §1): a closure literal
+    /// (a closure TYPE has no lazy form, so the modifier would be invisible
+    /// wherever the closure travels) and an `external fun` (the host's calling
+    /// convention forces nothing). The THREE homes that keep it are the three
+    /// the paper names — a free `fun`, an `impl` method and a `trait`
+    /// signature — so, unlike `...`, this is NOT refused in a member body.
+    fn reject_lazy_position(&mut self, parameters: &[Parameter<'src>], reason: &'static str) {
+        for parameter in parameters.iter().filter(|parameter| parameter.lazy) {
             self.errors.push(ParseError {
                 span: parameter.span,
                 reason: ParseErrorReason::Rule(reason),

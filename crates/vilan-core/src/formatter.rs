@@ -4115,6 +4115,13 @@ impl<'src> Printer<'src> {
             if index > 0 {
                 self.out.push_str(", ");
             }
+            // `lazy` is the outermost prefix: it says what the CALL SITE does
+            // with the argument, ahead of how the callee receives it
+            // (lazy.md §1). Exclusive with every prefix below it by the
+            // grammar, so writing it here cannot double up.
+            if parameter.lazy {
+                self.out.push_str("lazy ");
+            }
             // `mut` (binder mutability) and the conventions are exclusive by
             // the grammar, so at most one prefix prints.
             if parameter.mutable {
@@ -7784,6 +7791,28 @@ mod bailing_constructs {
             "fun gather<T: (2..)>(...sources: (U in T: SignalCell<U>)): SignalCell<T> {\n\
              \tSignal::new(sources)\n\
              }\n",
+        );
+    }
+
+    /// `lazy message: str` — a lazy parameter (lazy.md §1). It is a keyword with
+    /// no node of its own beyond the flag, so a dropped one is silent token
+    /// drift that would change the program's meaning (an argument that ran at
+    /// the call instead of inside the callee). Pinned in all three homes it is
+    /// legal in, and beside an eager parameter so the prefix is not printed for
+    /// the wrong one.
+    #[test]
+    fn lazy_parameters() {
+        assert_construct(
+            "fun expect_positive(value: i32, lazy complaint: str): i32 {\n\tvalue\n}\n",
+            "fun expect_positive(value: i32, lazy complaint: str): i32 {\n\tvalue\n}\n",
+        );
+        assert_construct(
+            "trait Complainer {\n\tfun complain(self, lazy message: str): str;\n}\n",
+            "trait Complainer {\n\tfun complain(self, lazy message: str): str;\n}\n",
+        );
+        assert_construct(
+            "impl Thing {\n\tfun say(self, lazy message: str): str {\n\t\tmessage\n\t}\n}\n",
+            "impl Thing {\n\tfun say(self, lazy message: str): str {\n\t\tmessage\n\t}\n}\n",
         );
     }
 

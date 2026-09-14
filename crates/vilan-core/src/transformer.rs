@@ -1834,6 +1834,45 @@ fn helper_source(name: &str) -> &'static str {
         // `for x in set`: `Set` is a struct `[table]` over a `NativeMap`, so the
         // elements are the backing map's stored originals, in insertion order (I1).
         "__set_iter" => "function __set_iter(set) {\n\treturn [ ...set[0].values() ];\n}",
+        // proposal/lazy.md §5 — the memo cell, and the ONE forcing helper both
+        // lazy positions share (a `lazy` parameter and a `lazy let` module
+        // binding). `{ state, value, thunk }` is the paper's shape; `name` is
+        // the fourth slot, carried because the cycle and poison messages have
+        // to say WHICH binding, and the forcing site has no other way to know.
+        //
+        // States: 0 pending, 1 running, 2 done, 3 poisoned. `running` IS the
+        // cycle trap — an initializer that (transitively) touches its own
+        // binding re-enters here and finds its own flag set, which is a clear
+        // panic rather than a silent hang. A panicking thunk POISONS (§6a, the
+        // user's call): the failure propagates at the touching site, and every
+        // later touch re-panics naming the poison, because retrying would turn
+        // "at most once" into "at least once per attempt".
+        //
+        // `thunk = null` after a successful force so the closure — and
+        // everything it captured — is collectable once the value exists.
+        "__lazy" => {
+            "function __lazy(name, thunk) {\n\
+             \treturn { name: name, state: 0, value: undefined, thunk: thunk };\n\
+             }"
+        }
+        "__force" => {
+            "function __force(cell) {\n\
+             \tif (cell.state === 2) return cell.value;\n\
+             \tif (cell.state === 1) throw \"lazy initialization cycle: `\" + cell.name + \"`\";\n\
+             \tif (cell.state === 3) throw \"lazy `\" + cell.name + \"` is poisoned: its initializer panicked: \" + cell.value;\n\
+             \tcell.state = 1;\n\
+             \ttry {\n\
+             \t\tcell.value = cell.thunk();\n\
+             \t} catch (failure) {\n\
+             \t\tcell.state = 3;\n\
+             \t\tcell.value = failure;\n\
+             \t\tthrow failure;\n\
+             \t}\n\
+             \tcell.state = 2;\n\
+             \tcell.thunk = null;\n\
+             \treturn cell.value;\n\
+             }"
+        }
         // The trap arm of an exhaustive `match` over a BACKED enum
         // (backed-enums.md §9): the enum lowers to a bare host primitive, so its
         // runtime domain is the host's, not the variant set the analyzer proved
@@ -4178,6 +4217,21 @@ impl<'src> Transformer<'src> {
                     self.ensure_function_emitted(function_id);
                     return Some(js::Node::Local(self.ng.name_for(function_id)));
                 }
+                // lazy.md §1/§2: the binding holds a memo cell, so a READ of it
+                // is a force. This is the whole of "the parameter reads as a
+                // plain `T` — fully transparent": every use in the body goes
+                // through here, and the first one to run evaluates the thunk.
+                // The two positions that must NOT force — a forward into
+                // another lazy position, and the cell's own declaration — never
+                // reach this arm (`lazy_argument` intercepts the first,
+                // `Expr::Parameter` / the binding emission the second).
+                if self.program.lazy_cells.contains(id) {
+                    self.used_helpers.insert("__force");
+                    return Some(js::Node::Call(
+                        Box::new(js::Node::Local("__force".to_string())),
+                        vec![js::Node::Local(self.ng.name_for(*id))],
+                    ));
+                }
                 // A boxed scalar local reads through its cell's slot 0.
                 if self.local_is_boxed(*id) {
                     return Some(js::Node::PropertyIndex(
@@ -4240,6 +4294,15 @@ impl<'src> Transformer<'src> {
                     .argument_ids
                     .iter()
                     .filter_map(|arg| {
+                        // lazy.md §1: an argument standing in a `lazy` position
+                        // is not evaluated here at all — it is packaged, or it
+                        // forwards a cell it already holds. Both answers are
+                        // built whole, so neither passes through `maybe_clone`:
+                        // a memo cell is an identity, and copying one would give
+                        // the callee a second memo of the same thunk.
+                        if let Some(cell) = self.lazy_argument(*arg) {
+                            return Some(cell);
+                        }
                         // An argument to an `own` parameter is copied (marked in
                         // `clone_sites`), like a binding copy.
                         self.walk_entity(*arg, block)
@@ -6452,6 +6515,60 @@ impl<'src> Transformer<'src> {
             }
             _ => false,
         }
+    }
+
+    /// proposal/lazy.md §1 — what a call site emits for an argument standing in
+    /// a `lazy` parameter. `None` for every other argument, which is every
+    /// argument in a program that writes no `lazy`.
+    ///
+    /// Two answers, decided by the analyzer (`record_lazy_arguments`) rather
+    /// than re-derived here, because the question is "what did this call
+    /// resolve to" and that is the solver's answer:
+    ///
+    /// - a FORWARD — the argument is a bare reference to a binding that already
+    ///   holds a cell, so the cell travels as-is. One memo however deep the
+    ///   chain, which is the whole of §1's forwarding rule: the eventual first
+    ///   read forces the ORIGINAL thunk, and nothing in between re-wraps it;
+    /// - a THUNK — `__lazy(<name>, () => <the expression>)`. The expression is
+    ///   walked into the closure's OWN block, so every statement its lowering
+    ///   needs (temporaries, short-circuit slots, scope-end teardown) lands
+    ///   INSIDE the thunk. Walking it into the enclosing block would evaluate at
+    ///   the call site the very thing the whole feature defers.
+    fn lazy_argument(&mut self, argument_id: Id) -> Option<js::Node<'src>> {
+        if self.program.lazy_argument_forwards.contains(&argument_id) {
+            let Some(Expr::Local(binding)) = self.program.entity_map.get(&argument_id) else {
+                return None;
+            };
+            let binding = *binding;
+            self.referenced_globals.insert(binding);
+            return Some(js::Node::Local(self.ng.name_for(binding)));
+        }
+        let name = *self.program.lazy_argument_thunks.get(&argument_id)?;
+        let mark = self.pending_temporaries.len();
+        let mut body: Vec<js::Node<'src>> = Vec::new();
+        let value = self.walk_entity(argument_id, &mut body);
+        if let Some(value) = value {
+            // The same tail seam a closure body takes (B152): a divergent tail
+            // is the statement, never a value to `return`.
+            if value.is_divergent() {
+                body.push(value);
+            } else {
+                body.push(js::Node::Return(Box::new(value)));
+            }
+        }
+        self.seal_pending_temporaries(mark, &mut body);
+        self.used_helpers.insert("__lazy");
+        Some(js::Node::Call(
+            Box::new(js::Node::Local("__lazy".to_string())),
+            vec![
+                js::Node::String(std::borrow::Cow::Owned(name.to_string())),
+                js::Node::Closure(js::Closure {
+                    parameters: Vec::new(),
+                    body,
+                    is_async: false,
+                }),
+            ],
+        ))
     }
 
     /// The `__enum_trap` sequence for a set of backed tests read while

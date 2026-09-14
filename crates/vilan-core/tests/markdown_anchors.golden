@@ -480,6 +480,7 @@ tour/functions-and-closures.md h1 functions--closures
 tour/functions-and-closures.md h2 functions
 tour/functions-and-closures.md h2 taking-any-number-of-arguments
 tour/functions-and-closures.md h3 passing-a-pack-on
+tour/functions-and-closures.md h2 lazy-parameters
 tour/functions-and-closures.md h2 closures
 tour/functions-and-closures.md h2 named-functions-as-closures
 tour/functions-and-closures.md h2 async-closures

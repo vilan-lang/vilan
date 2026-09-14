@@ -74,11 +74,11 @@ const EAGER_AND_LAZY: &str = r#"import std::reactive::{ Disposable, Signal, Sign
 fun main() {
 	let count: SignalCell<i32> = Signal::new(1);
 	let eager = count.sub(|value| print(i"sub {value}"));
-	let lazy = count.on_change(|value| print(i"on_change {value}"));
+	let quiet = count.on_change(|value| print(i"on_change {value}"));
 	print("attached");
 	count.set(2);
 	eager.dispose();
-	lazy.dispose();
+	quiet.dispose();
 	count.set(3);
 	let (_built, scope) = comp(|| {
 		count.effect_on_change(|value| print(i"effect_on_change {value}"));
