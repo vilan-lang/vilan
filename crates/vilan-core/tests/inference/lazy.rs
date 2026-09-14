@@ -639,3 +639,316 @@ fn the_force_helper_has_an_interpreter_arm() {
         "\"Pack!/Pack! none\"\n",
     );
 }
+
+// --- §2, lazy module bindings ---------------------------------------------
+
+/// "The initializer runs at the binding's FIRST USE instead of module load,
+/// then memoizes." Both halves are observable in one program: the print order
+/// says when, and the single "opening" says how often.
+#[test]
+fn a_lazy_module_binding_initializes_at_its_first_use_and_memoizes() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun open_db(tag: str): str {
+            print(i"opening {tag}");
+            tag
+        }
+
+        lazy let database: str = open_db("kolt.db");
+
+        fun main() {
+            print("start");
+            print(database);
+            print(database);
+            print("done");
+        }
+        "#,
+        "start\nopening kolt.db\nkolt.db\nkolt.db\ndone\n",
+    );
+}
+
+/// An EAGER module binding beside it, to say what the difference is: the eager
+/// one runs before `main` does, the lazy one after `main` asks for it.
+#[test]
+fn an_eager_module_binding_still_initializes_at_load() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun announce(tag: str): str {
+            print(i"opening {tag}");
+            tag
+        }
+
+        let eager: str = announce("eager");
+        lazy let deferred: str = announce("deferred");
+
+        fun main() {
+            print("start");
+            print(eager);
+            print(deferred);
+        }
+        "#,
+        "opening eager\nstart\neager\nopening deferred\ndeferred\n",
+    );
+}
+
+/// A lazy binding nothing uses runs nothing — the §2 half of `expect`'s happy
+/// path, and the reason the declaration may not be emitted for its effects.
+#[test]
+fn a_lazy_module_binding_nothing_uses_never_initializes() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun announce(): str {
+            print("opening");
+            "value"
+        }
+
+        lazy let unused: str = announce();
+
+        fun main() {
+            print("start");
+        }
+        "#,
+        "start\n",
+    );
+}
+
+/// "an initializer that (transitively) touches its own binding traps with a
+/// clear message … via an in-progress flag — not a silent hang."
+#[test]
+fn a_lazy_initialization_cycle_traps_by_name() {
+    assert_run_panics(
+        r#"
+        import std::io::print;
+
+        fun build(): str {
+            i"via {database}"
+        }
+
+        lazy let database: str = build();
+
+        fun main() {
+            print(database);
+        }
+        "#,
+        "lazy initialization cycle: `database`",
+    );
+}
+
+/// §6a, the user's call: "A failed initializer poisons the binding … later
+/// touches re-panic with the poisoned message." The FIRST touch propagates the
+/// author's own panic, so both are observable in one run.
+#[test]
+fn a_failed_lazy_initializer_poisons_the_binding() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::io::panic;
+        import std::reactive::guarded;
+        import std::option::Option::{ self, Some, None };
+
+        fun build(): str {
+            panic("no database")
+        }
+
+        lazy let database: str = build();
+
+        fun touch(): str {
+            database
+        }
+
+        fun main() {
+            match guarded(|| print(touch())) {
+                Some(let message) => print(i"first: {message}"),
+                None => print("first: clean"),
+            }
+            match guarded(|| print(touch())) {
+                Some(let message) => print(i"second: {message}"),
+                None => print("second: clean"),
+            }
+        }
+        "#,
+        "first: no database\n\
+         second: lazy `database` is poisoned: its initializer panicked: no database\n",
+    );
+}
+
+/// The emission: the declaration builds the cell and nothing else, and the read
+/// forces it. Behaviour proves the timing; this proves the shape the timing
+/// rests on.
+#[test]
+fn a_lazy_module_binding_emits_a_cell_and_its_reads_force() {
+    let source = r#"
+        import std::io::print;
+
+        fun open_db(): str {
+            "kolt.db"
+        }
+
+        lazy let database: str = open_db();
+
+        fun main() {
+            print(database);
+        }
+        "#;
+    assert_emits_containing(source, "const database = __lazy(\"database\", () => {");
+    assert_emits_containing(source, "__force(database)");
+}
+
+/// A module binding handed to a lazy PARAMETER is a forward, not a second cell:
+/// the two positions share one lowering, so a cell travels as a cell.
+#[test]
+fn a_lazy_module_binding_forwards_into_a_lazy_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun announce(): str {
+            print("opening");
+            "value"
+        }
+
+        lazy let database: str = announce();
+
+        fun show(lazy message: str, read: bool): i32 {
+            if read {
+                print(message);
+            }
+            0
+        }
+
+        fun main() {
+            show(database, false);
+            print("nothing yet");
+            show(database, true);
+        }
+        "#,
+        "nothing yet\nopening\nvalue\n",
+    );
+}
+
+/// §2: "The initializer is sync and context-free — first touch can happen
+/// anywhere, so the deferred code must be self-contained."
+#[test]
+fn a_context_reading_lazy_initializer_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+
+        let cell: SignalCell<i32> = Signal::new(1);
+
+        fun bump(): str {
+            cell.set(cell.get() + 1);
+            "bumped"
+        }
+
+        lazy let label: str = bump();
+
+        fun main() {
+            print(label);
+        }
+        "#,
+        "this initializer requires an ambient context",
+    );
+}
+
+/// The sync half is the rule EVERY module initializer obeys, lazy or not, and
+/// it stays one diagnostic: `lazy` adds no second sentence about the same
+/// mistake (B5).
+#[test]
+fn an_async_lazy_initializer_keeps_the_one_module_initializer_diagnostic() {
+    assert_fails_once_with(
+        r#"
+        import std::io::print;
+        import std::fs::read_file_to_str;
+
+        lazy let config: str = read_file_to_str("config.txt");
+
+        fun main() {
+            print(config);
+        }
+        "#,
+        "a module-level binding cannot await",
+    );
+}
+
+/// "platform coloring flows from the initializer exactly as global init colors
+/// today" — the reachability path names the binding, so the fence is the same
+/// one an eager binding would have earned.
+#[test]
+fn a_lazy_initializer_colors_its_binding() {
+    assert_fails_browser_with(
+        r#"
+        import std::io::print;
+        import std::fs::read_file_to_str;
+
+        lazy let config: str = read_file_to_str("config.txt");
+
+        fun main() {
+            print(config);
+        }
+        "#,
+        "requires the `process` layer of `std` and cannot run on `browser`",
+    );
+}
+
+// --- §3, what a lazy binding is not ---------------------------------------
+
+/// "Lazy local `let` … excluded for symmetry" (§3): an end-of-scope drop would
+/// need a runtime was-it-initialized flag, and drop flags are ratified out.
+#[test]
+fn a_lazy_local_binding_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun body() {
+            lazy let inner: i32 = 1;
+            print(i"{inner}");
+        }
+
+        fun main() {
+            body();
+        }
+        "#,
+        "is a `lazy` binding inside a body",
+    );
+}
+
+#[test]
+fn a_lazy_binding_is_let_not_mut() {
+    assert_fails_with(
+        "lazy mut count: i32 = 1;\n\nfun main() {\n\tprint(i\"{count}\");\n}\n",
+        "it is `lazy let`; `mut` names a slot anything may rewrite",
+    );
+}
+
+#[test]
+fn a_lazy_binding_declares_its_initializer() {
+    assert_fails_with(
+        "lazy let count: i32;\n\nfun main() {\n\tprint(i\"{count}\");\n}\n",
+        "a lazy binding declares the initializer it defers",
+    );
+}
+
+#[test]
+fn a_lazy_binding_binds_one_name() {
+    assert_fails_with(
+        "lazy let (a, b): (i32, i32) = (1, 2);\n\nfun main() {\n\tprint(i\"{a}\");\n}\n",
+        "a lazy binding binds ONE name to one memo cell",
+    );
+}
+
+#[test]
+fn a_bare_lazy_says_what_the_form_is() {
+    assert_fails_with(
+        "lazy count = 1;\n\nfun main() {\n\tprint(i\"{count}\");\n}\n",
+        "a lazy binding is `lazy let name: T = <initializer>;`",
+    );
+}

@@ -653,6 +653,22 @@ impl<'a, 'src> LoadTimeWalk<'a, 'src> {
     /// initializer reads it (a 1-cycle) — the ordering pass must see that, not
     /// silently drop it.
     fn evaluated_globals(&mut self, binding: Id) -> Vec<Id> {
+        // `proposal/lazy.md` §2: a `lazy let`'s initializer does not run at
+        // module load — the declaration builds a memo cell holding a thunk,
+        // which is a closure CREATION, and creating a closure is inert (the
+        // rule above that keeps the mutually-recursive module-closure idiom
+        // legal). So a lazy binding has no out-edges. It stays an ordinary
+        // TARGET: the cell must still be declared before anything reads it, and
+        // a read of one is an edge like any other.
+        //
+        // This is also what leaves §2's reentrancy trap to the runtime, where
+        // the paper puts it: two lazy bindings that reach each other are not a
+        // compile error (neither may ever be forced), and the one that is
+        // forced into its own initialization meets `__force`'s `running` flag
+        // and panics with "lazy initialization cycle: `name`".
+        if self.program.lazy_cells.contains(&binding) {
+            return Vec::new();
+        }
         let mut reads: BTreeSet<u32> = BTreeSet::new();
         let mut seen: HashSet<Id> = HashSet::default();
         seen.insert(binding);

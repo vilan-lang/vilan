@@ -5267,8 +5267,16 @@ impl<'src> Transformer<'src> {
                     // An unused binding is dropped — but a side-effecting
                     // initializer (a call mutating through `&mut`, say) must still
                     // run; emit it as a bare statement, discarding the value.
+                    //
+                    // A `lazy` binding is the one exception, and it is the whole
+                    // feature (lazy.md §2): its initializer runs at the
+                    // binding's FIRST USE, so a binding nothing uses runs
+                    // nothing. Emitting the initializer here for its effects
+                    // would run at load exactly what `lazy` was written to
+                    // defer.
                     let initial = self.program.variables.get(id).and_then(|v| v.initial);
                     if let Some(value_id) = initial
+                        && !self.program.lazy_cells.contains(id)
                         && self.expr_has_side_effects(value_id)
                     {
                         return self.walk_entity(value_id, block);
@@ -5291,7 +5299,49 @@ impl<'src> Transformer<'src> {
                 } else {
                     None
                 };
-                let value = if let Some(hmr_binding) = hmr_binding {
+                // lazy.md §2: the declaration builds the memo cell, and nothing
+                // else. The initializer is walked into the THUNK's own block —
+                // every statement its lowering needs goes inside, exactly as a
+                // lazy argument's does — so module load evaluates one object
+                // literal and the initializer waits for the first read, which
+                // `Expr::Local`'s `__force` arm performs. HMR is skipped here
+                // because `compute_hmr_bindings` already excluded every lazy
+                // binding; the branch order makes that visible rather than
+                // implicit.
+                let value = if self.program.lazy_cells.contains(id) {
+                    let name = self
+                        .program
+                        .variables
+                        .get(id)
+                        .map(|variable| variable.name)
+                        .unwrap_or("");
+                    let mark = self.pending_temporaries.len();
+                    let mut thunk_block: Vec<js::Node<'src>> = Vec::new();
+                    let inner = initial
+                        .and_then(|value_id| {
+                            self.walk_entity(value_id, &mut thunk_block)
+                                .map(|node| self.maybe_clone(value_id, node))
+                        })
+                        .unwrap_or(js::Node::Void);
+                    if inner.is_divergent() {
+                        thunk_block.push(inner);
+                    } else {
+                        thunk_block.push(js::Node::Return(Box::new(inner)));
+                    }
+                    self.seal_pending_temporaries(mark, &mut thunk_block);
+                    self.used_helpers.insert("__lazy");
+                    js::Node::Call(
+                        Box::new(js::Node::Local("__lazy".to_string())),
+                        vec![
+                            js::Node::String(Cow::Owned(name.to_string())),
+                            js::Node::Closure(js::Closure {
+                                parameters: Vec::new(),
+                                body: thunk_block,
+                                is_async: false,
+                            }),
+                        ],
+                    )
+                } else if let Some(hmr_binding) = hmr_binding {
                     let mut thunk_block = Vec::new();
                     let inner = initial
                         .and_then(|value_id| {

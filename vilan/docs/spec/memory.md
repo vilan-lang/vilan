@@ -989,3 +989,56 @@ closure over a `&mut` parameter, handed to a function that stores it,
 leaves the frame whose place the view names. Nothing in std does this,
 and the shape needs the closure-escape analysis §6.4's dynamic remainder
 is future work for.
+
+## 6.10 `lazy` — a binding initialized at first use
+
+*(Design: [`lazy`](https://github.com/vilan-lang/proposals/blob/main/projects/vilan/proposal/lazy.md) §2.)*
+
+A **module-level** `let` may be written `lazy`, and then its initializer
+runs at the binding's **first use** instead of at module load, and
+memoizes:
+
+```vilan
+import std::db::Database;
+
+lazy let database: Database = Database::open("kolt.db");
+
+fun main() {
+	database.exec("CREATE TABLE IF NOT EXISTS notes (body TEXT)");
+}
+```
+
+*Everything else about the binding is unchanged.* The module owns the
+value, it has process lifetime and never drops, a resource is loan-only
+and write-frozen (§6.8), a closure may reference it under R9's
+module-level exemption, and the platform coloring of the initializer
+colors the binding exactly as an eager one's does. `lazy` moves one
+event's **time**, and nothing else.
+
+Four rules follow from where the initializer runs:
+
+- **The initializer is sync and context-free.** First touch can happen
+  anywhere, so the deferred code must be self-contained — the same law a
+  `drop` body obeys (§6.8), and for the same reason: neither call site
+  threads a context.
+- **Reentrancy traps.** An initializer that (transitively) reads its own
+  binding panics with `` lazy initialization cycle: `database` ``, via an
+  in-progress flag. It is not a compile error: two lazy bindings that
+  reach each other are legal as long as neither is forced into its own
+  initialization.
+- **A failed initializer poisons the binding.** The panic propagates at
+  the touching site, and every later touch re-panics naming the poison.
+  Retrying would re-run the initializer's side effects and turn "at most
+  once" into "at least once per attempt".
+- **Initialization is atomic within a turn**, by construction: the
+  initializer is synchronous, so nothing interleaves mid-initialization.
+
+A **local** `let` may not be `lazy`: destroying one at the end of its
+scope would need a runtime was-it-initialized flag, and drop flags are
+ratified out (§6.8). Neither may a struct field — a field's forcing point
+is any read anywhere, which is interior mutability through a copyable
+value, and `Shared` (§6.7) is the feature for that.
+
+The same word on a **parameter** defers an argument rather than an
+initializer; the two share one lowering and one semantic — evaluate at
+first demand, at most once, memoize.

@@ -613,6 +613,7 @@ fn starts_statement_or_item(token: &Token<'_>) -> bool {
         || matches!(
             token,
             Token::Let
+                | Token::Lazy
                 | Token::Mut
                 | Token::Ret
                 | Token::Jump
@@ -2542,7 +2543,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             // operand). Nothing else in the grammar leads with `|`/`||` here.
             Some(Token::Op("|") | Token::Op("||")) => return self.parse_closure(),
             Some(Token::Jump) => return self.parse_jump(),
-            Some(Token::Let | Token::Mut) => return self.parse_let(),
+            Some(Token::Let | Token::Mut | Token::Lazy) => return self.parse_let(),
             Some(Token::Ret) => return self.parse_return(),
             // The four block-bearing heads. They share one rule past their closing
             // brace — B248/B259's: the form is COMPLETE there, so an operator or a
@@ -4554,10 +4555,35 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// name to `Let` and a destructuring binder to `LetDestructure`.
     fn parse_let(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
+        // `lazy let name: T = init;` (proposal/lazy.md §2) — the initializer
+        // runs at the binding's first USE instead of at module load, then
+        // memoizes. `lazy` is the outermost word, as it is on a parameter, and
+        // for the same reason: it is about WHEN, before anything about what.
+        let lazy = self.eat(&Token::Lazy);
         let mutable = if self.eat(&Token::Let) {
             false
         } else if self.eat(&Token::Mut) {
             true
+        } else if lazy {
+            // `lazy name = …` — the binder word is missing. Taken as `let` and
+            // reported, rather than declined: declining would hand the word
+            // back to an expression attempt that cannot read it either, and
+            // `attempt` truncates the errors a declining branch pushed, so the
+            // rule would never reach the author (they would get "found 'lazy'
+            // expected an item" about a keyword they spelled correctly). This
+            // is `misplaced_mut`'s move on the parameter side, for the same
+            // reason (diagnostics-standard B5).
+            self.errors.push(ParseError {
+                span: self.span_from(start),
+                reason: ParseErrorReason::Rule(
+                    "a lazy binding is `lazy let name: T = <initializer>;` — `lazy` \
+                     defers a BINDING's initializer to its first use, and a parameter's \
+                     argument to the callee's first read",
+                ),
+                context: Vec::new(),
+                hint: None,
+            });
+            false
         } else {
             return None;
         };
@@ -4574,8 +4600,54 @@ impl<'a, 'src> Parser<'a, 'src> {
         } else {
             None
         };
+        if lazy {
+            // `lazy mut` — the binding is initialized ONCE, at first use, and
+            // memoized; a `mut` module global is a different contract (a slot
+            // anything may rewrite) and the two say opposite things about when
+            // the value is settled.
+            if mutable {
+                self.errors.push(ParseError {
+                    span: self.span_from(start),
+                    reason: ParseErrorReason::Rule(
+                        "a lazy binding is initialized once, at its first use, and memoized, \
+                         so it is `lazy let`; `mut` names a slot anything may rewrite",
+                    ),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+            // The initializer IS the feature — there is nothing to defer
+            // without one, and a declaration-only `let` is a shape the binding
+            // grammar allows for other reasons.
+            if value.is_none() {
+                self.errors.push(ParseError {
+                    span: self.span_from(start),
+                    reason: ParseErrorReason::Rule(
+                        "a lazy binding declares the initializer it defers: write \
+                         `lazy let name: T = <initializer>;`",
+                    ),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+            // One cell, one name: a destructure would need one memo per piece
+            // and a first-use rule per piece, which is not what `lazy` means.
+            if !matches!(pattern, Pattern::Binding(..)) {
+                self.errors.push(ParseError {
+                    span: pattern_span,
+                    reason: ParseErrorReason::Rule(
+                        "a lazy binding binds ONE name to one memo cell; destructure inside \
+                         the initializer, or bind the whole value lazily and read its pieces",
+                    ),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+        }
         let node = match pattern {
-            Pattern::Binding(name, _, _) => Node::Let((name, pattern_span), type_, value, mutable),
+            Pattern::Binding(name, _, _) => {
+                Node::Let((name, pattern_span), type_, value, mutable, lazy)
+            }
             pattern => Node::LetDestructure((pattern, pattern_span), type_, value, mutable),
         };
         Some((node, self.span_from(start)))

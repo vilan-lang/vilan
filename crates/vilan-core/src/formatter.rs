@@ -4257,7 +4257,7 @@ impl<'src> Printer<'src> {
             | Node::Await(_)
             | Node::Async(_) => 10,
             Node::Assign(_, _, _)
-            | Node::Let(_, _, _, _)
+            | Node::Let(_, _, _, _, _)
             | Node::Closure(_)
             | Node::If(_)
             | Node::For(_, _)
@@ -6064,7 +6064,14 @@ impl<'src> Printer<'src> {
                 self.out.push_str("const ");
                 self.print_split_operand(inner, 0, split);
             }
-            Node::Let(name, declared_type, value, mutable) => {
+            Node::Let(name, declared_type, value, mutable, lazy) => {
+                // `lazy` precedes the binder word, as it does on a parameter
+                // (lazy.md §2). It is a keyword with no node of its own beyond
+                // the flag, so dropping it here would silently turn a deferred
+                // initializer into a load-time one.
+                if *lazy {
+                    self.out.push_str("lazy ");
+                }
                 self.out.push_str(if *mutable { "mut " } else { "let " });
                 self.out.push_str(name.0);
                 if let Some(declared_type) = declared_type {
@@ -7814,6 +7821,20 @@ mod bailing_constructs {
             "impl Thing {\n\tfun say(self, lazy message: str): str {\n\t\tmessage\n\t}\n}\n",
             "impl Thing {\n\tfun say(self, lazy message: str): str {\n\t\tmessage\n\t}\n}\n",
         );
+    }
+
+    /// `lazy let name: T = init;` — a lazy MODULE binding (lazy.md §2). Same
+    /// token-drift risk as the parameter above, with a larger consequence: a
+    /// dropped `lazy` moves the initializer from first use back to module load.
+    #[test]
+    fn lazy_module_bindings() {
+        assert_construct(
+            "lazy let database: Database = Database::open(\"kolt.db\");\n",
+            "lazy let database: Database = Database::open(\"kolt.db\");\n",
+        );
+        assert_construct("lazy let count = 1;\n", "lazy let count = 1;\n");
+        // The eager neighbour is untouched.
+        assert_construct("let count = 1;\n", "let count = 1;\n");
     }
 
     /// `void` written as a VALUE prints as `void`; the `Void` the parser

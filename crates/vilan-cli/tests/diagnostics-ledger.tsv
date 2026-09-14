@@ -498,3 +498,5 @@ NEW	-	`{name}` is a `lazy` parameter of the resource type `{type}`: a lazy argum
 NEW	-	this argument is the resource `{type}`, and it stands in the `lazy` parameter `{name}`: the thunk that carries it would own the resource
 NEW	-	this argument suspends, and it stands in the `lazy` parameter `{name}`: the thunk forces on the parameter's first read
 NEW	-	this argument requires an ambient context, and it stands in the `lazy` parameter `{name}`: the thunk forces inside the callee
+NEW	-	`{name}` is a `lazy` binding inside a body: `lazy` defers a MODULE-LEVEL binding, whose lifetime is the process's
+NEW	-	this initializer requires an ambient context, and it initializes the `lazy` binding `{name}`: a lazy initializer runs at the binding's first use

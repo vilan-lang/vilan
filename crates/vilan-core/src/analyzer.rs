@@ -3909,6 +3909,18 @@ pub struct Analyzer<'src> {
     // (`__force`), which is what makes the callee side "a plain `T`, fully
     // transparent"; the two sets above are the only places a read does not.
     lazy_cells: HashSet<Id>,
+    // Every `lazy let` DECLARATION, in source order, before it is known whether
+    // it is module-level (§2) or a local (§3, excluded). `record_lazy_bindings`
+    // partitions it: a module-level one becomes a cell, a local is refused.
+    lazy_binding_declarations: Vec<Id>,
+    // The locals the partition refused, held for `check_lazy_arguments` to
+    // report inside the Class A window.
+    lazy_local_bindings: Vec<Id>,
+    // A lazy binding's INITIALIZER expression id, mapped to the binding's name —
+    // the §2 half of `lazy_argument_thunks`, read by
+    // `check_lazy_argument_effects` to say which binding an initializer that
+    // suspends or reads a context belongs to.
+    lazy_binding_initializers: IndexMap<Id, &'src str>,
     // What each thunk DOES when forced (§1's sync-only and context-free
     // restrictions), keyed by the same argument id. Collected while the thunks
     // are recorded, judged by `check_lazy_argument_effects` once the post-passes
@@ -5431,6 +5443,9 @@ impl<'src> Analyzer<'src> {
             lazy_argument_thunks: IndexMap::default(),
             lazy_argument_forwards: HashSet::default(),
             lazy_cells: HashSet::default(),
+            lazy_binding_declarations: Vec::new(),
+            lazy_local_bindings: Vec::new(),
+            lazy_binding_initializers: IndexMap::default(),
             lazy_thunk_effects: IndexMap::default(),
             spread_elements: HashSet::default(),
             spread_spans: HashMap::default(),
@@ -9294,7 +9309,18 @@ impl<'src> Analyzer<'src> {
                 Some(variable) => (variable.type_id, variable.name.to_string()),
                 None => continue,
             };
-            let form = self.hmr_transfer_form(type_id);
+            // lazy.md §2: a `lazy let` is not transferable. What HMR carries
+            // across a swap is a VALUE, and a lazy binding may not have one yet
+            // — adopting a cell would hand the new bundle the old bundle's
+            // thunk, closed over the old bundle's functions. Fresh init on each
+            // swap is the honest answer, and it is the one every excluded form
+            // already takes. (A lazy binding whose state must survive a swap is
+            // a candidate item, not a v1 shape.)
+            let form = if self.lazy_cells.contains(&binding_id) {
+                TransferForm::Excluded
+            } else {
+                self.hmr_transfer_form(type_id)
+            };
             // `pkg::` is the entry package's canonical namespace name (matching the
             // `pkg::` import root); the proposal's illustrative `app::` would be the
             // vilan.toml package name, which does not reach the analyzer (recorded
@@ -23433,6 +23459,53 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// proposal/lazy.md §2 — partition the `lazy let` declarations into the
+    /// module-level ones (which become memo cells) and the locals (which §3
+    /// excludes), and record each module one's initializer.
+    ///
+    /// The partition cannot happen at the declaration's walk: which scopes are
+    /// module bodies is only settled once every `mod` has registered, and
+    /// `module_level_binding_ids` is the one answer emission and the loan-only
+    /// rule already share. Runs before `record_lazy_arguments`, which asks
+    /// `lazy_cells` whether an argument forwards a cell — a module binding
+    /// passed to a lazy parameter is a forward, exactly as a lazy parameter is.
+    fn record_lazy_bindings(&mut self) {
+        if self.lazy_binding_declarations.is_empty() {
+            return;
+        }
+        let module_level = self.module_level_binding_ids();
+        for binding_id in std::mem::take(&mut self.lazy_binding_declarations) {
+            if !module_level.contains(&binding_id) {
+                self.lazy_local_bindings.push(binding_id);
+                continue;
+            }
+            self.lazy_cells.insert(binding_id);
+            if let Some(variable) = self.variables.get(&binding_id)
+                && let Some(initial) = variable.initial
+            {
+                let name = variable.name;
+                self.lazy_binding_initializers.insert(initial, name);
+            }
+        }
+        // The effects half, in a second loop so the walk's borrow of `self`
+        // does not fight the inserts above. Same sink, same walk and same
+        // conservatism as a thunked argument's: an initializer is a deferred
+        // expression with exactly the two restrictions §2 states for it.
+        let initializers: Vec<Id> = self.lazy_binding_initializers.keys().copied().collect();
+        for initializer_id in initializers {
+            let mut effects = ThunkEffects::default();
+            self.scan_capture_body(
+                initializer_id,
+                &HashSet::default(),
+                &mut HashSet::default(),
+                &mut Vec::new(),
+                &mut HashSet::default(),
+                &mut effects,
+            );
+            self.lazy_thunk_effects.insert(initializer_id, effects);
+        }
+    }
+
     /// proposal/lazy.md §1 — decide, for every resolved call, which arguments
     /// the call site THUNKS and which FORWARD a cell they already hold.
     ///
@@ -23519,6 +23592,38 @@ impl<'src> Analyzer<'src> {
     /// standing in the lazy position resolves to one, which is the same rule
     /// reaching the generic case (`lazy fallback: T` at a resource `T`).
     fn check_lazy_arguments(&mut self) {
+        // §3: no lazy local `let`. An end-of-scope drop would need a runtime
+        // was-it-initialized flag, and drop flags are ratified out (C4 (c));
+        // lazy DATA locals are harmless but weakly motivated, and are excluded
+        // for symmetry rather than for a rule of their own. Reported here
+        // rather than at the walk because the partition that finds them needs
+        // every scope to exist first.
+        for binding_id in std::mem::take(&mut self.lazy_local_bindings) {
+            // S1: the refusal anchors at the binding's own declaration.
+            if self.reusable_entity(binding_id) {
+                continue;
+            }
+            let name = self
+                .variables
+                .get(&binding_id)
+                .map(|variable| variable.name)
+                .unwrap_or("the binding");
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: **self.span_map.get(&binding_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "`{name}` is a `lazy` binding inside a body: `lazy` defers a \
+                         MODULE-LEVEL binding, whose lifetime is the process's. A local \
+                         would need a runtime was-it-initialized flag to know whether to \
+                         destroy it at the end of its scope — drop the `lazy`, or lift the \
+                         binding to module level"
+                    ),
+                },
+                binding_id,
+            );
+        }
         if self.lazy_cells.is_empty() {
             return;
         }
@@ -28400,9 +28505,18 @@ impl<'src> Analyzer<'src> {
                 }
                 Some(Expr::Binary(*op, lhs_id, rhs_id))
             }
-            Node::Let(name, type_, value, mutable) => {
+            Node::Let(name, type_, value, mutable, lazy) => {
                 let name_span = name.1;
                 let name = name.0;
+                // lazy.md §2: the binding holds a memo cell whose initializer
+                // runs at its FIRST USE. Which bindings are module-level is not
+                // an answer this walk has (module bodies register as it goes),
+                // so the declaration is only RECORDED here;
+                // `record_lazy_bindings` partitions it once every scope exists,
+                // and `check_lazy_arguments` refuses the local ones (§3).
+                if *lazy {
+                    self.lazy_binding_declarations.push(id);
+                }
                 // `_` eats the value: the binding is never referenceable.
                 // Visible from the END of the whole statement, so the
                 // initializer reads an enclosing (or shadowed) binding, never
@@ -48580,6 +48694,10 @@ pub struct Program<'src> {
     /// The bindings that hold a memo cell: `lazy` parameters (§1) and `lazy let`
     /// module bindings (§2). A read of one forces it.
     pub lazy_cells: HashSet<Id>,
+    /// A `lazy let`'s initializer expression id, mapped to the binding's name
+    /// (§2) — the transformer labels the cell with it, and
+    /// `check_lazy_argument_effects` names the binding in its refusals.
+    pub lazy_binding_initializers: IndexMap<Id, &'src str>,
     /// What each thunk does when forced, for `check_lazy_argument_effects`.
     pub lazy_thunk_effects: IndexMap<Id, ThunkEffects>,
     /// Every call site the emission will `await` — the `function_calls` key of
@@ -56220,6 +56338,7 @@ fn analyze_over_world<'src>(
         // are replayed still has to produce them. Before the Class A checks
         // because two of them (the R9 capture scan and rule 3's view-capture
         // ban) read the thunk set.
+        analyzer.record_lazy_bindings();
         analyzer.record_lazy_arguments();
     }
     // ------------------------------------------------------------------
@@ -57300,6 +57419,7 @@ fn analyze_over_world<'src>(
         lazy_argument_thunks: std::mem::take(&mut analyzer.lazy_argument_thunks),
         lazy_argument_forwards: std::mem::take(&mut analyzer.lazy_argument_forwards),
         lazy_cells: std::mem::take(&mut analyzer.lazy_cells),
+        lazy_binding_initializers: std::mem::take(&mut analyzer.lazy_binding_initializers),
         lazy_thunk_effects: std::mem::take(&mut analyzer.lazy_thunk_effects),
         suspending_calls: HashSet::default(),
         async_values: analyzer.async_values.clone(),
@@ -57867,11 +57987,18 @@ pub fn check_lazy_argument_effects(program: &mut Program) {
     }
     let mut violations: Vec<(Error, SourceId)> = Vec::new();
     for (argument_id, effects) in program.lazy_thunk_effects.iter() {
-        let name = program
-            .lazy_argument_thunks
-            .get(argument_id)
-            .copied()
-            .unwrap_or("");
+        // §2's initializers obey the same two rules as §1's arguments, and for
+        // the same reason — a forcing site threads no context and must not
+        // suspend — so they share this pass. What differs is only which of the
+        // two the author wrote, which is what the wording says.
+        let binding = program.lazy_binding_initializers.get(argument_id).copied();
+        let name = binding.unwrap_or_else(|| {
+            program
+                .lazy_argument_thunks
+                .get(argument_id)
+                .copied()
+                .unwrap_or("")
+        });
         let callees: Vec<Id> = effects
             .calls
             .iter()
@@ -57883,14 +58010,29 @@ pub fn check_lazy_argument_effects(program: &mut Program) {
                 },
             )
             .collect();
+        // §2's sync half is ALREADY enforced, by the rule every module-level
+        // initializer obeys whether or not it is lazy — the one that names the
+        // async callee an initializer reaches and says a module binding cannot
+        // await. (Quoted no closer than that on purpose: the ledger's
+        // `APPENDIX_HEADS_NOT_HELD` claims that sentence appears nowhere in the
+        // tree as one run, and a comment is part of the tree.) Reporting it
+        // again here would be two diagnostics for one root cause (B5), so a
+        // BINDING's initializer takes only the context question, and the
+        // sentence below reaches arguments alone.
+        //
         // The explicit token anchors at the `await`; an implicit suspension has
         // no token to point at, so it anchors at the argument.
-        let suspension = effects.awaits.or_else(|| {
-            callees
-                .iter()
-                .any(|callee| program.async_functions.contains(callee))
-                .then_some(*argument_id)
-        });
+        let suspension = binding
+            .is_none()
+            .then(|| {
+                effects.awaits.or_else(|| {
+                    callees
+                        .iter()
+                        .any(|callee| program.async_functions.contains(callee))
+                        .then_some(*argument_id)
+                })
+            })
+            .flatten();
         if let Some(anchor) = suspension {
             violations.push(program.anchored(
                 Error {
@@ -57918,13 +58060,23 @@ pub fn check_lazy_argument_effects(program: &mut Program) {
                     trace: Vec::new(),
                     note: None,
                     span: **program.span_map.get(argument_id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!(
-                        "this argument requires an ambient context, and it stands in the \
-                         `lazy` parameter `{name}`: the thunk forces inside the callee, where \
-                         the call site's contexts may be gone — the self-containment a `drop` \
-                         body obeys, for the same reason. Pass a closure explicitly and call \
-                         it where the context is threaded"
-                    ),
+                    msg: match binding {
+                        Some(_) => format!(
+                            "this initializer requires an ambient context, and it \
+                             initializes the `lazy` binding `{name}`: a lazy initializer \
+                             runs at the binding's first use, which can be anywhere, so it \
+                             must be self-contained — the rule a `drop` body obeys, for the \
+                             same reason. Do the context-reading work inside a turn that \
+                             threads one"
+                        ),
+                        None => format!(
+                            "this argument requires an ambient context, and it stands in \
+                             the `lazy` parameter `{name}`: the thunk forces inside the \
+                             callee, where the call site's contexts may be gone — the \
+                             self-containment a `drop` body obeys, for the same reason. Pass \
+                             a closure explicitly and call it where the context is threaded"
+                        ),
+                    },
                 },
                 *argument_id,
             ));

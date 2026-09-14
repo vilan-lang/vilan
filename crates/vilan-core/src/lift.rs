@@ -283,8 +283,8 @@ fn descend<'src>(node: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
             return_type,
             return_value: seal_boxed(return_value),
         }),
-        Node::Let(name, annotation, value, mutable) => {
-            Node::Let(name, annotation, seal_opt(value), mutable)
+        Node::Let(name, annotation, value, mutable, lazy) => {
+            Node::Let(name, annotation, seal_opt(value), mutable, lazy)
         }
         Node::LetDestructure(pattern, annotation, value, mutable) => {
             Node::LetDestructure(pattern, annotation, seal_opt(value), mutable)
