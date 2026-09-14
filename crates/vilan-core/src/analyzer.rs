@@ -3900,7 +3900,7 @@ pub struct Analyzer<'src> {
     // NAME the impl wrote, after the queue itself is consumed. Accumulates
     // across builds, matching the drain-once contract.
     written_type_spellings: Vec<(TypeId, &'src str)>,
-    prepped_uses: PreppedImports<'src>,
+    prepped_uses: PreppedUses<'src>,
     // Deferred module-qualified type references (`style::Style`), drained after
     // `prepped_type_locals` so a path's namespace head has resolved by the time
     // its member is looked up in it.
@@ -4999,7 +4999,32 @@ pub struct ImportAlias<'src> {
 /// The queue an `import`/`use` statement's leaves wait in until the world can
 /// resolve them: the namespace path, the leaf name the path RESOLVES to, the
 /// scope the statement binds into, the statement's span, the leaf's span, the
-/// file, and the `as` alias the leaf BINDS under when it has one (E142).
+/// file, the `as` alias the leaf BINDS under when it has one (E142), and
+/// whether the walk BINDS at all.
+///
+/// B318 S4: the last flag is `false` for a statement whose whole payload is an
+/// `(impl …)` selector. Such a statement names no leaf, so the flattening walk
+/// produced no entry for it and `resolve_import` never saw its path — which
+/// left the admission pass looking its module up by FILE NAME
+/// (`module_source_by_name`, retired here), a string match against
+/// `canonical_sources` that read a `\`-separated Windows path as a miss and
+/// took the seal fix 9b22ec36 to make host-independent at all. A walk that
+/// binds nothing still walks: it resolves the path, records each segment's
+/// reference (so go-to-definition and rename reach a selector's module) and
+/// stops one line short of writing the leaf into the scope.
+/// [`PreppedImports`] without the bind flag: a `use` statement always binds —
+/// it names items out of a namespace already in scope, and there is no
+/// selector form of it.
+type PreppedUses<'src> = Vec<(
+    Vec<(&'src str, Span)>,
+    &'src str,
+    Id,
+    Span,
+    Span,
+    SourceId,
+    Option<(&'src str, Span)>,
+)>;
+
 type PreppedImports<'src> = Vec<(
     Vec<(&'src str, Span)>,
     &'src str,
@@ -5008,6 +5033,7 @@ type PreppedImports<'src> = Vec<(
     Span,
     SourceId,
     Option<(&'src str, Span)>,
+    bool,
 )>;
 
 /// One flattened `import`/`use` leaf: the namespace segments leading to it
@@ -5063,15 +5089,6 @@ pub struct ImportImplSelector {
     /// The members the `::` tail named, empty when the selector takes the whole
     /// block.
     pub members: Vec<(String, Span)>,
-    /// The module path the selector was written under, past the origin
-    /// (`["ext"]` for `import pkg::ext::{ (impl T) };`).
-    ///
-    /// A statement whose whole payload is a selector binds no name, so
-    /// `resolve_import` never walked it and `type_references` holds no row for
-    /// its spans. The module still LOADED — the module collectors take a
-    /// selector's path too — so its file is in `canonical_sources`, and these
-    /// segments are what finds it (see [`module_source_by_name`]).
-    pub path: Vec<String>,
 }
 
 /// Flattens an `import`/`use` tree into (path, leaf-name, leaf-span, alias)
@@ -26858,8 +26875,15 @@ impl<'src> Analyzer<'src> {
                         leaf_span,
                         self.current_source_id,
                         alias,
+                        true,
                     ));
                 }
+                // B318 S4: a selector's own path is walked too, BINDING
+                // nothing. The walk is what puts the module's segments in
+                // `type_references`, which is where the admission pass reads
+                // the files a statement carried — the one channel that works
+                // the same on every host.
+                self.queue_selector_paths(root_branch, scope_id, node.1, &mut path_spans);
                 self.bank_import_restriction(root_branch, *modifier, scope_id, node.1, path_spans);
                 Some(Expr::Void)
             }
@@ -34672,6 +34696,55 @@ impl<'src> Analyzer<'src> {
     /// the import fixpoint, so the name is read AFTER the file's plain leaves
     /// have bound, which is §3.6's "plain leaves bind first, selectors resolve
     /// second" with no second walk to write.
+    /// B318 S4 — queues the path of every `(impl …)` selector in an `import`
+    /// tree for a WALK that binds nothing.
+    ///
+    /// A statement whose brace set holds only selectors binds no leaf, so
+    /// [`flatten_namespace_branch`] produced no entry for it and the path was
+    /// never resolved: nothing recorded a reference for `pkg::ext` in
+    /// `import pkg::ext::{ (impl T) };`, and the admission pass had to find the
+    /// module by matching the segments against `canonical_sources` as a file
+    /// path ([`module_source_by_name`], retired with this). That lookup is a
+    /// host-dependent string match — a canonical path is `\`-separated on
+    /// Windows and `/`-separated everywhere else, which is what the Order 35
+    /// seal fix (vilan 9b22ec36) had to repair — and it is guesswork even where
+    /// it works: two packages with the same directory shape both match, and it
+    /// picked whichever shared the longer prefix with the importer.
+    ///
+    /// The walk answers exactly, by the same route every other import takes.
+    /// It is queued only when the statement's segments are not already in the
+    /// queue from a real leaf, so `import pkg::x::{ y::helper, (impl T) };`
+    /// costs nothing extra.
+    fn queue_selector_paths(
+        &mut self,
+        branch: &'src ImportBranch<'src>,
+        scope_id: Id,
+        span: Span,
+        path_spans: &mut Vec<Span>,
+    ) {
+        let mut written = Vec::new();
+        collect_impl_selectors(branch, Vec::new(), &mut written);
+        for (path, _) in written {
+            let Some(((leaf, leaf_span), segments)) = path.split_last() else {
+                continue;
+            };
+            if path_spans.contains(leaf_span) {
+                continue;
+            }
+            path_spans.push(*leaf_span);
+            self.prepped_imports.push((
+                segments.to_vec(),
+                leaf,
+                scope_id,
+                span,
+                *leaf_span,
+                self.current_source_id,
+                None,
+                false,
+            ));
+        }
+    }
+
     fn bank_import_restriction(
         &mut self,
         branch: &'src ImportBranch<'src>,
@@ -34709,13 +34782,6 @@ impl<'src> Analyzer<'src> {
                     .members
                     .iter()
                     .map(|(name, span)| ((*name).to_string(), *span))
-                    .collect(),
-                // Past the ORIGIN segment (`pkg`, `std`, a dependency name),
-                // which names a package rather than a file.
-                path: path
-                    .iter()
-                    .skip(1)
-                    .map(|(name, _)| (*name).to_string())
                     .collect(),
             });
         }
@@ -34899,6 +34965,7 @@ impl<'src> Analyzer<'src> {
         leaf_span: Span,
         source_id: SourceId,
         alias: Option<(&'src str, Span)>,
+        bind: bool,
     ) -> bool {
         // The segments to walk, each with its source span. A `self` leaf re-binds
         // the namespace it sits in (e.g. `Option::{ self }` binds `Option`);
@@ -35188,6 +35255,15 @@ impl<'src> Analyzer<'src> {
         // A `self` leaf's own span points at the namespace it re-binds.
         if name == "self" {
             self.record_reference(source_id, leaf_span, target_id);
+        }
+        // B318 S4: a selector-only statement's walk stops here. It has resolved
+        // the path and recorded every segment's reference — which is all it was
+        // for — and it binds no name, records no alias and makes no reach: a
+        // module FILE is not a module's own top-level declaration, so the
+        // plain-reach warning had nothing to say about this leaf anyway
+        // (§5's third exemption).
+        if !bind {
+            return true;
         }
         // E142: an `as` alias renames the binding and nothing else — the path
         // resolved exactly as it would have without one. The alias's own span
@@ -42340,10 +42416,10 @@ impl<'src> Analyzer<'src> {
         loop {
             let before = remaining.len();
             remaining.retain(
-                |(path, name, scope_id, span, leaf_span, source_id, alias)| {
+                |(path, name, scope_id, span, leaf_span, source_id, alias, bind)| {
                     let diagnostics_before = self.diagnostics.len();
                     let resolved = self.resolve_import(
-                        path, name, *scope_id, *span, false, *leaf_span, *source_id, *alias,
+                        path, name, *scope_id, *span, false, *leaf_span, *source_id, *alias, *bind,
                     );
                     self.attribute_new_diagnostics(diagnostics_before, *source_id);
                     !resolved
@@ -42353,10 +42429,10 @@ impl<'src> Analyzer<'src> {
                 break;
             }
         }
-        for (path, name, scope_id, span, leaf_span, source_id, alias) in remaining {
+        for (path, name, scope_id, span, leaf_span, source_id, alias, bind) in remaining {
             let diagnostics_before = self.diagnostics.len();
             self.resolve_import(
-                &path, name, scope_id, span, true, leaf_span, source_id, alias,
+                &path, name, scope_id, span, true, leaf_span, source_id, alias, bind,
             );
             self.attribute_new_diagnostics(diagnostics_before, source_id);
         }
@@ -57231,20 +57307,6 @@ pub fn check_impl_selector_admission(program: &mut Program) {
 /// `impl` arrives with it. `only` declines the lot.
 fn statement_sources(program: &Program, restriction: &ImportImplRestriction) -> Vec<SourceId> {
     let mut sources: Vec<SourceId> = Vec::new();
-    for selector in &restriction.selectors {
-        let Some(source) = module_source_by_name(program, restriction.source, &selector.path)
-        else {
-            continue;
-        };
-        if source != restriction.source && !sources.contains(&source) {
-            sources.push(source);
-        }
-        for ancestor in ancestor_module_sources(program, source, selector.path.len()) {
-            if ancestor != restriction.source && !sources.contains(&ancestor) {
-                sources.push(ancestor);
-            }
-        }
-    }
     for span in &restriction.path_spans {
         let Some(Some(definition)) =
             program
@@ -57269,63 +57331,6 @@ fn statement_sources(program: &Program, restriction: &ImportImplRestriction) -> 
         }
     }
     sources
-}
-
-/// The file a module path names, found by NAME rather than through a recorded
-/// reference — see [`ImportImplSelector::path`] for why a selector needs this.
-///
-/// A module's file is `<segments>.vl` or `<segments>/lib.vl` under whichever
-/// package root it came from, so a loaded source's path ENDS the way the
-/// segments spell it. Ambiguity is resolved toward the importer: two packages
-/// with the same directory shape both match the suffix, and the one sharing the
-/// longer prefix with the importing file is the one the import reached.
-fn module_source_by_name(
-    program: &Program,
-    importer: SourceId,
-    segments: &[String],
-) -> Option<SourceId> {
-    if segments.is_empty() {
-        return None;
-    }
-    let home = program
-        .canonical_sources
-        .get(importer.0 as usize)
-        .cloned()
-        .unwrap_or_default();
-    // The longest prefix that names a loaded file: `a::b::item` is the module
-    // `a::b` reaching a name, and `a::b::c` may be a module in its own right.
-    for length in (1..=segments.len()).rev() {
-        // Matched by PATH COMPONENTS, not by string suffix: a canonical path on
-        // Windows is `\\`-separated, and `Path::ends_with` compares components
-        // (both separators read as one there), so the same candidate matches
-        // on every host — the string form never matched a `\\` path.
-        let mut tail = std::path::PathBuf::new();
-        for segment in &segments[..length] {
-            tail.push(segment);
-        }
-        let candidates = [tail.with_extension("vl"), tail.join("lib.vl")];
-        let mut best: Option<(usize, SourceId)> = None;
-        for (index, loaded) in program.canonical_sources.iter().enumerate() {
-            if !candidates
-                .iter()
-                .any(|candidate| loaded.ends_with(candidate))
-            {
-                continue;
-            }
-            let shared = loaded
-                .components()
-                .zip(home.components())
-                .take_while(|(left, right)| left == right)
-                .count();
-            if best.is_none_or(|(previous, _)| shared > previous) {
-                best = Some((shared, SourceId(index as u32)));
-            }
-        }
-        if let Some((_, source)) = best {
-            return Some(source);
-        }
-    }
-    None
 }
 
 /// The files of the modules ABOVE `source` on its own path — `x.vl` for

@@ -6101,3 +6101,68 @@ fn b318_a_plain_import_of_the_same_module_lifts_the_restriction() {
         "the plain `import pkg::x;` should keep `x.vl`'s block: {diagnostics:?}"
     );
 }
+
+/// B318 S4 — a statement whose whole payload is a selector WALKS its path.
+///
+/// `resolve_import` gained a `bind` flag for this: the walk resolves the
+/// module, records each segment's reference and stops one line short of
+/// binding a name. Before it, such a statement was never walked at all and the
+/// admission pass matched the selector's segments against `canonical_sources`
+/// as a file path — a host-dependent string comparison (the Order 35 seal fix
+/// 9b22ec36 is the exhibit) that also guessed between two packages of the same
+/// shape. The nested path is what the guess could not see: the module is
+/// `deep/ext.vl`, and only a walk knows the statement reached it through
+/// `deep`.
+#[test]
+fn b318_a_selector_only_statement_walks_a_nested_path() {
+    let diagnostics = analyze_package(
+        &[
+            (
+                "item.vl",
+                "export struct Boxed<T> { value: T }\n\n\
+                 export impl Boxed<type T> {\n\tfun make(value: T): Boxed<T> { Boxed { value = value } }\n}\n",
+            ),
+            (
+                "deep/ext.vl",
+                "import pkg::item::Boxed;\n\n\
+                 export impl Boxed<i32> {\n\tfun tag(self): i32 { 1 }\n}\n",
+            ),
+            (
+                "app.vl",
+                "import pkg::item::Boxed;\nimport pkg::deep::ext::{ (impl Boxed<i32>) };\n\n\
+                 fun main() {\n\tlet _ = Boxed::make(1).tag();\n}\n",
+            ),
+        ],
+        "app.vl",
+        Platform::default(),
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "a selector under a nested path should admit its block: {diagnostics:?}"
+    );
+}
+
+/// The same walk's other half: a selector naming a module that does not exist
+/// is REFUSED, by the ordinary import miss. The file-name lookup it replaces
+/// was silent — it answered `None` and the statement claimed nothing.
+#[test]
+fn b318_a_selector_only_statement_refuses_a_module_that_is_not_there() {
+    let diagnostics = analyze_package(
+        &[
+            ("item.vl", "export struct Boxed<T> { value: T }\n"),
+            (
+                "app.vl",
+                "import pkg::item::Boxed;\nimport pkg::nowhere::{ (impl Boxed<i32>) };\n\n\
+                 fun main() {}\n",
+            ),
+        ],
+        "app.vl",
+        Platform::default(),
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|message| message.contains("cannot find 'nowhere' in the imported path")),
+        "the selector's own path should be walked and reported: {diagnostics:?}"
+    );
+}
