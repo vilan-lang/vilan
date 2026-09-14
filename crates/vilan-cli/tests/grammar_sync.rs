@@ -2014,6 +2014,113 @@ fn e170_a_call_is_still_a_call_inside_a_head_item_and_outside_one() {
     assert_eq!(painting.region_depth("child", "meta.tag.vilan"), 0);
 }
 
+// --- E176: a head item with NO parens is an attribute name too --------------
+//
+// E170 gave the head its attribute vocabulary and reached only the names a `(`
+// follows, so the two head items that carry no parens of their own painted as
+// NOTHING: a bare boolean attribute (`disabled` in `<input type("checkbox")
+// disabled />`) and the attribute half of an attribute-then-chain item
+// (`hidden` in `hidden.show(flag)`). Both are attribute names by the grammar's
+// own one-token disambiguation — a leading `.` is chain form, `on` plus `:` is
+// the event form, an ident plus `(` is an attribute with a value, and a bare
+// ident is a boolean attribute (element-syntax.md §113) — so the vocabulary is
+// owed to them and E170's rule simply could not ask for it.
+//
+// TextMate only. The book's highlight.js theme has no head REGION — it is
+// regex-level and paints tag names and the `on:` form from their own spelling —
+// so it never carried E170's vocabulary either, and there is nothing here to
+// mirror. The three-places rule is about a KEYWORD; this is a scope.
+//
+// Measured over the tree at the fix, tokenising every one of the 257 tracked
+// `.vl` files and all 464 `vilan` fences under `vilan/docs` with both grammars
+// and diffing per character: 10 characters move, all of them ONE token —
+// `disabled` in `vilan/test/element-syntax.vl`, the estate's only parenless
+// head item. kolt's 26 `.vl` move nothing: every head item it writes is the
+// dotted chain form, which this rule's lookbehind declines.
+
+/// Every shape the parenless rule has to tell apart: the two it must paint, the
+/// tag names and the `on:` form it must not steal, a chain link's method, a
+/// hyphenated name, a hole child and a call outside the markup.
+const E176_PARENLESS_HEAD_ITEMS: &str = concat!(
+    "fun probe(flag: bool): View {\n",
+    "\tlet widget = compute(\"x\");\n",
+    "\t<label class(\"row\") hidden.show(flag)>\n",
+    "\t\t<input type(\"checkbox\") on:click(|_| { bump(); }) aria-label(\"y\") disabled />\n",
+    "\t\t{widget}\n",
+    "\t</label>\n",
+    "}\n",
+);
+
+#[test]
+fn e176_a_parenless_head_item_carries_the_attribute_vocabulary() {
+    let Some(painting) = painting(E176_PARENLESS_HEAD_ITEMS) else {
+        return;
+    };
+    let attribute = "entity.other.attribute-name.vilan";
+    // THE DEFECT, both halves: neither name was painted at all.
+    assert_eq!(
+        painting.scope_at("disabled"),
+        attribute,
+        "a bare boolean attribute"
+    );
+    assert_eq!(
+        painting.scope_at("hidden"),
+        attribute,
+        "the attribute half of `hidden.show(flag)`"
+    );
+    // Each inside the head, which is the only place the vocabulary is offered.
+    for name in ["disabled", "hidden"] {
+        assert_eq!(painting.region_depth(name, "meta.tag.vilan"), 1, "{name}");
+    }
+    // And the head items that already carried it still do — `on:click` in
+    // particular, which this rule sits ahead of `$self` for and would have
+    // taken the `on` of if its lookahead did not decline a `:`.
+    assert_eq!(painting.scope_at("click"), attribute, "the `on:` form");
+    assert_eq!(painting.scope_at("class"), attribute, "a valued attribute");
+    assert_eq!(
+        painting.scope_at("aria-label"),
+        attribute,
+        "a hyphenated name"
+    );
+}
+
+#[test]
+fn e176_the_parenless_rule_declines_a_tag_name_a_hole_and_a_chain_link() {
+    let Some(painting) = painting(E176_PARENLESS_HEAD_ITEMS) else {
+        return;
+    };
+    let attribute = "entity.other.attribute-name.vilan";
+    // THE TAG-NAME CONTROL. A rule that paints bare lowercase words inside a
+    // head is exactly the rule that could take the tag's own name, and the
+    // head region's `begin` consuming it is what says it cannot — asserted
+    // rather than assumed, on both an opening tag with items after it and one
+    // with none.
+    assert_eq!(painting.scope_at("label class"), "entity.name.tag.vilan");
+    assert_eq!(painting.scope_at("input"), "entity.name.tag.vilan");
+    // A `{hole}` child is OUTSIDE the head — the region ends at the `>` and
+    // bails at a `{` — so nothing in it is an attribute and nothing in it is
+    // in a head at all. (It is not one token of its own: the hole's name falls
+    // to whatever `$self` makes of a plain identifier, which is the point.)
+    let hole = painting.tokens_over("{widget}");
+    assert!(
+        hole.iter().all(|token| token.innermost() != attribute),
+        "a hole child was painted as an attribute: {:?}",
+        painting.scopes_over("{widget}"),
+    );
+    assert!(
+        hole.iter()
+            .all(|token| !token.scopes.iter().any(|scope| scope == "meta.tag.vilan")),
+        "a hole child is not inside the head: {:?}",
+        painting.scopes_over("{widget}"),
+    );
+    // A chain link's method keeps the call scope: the lookbehind declines a
+    // name glued to a `.`, which is the same guard E170's rule carries.
+    assert_eq!(painting.scope_at("show"), "entity.name.function.vilan");
+    // And a call outside the markup is untouched.
+    assert_eq!(painting.scope_at("compute"), "entity.name.function.vilan");
+    assert_eq!(painting.region_depth("compute", "meta.tag.vilan"), 0);
+}
+
 /// The book's twin (the third place). highlight.js has no operator rule, so its
 /// brackets were never mis-scoped — but its element-tag rule made the very same
 /// `<type` mistake, and takes the very same guard.

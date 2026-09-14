@@ -1305,6 +1305,140 @@ fn find_linked_tags(
         .for_each_child(&mut |child| find_linked_tags(child, offset, out));
 }
 
+/// What Organize Imports does with an import statement whose every leaf pruned
+/// away (E173, E180) — the half of the answer the FADE needs, so that the mark
+/// and the edit can never describe different things.
+enum EmptiedStatement {
+    /// The narrower statement it becomes; the leaf still fades, and the fade
+    /// names this text.
+    Rewritten(String),
+    /// Nothing: the rescue would have bound a name the file has taken, so the
+    /// statement stands as written and its leaves do not fade at all.
+    Kept,
+}
+
+/// The tables one Organize Imports pass judges its module question against
+/// (E169, E180) — built once by [`Document::import_use_context`] and handed to
+/// every leaf.
+///
+/// Three of the four are LAZY. Rule (2) is only ever reached by a leaf rule (1)
+/// could not answer, and the collision guard only by a statement whose every
+/// leaf pruned away — so on the common shape (one unused leaf beside a used
+/// one) nothing here is built at all, which matters because this runs on the
+/// debounced diagnostics path (E114's 6.2 ms budget).
+struct ImportUseContext<'a> {
+    /// The text the pass is reading — the analyzed text for the fades, the live
+    /// text for the action. Both callers already hold it; the collision guard
+    /// needs it to read a module SEGMENT's name.
+    source: &'a str,
+    /// Every definition this file's top-level import LEAVES bind, aliases
+    /// included — E169's exclusion set.
+    bound_by_leaves: HashSet<Definition>,
+    /// The spans in THIS file at which the analyzer resolved a member by
+    /// RECEIVER syntax (E180). `Program::member_name_spans` is written only at
+    /// `Node::MemberAccessor`, so it is exactly the `subject.member` set and a
+    /// `Head::member` path segment is not in it.
+    receiver_members: std::cell::OnceCell<HashSet<Span>>,
+    /// Every definition declared inside an `impl` block or a `trait` — what a
+    /// module import carries beyond its own name (E180).
+    impl_members: std::cell::OnceCell<HashSet<Id>>,
+    /// The names this file ALREADY binds: its top-level declarations and
+    /// everything its import list binds. E180's collision guard — a rescue that
+    /// would take one of these is refused.
+    taken_names: std::cell::OnceCell<HashSet<String>>,
+}
+
+impl ImportUseContext<'_> {
+    fn receiver_members(&self, program: &Program) -> &HashSet<Span> {
+        self.receiver_members.get_or_init(|| {
+            let lookup = program.source_lookup();
+            program
+                .member_name_spans
+                .iter()
+                .filter(|(id, _)| lookup.of(**id) == Some(SourceId(0)))
+                .map(|(_, span)| *span)
+                .collect()
+        })
+    }
+
+    fn impl_members(&self, program: &Program) -> &HashSet<Id> {
+        self.impl_members.get_or_init(|| {
+            program
+                .implementations
+                .iter()
+                .flat_map(|implementation| implementation.declarations.values().copied())
+                .chain(
+                    program
+                        .traits
+                        .values()
+                        .flat_map(|trait_| trait_.declarations.values().copied()),
+                )
+                .collect()
+        })
+    }
+
+    fn taken_names(&self) -> &HashSet<String> {
+        self.taken_names.get_or_init(|| names_bound_in(self.source))
+    }
+}
+
+/// Every name `source` binds at its top level: its own declarations, and what
+/// its import list binds (a leaf's name, or an `as` alias's).
+///
+/// E180's collision guard reads this. Deliberately SYNTACTIC — a parse of the
+/// buffer, no analyzer — because the question is "is this identifier free in
+/// this file", which is answered by what is written and not by what resolved:
+/// a file carrying a broken declaration still has the name taken.
+///
+/// The prelude is deliberately absent. An explicit import beats an ambient
+/// prelude name (`prelude.md` §9.1), so shadowing one is legal and the rescue
+/// may do it; it is the file's OWN bindings that a second binding collides
+/// with.
+fn names_bound_in(source: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    if let (Some(tree), _) = vilan_core::parsing::parse(source) {
+        for item in &tree.0 {
+            // An item under `export`, a derive, a service attribute or a user
+            // macro attribute still declares its own name.
+            let mut node = &item.0;
+            while let Node::Export(_, inner)
+            | Node::Derive(_, inner)
+            | Node::Service(_, inner)
+            | Node::MacroAttribute(_, _, _, inner) = node
+            {
+                node = &inner.0;
+            }
+            let name = match node {
+                Node::Func(function) | Node::MacroFun(function) => function.name.0,
+                Node::Struct(name, ..)
+                | Node::Enum(name, ..)
+                | Node::Trait(name, ..)
+                | Node::Let(name, ..) => name.0,
+                Node::Module(name, _) => name,
+                _ => continue,
+            };
+            names.insert(name.to_string());
+        }
+    }
+    // What the import list binds. `import_leaf_name_spans` offers the ALIAS's
+    // span for an aliased leaf, which is the name the file actually takes
+    // (E142); a `(impl T)` selector is offered at its own span and binds no
+    // name, so the identifier test drops it.
+    for span in vilan_core::formatter::import_leaf_name_spans(source) {
+        let Some(text) = source.get(span.into_range()) else {
+            continue;
+        };
+        if !text.is_empty()
+            && text
+                .chars()
+                .all(|character| character.is_alphanumeric() || character == '_')
+        {
+            names.insert(text.to_string());
+        }
+    }
+    names
+}
+
 /// A type's written HEAD name, for B318 S3's organizer rewrite — `Style` for
 /// `Style`, for `List<i32>` and for a `List<type T>` block alike, because that
 /// is what a selector's subject is spelled with.
@@ -4463,18 +4597,18 @@ impl Document {
                 // the file's import list, so a reference written there is not
                 // mistaken for the file using the import.
                 let import_spans = vilan_core::formatter::import_statement_spans(source);
-                // E169: what this file's OTHER import leaves already bind, so a
-                // whole-module leaf is judged on what the module import ALONE
-                // brings. Computed once for the pass — it is a walk of every
-                // leaf, and asking it per leaf would be that walk squared.
-                let bound = self.definitions_bound_by_import_leaves(program, source);
+                // E169/E180: what this file's OTHER import leaves already
+                // bind, what a receiver resolved, what names are taken. Built
+                // once for the pass — each is a walk, and asking one per leaf
+                // would be that walk squared.
+                let context = self.import_use_context(program, source);
                 let keep = |leaf_span: Span| {
-                    self.import_leaf_is_used(program, leaf_span, &import_spans, &bound)
+                    self.import_leaf_is_used(program, leaf_span, &import_spans, &context)
                 };
                 // E168: the second question, asked only of a statement the
                 // first emptied out.
                 let keep_module = |module_span: Span| {
-                    self.import_module_is_used(program, module_span, &import_spans, &bound)
+                    self.import_module_is_used(program, module_span, &import_spans, &context)
                 };
                 vilan_core::formatter::organize_import_runs(source, &keep, &keep_module)
             }
@@ -4509,6 +4643,12 @@ impl Document {
     /// See [`Document::UNUSED_IMPORT`]. The rewritten statement follows.
     const UNUSED_BUT_THE_MODULE_IS_USED: &str =
         "unused; the module's impls are in use — Organize Imports rewrites this to";
+    /// E180's third text, for the leaf rule (0) pruned: the PRELUDE already
+    /// binds this definition. "unused import" is the one thing it is not — the
+    /// name may be spelled on every line of the file, and a user looking at
+    /// `Option` faded in a file full of `Option::Some` has been told something
+    /// they can see is false. The prelude-bound name follows in backticks.
+    const REDUNDANT_PRELUDE_BINDS: &str = "redundant: the prelude already binds";
 
     /// The top-level import leaves nothing in this file uses (E114) — the spans
     /// the editor FADES, in the analyzed text's coordinates.
@@ -4543,38 +4683,83 @@ impl Document {
         // since a stale document decides nothing above.
         let source = self.analyzed_text();
         let import_spans = vilan_core::formatter::import_statement_spans(source);
-        let bound = self.definitions_bound_by_import_leaves(program, source);
+        let context = self.import_use_context(program, source);
         let leaves: Vec<(Span, bool)> = vilan_core::formatter::import_leaf_name_spans(source)
             .into_iter()
             .map(|leaf| {
-                let used = self.import_leaf_is_used(program, leaf, &import_spans, &bound);
+                let used = self.import_leaf_is_used(program, leaf, &import_spans, &context);
                 (leaf, used)
             })
             .collect();
         if leaves.iter().all(|(_, used)| *used) {
             return Vec::new();
         }
-        let rewrites =
-            self.rewritten_import_statements(program, source, &import_spans, &bound, &leaves);
+        let emptied =
+            self.rewritten_import_statements(program, source, &import_spans, &context, &leaves);
         leaves
             .into_iter()
             .filter(|(_, used)| !used)
-            .map(|(leaf, _)| {
-                let message = rewrites
+            .filter_map(|(leaf, _)| {
+                let fate = emptied
                     .iter()
                     .find(|(statement, _)| spans_contain(*statement, leaf))
-                    .map(|(_, rewrite)| {
+                    .map(|(_, fate)| fate);
+                let message = match fate {
+                    // E180: the collision guard kept the statement exactly as
+                    // written, so the action removes NOTHING here and E114's
+                    // contract says nothing may fade.
+                    Some(EmptiedStatement::Kept) => return None,
+                    Some(EmptiedStatement::Rewritten(rewrite)) => {
                         format!("{} `{rewrite}`", Self::UNUSED_BUT_THE_MODULE_IS_USED)
-                    })
-                    .unwrap_or_else(|| Self::UNUSED_IMPORT.to_string());
-                (leaf, message)
+                    }
+                    // E180: a leaf the PRELUDE already binds is not "unused" in
+                    // any sense its reader would recognize — the name may be
+                    // spelled fifty times in the file. Say what it is instead,
+                    // so a heavily-used name faded is explained rather than
+                    // contradicted (E145's territory).
+                    None => match self.prelude_redundant_name(program, source, leaf) {
+                        Some(name) => format!("{} `{name}`", Self::REDUNDANT_PRELUDE_BINDS),
+                        None => Self::UNUSED_IMPORT.to_string(),
+                    },
+                };
+                Some((leaf, message))
             })
             .collect()
     }
 
-    /// E173: the import statements Organize Imports will REWRITE to
-    /// `import <module>;` rather than delete, as `(statement span, the
-    /// statement it becomes)`.
+    /// The NAME a rule-(0) leaf is redundant with — `Some` exactly when
+    /// [`Self::import_leaf_is_used`]'s rule (0) is what pruned this leaf.
+    ///
+    /// Asked only of a leaf already known unused, and it re-asks rule (0)'s own
+    /// two questions rather than threading a reason out of the leaf walk: the
+    /// pair is a map lookup and a slice search, and a second `bool` returned
+    /// from the predicate would have to be carried through the organizer's
+    /// `keep` closure, which is a `Fn(Span) -> bool` the formatter owns.
+    fn prelude_redundant_name<'a>(
+        &self,
+        program: &Program,
+        source: &'a str,
+        leaf_span: Span,
+    ) -> Option<&'a str> {
+        // An `as` alias renames the thing, so it is never prelude-redundant —
+        // rule (0) declines it too.
+        if program
+            .import_alias_spans
+            .contains_key(&(SourceId(0), leaf_span))
+        {
+            return None;
+        }
+        let definition_id = self.import_path_definition(program, leaf_span)?;
+        program
+            .prelude_bindings
+            .contains(&definition_id)
+            .then(|| source.get(leaf_span.into_range()))
+            .flatten()
+    }
+
+    /// E173: what Organize Imports will do with each import statement its leaf
+    /// question emptied out — `(statement span, its fate)`, for every statement
+    /// the action does something other than delete.
     ///
     /// Asked OF the organizer rather than recomputed beside it. `keep_module`
     /// is E168's second question and it is put only to a statement the leaf
@@ -4592,9 +4777,9 @@ impl Document {
         program: &Program,
         source: &str,
         import_spans: &[Span],
-        bound: &HashSet<Definition>,
+        context: &ImportUseContext<'_>,
         leaves: &[(Span, bool)],
-    ) -> Vec<(Span, String)> {
+    ) -> Vec<(Span, EmptiedStatement)> {
         let emptied = |statement: Span| {
             let mut saw_one = false;
             for (leaf, used) in leaves {
@@ -4621,7 +4806,7 @@ impl Document {
         };
         let widened = std::cell::RefCell::new(Vec::new());
         let keep_module = |module_span: Span| {
-            let rescue = self.import_module_is_used(program, module_span, import_spans, bound);
+            let rescue = self.import_module_is_used(program, module_span, import_spans, context);
             if !matches!(rescue, vilan_core::formatter::ModuleRescue::No) {
                 widened.borrow_mut().push((module_span, rescue.clone()));
             }
@@ -4635,6 +4820,12 @@ impl Document {
                 let statement = *import_spans
                     .iter()
                     .find(|statement| spans_contain(**statement, module_span))?;
+                // E180: a KEPT statement is not rewritten to anything — the
+                // action leaves it exactly as written, and the fade walk reads
+                // this to say nothing at all about its leaves.
+                if matches!(rescue, vilan_core::formatter::ModuleRescue::Keep) {
+                    return Some((statement, EmptiedStatement::Kept));
+                }
                 // The statement's own head, up to and including the module
                 // segment the organizer kept — which is what it prints. A
                 // statement's span ends at its path (the `;` is outside it), so
@@ -4653,7 +4844,7 @@ impl Document {
                     }
                     _ => format!("{};", head.join(" ")),
                 };
-                Some((statement, rewritten))
+                Some((statement, EmptiedStatement::Rewritten(rewritten)))
             })
             .collect()
     }
@@ -4974,7 +5165,7 @@ impl Document {
         program: &Program,
         leaf_span: Span,
         import_spans: &[Span],
-        bound_by_leaves: &HashSet<Definition>,
+        context: &ImportUseContext<'_>,
     ) -> bool {
         let entry = SourceId(0);
         // B318 S3: an `(impl …)` selector is a terminal the organizer prunes,
@@ -5050,12 +5241,7 @@ impl Document {
             crate::references::kind_of(program, Definition::Entity(definition_id)),
             Some(crate::references::DefinitionKind::Module)
         ) {
-            return self.module_import_brings_a_use(
-                program,
-                definition_id,
-                import_spans,
-                bound_by_leaves,
-            );
+            return self.module_import_brings_a_use(program, definition_id, import_spans, context);
         }
         false
     }
@@ -5131,6 +5317,23 @@ impl Document {
             .collect()
     }
 
+    /// The pass-level tables [`Self::import_leaf_is_used`] and the module
+    /// question are judged against, built once for a whole organizer run.
+    ///
+    /// Every one of them is a walk of something whole-file or whole-program, and
+    /// every one of them is asked per LEAF — computing them inside the predicate
+    /// would be that walk squared, which is what E169's own comment says about
+    /// the one table that predates E180.
+    fn import_use_context<'a>(&self, program: &Program, source: &'a str) -> ImportUseContext<'a> {
+        ImportUseContext {
+            source,
+            bound_by_leaves: self.definitions_bound_by_import_leaves(program, source),
+            receiver_members: std::cell::OnceCell::new(),
+            impl_members: std::cell::OnceCell::new(),
+            taken_names: std::cell::OnceCell::new(),
+        }
+    }
+
     /// Rule (2), asked of a MODULE — the one question E168 and E169 share.
     ///
     /// A whole-module import brings more than its own name: every `impl` in that
@@ -5150,7 +5353,7 @@ impl Document {
         program: &Program,
         module_id: Id,
         import_spans: &[Span],
-        bound_by_leaves: &HashSet<Definition>,
+        context: &ImportUseContext<'_>,
     ) -> bool {
         let entry = SourceId(0);
         let Some(home) = program.source_of(module_id) else {
@@ -5159,15 +5362,87 @@ impl Document {
         if home == entry {
             return false;
         }
+        // E180's THIRD subtraction (R9, RULED 2026-09-14). A module the PRELUDE
+        // module itself re-exports — `std/src/web.vl` lines 47-48, `export
+        // import pkg::style;` and `export import pkg::ui;` — is loaded for
+        // every file of the package whatever that file imports, so an import
+        // reaching it carries no `impl` the file would otherwise lack. Rescuing
+        // it is not wrong, it is REDUNDANT, and the redundant statement is one
+        // the organizer would then write into every file of an application:
+        // kolt's `import std::ui::{ (impl View) };`.
+        if program.prelude_bindings.contains(&module_id) {
+            return false;
+        }
         self.reference_index
             .occurrences_in(entry)
             .any(|occurrence| {
-                !import_spans.iter().any(|statement| {
-                    statement.start <= occurrence.span.start && occurrence.span.end <= statement.end
-                }) && !bound_by_leaves.contains(&occurrence.definition)
-                    && crate::references::declaration_source(program, occurrence.definition)
-                        == Some(home)
+                self.module_import_alone_carries(program, context, home, import_spans, occurrence)
             })
+    }
+
+    /// Whether ONE occurrence in this file is something the import reaching
+    /// `home` is ALONE in bringing — rule (2)'s per-occurrence half, shared by
+    /// [`Self::module_import_brings_a_use`] and [`Self::rescuing_subject`] so
+    /// the keep decision and the narrowing can never be read off different
+    /// sets.
+    ///
+    /// Four subtractions, three of them E180's:
+    ///  - a reference written by the file's own IMPORT LIST is not the file
+    ///    using anything (an import path's segments resolve to the definitions
+    ///    its leaves bind, so counting them lets a statement justify itself);
+    ///  - a definition another import LEAF of this file binds is that leaf's
+    ///    contribution, not the module's (E169);
+    ///  - a definition the PRELUDE binds is ambient: the file has it whether or
+    ///    not this statement exists, so the statement does not bring it.
+    ///    `Option::Some` in kolt's generated `src/lucide/lib.vl` is the exhibit
+    ///    — `Some` is declared in std's `option.vl`, and reading it as "the
+    ///    import brings `Some`" is what made the organizer rescue
+    ///    `import std::option;` and bind `option` over the file's own
+    ///    `fun option()`;
+    ///  - and what remains must be an `impl`/trait member resolved by RECEIVER
+    ///    syntax (`x.child(..)`), never a definition spelled as a PATH SEGMENT
+    ///    behind a head (`Option::Some`, `Type::new`). That is the whole of
+    ///    what a module import carries beyond its own name in today's
+    ///    program-global impl model: a path-qualified reach is spelled through
+    ///    a head that is a leaf's, the prelude's, or the module leaf's own, and
+    ///    each of those heads is accounted for somewhere else (rule (1), rule
+    ///    (0), the leaf set above).
+    ///
+    /// Receiver syntax is read from the ANALYZER's own record rather than
+    /// guessed from the text: `Program::member_name_spans` is written only at
+    /// `Node::MemberAccessor`, so a span in it IS a `subject.member` resolution
+    /// and a `Head::member` path is not in it at all. (The reference index
+    /// cannot tell them apart on its own — both arrive as an occurrence of the
+    /// member's definition at the member's own span.)
+    fn module_import_alone_carries(
+        &self,
+        program: &Program,
+        context: &ImportUseContext<'_>,
+        home: SourceId,
+        import_spans: &[Span],
+        occurrence: &crate::references::Occurrence,
+    ) -> bool {
+        if import_spans.iter().any(|statement| {
+            statement.start <= occurrence.span.start && occurrence.span.end <= statement.end
+        }) {
+            return false;
+        }
+        if context.bound_by_leaves.contains(&occurrence.definition) {
+            return false;
+        }
+        if crate::references::declaration_source(program, occurrence.definition) != Some(home) {
+            return false;
+        }
+        // A struct FIELD read through a receiver is not an impl member and
+        // arrives with the type, not with the module import.
+        let Definition::Entity(used) = occurrence.definition else {
+            return false;
+        };
+        if program.prelude_bindings.contains(&used) {
+            return false;
+        }
+        context.impl_members(program).contains(&used)
+            && context.receiver_members(program).contains(&occurrence.span)
     }
 
     /// E168's rescue: whether the MODULE an emptied-out import statement reaches
@@ -5187,7 +5462,7 @@ impl Document {
         program: &Program,
         module_span: Span,
         import_spans: &[Span],
-        bound_by_leaves: &HashSet<Definition>,
+        context: &ImportUseContext<'_>,
     ) -> ModuleRescue {
         let Some(module_id) = self.import_path_definition(program, module_span) else {
             return ModuleRescue::No;
@@ -5198,16 +5473,32 @@ impl Document {
         ) {
             return ModuleRescue::No;
         }
-        if !self.module_import_brings_a_use(program, module_id, import_spans, bound_by_leaves) {
+        if !self.module_import_brings_a_use(program, module_id, import_spans, context) {
             return ModuleRescue::No;
         }
         // B318 S3: the module form is the WIDE rescue, and a selector is the
         // narrow one. When everything this file gets from that module is the
         // members of one subject's `impl` blocks, the selector says exactly
         // that and the module import says more than the file needs.
-        match self.rescuing_subject(program, module_id, import_spans, bound_by_leaves) {
+        match self.rescuing_subject(program, module_id, import_spans, context) {
+            // A selector binds NO name, so it needs no collision guard: it says
+            // which blocks this file admits and adds nothing to the scope.
             Some(subject) => ModuleRescue::Selector(subject),
-            None => ModuleRescue::Module,
+            // E180's collision guard. `import <module>;` BINDS `<module>`, and
+            // the organizer must never write a statement whose new name is
+            // already taken — kolt's generated `src/lucide/lib.vl` declares
+            // `fun option()`, and `import std::option;` bound the module over
+            // it, so the organized file stopped checking. Shadowing an ambient
+            // PRELUDE name is fine and deliberately not guarded: an explicit
+            // import beats the prelude, which is the language's own rule.
+            None => match context
+                .source
+                .get(module_span.into_range())
+                .is_some_and(|name| context.taken_names().contains(name))
+            {
+                true => ModuleRescue::Keep,
+                false => ModuleRescue::Module,
+            },
         }
     }
 
@@ -5224,18 +5515,13 @@ impl Document {
         program: &Program,
         module_id: Id,
         import_spans: &[Span],
-        bound_by_leaves: &HashSet<Definition>,
+        context: &ImportUseContext<'_>,
     ) -> Option<String> {
         let entry = SourceId(0);
         let home = program.source_of(module_id)?;
         let mut subject: Option<String> = None;
         for occurrence in self.reference_index.occurrences_in(entry) {
-            if import_spans.iter().any(|statement| {
-                statement.start <= occurrence.span.start && occurrence.span.end <= statement.end
-            }) || bound_by_leaves.contains(&occurrence.definition)
-                || crate::references::declaration_source(program, occurrence.definition)
-                    != Some(home)
-            {
+            if !self.module_import_alone_carries(program, context, home, import_spans, occurrence) {
                 continue;
             }
             let Definition::Entity(used) = occurrence.definition else {
@@ -5469,6 +5755,7 @@ impl Document {
                         title: format!("Import `{name}` from {}", module_path.join("::")),
                         span: edit.span,
                         replacement: edit.replacement,
+                        target: None,
                     });
                 }
             } else if let Some(suggestion) = diagnostic
@@ -5480,6 +5767,7 @@ impl Document {
                     title: format!("Change to `{suggestion}`"),
                     span: diagnostic.span,
                     replacement: suggestion.to_string(),
+                    target: None,
                 });
             } else if let Some((span, replacement)) = self.declare_contexts_fix(program, diagnostic)
             {
@@ -5487,6 +5775,7 @@ impl Document {
                     title: "Declare the inferred contexts".to_string(),
                     span,
                     replacement,
+                    target: None,
                 });
             } else if diagnostic.msg.starts_with(MISSING_TERMINATOR_MESSAGE) {
                 // S2 (editing-dx.md §17.4, E54's home): the diagnostic's own
@@ -5500,6 +5789,7 @@ impl Document {
                     title: "Insert `;`".to_string(),
                     span: Span::from(insertion..insertion),
                     replacement: ";".to_string(),
+                    target: None,
                 });
             } else if diagnostic.msg.ends_with(DISCARDED_VALUE_MESSAGE)
                 && let Some(semicolon_span) =
@@ -5515,6 +5805,7 @@ impl Document {
                     title: "Remove `;`".to_string(),
                     span: semicolon_span,
                     replacement: String::new(),
+                    target: None,
                 });
             } else if diagnostic
                 .msg
@@ -5534,6 +5825,7 @@ impl Document {
                     title: format!("Wrap as `{hole}`"),
                     span,
                     replacement: hole,
+                    target: None,
                 });
             } else if diagnostic.msg.starts_with(AT_IS_NOT_A_TOKEN)
                 && let Some(fix) = media_rule_fix(&self.text, diagnostic.span.start)
@@ -5553,6 +5845,7 @@ impl Document {
                     title: "Remove `!important`".to_string(),
                     span: Span::from(start..diagnostic.span.end),
                     replacement: String::new(),
+                    target: None,
                 });
             }
         }
@@ -5581,7 +5874,37 @@ impl Document {
                     title: format!("Import as `#{leaf}`"),
                     span: Span::from(at..at),
                     replacement: "#".to_string(),
+                    target: None,
                 });
+                // E177, and §5's own pairing: the OTHER way out of a plain
+                // reach is to export the thing.
+                if let Some(definition) = self.reached_definition(warning)
+                    && let Some(fix) = self.export_declaration_fix(program, definition)
+                {
+                    fixes.push(fix);
+                }
+            } else if warning.msg.contains(REACH_THROUGH_THE_MODULE) {
+                // §5's second door, the QUALIFIED reach (`import pkg::a;` then
+                // `a::hidden()`): there is no leaf to mark, so "Export" is the
+                // only fix the paper names for it.
+                if let Some(definition) = self.reached_definition(warning)
+                    && let Some(fix) = self.export_declaration_fix(program, definition)
+                {
+                    fixes.push(fix);
+                }
+            } else if warning.msg.contains(SIGNATURE_EXPOSES_A_PRIVATE_TYPE)
+                && !warning.msg.contains(EXPOSED_TYPE_IS_FOREIGN)
+            {
+                // B318 §4's "Export `S`". The warning is spanned at the
+                // EXPORTED ITEM's own name — one warning per declaration,
+                // whichever signature position found the exposure — so the
+                // type it names is recovered from the message and resolved
+                // against this file's recorded type references.
+                if let Some(definition) = self.exposed_type_definition(program, &warning.msg)
+                    && let Some(fix) = self.export_declaration_fix(program, definition)
+                {
+                    fixes.push(fix);
+                }
             } else if warning.msg.ends_with(REACH_IS_REDUNDANT)
                 && self.text[..warning.span.start].ends_with('#')
             {
@@ -5589,10 +5912,140 @@ impl Document {
                     title: "Delete the `#`".to_string(),
                     span: Span::from(warning.span.start - 1..warning.span.start),
                     replacement: String::new(),
+                    target: None,
                 });
             }
         }
         fixes
+    }
+
+    /// The private item a B318 §5 reach warning is ABOUT, read off the warning
+    /// itself (E177).
+    ///
+    /// The two doors span differently — the leaf form is spanned at the leaf,
+    /// the qualified form at the whole `a::hidden` path — so the fix is not
+    /// keyed on the span's exact shape. Both messages open with the reached
+    /// PATH in backticks, and the reference index narrows every use to its own
+    /// identifier, so the occurrence inside the warning that spells the path's
+    /// last segment is the one the warning means.
+    fn reached_definition(&self, warning: &Error) -> Option<Id> {
+        let path = warning.msg.strip_prefix('`')?.split('`').next()?;
+        let leaf = path.rsplit("::").next()?;
+        self.reference_index
+            .occurrences_in(SourceId(0))
+            .find(|occurrence| {
+                spans_contain(warning.span, occurrence.span)
+                    && !occurrence.is_declaration
+                    && matches!(occurrence.definition, Definition::Entity(_))
+                    && self
+                        .program
+                        .as_ref()
+                        .and_then(|program| {
+                            crate::references::name_of(program, occurrence.definition)
+                        })
+                        .is_some_and(|name| name == leaf)
+            })
+            .and_then(|occurrence| match occurrence.definition {
+                Definition::Entity(id) => Some(id),
+                Definition::Field(..) => None,
+            })
+    }
+
+    /// B318 §4/§5's "Export `S`" (E177): the edit that inserts `export ` in
+    /// front of `definition`'s declaration, WHEREVER it lives.
+    ///
+    /// The declaration's file comes from the reference index, which carries a
+    /// declaration row for every definition in the program and not only for
+    /// this file's — so the fix reaches the sibling module the warning is
+    /// really about without the LSP guessing at a path. Its own text is read
+    /// from DISK when it is not this buffer (the same bargain go-to-definition
+    /// makes), and the range is converted through THAT file's line index here,
+    /// because the handler has only this document's.
+    ///
+    /// Four refusals, each of them a place a wrong edit would be worse than no
+    /// action:
+    ///  - a declaration with no file (generated code) has nothing to edit;
+    ///  - a declaration outside this package's source root is not ours to
+    ///    change — §4's dependency arm says so in the message, and this is the
+    ///    same rule applied to the edit;
+    ///  - an INDENTED declaration line is a member, a variant or a local, and
+    ///    `export` does not belong in front of one (a top-level item is at
+    ///    column 0 — the formatter's own invariant);
+    ///  - a line already beginning `export` (or `export(in …)`) has nothing to
+    ///    add, which is also what keeps the action from being offered twice.
+    fn export_declaration_fix(&self, program: &Program, definition: Id) -> Option<QuickFix> {
+        let entity = Definition::Entity(definition);
+        let name = crate::references::name_of(program, entity)?.to_string();
+        let declaration = self
+            .reference_index
+            .occurrences_of(entity)
+            .find(|occurrence| occurrence.is_declaration_of(entity))?;
+        let path = program.source_path(declaration.source)?.to_path_buf();
+        if let Some(root) = self.package_root()
+            && !path.starts_with(root)
+        {
+            return None;
+        }
+        let title = format!("Export `{name}`");
+        // The current buffer answers from its LIVE text — `quickfixes` runs
+        // only on a document whose snapshots agree, so that is also the
+        // analyzed text the span came from.
+        if declaration.source == SourceId(0) {
+            let at = top_level_item_start(&self.text, declaration.span.start)?;
+            return Some(QuickFix {
+                title,
+                span: Span::from(at..at),
+                replacement: "export ".to_string(),
+                target: None,
+            });
+        }
+        let text = std::fs::read_to_string(&path).ok()?;
+        let at = top_level_item_start(&text, declaration.span.start)?;
+        let range = LineIndex::new(&text).range(&Span::from(at..at));
+        Some(QuickFix {
+            title,
+            // Unused for a targeted fix; the warning's own span is the anchor.
+            span: Span::from(declaration.span.start..declaration.span.start),
+            replacement: "export ".to_string(),
+            target: Some(FixTarget { path, range }),
+        })
+    }
+
+    /// The private TYPE a §4 exposure warning names — `S` in "`S` is used in
+    /// the signature …" — resolved to its definition.
+    ///
+    /// The warning is spanned at the exported ITEM's declaration name and
+    /// carries the type only as text, so the name is read off the front of the
+    /// message and matched against this file's recorded type references: a
+    /// signature that names `S` records `S` at its own span, whatever the
+    /// position was. If the file's references for that name disagree about
+    /// which definition it is — two `S`es in one file, which nothing in the
+    /// estate writes — the fix is declined rather than guessed at.
+    fn exposed_type_definition(&self, program: &Program, message: &str) -> Option<Id> {
+        let exposed = message.strip_prefix('`')?.split('`').next()?;
+        let mut found: Option<Id> = None;
+        for (source, span, definition, _) in &program.type_references {
+            if *source != SourceId(0) {
+                continue;
+            }
+            let Some(definition) = *definition else {
+                continue;
+            };
+            if crate::references::name_of(program, Definition::Entity(definition)) != Some(exposed)
+            {
+                continue;
+            }
+            // An import path's own segments resolve to the same definitions its
+            // leaves bind; a signature's reference is the one this is about,
+            // but either answers the same definition, so only DISAGREEMENT
+            // matters.
+            if found.is_some_and(|seen| seen != definition) {
+                return None;
+            }
+            found = Some(definition);
+            let _ = span;
+        }
+        found
     }
 
     /// The `css`-spelling conversion offered over `range` (LIVE space, and the
@@ -5646,12 +6099,19 @@ impl Document {
         // it is wanted by one code action and by nothing else — and only after
         // the block direction has declined, so a cursor in a block never pays
         // for it.
-        let style_text = self.std_style_text();
-        let style_tree = style_text
-            .as_deref()
-            .and_then(|text| vilan_core::parsing::parse(text).0);
-        let mut surface = match (style_text.as_deref(), style_tree.as_ref()) {
-            (Some(text), Some(tree)) => StyleSurface::build(text, &tree.0),
+        let std_style = self.std_style_source();
+        let style_tree = std_style
+            .as_ref()
+            .and_then(|(_, text)| vilan_core::parsing::parse(text).0);
+        // E175: and every OTHER file of the program that writes `impl Style`.
+        // Read and parsed BEFORE the surface, because the surface borrows both.
+        let sibling_texts = self.style_impl_texts(std_style.as_ref().map(|(source, _)| *source));
+        let sibling_trees: Vec<_> = sibling_texts
+            .iter()
+            .map(|text| vilan_core::parsing::parse(text).0)
+            .collect();
+        let mut surface = match (std_style.as_ref(), style_tree.as_ref()) {
+            (Some((_, text)), Some(tree)) => StyleSurface::build(text, &tree.0),
             _ => StyleSurface::default(),
         };
         // And the CURRENT file's own `impl Style` extensions (E172). The tree
@@ -5661,6 +6121,14 @@ impl Document {
         // shorthand is usually the FIRST link, and a first link with no block
         // spelling is an empty convertible prefix and no action offered.
         surface.extend(source, &root.0);
+        // The siblings last: `extend` keeps the first body registered under a
+        // name, so std outranks this file and this file outranks a sibling —
+        // which is the order a call would resolve in anyway.
+        for (text, tree) in sibling_texts.iter().zip(&sibling_trees) {
+            if let Some(tree) = tree {
+                surface.extend(text, &tree.0);
+            }
+        }
         Some(CssConversion {
             to_chain: false,
             span: node.1,
@@ -5683,7 +6151,7 @@ impl Document {
     /// modules (then there is no `style()` chain to convert either), or when the
     /// file cannot be read; the conversion degrades to the chokepoint links and
     /// the combinators rather than to a wrong answer.
-    fn std_style_text(&self) -> Option<String> {
+    fn std_style_source(&self) -> Option<(SourceId, String)> {
         let program = self.program.as_ref()?;
         let source = program.functions.iter().find_map(|(id, function)| {
             (function.name == "with_length")
@@ -5696,7 +6164,55 @@ impl Document {
                         .is_some_and(|name| name == "style.vl")
                 })
         })?;
-        std::fs::read_to_string(program.source_path(source)?).ok()
+        let text = std::fs::read_to_string(program.source_path(source)?).ok()?;
+        Some((source, text))
+    }
+
+    /// E175: the text of every OTHER file the analyzed program loaded that
+    /// writes an `impl Style` block — the css converter's reach past the file
+    /// it was invoked in.
+    ///
+    /// E167 read std's `style.vl` and E172 the current file, and that is where
+    /// the inliner stopped: kolt's `button_style` converts the prefix its own
+    /// file's `flex_row` opens and SPLITS at `.script_label()`, four lines of
+    /// `theme.vl` away, in the same package, already loaded and analyzed. The
+    /// missing half was never the parse — it is finding the files worth
+    /// parsing, and the analyzed impl table is the one thing that knows: an
+    /// `Implementation` records the file whose text declares it (B318 §3.3),
+    /// so the blocks whose subject head is `Style` name their own sources and
+    /// nothing else is read.
+    ///
+    /// Read from DISK, like std's own file: the conversion is a code action on
+    /// one document, and a sibling's unsaved buffer lives in the server's
+    /// document map, not in this one. A sibling edited but unsaved inlines its
+    /// last saved body, which is the same bargain go-to-definition makes.
+    ///
+    /// `skip` is std's own source, already read by
+    /// [`Self::std_style_source`]; `SourceId(0)` is skipped because the current
+    /// file's tree is in hand (E172) and its BUFFER, not its saved text, is
+    /// what the conversion must agree with.
+    fn style_impl_texts(&self, skip: Option<SourceId>) -> Vec<String> {
+        let Some(program) = self.program.as_ref() else {
+            return Vec::new();
+        };
+        let mut seen = vec![SourceId(0)];
+        seen.extend(skip);
+        let mut texts = Vec::new();
+        for implementation in program.implementations.iter() {
+            if seen.contains(&implementation.source) {
+                continue;
+            }
+            if subject_head_name(program, implementation.subject).as_deref() != Some("Style") {
+                continue;
+            }
+            seen.push(implementation.source);
+            if let Some(path) = program.source_path(implementation.source)
+                && let Ok(text) = std::fs::read_to_string(path)
+            {
+                texts.push(text);
+            }
+        }
+        texts
     }
 
     /// Every unambiguous missing-import fix in the file, folded into ONE edit
@@ -5856,13 +6372,61 @@ impl Document {
     }
 }
 
+/// Where `export ` is inserted to export the top-level item whose name begins
+/// at `name_start` in `text` (E177) — the start of that item's own line.
+///
+/// `None` when the line is INDENTED (a member, a variant, a local — a top-level
+/// item is at column 0, which the formatter guarantees) or already begins
+/// `export`, in which case there is nothing to add and no action to offer.
+/// An attribute written above the item (`[derive(Json)]` on its own line)
+/// leaves the declaration's own line untouched, which is where the word goes.
+fn top_level_item_start(text: &str, name_start: usize) -> Option<usize> {
+    let line_start = text.get(..name_start)?.rfind('\n').map_or(0, |at| at + 1);
+    let line = text.get(line_start..)?;
+    if line.starts_with([' ', '\t']) {
+        return None;
+    }
+    if line
+        .strip_prefix("export")
+        .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+    {
+        return None;
+    }
+    Some(line_start)
+}
+
 /// One quickfix's ready-made edit (E54b, E54d, E58c): a menu title and the
 /// `(span, replacement)` this document's own text needs — LIVE space, same
 /// convention as [`Document::organize_import_edits`].
+///
+/// E177 widened it with a TARGET. Every fix before it edited the buffer the
+/// action was invoked in, and that was not a design so much as the only thing
+/// the type could say: B318 §4/§5's "Export `S`" inserts one word in front of
+/// a declaration WHEREVER it lives, which is usually another file of the same
+/// package, so the paper's third fix shipped as a sentence in a message while
+/// its two same-file siblings shipped as actions.
 pub struct QuickFix {
     pub title: String,
+    /// The edit's span in THIS document's live text. Ignored when
+    /// [`QuickFix::target`] is `Some` — it is then the WARNING's own span, kept
+    /// so the action still anchors where the user's cursor is.
     pub span: Span,
     pub replacement: String,
+    /// E177: the other file this fix edits, when it is not this document.
+    pub target: Option<FixTarget>,
+}
+
+/// Where a cross-file [`QuickFix`] lands (E177): the file, and the range in
+/// THAT file's text.
+///
+/// The range is converted HERE rather than handed over as a span, because the
+/// conversion needs the target file's own line index and the handler has only
+/// this document's. Carrying the answer is what makes it impossible to apply a
+/// span from one file through another file's index — the failure mode that
+/// corrupts a file rather than merely looking wrong.
+pub struct FixTarget {
+    pub path: PathBuf,
+    pub range: Range,
 }
 
 /// The sentence B318 §5's plain-reach warning carries, and the key the "mark
@@ -5872,6 +6436,17 @@ const REACH_IS_UNMARKED: &str = "Importing it anyway is allowed — mark the rea
 
 /// Its twin: the marker written on an item that is exported anyway.
 const REACH_IS_REDUNDANT: &str = "the reach marker is redundant — delete the `#`";
+
+/// B318 §5's SECOND door — `import pkg::a;` then `a::hidden()`, where there is
+/// no leaf to mark and "Export" is the only fix the paper names for it.
+const REACH_THROUGH_THE_MODULE: &str = "and this path reaches it through the module";
+
+/// B318 §4's exposure warning, and the key the "Export `S`" fix reads it by.
+const SIGNATURE_EXPOSES_A_PRIVATE_TYPE: &str = "is exported, but";
+
+/// Its dependency arm: `S` belongs to another package, so there is no
+/// declaration here to export and the message says what the two ways out are.
+const EXPOSED_TYPE_IS_FOREIGN: &str = "in another package, and cannot be exported from here";
 
 /// The name in an unknown-name diagnostic's message: `cannot find 'X' in this
 /// scope...` (a bare value) or `cannot find type 'X'...` — the two "cannot
@@ -6683,6 +7258,7 @@ fn media_rule_fix(text: &str, at: usize) -> Option<QuickFix> {
         title: format!("Use `{spelling}`"),
         span: Span::from(at..at + "@media".len() + after_query + brace + 1),
         replacement: format!("{head} {{"),
+        target: None,
     })
 }
 
@@ -7766,6 +8342,171 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // E177: B318 §5's OTHER way out of a plain reach — export the thing. The
+    // edit lands in `a.vl`, which is what `QuickFix` could not say before: the
+    // type carried a span in this document and nothing else, so the paper's
+    // third fix shipped as a sentence in a message while its two one-character
+    // siblings shipped as actions. The fix is offered BESIDE the mark, because
+    // the two are genuinely different decisions ("this reach is deliberate" vs
+    // "this item should have been surface").
+    #[test]
+    fn quickfix_exports_a_reached_declaration_in_the_file_that_declares_it() {
+        const MODULE: &str = "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n";
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::hidden;\n\nfun main() {\n\tlet _ = hidden();\n}\n",
+            ),
+            ("a.vl", MODULE),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text().to_string();
+        let whole = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        let titles: Vec<&String> = fixes.iter().map(|fix| &fix.title).collect();
+        assert!(
+            titles.contains(&&"Import as `#hidden`".to_string()),
+            "the same-file fix is still offered: {titles:?}"
+        );
+        let export = fixes
+            .iter()
+            .find(|fix| fix.title == "Export `hidden`")
+            .unwrap_or_else(|| panic!("no export fix: {titles:?}"));
+        let target = export
+            .target
+            .as_ref()
+            .expect("the declaration lives in another file");
+        assert!(
+            target.path.ends_with("a.vl"),
+            "the edit belongs to the declaring file: {:?}",
+            target.path
+        );
+        assert_eq!(export.replacement, "export ");
+        // The range is `a.vl`'s own — line 2, column 0, where `fun hidden`
+        // begins — converted through THAT file's line index and not this
+        // document's.
+        assert_eq!(target.range.start, target.range.end, "an insertion");
+        assert_eq!(target.range.start.line, 2);
+        assert_eq!(target.range.start.character, 0);
+        // Applied, it produces the exported declaration.
+        let mut applied = MODULE.to_string();
+        let at = MODULE.find("fun hidden").expect("the declaration");
+        applied.insert_str(at, "export ");
+        assert_eq!(
+            applied,
+            "export fun shown(): i32 { 1 }\n\nexport fun hidden(): i32 { 2 }\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The QUALIFIED reach (§5's second door): `import pkg::a;` then
+    // `a::hidden()`. There is no leaf to mark, so "Export" is the only fix the
+    // paper names for it — and it is the same cross-file edit.
+    #[test]
+    fn quickfix_exports_a_declaration_reached_through_a_qualified_path() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a;\n\nfun main() {\n\tlet _ = a::hidden();\n}\n",
+            ),
+            (
+                "a.vl",
+                "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n",
+            ),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text().to_string();
+        let whole = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        let export = fixes
+            .iter()
+            .find(|fix| fix.title == "Export `hidden`")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no export fix: {:?}",
+                    fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+                )
+            });
+        let target = export.target.as_ref().expect("another file");
+        assert!(target.path.ends_with("a.vl"), "{:?}", target.path);
+        assert_eq!(target.range.start.line, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // B318 §4's "Export `S`", the exposure warning's own fix. The private type
+    // is in the SAME file here, which is the shape the warning usually takes —
+    // so the fix carries no target and edits this buffer, and the two paths
+    // through `export_declaration_fix` are both exercised by the pair.
+    #[test]
+    fn quickfix_exports_a_private_type_an_exported_signature_names() {
+        let source = "struct Secret {\n\tvalue: i32,\n}\n\n\
+                      export fun make(): Secret {\n\tSecret { value: 1 }\n}\n";
+        let (dir, document) =
+            analyze_workspace(&[("main.vl", source), ("a.vl", "fun unused() {}\n")]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text().to_string();
+        let whole = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        let export = fixes
+            .iter()
+            .find(|fix| fix.title == "Export `Secret`")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no export fix: {:?}",
+                    fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            export.target.is_none(),
+            "the declaration is in this buffer: {:?}",
+            export.target.as_ref().map(|t| &t.path)
+        );
+        let mut applied = text.clone();
+        applied.replace_range(export.span.into_range(), &export.replacement);
+        assert!(applied.starts_with("export struct Secret {"), "{applied:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The refusals, which are the half a wrong edit would be worse than no
+    // action for: an item already exported offers nothing to export (so the
+    // action is never offered twice), and a warning about a module that is
+    // already surface offers nothing at all.
+    #[test]
+    fn quickfix_never_offers_to_export_what_is_already_exported() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::{ #shown };\n\nfun main() {\n\tlet _ = shown();\n}\n",
+            ),
+            (
+                "a.vl",
+                "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n",
+            ),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text().to_string();
+        let whole = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        assert!(
+            fixes.iter().all(|fix| !fix.title.starts_with("Export ")),
+            "{:?}",
+            fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // E149: hovering an operator answers with the method it dispatches to.
     //
     // An operator is the one call spelled without a name, so every path that
@@ -8114,8 +8855,8 @@ pub(crate) mod tests {
     }
 
     /// [`css_conversion_of`] with SIBLING files beside `main.vl` in the
-    /// workspace — E172's boundary: an `impl Style` in another file of the same
-    /// package is analyzed, and the inliner still cannot read it.
+    /// workspace — E175's subject: an `impl Style` in another file of the same
+    /// package, which the inliner reaches through the analyzed impl table.
     fn css_conversion_across(
         source: &str,
         siblings: &[(&str, &str)],
@@ -8299,17 +9040,18 @@ pub(crate) mod tests {
         );
     }
 
-    // E172's BOUNDARY, pinned rather than left to be found: the inliner reads
-    // the CURRENT file's `impl Style` bodies, and a SIBLING file's are out of
-    // reach even though the analyzer has loaded them. kolt's own `button_style`
-    // runs into this at `.script_label()`, which `theme.vl` declares — so its
-    // chain converts the prefix its own file's `flex_row` opens and splits
-    // there, where before E172 it converted nothing at all. Widening this is a
-    // change of a different kind: the current file is in hand because the
-    // conversion already raw-parses it, and a sibling's body would have to come
-    // off the analyzed impl table instead.
+    // E175: the inliner reaches a SIBLING file's `impl Style`, which is where
+    // E167 and E172 stopped. kolt's own `button_style` ran into this at
+    // `.script_label()`, four lines of `theme.vl` away and in the same package
+    // — already loaded, already analyzed, and out of reach because the
+    // converter read exactly two texts: std's `style.vl` and the buffer it was
+    // invoked in. The missing half was never the parse; it was knowing which
+    // files were worth parsing, and the analyzed impl table knows, because an
+    // `Implementation` records the file whose text declares it. The whole chain
+    // converts now, `script_label` inlined through `with_length` exactly as a
+    // std shorthand is.
     #[test]
-    fn refactor_does_not_reach_an_impl_style_extension_in_a_sibling_file() {
+    fn refactor_inlines_an_impl_style_extension_from_a_sibling_file() {
         let conversion = css_conversion_across(
             "import std::style::{ Display, FlexDirection, Length, Style, style };\nimport pkg::theme;\n\n             impl Style {\n\tfun flex_row(self): Style {\n\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n\t}\n}\n\n             fun button_style(): Style {\n\tsty~le()\n\t\t.flex_row()\n\t\t.radius(Length::px(4))\n\t\t.script_label()\n\t\t.raw(\"outline\", \"none\")\n}\n",
             &[(
@@ -8317,10 +9059,30 @@ pub(crate) mod tests {
                 "import std::style::{ Length, Style };\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.with_length(\"letter-spacing\", Length::px(1))\n\t}\n}\n",
             )],
         )
-        .expect("the prefix the file's own extension opens converts");
+        .expect("a chain reaching a sibling's extension converts");
         assert_eq!(
             conversion.2,
-            "css {\n\t\tdisplay: {Display::Flex.value()};\n\t\tflex-direction: {FlexDirection::Row.value()};\n\t\tborder-radius: {Length::px(4)};\n\t}.script_label().raw(\"outline\", \"none\")",
+            "css {\n\t\tdisplay: {Display::Flex.value()};\n\t\tflex-direction: {FlexDirection::Row.value()};\n\t\tborder-radius: {Length::px(4)};\n\t\tletter-spacing: {Length::px(1)};\n\t\toutline: none;\n\t}",
+            "{conversion:?}"
+        );
+    }
+
+    // The reach is the IMPL TABLE's, not "every file in the package": a sibling
+    // that writes no `impl Style` is never read, and a sibling extension whose
+    // body is not a self-chain is a barrier there exactly as it is here.
+    #[test]
+    fn refactor_splits_at_a_sibling_extension_whose_body_is_not_a_chain() {
+        let conversion = css_conversion_across(
+            "import std::style::{ Color, Length, Style, style };\nimport pkg::theme;\n\n             fun card(): Style {\n\tsty~le()\n\t\t.radius(Length::px(4))\n\t\t.themed()\n\t\t.raw(\"outline\", \"none\")\n}\n",
+            &[(
+                "theme.vl",
+                "import std::style::{ Color, Style };\n\nimpl Style {\n\tfun themed(self): Style {\n\t\tlet accent = Color::gray(900);\n\t\tself.color(accent)\n\t}\n}\n",
+            )],
+        )
+        .expect("the convertible prefix converts");
+        assert_eq!(
+            conversion.2,
+            "css {\n\t\tborder-radius: {Length::px(4)};\n\t}.themed().raw(\"outline\", \"none\")",
             "{conversion:?}"
         );
     }
@@ -11884,6 +12646,122 @@ pub(crate) mod tests {
             .collect();
         let _ = std::fs::remove_dir_all(&directory);
         labels
+    }
+
+    // --- E178: completion consults the visibility bit ----------------------
+    //
+    // B318 §1 gates three tooling consumers on the bit, and S1 wired two of
+    // them (the add-import quickfix, the steers) and left the third because
+    // `vilan-ide` was another lane's file: an import-path popup went on listing
+    // every name a module declares, its private machinery included. One rule
+    // in every place it is asked, under the uncurated-module exemption.
+    //
+    // The AUTO-IMPORT candidate table is the one consumer this does not reach,
+    // and its reason is measured rather than assumed: it is built once per
+    // ANALYSIS, outside the scope that owns overlay loads, so reading each
+    // module's rows there parses an open buffer's content into the
+    // process-global cache once per keystroke — §7.5's session leak, and four
+    // `overlay_module_reclaim` pins go red on it (see the comment in
+    // `AutoImportOrder::build`). It needs the analyzer's own
+    // `exported_entities`/`curated_modules` on `Program`, which is filed.
+
+    /// A CURATED module — one `export` marker is what makes it one — beside its
+    /// own private machinery.
+    const CURATED_MODULE: &str = concat!(
+        "export fun shown(): i32 {\n\t1\n}\n\n",
+        "export fun also_shown(): i32 {\n\t3\n}\n\n",
+        "fun hidden(): i32 {\n\t2\n}\n",
+    );
+
+    /// The same module with no marker anywhere: it offers everything, exactly
+    /// as it did before the bit existed.
+    const UNCURATED_MODULE: &str = concat!(
+        "fun shown(): i32 {\n\t1\n}\n\n",
+        "fun also_shown(): i32 {\n\t3\n}\n\n",
+        "fun hidden(): i32 {\n\t2\n}\n",
+    );
+
+    #[test]
+    fn an_import_path_offers_a_curated_modules_exports_and_not_its_machinery() {
+        let labels = workspace_completions_at_cursor(&[
+            ("main.vl", "import pkg::a::|\n"),
+            ("a.vl", CURATED_MODULE),
+        ]);
+        assert!(labels.contains(&"shown".to_string()), "{labels:?}");
+        assert!(
+            !labels.contains(&"hidden".to_string()),
+            "a private item is not offered to an import path: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn an_origin_offers_its_surfaces_exports_and_not_its_machinery() {
+        // The ORIGIN arm (`OriginListing::completions`): a package's `lib.vl`
+        // surface, read through the captured listing. Its MODULES are not
+        // filtered and are not a leak — a module is a file, `export` marks
+        // items inside one — so `a` is offered beside the surface's names.
+        let labels = workspace_completions_at_cursor(&[
+            ("app/src/main.vl", "import common::|\n"),
+            (
+                "app/vilan.toml",
+                "[package]\nname = \"app\"\n\n[package.dependencies]\n\
+                 common = { path = \"../common\" }\n",
+            ),
+            ("common/vilan.toml", "[library]\nname = \"common\"\n"),
+            ("common/src/lib.vl", CURATED_MODULE),
+            ("common/src/a.vl", "fun anything() {}\n"),
+        ]);
+        assert!(labels.contains(&"shown".to_string()), "{labels:?}");
+        assert!(labels.contains(&"a".to_string()), "a module: {labels:?}");
+        assert!(
+            !labels.contains(&"hidden".to_string()),
+            "the surface's private machinery is not offered: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn an_import_path_into_an_uncurated_module_offers_everything() {
+        let labels = workspace_completions_at_cursor(&[
+            ("main.vl", "import pkg::a::|\n"),
+            ("a.vl", UNCURATED_MODULE),
+        ]);
+        assert!(
+            labels.contains(&"shown".to_string()) && labels.contains(&"hidden".to_string()),
+            "an uncurated module offers everything: {labels:?}"
+        );
+    }
+
+    /// B318 S3's selector surface with a PRIVATE subject beside an exported
+    /// one — the module writes an `impl` block for each.
+    const CURATED_IMPL_MODULE: &str = concat!(
+        "export struct Shown {\n\tn: i32,\n}\n\n",
+        "struct Hidden {\n\tn: i32,\n}\n\n",
+        "impl Shown {\n\tfun widen(self): i32 {\n\t\tself.n\n\t}\n}\n\n",
+        "impl Hidden {\n\tfun narrow(self): i32 {\n\t\tself.n\n\t}\n}\n",
+    );
+
+    #[test]
+    fn an_impl_selector_never_offers_a_private_subject_or_its_members() {
+        let subjects = workspace_completions_at_cursor(&[
+            ("main.vl", "import pkg::a::{ (impl |\n"),
+            ("a.vl", CURATED_IMPL_MODULE),
+        ]);
+        assert!(subjects.contains(&"Shown".to_string()), "{subjects:?}");
+        assert!(
+            !subjects.contains(&"Hidden".to_string()),
+            "a private subject is not a block an importer may admit: {subjects:?}"
+        );
+        // And its members are not reachable by naming it anyway.
+        let members = workspace_completions_at_cursor(&[
+            ("main.vl", "import pkg::a::{ (impl Hidden)::|\n"),
+            ("a.vl", CURATED_IMPL_MODULE),
+        ]);
+        assert!(!members.contains(&"narrow".to_string()), "{members:?}");
+        let members = workspace_completions_at_cursor(&[
+            ("main.vl", "import pkg::a::{ (impl Shown)::|\n"),
+            ("a.vl", CURATED_IMPL_MODULE),
+        ]);
+        assert!(members.contains(&"widen".to_string()), "{members:?}");
     }
 
     #[test]
@@ -15739,6 +16617,225 @@ pub(crate) mod tests {
         );
         let result = organized(&document).expect("a wholly unused module import offers a prune");
         assert_eq!(result, "fun main() {}\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- E180: the organizer broke kolt's generated `src/lucide/lib.vl` -----
+    //
+    // Under `prelude = "std::web"` the file's two imports are both redundant
+    // with the prelude (rule (0), and correct — the file checks clean with both
+    // deleted), but E168's rescue then rewrote them, and `import std::option;`
+    // bound the module name `option` over the file's own `fun option()` icon:
+    // "`option` is a module, not a value" at `Option::Some(option())`. Two
+    // defects, pinned separately below — rule (2) counting a PRELUDE-bound,
+    // PATH-QUALIFIED reach as something the module import brings, and a rescue
+    // introducing a binding with no check that the name was free.
+
+    /// The web prelude, which is what kolt's own manifest declares: it is the
+    /// prelude that binds `Option`/`Some`/`None`, `View`/`view`, and the two
+    /// ambient MODULES (`style`, `ui`) R9's third subtraction is about.
+    const WEB_PRELUDE_MANIFEST: &str = "[package]\nname = \"probe\"\nprelude = \"std::web\"\n\n[entry.main]\ntarget = \"browser\"\n";
+
+    // E180 pin (a). The kolt shape at its smallest: the prelude binds `Option`,
+    // so the import is redundant and rule (0) prunes the leaf — and the module
+    // rescue must NOT then put `import std::option;` back. `Some` IS declared
+    // in std's `option.vl`, which is exactly what rule (2) used to count: a
+    // definition the prelude binds, spelled as a path segment behind a head.
+    // Neither reading survives E180's subtractions, so the statement goes.
+    #[test]
+    fn organize_prunes_a_prelude_redundant_import_a_qualified_variant_reaches_through() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import std::option::Option;\n\nfun pick(): Option<i32> {\n\tOption::Some(1)\n}\n",
+            ),
+            ("vilan.toml", WEB_PRELUDE_MANIFEST),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&document).expect("the prelude-redundant import offers an edit"),
+            // The blank line the run's own paragraph break leaves is the
+            // deletion's pre-existing shape (E168-era): the run takes one line
+            // ending with it, never the separator after it.
+            "\nfun pick(): Option<i32> {\n\tOption::Some(1)\n}\n",
+            "`Option::Some` is a path-qualified reach through a PRELUDE-bound \
+             head — the import brings nothing and no rescue is owed",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E180 pin (b). The same file with the collision actually present: kolt's
+    // generated lookup table calls `option()`, its own icon function, inside
+    // `Option::Some(..)`. Whatever the organizer decides, no edit it writes may
+    // bind `option` — that is the statement the guard makes, and it is asserted
+    // over the organized TEXT rather than over an internal decision, because
+    // the text is what breaks the build.
+    #[test]
+    fn organize_never_binds_a_module_name_the_file_has_taken() {
+        let source = "import std::option::Option;\n\nfun option(): i32 {\n\t1\n}\n\n\
+                      fun pick(): Option<i32> {\n\tOption::Some(option())\n}\n";
+        let (dir, document) =
+            analyze_workspace(&[("main.vl", source), ("vilan.toml", WEB_PRELUDE_MANIFEST)]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        let result = organized(&document).unwrap_or_else(|| source.to_string());
+        assert!(
+            !result.contains("import std::option;"),
+            "the organizer bound `option` over the file's own `fun option()`:\n{result}",
+        );
+        assert_eq!(
+            result,
+            "\nfun option(): i32 {\n\t1\n}\n\nfun pick(): Option<i32> {\n\tOption::Some(option())\n}\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E180 pin (c) — R9's third subtraction, RULED 2026-09-14. `std::web` says
+    // `export import pkg::ui;`, so `std::ui` is loaded for EVERY file of the
+    // package and its impls are there whatever this file imports. `view("div")
+    // .child(..)` is a receiver-syntax use of a member declared in `ui.vl`, so
+    // without the subtraction the rescue fires and writes
+    // `import std::ui::{ (impl View) };` into the file — redundant, and (kolt's
+    // estate) into every file of an application. With it the statement goes.
+    #[test]
+    fn organize_strips_a_ui_import_the_prelude_module_itself_reexports() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import std::ui::{ View, view };\n\nfun page(): View {\n\tview(\"div\").child(view(\"p\"))\n}\n",
+            ),
+            ("vilan.toml", WEB_PRELUDE_MANIFEST),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&document).expect("both leaves are prelude-redundant"),
+            "\nfun page(): View {\n\tview(\"div\").child(view(\"p\"))\n}\n",
+            "`std::ui` is ambient under this prelude — rescuing it as a \
+             selector is redundant, not protective",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [`LEAF_AND_IMPL`]'s two-subject sibling: the module rescue is the WIDE
+    /// form only when the file's uses span more than one `impl` block
+    /// (`visibility.md` §7.2), and the collision guard is about the wide form —
+    /// a SELECTOR binds no name and needs no guard at all.
+    const LEAF_AND_TWO_IMPLS: &str = concat!(
+        "fun b(): i32 {\n\t1\n}\n\n",
+        "impl i32 {\n\tfun doubled(self): i32 {\n\t\tself * 2\n\t}\n}\n\n",
+        "impl bool {\n\tfun flipped(self): bool {\n\t\tself\n\t}\n}\n",
+    );
+
+    // E180's collision guard where the rescue is genuinely WANTED: `a.vl`'s two
+    // `impl` blocks are the only thing bringing `doubled` and `flipped`, so
+    // E168 would rewrite `import pkg::a::b;` to `import pkg::a;` — but the file
+    // declares its own `fun a()`, and that rewrite binds `a` over it. The
+    // organizer keeps the statement exactly as written instead: it may not
+    // break a green build to tidy one.
+    #[test]
+    fn organize_keeps_an_emptied_import_verbatim_when_its_module_name_is_taken() {
+        let source = "import pkg::a::b;\n\nfun a(): i32 {\n\t2\n}\n\n\
+                      fun main(): bool {\n\tlet n = a().doubled();\n\tlet flag = n > 0;\n\t\
+                      flag.flipped()\n}\n";
+        let (dir, document) =
+            analyze_workspace(&[("main.vl", source), ("a.vl", LEAF_AND_TWO_IMPLS)]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&document),
+            None,
+            "`a` is taken by the file's own declaration — the statement stands",
+        );
+        // E114/E173's contract: what fades is what the action removes, and the
+        // action removes nothing here.
+        assert_eq!(
+            faded(&document),
+            Vec::<String>::new(),
+            "a statement the action keeps verbatim must not fade",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The guard's other half: the same shape with the module's name FREE still
+    // rescues, so the guard narrows E168 and does not replace it.
+    #[test]
+    fn organize_still_rescues_when_the_module_name_is_free() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::b;\n\nfun local(): i32 {\n\t2\n}\n\n\
+                 fun main(): bool {\n\tlet n = local().doubled();\n\tlet flag = n > 0;\n\t\
+                 flag.flipped()\n}\n",
+            ),
+            ("a.vl", LEAF_AND_TWO_IMPLS),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|e| &e.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            organized(&document).expect("the emptied statement is rescued"),
+            "import pkg::a;\n\nfun local(): i32 {\n\t2\n}\n\n\
+             fun main(): bool {\n\tlet n = local().doubled();\n\tlet flag = n > 0;\n\t\
+             flag.flipped()\n}\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E180 pin (e). A rule-(0) leaf is not "unused" in any sense its reader
+    // would recognize — `Option` may be spelled on every line of the file — so
+    // the fade says what it actually is and names the prelude.
+    #[test]
+    fn a_prelude_redundant_faded_leaf_says_the_prelude_binds_it() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import std::option::Option;\n\nfun pick(): Option<i32> {\n\tOption::Some(1)\n}\n",
+            ),
+            ("vilan.toml", WEB_PRELUDE_MANIFEST),
+        ]);
+        assert_eq!(
+            faded_messages(&document),
+            vec![(
+                "Option".to_string(),
+                "redundant: the prelude already binds `Option`".to_string(),
+            )],
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

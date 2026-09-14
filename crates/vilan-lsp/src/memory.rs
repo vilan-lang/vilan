@@ -82,7 +82,12 @@ impl Memory {
 }
 
 /// `bytes` as `N.M MiB`, or `?` where the host said nothing.
-fn mib(bytes: Option<usize>) -> String {
+///
+/// Shared with the retained-state line (E179), which carries the base cache's
+/// weight and budget in the same unit and must render them the same way — two
+/// spellings of "N.M MiB" on one page is exactly the kind of drift the summary
+/// exists to be read quickly.
+pub(crate) fn mib(bytes: Option<usize>) -> String {
     match bytes {
         // Tenths of a MiB, computed in integers: `bytes * 10 / MiB` cannot
         // overflow a `usize` on any address space this process runs in (the

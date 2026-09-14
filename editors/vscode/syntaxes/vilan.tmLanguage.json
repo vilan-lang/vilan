@@ -489,6 +489,11 @@
        "name": "entity.other.attribute-name.vilan"
       },
       {
+       "comment": "A PARENLESS head item's name (E176). E170 gave the head its attribute vocabulary and reached only the names a `(` follows, so the two head items that carry no parens of their own painted as NOTHING: a bare boolean attribute (`disabled` in `<input type(\"checkbox\") disabled />`) and the attribute half of an attribute-then-chain item (`hidden` in `hidden.show(flag)`, whose `show` is a chain link and is coloured as the call it is). Both are attribute names by the grammar's own one-token rule — inside a head, a leading `.` is chain form, `on` plus `:` is the event form, an ident plus `(` is an attribute with a value, and a bare ident is a boolean attribute — so the vocabulary is owed to them. One more rule, after E170's and before `$self`, with the SAME lookbehind (a `.` leaves a chain link alone, a `-` leaves a hyphenated name to the rule that paints the whole of it, a `:` leaves `on:click` to the event rule) plus a `<` that keeps it off a tag name in the shape where the head region's own begin did not consume one. What is new is the LOOKAHEAD, and it is what the rule is: not a `(`, which is E170's; not a `:`, which would take `on` out of `on:click` and leave the event name uncoloured, since this rule sits ahead of `$self` and would win the tie at the same character; and not a `-`, which is the first segment of a hyphenated name. A `.` is deliberately allowed, because that is the `hidden` case. A `{hole}` never reaches this rule: the head region ENDS at a `{`, so a child hole is outside it, and a value's parentheses are `#element-head-value`'s own region, which this rule is not part of.",
+       "match": "(?<![A-Za-z0-9_.:<-])([a-z][a-zA-Z0-9_]*)(?![A-Za-z0-9_(:-])",
+       "name": "entity.other.attribute-name.vilan"
+      },
+      {
        "include": "$self"
       }
      ]

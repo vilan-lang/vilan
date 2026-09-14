@@ -93,10 +93,61 @@ fn code_tokens(source: &str) -> Option<Vec<Token<'_>>> {
 /// moves whole, already-canonical items.
 fn normalize(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     sort_css_blocks(sort_style_chains(sort_element_heads(sort_import_runs(
-        &drop_redundant_import_aliases(canonicalize_declaration_clauses(
-            drop_anonymous_binder_keywords(collapse_field_shorthands(drop_trailing_commas(tokens))),
+        &hoist_export_all_markers(drop_redundant_import_aliases(
+            canonicalize_declaration_clauses(drop_anonymous_binder_keywords(
+                collapse_field_shorthands(drop_trailing_commas(tokens)),
+            )),
         )),
     ))))
+}
+
+/// Moves every bare `export *;` to the FRONT of the token stream, so the safety
+/// net accepts the printer giving the marker its canonical place (E181) while
+/// still checking that the markers a file wrote all survive the reprint.
+///
+/// A relocation, deliberately, rather than a deletion. Dropping the three
+/// tokens from both streams would also accept a reprint that LOST the marker —
+/// a module-wide export silently deleted — and the net exists precisely to
+/// catch that class. Hoisting them all to one canonical position makes the two
+/// streams agree about where the marker is without making them agree about
+/// whether it is there: the count travels, and every other token keeps its
+/// order.
+///
+/// The one thing it gives up is a marker crossing a `mod` boundary, since the
+/// hoist does not respect block structure. That is the same concession
+/// [`sort_import_runs`] makes about a run's members, and the printer's move is
+/// TOP-LEVEL only, so nothing it does can reach the case.
+///
+/// `export *;` is the only production that lexes to this triple — the parser
+/// takes the `;` in its lookahead for exactly that reason (`export * helper;`
+/// is a deref, B321) — so the scan cannot mistake anything else for it.
+fn hoist_export_all_markers(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
+    let mut markers = 0usize;
+    let mut rest: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        if tokens[index] == Token::Export
+            && tokens.get(index + 1) == Some(&Token::Op("*"))
+            && tokens.get(index + 2) == Some(&Token::Ctrl(';'))
+        {
+            markers += 1;
+            index += 3;
+            continue;
+        }
+        rest.push(tokens[index].clone());
+        index += 1;
+    }
+    if markers == 0 {
+        return rest;
+    }
+    let mut result = Vec::with_capacity(rest.len() + markers * 3);
+    for _ in 0..markers {
+        result.push(Token::Export);
+        result.push(Token::Op("*"));
+        result.push(Token::Ctrl(';'));
+    }
+    result.extend(rest);
+    result
 }
 
 /// Drops the `type` keyword in front of an ANONYMOUS binder — `type _` is `_`
@@ -1642,19 +1693,21 @@ pub struct ImportRunEdit {
     pub replacement: String,
 }
 
-/// A pruned import statement awaiting canonical rendering. A re-export is surface,
-/// not usage, so it is never pruned and renders from its original node; an
-/// `import`/`use` that survived (whole or in part) renders from a node rebuilt to
-/// carry only the leaves `keep` retained.
+/// A pruned import statement awaiting canonical rendering. Two statements
+/// render from their ORIGINAL node — a re-export, which is surface rather than
+/// usage and is never pruned, and E180's collision guard, whose whole answer is
+/// "this statement stands exactly as it was written" — and an `import`/`use`
+/// that survived whole or in part renders from a node rebuilt to carry only the
+/// leaves `keep` retained.
 enum PrunedStatement<'ast, 'src> {
-    ReExport(&'ast Node<'src>),
+    AsWritten(&'ast Node<'src>),
     Rebuilt(Node<'src>),
 }
 
 impl<'src> PrunedStatement<'_, 'src> {
     fn node(&self) -> &Node<'src> {
         match self {
-            PrunedStatement::ReExport(node) => node,
+            PrunedStatement::AsWritten(node) => node,
             PrunedStatement::Rebuilt(node) => node,
         }
     }
@@ -1776,14 +1829,25 @@ pub enum ModuleRescue {
     /// `import <module>::{ (impl <subject>) };` — it uses exactly one block's
     /// members. The string is the subject as it should be rendered.
     Selector(String),
+    /// E180: the module IS needed, but `import <module>;` would BIND the module
+    /// segment's name and the file has already taken it — kolt's generated
+    /// `src/lucide/lib.vl` declares `fun option()`, and the rescue
+    /// `import std::option;` bound `option` over it, so the organized file
+    /// stopped checking ("`option` is a module, not a value"). The organizer may
+    /// never write a statement whose new name collides, and the only edit that
+    /// is certainly safe on a file that builds is no edit: the statement is
+    /// printed exactly as written, and — E114/E173's contract, that what fades
+    /// is what the action removes — its leaves do NOT fade.
+    Keep,
 }
 
 /// E168: the statement `branch` becomes when every one of its leaves pruned
 /// away but `keep_module` says the module it reaches into is still needed —
 /// `import pkg::a;`, rendered through the canonical printer like any other
-/// surviving statement. `None` when the module is not wanted, or when the
-/// truncation would leave an ORIGIN rather than a module (see
-/// [`import_module_branch`]).
+/// surviving statement. [`RescuedImport::Dropped`] when the module is not
+/// wanted, or when the truncation would leave an ORIGIN rather than a module
+/// (see [`import_module_branch`]); [`RescuedImport::Verbatim`] when the rescue
+/// would bind a name this file has already taken (E180).
 ///
 /// The predicate is asked at the module SEGMENT's span, which is the span the
 /// analyzer recorded the module's own reference at — so the editor answers it
@@ -1792,16 +1856,37 @@ pub enum ModuleRescue {
 fn module_only_import_branch<'src>(
     branch: &ImportBranch<'src>,
     keep_module: &dyn Fn(Span) -> ModuleRescue,
-) -> Option<ImportBranch<'src>> {
-    let (module, module_span, depth) = import_module_branch(branch)?;
+) -> RescuedImport<'src> {
+    let Some((module, module_span, depth)) = import_module_branch(branch) else {
+        return RescuedImport::Dropped;
+    };
     if depth < 2 {
-        return None;
+        return RescuedImport::Dropped;
     }
     match keep_module(module_span) {
-        ModuleRescue::No => None,
-        ModuleRescue::Module => Some(module),
-        ModuleRescue::Selector(subject) => Some(attach_selector(module, subject)),
+        ModuleRescue::No => RescuedImport::Dropped,
+        ModuleRescue::Module => RescuedImport::Narrowed(module),
+        ModuleRescue::Selector(subject) => {
+            RescuedImport::Narrowed(attach_selector(module, subject))
+        }
+        // E180's collision guard. The caller has the statement's own node and
+        // reprints that; the truncation computed above is thrown away, which is
+        // the point — a `Keep` is the organizer declining to narrow anything.
+        ModuleRescue::Keep => RescuedImport::Verbatim,
     }
+}
+
+/// What [`module_only_import_branch`] decided about an import statement every
+/// one of whose leaves pruned away — the three-way answer [`ModuleRescue`]
+/// became once E180 added an outcome that is neither a deletion nor a rewrite.
+enum RescuedImport<'src> {
+    /// The module brings the file nothing (or the truncation would leave an
+    /// ORIGIN): the statement goes.
+    Dropped,
+    /// The narrower statement the rescue prints in its place.
+    Narrowed(ImportBranch<'src>),
+    /// The statement stands exactly as written (E180).
+    Verbatim,
 }
 
 /// `<module>` rewritten as `<module>::{ (impl <subject>) }` — the module path's
@@ -2791,9 +2876,16 @@ impl<'src> Printer<'src> {
         }
     }
 
-    /// Emits a blank line (used to preserve a paragraph gap before the next item).
+    /// Emits a blank line (used to preserve a paragraph gap before the next
+    /// item).
+    ///
+    /// IDEMPOTENT: a gap already opened is not opened again. E181's forced gap
+    /// below the `export *;` marker is asked for before the next item's
+    /// comments are flushed, and the source may have written a gap there too —
+    /// two asks must still be one blank line, exactly as two blank lines in the
+    /// source collapse to one.
     fn blank_line(&mut self) {
-        if !self.out.is_empty() {
+        if !self.out.is_empty() && !self.out.ends_with('\n') {
             self.out.push('\n');
         }
     }
@@ -2876,17 +2968,59 @@ impl<'src> Printer<'src> {
         // there — `let age = now().since(t).describe();` at 54 columns split
         // three ways because the `fun` above it was 108.
         self.split = Split::Off;
+        // E181: the bare `export *;` marker has a canonical PLACE — the slot
+        // just below the file's leading import run — and the printer puts it
+        // there rather than printing it where it was written. Everything else
+        // about a marker is unchanged: a second one is an ordinary item printed
+        // in source order (the analyzer's business, and the formatter never
+        // hides a diagnosis), and `export import`, `export item` and
+        // `export(in …) item` are DECLARATIONS that stay exactly where they are.
+        let marker = top_level
+            .then(|| {
+                items
+                    .iter()
+                    .position(|item| matches!(item.0, Node::ExportAll))
+            })
+            .flatten();
+        let slot = marker.map(|at| self.export_all_marker_slot(items, at));
+        // Taken out of the comment stream BEFORE anything prints, so a comment
+        // written above the marker travels with it instead of being flushed
+        // where the marker used to be.
+        let marker_comments = match marker {
+            Some(at) => self.take_marker_comments(items, at),
+            None => Vec::new(),
+        };
         let mut prev_end = start_from;
         let mut index = 0;
+        // E181: the paragraph gap BELOW the marker, owed by whatever follows it
+        // whatever the source wrote between them.
+        let mut force_blank = false;
         while index < items.len() {
+            if slot == Some(index) {
+                let at = marker.expect("a slot exists only when a marker does");
+                prev_end =
+                    self.print_export_all_marker(items, at, index, prev_end, &marker_comments);
+                force_blank = true;
+            }
+            if marker == Some(index) {
+                index += 1;
+                continue;
+            }
             if top_level && import_kind_and_branch(&items[index].0).is_some() {
                 let run_end = self.import_run_end(items, index);
-                prev_end = self.print_import_run(&items[index..run_end], prev_end);
+                prev_end = self.print_import_run(&items[index..run_end], prev_end, force_blank);
+                force_blank = false;
                 index = run_end;
                 continue;
             }
             let item = &items[index];
             let range = item.1.into_range();
+            // E181's gap goes above the next item's COMMENTS, not between them
+            // and the item they document.
+            if force_blank {
+                self.blank_line();
+                force_blank = false;
+            }
             let after_comments = self.flush_comments_before(range.start, prev_end);
             if self.has_blank_between(after_comments, range.start) {
                 self.blank_line();
@@ -2916,7 +3050,191 @@ impl<'src> Printer<'src> {
             prev_end = range.end;
             index += 1;
         }
+        if slot == Some(items.len()) {
+            let at = marker.expect("a slot exists only when a marker does");
+            prev_end =
+                self.print_export_all_marker(items, at, items.len(), prev_end, &marker_comments);
+        }
         prev_end
+    }
+
+    /// E181: where the bare `export *;` marker at `marker` PRINTS — an index
+    /// into `items`, read as "just before this item" (`items.len()` = last).
+    ///
+    /// The slot is the one below the file's LEADING import run: module comment,
+    /// the imports, the marker, then the items. B318 S1 introduced the marker
+    /// and left it wherever it was written — before the imports, mid-file, glued
+    /// to the next item — because the printer walks statements in source order
+    /// and only sorts imports WITHIN their run; S6's estate sweep is about to
+    /// write hundreds of them, so the rule lands first and the sweep's output is
+    /// already canonical.
+    ///
+    /// The block is measured with the marker LIFTED OUT, which is what makes a
+    /// marker written above the imports find the same slot as one written below
+    /// them: the imports are the file's leading block either way, and the marker
+    /// was never part of it. A file with no leading import at all puts the
+    /// marker before its first item — after the module comment, which is
+    /// [`Self::print_export_all_marker`]'s half of the answer.
+    ///
+    /// **The BLOCK, not the sort RUN.** [`Self::import_run_end`] stops at a
+    /// standalone comment, because imports may not reorder across one; the
+    /// marker's slot is not a sorting question and must not inherit that break.
+    /// kolt's `views.vl` is the exhibit: a `// FIXME:` line sits between its
+    /// first import and its second, so the sort run is ONE statement long and a
+    /// marker written correctly below all thirty of them was moved up into the
+    /// middle of the list — further from the canonical shape than where it
+    /// started. The block is every leading import, comments and blank lines and
+    /// all.
+    fn export_all_marker_slot(&self, items: &[Spanned<Node<'src>>], marker: usize) -> usize {
+        let mut slot = 0;
+        let mut index = 0;
+        while index < items.len() {
+            if index == marker {
+                index += 1;
+                continue;
+            }
+            if import_kind_and_branch(&items[index].0).is_none() {
+                break;
+            }
+            index += 1;
+            slot = index;
+        }
+        slot
+    }
+
+    /// Prints the marker at its slot, with a paragraph gap above it and its own
+    /// comments (already taken out of the stream by
+    /// [`Self::take_marker_comments`]) riding along. Returns the source offset
+    /// the caller should go on measuring gaps from.
+    ///
+    /// Two shapes. Below an import run there is nothing left to flush — the run
+    /// took its own comments and whatever follows belongs to the next item — so
+    /// the marker prints straight away. With no run above it the marker is the
+    /// file's first STATEMENT, and the module comment has to come out ahead of
+    /// it while a doc comment written against the first item must not: the split
+    /// between the two is the last blank line before that item, and
+    /// [`Self::module_comment_end`] finds it.
+    fn print_export_all_marker(
+        &mut self,
+        items: &[Spanned<Node<'src>>],
+        marker: usize,
+        slot: usize,
+        prev_end: usize,
+        comments: &[&'src str],
+    ) -> usize {
+        let mut prev_end = prev_end;
+        // No leading import at all: the marker is the file's first statement,
+        // so nothing has printed yet and the module comment is still pending.
+        if slot == 0 {
+            let until = self.module_comment_end(items, marker);
+            prev_end = self.flush_comments_before(until, prev_end);
+        }
+        self.blank_line();
+        for text in comments {
+            self.line();
+            self.out.push_str(text);
+        }
+        self.line();
+        self.out.push_str("export *;");
+        prev_end
+    }
+
+    /// The offset [`Self::print_export_all_marker`] flushes comments up to when
+    /// the marker leads the file: past the module comment, and short of any
+    /// comment block written directly against the first item.
+    ///
+    /// A file's leading comments are one block or two. `// The WEB prelude — …`
+    /// followed by a blank line is the MODULE's comment and the marker goes
+    /// below it; `/// what this function does` with no blank line between it and
+    /// the `fun` is that item's, and a marker inserted between them would take
+    /// a doc comment off its declaration. The blank line is the whole
+    /// distinction, and it is the one the language's own files already draw.
+    fn module_comment_end(&self, items: &[Spanned<Node<'src>>], marker: usize) -> usize {
+        let Some(first) = items
+            .iter()
+            .enumerate()
+            .find(|(index, _)| *index != marker)
+            .map(|(_, item)| item.1.into_range().start)
+        else {
+            // A file whose only statement is the marker: every comment in it
+            // precedes the marker.
+            return self.source.len();
+        };
+        let pending: Vec<Span> = self.comments[self.cursor..]
+            .iter()
+            .map(|(span, _)| *span)
+            .filter(|span| span.into_range().start < first)
+            .collect();
+        let mut attached = pending.len();
+        let mut next_start = first;
+        while attached > 0 {
+            let range = pending[attached - 1].into_range();
+            if self.has_blank_between(range.end, next_start) {
+                break;
+            }
+            next_start = range.start;
+            attached -= 1;
+        }
+        pending
+            .get(attached)
+            .map(|span| span.into_range().start)
+            .unwrap_or(first)
+    }
+
+    /// E181: the comments written directly above the `export *;` marker, taken
+    /// OUT of the printer's comment stream so they travel to the marker's slot
+    /// instead of being flushed at the place the marker used to occupy.
+    ///
+    /// Directly above means: standalone (on its own line, not a trailing
+    /// comment of the item before), below the previous item, and reachable from
+    /// the marker with no blank line in between — the same attachment rule the
+    /// rest of the printer uses for a comment and the item under it.
+    fn take_marker_comments(
+        &mut self,
+        items: &[Spanned<Node<'src>>],
+        marker: usize,
+    ) -> Vec<&'src str> {
+        let marker_start = items[marker].1.into_range().start;
+        let floor = match marker {
+            0 => 0,
+            _ => items[marker - 1].1.into_range().end,
+        };
+        let candidates: Vec<usize> = (0..self.comments.len())
+            .filter(|index| {
+                let range = self.comments[*index].0.into_range();
+                floor <= range.start && range.end <= marker_start
+            })
+            .collect();
+        let mut attached = candidates.len();
+        let mut next_start = marker_start;
+        while attached > 0 {
+            let range = self.comments[candidates[attached - 1]].0.into_range();
+            if self.has_blank_between(range.end, next_start) {
+                break;
+            }
+            let above = match attached {
+                1 => floor,
+                _ => self.comments[candidates[attached - 2]].0.into_range().end,
+            };
+            // A comment sharing a line with whatever precedes it is that
+            // statement's trailing comment and stays with it.
+            let standalone = above == 0
+                || self
+                    .source
+                    .get(above..range.start)
+                    .is_some_and(|gap| gap.contains('\n'));
+            if !standalone {
+                break;
+            }
+            next_start = range.start;
+            attached -= 1;
+        }
+        let taken = &candidates[attached..];
+        let texts: Vec<&'src str> = taken.iter().map(|index| self.comments[*index].1).collect();
+        for index in taken.iter().rev() {
+            self.comments.remove(*index);
+        }
+        texts
     }
 
     /// The exclusive end of the import run starting at `start`: the longest span
@@ -2942,8 +3260,16 @@ impl<'src> Printer<'src> {
     /// [`import_sort_key`]): reordered by kind/root/path, brace sets sorted,
     /// blank lines coalesced into one block. Each item's trailing same-line
     /// comment travels with it. Returns the source offset past the run.
-    fn print_import_run(&mut self, run: &[Spanned<Node<'src>>], prev_end: usize) -> usize {
+    fn print_import_run(
+        &mut self,
+        run: &[Spanned<Node<'src>>],
+        prev_end: usize,
+        force_blank: bool,
+    ) -> usize {
         let first_start = run[0].1.into_range().start;
+        if force_blank {
+            self.blank_line();
+        }
         let after_comments = self.flush_comments_before(first_start, prev_end);
         if self.has_blank_between(after_comments, first_start) {
             self.blank_line();
@@ -3023,16 +3349,25 @@ impl<'src> Printer<'src> {
             let end = item.1.into_range().end;
             let statement = match &item.0 {
                 // A re-export is surface, not usage — never pruned.
-                Node::Export(..) => Some(PrunedStatement::ReExport(&item.0)),
+                Node::Export(..) => Some(PrunedStatement::AsWritten(&item.0)),
                 // E168: an `import` emptied of its leaves is offered to
                 // `keep_module` before it is dropped — the module it reaches
                 // into may be the only thing bringing an `impl` the file calls
                 // a method from. A `use` is not rewritten: it binds a name out
                 // of a namespace into this scope, and a namespace with no name
                 // taken out of it binds nothing at all.
-                Node::Import(branch, modifier) => prune_import_branch(branch, keep)
-                    .or_else(|| module_only_import_branch(branch, keep_module))
-                    .map(|pruned| PrunedStatement::Rebuilt(Node::Import(pruned, *modifier))),
+                Node::Import(branch, modifier) => match prune_import_branch(branch, keep) {
+                    Some(pruned) => Some(PrunedStatement::Rebuilt(Node::Import(pruned, *modifier))),
+                    None => match module_only_import_branch(branch, keep_module) {
+                        RescuedImport::Dropped => None,
+                        RescuedImport::Narrowed(pruned) => {
+                            Some(PrunedStatement::Rebuilt(Node::Import(pruned, *modifier)))
+                        }
+                        // E180: the original node, so the run reprints the
+                        // statement the file already has.
+                        RescuedImport::Verbatim => Some(PrunedStatement::AsWritten(&item.0)),
+                    },
+                },
                 Node::Use(branch) => prune_import_branch(branch, keep)
                     .map(|pruned| PrunedStatement::Rebuilt(Node::Use(pruned))),
                 _ => None,
@@ -11055,6 +11390,171 @@ mod import_sorting {
 }
 
 #[cfg(test)]
+mod export_marker_placement {
+    //! E181: the bare `export *;` marker has a canonical PLACE — the slot just
+    //! below the file's leading import run, with a paragraph gap on both sides
+    //! — and `vilan fmt` puts it there. B318 S1 introduced the marker and the
+    //! printer left it wherever it was written (before the imports, mid-file,
+    //! glued to the next item — all four placements survived a reprint
+    //! unchanged on 9b22ec36), because statements print in source order and
+    //! only imports sort within their run. S6's estate sweep is about to write
+    //! hundreds of markers, so the rule lands first.
+    use super::{format, normalize};
+    use crate::lexing::tokenize;
+    use crate::token::Token;
+
+    /// The reprint puts the marker in its slot, is idempotent, and did not
+    /// silently bail — a bail returns the input verbatim, so the appended blank
+    /// lines would survive instead of being canonicalized away.
+    fn assert_places(source: &str, expected: &str) {
+        assert_eq!(format(source), expected, "the marker is not in its slot");
+        assert_eq!(format(expected), expected, "not idempotent");
+        assert_eq!(
+            format(&format!("{source}\n\n")),
+            expected,
+            "silently bailed on {source:?}"
+        );
+    }
+
+    fn raw_tokens(text: &str) -> Vec<Token<'_>> {
+        let (tokens, errors) = tokenize(text);
+        assert!(errors.is_empty(), "did not lex cleanly: {text:?}");
+        tokens.into_iter().map(|(token, _)| token).collect()
+    }
+
+    // Written ABOVE the imports — the shape the six benchmark modules carry —
+    // the marker moves below them. The imports are the file's leading run
+    // either way: the slot is measured with the marker lifted out.
+    #[test]
+    fn a_marker_above_the_imports_moves_below_them() {
+        assert_places(
+            "export *;\n\nimport std::io::print;\nimport pkg::a;\n\nfun main() {}\n",
+            "import std::io::print;\nimport pkg::a;\n\nexport *;\n\nfun main() {}\n",
+        );
+    }
+
+    // Written MID-FILE, the marker comes back up to the slot — and the comment
+    // written directly above it travels with it, because that comment is about
+    // the marker and about nothing the marker left behind.
+    #[test]
+    fn a_marker_written_mid_file_comes_back_up_with_its_comment() {
+        assert_places(
+            "import std::io::print;\n\nfun main() {}\n\n// every item is surface\nexport *;\n",
+            "import std::io::print;\n\n// every item is surface\nexport *;\n\nfun main() {}\n",
+        );
+    }
+
+    // GLUED to the statements on either side, the marker earns its paragraph
+    // gaps: the slot is a place AND a shape, and a marker already at the right
+    // index is still printed with the gaps.
+    #[test]
+    fn a_glued_marker_earns_its_paragraph_gaps() {
+        assert_places(
+            "import std::io::print;\nexport *;\nfun main() {}\n",
+            "import std::io::print;\n\nexport *;\n\nfun main() {}\n",
+        );
+    }
+
+    // With no imports the marker leads the file — after the MODULE comment,
+    // which is the block a blank line separates from the first item, and above
+    // a doc comment written against that item, which is not.
+    #[test]
+    fn with_no_imports_the_marker_follows_the_module_comment() {
+        assert_places(
+            "// what this module is\n\n/// what main does\nfun main() {}\n\nexport *;\n",
+            "// what this module is\n\nexport *;\n\n/// what main does\nfun main() {}\n",
+        );
+    }
+
+    // The block is not the sort RUN. `import_run_end` stops at a standalone
+    // comment (imports may not reorder across one), and inheriting that break
+    // here moved a correctly-placed marker UP into the middle of the import
+    // list — kolt's `views.vl`, whose second import carries a `// FIXME:` line
+    // above it and whose marker sits correctly below all thirty. Measured on
+    // the copy: `vilan fmt --check` flagged exactly that one file, and this is
+    // the pin that keeps it flagging nothing.
+    #[test]
+    fn a_comment_inside_the_import_block_does_not_end_it() {
+        let source = "import std::io::print;\n\
+                      // why the next one is here\n\
+                      import pkg::a;\n\n\
+                      export *;\n\n\
+                      fun main() {}\n";
+        assert_eq!(format(source), source, "the marker is already in its slot");
+        // And a marker written ABOVE that same block still lands below all of
+        // it, not between the comment and the import under it.
+        assert_places(
+            "export *;\nimport std::io::print;\n\
+             // why the next one is here\n\
+             import pkg::a;\n\nfun main() {}\n",
+            "import std::io::print;\n\
+             // why the next one is here\n\
+             import pkg::a;\n\nexport *;\n\nfun main() {}\n",
+        );
+    }
+
+    // A file already in the canonical shape reprints byte-identically.
+    #[test]
+    fn a_file_already_in_the_shape_is_unchanged() {
+        let source = "// the module\n\nimport std::io::print;\n\nexport *;\n\nfun main() {}\n";
+        assert_eq!(format(source), source);
+    }
+
+    // A file whose only statement is the marker has nowhere to move it to.
+    #[test]
+    fn a_file_that_is_only_the_marker_is_unchanged() {
+        assert_eq!(format("export *;\n"), "export *;\n");
+    }
+
+    // A SECOND marker is the analyzer's business — the formatter never hides a
+    // diagnosis by tidying the evidence — so it is left exactly where it was
+    // written and only the first one moves.
+    #[test]
+    fn a_duplicate_marker_is_left_where_it_was_written() {
+        assert_places(
+            "import std::io::print;\nfun a() {}\nexport *;\nfun b() {}\nexport *;\n",
+            "import std::io::print;\n\nexport *;\n\nfun a() {}\n\nfun b() {}\nexport *;\n",
+        );
+    }
+
+    // Only the BARE marker moves. `export import` is a re-export and sorts
+    // inside the import run like any other statement; `export item` and
+    // `export(in PATH) item` are declarations and hold their place.
+    #[test]
+    fn the_export_declarations_stay_where_they_are() {
+        assert_places(
+            "export import std::io::print;\nexport fun surface() {}\n\n\
+             export(in pkg) fun narrowed() {}\n\nfun local() {}\n\nexport *;\n",
+            "export import std::io::print;\n\nexport *;\n\nexport fun surface() {}\n\n\
+             export(in pkg) fun narrowed() {}\n\nfun local() {}\n",
+        );
+    }
+
+    // The safety net accepts the move (the marker is hoisted to one canonical
+    // token position on both streams) and still refuses a marker being LOST or
+    // gained — which is the whole reason the normalization relocates the tokens
+    // rather than dropping them.
+    #[test]
+    fn the_net_forgives_the_move_and_not_a_lost_marker() {
+        assert_eq!(
+            normalize(raw_tokens("export *;\nimport a::b;\n")),
+            normalize(raw_tokens("import a::b;\n\nexport *;\n")),
+            "the relocation is what the net is being asked to forgive"
+        );
+        assert_ne!(
+            normalize(raw_tokens("import a::b;\n\nexport *;\n")),
+            normalize(raw_tokens("import a::b;\n")),
+            "a dropped marker is a token drift, not a canonicalization"
+        );
+        assert_ne!(
+            normalize(raw_tokens("import a::b;\n\nexport *;\n")),
+            normalize(raw_tokens("import a::b;\n\nexport *;\nexport *;\n")),
+            "the marker COUNT still travels"
+        );
+    }
+}
+
+#[cfg(test)]
 mod organize {
     //! `organize_import_runs` backs the LSP "Organize Imports" action: it sorts
     //! top-level import runs into the same canonical order `vilan fmt` produces
@@ -11426,6 +11926,31 @@ mod insert {
         let mut result = source.to_string();
         result.replace_range(edit.span.into_range(), &edit.replacement);
         Some(result)
+    }
+
+    // E181: a NEW leading import goes ABOVE the `export *;` marker, never
+    // below it — the marker's slot is the line under the import run, so an
+    // import inserted under it would be the one statement the next `vilan fmt`
+    // had to step over. The file whose only header line is the marker is the
+    // shape that says so: there is no run to insert into, and the fresh
+    // statement takes the first line.
+    #[test]
+    fn a_fresh_import_lands_above_the_export_marker() {
+        assert_eq!(
+            apply("export *;\n\nfun main() {}\n", &["std", "json"], "Json").as_deref(),
+            Some("import std::json::Json;\nexport *;\n\nfun main() {}\n"),
+        );
+        // And with a run already there, the new statement sorts into the run,
+        // which is itself above the marker.
+        assert_eq!(
+            apply(
+                "import std::io::print;\n\nexport *;\n\nfun main() {}\n",
+                &["std", "json"],
+                "Json",
+            )
+            .as_deref(),
+            Some("import std::io::print;\nimport std::json::Json;\n\nexport *;\n\nfun main() {}\n"),
+        );
     }
 
     // E83: auto-import completion probes MANY leaves against ONE buffer, so

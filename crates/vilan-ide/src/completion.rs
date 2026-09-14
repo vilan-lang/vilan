@@ -2393,6 +2393,20 @@ impl<'a, 'src> Analysis<'a, 'src> {
             return Vec::new();
         };
         let blocks = vilan_core::analyzer::module_impl_blocks(&file);
+        // E178: a selector names a SUBJECT, and a subject the module keeps
+        // private is not a block an importer may admit. `module_impl_blocks`
+        // answers with the block's written head and nothing about visibility —
+        // an `impl` block carries no marker of its own at this sha (B318 S4 is
+        // what gives one meaning), so the bit that exists to be read is the
+        // SUBJECT's, and a head that names no importable of this module (a
+        // primitive, or a type declared elsewhere and extended here) is left
+        // offered, because the module is not the place that decides it.
+        let importables = vilan_core::analyzer::module_importables(&file);
+        let offered = offered_importables(&importables);
+        let declares_privately = |head: &str| {
+            importables.iter().any(|row| row.name == head)
+                && !offered.iter().any(|row| row.name == head)
+        };
         match subject {
             // After `impl `: one row per SUBJECT the module writes a block for,
             // deduplicated — two blocks for one head are one thing to select.
@@ -2400,6 +2414,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 let mut seen: HashSet<String> = HashSet::new();
                 blocks
                     .into_iter()
+                    .filter(|(head, _)| !declares_privately(head))
                     .filter(|(head, _)| seen.insert(head.clone()))
                     .map(|(head, _)| Completion::bare(head, CompletionKind::Struct))
                     .collect()
@@ -2410,6 +2425,9 @@ impl<'a, 'src> Analysis<'a, 'src> {
             // also what the selector filters by before its type test runs.
             Some(subject) => {
                 let head = selector_subject_head(subject);
+                if declares_privately(head) {
+                    return Vec::new();
+                }
                 let mut seen: HashSet<String> = HashSet::new();
                 blocks
                     .into_iter()
@@ -3005,9 +3023,14 @@ fn module_member_completions(
             .as_deref()
             .map(vilan_core::analyzer::module_importables)
             .unwrap_or_default();
+        // E178: the visibility bit, here as at the origin listing — a module's
+        // private machinery is not offered to an import path.
+        let offered = offered_importables(&importables);
         let Some((name, past_enum)) = segments[cut..].split_first() else {
-            let mut items: Vec<Completion> =
-                importables.iter().map(importable_completion).collect();
+            let mut items: Vec<Completion> = offered
+                .iter()
+                .map(|importable| importable_completion(importable))
+                .collect();
             // The directory's children, after the module's own names: an item
             // and a submodule can share a spelling, and the module's own item
             // is what an import of that name binds (the walk asks the item
@@ -3026,7 +3049,7 @@ fn module_member_completions(
         if !past_enum.is_empty() {
             return Vec::new();
         }
-        return importables
+        return offered
             .iter()
             .find(|importable| {
                 importable.name == *name
@@ -3065,6 +3088,37 @@ fn module_member_completions(
 /// One importable name as a completion candidate. Bare by construction — an
 /// import binds a name, it never calls it — so the shaping post-pass in
 /// [`Analysis::completion`] has nothing left to strip.
+/// B318 §1's completion filter (E178): the rows of a module whose importables
+/// are `importables` that completion may OFFER.
+///
+/// The bit gates three tooling consumers, and completion is the one S1 left —
+/// the add-import quickfix reads it (`Document::import_candidates`) and the
+/// steers read it, while an import-path popup went on listing every name a
+/// module declares, private ones included. It is the same one-line rule in both
+/// places, under the same **uncurated-module exemption**: a module carrying no
+/// `export` marker anywhere offers everything it declares, exactly as it did
+/// before the bit existed, because on the day the marker gains meaning no
+/// module in the estate has written one and hiding every name in std from
+/// completion is not a migration, it is an outage. The plain-reach WARNING is
+/// what tells an author to curate; this is what stops the tooling punishing
+/// them for not having done it yet.
+///
+/// A NARROWED export (`export(in pkg)`) counts as offered, which is
+/// `Visibility::is_exported`'s own documented rule: none of the three consumers
+/// has an importing file to test a narrowing against — a completion list is
+/// offered before the import exists — and letting the reach warning correct an
+/// out-of-scope use beats hiding a name the module's author deliberately
+/// published.
+fn offered_importables<'a>(
+    importables: &'a [vilan_core::analyzer::Importable<'a>],
+) -> Vec<&'a vilan_core::analyzer::Importable<'a>> {
+    let curated = vilan_core::analyzer::module_is_curated(importables);
+    importables
+        .iter()
+        .filter(|row| !curated || row.exported.is_exported())
+        .collect()
+}
+
 fn importable_completion(importable: &vilan_core::analyzer::Importable) -> Completion {
     use vilan_core::analyzer::ImportableKind;
     let kind = match importable.kind {
@@ -3642,14 +3696,19 @@ impl OriginListing {
                 items.push(Completion::bare(namespace.clone(), CompletionKind::Module));
             }
         }
-        for importable in self
+        // E178: the surface's own names, filtered on the visibility bit under
+        // the uncurated-module exemption (see [`offered_importables`]). The
+        // MODULES above are not filtered and are not a leak: a module is a
+        // file, `export` marks items inside one, and a private `mod` is a
+        // different question (B318's open (d)).
+        let importables = self
             .surface
             .as_deref()
             .map(vilan_core::analyzer::module_importables)
-            .unwrap_or_default()
-        {
+            .unwrap_or_default();
+        for importable in offered_importables(&importables) {
             if seen.insert(importable.name.to_string()) {
-                items.push(importable_completion(&importable));
+                items.push(importable_completion(importable));
             }
         }
         items
@@ -3774,6 +3833,22 @@ impl AutoImportOrder {
                     continue;
                 };
                 let child_source = source_of.of(child_id);
+                // E178, NOT filtered here, and the reason is worth writing down
+                // where the next reader of this loop will look for it. The bit
+                // lives on `Importable`, which is a syntactic read of a module's
+                // FILE (`module_importables`), and this table is built once per
+                // ANALYSIS, on the analysis thread but OUTSIDE the scope that
+                // owns overlay loads (`document.rs` builds the index after the
+                // analysis returns). Reading every std and pkg module here
+                // therefore parses each one into the process-global,
+                // content-keyed parse cache — and for a module the user has
+                // open, that is a fresh entry per keystroke, which is exactly
+                // §7.5's session leak M9 closed. Measured: four
+                // `overlay_module_reclaim` pins go red (`ParseCleanCacheText`
+                // grew 36 and 272 bytes). The filter the other three consumers
+                // apply needs the analyzer's own `exported_entities` /
+                // `curated_modules` on `Program` to be applied here; that is a
+                // `vilan-core` surface and is filed.
                 let module = modules.len() as u32;
                 modules.push(AutoImportModule {
                     path: vec![root.to_string(), child_module.name.to_string()],
