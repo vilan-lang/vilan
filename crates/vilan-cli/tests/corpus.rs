@@ -860,3 +860,158 @@ fn eight_concurrent_runs_of_the_filesystem_program_agree_byte_for_byte() {
     );
     let _ = std::fs::remove_dir_all(&work);
 }
+
+// --- N83: what a corpus build leaves in the tree -----------------------------
+
+/// Every file a corpus build EMITS beside the sources is named by the
+/// repository's `.gitignore`.
+///
+/// The byte gate above stages the corpus into a work directory, so
+/// `--test corpus` never dirties the tree. The regeneration RITUAL does not:
+/// rebuilding a golden is `vilan build vilan/test/<program>.vl` **in place**
+/// (`AGENTS.md` §2, and the reason is that a stale binary writes wrong
+/// goldens). The three programs that reach `std::asset` write four files
+/// beside the corpus when they are built there — `.vilan-bundled`,
+/// `icons/close.svg`, `logo.<hash>.svg` and `robots.txt` — and none of them
+/// was ignored, so `git add -A` after a regeneration swept all four into the
+/// commit.
+///
+/// A test must not build in place either, so this one builds the asset
+/// programs in a staged copy, diffs the directory against the staging, and
+/// asks `git check-ignore` about the path each emitted file WOULD have under
+/// `vilan/test/`. That keeps the list honest in both directions: a new bundled
+/// asset reds until `.gitignore` names it, and an ignore line deleted reds the
+/// asset that needed it. The content hash in `logo.<hash>.svg` is exactly why
+/// the question is asked of git rather than of a list written here.
+#[test]
+fn every_asset_a_corpus_build_emits_beside_the_sources_is_gitignored() {
+    let corpus = corpus_dir();
+    let work = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "corpus_emissions_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).expect("create the emissions work dir");
+
+    // The staging the byte gate uses, minus the goldens: the programs and the
+    // resource trees they bundle from.
+    let mut asset_programs: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&corpus).expect("corpus directory") {
+        let path = entry.expect("corpus entry").path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if path.is_dir() {
+            stage_tree(&path, &work.join(name));
+            continue;
+        }
+        let Some(extension) = path.extension() else {
+            continue;
+        };
+        if extension == GOLDEN_EXTENSION || extension == "css" {
+            continue;
+        }
+        std::fs::copy(&path, work.join(name)).expect("stage a corpus file");
+        if extension == "vl"
+            && std::fs::read_to_string(&path).is_ok_and(|text| text.contains("std::asset"))
+        {
+            asset_programs.push(name.to_string());
+        }
+    }
+    asset_programs.sort();
+    assert!(
+        !asset_programs.is_empty(),
+        "no corpus program reaches `std::asset`, so this pin measures nothing"
+    );
+
+    let staged = files_under(&work);
+    for name in &asset_programs {
+        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .arg("build")
+            .arg(work.join(name))
+            .env("VILAN_STD", std_dir())
+            .output()
+            .expect("run vilan build");
+        assert!(
+            output.status.success(),
+            "{name}: build failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // What appeared, minus the compiler's own outputs for the program itself.
+    let emitted: Vec<PathBuf> = files_under(&work)
+        .into_iter()
+        .filter(|path| !staged.contains(path))
+        .filter(|path| {
+            !path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| matches!(extension, "mjs" | "js" | "css" | "json" | "map"))
+        })
+        .collect();
+    let _ = std::fs::remove_dir_all(&work);
+    assert!(
+        !emitted.is_empty(),
+        "the asset programs emitted nothing, so this pin measures nothing: \
+         {asset_programs:?}"
+    );
+
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let probe = Command::new("git")
+        .arg("check-ignore")
+        .arg("--no-index")
+        .arg("-q")
+        .arg("vilan/test/.vilan-bundled")
+        .current_dir(&repository)
+        .status();
+    let Ok(_) = probe else {
+        // No git on this host: the question cannot be asked, and a pin that
+        // cannot ask its question declines rather than fails.
+        eprintln!("no `git` on this host, so the ignore rules are not checked (N83)");
+        return;
+    };
+    let mut unignored: Vec<String> = Vec::new();
+    for relative in &emitted {
+        let in_tree = Path::new("vilan/test").join(relative);
+        let display = in_tree.to_string_lossy().replace('\\', "/");
+        let status = Command::new("git")
+            .arg("check-ignore")
+            .arg("--no-index")
+            .arg("-q")
+            .arg(&display)
+            .current_dir(&repository)
+            .status()
+            .expect("run git check-ignore");
+        if !status.success() {
+            unignored.push(display);
+        }
+    }
+    assert!(
+        unignored.is_empty(),
+        "a corpus build writes these beside the sources and `.gitignore` names \
+         none of them, so `git add -A` after a golden regeneration commits \
+         them: {unignored:#?}"
+    );
+}
+
+/// Every file under `root`, as paths relative to it.
+fn files_under(root: &Path) -> std::collections::BTreeSet<PathBuf> {
+    fn walk(root: &Path, at: &Path, into: &mut std::collections::BTreeSet<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(at) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, into);
+            } else if let Ok(relative) = path.strip_prefix(root) {
+                into.insert(relative.to_path_buf());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    walk(root, root, &mut out);
+    out
+}
