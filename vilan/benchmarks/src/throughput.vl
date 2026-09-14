@@ -1,5 +1,3 @@
-export *;
-
 // RPC round-trip throughput: sequential calls (each awaited — honest latency,
 // no pipelining) over the in-process transport and over real HTTP on
 // localhost, with the JSON and binary codecs side by side. Timings vary by
@@ -32,6 +30,8 @@ import std::shared::Shared;
 import std::time::now_millis;
 import std::wire::{ Codec, Serializer };
 import pkg::report::{ rate, round, section };
+
+export *;
 
 fun add_protocol(codec: Codec): RpcProtocol {
 	let total: Shared<i32> = Shared::new(0);

@@ -1,5 +1,3 @@
-export *;
-
 // Frames-per-mutation: the reactive-batching claims counted at the wire, over
 // an in-process duplex with a counting bridge. These counts are exact
 // invariants (CI pins them), not timings.
@@ -26,6 +24,8 @@ import std::rpc::{
 import std::shared::Shared;
 import std::wire::Serializer;
 import pkg::report::section;
+
+export *;
 
 fun run() {
 	section("coalescing (update frames counted at the wire)");
