@@ -77,6 +77,19 @@
 //! - **`Note { .. msg: .. }` sites are deliberately not rowed.** A C3 note is
 //!   recorded inside its primary's row, which is the convention every ledger
 //!   batch has used. They are enumerated only to be skipped.
+//! - **The INTERPRETER's failures are outside the walk too, and they are user
+//!   text.** The const channel refuses through `Failure` — `Failure::new` and
+//!   `Failure::unsupported` — not through `Error { .. msg: .. }`, so check (3)
+//!   has never enumerated one: `asset::emit` reached outside a `const`
+//!   expression, `check_emit_kind`'s three refusals about what a kind may
+//!   name, `asset::stage`/`staged`/`read`/`digest`/`schedule_at_end`. They are
+//!   rowed (N85, the owner's ruling: they are user-visible, so they are the
+//!   ledger's), which means check (2) holds a REWORD of each; a brand-new one
+//!   in that family still escapes check (3), exactly as the `msg:` families
+//!   above do. Widening the walk to `Failure::new`/`unsupported` is a real
+//!   option and a larger one — the family also carries the macro engine's
+//!   "not available at expansion time" limits, which are a different audience
+//!   — and it is not taken here.
 //! - **Nothing here proves a message is REACHABLE.** A row whose site is dead
 //!   code still passes check (2) as long as the literal is in the tree.
 //!

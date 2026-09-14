@@ -493,3 +493,12 @@ row	flagship	key
 461	-	`{path}` is not exported by `{module}`, and this path reaches it through the module. The spelling that says so is a marked import: `import {module}::{ #{leaf} };`, and then `{leaf}` on its own
 462	-	a closure written at this {position} would be born under `{clause}`, a `context` clause the threading cannot follow, and would capture its context at creation instead of taking one at each call: a clause is followed on a parameter, a `let` annotation, a struct field, a return type, and a generic argument the struct binds to a FIELD — not inside a `List`, a `Map`, an `Option`, a tuple or an array
 463	-	'{member}' is provided by an `impl` in module `{module}`, and {claim}: {fix}
+NEW	-	`{spelling}` outside a `const` expression
+NEW	-	`asset::stage` outside a `const` expression
+NEW	-	`asset::staged` outside a `const` expression
+NEW	-	`asset::read` outside a `const` expression
+NEW	-	`asset::digest` outside a `const` expression
+NEW	-	`asset::schedule_at_end` outside a `const` expression
+NEW	-	`{function}` kinds name one file beside the build output; `{kind}` is not one path segment — pass a bare kind like `css`
+NEW	-	`{function}` kinds name one file beside the build output, and `{kind}` collides with {collision} — pass a kind of the program's own, like `routes`
+NEW	-	`asset::emit_keyed` cannot order the `{kind}` kind: the style sidecar is ordered by the CSS cascade, not by a contribution's key — write a rule with `asset::emit`, or let `std::style` own the sheet
