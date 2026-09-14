@@ -291,7 +291,7 @@ fn within_cannot_wrap_a_breakpoint() {
     assert!(
         diagnostics
             .iter()
-            .any(|(message, _)| message.contains("nest conditions as md(within(..))")),
+            .any(|(message, _)| message.contains("nest it as md(within(..))")),
         "{diagnostics:#?}"
     );
 }
@@ -2293,7 +2293,7 @@ fn an_attribute_cannot_wrap_a_media_conditioned_style() {
     assert!(
         diagnostics
             .iter()
-            .any(|(message, _)| message.contains("nest conditions as md(attribute(..))")),
+            .any(|(message, _)| message.contains("nest it as md(attribute(..))")),
         "{diagnostics:#?}"
     );
 }
@@ -2459,17 +2459,20 @@ fn ssr_renders_attribute_conditioned_classes() {
     );
 }
 
-// --- A89: the PRESENCE form and the `not` marker (ui-styling.md, A89) ---------
-// `attribute`/`within` take `value: Option<str>`: `Some(v)` is the exact match
-// CSS spells `[name="v"]`, `None` the PRESENCE condition `[name]` — the shape a
-// boolean attribute actually has in markup, which had no spelling before and
-// pushed authors onto `child_relation` as a raw-selector escape hatch.
+// --- A89's presence form, A95's NEGATION as a value (style-conditions.md §5.2) --
+// `attribute(name)` is the PRESENCE condition `[name]` — the shape a boolean
+// attribute actually has in markup — and `attribute(name).eq(v)` the exact
+// match `[name="v"]`; the `Option<str>` the sugar still takes is A89's and is
+// deprecated for it.
 //
-// Negation is a MARKER, not a pseudo head: `not(inner)` emits nothing and marks
-// the inner's slots, and the condition IMMEDIATELY enclosing it emits its own
-// selector negated. Reading inside-out, `not` negates exactly the next
-// condition out. Three refusals fence it: an unwrapped `not`, `not(not(..))`,
-// and a negated media condition.
+// Negation was a MARKER (A89): `not(inner)` emitted nothing and marked the
+// inner's slots, and the condition immediately enclosing it negated its own
+// selector — the only reading a WRAPPER can have, since which selector is
+// negated is a fact about the condition outside it. A95 S2 retires it. A
+// condition is a value, so `.not()` is written on the value it negates and the
+// question never arises; the marker's three refusals (an unwrapped `not`, a
+// double `not`, a negated media condition) go with it, replaced by the two
+// `Condition::not` refuses at the value.
 
 #[test]
 fn an_attribute_condition_with_no_value_selects_on_presence() {
@@ -2540,12 +2543,14 @@ fn an_ancestor_guard_with_no_value_selects_on_presence() {
 /// `.sX:not([disabled]):hover` — the hover is KEPT and the attribute negated,
 /// because `not` negates the next condition OUT.
 #[test]
-fn not_under_an_attribute_negates_the_attribute_and_keeps_the_pseudo() {
+fn a_negated_attribute_condition_composes_with_a_pseudo_class() {
+    // The pair that had no spelling before A89 and no honest one before A95:
+    // hovered AND not disabled, with the negation on the condition it negates.
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style };
+        import std::style::{ style, Style, attribute, hover };
         fun s(): Style {
-            style().attribute("disabled", None, style().not(style().hover(style().opacity(0.8))))
+            style().on(attribute("disabled").not() + hover(), style().opacity(0.8))
         }
         let _s = const s();
         fun main() {}
@@ -2560,15 +2565,13 @@ fn not_under_an_attribute_negates_the_attribute_and_keeps_the_pseudo() {
     );
 }
 
-/// The other spelling: the mark sits directly under the pseudo-class, so it is
-/// the PSEUDO that is negated — `hover(not(s))` is `.sX:not(:hover)`.
 #[test]
-fn not_under_a_pseudo_class_negates_the_pseudo_class() {
+fn a_negated_pseudo_class_renders_as_not() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style };
+        import std::style::{ style, Style, hover };
         fun s(): Style {
-            style().hover(style().not(style().opacity(0.8)))
+            style().on(hover().not(), style().opacity(0.8))
         }
         let _s = const s();
         fun main() {}
@@ -2583,17 +2586,16 @@ fn not_under_a_pseudo_class_negates_the_pseudo_class() {
     );
 }
 
-/// The relation axis negates too: a guard on an ancestor that does NOT carry
-/// the theme. This is the one rule the negation moves into another cascade
-/// BAND — the line starts with ':' rather than '[' — which is recorded at
-/// `render_rule` and pinned here so the move is deliberate.
 #[test]
-fn not_under_an_ancestor_guard_negates_the_guard() {
+fn a_negated_ancestor_guard_opens_the_line_with_a_colon() {
+    // The one negation that moves a rule's cascade BAND: `:not([..]) .sX` opens
+    // with ':' where `[..] .sX` opened with '[', so it sorts among the pseudo
+    // rules instead of after them (A89's one recorded band move, unchanged).
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style };
+        import std::style::{ style, Style, attribute, within };
         fun s(): Style {
-            style().within("data-theme", Some("dark"), style().not(style().opacity(0.8)))
+            style().on(within(attribute("data-theme").eq("dark")).not(), style().opacity(0.8))
         }
         let _s = const s();
         fun main() {}
@@ -2610,20 +2612,17 @@ fn not_under_an_ancestor_guard_negates_the_guard() {
 
 /// Specificity, stated and pinned: `:not(x)` counts as its ARGUMENT, so the
 /// composed `.sX:not([disabled]):hover` is (0,3,0) — class + attribute +
-/// pseudo-class — over the plain `.sY:hover`'s (0,2,0), and the
-/// more-conditioned rule wins the cascade exactly as it does un-negated. The
-/// two rules are compared as TEXT because there is no browser in the tree: the
-/// composed line carries both an attribute selector and a pseudo-class where
-/// the plain one carries only the pseudo-class.
+/// pseudo-class — and beats the plain `.sX:hover`'s (0,2,0) on the cascade
+/// rather than on the sheet's line order.
 #[test]
 fn a_negated_attribute_rule_outranks_the_plain_pseudo_rule() {
     let assets = collected_assets(
         r#"
-        import std::style::{ style, Style };
+        import std::style::{ style, Style, attribute, hover };
         fun s(): Style {
             style()
-                .hover(style().opacity(0.9))
-                .attribute("disabled", None, style().not(style().hover(style().opacity(0.8))))
+                .on(hover(), style().opacity(0.9))
+                .on(attribute("disabled").not() + hover(), style().opacity(0.8))
         }
         let _s = const s();
         fun main() {}
@@ -2648,27 +2647,24 @@ fn a_negated_attribute_rule_outranks_the_plain_pseudo_rule() {
     assert!(!plain.contains(":not("), "{plain}");
 }
 
-/// The `css` block reaches the same rule by the name-blind nested-rule rule
-/// (css-block.md §5.3): `.not { … }` is `.not(style() … )` with no knowledge of
-/// the combinator's name anywhere in the desugar, and `.attribute(a, None) { … }`
-/// carries its arguments before the chain. Both spellings must resolve to ONE
-/// class, which is the strongest available statement that they are one rule.
+/// The `css` block reaches the same rule through the name-blind dotted head
+/// (css-block.md §5.3, §4 of style-conditions.md): `.on(<set>) { … }` lowers to
+/// `.on(<set>, style() … )` with no new lowering rule, and the constructors are
+/// ambient inside a block, so the head needs no import. Both spellings must
+/// resolve to ONE class, which is the strongest available statement that they
+/// are one rule.
 #[test]
-fn a_css_block_spells_the_negated_presence_condition() {
+fn a_css_block_head_takes_a_condition_set() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, Style };
+        import std::style::{ style, Style, attribute, hover };
         fun main() {
             let chain = const style()
-                .attribute("disabled", None, style().not(style().hover(style().raw("color", "red"))));
+                .on(attribute("disabled").not() + hover(), style().raw("color", "red"));
             let block = const css {
-                .attribute("disabled", None) {
-                    .not {
-                        .hover {
-                            color: red;
-                        }
-                    }
+                .on(attribute("disabled").not() + hover()) {
+                    color: red;
                 }
             };
             print(chain.class_list() == block.class_list());
@@ -2679,86 +2675,36 @@ fn a_css_block_spells_the_negated_presence_condition() {
     );
 }
 
-/// Refusal 1: a marked style that reaches APPLICATION. `not` emitted no rule
-/// for it — it never knew which selector to negate — so its class would name
-/// nothing on the sheet and the element would silently get the UN-negated
-/// declaration instead. Application is runtime-legal code (`styled`,
-/// `bind_styled` and the element syntax all render through `class_list`), so
-/// this one refusal is a runtime failure where the other two are build errors.
+/// The marker is GONE, and a program written against it stops compiling rather
+/// than meaning something else. `Style::not` was the only method that emitted
+/// nothing, and its whole estate is the codemod this slice carries.
 #[test]
-fn an_unwrapped_not_is_refused_at_application() {
-    assert_run_panics(
-        r#"
-        import std::style::{ style, Style };
-        fun main() {
-            let bad = const style().not(style().opacity(0.5));
-            let _classes = bad.class_list();
-        }
-        main();
-        "#,
-        "unwrapped not(..)",
-    );
-}
-
-/// Refusal 2: a double negation is said, not cancelled.
-#[test]
-fn a_double_not_fails_the_build() {
-    let diagnostics = failure_diagnostics(
+fn the_not_marker_is_retired() {
+    assert_fails(
         r#"
         import std::style::{ style, Style };
         fun s(): Style {
-            style().hover(style().not(style().not(style().opacity(0.5))))
+            style().not(style().opacity(0.5))
         }
         let _s = const s();
         fun main() {}
         main();
         "#,
     );
-    assert!(
-        diagnostics
-            .iter()
-            .any(|(message, _)| message.contains("not(not(..))")),
-        "{diagnostics:#?}"
+}
+
+/// A double negation is said, not cancelled — the marker's refusal, restated on
+/// the value.
+#[test]
+fn a_double_negation_on_a_condition_fails_the_build() {
+    assert_fails_with(
+        &conditioned(r#"style().on(hover().not().not(), style().color(Color::gray(50)))"#),
+        "a double negation is a spelling mistake",
     );
 }
 
-/// Refusal 3, both spellings of it: `@media not (..)` is its own grammar and no
-/// ruling has reached it, so a breakpoint may neither wrap a marked style nor
-/// be wrapped by one.
-#[test]
-fn a_negated_media_condition_fails_the_build() {
-    for program in [
-        r#"
-        import std::style::{ style, Style };
-        fun s(): Style {
-            style().md(style().not(style().opacity(0.5)))
-        }
-        let _s = const s();
-        fun main() {}
-        main();
-        "#,
-        r#"
-        import std::style::{ style, Style };
-        fun s(): Style {
-            style().not(style().md(style().opacity(0.5)))
-        }
-        let _s = const s();
-        fun main() {}
-        main();
-        "#,
-    ] {
-        let diagnostics = failure_diagnostics(program);
-        assert!(
-            diagnostics
-                .iter()
-                .any(|(message, _)| message.contains("a media condition cannot be negated")),
-            "{diagnostics:#?}"
-        );
-    }
-}
-
-/// The marker's grammar fence: a leading `!` on a condition token IS the
-/// negation, so `pseudo`'s free-form name may not forge one.
+/// The marker's grammar fence, still live: a leading `!` on a condition token IS
+/// the negation, so `pseudo`'s free-form name may not forge one.
 #[test]
 fn a_pseudo_class_name_cannot_forge_the_negation_marker() {
     let diagnostics = failure_diagnostics(
@@ -2780,19 +2726,19 @@ fn a_pseudo_class_name_cannot_forge_the_negation_marker() {
     );
 }
 
-/// A negated slot is its OWN slot: `[disabled]` and `:not([disabled])` are two
-/// conditions on one property, so they coexist rather than overwrite — the same
-/// rule two values of one attribute already follow.
+/// A negated condition is its OWN slot: `[disabled]` and `:not([disabled])` are
+/// two conditions on one property, so they coexist rather than overwrite — the
+/// same rule two values of one attribute already follow.
 #[test]
 fn a_negated_condition_is_its_own_slot() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::style::{ style, Style };
+        import std::style::{ style, Style, attribute };
         fun main() {
             let both = const style()
-                .attribute("disabled", None, style().opacity(0.5))
-                .attribute("disabled", None, style().not(style().opacity(1.0)));
+                .on(attribute("disabled"), style().opacity(0.5))
+                .on(attribute("disabled").not(), style().opacity(1.0));
             print(both.class_list().split(" ").len());
         }
         main();
@@ -2801,11 +2747,12 @@ fn a_negated_condition_is_its_own_slot() {
     );
 }
 
-/// `child_relation`'s refusal gains A89's steer: the reason kolt reached for
-/// `child_relation` as a raw-selector hatch was that a state on the element
-/// ITSELF had no spelling, and now it does.
+/// The child relation's refusal steers twice: to `attribute(..)` for a state on
+/// the element ITSELF (the want that drove kolt onto the deleted
+/// `child_relation` raw-selector hatch), and to the SET for a condition that
+/// belongs BESIDE the relation rather than under it.
 #[test]
-fn a_child_relation_steers_a_conditioned_inner_to_attribute() {
+fn a_child_relation_steers_a_conditioned_inner_to_attribute_and_to_the_set() {
     let diagnostics = failure_diagnostics(
         r#"
         import std::style::{ style, Style };
@@ -2821,6 +2768,12 @@ fn a_child_relation_steers_a_conditioned_inner_to_attribute() {
         diagnostics
             .iter()
             .any(|(message, _)| message.contains("for a state on the element ITSELF")),
+        "{diagnostics:#?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|(message, _)| message.contains(".on(attribute(name) + children(), ..)")),
         "{diagnostics:#?}"
     );
 }
@@ -3025,6 +2978,11 @@ fn a_within_rule_sorts_after_the_pseudo_band() {
 /// UNCONDITIONED inner (a pseudo or attribute under it would bind to the
 /// child's compound — unruled semantics), cannot wrap a breakpoint, and no
 /// relation wraps a relation.
+///
+/// They are the SUGAR's fences and A95 S2 KEEPS them (R1): deleting a refusal
+/// makes a formerly refused program compile with nothing to steer to, and the
+/// sugar is still a documented surface. What changed is the steer — every one
+/// of them now also names the SET, which has no nesting order to get wrong.
 #[test]
 fn a_child_relation_takes_an_unconditioned_style() {
     let diagnostics = failure_diagnostics(
@@ -3083,7 +3041,7 @@ fn a_child_relation_cannot_wrap_a_breakpoint() {
     assert!(
         diagnostics
             .iter()
-            .any(|(message, _)| message.contains("nest conditions as md(children(..))")),
+            .any(|(message, _)| message.contains("nest it as md(children(..))")),
         "{diagnostics:#?}"
     );
 }
@@ -6585,9 +6543,7 @@ fn b311_the_miscompiles_own_exhibit_is_spelled_as_two_condition_values() {
         assets.iter().any(|(kind, line)| {
             kind == "css"
                 && line.starts_with(".s")
-                && line.ends_with(
-                    "[data-open=\"true\"]:not(:active):hover{opacity:0.5}"
-                )
+                && line.ends_with("[data-open=\"true\"]:not(:active):hover{opacity:0.5}")
         }),
         "{assets:?}"
     );
@@ -6653,19 +6609,22 @@ fn b322_a_breakpoint_width_and_a_written_property_are_fenced_against_the_separat
     }
 }
 
-// --- A93: `child_relation`'s token is `children`'s and `divide`'s ---------------
-// The method is reachable from outside std only because the language has no
-// visibility yet (B318), and its token went into the slot key unexamined — so
-// a token that is neither `>*` nor `>*+*` landed in the PSEUDO slot, skipped
-// the `@layer vilan` wrap and the `> *` suffix, and rendered a rule about the
-// element ITSELF from a child-relation method. A89 gave what it was reached for
-// a real spelling, so the hatch closes.
+// --- A93: `child_relation` is DELETED -------------------------------------------
+// The method was `children`'s and `divide`'s shared chokepoint, and it was
+// reachable from outside std only because the language had no visibility yet.
+// Its token went into the slot key unexamined, so a token that was neither `>*`
+// nor `>*+*` landed in the PSEUDO slot, skipped the `@layer vilan` wrap and the
+// `> *` suffix, and rendered a rule about the ELEMENT from a method whose whole
+// subject is that element's children — a raw-selector hatch, not a relation.
+// Order 33 fenced the token to the two shipped relations; A95 S2 deletes the
+// method, because `children()` and `divide()` are condition VALUES now and the
+// two callers pass no token at all.
 
 #[test]
-fn a93_a_child_relation_token_outside_the_two_relations_is_refused() {
-    // kolt's `views.vl` site, which rendered `.sX:not([hidden])` — a rule about
-    // the element, from a method whose whole subject is its children.
-    let diagnostics = failure_diagnostics(
+fn a93_the_child_relation_hatch_is_gone() {
+    // kolt's own token, the exhibit the fence was built on. It no longer names
+    // a method, so the hatch cannot be reached to be fenced.
+    assert_fails(
         r#"
         import std::style::{ style, Style };
         fun s(): Style {
@@ -6676,25 +6635,14 @@ fn a93_a_child_relation_token_outside_the_two_relations_is_refused() {
         main();
         "#,
     );
-    let refusal = diagnostics
-        .iter()
-        .map(|(message, _)| message.as_str())
-        .find(|message| message.contains("child_relation takes one of the two shipped relations"))
-        .unwrap_or_else(|| panic!("{diagnostics:#?}"));
-    assert!(refusal.contains("not([hidden])"), "{refusal}");
-    assert!(refusal.contains("attribute(name, value, ..)"), "{refusal}");
-    assert!(
-        refusal.contains("not(..) inside the condition it negates"),
-        "{refusal}"
-    );
 }
 
 #[test]
 fn a93_the_two_shipped_relations_are_the_controls() {
-    // Non-vacuity, beside the refusal: both legitimate tokens still reach the
-    // sheet with their own rendering — `children` the bare `> *`, `divide` the
-    // `:not(:first-child)` refinement — so the fence rejects the hatch and
-    // nothing else.
+    // Non-vacuity, beside the deletion: both relations still reach the sheet
+    // with their own rendering — `children` the bare `> *`, `divide` the
+    // `:not(:first-child)` refinement — through the condition values that
+    // replaced the token.
     let assets = collected_assets(
         r#"
         import std::style::{ style, space, Style };
@@ -7208,15 +7156,65 @@ fn not_and_eq_refuse_a_set_rather_than_guessing_which_condition_they_mean() {
 }
 
 #[test]
-fn an_ancestor_guard_takes_an_attribute_condition_in_this_version() {
-    // The ruling is that `within` takes a CONDITION, and it does — but the
-    // guard's selector travels inside the slot key, so a pseudo-class in it
-    // would carry the key's own separator. Refused naming the reason and the
-    // form that works.
-    assert_fails_with(
-        &conditioned(r#"style().on(within(hover()), style().color(Color::gray(50)))"#),
-        "guards on an ancestor's ATTRIBUTE in this version",
+fn an_ancestor_guard_takes_any_condition_that_selects_an_element() {
+    // S1 refused every non-attribute guard: the guard travelled inside the slot
+    // key as its RENDERED selector, so `^:hover` carried the key's own
+    // separator. A95 S2 stores the inner TOKEN instead (`^hover`) and renders
+    // it at `render_rule` through the same per-axis rendering every other token
+    // gets, so the ruling's own example lands.
+    let hovered = style_rules(&conditioned(
+        r#"style().on(within(hover()), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(
+        hovered,
+        vec![":hover .s1a8ssfc{color:var(--gray-50)}".to_string()],
+        "{hovered:?}"
     );
+    // The presence form of the ruling's other example, and the negated guard
+    // beside it — the negation still wraps the ancestor's whole selector.
+    let present = style_rules(&conditioned(
+        r#"style().on(within(attribute("open")), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(
+        present,
+        vec!["[open] .s14u69pq{color:var(--gray-50)}".to_string()],
+        "{present:?}"
+    );
+    let negated = style_rules(&conditioned(
+        r#"style().on(within(hover()).not(), style().color(Color::gray(50)))"#,
+    ));
+    assert_eq!(
+        negated,
+        vec![":not(:hover) .sef5r0p{color:var(--gray-50)}".to_string()],
+        "{negated:?}"
+    );
+}
+
+#[test]
+fn an_ancestor_guard_refuses_a_condition_that_selects_no_element() {
+    // A guard holds a condition an ANCESTOR can match. The other four axes are
+    // not element selectors at all, and each refusal names where its condition
+    // belongs instead — beside the guard in the set, or nowhere.
+    for (written, needle) in [
+        (
+            r#"style().on(within(md()), style().color(Color::gray(50)))"#,
+            "was given a breakpoint",
+        ),
+        (
+            r#"style().on(within(within(attribute("open"))), style().color(Color::gray(50)))"#,
+            "was given another guard",
+        ),
+        (
+            r#"style().on(within(children()), style().color(Color::gray(50)))"#,
+            "was given a child relation",
+        ),
+        (
+            r#"style().on(within(element("selection")), style().color(Color::gray(50)))"#,
+            "was given a pseudo-element",
+        ),
+    ] {
+        assert_fails_with(&conditioned(written), needle);
+    }
 }
 
 #[test]

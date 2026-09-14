@@ -6,10 +6,13 @@ import std::style::{
 	Length,
 	RadialExtent,
 	Style,
+	attribute,
 	declarations,
 	declare,
+	hover,
 	space,
 	style,
+	within,
 };
 
 // Typed atomic styles (proposal/ui-styling.md): construction inside `const`
@@ -157,19 +160,19 @@ fun main() {
 		.attribute("data-open", Some("true"), style().hover(style().background(Color::gray(100))));
 	print(disclosed.class_list());
 
-	// A89: the PRESENCE form and the negation MARKER. `None` renders `[name]`
-	// — the shape a boolean attribute actually has in markup — and `not(..)`
-	// emits nothing itself: the condition immediately OUTSIDE it emits its own
-	// selector negated, so `attribute(.., None, not(hover(..)))` keeps the
-	// hover and negates the attribute. The golden pins the four selectors in
+	// A89's presence form and A95's NEGATION. `attribute(name)` is the presence
+	// condition — the shape a boolean attribute actually has in markup — and
+	// `.not()` is written on the condition it negates, which is what makes
+	// `attribute("disabled").not() + hover()` say "hovered AND not disabled"
+	// with nothing to reason about. The golden pins the four selectors in
 	// bytes, the negated ancestor guard among them — the one negation that
 	// moves a rule out of the `[` cascade band into the `:` one.
 	let gated = const style()
-		.within("data-theme", Some("dark"), style().not(style().background(Color::gray(900))))
-		.within("data-collapsed", None, style().display(Display::Hidden))
-		.attribute("data-selected", None, style().color(Color::gray(50)))
-		.attribute("disabled", None, style().not(style().hover(style().background(Color::gray(100)))))
-		.hover(style().not(style().color(Color::gray(700))));
+		.on(within(attribute("data-theme").eq("dark")).not(), style().background(Color::gray(900)))
+		.on(within(attribute("data-collapsed")), style().display(Display::Hidden))
+		.on(attribute("data-selected"), style().color(Color::gray(50)))
+		.on(attribute("disabled").not() + hover(), style().background(Color::gray(100)))
+		.on(hover().not(), style().color(Color::gray(700)));
 	print(gated.class_list());
 
 	// The child-side relations (ui-styling.md §0bis.6): children and divide

@@ -448,14 +448,10 @@ row	flagship	key
 416	-	parameter `{parameter_name}` of `[rpc]` method `{method_name}` starts with `__`, which the `[service]` expansion reserves for its own bindings
 417	-	`[rpc]` method `{method_name}` is declared `async` and takes `&mut self`, and the two cannot both hold
 418	-	`[service]` needs std's `rpc.vl`, and the std this package resolves to does not carry one
-419	-	this style carries an unwrapped not(..): `not` marks the condition immediately outside it and emits no rule of its own, so wrap it before applying the style — attribute(name, value, not(..)), within(name, value, not(..)), hover(not(..))
-420	-	not(not(..)) — a double negation is a spelling mistake rather than a cancellation: drop both, or negate the condition you meant
-421	-	a media condition cannot be negated in this version — `not` negates the condition immediately outside it, and `@media not (..)` is a grammar of its own; negate the relation, attribute or pseudo-class INSIDE the breakpoint instead
-422	-	a pseudo-class name cannot start with {...} — a leading {...} is the condition grammar's negation marker; write not(..) inside the condition you want negated
+422	-	a pseudo-class name cannot start with {...} — a leading {...} is the condition grammar's negation marker; write `.not()` on the condition you want negated (pseudo("focus-visible").not())
 423	-	a custom property is written with its dashes — var("--button-color"), not var("{name}")
 424	-	a custom property name cannot contain {...} — the name is one token, like --button-color
 425	-	cannot find type '{name}'; this `impl`'s subject is the trait `{trait_name}` itself, so it is written for EVERY type that implements it — and that type has no name here. Say `Self`, or name it in the head: `impl type {name}: {trait_name}<..>`
-427	-	child_relation takes one of the two shipped relations — >* (children) or >*+* (divide) — and got {...}: it is those two methods' shared chokepoint, not a raw-selector hatch. A condition on the element ITSELF is attribute(name, value, ..) or within(name, value, ..), and a negated one is not(..) inside the condition it negates.
 428	-	`[rpc]` method `{method_name}` takes a name the `[service]` expansion generates on `{owner}`
 429	-	`[rpc]` method `{method_name}` returns a keyed handle whose key `{rendered}` is {missing}: the client names the key in every keyed `Subscribe`, each `Delta` the channel forwards carries it, and the mirror indexes by it
 430	-	'{member_name}' is declared by two blanket impls whose bounds OVERLAP{elsewhere}: a type satisfying both clauses matches both impls, and an inherent member is taken from the first matching impl without ranking. Narrow one bound so the two are disjoint, or declare '{member_name}' on a trait
@@ -473,7 +469,6 @@ row	flagship	key
 442	-	a condition set holds ONE child relation, and this one holds {...} and {...} — divide() is children() minus the first child, so the two can never agree about that child; pick the one you mean
 443	-	a condition set holds ONE pseudo-element, and this one holds {...} and {...} — a compound selector admits one, always last, with nothing after it
 444	-	within(..) guards on ONE condition and was given a set — an ancestor carrying several conditions is a selector this version does not spell; guard on the one that identifies the ancestor
-445	-	within(..) guards on an ancestor's ATTRIBUTE in this version and was given {...} — the ancestor's selector travels inside the slot key, where a ':' mis-aligns every split of it (B311), so a pseudo-class or a relation cannot ride there yet; write within(attribute(name)) or within(attribute(name).eq(value))
 446	-	`.not()` negates ONE condition and this set holds {...} — negate each one where it is written (hover().not() + active()), which is the whole point of a condition being a value
 447	-	a breakpoint cannot be negated in this version — `@media not (..)` is a grammar of its own and no ruling has reached it; negate the relation, attribute or pseudo-class INSIDE the breakpoint instead
 448	-	a pseudo-element cannot be negated — `:not(::selection)` is not a selector CSS admits; negate a condition that selects the ELEMENT instead
@@ -481,7 +476,6 @@ row	flagship	key
 450	-	`.eq(..)` gives ONE attribute condition its value and this set holds {...} — write it on the attribute (attribute(name).eq(value) + hover()), not on the set
 451	-	`.eq(..)` gives an ATTRIBUTE condition its exact value and this condition is {...} — a pseudo-class, a relation or a breakpoint has no value to match; attribute(name).eq(value) is the form
 452	-	this attribute condition already carries a value ({...}) — `.eq(..)` narrows PRESENCE to one value, so write attribute(name).eq(value) once
-453	-	not(..) negates the condition immediately outside it, and this one carries {...} conditions — which of them is negated is not decided by anything; negate the condition itself with `.not()`
 454	-	an `import`/`use` path is `::`-separated NAMES, ending in a name or a `{ a, b }` set, with an optional `as` alias on the leaf — `import pkg::a::{ b, c as d };` — and this token begins none of those
 455	-	`export` takes an ITEM — a `fun`, `struct`, `enum`, `trait`, `impl`, `mod`, a module-level `let`, or an `import`/`use` to re-export (`export import pkg::io::print;`) — plus `*;` for the whole module and a `(in PATH)` scope before any of them (`export(in pkg) fun f()`): an expression is none of those, and publishes nothing, checks nothing and emits nothing
 456	-	`{type}` {position}. `{item}` is exported, but `{type}` is not. A consumer can {verb} `{item}` but cannot name {noun}.
@@ -496,3 +490,7 @@ NEW	-	a pseudo-class name cannot contain ':' (got {...}) — one value is one ps
 NEW	-	this style's slot key is not one media:condition:property triple (got {...}) — every field that reaches a key is fenced against ':' where it is written, so a key holding another one means a condition token was minted carrying the key's own separator; that is the bug, not this read
 NEW	-	a breakpoint's min-width cannot contain ':' (got {...}) — it is the slot key's own field separator, and a width is a CSS length (media("768px"), or the named sm/md/lg/xl)
 NEW	-	a declaration's property cannot contain '{...}' (got {...}) — it separates the property from its value and from the next declaration; pass the value as the second argument
+NEW	-	within(..) guards on an ANCESTOR and was given a breakpoint — a media query conditions the viewport, not an element, so it belongs beside the guard in the set rather than inside it: .on(md() + within(attribute(name)), ..)
+NEW	-	within(..) guards on ONE ancestor and was given another guard — a grandparent chain is a selector this version does not spell; guard on the ancestor that identifies the state
+NEW	-	within(..) guards on an ancestor's own condition and was given a child relation — children() and divide() say where a rule REACHES, not what an ancestor matches, so they belong beside the guard in the set: .on(within(attribute(name)) + children(), ..)
+NEW	-	within(..) guards on an ancestor and was given a pseudo-element — `::selection` is a piece of a box CSS paints, never an element something can be inside of; guard on an attribute or a pseudo-class

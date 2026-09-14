@@ -525,12 +525,11 @@ fn a_delegating_condition_is_recorded_on_the_axis_it_delegates_to() {
             continue;
         };
         // `hover` is `self.pseudo("hover", inner)`; `md` is
-        // `self.media("48rem", inner)`; `children` is
-        // `self.child_relation(">*", "children", inner)`. A condition whose
-        // WHOLE body is one such call must carry the axis of what it delegates
-        // to. The primitives have real bodies, so the single-statement test is
-        // what separates a delegation from a special case; their own axes are
-        // pinned by the order pins in `formatter.rs`.
+        // `self.media("48rem", inner)`. A condition whose WHOLE body is one
+        // such call must carry the axis of what it delegates to. The primitives
+        // have real bodies, so the single-statement test is what separates a
+        // delegation from a special case; their own axes are pinned by the
+        // order pins in `formatter.rs`.
         let statements: Vec<&String> = body
             .iter()
             .filter(|line| {
@@ -545,7 +544,6 @@ fn a_delegating_condition_is_recorded_on_the_axis_it_delegates_to() {
             ("pseudo", ConditionAxis::Pseudo),
             ("media", ConditionAxis::Media),
             ("within", ConditionAxis::Relation),
-            ("child_relation", ConditionAxis::Relation),
             ("attribute", ConditionAxis::Attribute),
         ] {
             if name != delegate
