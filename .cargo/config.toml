@@ -1,0 +1,12 @@
+# The test threads' stack. libtest runs every #[test] on a 2 MiB thread, and
+# the analyzer's expression walk (`walk_expr_node_inner`, one frame per level
+# of nesting) overflowed that on Windows at nine levels — a module-cycle pin,
+# `b250_a_declared_leg_with_no_manifest_is_unchanged`, aborted the Windows
+# shard at Order 36's seal (0xc00000fd) while Linux passed at 2 MiB and
+# failed at 1 MiB. The binaries are unaffected: `vilan` runs the compiler on a
+# COMPILER_STACK_SIZE thread (128 MiB) and the language server on 128–256 MiB
+# threads. cargo and nextest both hand this table to the test processes, so
+# the suite runs on 8 MiB threads everywhere, CI included. A value written by
+# the shell still wins (no `force`).
+[env]
+RUST_MIN_STACK = "8388608"
