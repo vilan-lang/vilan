@@ -318,7 +318,7 @@ struct JsonWriter {
 	variant_arities: Shared<List<i32>>,
 }
 
-impl JsonWriter {
+export impl JsonWriter {
 	fun new(): JsonWriter {
 		JsonWriter {
 			out = Shared::new(""),
@@ -385,7 +385,7 @@ impl JsonWriter {
 
 // The visitor's write half, natively — `describe` monomorphizes straight onto
 // these methods on the direct path.
-impl JsonWriter with Serialize {
+export impl JsonWriter with Serialize {
 	fun begin_struct(self, fields: i32) {
 		self.open("{");
 	}
@@ -485,7 +485,7 @@ struct JsonReader {
 	error: Shared<Option<str>>,
 }
 
-impl JsonReader {
+export impl JsonReader {
 	fun new(root: JsonValue): JsonReader {
 		let stack: Shared<List<JsonValue>> = Shared::new([]);
 		stack.write().push(root);
@@ -561,7 +561,7 @@ impl JsonReader {
 }
 
 // The visitor's read half, natively.
-impl JsonReader with Deserialize {
+export impl JsonReader with Deserialize {
 	fun begin_struct(self) {}
 
 	fun field(self, name: str) {

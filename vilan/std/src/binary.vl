@@ -180,7 +180,7 @@ struct BinaryReader {
 	error: Shared<Option<str>>,
 }
 
-impl BinaryReader {
+export impl BinaryReader {
 	fun new(bytes: Bytes): BinaryReader {
 		BinaryReader { bytes, cursor = Shared::new(0), error = Shared::new(None) }
 	}
@@ -310,7 +310,7 @@ impl BinaryReader {
 // `begin_variant` is a no-op — the mirror of the write side, where
 // `begin_variant` writes it); `is_null` peeks the Option marker and consumes
 // it only for `Some`, leaving `None`'s `0x00` for `null_value`.
-impl BinaryReader with Deserialize {
+export impl BinaryReader with Deserialize {
 	fun begin_struct(self) {}
 
 	fun field(self, name: str) {}
