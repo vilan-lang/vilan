@@ -667,6 +667,9 @@ fn free_condition_constructors(source: &str) -> BTreeMap<String, Vec<String>> {
     let mut constructors = BTreeMap::new();
     let mut current: Option<(String, Vec<String>)> = None;
     for line in source.lines() {
+        // sweep-36 (B318 S6): a prelude constructor is `export fun …` now; the
+        // marker is not the name.
+        let line = strip_visibility_marker(line);
         if line.starts_with("fun ") && line.ends_with("): Condition {") {
             if let Some((name, body)) = current.take() {
                 constructors.insert(name, body);
