@@ -12938,6 +12938,18 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// [`completion_items_at_cursor`] with an explicit cursor marker, for the
+    /// same reason [`completions_at_marker`] has one (E69's head pins sit
+    /// beside closure literals).
+    fn completion_items_at_marker(src: &str, marker: char) -> Vec<Completion> {
+        let offset = src
+            .find(marker)
+            .unwrap_or_else(|| panic!("test source needs a `{marker}` cursor marker"));
+        let text = src.replace(marker, "");
+        let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
+        document.completion(offset)
+    }
+
     /// The full completion candidates offered at the `|` cursor in `src` —
     /// carrying `detail`, `documentation`, and `call_parameters` (WO-3).
     fn completion_items_at_cursor(src: &str) -> Vec<Completion> {
@@ -14010,6 +14022,173 @@ pub(crate) mod tests {
         assert!(
             labels.contains(&"caption".to_string()),
             "the binding in scope: {labels:?}"
+        );
+    }
+
+    // --- E69: the attribute NAMES in an undotted head ------------------------
+    //
+    // E67 left this position without a vocabulary and said exactly why: a hand
+    // list "would be a second source of truth with nothing to gate it". The
+    // owner's 2026-09-14 ruling is the answer to that sentence — GENERATED from
+    // the WHATWG HTML attribute index and the SVG 2 one, vendored as
+    // `crates/vilan-ide/src/html-attributes.tsv` and held to it OFFLINE by
+    // `vilan-ide`'s own `html_attributes_sync` gate. The pins below are about
+    // what reaches the popup; that the table is the spec's is that gate's job,
+    // and it is the one that goes red when the extract is refreshed and the
+    // table is not.
+
+    // The item's own exhibit: `<input |>` offers the input's attributes.
+    #[test]
+    fn element_head_offers_the_tags_own_attributes() {
+        let labels = element_head_completions("\t<input ~/>\n");
+        for attribute in ["type", "disabled", "value", "placeholder", "required"] {
+            assert!(
+                labels.contains(&attribute.to_string()),
+                "`{attribute}` is an `input` attribute: {labels:?}"
+            );
+        }
+    }
+
+    // …and the globals every element takes, beside them.
+    #[test]
+    fn element_head_offers_the_global_attributes() {
+        let labels = element_head_completions("\t<input ~/>\n");
+        for attribute in ["class", "id", "hidden", "title", "tabindex"] {
+            assert!(
+                labels.contains(&attribute.to_string()),
+                "`{attribute}` is a global attribute: {labels:?}"
+            );
+        }
+        // A tag with no own attributes at all still gets them — the globals
+        // are what EVERY element takes.
+        let plain = element_head_completions("\t<div ~></div>\n");
+        assert!(
+            plain.contains(&"class".to_string()) && plain.contains(&"id".to_string()),
+            "a `div` takes the globals: {plain:?}"
+        );
+        // …and an `input`'s own names are not poured over it.
+        assert!(
+            !plain.contains(&"placeholder".to_string()),
+            "`placeholder` is not a `div` attribute: {plain:?}"
+        );
+    }
+
+    // The SVG half of the ruling, and lucide's own shape: `<svg |>` offers
+    // `viewBox` (the per-element index) and the presentation attributes the
+    // SVG namespace gives every element (`fill`, `stroke-width`).
+    #[test]
+    fn element_head_offers_the_svg_vocabulary() {
+        let labels = element_head_completions("\t<svg ~></svg>\n");
+        for attribute in [
+            "viewBox",
+            "fill",
+            "stroke",
+            "stroke-width",
+            "stroke-linecap",
+        ] {
+            assert!(
+                labels.contains(&attribute.to_string()),
+                "`{attribute}` is SVG's: {labels:?}"
+            );
+        }
+        // The presentation attributes belong to the SVG namespace, not to
+        // every tag: `a` and `title` are in BOTH indices and are written as
+        // the HTML elements they are.
+        let html = element_head_completions("\t<a ~></a>\n");
+        assert!(
+            html.contains(&"href".to_string()),
+            "`a` keeps its own: {html:?}"
+        );
+        assert!(
+            !html.contains(&"stroke-width".to_string()),
+            "SVG's presentation attributes are not poured over an HTML `a`: {html:?}"
+        );
+    }
+
+    // The event form: `on:` still offers the grammar's own template, and now
+    // the `GlobalEventHandlers` names with it, in vilan's `on:event` spelling
+    // (the content attribute is `onclick`; the table drops the `on`).
+    #[test]
+    fn element_head_offers_the_event_names() {
+        let labels = element_head_completions("\t<button ~></button>\n");
+        assert!(
+            labels.contains(&"on:".to_string()),
+            "the bare template survives — a custom event is still a legal head item: {labels:?}"
+        );
+        for event in ["on:click", "on:input", "on:submit", "on:keydown"] {
+            assert!(
+                labels.contains(&event.to_string()),
+                "`{event}` is a GlobalEventHandlers name: {labels:?}"
+            );
+        }
+        // The CONTENT attribute spelling is not offered as an attribute — it
+        // would be a second, wrong way to write the same thing.
+        assert!(
+            !labels.contains(&"onclick".to_string()),
+            "`onclick` is spelled `on:click` here: {labels:?}"
+        );
+    }
+
+    // Accepting an attribute inserts its call shape, one value — the head's
+    // own grammar (`parse_element_head_item` refuses a second).
+    #[test]
+    fn an_attribute_candidate_inserts_one_value() {
+        let items = completion_items_at_marker(
+            &format!("{ELEMENT_HEAD_PRELUDE}fun main() {{\n\t<input ~/>\n}}\n"),
+            '~',
+        );
+        let attribute = items
+            .iter()
+            .find(|completion| completion.label == "type")
+            .expect("`type` offered");
+        assert_eq!(attribute.kind, CompletionKind::Field);
+        assert_eq!(
+            attribute.call_parameters.as_deref(),
+            Some(["value".to_string()].as_slice()),
+            "an attribute takes exactly one value"
+        );
+    }
+
+    // The DOTTED position is the chain's, and the attribute vocabulary has no
+    // place in it: `<div .|>` commits the head item to a `View` method.
+    #[test]
+    fn a_chain_position_offers_no_attribute_names() {
+        let labels = element_head_completions("\t<input .~/>\n");
+        assert!(
+            labels.contains(&"bind_text".to_string()),
+            "still the View's methods: {labels:?}"
+        );
+        // Names that are ONLY attributes — `class`, `autofocus` and `show` are
+        // `View` methods too, and a dotted `.class(…)` is exactly right.
+        for absent in ["type", "placeholder", "viewBox", "on:", "on:click"] {
+            assert!(
+                !labels.contains(&absent.to_string()),
+                "`{absent}` is not a chain link: {labels:?}"
+            );
+        }
+    }
+
+    // The table is an OFFER, never a vocabulary: the desugar stays name-blind
+    // (element-syntax.md §2, §9 item 3), so a name no index ever heard of is
+    // written, lowered and analyzed exactly as before. This is the half of
+    // E69's ruling that says what did NOT change.
+    #[test]
+    fn an_unknown_attribute_name_is_never_refused() {
+        let source = "import std::ui::view;\nimport std::io::print;\n\
+             fun main() {\n\t\
+             let card = <div data-tip(\"hello\") aria-nonesuch(\"x\") wibble(\"y\")></div>;\n\t\
+             print(\"built\");\n\t\
+             let _ = card;\n\
+             }\n";
+        let document = Document::analyze(source, &std_root(), Path::new("test.vl"));
+        let messages: Vec<String> = document
+            .diagnostics
+            .iter()
+            .map(|error| error.msg.clone())
+            .collect();
+        assert!(
+            messages.is_empty(),
+            "an attribute name outside the table is still a name: {messages:?}"
         );
     }
 

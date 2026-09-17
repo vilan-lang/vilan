@@ -668,34 +668,36 @@ fn innermost_open_tag_end(
     node: &vilan_core::Spanned<vilan_core::node::Node<'_>>,
     offset: usize,
     source: &str,
-    best: &mut Option<(usize, usize)>,
+    best: &mut Option<(usize, std::ops::Range<usize>)>,
 ) {
     use vilan_core::node::Node;
     let span = node.1.into_range();
     if span.start <= offset && offset <= span.end {
-        let tag_end = match &node.0 {
+        let tag = match &node.0 {
             // A fragment (A46) has no head at all, so nothing completes
             // inside `<>` — `None`, not a zero-width head.
-            Node::Element(body) => body.tag.map(|tag| tag.end),
-            Node::Error => error_tag_name_end(source, span.start, span.end),
+            Node::Element(body) => body.tag.map(|tag| tag.start..tag.end),
+            Node::Error => error_tag_name_range(source, span.start, span.end),
             _ => None,
         };
-        if let Some(tag_end) = tag_end
-            && tag_end <= offset
-            && best.is_none_or(|(width, _)| span.end - span.start <= width)
+        if let Some(tag) = tag
+            && tag.end <= offset
+            && best
+                .as_ref()
+                .is_none_or(|(width, _)| span.end - span.start <= *width)
         {
-            *best = Some((span.end - span.start, tag_end));
+            *best = Some((span.end - span.start, tag));
         }
     }
     node.0
         .for_each_child(&mut |child| innermost_open_tag_end(child, offset, source, best));
 }
 
-/// The end of the tag name in an error node the element recovery produced —
+/// The tag name's byte range in an error node the element recovery produced —
 /// `<` immediately followed by a name, the whole run closed by `>`. `None`
 /// for any other error node, so a failed expression is never mistaken for
 /// markup.
-fn error_tag_name_end(source: &str, start: usize, end: usize) -> Option<usize> {
+fn error_tag_name_range(source: &str, start: usize, end: usize) -> Option<std::ops::Range<usize>> {
     let slice = source.get(start..end)?;
     if !slice.starts_with('<') || !slice.ends_with('>') {
         return None;
@@ -704,7 +706,7 @@ fn error_tag_name_end(source: &str, start: usize, end: usize) -> Option<usize> {
         .bytes()
         .take_while(|byte| is_identifier_byte(*byte) || *byte == b'-')
         .count();
-    (name > 0).then_some(start + 1 + name)
+    (name > 0).then_some(start + 1..start + 1 + name)
 }
 
 /// The candidates for one of §7.1's four positions in a `css` body.
@@ -762,13 +764,94 @@ fn css_block_completions(position: CssPosition) -> Vec<Completion> {
     }
 }
 
+/// The ATTRIBUTE names offered undotted in `<tag |>` (E69): the tag's own,
+/// then the globals every element takes, then — for an SVG-shaped tag — the
+/// presentation attributes the SVG index gives the whole namespace.
+///
+/// The tag's own names come first because they are the ones the tag is FOR;
+/// the client sorts by label within its own filter, but the playground ranks
+/// by the order it is handed (`vilan-wasm`'s `boost`), and a `<input |>` whose
+/// first offer is `accesskey` would be a worse answer than one whose first
+/// offer is `accept`.
+///
+/// An unknown tag — a custom element, a mid-edit `<di|` — is not a refusal: it
+/// has no own names and takes the globals, which is what every element takes.
+fn attribute_completions(tag: &str) -> Vec<Completion> {
+    use crate::html_attributes::{
+        ELEMENT_ATTRIBUTES, GLOBAL_ATTRIBUTES, SVG_ELEMENTS, SVG_GLOBAL_ATTRIBUTES,
+    };
+    // The table is sorted by `(tag, attribute)`, so one binary search finds the
+    // tag's first row and the run ends at the first row naming another tag.
+    let first = ELEMENT_ATTRIBUTES.partition_point(|(element, _)| *element < tag);
+    let own = ELEMENT_ATTRIBUTES[first..]
+        .iter()
+        .take_while(|(element, _)| *element == tag)
+        .map(|(_, attribute)| *attribute);
+    let wide: &[&str] = if SVG_ELEMENTS.binary_search(&tag).is_ok() {
+        SVG_GLOBAL_ATTRIBUTES
+    } else {
+        &[]
+    };
+    let wide = wide.iter().copied();
+    own.chain(GLOBAL_ATTRIBUTES.iter().copied())
+        .chain(wide)
+        .map(|attribute| {
+            let mut completion = Completion::bare(attribute.to_string(), CompletionKind::Field);
+            // An attribute takes exactly one value (`parse_element_head_item`
+            // refuses a second), so the call shape is the one-parameter one —
+            // and going through `call_parameters` rather than a snippet is what
+            // makes accepting one honour the user's own
+            // `vilan.completion.functionCall` setting and their client's
+            // snippet support, exactly as a method link does.
+            completion.call_parameters = Some(vec!["value".to_string()]);
+            completion
+        })
+        .collect()
+}
+
+/// The `on:event(…)` candidates offered undotted in `<tag |>` (E69): one per
+/// `GlobalEventHandlers` name, plus the bare `on:` template that was E67's
+/// whole answer here.
+///
+/// Snippets, and deliberately: the event form is a *grammar* form whose body is
+/// a closure, so what the author wants inserted is the closure too
+/// (`on:click(|event| { … })`), and `CompletionKind::Snippet`'s `~`-prefixed
+/// ranking is what keeps seventy-odd of them from burying the attribute names
+/// at the same position.
+///
+/// The bare `on:` stays because the table is `GlobalEventHandlers` and a
+/// CUSTOM event (`on:my-thing`) is still a legal head item — the desugar is
+/// name-blind about events exactly as it is about attributes.
+fn event_completions() -> Vec<Completion> {
+    let mut items = vec![Completion::snippet(
+        "on:",
+        "an event handler",
+        "on:${1:click}(|${2:event}| { $0 })",
+        "on:",
+    )];
+    items.extend(crate::html_attributes::EVENTS.iter().map(|event| {
+        Completion::snippet(
+            &format!("on:{event}"),
+            "an event handler",
+            &format!("on:{event}(|${{1:event}}| {{ $0 }})"),
+            &format!("on:{event}"),
+        )
+    }));
+    items
+}
+
 /// The root of a raw parse, shared by the two sub-language worlds
 /// [`Analysis::cursor_context`] classifies (an element head, a `css` body).
 type RawRoot<'src> = vilan_core::Spanned<vilan_core::node::NodeList<'src>>;
 
-/// Whether `offset` (LIVE space — see [`Analysis::completion`]) sits in an
-/// element's OPENING TAG, where the desugar takes an attribute, an
-/// `on:event(…)`, or a `.method(…)` chain link (element-syntax.md §2–4).
+/// The TAG NAME of the element whose OPENING TAG `offset` (LIVE space — see
+/// [`Analysis::completion`]) sits in, where the desugar takes an attribute, an
+/// `on:event(…)`, or a `.method(…)` chain link (element-syntax.md §2–4);
+/// `None` when the cursor is not in a head at all.
+///
+/// The name travels with the answer because E69's attribute vocabulary is
+/// per-element: `<input |>` and `<svg |>` offer different lists, and the tag
+/// is the only thing that says which.
 ///
 /// "In the head" is *after the tag name, before the head's `>`, and at the
 /// head's own bracket depth*. The depth clause is what keeps this honest:
@@ -783,25 +866,23 @@ type RawRoot<'src> = vilan_core::Spanned<vilan_core::node::NodeList<'src>>;
 /// buffer's lexis, tokenized once by [`Analysis::cursor_context`] and shared
 /// with the member test; `root` is that buffer's raw parse, shared with the
 /// `css` body test.
-fn in_element_head(
+fn element_head_tag<'text>(
     root: Option<&RawRoot<'_>>,
-    text: &str,
+    text: &'text str,
     tokens: &[(Token<'_>, Span)],
     offset: usize,
-) -> bool {
-    let mut best: Option<(usize, usize)> = None;
+) -> Option<&'text str> {
+    let mut best: Option<(usize, std::ops::Range<usize>)> = None;
     if let Some(root) = root {
         for item in &root.0 {
             innermost_open_tag_end(item, offset, text, &mut best);
         }
     }
-    let Some((_, tag_end)) = best else {
-        return false;
-    };
+    let (_, tag) = best?;
     let mut depth = 0usize;
     for (token, span) in tokens {
         let range = span.into_range();
-        if range.start < tag_end {
+        if range.start < tag.end {
             continue;
         }
         if range.start >= offset {
@@ -811,11 +892,11 @@ fn in_element_head(
             Token::Ctrl('(' | '[' | '{') => depth += 1,
             Token::Ctrl(')' | ']' | '}') => depth = depth.saturating_sub(1),
             // The head is already closed: the cursor is among the children.
-            Token::Ctrl('>') if depth == 0 => return false,
+            Token::Ctrl('>') if depth == 0 => return None,
             _ => {}
         }
     }
-    depth == 0
+    (depth == 0).then(|| text.get(tag).unwrap_or_default())
 }
 
 /// Which of §7.1's four positions `offset` (LIVE space) sits in, or `None` when
@@ -1133,15 +1214,16 @@ enum CssPosition {
 /// patch — the three earlier faces (E66's call receiver, E67's element head)
 /// each arrived as their own branch of the same byte-pair dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CursorContext {
+enum CursorContext<'text> {
     /// Not a code position at all — inside a string literal's body, or inside a
     /// `//` comment. Nothing is offered.
     NoCode,
     /// A macro name: `[Na…` at an item position, or inside `[derive(…)`.
     MacroName,
     /// Inside an element's opening tag (E67). `chain` is the `.` that commits
-    /// the head item to the chain form rather than to an attribute.
-    ElementHead { chain: bool },
+    /// the head item to the chain form rather than to an attribute; `tag` is
+    /// the element's own name, which is what picks E69's attribute list.
+    ElementHead { chain: bool, tag: &'text str },
     /// Inside a `css` block's own body (css-block.md §7.1) — a second
     /// sub-language world, and the same shape as the first: the block is
     /// desugared before analysis, so nothing in scope belongs here.
@@ -1175,7 +1257,7 @@ enum CursorContext {
 /// of trivia to drift from the first. The receiver is likewise the token before
 /// the `.` rather than the byte before it, which is what lets a chain be written
 /// down the page (`p\n\t\t.|`).
-fn member_context(tokens: &[(Token, Span)], start: usize) -> Option<CursorContext> {
+fn member_context<'text>(tokens: &[(Token, Span)], start: usize) -> Option<CursorContext<'text>> {
     let dot = tokens
         .iter()
         .rposition(|(_, span)| span.into_range().end <= start)?;
@@ -1453,7 +1535,9 @@ impl<'a, 'src> Analysis<'a, 'src> {
             // Macro names are always bare, so they bypass the call-suppression
             // below.
             CursorContext::MacroName => return self.macro_name_completions(),
-            CursorContext::ElementHead { chain } => return self.element_head_completions(chain),
+            CursorContext::ElementHead { chain, tag } => {
+                return self.element_head_completions(chain, tag);
+            }
             CursorContext::CssBlock(position) => return css_block_completions(position),
             // A field position offers the struct's fields and NOTHING else
             // (E160) — the element head's rule, for the element head's reason:
@@ -1538,13 +1622,13 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// receiver and the `.` are — `p.`, `p .`, `p\n\t.` and `p // note\n.` are
     /// one position, and what FOLLOWS the cursor never enters the question at
     /// all (`a.|.b` is the `a.` position).
-    fn cursor_context(
+    fn cursor_context<'text>(
         &self,
-        text: &str,
+        text: &'text str,
         tokens: &[(Token<'_>, Span)],
         offset: usize,
         start: usize,
-    ) -> CursorContext {
+    ) -> CursorContext<'text> {
         let bytes = text.as_bytes();
         // Text, not code. First, because every trigger below reads characters
         // that mean nothing inside one: a `.` in a caption is not a member
@@ -1590,9 +1674,10 @@ impl<'a, 'src> Analysis<'a, 'src> {
         // chain link — and nothing that is merely in scope. The check runs from
         // `start` (the head item being typed), and the `.` just before it is the
         // same disambiguator the grammar uses.
-        if in_element_head(raw.as_ref(), text, tokens, start) {
+        if let Some(tag) = element_head_tag(raw.as_ref(), text, tokens, start) {
             return CursorContext::ElementHead {
                 chain: start >= 1 && bytes[start - 1] == b'.',
+                tag,
             };
         }
         // A `css` block's body is the second such world (css-block.md §7.1),
@@ -1632,40 +1717,45 @@ impl<'a, 'src> Analysis<'a, 'src> {
         CursorContext::Expression
     }
 
-    /// The candidates for an element's head (E67). `chain` says the cursor
-    /// follows a `.`, so the head item under construction is a chain link.
+    /// The candidates for an element's head (E67, E69). `chain` says the cursor
+    /// follows a `.`, so the head item under construction is a chain link;
+    /// `tag` is the element's own name, which picks the attribute list.
     ///
-    /// Both halves come from the compiler's own knowledge, so neither can
-    /// drift: the chain form's vocabulary is the `View` type's method set,
-    /// read from the std declaration the program compiles against, and the
-    /// event form is a *grammar* form, not a name list. The undotted
-    /// ATTRIBUTE vocabulary is deliberately absent — element-syntax.md §2 and
-    /// §9 item 3 make the desugar name-blind (`name(x)` lowers to
-    /// `.attr("name", x)` whatever `name` is), so there is no list to offer
-    /// and inventing one here would be a second source of truth with nothing
-    /// to gate it. What the head position stops offering is the enclosing
-    /// scope: not one binding, type, keyword or construct snippet may appear
-    /// between `<div` and `>`.
-    fn element_head_completions(&self, chain: bool) -> Vec<Completion> {
-        let Some(view_id) = self.element_view_nominal_id() else {
-            return Vec::new();
-        };
+    /// Every half comes from a gated source, so none can drift: the chain
+    /// form's vocabulary is the `View` type's method set, read from the std
+    /// declaration the program compiles against; the ATTRIBUTE and EVENT
+    /// vocabularies are [`crate::html_attributes`], generated from the WHATWG
+    /// and SVG attribute indices and held to their vendored extract by
+    /// `html_attributes_sync`.
+    ///
+    /// E67 left the attribute names out and said why: a hand list "would be a
+    /// second source of truth with nothing to gate it". E69's ruling is the
+    /// answer to exactly that — GENERATED and GATED — and nothing else about
+    /// the head changed: the desugar stays NAME-BLIND (element-syntax.md §2,
+    /// §9 item 3), so a `data-tip(…)` or an `aria-` name this table has never
+    /// heard of is written and lowered exactly as before. Completion is an
+    /// offer, never a vocabulary.
+    ///
+    /// What the head position still stops offering is the enclosing scope: not
+    /// one binding, type, keyword or construct snippet may appear between
+    /// `<div` and `>`.
+    fn element_head_completions(&self, chain: bool, tag: &str) -> Vec<Completion> {
         let mut items = Vec::new();
-        self.push_methods(view_id, true, &mut items);
-        if !chain {
-            // Undotted: the chain form is offered in its own spelling, dot
-            // included, because an undotted `text(…)` is an ATTRIBUTE named
-            // "text" — a different construct, and the one §4's warning exists
-            // to catch.
-            for item in &mut items {
-                item.label = format!(".{}", item.label);
+        if let Some(view_id) = self.element_view_nominal_id() {
+            self.push_methods(view_id, true, &mut items);
+            if !chain {
+                // Undotted: the chain form is offered in its own spelling, dot
+                // included, because an undotted `text(…)` is an ATTRIBUTE named
+                // "text" — a different construct, and the one §4's warning
+                // exists to catch.
+                for item in &mut items {
+                    item.label = format!(".{}", item.label);
+                }
             }
-            items.push(Completion::snippet(
-                "on:",
-                "an event handler",
-                "on:${1:click}(|${2:event}| { $0 })",
-                "on:",
-            ));
+        }
+        if !chain {
+            items.extend(attribute_completions(tag));
+            items.extend(event_completions());
         }
         items
     }
@@ -1680,11 +1770,11 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// fields are the DECLARATION's, `Holder<i32> { … }` and `Holder<str> { … }`
     /// name the same ones, and the argument list the author wrote plays no part
     /// in which names are offered.
-    fn struct_initializer_context(
+    fn struct_initializer_context<'text>(
         &self,
         tokens: &[(Token<'_>, Span)],
         start: usize,
-    ) -> Option<CursorContext> {
+    ) -> Option<CursorContext<'text>> {
         let (open, head) = struct_initializer_head(tokens, start)?;
         let Token::Ident(name) = tokens[head].0 else {
             return None;

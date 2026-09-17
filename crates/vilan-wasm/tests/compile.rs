@@ -705,6 +705,35 @@ fn member_completion_answers_from_the_retained_analysis() {
     );
 }
 
+/// E69: the element head's attribute vocabulary reaches the playground
+/// unchanged — the table is a `vilan-ide` const, so the crate that builds for
+/// `wasm32-unknown-unknown` carries it with no protocol and no filesystem.
+#[test]
+fn element_head_completion_offers_the_attribute_table() {
+    let compiled =
+        "import std::ui::view;\n\nfun main() {\n\tlet card = <input/>;\n\tlet _ = card;\n}\n";
+    let live =
+        "import std::ui::view;\n\nfun main() {\n\tlet card = <input />;\n\tlet _ = card;\n}\n";
+    let items = complete_after(compiled, live, 3, 19);
+    let offered = labels(&items);
+    for expected in ["type", "disabled", "value", "class", "id"] {
+        assert!(
+            offered.contains(&expected),
+            "`{expected}` missing from the playground's head popup: {offered:?}"
+        );
+    }
+    assert!(
+        offered.contains(&"on:click"),
+        "the event names too: {offered:?}"
+    );
+    // The call shape an attribute inserts is the front-end's own mapping of
+    // `call_parameters`, not a second rule for the playground.
+    let attribute = named(&items, "type");
+    assert_eq!(attribute.kind, "field");
+    assert_eq!(attribute.insert, "type(${1:value})$0");
+    assert!(attribute.is_snippet);
+}
+
 /// Import-path completion with no filesystem: `import std::` enumerates the
 /// embedded toolchain's modules out of the document overlay (the
 /// `modules_in_root` overlay listing, pinned in core), plus the names std's
