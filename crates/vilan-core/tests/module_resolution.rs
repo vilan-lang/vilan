@@ -7077,3 +7077,71 @@ fn b335_a_module_owning_a_file_and_a_directory_reports_its_own_file() {
         "a duplicate one-id range would demote `source_lookup`"
     );
 }
+
+/// E185 — the S4 refusal names the importing module, and is PLACED.
+///
+/// The sweep saw it sixteen times as "module `that module` does not admit it".
+/// The importing body there was `[derive(..)]`-synthesized — every `Wire`
+/// visitor is — and generated code's source id is the sentinel outside
+/// `sources`, so the module lookup fell through to the placeholder and the
+/// refusal carried `0..0` against the entry. The body resolves through
+/// `note_source_of` to the file the derive was WRITTEN in, which is the file
+/// whose import the steer asks the reader to widen, and `Program::anchored`
+/// puts the diagnostic on the attribute that generated the code (E16's rule).
+#[test]
+fn b318_the_admission_refusal_names_the_module_that_did_not_admit() {
+    let files: Vec<(&str, String)> = vec![
+        (
+            "thing.vl",
+            "import std::wire::Wire;\n\nexport *;\n\n[derive(Wire)]\nstruct Point {\n\tx: i32,\n\ty: i32,\n}\n"
+                .to_string(),
+        ),
+        (
+            "w.vl",
+            // `Counter` is exported; its `impl` is NOT, so the export gate
+            // hides the block from every file but this one.
+            "import std::wire::Serialize;\n\nexport struct Counter {\n\tcount: i32,\n}\n\n\
+             impl Counter with Serialize {\n\
+             \tfun begin_struct(self, fields: i32) {}\n\
+             \tfun field(self, name: str) {}\n\
+             \tfun end_struct(self) {}\n\
+             \tfun begin_list(self, length: i32) {}\n\
+             \tfun end_list(self) {}\n\
+             \tfun begin_variant(self, name: str, arity: i32) {}\n\
+             \tfun end_variant(self) {}\n\
+             \tfun null_value(self) {}\n\
+             \tfun some_value(self) {}\n\
+             \tfun str_value(self, value: str) {}\n\
+             \tfun i32_value(self, value: i32) {}\n\
+             \tfun u32_value(self, value: u32) {}\n\
+             \tfun i53_value(self, value: i53) {}\n\
+             \tfun f64_value(self, value: f64) {}\n\
+             \tfun bool_value(self, value: bool) {}\n\
+             }\n"
+                .to_string(),
+        ),
+        (
+            "c.vl",
+            "import std::io::print;\nimport pkg::thing::Point;\nimport pkg::w::Counter;\n\n\
+             fun main() {\n\tlet counter = Counter { count = 0 };\n\
+             \tPoint { x = 1, y = 2 }.describe(counter);\n\tprint(\"done\");\n}\nmain();\n"
+                .to_string(),
+        ),
+    ];
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    let refused = transform_package(&borrowed, "c.vl", Platform::default())
+        .expect_err("`thing.vl`'s derived visitor cannot admit `w.vl`'s hidden impl");
+    assert!(
+        refused.contains("'begin_struct' is provided by an `impl` in module `w`")
+            && refused.contains("module `thing` does not admit it")
+            && refused.contains("Widen `thing`'s own import of `w`"),
+        "the refusal must name the importing module, not a placeholder: {refused}"
+    );
+    assert!(
+        !refused.contains("that module"),
+        "the placeholder is gone: {refused}"
+    );
+}

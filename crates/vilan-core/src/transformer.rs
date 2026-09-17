@@ -2253,6 +2253,16 @@ struct AdmissionMiss {
     /// decided this (`visibility.md` §3.5), which is NOT necessarily the file
     /// that instantiated the body.
     importer: crate::analyzer::SourceId,
+    /// E185: the body itself, so the refusal can NAME the importing module.
+    /// `importer` is `[derive(..)]`-synthesized code's sentinel source
+    /// ([`crate::analyzer::DERIVED_SOURCE`]) whenever the emitting body is a
+    /// generated one — which is every `Wire` visitor, and so every miss the
+    /// sweep actually saw — and that sentinel is outside `sources`, so the
+    /// module name came out as the placeholder `that module`, sixteen times in
+    /// one report. The entity resolves through `note_source_of` to the file the
+    /// derive was WRITTEN in, which is the file whose import the reader has to
+    /// widen.
+    importing_body: Option<Id>,
     /// The file declaring the `impl` the lookup would otherwise have taken.
     declared_in: crate::analyzer::SourceId,
 }
@@ -3188,19 +3198,28 @@ impl<'src> Transformer<'src> {
         // as ruled. Checked FIRST because it is the specific diagnosis of the
         // general symptom below.
         if let Some(miss) = self.admission_miss.borrow_mut().take() {
-            let module = |source: crate::analyzer::SourceId| -> String {
+            let module = |source: crate::analyzer::SourceId| -> Option<String> {
                 self.program
                     .canonical_sources
                     .get(source.0 as usize)
                     .and_then(|path: &std::path::PathBuf| path.file_stem())
                     .and_then(|stem| stem.to_str())
-                    .unwrap_or("that module")
-                    .to_string()
+                    .map(str::to_owned)
             };
             let member = miss.member;
-            let declaring = module(miss.declared_in);
-            let here = module(miss.importer);
-            return Err(Error {
+            let declaring = module(miss.declared_in).unwrap_or_else(|| "that module".to_string());
+            // E185: the importing module's SPELLED name. The body that asked
+            // may be `[derive(..)]`-synthesized, whose source id is the
+            // sentinel outside `sources` — `note_source_of` resolves it to the
+            // file the derive was written in, which is the file whose import
+            // the steer below asks the reader to widen.
+            let here = miss
+                .importing_body
+                .and_then(|body| self.program.note_source_of(body))
+                .and_then(module)
+                .or_else(|| module(miss.importer))
+                .unwrap_or_else(|| "that module".to_string());
+            let error = Error {
                 trace: Vec::new(),
                 note: None,
                 span: Span::default(),
@@ -3211,7 +3230,23 @@ impl<'src> Transformer<'src> {
                      the CALLER does not reach it. Widen `{here}`'s own import of \
                      `{declaring}` — `(impl _)` admits every implementation it declares"
                 ),
+            };
+            // E185: and PLACED — through the one anchoring rule every
+            // post-`analyze` pass uses (E16), which re-spans generated code at
+            // the attribute that generated it. The file rides in the note, the
+            // channel the CLI reads a transformer refusal's location from; the
+            // refusal used to carry `0..0` against the entry, so it rendered at
+            // the entry's first byte whatever module it was about.
+            let Some(body) = miss.importing_body else {
+                return Err(error);
+            };
+            let (mut error, source) = self.program.anchored(error, body);
+            error.note = Some(Note {
+                span: error.span,
+                msg: format!("`{here}` is the module whose import decides this"),
+                source: Some(source),
             });
+            return Err(error);
         }
 
         // Never-silent (B55): refuse to ship a program that emitted a body-less
@@ -10207,6 +10242,7 @@ impl<'src> Transformer<'src> {
         *self.admission_miss.borrow_mut() = Some(AdmissionMiss {
             member: member.to_string(),
             importer,
+            importing_body: self.emitting_stack.last().copied(),
             declared_in,
         });
         None
