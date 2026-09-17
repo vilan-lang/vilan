@@ -10346,3 +10346,443 @@ fn b286_a_caller_whose_parameter_carries_no_such_bound_is_still_refused() {
         "cannot infer 'T' for this call",
     );
 }
+
+// --- B347/B351/B352/B353: the VALUE forms' closure typing -------------------
+//
+// A99 retired the six `View` parent methods, and the free calls that replaced
+// them do not bind their generics through a receiver. Four filings came out of
+// that one change, and they are three different seams:
+//
+//   * B347 — the bidirectional fill resolved the expected parameter type
+//     through the call's substitution only when it was a BARE `Type::Generic`,
+//     so `each_by`'s `|SignalCell<T>| C` froze at the abstract `SignalCell<T>`.
+//   * B352 (2) — an explicit type ARGUMENT (`SignalCell<Option<str>>::new`) was
+//     overwritten by a later argument-side reconcile that knew less.
+//   * B353 — a method call INSIDE an unannotated closure body was checked
+//     while the parameter's one-shot slot was still `Unknown`, so the check
+//     passed vacuously and never ran again. That one was UNSOUND.
+//
+// Every program here is std-only and every closure parameter is written
+// UNANNOTATED, because the annotation is exactly what each filing had to add.
+
+/// The fixture the `each_by` pins run on: a keyed row type with a field the
+/// render closure reads through the row's own cell.
+const A_KEYED_ROW: &str = r#"
+        [derive(PartialEq)]
+        struct Handle { id: i32, title: str }
+"#;
+
+/// **B347 — `each_by`'s `T` reaches an UNANNOTATED render closure.**
+///
+/// The retired `View::bind_each_by` METHOD bound `T` through the receiver path;
+/// the free call does not, and the render parameter is `SignalCell<T>` — one
+/// constructor deep, which is what the bare-`Type::Generic` arm of the
+/// bidirectional fill could not see. `h` froze at `SignalCell<T>` and every use
+/// of the row was "cannot access field 'title' on type T".
+#[test]
+fn b347_each_by_types_an_unannotated_render_closure_from_its_source() {
+    assert_compiles_browser(&format!(
+        r#"
+        import std::reactive::{{ Signal, SignalCell }};
+        import std::ui::{{ View, each_by, mount_root, view }};
+        {A_KEYED_ROW}
+        fun main() {{
+            let handles = Signal::new([Handle {{ id = 1, title = "one" }}]);
+            let _root = mount_root("app", || view("nav")
+                .child(each_by(handles, |h| h.id, |h| view("li")
+                    .bind_text(h.map(|c| c.title)))));
+        }}
+        "#
+    ));
+}
+
+/// B347's other reader of the same row: the cell read DIRECTLY, with no inner
+/// `map` to carry the blame. `h.get().title` is the shortest statement that the
+/// parameter is a `SignalCell<Handle>` and not a `SignalCell<T>`.
+#[test]
+fn b347_the_each_by_row_cell_reads_its_own_field() {
+    assert_compiles_browser(&format!(
+        r#"
+        import std::reactive::{{ Signal, SignalCell }};
+        import std::ui::{{ View, each_by, mount_root, view }};
+        {A_KEYED_ROW}
+        fun main() {{
+            let handles = Signal::new([Handle {{ id = 1, title = "one" }}]);
+            let _root = mount_root("app", || view("nav")
+                .child(each_by(handles, |h| h.id, |h| view("li").text(h.get().title))));
+        }}
+        "#
+    ));
+}
+
+/// B347's second half, and the reason the filing called the cascade spurious:
+/// a render closure that is genuinely wrong reports ONCE, at the field, with no
+/// `owner_scope … can be reached without an enclosing run` behind it. The
+/// cascade was the frozen parameter's shadow — an unresolved row type left the
+/// chain's `Slot` unselected and every sibling link inherited the complaint —
+/// so the only honest way to hold it is to write a real mistake and count.
+#[test]
+fn b347_a_wrong_render_body_reports_once_with_no_owner_scope_cascade() {
+    let errors = compile_browser(&format!(
+        r#"
+        import std::reactive::{{ Signal, SignalCell }};
+        import std::ui::{{ View, each_by, mount_root, view }};
+        {A_KEYED_ROW}
+        fun main() {{
+            let handles = Signal::new([Handle {{ id = 1, title = "one" }}]);
+            let _root = mount_root("app", || view("nav")
+                .child(view("h1").text("header"))
+                .child(each_by(handles, |h| h.id, |h| view("li").text(h.get().missing)))
+                .child(view("footer").text("footer")));
+        }}
+        "#
+    ))
+    .expect_err("a field the row does not have is still a mistake");
+    assert_eq!(errors.len(), 1, "one mistake, one diagnostic: {errors:#?}");
+    assert!(
+        errors[0].contains("missing"),
+        "the one diagnostic names the field: {errors:#?}"
+    );
+    assert!(
+        !errors.iter().any(|error| error.contains("owner_scope")),
+        "no `owner_scope` cascade behind it: {errors:#?}"
+    );
+}
+
+// --- B351: a block hole whose tail is a generic METHOD over a nested `swap` --
+//
+// The shape kolt's `app_shell` writes (views.vl:94, the `FIXME` and the
+// `let shell: View = ..` that works around it). Three things have to be true
+// together: the hole is a BLOCK hole (`{{ .. }}`), its tail is a call to a
+// GENERIC METHOD whose type argument comes only from its closure's return, and
+// that closure builds a NESTED `swap` one of whose render closures is a
+// `match`. `run`'s `U` then never bound, so the hole's own `child<C: Slot>`
+// took `U` for its `C` and the emitter reached `Slot::place` — a body-less
+// trait requirement, B55's never-silent refusal with no span.
+//
+// The five variants below all COMPILED on d783fbf4 and are pinned so the fix
+// cannot regress one of them into the reproduction. Two the filing listed as
+// passing do NOT (see the lane report): an expression-bodied `run` body and
+// both render closures annotated both still fail, so the trigger is not what
+// the twenty-line note said it was — and the generic may be a USER method as
+// well as an `external` one.
+
+/// B351's shared fixture: two enums to `match` on and a context to `run`.
+const A_NESTED_SWAP_WORLD: &str = r#"
+        import std::context::Context;
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, mount_root, swap, view };
+
+        [derive(PartialEq)]
+        enum Tab { A, B }
+
+        [derive(PartialEq)]
+        enum Leaf { X, Y }
+
+        struct User { name: str }
+
+        let user_context: Context<User> = Context::new();
+"#;
+
+/// The nested `swap` itself, written once — every pin below places the same
+/// expression somewhere different.
+const A_NESTED_SWAP: &str = r#"<section .child(swap(tab, |x| match x {
+                    Tab::A => <p/>,
+                    Tab::B => <div .child(swap(leaf, |y| match y {
+                        Leaf::X => <span/>,
+                        Leaf::Y => <b/>,
+                    })) />,
+                })) />"#;
+
+/// **B351 — the reproduction.** A block hole whose tail is `context.run(v, ||
+/// { .. })` over the nested `swap`.
+#[test]
+fn b351_a_block_hole_tailed_by_a_generic_method_over_a_nested_swap_resolves() {
+    assert_compiles_browser(&format!(
+        r#"
+        {A_NESTED_SWAP_WORLD}
+        fun main() {{
+            let tab = Signal::new(Tab::A);
+            let leaf = Signal::new(Leaf::X);
+            let _root = mount_root("app", || <div>
+                {{{{
+                    user_context.run(User {{ name = "s" }}, || {{
+                        {A_NESTED_SWAP}
+                    }})
+                }}}}
+            </div>);
+        }}
+        "#
+    ));
+}
+
+/// Variant 1 — a USER FREE FUNCTION with the same signature. The free path
+/// binds `U`; this one has always compiled and is the control that says the
+/// fix belongs on the method side.
+#[test]
+fn b351_a_free_generic_in_the_same_block_hole_still_compiles() {
+    assert_compiles_browser(&format!(
+        r#"
+        {A_NESTED_SWAP_WORLD}
+        fun ident<U>(body: || U): U {{ body() }}
+
+        fun main() {{
+            let tab = Signal::new(Tab::A);
+            let leaf = Signal::new(Leaf::X);
+            let _root = mount_root("app", || <div>
+                {{{{
+                    ident(|| {{
+                        {A_NESTED_SWAP}
+                    }})
+                }}}}
+            </div>);
+        }}
+        "#
+    ));
+}
+
+/// Variant 2 — a SINGLE (un-nested) `swap` under the same `run`.
+#[test]
+fn b351_a_single_swap_under_the_same_run_still_compiles() {
+    assert_compiles_browser(&format!(
+        r#"
+        {A_NESTED_SWAP_WORLD}
+        fun main() {{
+            let tab = Signal::new(Tab::A);
+            let _root = mount_root("app", || <div>
+                {{{{
+                    user_context.run(User {{ name = "s" }}, || {{
+                        <section .child(swap(tab, |x| match x {{
+                            Tab::A => <p/>,
+                            Tab::B => <b/>,
+                        }})) />
+                    }})
+                }}}}
+            </div>);
+        }}
+        "#
+    ));
+}
+
+/// Variant 3 — the same `run` in a PLAIN `{expression}` hole rather than a
+/// block hole.
+#[test]
+fn b351_the_same_run_in_a_plain_child_hole_still_compiles() {
+    assert_compiles_browser(&format!(
+        r#"
+        {A_NESTED_SWAP_WORLD}
+        fun main() {{
+            let tab = Signal::new(Tab::A);
+            let leaf = Signal::new(Leaf::X);
+            let _root = mount_root("app", || <div>
+                {{user_context.run(User {{ name = "s" }}, || {{
+                    {A_NESTED_SWAP}
+                }})}}
+            </div>);
+        }}
+        "#
+    ));
+}
+
+/// Variant 4 — the block hole WITHOUT the `run`: the nested `swap` is the
+/// hole's own tail.
+#[test]
+fn b351_a_block_hole_over_the_nested_swap_alone_still_compiles() {
+    assert_compiles_browser(&format!(
+        r#"
+        {A_NESTED_SWAP_WORLD}
+        fun main() {{
+            let tab = Signal::new(Tab::A);
+            let leaf = Signal::new(Leaf::X);
+            let _root = mount_root("app", || <div>
+                {{{{
+                    {A_NESTED_SWAP}
+                }}}}
+            </div>);
+        }}
+        "#
+    ));
+}
+
+/// Variant 5 — kolt's WORKAROUND, pinned as a variant because it is the
+/// program the estate actually carries until the integrator drops the
+/// `FIXME`: the same call through an ANNOTATED binding, which gives `U` an
+/// expectation that is not the hole's own `C`.
+#[test]
+fn b351_the_annotated_binding_workaround_still_compiles() {
+    assert_compiles_browser(&format!(
+        r#"
+        {A_NESTED_SWAP_WORLD}
+        fun main() {{
+            let tab = Signal::new(Tab::A);
+            let leaf = Signal::new(Leaf::X);
+            let _root = mount_root("app", || <div>
+                {{{{
+                    let shell: View = user_context.run(User {{ name = "s" }}, || {{
+                        {A_NESTED_SWAP}
+                    }});
+                    shell
+                }}}}
+            </div>);
+        }}
+        "#
+    ));
+}
+
+// --- B352/B353: the explicit type argument, and the unchecked closure body ---
+
+/// **B352 (2) — an explicit TYPE ARGUMENT survives an argument that knows
+/// less.** `Signal<Option<str>>::new(None)` is the spelling kolt's
+/// `create_new_channel_modal` uses (channel.vl:134). `None` types as
+/// `Option<unknown>`, which unifies with `Option<str>` and was then written
+/// back over the binding the path had already fixed — so the cell was a
+/// `SignalCell<Option>` with nothing in the payload, `unwrap_or_default`'s
+/// `Default` bound resolved against that hole, and emission reached
+/// `Default::default` with no body. The annotation `|x: Option<str>|` was the
+/// workaround; the mistake is one constructor above it.
+#[test]
+fn b352_an_explicit_type_argument_outlives_a_less_resolved_argument() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, mount_root, view };
+
+        fun main() {
+            let error_text = Signal<Option<str>>::new(None);
+            let _root = mount_root("app", || <div .show(error_text.map(|x| x.is_some()))>
+                {error_text.map(|x| x.unwrap_or_default())}
+            </div>);
+        }
+        "#,
+    );
+}
+
+/// The same mistake with no std in sight: a user container, a user static, and
+/// a payload-less variant for the argument. The refusal names the type the
+/// path wrote, which is the shortest statement that the explicit argument won.
+#[test]
+fn b352_an_explicit_type_argument_on_a_user_static_is_not_overwritten() {
+    assert_fails_with(
+        r#"
+        struct Box<T> { v: T }
+        impl Box<type T> {
+            fun new(v: T): Box<T> { Box { v = v } }
+        }
+        fun take(x: Box<i32>) { let _ = x; }
+        fun main() {
+            let b = Box<Option<str>>::new(None);
+            take(b);
+        }
+        "#,
+        "Expected Box<i32>, but got Box<Option<str>> instead.",
+    );
+}
+
+/// The CONTROL: an explicit type argument the argument CONTRADICTS is still a
+/// refusal, and the message still reads in the written argument's terms. The
+/// fix must keep the explicit binding, not stop checking against it.
+#[test]
+fn b352_an_explicit_type_argument_still_refuses_a_contradicting_argument() {
+    assert_fails_with(
+        r#"
+        struct Box<T> { v: T }
+        impl Box<type T> {
+            fun new(v: T): Box<T> { Box { v = v } }
+        }
+        fun main() {
+            let _b = Box<Option<str>>::new(Some(1));
+        }
+        "#,
+        "Expected Option<str>, but got Option<i32> instead.",
+    );
+}
+
+/// **B353 — a call inside an UNANNOTATED closure body is checked.** The
+/// miscompile: `flag` is a `SignalCell<bool>`, `cell` a `SignalCell<str>`, and
+/// the emitted program printed `flag = a string`. Nothing downstream re-checks
+/// the argument, so this is a `miscompile` and not a missed diagnostic.
+#[test]
+fn b353_a_method_call_inside_an_unannotated_closure_body_is_checked() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Owner, Signal, SignalCell, owner_scope };
+
+        fun main() {
+            owner_scope.run(Owner::new(), || {
+                let flag: SignalCell<bool> = Signal::new(false);
+                let cell = Signal::new("a string");
+                cell.effect(|incoming| {
+                    flag.set(incoming);
+                });
+                print(i"flag = {flag.get()}");
+            });
+        }
+        "#,
+        "Expected bool, but got str instead.",
+    );
+}
+
+/// B353 through a USER `Source` impl and a `Result` destructure — the
+/// exhibit's own shape (kolt views.vl:222, the commented `channels.set(
+/// incoming)` without its `if incoming is Some(..)` guard). An
+/// `Option<List<i53>>` stored where a `List<i53>` is read: the run printed
+/// `len=2`, the `Option`'s own two-slot representation read as a list.
+#[test]
+fn b353_the_remote_source_effect_shape_is_checked_too() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Owner, Signal, SignalCell, Source, Subscription, owner_scope };
+
+        struct Stored<T> { inner: SignalCell<T> }
+
+        impl Stored<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+            [must_use]
+            fun on_change(self, observer: |T| void): Subscription {
+                self.inner.on_change(observer)
+            }
+        }
+
+        impl Stored<type T> {
+            fun new(value: T): Stored<T> { Stored { inner = Signal::new(value) } }
+        }
+
+        fun remote<T>(value: T): Result<Stored<T>, str> { Ok(Stored::new(value)) }
+
+        fun main() {
+            owner_scope.run(Owner::new(), || {
+                let channels: SignalCell<List<i53>> = Signal::new([]);
+                let got = remote(Some([1i53]));
+                if got is Ok(let incoming) {
+                    incoming.effect(|incoming| {
+                        channels.set(incoming);
+                    });
+                }
+            });
+        }
+        "#,
+        "Expected List<i53>, but got Option<List<i53>> instead.",
+    );
+}
+
+/// The CONTROL for B353's deferral: a closure body whose calls AGREE with the
+/// parameter its enclosing call supplies must still compile, and the parameter
+/// must still be typed by that enclosing call and by nothing nearer.
+#[test]
+fn b353_an_agreeing_closure_body_still_compiles() {
+    assert_compiles(
+        r#"
+        import std::reactive::{ Owner, Signal, SignalCell, owner_scope };
+
+        fun main() {
+            owner_scope.run(Owner::new(), || {
+                let mirror: SignalCell<str> = Signal::new("");
+                let cell = Signal::new("a string");
+                cell.effect(|incoming| {
+                    mirror.set(incoming);
+                });
+            });
+        }
+        "#,
+    );
+}

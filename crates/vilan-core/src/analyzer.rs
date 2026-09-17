@@ -19618,6 +19618,33 @@ impl<'src> Analyzer<'src> {
     /// The substitution a trait's members are typed under when the trait is
     /// used at `arguments` (`Get<i32>` -> `{ Get::T: i32 }`). Empty when the
     /// trait takes no parameters, or when none were supplied.
+    /// B352: a TRAIT subject written WITH arguments (`Signal<Option<str>>::new`)
+    /// seeds this call's bindings from the trait's own parameters.
+    ///
+    /// A nominal subject (`Boxy<i32>::make`) reconciles against the matched
+    /// impl's subject and has always seeded; a trait has no impl to reconcile
+    /// against, so its arguments were INERT — `Signal<i32>::new("x")` compiled,
+    /// the `i32` reaching nothing, and `Signal<Option<str>>::new(None)` took
+    /// its `T` from the payload-less `None` instead, carrying a
+    /// `SignalCell<Option>` whose payload no bound could resolve against. kolt
+    /// spells that shape twice (channel.vl:135, :342) and annotates around it.
+    ///
+    /// The trait's parameters ARE the channel, zipped with what the path wrote
+    /// — the same list [`Self::trait_parameter_substitution`] zips for a
+    /// member reached through a bound.
+    fn seed_trait_static_subject_bindings(&mut self, id: Id, subject_type: &Type) {
+        let Type::Trait(trait_id, arguments) = subject_type else {
+            return;
+        };
+        if arguments.is_empty() {
+            return;
+        }
+        let bindings = self.trait_parameter_substitution(*trait_id, arguments);
+        if !bindings.is_empty() {
+            self.static_subject_bindings.insert(id, bindings);
+        }
+    }
+
     fn trait_parameter_substitution(
         &self,
         trait_id: Id,
@@ -32277,6 +32304,64 @@ impl<'src> Analyzer<'src> {
     /// `self_parameter_offset` is 1 for a method (whose first parameter is
     /// `self`, which no argument stands for) and 0 for a free function or a
     /// static — the ONE place the two call paths differ, so both can share this.
+    /// Record one inferred generic binding, keeping the BETTER of two answers
+    /// when the constraint already has one (B352).
+    ///
+    /// A binding carrying a HOLE — an `Unknown` or `Unresolved` anywhere in its
+    /// structure — is not evidence, and it must not displace one that has none.
+    /// `Box<Option<str>>::new(None)` is the exhibit: the path FIXED `T` at
+    /// `Option<str>`, then the argument `None` typed as `Option<unknown>`,
+    /// unified with it (a hole unifies with anything), and the unification was
+    /// written back — so the call's own substitution said `Box<Option>` and
+    /// every bound on the payload (`unwrap_or_default`'s `T: Default`) resolved
+    /// against nothing. kolt spells that shape `Signal<Option<str>>::new(None)`
+    /// and carries the `|x: Option<str>|` annotation that works around it.
+    ///
+    /// It is not "the explicit argument wins": a CONTRADICTING argument is
+    /// still refused by the reconcile that produced this binding, and a later
+    /// answer with no hole still replaces an earlier one. Only the strictly
+    /// less-resolved answer is declined.
+    fn record_generic_binding(
+        &self,
+        substitution: &mut SubstitutionContext,
+        constraint_id: TypeId,
+        type_id: TypeId,
+    ) {
+        if let Some(existing) = substitution.get(&constraint_id).copied()
+            && existing != type_id
+            && self.binding_is_weaker(type_id, existing)
+        {
+            return;
+        }
+        substitution.insert(constraint_id, type_id);
+    }
+
+    /// Whether `candidate` says strictly LESS about a generic than `held` does
+    /// — the test [`Self::record_generic_binding`] declines on.
+    ///
+    /// Two shapes, and both are "the same answer with something rubbed out":
+    /// a HOLE where the held binding has none (`Option<unknown>` against
+    /// `Option<str>`), and the same nominal head with its arguments ERASED.
+    /// The second is the one `None` produces: a payload-less variant types as
+    /// the bare enum, `Option` with an empty argument list, which carries no
+    /// hole to test for and unifies with every `Option<_>` there is.
+    ///
+    /// Anything else replaces: a different type is a contradiction the
+    /// reconcile that produced it has already judged, and a better-resolved
+    /// answer arriving late is the ordinary way a generic lands.
+    fn binding_is_weaker(&self, candidate: TypeId, held: TypeId) -> bool {
+        if self.type_has_hole(candidate) && !self.type_has_hole(held) {
+            return true;
+        }
+        match (candidate.get_type(self), held.get_type(self)) {
+            (Type::Enum(candidate_id, candidate_args), Type::Enum(held_id, held_args))
+            | (Type::Struct(candidate_id, candidate_args), Type::Struct(held_id, held_args)) => {
+                candidate_id == held_id && candidate_args.is_empty() && !held_args.is_empty()
+            }
+            _ => false,
+        }
+    }
+
     fn bind_callee_own_generics(
         &mut self,
         member_id: Id,
@@ -32364,7 +32449,7 @@ impl<'src> Analyzer<'src> {
             if let Some((_, bindings)) = reconciled {
                 for (constraint_id, type_id) in bindings {
                     if bindable.contains(&constraint_id) {
-                        substitution.insert(constraint_id, type_id);
+                        self.record_generic_binding(substitution, constraint_id, type_id);
                     }
                 }
             }
@@ -32644,9 +32729,30 @@ impl<'src> Analyzer<'src> {
             return;
         };
         for (constraint_id, type_id) in bindings {
+            // B351: an expectation that is ITSELF another call's still-abstract
+            // own generic is not evidence. A `{{ .. }}` child hole lands in
+            // `View::child<C: Slot>`, so the hole's tail is expected at the
+            // bare `C` — and binding `run<U>`'s `U` to it froze `U` at a
+            // parameter only the enclosing call could ever ground. `child`
+            // then took `U` for its own `C`, and the emitter reached `Slot`'s
+            // body-less `place` (B55, with no span) on the program kolt's
+            // `app_shell` writes.
+            //
+            // An enclosing DECLARATION's binder is a different thing and still
+            // binds: inside `fun g<U>(v: U): U { f(v) }` the expectation `U` is
+            // a name in scope at the call, rigid for the whole body, and
+            // `f`'s own generic taking it is exactly right.
+            //
+            // `generic_is_enclosing_binder` is the same question this loop
+            // already asks about the CONSTRAINT, asked about the VALUE.
+            let expectation_is_a_foreign_generic = match *type_id.borrow_type(self) {
+                Type::Generic(named) => !self.generic_is_enclosing_binder(named, call_id),
+                _ => false,
+            };
             if open.contains(&constraint_id)
                 && !self.generic_is_enclosing_binder(constraint_id, call_id)
                 && *type_id.borrow_type(self) != Type::Generic(constraint_id)
+                && !expectation_is_a_foreign_generic
                 && !self.type_has_hole(type_id)
             {
                 substitution.insert(constraint_id, type_id);
@@ -34339,12 +34445,34 @@ impl<'src> Analyzer<'src> {
                             // (`|T| U`) types the closure parameter with the
                             // concrete receiver binding (`T = Point`) rather
                             // than the abstract `T`.
-                            let resolved = match expected_type_id.get_type(self) {
+                            //
+                            // STRUCTURALLY, not only when the expected type is
+                            // a BARE `Type::Generic` (B347). `each_by`'s render
+                            // parameter is `|SignalCell<T>| C` — the generic is
+                            // one constructor deep — so the bare-generic arm
+                            // did not reach it and the slot froze at the
+                            // abstract `SignalCell<T>`: `h.get().title` was
+                            // then "cannot access field 'title' on type T",
+                            // with the annotation `|h: SignalCell<Handle>|` the
+                            // only way out. The retired `View::bind_each_by`
+                            // METHOD bound `T` through the receiver path, which
+                            // is why A99's rewrite to the free call was not
+                            // type-preserving for this one signature.
+                            //
+                            // A substitution that binds nothing leaves the type
+                            // as written, which is what the old arm's
+                            // `unwrap_or(expected_type_id)` did for its own
+                            // case, so a call whose generics have not landed
+                            // yet is unchanged.
+                            let expected_type = expected_type_id.get_type(self);
+                            let resolved = match &expected_type {
                                 Type::Generic(constraint_id) => substitution_context
-                                    .get(&constraint_id)
+                                    .get(constraint_id)
                                     .copied()
                                     .unwrap_or(expected_type_id),
-                                _ => expected_type_id,
+                                _ => self
+                                    .substitute_type(&expected_type, substitution_context)
+                                    .get_type_id(self),
                             };
                             if let Some(parameter) = self.parameters.get_mut(parameter_id) {
                                 parameter.type_id = resolved;
@@ -38933,7 +39061,11 @@ impl<'src> Analyzer<'src> {
                                 let bindable = self.callee_bindable_generics(target_id);
                                 for (constraint_id, type_id) in bindings {
                                     if bindable.contains(&constraint_id) {
-                                        substitution_context.insert(constraint_id, type_id);
+                                        self.record_generic_binding(
+                                            &mut substitution_context,
+                                            constraint_id,
+                                            type_id,
+                                        );
                                     }
                                 }
                             }
@@ -40104,6 +40236,37 @@ impl<'src> Analyzer<'src> {
                 .unwrap_or(Type::Unknown);
             let argument_type = self.infer_type(*argument_id, &parameter_type, &HashMap::default());
             if matches!(argument_type, Type::Unresolved) {
+                return Resolution::Deferred;
+            }
+            // B353 — an UNANNOTATED closure parameter whose one-shot slot has
+            // not been filled yet is `Unknown`, and `Unknown` reconciles with
+            // everything. This check ran ONCE and answered `Resolved`, so a
+            // call written inside a closure body was checked against a
+            // parameter that had no type yet and then never checked again:
+            //
+            //     let cell = Signal::new("a string");   // SignalCell<str>
+            //     cell.effect(|incoming| flag.set(incoming));  // flag: <bool>
+            //
+            // compiled, and the emitted program printed a `str` out of a
+            // `SignalCell<bool>`. It is a MISCOMPILE and not merely a missed
+            // diagnostic: nothing downstream re-checks the argument, and the
+            // JS is untyped. The annotated form (`|incoming: str|`) was
+            // refused, and so was an annotated RECEIVER (`let cell:
+            // SignalCell<str> = ..`) — the two orders differ only in when the
+            // enclosing call resolves, which is exactly what "checked while
+            // the slot was still open" means.
+            //
+            // The free-function path has never had this hole: its positional
+            // loop meets the same argument and either adopts the declared type
+            // (B13) or DEFERS. Deferring is what this one does — the enclosing
+            // call fills the slot, the retry sees a real type, and the
+            // ordinary "Expected bool, but got str" lands on the argument. A
+            // slot NOTHING ever fills is B131's starved-parameter refusal,
+            // which names the parameter and asks for an annotation, so the
+            // deferral cannot go silent.
+            if matches!(argument_type, Type::Unknown)
+                && self.is_unknown_closure_parameter(*argument_id)
+            {
                 return Resolution::Deferred;
             }
             argument_types.push(argument_type);
@@ -45440,6 +45603,7 @@ impl<'src> Analyzer<'src> {
                             // binders for the call this accessor subjects —
                             // reconciled impl-first so the bindings key on the
                             // impl's generics.
+                            self.seed_trait_static_subject_bindings(id, &subject_type);
                             let has_concrete_args = matches!(
                                 &subject_type,
                                 Type::Struct(_, args) | Type::Enum(_, args) if !args.is_empty()
@@ -59604,6 +59768,9 @@ pub fn build_impl_admission(program: &mut Program) {
     // B338: selectors that admitted nothing, reported once the walk is done so
     // the diagnostics come back in source order.
     let mut selector_misses: Vec<(SourceId, Span, String)> = Vec::new();
+    // B350: `#(impl T)` selectors whose blocks the module exports anyway — a
+    // WARNING, banked the same way so it lands in source order too.
+    let mut redundant_markers: Vec<(SourceId, Span, String)> = Vec::new();
     // Per statement, the files its walk carried — the input the collision
     // refusal reads, and the same answer the admission loop below computes.
     // Built for EVERY statement only when a collision is banked; otherwise only
@@ -59657,6 +59824,8 @@ pub fn build_impl_admission(program: &mut Program) {
         for selector in &row.selectors {
             let mut members: Vec<Id> = Vec::new();
             let mut subject_reached = false;
+            // B350: whether the `#` on this selector reached anything HIDDEN.
+            let mut reached_a_hidden_block = false;
             for implementation in &program.implementations {
                 if !sources.contains(&implementation.source)
                     || !selector_admits(program, implementation.subject, selector.subject)
@@ -59664,6 +59833,7 @@ pub fn build_impl_admission(program: &mut Program) {
                     continue;
                 }
                 subject_reached = true;
+                reached_a_hidden_block |= hidden.contains(&implementation.impl_id);
                 for (name, member_id) in &implementation.declarations {
                     if selector.members.is_empty()
                         || selector.members.iter().any(|(taken, _)| taken == name)
@@ -59671,6 +59841,34 @@ pub fn build_impl_admission(program: &mut Program) {
                         members.push(*member_id);
                     }
                 }
+            }
+            // B350 (§14/§15's open symmetry): the IMPL twin of S2's
+            // "`{module}` exports `{leaf}`, so the reach marker is redundant".
+            // A `#` says "this block is hidden from me and I am taking it
+            // anyway"; written on a selector every one of whose blocks the
+            // module exports, it says something about the author's belief that
+            // is not true, and the fix is to delete a character. A WARNING and
+            // not a refusal, exactly as the leaf twin is: the import means the
+            // same thing with the marker as without it.
+            //
+            // Silent when the selector reached NO block at all — that is
+            // B338's miss, already reported above, and a second sentence about
+            // a marker on a selector that admits nothing would bury it.
+            if selector.reached && subject_reached && !reached_a_hidden_block {
+                let subject = &selector.text;
+                let modules = sources
+                    .iter()
+                    .map(|source| format!("`{}`", module_stem(program, *source)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                redundant_markers.push((
+                    row.source,
+                    selector.span,
+                    format!(
+                        "every `impl {subject}` in {modules} is exported, so the reach marker \
+                         is redundant — delete the `#`"
+                    ),
+                ));
             }
             // B338: a selector that admits NOTHING is almost certainly a typo,
             // and it used to be silent — the mistake surfaced later, as the
@@ -59737,6 +59935,21 @@ pub fn build_impl_admission(program: &mut Program) {
             },
             source,
         );
+    }
+    // B350's warnings, in the same canonical order. Deduplicated by SITE: a
+    // package with two entries resolves a shared module's imports once per
+    // entry world, and one selector is one mistake (B5, the leaf twin's rule).
+    redundant_markers.sort_by_key(|(source, span, _)| (source.0, span.start, span.end));
+    redundant_markers
+        .dedup_by(|left, right| left.0 == right.0 && left.1 == right.1 && left.2 == right.2);
+    for (source, span, msg) in redundant_markers {
+        program.warnings.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span,
+            msg,
+        });
+        program.warning_sources.push(source);
     }
     program.impl_admission = ImplAdmission {
         restricting,
