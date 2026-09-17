@@ -16,8 +16,8 @@
 //! | Written | Lowers to |
 //! |---|---|
 //! | `css { … }` | `style()` followed by the items in written order |
-//! | `prop: <one hole>;` | `.raw("prop", <the hole's expression>)` |
-//! | `prop: <anything else>;` | `.raw("prop", <the value's source slice as a str, each hole through `std::style::piece`>)` |
+//! | `prop(value);` | `.raw("prop", <the one argument, untouched>)` |
+//! | `prop(a, b, …);` | `.raw("prop", <the arguments joined by one space, each through `std::style::piece`>)` |
 //! | `.name { … }` | `.name(style() … )` |
 //! | `.name(a, b) { … }` | `.name(a, b, style() … )` |
 //! | `.name(a, b);` | `.name(a, b)` — a chain link, verbatim (A69) |
@@ -50,18 +50,19 @@
 //! prelude at all; the loader seeds `std::style` off the reference itself, so
 //! the form needs no import to work.
 //!
-//! Property names and value text are stored as SPANS by the parser (a
-//! hyphenated or custom property spans tokens carrying no joined text) and
-//! sliced from the source here, where it is in scope — the same mechanism the
-//! element desugar uses for tag and attribute names.
+//! Property names are stored as SPANS by the parser (a hyphenated or custom
+//! property spans tokens carrying no joined text) and sliced from the source
+//! here, where it is in scope — the same mechanism the element desugar uses for
+//! tag and attribute names. A declaration's VALUES are not sliced at all any
+//! more: they are ordinary expression nodes the parser built (A101).
 //!
 //! The pass is the identity on css-free trees: a cheap `contains_css`
 //! prefilter (riding `for_each_child`, like lift's mark detection) leaves
 //! untouched nodes unrebuilt.
 
 use crate::node::{
-    BinaryOp, Closure, CssBody, CssDeclaration, CssItem, CssLink, CssNested, CssValuePiece,
-    ElementHeadItem, If, Node, NodeIfBranch, NodeList,
+    BinaryOp, Closure, CssBody, CssDeclaration, CssItem, CssLink, CssNested, ElementHeadItem, If,
+    Node, NodeIfBranch, NodeList,
 };
 use crate::span::{Span, Spanned};
 
@@ -155,21 +156,26 @@ fn build_chain<'src>(body: CssBody<'src>, head: Span, source: &'src str) -> Span
     chain
 }
 
-/// `prop: value;` → `.raw("prop", value)` — one row of the table, total: there
-/// is no CSS property the block cannot express, because `raw` is the model's
-/// escape hatch and the block inherits it whole (§5.2).
+/// `prop(value);` → `.raw("prop", value)` — one row of the table, total:
+/// there is no CSS property the block cannot express, because `raw` is the
+/// model's escape hatch and the block inherits it whole (§5.2).
 fn declaration_link<'src>(
     declaration: CssDeclaration<'src>,
     source: &'src str,
 ) -> Spanned<Node<'src>> {
     let CssDeclaration {
         property,
-        value,
-        value_span,
+        mut arguments,
+        parens,
         span,
     } = declaration;
+    // An argument is an ordinary expression and may hold a block of its own,
+    // exactly as a nested rule's head or a chain link's arguments may.
+    for argument in arguments.iter_mut() {
+        take_and_desugar(argument, source);
+    }
     let property_text = &source[property.into_range()];
-    let value = build_value(value, value_span, source);
+    let value = build_value(arguments, parens);
     // Zero-width scaffolding span: the property name is CSS, not a method
     // reference, and the LSP paints it as a property.
     let anchor: Span = (property.start..property.start).into();
@@ -183,66 +189,58 @@ fn declaration_link<'src>(
     )
 }
 
-/// The two value rows of §5.2's table are one rule with two spellings of the
-/// argument. A value that is EXACTLY one hole and nothing else passes its
-/// expression through untouched, so `gap: {space(4)};` keeps a `Length` and its
-/// `:root` line; anything else becomes a `str` — and when it contains holes,
-/// the same parenthesized concatenation the lexer builds for an i-string, so
-/// `padding: {a} {b};` and `.raw("padding", i"{a} {b}")` are the same tree.
-/// Both paths call the same method, and the TYPE SYSTEM decides what the value
-/// means.
-fn build_value<'src>(
-    pieces: Vec<CssValuePiece<'src>>,
-    value_span: Span,
-    source: &'src str,
-) -> Spanned<Node<'src>> {
-    if let [CssValuePiece::Hole(..)] = pieces.as_slice() {
-        let Some(CssValuePiece::Hole(expression, _)) = pieces.into_iter().next() else {
-            unreachable!("just matched a single hole");
+/// The declaration's arguments as the ONE value `raw` takes (A101 R10).
+///
+/// ONE argument passes through untouched, so `gap(space(4));` keeps a `Length`
+/// and its `:root` line and `outline("none");` is the string it reads as —
+/// `raw`'s §6 bound decides what the value means, which is where the type
+/// system already lives.
+///
+/// N arguments are joined by a single SPACE, CSS's own value-list separator, so
+/// `margin(px(4), px(8));` is `margin:4px 8px`. `raw`'s ARITY does not change:
+/// the join is built here, as the same parenthesized concatenation the lexer
+/// builds for an i-string (`("" + a + " " + b)`, left-associated, seeded with
+/// the empty string), with every argument through `std::style::piece` (A34) —
+/// which returns the piece's text and puts its `:root` line on the sheet on the
+/// way past. Without it a `Length` mid-list would emit `var(--space-4)` with
+/// nothing declaring it, which is the hazard the one-argument path exists to
+/// close.
+fn build_value<'src>(arguments: Vec<Spanned<Node<'src>>>, parens: Span) -> Spanned<Node<'src>> {
+    if arguments.len() == 1 {
+        let Some(only) = arguments.into_iter().next() else {
+            unreachable!("just checked the length");
         };
-        return expression;
+        return only;
     }
-    if let [CssValuePiece::Text(text)] = pieces.as_slice() {
-        // A hole-free value is its own source slice, read as a string body:
-        // exactly the node `.raw("prop", "text")` parses to.
-        return (Node::String(&source[text.into_range()]), *text);
+    let mut concatenation: Spanned<Node<'src>> = (Node::String(""), parens);
+    for (index, argument) in arguments.into_iter().enumerate() {
+        if index > 0 {
+            let separator = (Node::String(" "), argument.1);
+            concatenation = join(concatenation, separator);
+        }
+        let part = wrap_piece(argument);
+        concatenation = join(concatenation, part);
     }
-    // Mixed: the i-string's own shape — `("" + part + part + …)`, left
-    // associated, seeded with the empty string (`lexing::emit_interpolated`)
-    // — with every HOLE wrapped in `std::style::piece` (A34), which returns
-    // the hole's text and puts its `:root` line on the sheet on the way past.
-    //
-    // That wrapper is the whole of A34. Without it a mixed value was a plain
-    // string concatenation, so `border: 1px solid {Color::gray(500)};` had no
-    // correct spelling: `+` refuses a struct outright, and reaching for
-    // `.text` emits `var(--gray-500)` with nothing declaring it — the exact
-    // hazard the single-hole path exists to close. The single-hole path is
-    // untouched: a value that is EXACTLY one hole still passes its expression
-    // through, keeps its type, and reaches `Style::raw`, which does the same
-    // job for a whole value.
-    let mut concatenation: Spanned<Node<'src>> = (Node::String(""), value_span);
-    for piece in pieces {
-        let part = match piece {
-            CssValuePiece::Hole(expression, _) => wrap_piece(expression),
-            CssValuePiece::Text(text) => (Node::String(&source[text.into_range()]), text),
-        };
-        let span: Span = (concatenation.1.start..part.1.end).into();
-        concatenation = (
-            Node::Binary(BinaryOp::Add, Box::new(concatenation), Box::new(part)),
-            span,
-        );
-    }
-    (concatenation.0, value_span)
+    (concatenation.0, parens)
 }
 
-/// One hole of a MIXED value, wrapped in `std::style::piece` (A34): the call
-/// returns the hole's text and emits its `:root` line, so a typed style token
-/// mid-value carries its token exactly as a whole-value one does.
+/// One `+` of the value join, with the grown span.
+fn join<'src>(left: Spanned<Node<'src>>, right: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
+    let span: Span = (left.1.start..right.1.end).into();
+    (
+        Node::Binary(BinaryOp::Add, Box::new(left), Box::new(right)),
+        span,
+    )
+}
+
+/// One argument of a MULTI-argument value, wrapped in `std::style::piece`
+/// (A34): the call returns the argument's text and emits its `:root` line, so a
+/// typed style token mid-value carries its token exactly as a whole value does.
 ///
-/// The callee is a `StdItem`, so it means std's `piece` whatever the site
-/// binds — the same hygiene B270 gave the seed, and for the same reason: this
-/// is a call nobody wrote. Its span is the hole's own expression span, which
-/// is where a `CssPiece` failure should underline.
+/// The callee is a `StdItem`, so it means std's `piece` whatever the site binds
+/// — the same hygiene B270 gave the seed, and for the same reason: this is a
+/// call nobody wrote. Its span is the argument's own, which is where a
+/// `CssPiece` failure should underline.
 fn wrap_piece<'src>(expression: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
     let span = expression.1;
     (
@@ -601,6 +599,10 @@ mod tests {
         (strip_spans(&peeled(block)), strip_spans(&peeled(chain)))
     }
 
+    /// What [`lowered`] and [`peeled`] put in FRONT of the fixture, which every
+    /// span pin here is an offset into: `let probe = `.
+    const PROBE_PREFIX: usize = "let probe = ".len();
+
     /// [`lowered`] with the marks off and the seed read as the accessor it
     /// means.
     fn peeled(source: &str) -> String {
@@ -681,21 +683,21 @@ mod tests {
     }
 
     #[test]
-    fn a_mixed_value_lowers_to_the_i_string_shape_with_each_hole_through_piece() {
-        // Text, hole, text — the same parenthesized concatenation
-        // `lexing::emit_interpolated` builds, whitespace included (the space
-        // before `+` belongs to the text run, not to the hole), with every
-        // HOLE wrapped in `std::style::piece` (A34), which returns the hole's
-        // text and puts its `:root` line on the sheet.
+    fn several_arguments_lower_to_the_space_join_with_each_through_piece() {
+        // R10: N arguments are ONE value, joined by a single space — the same
+        // parenthesized concatenation `lexing::emit_interpolated` builds for an
+        // i-string, seeded with the empty string — with every ARGUMENT wrapped
+        // in `std::style::piece` (A34), which returns its text and puts its
+        // `:root` line on the sheet.
         //
         // The chain side spells the wrapper out, so the two sides are the same
         // tree and the claim stays "the lowering IS the chain". `piece` is a
-        // hygienic reference in the block, and the normalization below reads
-        // it as the name a hand-written chain would import.
-        let block = strip_spans(&peeled("css { padding: calc({a} + 2px); }"))
+        // hygienic reference in the block, and the normalization below reads it
+        // as the name a hand-written chain would import.
+        let block = strip_spans(&peeled("css { border(\"1px solid\", gray(500)); }"))
             .replace("StdItem(\"style\", \"piece\")", "Accessor(\"piece\")");
         let chain = strip_spans(&peeled(
-            r#"style().raw("padding", "" + "calc(" + piece(a) + " + 2px)")"#,
+            r#"style().raw("border", "" + piece("1px solid") + " " + piece(gray(500)))"#,
         ));
         assert_eq!(block, chain);
     }
@@ -734,7 +736,7 @@ mod tests {
         // middle included.
         let (block, chain) = shapes_match(
             "css { color: red; .hover { color: blue; } padding: 1rem; }",
-            r#"style().raw("color", "red").hover(style().raw("color", "blue")).raw("padding", "1rem")"#,
+            r#"style().raw("color", "red").hover(style().raw("color", "blue")).raw("padding", rem(1))"#,
         );
         assert_eq!(block, chain);
     }
@@ -767,7 +769,7 @@ mod tests {
         // may write any property at all).
         let (block, chain) = shapes_match(
             "css { color: red; .ghost(); padding: 1rem; }",
-            r#"style().raw("color", "red").ghost().raw("padding", "1rem")"#,
+            r#"style().raw("color", "red").ghost().raw("padding", rem(1))"#,
         );
         assert_eq!(block, chain);
     }
@@ -879,12 +881,19 @@ mod tests {
     }
 
     #[test]
-    fn a_hole_keeps_its_own_expression_span() {
-        // The generated `.raw` link must not shadow the hole's own tokens: the
-        // hole's expression carries the span it was written at, and the link's
-        // accessor is zero-width elsewhere.
-        let tree = lowered("css { gap: {space(4)}; }");
-        assert!(tree.contains("(Accessor(\"space\"), 24..29)"), "{tree}");
+    fn an_arguments_expression_keeps_its_own_span() {
+        // The generated `.raw` link must not shadow the declaration's own
+        // tokens: an argument carries the span it was written at, and the
+        // link's accessor is zero-width elsewhere. The offset is read off the
+        // fixture rather than written down, so a value's SPELLING can change
+        // without the pin becoming a claim about arithmetic.
+        let source = "css { gap(space(4)); }";
+        let at = PROBE_PREFIX + source.find("space").expect("the fixture");
+        let tree = lowered(source);
+        assert!(
+            tree.contains(&format!("(Accessor(\"space\"), {at}..{})", at + 5)),
+            "{tree}"
+        );
     }
 
     #[test]
@@ -892,6 +901,21 @@ mod tests {
         let plain = r#"style().raw("display", "flex")"#;
         assert_eq!(lowered(plain), lowered(plain));
         assert!(!lowered(plain).contains("Css"), "no css node survives");
+    }
+
+    #[test]
+    fn a_block_inside_a_declarations_argument_is_lowered() {
+        // A declaration's arguments are ordinary expressions and may hold a
+        // block of their own, so the pass descends into them exactly as it
+        // descends into a nested rule's head and a chain link's arguments.
+        //
+        // It did NOT before A101, and the shape was a live defect at
+        // d783fbf4: `content: {const css { … }.class_list()};` left the inner
+        // `Node::Css` in the tree, and the analyzer answered a legal program
+        // with three cascading "could not be resolved" errors about a type it
+        // had no arm for.
+        let tree = lowered("css { content(const css { display(\"flex\"); }.class_list()); }");
+        assert!(!tree.contains("Css("), "no css node survives: {tree}");
     }
 
     #[test]

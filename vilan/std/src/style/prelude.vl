@@ -22,6 +22,7 @@
 import pkg::style::{
 	Color,
 	Condition,
+	CssPiece,
 	Length,
 	Style,
 	active as active_condition,
@@ -37,10 +38,12 @@ import pkg::style::{
 	lg as lg_condition,
 	md as md_condition,
 	media as media_condition,
+	piece as value_piece,
 	pseudo as pseudo_condition,
 	sm as sm_condition,
 	space as scale_step,
 	style as open_style,
+	var as custom_property,
 	within as within_condition,
 	xl as xl_condition,
 };
@@ -123,6 +126,26 @@ fun rgba(red: i32, green: i32, blue: i32, alpha: f64): Color {
 
 fun oklch(lightness: f64, chroma: f64, hue: f64): Color {
 	Color::oklch(lightness, chroma, hue)
+}
+
+/// A CUSTOM PROPERTY as a value — `color(var("--brand-ink"));` (A101 R12).
+/// `--brand-ink` is not an expression, so CSS's `var(--x)` is spelled with the
+/// name as a string; the dashes are checked, because a name without them is not
+/// a reference at all.
+fun var(name: str): str {
+	custom_property(name)
+}
+
+/// One PIECE of a value assembled from text and expressions —
+/// `padding(i"calc({piece(space(4))} + 2px)");`.
+///
+/// A declaration's arguments are whole values, joined by a space when there are
+/// several (A101 R10); a value whose parts are GLUED (`calc(… + 2px)`,
+/// `{150}ms`) is one argument built here instead, and each part goes through
+/// this so a `Length` or a `Color` inside it puts its `:root` line on the sheet
+/// rather than emitting a `var()` nothing declares.
+fun piece<V: CssPiece>(value: V): str {
+	value_piece(value)
 }
 
 // --- the builder --------------------------------------------------------------

@@ -14,7 +14,7 @@ use vilan_core::fx::{FxHashMap as HashMap, FxHashSet};
 use vilan_core::id::Id;
 use vilan_core::leak_tally::{LeakSite, Leaked};
 use vilan_core::lexing::{AT_IS_NOT_A_TOKEN, tokenize};
-use vilan_core::node::{Convention, CssDeclaration, CssItem, CssValuePiece, Node};
+use vilan_core::node::{Convention, CssDeclaration, CssItem, Node};
 use vilan_core::parsing::IMPORTANT_HAS_NO_PLACE;
 use vilan_core::{
     Error, LeakedEntryAst, Manifest, OwnedModules, Platform as BuildPlatform, Program, Span,
@@ -5823,26 +5823,6 @@ impl Document {
                     replacement: String::new(),
                     target: None,
                 });
-            } else if diagnostic
-                .msg
-                .starts_with(vilan_core::parsing::HASH_IS_NOT_A_CSS_VALUE)
-                && let Some(span) = hex_colour_span(&self.text, diagnostic.span.start)
-            {
-                // css-block S5, §7.2 fix 1. B318 §2.3 moved the refusal off the
-                // lexer and onto the `css` block's own value parser — `#` is the
-                // import reach marker now, and the lexer had no way to know
-                // which of the two it was looking at — so this keys on the
-                // parser's constant. The diagnostic is still ONE character wide
-                // (`#`), which is what lets the colour be read off the text
-                // here, and the fix is still the hole spelling the diagnostic
-                // names, so the two cannot disagree (E58c's rule).
-                let hole = format!("{{Color::hex(\"{}\")}}", &self.text[span.into_range()]);
-                fixes.push(QuickFix {
-                    title: format!("Wrap as `{hole}`"),
-                    span,
-                    replacement: hole,
-                    target: None,
-                });
             } else if diagnostic.msg.starts_with(AT_IS_NOT_A_TOKEN)
                 && let Some(fix) = media_rule_fix(&self.text, diagnostic.span.start)
             {
@@ -5861,10 +5841,11 @@ impl Document {
                     target: None,
                 });
             } else if diagnostic.msg.starts_with(IMPORTANT_HAS_NO_PLACE) {
-                // §7.2 fix 3. The parser excises `!important` from the value
-                // and reports at exactly its span, so the fix is that span
-                // plus the whitespace holding it to the value — removing the
-                // marker alone would leave `flex ;`.
+                // §7.2 fix 3. The parser reads the marker off the declaration's
+                // argument TOKENS (A101 — `red !important` is not an expression)
+                // and reports at exactly its span, so the fix is that span plus
+                // the whitespace holding it to the value — removing the marker
+                // alone would leave `color(red )`.
                 let start = self.text[..diagnostic.span.start]
                     .trim_end_matches([' ', '\t'])
                     .len();
@@ -6871,44 +6852,22 @@ fn render_chain_link(item: &CssItem<'_>, source: &str) -> Option<String> {
     }
 }
 
-/// A declaration's value as the `raw` argument it lowers to — the three rows of
-/// §5.2's table, in the same order the desugar reads them.
+/// A declaration's value as the ONE `raw` argument it lowers to (A101 R10).
+///
+/// ONE argument IS the value and passes through untouched. SEVERAL are the
+/// space join, and the conversion DECLINES on them — the third refusal, and the
+/// honest one: the chain twin of `margin(px(4), px(8))` is
+/// `raw("margin", piece(px(4)) + " " + piece(px(8)))`, and `piece` is ambient
+/// inside a BLOCK and nowhere else, so the text this writes into the user's
+/// file would name something the file does not import. An action that leaves a
+/// file broken is worse than an action not offered; adding the import is a
+/// different feature (the add-import machinery is a `Document` surface, and
+/// this renderer has no file to add one to).
 fn render_chain_value(declaration: &CssDeclaration<'_>, source: &str) -> Option<String> {
-    match declaration.value.as_slice() {
-        // Exactly one hole passes its expression through untouched, so the
-        // argument IS that expression.
-        [CssValuePiece::Hole(_, braces)] => Some(
-            source[braces.start + 1..braces.end.saturating_sub(1)]
-                .trim()
-                .to_string(),
-        ),
-        [CssValuePiece::Text(text)] => {
-            Some(format!("\"{}\"", escape_value(&source[text.into_range()])?))
-        }
-        // Mixed: the i-string the desugar's concatenation already is — the two
-        // build the same tree (§5.2), and the value's own text is an i-string
-        // body verbatim, holes included.
-        pieces => {
-            let mut literal = String::new();
-            for piece in pieces {
-                match piece {
-                    CssValuePiece::Hole(_, braces) => {
-                        literal.push_str(&source[braces.into_range()])
-                    }
-                    CssValuePiece::Text(text) => {
-                        literal.push_str(&escape_value(&source[text.into_range()])?)
-                    }
-                }
-            }
-            Some(format!("i\"{literal}\""))
-        }
-    }
-}
-
-/// `text` as a vilan string-literal BODY, or `None` when the two spellings would
-/// stop meaning the same thing — see [`CssConversion`]'s backslash refusal.
-fn escape_value(text: &str) -> Option<String> {
-    (!text.contains('\\')).then(|| text.replace('"', "\\\""))
+    let [only] = declaration.arguments.as_slice() else {
+        return None;
+    };
+    Some(source[only.1.into_range()].to_string())
 }
 
 /// A `style()` chain as the `css` block it is the lowering of, with the links
@@ -7022,7 +6981,7 @@ fn render_css_link(
     let declarations = style_link_declarations(surface, name, &written, 0)?;
     let mut out = String::new();
     for (property, value) in declarations {
-        out.push_str(&format!("{inner}{property}: {value};\n"));
+        out.push_str(&format!("{inner}{property}({value});\n"));
     }
     Some(out)
 }
@@ -7160,13 +7119,13 @@ impl<'a> InlineValue<'a> {
         }
     }
 
-    /// The value as a `css` declaration writes it: a plain token run as itself,
-    /// everything else through a HOLE, which is exact.
+    /// The value as a `css` declaration writes it — which since A101 is the
+    /// ARGUMENT it already is: a declaration's value is an ordinary vilan
+    /// expression in both spellings, so the text passes straight through and
+    /// the plain-token-run rule (and the `{ }` hole it chose between) is gone
+    /// with the value grammar.
     fn declaration_value(&self) -> String {
-        match self.written {
-            Some((node, source)) => render_block_value(node, source),
-            None => format!("{{{}}}", self.text),
-        }
+        self.text.clone()
     }
 
     /// The value as a declaration's PROPERTY — a string literal that is
@@ -7257,11 +7216,16 @@ fn style_link_declarations<'a>(
 ///  - the expression is a path or call rooted at a parameter (`value.value()`),
 ///    so the caller's text is spliced at the parameter's own span.
 ///
-/// A `Binary` is refused, with one exception: `i"{x}"` lexes to `("" + (x))`
-/// (the lexer desugars an interpolation in place), and an i-string that is
-/// exactly one hole MEANS that hole — `flex_grow(3)` writes `flex-grow: {3};`
-/// rather than a nested i-string. Every other `Binary` carries wrapper tokens
-/// spanning the whole construct, which is exactly what a span splice cannot read.
+/// A `Binary` needs NO special case since A101, and losing the one it had is a
+/// fix. `i"{x}"` lexes to `("" + (x))` (the lexer desugars an interpolation in
+/// place) and the arm unwrapped it to its hole, so `flex_grow(3)` — whose body
+/// is `self.raw("flex-grow", i"{value}")` — converted to `flex-grow: {3};`,
+/// which lowers to `.raw("flex-grow", 3)` and does not compile: an `f64` is no
+/// `CssValue`, and the block spelling the refactor offered was one the type
+/// system refuses. The span splice reads the i-string WHOLE (its node spans the
+/// literal and the parameter sits inside it), so `flex-grow(i"{3}")` is what it
+/// writes now — the method's own expression, which is what the inliner promises
+/// everywhere else.
 fn inline_argument<'a>(
     node: &'a vilan_core::Spanned<Node<'a>>,
     style_source: &'a str,
@@ -7271,12 +7235,6 @@ fn inline_argument<'a>(
         && let Some((_, value)) = bindings.iter().find(|(parameter, _)| *parameter == name)
     {
         return Some((*value).clone());
-    }
-    if let Node::Binary(vilan_core::node::BinaryOp::Add, left, right) = &node.0 {
-        if matches!(left.0, Node::String("")) {
-            return inline_argument(right, style_source, bindings);
-        }
-        return None;
     }
     let mut holes: Vec<(vilan_core::span::Span, usize)> = Vec::new();
     collect_parameter_spans(node, bindings, &mut holes);
@@ -7338,23 +7296,6 @@ fn collect_parameter_spans<'a>(
     }
 }
 
-/// A `raw` argument as a declaration's value. A plain token run is written as
-/// itself; everything else goes back through a HOLE, which is exact — a value
-/// that is exactly one hole passes its expression through untouched.
-fn render_block_value(
-    value: &vilan_core::Spanned<vilan_core::node::Node<'_>>,
-    source: &str,
-) -> String {
-    if let Node::String(literal) = value.0
-        && !literal.is_empty()
-        && literal.trim() == literal
-        && !literal.contains(['\\', '"', ';', '{', '}'])
-    {
-        return literal.to_string();
-    }
-    format!("{{{}}}", &source[value.1.into_range()])
-}
-
 /// Whether `name` is spellable as a `css` property: the span-adjacent
 /// `name`-`-`-`name` run the grammar reads (`parse_css_property`), custom
 /// properties and vendor prefixes included. A `raw` call naming anything else
@@ -7371,21 +7312,6 @@ fn is_css_property(name: &str) -> bool {
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
             && !segment.as_bytes()[0].is_ascii_digit()
     })
-}
-
-/// The whole `#rrggbb` run the `#` diagnostic at `hash` points at — when it IS
-/// one. CSS has exactly four hex-colour lengths (3, 4, 6 and 8 digits), and the
-/// run has to END there: `#zzz` and `#333xyz` are not colours, and a fix that
-/// rewrote them would be inventing a value the author never wrote. Those keep
-/// the rule's explanation and get no edit at all (css-block.md §7.2 fix 1).
-fn hex_colour_span(text: &str, hash: usize) -> Option<Span> {
-    let rest = text.get(hash..)?.strip_prefix('#')?;
-    let digits = rest.bytes().take_while(u8::is_ascii_hexdigit).count();
-    let ends = rest
-        .as_bytes()
-        .get(digits)
-        .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_');
-    (matches!(digits, 3 | 4 | 6 | 8) && ends).then(|| Span::from(hash..hash + 1 + digits))
 }
 
 /// css-block.md §7.2 fix 2: `@media (min-width: 768px) {` → `.md {`.
@@ -8497,45 +8423,6 @@ pub(crate) mod tests {
         fixes
     }
 
-    // §7.2 fix 1. B318 §2.3 moved the refusal off the LEXER — `#` is the import
-    // reach marker now, and a context-free lexer cannot tell a colour from a
-    // reach — and onto the `css` block's own value parser, which can. The
-    // diagnostic is still ONE CHARACTER wide, which is what lets the fix read
-    // the colour off the text itself, and it still rewrites the whole run into
-    // the hole spelling the diagnostic names; this test is what holds the
-    // re-keying to the same answer.
-    #[test]
-    fn quickfix_wraps_a_hex_colour_as_a_colour_hole() {
-        let fixes = css_block_fixes("\tcss {\n\t\tcolor: #336699;\n\t}\n");
-        assert!(
-            fixes.contains(&(
-                "Wrap as `{Color::hex(\"#336699\")}`".to_string(),
-                "#336699".to_string(),
-                "{Color::hex(\"#336699\")}".to_string(),
-            )),
-            "{fixes:?}"
-        );
-        // The three-digit form too, and the four hex lengths are the whole
-        // gate: a `#` that is not a colour keeps the explanation and gets no
-        // edit, because there is nothing to wrap.
-        let short = css_block_fixes("\tcss {\n\t\tcolor: #333;\n\t}\n");
-        assert!(
-            short
-                .iter()
-                .any(|(title, _, _)| title == "Wrap as `{Color::hex(\"#333\")}`"),
-            "{short:?}"
-        );
-        for stray in ["#zzz", "#33669", "#333ing"] {
-            let not_a_colour = css_block_fixes(&format!("\tcss {{\n\t\tcolor: {stray};\n\t}}\n"));
-            assert!(
-                !not_a_colour
-                    .iter()
-                    .any(|(title, _, _)| title.starts_with("Wrap as")),
-                "`{stray}` is not a colour, so it gets the rule and no edit: {not_a_colour:?}"
-            );
-        }
-    }
-
     // B318 §5: the two reach warnings carry one-character fixes, and a WARNING
     // is not in `diagnostics` — deliberately, since 62 sites gate on
     // `diagnostics.is_empty()` and a warning must not disable Organize Imports.
@@ -9105,12 +8992,13 @@ pub(crate) mod tests {
         );
     }
 
-    // §7.2 fix 3. The parser excises `!important` from the value and reports
-    // at exactly its span; the fix removes it — and takes the space in front
-    // of it, so `flex !important;` becomes `flex;` rather than `flex ;`.
+    // §7.2 fix 3. The parser reads the marker off the declaration's argument
+    // TOKENS (A101) and reports at exactly its span; the fix removes it — and
+    // takes the space in front of it, so `flex !important` becomes `flex`
+    // rather than `flex `.
     #[test]
     fn quickfix_removes_an_important_marker() {
-        let fixes = css_block_fixes("\tcss {\n\t\tdisplay: flex !important;\n\t}\n");
+        let fixes = css_block_fixes("\tcss {\n\t\tdisplay(flex !important);\n\t}\n");
         assert!(
             fixes.contains(&(
                 "Remove `!important`".to_string(),
@@ -9149,7 +9037,7 @@ pub(crate) mod tests {
     // insertion fires inside a block with no css-side code at all.
     #[test]
     fn quickfix_inserts_a_missing_semicolon_in_a_css_block() {
-        let fixes = css_block_fixes("\tcss {\n\t\tdisplay: flex\n\t}\n");
+        let fixes = css_block_fixes("\tcss {\n\t\tdisplay(\"flex\")\n\t}\n");
         assert!(
             fixes.contains(&("Insert `;`".to_string(), String::new(), ";".to_string())),
             "{fixes:?}"
@@ -9208,14 +9096,14 @@ pub(crate) mod tests {
     #[test]
     fn refactor_converts_a_css_block_to_a_style_chain() {
         let conversion = css_conversion(
-            "\tcss {\n\t\tdis~play: flex;\n\t\tgap: {space(4)};\n\t\ttransition-duration: {150}ms;\n\t\t.md {\n\t\t\tpadding: {space(6)};\n\t\t}\n\t}\n",
+            "\tcss {\n\t\tdis~play(\"flex\");\n\t\tgap(space(4));\n\t\ttransition-duration(i\"{piece(150)}ms\");\n\t\t.md {\n\t\t\tpadding(space(6));\n\t\t}\n\t}\n",
         )
         .expect("a block converts");
         assert!(conversion.0, "block -> chain");
         assert!(conversion.1.starts_with("css {"), "{conversion:?}");
         assert_eq!(
             conversion.2,
-            "style()\n\t\t.raw(\"display\", \"flex\")\n\t\t.raw(\"gap\", space(4))\n\t\t.raw(\"transition-duration\", i\"{150}ms\")\n\t\t.md(style().raw(\"padding\", space(6)))",
+            "style()\n\t\t.raw(\"display\", \"flex\")\n\t\t.raw(\"gap\", space(4))\n\t\t.raw(\"transition-duration\", i\"{piece(150)}ms\")\n\t\t.md(style().raw(\"padding\", space(6)))",
             "{conversion:?}"
         );
     }
@@ -9226,7 +9114,7 @@ pub(crate) mod tests {
     #[test]
     fn refactor_converts_a_single_declaration_block_inline() {
         let conversion =
-            css_conversion("\tconst css { pad~ding: {space(6)}; }\n").expect("a block converts");
+            css_conversion("\tconst css { pad~ding(space(6)); }\n").expect("a block converts");
         assert_eq!(conversion.2, "style().raw(\"padding\", space(6))");
     }
 
@@ -9455,26 +9343,36 @@ pub(crate) mod tests {
         assert_eq!(back.2, block, "the round trip is the identity");
     }
 
-    // Two refusals, both about meaning rather than shape. A comment's
+    // The refusals, each about meaning rather than shape. A comment's
     // attachment is not recoverable across the reshape (the S3 printer refuses
-    // to reorder a commented block for the same reason), and a value carrying a
-    // BACKSLASH means different things in the two spellings — a chain's string
-    // literal has its escapes processed at emission and a block's token run
-    // does not.
+    // to reorder a commented block for the same reason), and a declaration with
+    // SEVERAL arguments has a chain twin that names `std::style::piece` — a
+    // name ambient inside a block and nowhere else, so the chain this wrote
+    // would not resolve in the file it landed in.
+    //
+    // A101 RETIRED a third: a value carrying a BACKSLASH used to mean different
+    // things in the two spellings, because a chain's string literal had its
+    // escapes processed at emission and a block's token run did not. A value is
+    // the same expression in both spellings now, so there is nothing to differ
+    // — and the conversion is offered.
     #[test]
     fn refactor_declines_where_the_two_spellings_would_differ() {
         assert_eq!(
-            css_conversion("\tcss {\n\t\t// keep me\n\t\tdis~play: flex;\n\t}\n"),
+            css_conversion("\tcss {\n\t\t// keep me\n\t\tdis~play(\"flex\");\n\t}\n"),
             None
         );
         assert_eq!(
-            css_conversion("\tcss {\n\t\tcon~tent: \"\\201C\";\n\t}\n"),
+            css_conversion("\tcss {\n\t\tmar~gin(px(4), px(8));\n\t}\n"),
             None
         );
-        // A quoted value is fine, though: escaping a `\"` into the chain's
-        // string literal round-trips exactly.
-        let quoted = css_conversion("\tcss {\n\t\tbackground-im~age: url(\"tile.png\");\n\t}\n")
-            .expect("a quoted value converts");
+        // The escaped value converts now, and round-trips: the block's own
+        // argument is the chain's own argument.
+        let escaped = css_conversion("\tcss {\n\t\tcon~tent(\"\\201C\");\n\t}\n")
+            .expect("an escaped value converts");
+        assert_eq!(escaped.2, "style().raw(\"content\", \"\\201C\")");
+        let quoted =
+            css_conversion("\tcss {\n\t\tbackground-im~age(\"url(\\\"tile.png\\\")\");\n\t}\n")
+                .expect("a quoted value converts");
         assert_eq!(
             quoted.2,
             "style().raw(\"background-image\", \"url(\\\"tile.png\\\")\")"
@@ -14122,8 +14020,8 @@ pub(crate) mod tests {
             "the dot is already typed: {labels:?}"
         );
         assert!(
-            !labels.contains(&"display".to_string()),
-            "a dotted item is never a property: {labels:?}"
+            !labels.contains(&"flex-direction".to_string()),
+            "a dotted item is never a CSS property name: {labels:?}"
         );
         // Mid-word offers the same list; the editor filters by the prefix.
         let mid_word = css_block_completions("\tlet card = css {\n\t\t.ho~\n\t};\n");
@@ -14177,12 +14075,16 @@ pub(crate) mod tests {
         );
     }
 
-    // §7.1 row 4: a hole is an ordinary expression, and completes as one —
-    // "unchanged", which is what makes typed values reachable at all.
+    // A101: there IS no value position any more. A declaration's arguments are
+    // ordinary vilan expressions, so the cursor inside the parens falls
+    // through to EXPRESSION completion — which is what §7.1's Q4 was open
+    // about, and it dissolved rather than being answered: `pct(`, `Color::`
+    // and every name in scope complete there because they are what is
+    // spellable there.
     #[test]
-    fn css_hole_is_ordinary_expression_ground() {
+    fn a101_a_declaration_argument_is_ordinary_expression_ground() {
         let labels = css_block_completions(
-            "\tlet ink = Color::gray(900);\n\tlet card = css {\n\t\tcolor: {i~};\n\t};\n",
+            "\tlet ink = Color::gray(900);\n\tlet card = css {\n\t\tcolor(i~);\n\t};\n",
         );
         assert!(
             labels.contains(&"ink".to_string()) && labels.contains(&"space".to_string()),
@@ -14192,28 +14094,11 @@ pub(crate) mod tests {
             !labels.contains(&"display".to_string()),
             "not the property vocabulary: {labels:?}"
         );
-    }
-
-    // Value position offers NOTHING in v1 (§7.1's closing paragraph, Q4):
-    // `flex` after `display:` needs a property->enum map that does not exist,
-    // and inventing one is the second source of truth E67 refused. Offering
-    // the scope instead would be worse than offering nothing — a binding name
-    // in value position is emitted as literal text.
-    #[test]
-    fn css_value_position_offers_nothing() {
-        let labels = css_block_completions("\tlet card = css {\n\t\tdisplay: ~\n\t};\n");
-        assert!(
-            labels.is_empty(),
-            "value position is empty in v1: {labels:?}"
+        // And past a first argument, where the space join goes.
+        let second = css_block_completions(
+            "\tlet ink = Color::gray(900);\n\tlet card = css {\n\t\tborder(\"1px solid\", i~);\n\t};\n",
         );
-        // Mid-value, after a hole: the hole's own `}` must not be read as a
-        // nested rule's, or the rest of the value reads as property position.
-        let after_hole =
-            css_block_completions("\tlet card = css {\n\t\tpadding: {space(4)} ~;\n\t};\n");
-        assert!(
-            after_hole.is_empty(),
-            "still the value after a hole closes: {after_hole:?}"
-        );
+        assert!(second.contains(&"ink".to_string()), "{second:?}");
     }
 
     // §7.1 row 2: a custom property completes from the declarations of this
@@ -14308,14 +14193,19 @@ pub(crate) mod tests {
             '~',
         );
         assert!(
-            dotted.contains(&"hover".to_string()) && !dotted.contains(&"display".to_string()),
-            "the combinators: {dotted:?}"
+            dotted.contains(&"hover".to_string())
+                && !dotted.contains(&"flex-direction".to_string()),
+            "the combinators, and never a CSS property name: {dotted:?}"
         );
         let value = completions_at_marker(
-            &format!("{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet card = css {{\n\t\tdisplay: ~\n"),
+            &format!("{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet card = css {{\n\t\twidth(~\n"),
             '~',
         );
-        assert!(value.is_empty(), "value position is empty: {value:?}");
+        assert!(
+            !value.contains(&"display".to_string()),
+            "a declaration's arguments are expression ground, not the property \
+             vocabulary: {value:?}"
+        );
         let custom = completions_at_marker(
             &format!("{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet card = css {{\n\t\t--~\n"),
             '~',
@@ -14341,22 +14231,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_unterminated_hole_is_not_css_position() {
-        // The negative that keeps the fallback honest: a `{…}` hole is an
-        // ordinary expression, and an unclosed one does not become CSS just
-        // because a `css` block encloses it.
+    fn an_unterminated_argument_is_not_css_position() {
+        // The negative that keeps the fallback honest: a declaration's
+        // arguments are ordinary expressions, and an unclosed list does not
+        // become CSS just because a `css` block encloses it.
         let labels = completions_at_marker(
             &format!(
-                "{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet ink = Color::gray(900);\n\tlet card = css {{\n\t\tcolor: {{i~\n"
+                "{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet ink = Color::gray(900);\n\tlet card = css {{\n\t\tcolor(i~\n"
             ),
             '~',
         );
         assert!(
             !labels.contains(&"display".to_string())
                 && !labels.contains(&"flex-direction".to_string()),
-            "a hole is not the property vocabulary: {labels:?}"
+            "an argument is not the property vocabulary: {labels:?}"
         );
-        // Ordinary expression ground, which is what the hole always was. (The
+        // Ordinary expression ground, which is what a value always was. (The
         // names the enclosing `let` would bind are not among them, because with
         // the statement unterminated there is no analyzed binding to offer —
         // that is the mid-edit analysis, not this classification.)
@@ -14373,7 +14263,7 @@ pub(crate) mod tests {
         // even with the enclosing function still unterminated.
         let labels = completions_at_marker(
             &format!(
-                "{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet card = css {{\n\t\tdisplay: flex;\n\t}};\n\tlet other = ca~\n"
+                "{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet card = css {{\n\t\tdisplay(\"flex\");\n\t}};\n\tlet other = ca~\n"
             ),
             '~',
         );

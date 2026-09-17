@@ -58,10 +58,10 @@ use std::cell::Cell;
 use crate::lexing;
 use crate::node::{
     ANONYMOUS_TYPE_BINDER, BackingLiteral, BinaryOp, Closure, Convention, CssBody, CssDeclaration,
-    CssItem, CssNested, CssValuePiece, ElementBody, ElementChild, ElementHeadItem, EnumVariant,
-    ExportScope, Exposure, ExternBinding, Func, GenericArguments, GenericParameter,
-    GenericParameters, If, ImplSelector, ImportBranch, ImportModifier, ImportTail, MatchLeg, Node,
-    NodeIfBranch, NodeList, Parameter, Pattern, ServiceAttr, StructField, TupleBound,
+    CssItem, CssNested, ElementBody, ElementChild, ElementHeadItem, EnumVariant, ExportScope,
+    Exposure, ExternBinding, Func, GenericArguments, GenericParameter, GenericParameters, If,
+    ImplSelector, ImportBranch, ImportModifier, ImportTail, MatchLeg, Node, NodeIfBranch, NodeList,
+    Parameter, Pattern, ServiceAttr, StructField, TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -266,7 +266,7 @@ const CSS_BLOCK_IS_BRACE_INITIAL: &str = "a `css { … }` block is brace-initial
 
 /// What a `css` block's body admits — the dot rule, spelled for the reader
 /// (proposal/css-block.md §3), chain links included (A69).
-const CSS_ITEM_EXPECTED: &str = "a declaration (`property: value;`), a nested rule (`.name { … }`) or a chain link \
+const CSS_ITEM_EXPECTED: &str = "a declaration (`property(value);`), a nested rule (`.name { … }`) or a chain link \
      (`.name();`)";
 
 /// The rule `const mut` breaks (G24). Curated (diagnostics-standard.md B6):
@@ -296,6 +296,21 @@ const CSS_PSEUDO_CLASS_IS_DOTTED: &str = "a `css` block writes a pseudo-class as
      (`.within(…)`) and `.divide` — so the grammar never consults a method list, and a \
      method added to `Style` cannot change what a block means";
 
+/// The rule a CSS-SPELLED declaration breaks (A101). Curated
+/// (diagnostics-standard.md B6): the prohibition explains itself and names the
+/// sanctioned spelling.
+///
+/// `property: value;` was the block's declaration form through Order 36 and is
+/// what every CSS author types, so the migration and the newcomer hit the same
+/// token — the `:` where a `(` belongs. A declaration is a CALL now: the
+/// property is the name, the value is its ordinary vilan expression arguments,
+/// and the `{ }` hole is gone because there is no token span left for one to
+/// interrupt.
+const A_CSS_DECLARATION_IS_A_CALL: &str = "a `css` declaration is a CALL: write `padding(space(4));`, not `padding: space(4);`. The \
+     property is the name and its value is ordinary vilan expressions, so a typed value needs \
+     no `{ }` hole — and several arguments join with one space, as CSS's own value lists do \
+     (`margin(px(4), px(8))`)";
+
 /// The rule `!important` breaks inside a `css` block. Curated
 /// (diagnostics-standard.md B6): the prohibition explains itself and names the
 /// sanctioned spelling — which is "nothing at all", because a later
@@ -320,27 +335,6 @@ pub const IMPORTANT_HAS_NO_PLACE: &str = "`!important` has no place in a `css` b
 const DOC_HIDDEN_IS_SUPERSEDED: &str = "`[doc(hidden)]` is superseded by visibility: an item its module does not `export` is already \
      reachable and absent from completion, which is the whole of what this marker meant — delete \
      it, and write `export` on the names consumers are meant to find";
-
-/// The rule a `#` inside a `css` block's VALUE breaks — `HASH_IS_NOT_A_TOKEN`'s
-/// successor (B318 §2.3). Curated (diagnostics-standard.md B6: the prohibition
-/// explains itself and names the sanctioned spelling).
-///
-/// The refusal used to live in the LEXER, unconditionally, which made it a
-/// context-free rule giving context-ful advice: an author writing
-/// `import a::{ #hidden }` was told about hex colours. B318 takes `#` as the
-/// import reach marker, so the byte lexes now and the colour rule moves to the
-/// one place that knows a `#` IS a colour — the block's own value parser. A `#`
-/// there would otherwise be swallowed into a value's text run and emitted as a
-/// raw hex literal, which is the one spelling that can leave the token system
-/// silently.
-///
-/// Public because the language server's quickfix keys on it (css-block S5,
-/// §7.2 fix 1) — one constant rather than a second copy to drift from. The
-/// diagnostic is ONE character wide, exactly as the lexer's was, so the fix
-/// still reads the colour off the text starting at the `#`.
-pub const HASH_IS_NOT_A_CSS_VALUE: &str = "`#` is not a colour here: in a `css` block a colour is a hole — \
-     `color: {Color::hex(\"#333\")};` — which routes it through the `Color` type that carries its \
-     own `:root` line";
 
 /// The rule `export <expression>;` breaks (B321). Curated
 /// (diagnostics-standard.md B6 — the prohibition explains itself and names the
@@ -3779,22 +3773,59 @@ impl<'a, 'src> Parser<'a, 'src> {
         }))
     }
 
-    /// `property: value;` — one declaration. The `;` is REQUIRED, including
-    /// after the last: the formatter may never invent a token (the token
-    /// equality net), and a required terminator makes value scanning decidable
-    /// in one pass (§4.3).
+    /// `property(value);` — one declaration, which is a CALL (A101). The `;`
+    /// is REQUIRED, including after the last: the formatter may never invent a
+    /// token (the token equality net), and a required terminator keeps an item
+    /// decidable in one pass (§4.3).
+    ///
+    /// The arguments are an ORDINARY argument list — the same production a
+    /// nested rule's head and every other call in the language take — so a
+    /// typed value needs no hole, value completion is expression completion,
+    /// and a value whose type is not a raw value is the ordinary type error AT
+    /// the argument rather than a string that silently reaches the sheet.
     fn parse_css_declaration(&mut self) -> Option<CssDeclaration<'src>> {
         let start = self.position;
         let Some(property) = self.parse_css_property() else {
             self.report_css_failure(CSS_ITEM_EXPECTED);
             return None;
         };
-        if !self.peek_is_op(":") {
-            self.report_css_failure("':'");
+        // The one token every migrating program and every CSS author writes
+        // here. It is a committed declaration by now — the property name read
+        // — so the rule reports for itself and names the call form.
+        if self.peek_is_op(":") {
+            let context = self.context_stack.clone();
+            self.errors.push(ParseError {
+                span: self.here_span(),
+                reason: ParseErrorReason::Rule(A_CSS_DECLARATION_IS_A_CALL),
+                context,
+                hint: None,
+            });
             return None;
         }
-        self.bump();
-        let (value, value_span) = self.parse_css_value()?;
+        if !self.peek_is_ctrl('(') {
+            self.report_css_failure("'('");
+            return None;
+        }
+        // `!important` is refused permanently and with its fix: merge is a
+        // record update, so a `Style` that needed it would be a `Style` that
+        // had lost the property the whole model is for (§10). Read off the
+        // TOKENS before the arguments are parsed, because `red !important` is
+        // not an expression and the argument list would report a `,` it never
+        // wanted — the reader would then never see the sentence that answers.
+        if let Some(span) = self.important_within_arguments() {
+            self.errors.push(ParseError {
+                span,
+                reason: ParseErrorReason::Rule(IMPORTANT_HAS_NO_PLACE),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+            return None;
+        }
+        let (arguments, parens) = self.parse_argument_list()?;
+        if arguments.is_empty() {
+            self.note_expected("a value");
+            return None;
+        }
         // The `;` reports as a MISSING TERMINATOR, gap-anchored: the mistake is
         // in the whitespace before the next item, not on it, and the message is
         // the one the language server already carries an "Insert `;`" quickfix
@@ -3806,16 +3837,50 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.bump();
         Some(CssDeclaration {
             property,
-            value,
-            value_span,
+            arguments,
+            parens,
             span: self.span_from(start),
         })
+    }
+
+    /// The span of a `!important` written inside the argument list opening at
+    /// the cursor, at any depth — `color(red !important)`, the CSS author's own
+    /// transliteration. `None` when the list holds none, or does not close.
+    fn important_within_arguments(&self) -> Option<Span> {
+        let mut depth = 0usize;
+        let mut at = self.position;
+        while let Some((token, span)) = self.tokens.get(at) {
+            match token {
+                Token::Ctrl('(') | Token::Ctrl('[') | Token::Ctrl('{') => depth += 1,
+                Token::Ctrl(')') | Token::Ctrl(']') | Token::Ctrl('}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return None;
+                    }
+                }
+                Token::Op("!")
+                    if matches!(
+                        self.tokens.get(at + 1),
+                        Some((Token::Ident("important"), _))
+                    ) =>
+                {
+                    return Some((span.start..self.tokens[at + 1].1.end).into());
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+        None
     }
 
     /// A property name — `{ "-" } NAME { "-" NAME }`, span-adjacent, so
     /// `flex-direction` is three tokens and `--color-ink` is five, and
     /// `data - id` is a name and an operator rather than a name. Returns the
     /// SPAN; the text is sliced at desugar, exactly as an element's tag is.
+    ///
+    /// R12: the leading-dash run is what admits a CUSTOM property as a call
+    /// head — `--brand-ink(gray(900));` — and it needs nothing new, exactly as
+    /// an element attribute's `data-`/`aria-` names need nothing new.
     fn parse_css_property(&mut self) -> Option<Span> {
         let start = self.position;
         let start_offset = self.here_span().start;
@@ -3842,101 +3907,6 @@ impl<'a, 'src> Parser<'a, 'src> {
             return None;
         }
         Some((start_offset..name.end).into())
-    }
-
-    /// A declaration's value: everything up to the `;` at brace depth 0, as a
-    /// run of source-text pieces and `{expression}` holes. There is no typed
-    /// value grammar — typed values arrive through holes, which is where the
-    /// type system already lives (§10).
-    fn parse_css_value(&mut self) -> Option<(Vec<CssValuePiece<'src>>, Span)> {
-        let start_offset = self.here_span().start;
-        let mut pieces = Vec::new();
-        // The pieces PARTITION the value's span: a text run is the source
-        // between one hole's `}` and the next hole's `{`, whitespace included.
-        // Slicing from the first TOKEN of a run instead would drop the space a
-        // hole is separated by, and `calc({w} + 2px)` would render `calc(w+
-        // 2px)` — the i-string this lowers to keeps that space, so this must.
-        let mut text_from = start_offset;
-        let mut end = start_offset;
-        loop {
-            if self.at_end() || self.peek_is_ctrl(';') || self.peek_is_ctrl('}') {
-                break;
-            }
-            if self.peek_is_ctrl('{') {
-                let open = self.here_span();
-                if text_from < open.start {
-                    pieces.push(CssValuePiece::Text((text_from..open.start).into()));
-                }
-                self.bump();
-                let Some(expression) = self.parse_expression() else {
-                    self.report_css_failure("an expression");
-                    return None;
-                };
-                let close = self.here_span();
-                if !self.peek_is_ctrl('}') {
-                    self.report_css_failure("'}'");
-                    return None;
-                }
-                self.bump();
-                pieces.push(CssValuePiece::Hole(
-                    expression,
-                    (open.start..close.end).into(),
-                ));
-                text_from = close.end;
-                end = close.end;
-                continue;
-            }
-            // B318 §2.3: a `#` lexes now, and a value's loop consumes any token
-            // as TEXT — so without this the block would emit `color: #333` as a
-            // raw hex literal, silently, which is exactly what the lexer's
-            // refusal existed to stop. Reported at the `#` alone (the span the
-            // quickfix reads the colour off) and then consumed as text, so the
-            // declaration still lowers and the block raises one diagnostic.
-            if self.peek_is(&Token::Hash) {
-                self.errors.push(ParseError {
-                    span: self.here_span(),
-                    reason: ParseErrorReason::Rule(HASH_IS_NOT_A_CSS_VALUE),
-                    context: self.context_stack.clone(),
-                    hint: None,
-                });
-                end = self.here_span().end;
-                self.bump();
-                continue;
-            }
-            // `!important` is refused permanently and with its fix: merge is a
-            // record update, so a `Style` that needed it would be a `Style` that
-            // had lost the property the whole model is for (§10). Consumed with
-            // its span excised from the value, so the declaration still lowers
-            // and the block raises one diagnostic rather than cascading.
-            if self.peek_is_op("!") && matches!(self.peek_at(1), Some(Token::Ident("important"))) {
-                let start = self.here_span().start;
-                let stop = self.tokens[self.position + 1].1.end;
-                self.errors.push(ParseError {
-                    span: (start..stop).into(),
-                    reason: ParseErrorReason::Rule(IMPORTANT_HAS_NO_PLACE),
-                    context: self.context_stack.clone(),
-                    hint: None,
-                });
-                if text_from < start {
-                    pieces.push(CssValuePiece::Text((text_from..start).into()));
-                }
-                self.bump();
-                self.bump();
-                text_from = stop;
-                end = stop;
-                continue;
-            }
-            end = self.here_span().end;
-            self.bump();
-        }
-        if text_from < end {
-            pieces.push(CssValuePiece::Text((text_from..end).into()));
-        }
-        if pieces.is_empty() {
-            self.note_expected("a value");
-            return None;
-        }
-        Some((pieces, (start_offset..end).into()))
     }
 
     // --- Elements (proposal/element-syntax.md) -------------------------------
@@ -8991,27 +8961,63 @@ mod tests {
     }
 
     #[test]
-    fn a_hash_in_a_css_value_still_reports_the_colour_rule() {
-        // The rule the lexer used to carry, re-homed (B318 §2.3). It must stay
-        // ONE character wide — the language server reads the colour off the text
-        // starting there — and it must still fire, because a `css` value's loop
-        // consumes any token as TEXT and would otherwise emit `color: #333` as a
-        // raw hex literal, silently.
-        let (_tree, errors) = parse("fun main() { let s = css { color: #333; }; }\n");
+    fn a101_a_css_declaration_is_a_call() {
+        // The grammar: `declaration = property "(" [ expression { "," expression }
+        // [ "," ] ] ")" ";"`, the property span-adjacent as before. A typed value
+        // is an ordinary argument, N arguments are ordinary arguments, and a
+        // custom property is a call head (R12).
+        for source in [
+            "fun main() { let s = css { outline(\"none\"); }; }\n",
+            "fun main() { let s = css { width(pct(100)); }; }\n",
+            "fun main() { let s = css { margin(px(4), px(8)); }; }\n",
+            "fun main() { let s = css { margin(px(4), px(8),); }; }\n",
+            "fun main() { let s = css { --brand-ink(gray(900)); }; }\n",
+            "fun main() { let s = css { flex-direction(\"column\"); }; }\n",
+            "fun main() { let s = css { color(Color::current().alpha(0.5)); }; }\n",
+        ] {
+            assert!(
+                rendered_errors(source).is_empty(),
+                "{source:?}: {:?}",
+                rendered_errors(source)
+            );
+        }
+        // The `:` spelling every migrating program writes: the rule names the
+        // call form, once, at the `:` itself.
+        //
+        // Written as two pieces on purpose: this is the one fixture that must
+        // KEEP the spelling A101 retired, and a whole `css { … }` block in one
+        // literal is exactly what the codemod migrates.
+        let (_tree, errors) = parse(concat!(
+            "fun main() { let s = css { padding",
+            ": 1rem; }; }\n"
+        ));
         assert_eq!(errors.len(), 1, "{errors:?}");
-        assert_eq!(render(&errors[0]), HASH_IS_NOT_A_CSS_VALUE);
+        assert_eq!(render(&errors[0]), A_CSS_DECLARATION_IS_A_CALL);
         assert_eq!(
             errors[0].span.into_range().len(),
             1,
-            "one character wide, so the fix can read the colour off the text"
+            "the `:` itself is the token that is wrong"
         );
-        // The sanctioned spelling is clean.
+        // A declaration still needs its `;`, and it still needs a value.
+        assert_eq!(
+            rendered_errors("fun main() { let s = css { outline(\"none\") }; }\n").len(),
+            1
+        );
+        assert!(!rendered_errors("fun main() { let s = css { outline(); }; }\n").is_empty());
+        // `!important` keeps its rule — read off the tokens, because
+        // `red !important` is not an expression and the argument list would
+        // otherwise report a `,` the author never wanted.
+        let (_tree, errors) = parse("fun main() { let s = css { color(red !important); }; }\n");
+        assert_eq!(render(&errors[0]), IMPORTANT_HAS_NO_PLACE);
+        // And the `#` colour rule is RETIRED with the value grammar it guarded:
+        // no CSS token ever reaches a declaration now, so `#333` is refused as
+        // the ordinary expression it is not.
         assert!(
-            rendered_errors("fun main() { let s = css { color: {Color::hex(\"#333\")}; }; }\n")
-                .is_empty()
+            rendered_errors("fun main() { let s = css { color(#333); }; }\n")
+                .iter()
+                .all(|error| !error.contains("is not a colour here")),
         );
-        // And `#` outside an import and outside a `css` block still refuses —
-        // as a PARSE error now, since the byte lexes.
+        // `#` outside an import still refuses as a parse error, as it did.
         assert_eq!(
             rendered_errors("fun main() { let x = # 3; }\n"),
             vec!["found '#' expected an expression".to_string()]

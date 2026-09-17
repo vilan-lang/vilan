@@ -291,7 +291,7 @@ const RESOURCE_DERIVE_REFUSAL_FRAGMENT: &str =
 
 /// The CURATED rule statements: the messages a `ParseErrorReason::Rule` states
 /// through a NAMED constant rather than a literal written at the site — the
-/// `css` block's four, the two statement-shape steers, the seven nesting
+/// `css` block's five, the two statement-shape steers, the seven nesting
 /// refusals, and the lexer's five, which reach `parsing.rs` through
 /// `LexError::rule` from another file entirely (N65).
 ///
@@ -345,6 +345,11 @@ const CURATED_RULE_STATEMENTS: &[(&str, &str, &str)] = &[
         "crates/vilan-core/src/parsing.rs",
         "IMPORTANT_HAS_NO_PLACE",
         "`!important` has no place in a `css` block:",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "A_CSS_DECLARATION_IS_A_CALL",
+        "a `css` declaration is a CALL: write `padding(space(4));`,",
     ),
     (
         "crates/vilan-core/src/parsing.rs",
@@ -440,11 +445,6 @@ const CURATED_RULE_STATEMENTS: &[(&str, &str, &str)] = &[
         "crates/vilan-core/src/parsing.rs",
         "DOC_HIDDEN_IS_SUPERSEDED",
         "`[doc(hidden)]` is superseded by visibility:",
-    ),
-    (
-        "crates/vilan-core/src/parsing.rs",
-        "HASH_IS_NOT_A_CSS_VALUE",
-        "`#` is not a colour here: in a `css` block a colour is a hole",
     ),
     (
         "crates/vilan-core/src/lexing.rs",

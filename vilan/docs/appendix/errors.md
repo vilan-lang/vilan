@@ -1011,17 +1011,21 @@ condition's operand, which reports **"`Point` is a type, not a value"**.
 Parenthesize the literal: `if p == (Point { x = 1 }) { … }`.
 → [spec §3.8](../spec/grammar.md)
 
-**"`#` is not a colour here …"** · **"`@` is not a vilan token …"**
-Both turn up almost only inside a `css` block. A colour is written as a
-hole that routes through the `Color` type — `color: {Color::hex("#333")};`
-— which is what lets the type carry its own `:root` line. And a `css`
-block has no at-rules of any kind: a media query is spelled as a
-breakpoint combinator (`.md { … }`), and a declaration block under a
-selector of your own is `std::style::declare`. The two are refused in
-different places, for a reason worth knowing: `@` lexes as nothing at
-all, anywhere, while `#` is a real token — the import **reach** marker,
-`import pkg::a::{ #hidden };` — so only the `css` block's own parser,
-which knows a `#` there is a colour, can refuse it.
+**"a `css` declaration is a CALL …"** · **"`@` is not a vilan token …"**
+Both turn up only inside a `css` block. A declaration is a CALL —
+`color(Color::hex("#333"));`, `width(pct(100));` — so the property is the
+name and the value is ordinary vilan expressions; the CSS-shaped
+`property: value;` is what the block used to take, and the `:` is where
+it reports. There are no `{ }` holes any more, because there is no token
+span for one to interrupt: a typed value is simply an argument, and a
+colour routes through the `Color` type as it always did, which is what
+lets the type carry its own `:root` line. Several arguments join with one
+space, the way CSS's own value lists do — `margin(px(4), px(8))`,
+`border("1px solid", gray(300))`. And a `css` block has no at-rules of
+any kind: a media query is spelled as a breakpoint combinator
+(`.md { … }`), and a declaration block under a selector of your own is
+`std::style::declare`. `@` lexes as nothing at all, anywhere, which is
+why that one is the lexer's refusal and not the block's.
 → [Styling](../guide/styling.md)
 
 **"`pub` is not a vilan keyword …"**
