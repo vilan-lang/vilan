@@ -140,8 +140,15 @@ function $y(signal, observer) {
 	const id = fresh_id();
 	const cell = signal[0];
 	signal[1].v.push([ id, () => {
-		observer(cell.v);
-		return;
+		const $z = [ 0, cell ];
+		let $A = null;
+		if ($z[0] === 0) {
+			const live = $z[1];
+			$A = observer(live.v);
+		} else {
+			$A = undefined;
+		}
+		return $A;
 	} ]);
 	return [ signal[1], id, __shared_new([ 1 ]) ];
 }
@@ -165,31 +172,31 @@ function $i(sources, $j) {
 	});
 	return derived;
 }
-function $B(self, $q) {
-	const $C = $q;
-	let $D = null;
-	if ($C[0] === 0) {
-		const turn = $C[1];
-		$D = enqueue(turn, self[1].v);
+function $D(self, $q) {
+	const $E = $q;
+	let $F = null;
+	if ($E[0] === 0) {
+		const turn = $E[1];
+		$F = enqueue(turn, self[1].v);
 	} else {
-		const $E = $u(draining_turns.v);
-		let $F = null;
-		if ($E[0] === 0) {
-			const draining = $E[1];
-			$F = enqueue(draining, self[1].v);
+		const $G = $u(draining_turns.v);
+		let $H = null;
+		if ($G[0] === 0) {
+			const draining = $G[1];
+			$H = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
 				subscriber[1]();
 			}
-			$F = undefined;
+			$H = undefined;
 		}
-		$D = $F;
+		$F = $H;
 	}
-	return $D;
+	return $F;
 }
-function $A(self, value, $o) {
+function $C(self, value, $o) {
 	self[0].v = __clone(value);
-	$B(self, $o);
+	$D(self, $o);
 }
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
@@ -205,6 +212,6 @@ const count = $e(20);
 const name = $g("hi");
 const both = $i([ __clone(count), name ], [ 1 ]);
 console.log($k(both)[0]);
-$A(count, 21, [ 1 ]);
+$C(count, 21, [ 1 ]);
 console.log($k(both)[0]);
 console.log($k(both)[1]);

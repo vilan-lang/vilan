@@ -322,7 +322,12 @@ for (const phase of ["mounted", "unmounted"]) {{
 
     // The mounted line is RECORDED, not asserted: V4 and the live session loops
     // are there by design, and pinning their count would pin an implementation
-    // detail of the exemplar rather than a law.
+    // detail of the exemplar rather than a law. Recording it means PRINTING it
+    // — `cargo nextest run -p vilan-cli --test reactive_lifetimes -E
+    // 'test(a_disposed_exemplar_holds_no_reactive_cycle)' --no-capture` — so
+    // the number a change to the graph moves can be read off the gate that
+    // measures it instead of re-derived by hand (C14 S3 read it this way).
+    println!("{stdout}");
     assert!(
         stdout.contains("mounted reachable="),
         "the walk must reach the mounted app; got:\n{stdout}"

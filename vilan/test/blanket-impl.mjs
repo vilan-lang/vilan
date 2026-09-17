@@ -54,7 +54,7 @@ function drain(turn) {
 		draining_turns.v.push(__clone(turn));
 		__with_finally(() => {
 			let budget = 100000;
-			while (!($r(turn[0].v)) && budget > 0) {
+			while (!($t(turn[0].v)) && budget > 0) {
 				const wave = turn[0].v;
 				turn[0].v = [  ];
 				turn[1].v = new Map();
@@ -90,17 +90,24 @@ function $j(signal, observer) {
 	const id = fresh_id();
 	const cell = signal[0];
 	signal[1].v.push([ id, () => {
-		observer(cell.v);
-		return;
+		const $k = [ 0, cell ];
+		let $l = null;
+		if ($k[0] === 0) {
+			const live2 = $k[1];
+			$l = observer(live2.v);
+		} else {
+			$l = undefined;
+		}
+		return $l;
 	} ]);
 	return [ signal[1], id, __shared_new([ 1 ]) ];
 }
-function $k(self) {
+function $m(self) {
 	return __clone(self[0].v);
 }
 function $i(self, observer) {
 	const subscription = $j(self, observer);
-	observer($k(self));
+	observer($m(self));
 	return subscription;
 }
 function $h(self, react) {
@@ -111,61 +118,61 @@ function $g(label, $b, $c) {
 		return console.log("[" + text + "]");
 	}, $b, $c);
 }
-function $r(self) {
+function $t(self) {
 	return self.length === 0;
 }
-function $s(self) {
+function $u(self) {
 	return __list_get(self, self.length - 1);
 }
-function $n(self, $o) {
-	const $p = $o;
-	let $q = null;
-	if ($p[0] === 0) {
-		const turn = $p[1];
-		$q = enqueue(turn, self[1].v);
+function $p(self, $q) {
+	const $r = $q;
+	let $s = null;
+	if ($r[0] === 0) {
+		const turn = $r[1];
+		$s = enqueue(turn, self[1].v);
 	} else {
-		const $t = $s(draining_turns.v);
-		let $u = null;
-		if ($t[0] === 0) {
-			const draining = $t[1];
-			$u = enqueue(draining, self[1].v);
+		const $v = $u(draining_turns.v);
+		let $w = null;
+		if ($v[0] === 0) {
+			const draining = $v[1];
+			$w = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
 				subscriber[1]();
 			}
-			$u = undefined;
+			$w = undefined;
 		}
-		$q = $u;
+		$s = $w;
 	}
-	return $q;
+	return $s;
 }
-function $l(self, value, $m) {
+function $n(self, value, $o) {
 	self[0].v = __clone(value);
-	$n(self, $m);
+	$p(self, $o);
 }
-function $v(slot, $w, $x) {
+function $x(slot, $y, $z) {
 	$d(slot, (inner) => {
-		return console.log("holder " + $k(inner));
-	}, $w, $x);
-}
-function $A(self) {
-	return "plain box";
-}
-function $z(box) {
-	console.log($A(box));
+		return console.log("holder " + $m(inner));
+	}, $y, $z);
 }
 function $C(self) {
-	return "marked box";
+	return "plain box";
 }
 function $B(box) {
 	console.log($C(box));
+}
+function $E(self) {
+	return "marked box";
+}
+function $D(box) {
+	console.log($E(box));
 }
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
 $a("static", [ 1 ]);
 const live = $e("first");
 $g(live, [ 1 ]);
-$l(live, "second", [ 1 ]);
-$v(live, [ 1 ]);
-$z([ [  ] ]);
+$n(live, "second", [ 1 ]);
+$x(live, [ 1 ]);
 $B([ [  ] ]);
+$D([ [  ] ]);

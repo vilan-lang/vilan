@@ -5,7 +5,7 @@ import pkg::io::panic;
 import pkg::native_map::NativeMap;
 import pkg::option::Option::{ self, None, Some };
 import pkg::result::Result::{ self, Err, Ok };
-import pkg::shared::Shared;
+import pkg::shared::{ Shared, Weak };
 import pkg::time::Timer;
 
 /// A resource that can be released. An `Owner` collects `Disposable`s and releases
@@ -359,7 +359,14 @@ export fun batch<T>(body: (sync || T) context turn_scope): T {
 /// A live subscription. Dropping it does NOT stop it (an owner scope is
 /// responsible for that — see the proposal); call `dispose` to stop early.
 export struct Subscription {
-	subscribers: Shared<List<Subscriber>>,
+	// WEAK, and this is the second of std's two back edges (C14 S3,
+	// `signal-cell-representation.md` §6). A subscription is an alias of the
+	// SIGNAL's subscriber list, held by whoever took it — an owner's cleanup
+	// list, an app's own binding — and none of those holders is the list's
+	// owner. A strong alias would mean a live handle to a disposed signal's
+	// list kept that list alive for as long as the handle lived, which is the
+	// leak a count cannot collect and the GC only hides.
+	subscribers: Weak<List<Subscriber>>,
 	id: i32,
 	// Extra teardown to run on dispose, once. `Signal::sub` leaves it `None`;
 	// a COUNTED subscription — `RemoteSource::sub`, whose lease holds a
@@ -379,8 +386,14 @@ export impl Subscription {
 	/// app already disposed by hand cannot unhook twice.
 	fun teardown(release: || void): Subscription {
 		mut subscribers: List<Subscriber> = [];
+		// There is no signal here, so there is no subscriber list to alias:
+		// the cell dies with this frame and the weak handle answers `None`
+		// once anything counts (C14 S4). `dispose`'s `None` arm is the right
+		// answer for exactly this case — nothing to detach, and `release`
+		// still runs, which is the whole of this shape's teardown.
+		let empty: Shared<List<Subscriber>> = Shared::new(subscribers);
 		Subscription {
-			subscribers = Shared::new(subscribers),
+			subscribers = empty.downgrade(),
 			id = fresh_id(),
 			release = Shared::new(Some(release)),
 		}
@@ -389,13 +402,23 @@ export impl Subscription {
 
 export impl Subscription with Disposable {
 	fun dispose(self) {
-		mut kept: List<Subscriber> = [];
-		for subscriber in self.subscribers.read() {
-			if subscriber.id != self.id {
-				kept.push(subscriber);
-			}
+		// The list this subscription aliases, IF it is still there. Under
+		// counting a `None` means the signal outlived nothing and its list is
+		// gone, so there is no subscriber to detach — and the rest of the
+		// teardown (the turn scrub, `release`) still runs, which is what
+		// `Subscription::teardown`'s signal-less shape needs.
+		match self.subscribers.upgrade() {
+			Some(let subscribers) => {
+				mut kept: List<Subscriber> = [];
+				for subscriber in subscribers.read() {
+					if subscriber.id != self.id {
+						kept.push(subscriber);
+					}
+				}
+				subscribers.write() = kept;
+			},
+			None => {},
 		}
-		self.subscribers.write() = kept;
 
 		// Scrub the AMBIENT turn's pending queue too: a disposed observer
 		// never fires, even if a `set` earlier in the same extent already
@@ -818,6 +841,16 @@ export impl SignalCell<type T> with Source<T> {
 /// is what the closure actually needs, and nothing points from it back to the
 /// signal.
 ///
+/// And the capture is WEAK — the first of std's two back edges (C14 S3). V1's
+/// repair shortened the cycle; it did not remove it. What is left is four
+/// nodes: cell → subscribers → `Subscriber` → `notify` → (captured) cell, a
+/// loop a refcount cannot collect because every edge in it is a holder. The
+/// closure must FOLLOW the cell to read it and must not decide when it dies —
+/// which is precisely what a weak handle says — so the notify upgrades on each
+/// call and does nothing if the cell is gone. On this backend it never is
+/// (`downgrade` is the identity until something counts, C14 S4); what lands
+/// here is the edge, written where the graph can be checked against it.
+///
 /// Concrete `Signal` and NOT widenable to `Source` (A33): this reads the
 /// STRUCTURE — the value cell and the subscriber list — not the trait's
 /// `get`/`sub`, and the whole reason it exists is to attach without the
@@ -825,14 +858,23 @@ export impl SignalCell<type T> with Source<T> {
 /// that, so `map`, which is built on it, stays a `Signal` method too.
 export fun observe<T>(signal: SignalCell<T>, observer: |T| void): Subscription {
 	let id = fresh_id();
-	let cell = signal.value;
+	let cell = signal.value.downgrade();
 	signal.subscribers.write().push(Subscriber {
 		id,
 		notify = || {
-			observer(cell.read());
+			match cell.upgrade() {
+				// `upgrade` rather than `get`: `observer` takes a VALUE, and
+				// `read()` is the spelling that copies one out of the cell
+				// (spec §6.1). A `get` view would have to be dereferenced to
+				// the same copy, and would say the weaker thing — that this
+				// only touches the cell — where a notification genuinely holds
+				// it for the length of the call.
+				Some(let live) => observer(live.read()),
+				None => {},
+			}
 		},
 	});
-	Subscription { subscribers = signal.subscribers, id, release = Shared::new(None) }
+	Subscription { subscribers = signal.subscribers.downgrade(), id, release = Shared::new(None) }
 }
 
 /// The canonical write side. `set_with` is the trait's default, unchanged —

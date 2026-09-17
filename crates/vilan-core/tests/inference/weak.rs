@@ -373,3 +373,139 @@ fn get_lowers_to_some_of_the_cell_slot() {
         "[ 0, weak.v ]",
     );
 }
+
+// --- C14 S3: std's two back edges are weak, and nothing above them moves -----
+//
+// `observe`'s notify closure captures the signal's VALUE CELL, and
+// `Subscription` aliases the signal's SUBSCRIBER LIST. Both are edges that must
+// be followed and must not decide a lifetime — a cell reached from its own
+// subscriber's closure, and a list aliased by a handle nobody owns it through —
+// so both are weak now.
+//
+// On this backend the change is invisible by construction: `downgrade` is the
+// identity, so the emitted graph is what it was and the heap-snapshot gate's
+// mounted SCC count does not move (243 reachable / 2 cycles, before and after).
+// What these pins hold is that the edge was rewritten without moving anything
+// standing on it — the notification still fires with the current value, the
+// detach still detaches, and the signal-less `teardown` shape still runs its
+// release. Every one was run against the pre-change std and prints the same.
+
+#[test]
+fn an_observer_fires_with_the_current_value_through_the_weak_capture() {
+    // `observe` upgrades on every notify and reads the cell through the strong
+    // handle, so the observer sees each value exactly as it did when the
+    // capture was strong — and the detach still empties the subscriber list.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Disposable, Signal, SignalCell };
+
+        fun main() {
+            let count: SignalCell<i32> = Signal::new(0);
+            mut seen: List<i32> = [];
+            let watch = count.on_change(|value: i32| seen.push(value));
+            count.set(1);
+            count.set(2);
+            print(i"seen={seen.len()} subscribers={count.subscribers.read().len()}");
+            watch.dispose();
+            count.set(3);
+            print(i"seen={seen.len()} subscribers={count.subscribers.read().len()}");
+        }
+        "#,
+        "seen=2 subscribers=1\nseen=2 subscribers=0\n",
+    );
+}
+
+#[test]
+fn a_teardown_subscription_over_no_signal_still_releases_exactly_once() {
+    // `Subscription::teardown` is the registration shape for a source outside
+    // the signal graph (`std::dom`'s `listen`): there is no signal, so there is
+    // no subscriber list to alias, and the cell it mints dies with the call.
+    // Under counting its weak alias answers `None` — which is the right answer,
+    // because the whole of this shape's teardown is the `release` one-shot, and
+    // that is a cell of its own. The `None` arm is UNREACHABLE on this backend
+    // (nothing counts, so every upgrade is `Some`), so what this pin holds is
+    // the behaviour the arm has to preserve rather than the arm itself:
+    // planting a `ret` into that arm leaves it green, and only C14 S4's real
+    // count can make it red.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Disposable, Subscription };
+
+        fun main() {
+            mut released = 0;
+            let bare = Subscription::teardown(|| released += 1);
+            bare.dispose();
+            bare.dispose();
+            print(i"released={released}");
+        }
+        "#,
+        "released=1\n",
+    );
+}
+
+#[test]
+fn a_set_after_the_owner_was_disposed_still_commits() {
+    // `signal-cell-representation.md` §5.2, and the law C14 S4 must preserve:
+    // disposal runs the owner's cleanups, which detach SUBSCRIBERS. It does
+    // nothing whatever to the cell. So a write after it commits and the read
+    // after that sees the new value — the cell is a fully live object that has
+    // merely lost its audience, not a stale one. Pinned here because the weak
+    // edges are the first change that could have made a disposed signal's cell
+    // unreadable, and it must not have.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Disposable, Owner, Signal, SignalCell };
+
+        fun main() {
+            let owner = Owner::new();
+            let tracked: SignalCell<i32> = Signal::new(10);
+            owner.dispose();
+            tracked.set(99);
+            print(i"after-dispose={tracked.get()}");
+        }
+        "#,
+        "after-dispose=99\n",
+    );
+}
+
+// --- The hole `Weak::upgrade` opened in B267's cell walk ---------------------
+
+#[test]
+fn a_read_through_an_upgraded_handle_copies_like_every_other_read() {
+    // B267's walk approximates cell identity by following handles between four
+    // slot forms, and joins everything it cannot follow to `Unknown`. A MATCH
+    // CAPTURE has no initializer to follow, and `Weak::upgrade` is the first
+    // API in the language that binds a handle through one — so before the
+    // capture was joined to `Unknown`, `Binding(strong)` was a singleton
+    // component nothing ever mutated and the elision handed out the cell's own
+    // storage. Measured: this program printed `2` where the same program
+    // written without the upgrade printed `1`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ None, Some };
+        import std::shared::{ Shared, Weak };
+
+        fun main() {
+            let cell: Shared<List<i32>> = Shared::new([1]);
+            let weak: Weak<List<i32>> = cell.downgrade();
+            match weak.upgrade() {
+                Some(let strong) => {
+                    mut copy = strong.read();
+                    cell.write().push(9);
+                    print(i"upgraded={copy.len()}");
+                },
+                None => {},
+            }
+            let direct: Shared<List<i32>> = Shared::new([1]);
+            mut copy = direct.read();
+            direct.write().push(9);
+            print(i"direct={copy.len()}");
+        }
+        "#,
+        "upgraded=1\ndirect=1\n",
+    );
+}

@@ -25839,6 +25839,31 @@ impl<'src> Analyzer<'src> {
                 cells.union(CellSlot::Binding(*parameter_id), CellSlot::Unknown);
             }
         }
+        // A handle BINDING with no initializer got its cell from somewhere this
+        // walk cannot follow, for the same reason a parameter did — so it joins
+        // `Unknown` the same way. The shape that reaches this is a MATCH
+        // CAPTURE, and `Weak::upgrade` (C1) is the first API in the language
+        // that produces one: `match weak.upgrade() { Some(let strong) => .. }`
+        // binds a handle to the cell through a pattern, and a capture has no
+        // `initial` for pass 2 to chase.
+        //
+        // Without it the capture is a SINGLETON component nothing ever mutates,
+        // so B267's elision hands out the cell's own storage — measured, before
+        // this line: `let copy = strong.read()` followed by
+        // `cell.write().push(9)` through the original handle printed a length
+        // of 2 where the same program written without the upgrade printed 1.
+        // The original handle is tainted by pass 3 (it was the receiver of a
+        // `downgrade`, which is not one of the four benign calls), so joining
+        // the capture to `Unknown` too is what puts the two ends of one cell in
+        // one component again.
+        for variable in self.variables.values() {
+            if variable.initial.is_none()
+                && let Some(shared_struct_id) = self.primitive_struct_ids.get("Shared").copied()
+                && self.type_is_shared_handle(variable.type_id, shared_struct_id)
+            {
+                cells.union(CellSlot::Binding(variable.id), CellSlot::Unknown);
+            }
+        }
         for expr in self.expr_id_to_expr_map.values() {
             match expr {
                 Expr::Variable(variable_id) => {
