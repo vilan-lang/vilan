@@ -3591,6 +3591,25 @@ impl<'src> Printer<'src> {
                 Some(b'\r') if bytes.get(deletion_end + 1) == Some(&b'\n') => deletion_end += 2,
                 _ => {}
             }
+            // E186: the run's own line ending is enough only when the run was
+            // PART of a paragraph. When the run WAS the paragraph — a blank
+            // line (or the start of the file) above it, a blank line below —
+            // the separator below it belonged to the run and is left behind by
+            // the line above, so the two blanks collapse into one and the file
+            // keeps two where it had one. kolt's generated `lucide/lib.vl` is
+            // the exhibit: its two prelude-redundant imports are a paragraph of
+            // their own between the header comment and `export *;`, and
+            // organizing it printed two blank lines above the `export`.
+            //
+            // Asked as "was this a paragraph", not "is there a blank below",
+            // because the blank below is the paragraph SEPARATOR only if the
+            // run began one. A run under a header comment (`// header` then
+            // `import a;`) is the comment's own paragraph continuing, and its
+            // blank below separates that whole paragraph from the next — so it
+            // stays, and the comment keeps its spacing.
+            if self.line_above_is_blank(run_start) {
+                deletion_end = self.blank_line_end(deletion_end).unwrap_or(deletion_end);
+            }
             return Some(ImportRunEdit {
                 span: Span::from(run_start..deletion_end),
                 replacement: String::new(),
@@ -3633,6 +3652,32 @@ impl<'src> Printer<'src> {
             span: Span::from(run_start..source_end),
             replacement,
         })
+    }
+
+    /// Whether the line ABOVE the one holding `pos` is blank, or `pos` is on the
+    /// file's first line (E186). Together with a blank line below, that is what
+    /// makes a run a whole PARAGRAPH rather than the tail of one.
+    fn line_above_is_blank(&self, pos: usize) -> bool {
+        let before = &self.source[..pos];
+        let Some(line_start) = before.rfind('\n') else {
+            // Nothing above at all: the run opens the file, and a paragraph
+            // separator below it is the run's own.
+            return true;
+        };
+        match before[..line_start].rfind('\n') {
+            Some(previous) => before[previous + 1..line_start].trim().is_empty(),
+            // One line above, and it is the file's first.
+            None => before[..line_start].trim().is_empty(),
+        }
+    }
+
+    /// The offset past the BLANK line beginning at `pos` (its own line ending
+    /// included, `\r\n` and all), or `None` when the line there is not blank —
+    /// E186's paragraph separator.
+    fn blank_line_end(&self, pos: usize) -> Option<usize> {
+        let rest = self.source.get(pos..)?;
+        let end = rest.find('\n').map(|at| at + 1).unwrap_or(rest.len());
+        rest[..end].trim().is_empty().then_some(pos + end)
     }
 
     /// Advances the comment cursor past every comment starting before `pos`,
@@ -12225,6 +12270,68 @@ mod organize {
             organize("import std::dead;\nfun main() {}\n", &["dead"]),
             "fun main() {}\n",
         );
+    }
+
+    // E186: a run that WAS a whole paragraph takes its separator with it.
+    //
+    // kolt's generated `lucide/lib.vl` is the exhibit: a header comment, a
+    // blank, two prelude-redundant imports, a blank, `export *;`. Deleting the
+    // run and one line ending left the blank BELOW it standing beside the blank
+    // above, so organizing printed two blank lines before the `export`. A
+    // generated file is exactly where that matters — `vilan fmt` is kept off it
+    // by `[package] generated`, so nothing repairs it afterwards.
+    #[test]
+    fn a_fully_dead_paragraph_takes_its_separator_with_it() {
+        assert_eq!(
+            organize(
+                "// header\n\nimport std::dead;\n\nexport *;\n\nfun main() {}\n",
+                &["dead"],
+            ),
+            "// header\n\nexport *;\n\nfun main() {}\n",
+        );
+    }
+
+    // …and at the START of the file, where "the line above" is no line at all:
+    // the run opens the file, so the blank below it is its own separator and a
+    // deleted run must not leave the file starting on a blank line.
+    #[test]
+    fn a_fully_dead_opening_paragraph_leaves_no_leading_blank() {
+        assert_eq!(
+            organize("import std::dead;\n\nfun main() {}\n", &["dead"]),
+            "fun main() {}\n",
+        );
+    }
+
+    // The boundary the rule turns on: a run that was the TAIL of a paragraph
+    // keeps the separator, because that blank separates the paragraph it
+    // belonged to from the next one — not the run from anything.
+    #[test]
+    fn a_fully_dead_run_under_a_comment_keeps_the_paragraph_separator() {
+        assert_eq!(
+            organize("// header\nimport std::dead;\n\nfun main() {}\n", &["dead"]),
+            "// header\n\nfun main() {}\n",
+        );
+    }
+
+    // A run with no blank under it is unchanged by E186 — there is no separator
+    // to take, and the line below must not be eaten.
+    #[test]
+    fn a_fully_dead_paragraph_with_no_blank_below_eats_nothing_extra() {
+        assert_eq!(
+            organize("// header\n\nimport std::dead;\nfun main() {}\n", &["dead"]),
+            "// header\n\nfun main() {}\n",
+        );
+    }
+
+    // CRLF: the separator is a whole `\r\n` too, or a stray CR stands as an
+    // empty line exactly as it did before the line-break fix below.
+    #[test]
+    fn a_fully_dead_crlf_paragraph_takes_its_whole_separator() {
+        let organized = organize(
+            &crlf("// header\n\nimport std::dead;\n\nfun main() {}\n"),
+            &["dead"],
+        );
+        assert_eq!(organized, crlf("// header\n\nfun main() {}\n"));
     }
 
     // Sort and prune compose: the run reorders and the dead leaf disappears in one
