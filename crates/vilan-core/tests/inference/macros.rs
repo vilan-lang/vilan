@@ -5076,3 +5076,149 @@ fn b217_a_hand_written_type_miss_is_still_reported_where_it_was_written() {
         "cannot find type 'AlsoMissing'",
     );
 }
+
+// --- E189: a closure handed to a call that did not resolve ------------------
+//
+// B229's hole, third lid, and the one that cascaded furthest. The call-graph
+// collector reads a call's operands out of `function_calls` — the calls the
+// solver WIRED — and an unwired METHOD call has no `entity_map` entry either,
+// so the walk stopped at the head of the chain: every call written inside the
+// unresolved one lost its owner (which reads back as "entered from outside the
+// graph"), and every closure literal among them lost its lexical parent (which
+// the coverage rule reads as uncovered). On kolt at d783fbf4 with its nine
+// retired `View` methods still written that turned nine real errors into 184,
+// 74 of them in a generated module that writes no closure at all.
+// `Program::unwired_calls` keeps the shape the walk needs.
+
+/// The kolt shape, minimised: a method that does not exist, handed a closure
+/// whose body reaches a context read. ONE error — the method — and no coverage
+/// fence anywhere under it.
+#[test]
+fn e189_a_closure_argument_of_an_unresolved_call_does_not_fence_its_reads() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+struct Thing {
+    label: str,
+}
+
+let current: Context<i32> = Context::new();
+
+fun host(body: (|| void) context current) {
+    current.run(1, body);
+}
+
+fun leaf() {
+    print(current.get());
+}
+
+fun page() {
+    leaf();
+}
+
+fun main() {
+    let thing = Thing { label = "x" };
+    host(|| {
+        thing.no_such_method(|| page());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "Thing has no method 'no_such_method'");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// The same hole through a FREE call the scope never resolved: the closure is
+/// an argument either way, and `Expr::Call` records the wired shape only.
+#[test]
+fn e189_a_closure_argument_of_an_unresolved_free_call_does_not_fence_its_reads() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let current: Context<i32> = Context::new();
+
+fun host(body: (|| void) context current) {
+    current.run(1, body);
+}
+
+fun leaf() {
+    print(current.get());
+}
+
+fun main() {
+    host(|| {
+        no_such_fn(|| leaf());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "cannot find 'no_such_fn' in this scope");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// The half the coverage rule cannot see on its own: the calls written inside
+/// an unresolved one keep their OWNER, so a function called only from there is
+/// not read as entered from outside the graph. Without it kolt still reported
+/// 115 of its 184 — every icon in the generated module among them, reached
+/// only through a chain whose head did not resolve.
+#[test]
+fn e189_a_call_inside_an_unresolved_call_keeps_its_owner() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+struct Thing {
+    label: str,
+}
+
+let current: Context<i32> = Context::new();
+
+fun host(body: (|| void) context current) {
+    current.run(1, body);
+}
+
+fun leaf(): str {
+    print(current.get());
+    "leaf"
+}
+
+fun main() {
+    let thing = Thing { label = "x" };
+    host(|| {
+        thing.no_such_method(leaf());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "Thing has no method 'no_such_method'");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+    assert_fails_without(source, "so it can't be used as a value");
+}
+
+/// The invariant neither rule may weaken: a program whose ONLY fault is the
+/// missing `run` still fences. Nothing here is unresolved, so nothing stands
+/// down and nothing is deferred.
+#[test]
+fn e189_a_clean_program_with_an_uncovered_read_still_fences() {
+    assert_fails_once_with(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let current: Context<i32> = Context::new();
+
+fun leaf() {
+    print(current.get());
+}
+
+fun main() {
+    leaf();
+}
+main();
+        "#,
+        "context `current` is read here, but this code can be reached without an enclosing `run`",
+    );
+}
+
