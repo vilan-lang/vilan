@@ -5331,7 +5331,7 @@ pub struct ImplAdmission {
     /// for the refusal that names it. Absent where the restriction is `only`.
     selector_of: HashMap<(SourceId, SourceId), String>,
     /// The `impl` BLOCKS a curated module does not export
-    /// ([`Program::hidden_impls`]), keyed by the block's own entity id. These
+    /// ([`Program::hidden_impls_pending`]), keyed by the block's own entity id. These
     /// reach their own file and nothing else unless a file wrote `#(impl T)`.
     hidden: HashSet<Id>,
     /// (importing file, impl block) — a `#(impl T)` selector's reach into a
@@ -49389,7 +49389,14 @@ pub struct Program<'src> {
     /// that reach only their own file and whatever file wrote `#(impl T)` for
     /// them. Keyed by the block's own entity id. Empty for an uncurated module
     /// and therefore for the whole estate.
-    pub hidden_impls: HashSet<Id>,
+    ///
+    /// **PENDING, and the name says so** (N95): [`build_impl_admission`] takes
+    /// this set on its way to [`ImplAdmission::hidden`], so a consumer reading
+    /// the field after the post-passes sees an empty set whatever the program
+    /// declared, and reads it as "no module hides an impl". The answer that
+    /// survives the pass is `program.impl_admission.hidden`; this one is the
+    /// input, and it is only correct to read before the pass runs.
+    pub hidden_impls_pending: HashSet<Id>,
     /// B318 (E178) — every top-level declaration a CURATED module publishes:
     /// marked `export`, `export(in PATH)`, or covered by its module's
     /// `export *;`.
@@ -58631,7 +58638,7 @@ fn analyze_over_world<'src>(
     // the whole estate: a module with NO marker offers everything, exactly as
     // it did before B318 (`visibility.md` §14), so a package that has not
     // curated loses nothing.
-    let hidden_impls: HashSet<Id> = analyzer
+    let hidden_impls_pending: HashSet<Id> = analyzer
         .implementations
         .iter()
         .filter(|implementation| {
@@ -58667,7 +58674,7 @@ fn analyze_over_world<'src>(
     let curated_modules = analyzer.curated_modules.clone();
 
     Some(Program {
-        hidden_impls,
+        hidden_impls_pending,
         exported_entities,
         curated_modules,
         platform,
@@ -59008,7 +59015,7 @@ pub fn build_impl_admission(program: &mut Program) {
         .collect();
     if restricting.is_empty()
         && program.cross_module_collisions.is_empty()
-        && program.hidden_impls.is_empty()
+        && program.hidden_impls_pending.is_empty()
     {
         return;
     }
@@ -59043,7 +59050,15 @@ pub fn build_impl_admission(program: &mut Program) {
     // statement walked to, which the subject test already decides.
     let mut reached: HashSet<(SourceId, Id)> = HashSet::default();
     let collisions = std::mem::take(&mut program.cross_module_collisions);
-    let hidden = std::mem::take(&mut program.hidden_impls);
+    let hidden = std::mem::take(&mut program.hidden_impls_pending);
+    // N95: the drain is what makes the field's name true, and the name is all
+    // that stood between a later consumer and an empty set it would have read
+    // as "nothing is hidden". Held here rather than at the early return above,
+    // which returns only when the set is already empty.
+    debug_assert!(
+        program.hidden_impls_pending.is_empty(),
+        "`hidden_impls_pending` is drained by this pass and never refilled"
+    );
     for row in &statements {
         if !hidden.is_empty() {
             for selector in row.selectors.iter().filter(|selector| selector.reached) {
