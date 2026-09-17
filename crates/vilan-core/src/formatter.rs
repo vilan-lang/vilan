@@ -2575,7 +2575,7 @@ pub fn organize_import_runs(
         comments: extract_comments(source),
         cursor: 0,
         source,
-        bailed: false,
+        declined: None,
         split: Split::Off,
         probing: false,
         atomic_elements: false,
@@ -2903,9 +2903,180 @@ fn parse(source: &str) -> Option<NodeList<'_>> {
     tree.filter(|_| errors.is_empty()).map(|(items, _)| items)
 }
 
+/// Why a reprint handed back the original bytes instead of a reprint
+/// (tracker N90).
+///
+/// A bail is not a diagnostic — it is the formatter declining to rewrite a file
+/// it does not fully understand, which is the right instinct and the wrong
+/// SILENCE: [`format`] hands the original back, so a caller comparing its
+/// answer to the file sees "already formatted" and a printer gap becomes
+/// invisible to the gate that exists to find it. `export let x = 1;` bailed
+/// through a whole order that way, green under `vilan fmt --check vilan/std`,
+/// and only an idempotency pin on one file caught it. So the four ways out are
+/// named, and [`reprint`] says which one it took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclineReason {
+    /// The source does not lex. Not a printer gap: there is nothing to reprint.
+    DoesNotLex,
+    /// The source does not parse cleanly. Not a printer gap either.
+    DoesNotParse,
+    /// The printer met a construct it has no rule for — one of the three
+    /// `_ => self.decline(..)` fallbacks. This is the printer gap.
+    NoRule,
+    /// The reprint came out with a DIFFERENT token stream, so the safety net
+    /// threw it away. Also a printer gap, and a worse one: the rule exists and
+    /// is wrong.
+    WouldChangeTheCode,
+}
+
+/// What [`reprint`] declined on: the reason, and — for a printer gap — the
+/// construct in the words of the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decline {
+    pub reason: DeclineReason,
+    /// The first line of the construct the printer met, trimmed, or the empty
+    /// string when the decline names no construct (it did not lex or parse).
+    pub construct: String,
+    /// The 1-based line that construct starts on, when one is known.
+    pub line: Option<usize>,
+}
+
+impl Decline {
+    /// One line a tool can print after the file's name.
+    pub fn sentence(&self) -> String {
+        match self.reason {
+            DeclineReason::DoesNotLex => "it does not lex".to_string(),
+            DeclineReason::DoesNotParse => "it does not parse".to_string(),
+            DeclineReason::NoRule => format!(
+                "the printer has no rule for this construct yet: `{}`",
+                self.construct
+            ),
+            DeclineReason::WouldChangeTheCode => format!(
+                "reprinting it would have changed the code, so the reprint was \
+                 thrown away (the formatter's own safety net): `{}`",
+                self.construct
+            ),
+        }
+    }
+}
+
+/// What the printer declined on, recorded at the fallback that declined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeclinedAt {
+    /// The span of the node the printer had no rule for.
+    span: Option<Span>,
+}
+
+/// Formats `original`, returning the reprinted text — or the [`Decline`] that
+/// says why there is none.
+///
+/// This is [`format`]'s honest half, and the one a TOOL should call: `format`
+/// returns the input on every way out, which a caller cannot tell from a file
+/// that was already canonical.
+///
+/// Canonical Vilan is LF and carries no BOM (`windows-support.md` §2), so the
+/// whole reprint runs over the NORMALIZED text: a CRLF file formats to its LF
+/// form exactly once and is idempotent after, the same way indentation is
+/// canonicalized. Normalizing here rather than at each emission site is what
+/// keeps the verbatim slices — macro arguments, an `i"…"` literal, a plain or
+/// triple-quoted string's raw text — free of `\r`, and it keeps the token-stream
+/// safety net comparing like with like (both sides lex from LF text). A decline
+/// leaves the caller the ORIGINAL bytes to keep: a file the formatter does not
+/// fully understand is not one to rewrite, not even its line endings. The line
+/// a `Decline` reports is the same in both, since normalizing removes no lines.
+pub fn reprint(original: &str) -> Result<String, Decline> {
+    let normalized = crate::util::normalize_newlines(crate::util::strip_bom(original));
+    let source: &str = &normalized;
+    let Some(original_tokens) = code_tokens(source) else {
+        return Err(decline(source, DeclineReason::DoesNotLex, None));
+    };
+    let Some(items) = parse(source) else {
+        return Err(decline(source, DeclineReason::DoesNotParse, None));
+    };
+    let mut printer = Printer {
+        out: String::new(),
+        indent: 0,
+        comments: extract_comments(source),
+        cursor: 0,
+        source,
+        declined: None,
+        split: Split::Off,
+        probing: false,
+        atomic_elements: false,
+    };
+    let prev_end = printer.print_items(&items, 0, true);
+    // Comments after the last item (trailing end-of-file comments).
+    printer.flush_comments_before(source.len(), prev_end);
+    printer.out.push('\n');
+    if let Some(declined) = printer.declined {
+        return Err(decline(source, DeclineReason::NoRule, declined.span));
+    }
+    let matches = code_tokens(&printer.out)
+        .is_some_and(|reprinted| normalize(reprinted) == normalize(original_tokens));
+    if matches {
+        Ok(printer.out)
+    } else {
+        // The safety net has no span to offer — it compares two whole token
+        // streams — so it names the file's first item, which is as close as the
+        // net can get to "where to start looking".
+        let first = items.first().map(|(_, span)| *span);
+        Err(decline(source, DeclineReason::WouldChangeTheCode, first))
+    }
+}
+
+/// Builds the [`Decline`] a reprint answers with: the reason, and the construct
+/// read out of `source` at `span` when the decline names one.
+fn decline(source: &str, reason: DeclineReason, span: Option<Span>) -> Decline {
+    Decline {
+        reason,
+        construct: span
+            .map(|span| first_line_at(source, span))
+            .unwrap_or_default(),
+        line: span.map(|span| line_of(source, span)),
+    }
+}
+
+/// The 1-based line `span` starts on. Sliced through `get`, never by index: a
+/// formatter that PANICS on a span is worse than one that declines, and the
+/// language server runs this behind a fence it should not need.
+fn line_of(source: &str, span: Span) -> usize {
+    let start = span.into_range().start.min(source.len());
+    source
+        .get(..start)
+        .unwrap_or_default()
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1
+}
+
+/// The first line of the source at `span`, trimmed and clipped — what a tool
+/// shows a reader so they can go and look at the construct themselves.
+fn first_line_at(source: &str, span: Span) -> String {
+    let range = span.into_range();
+    let start = range.start.min(source.len());
+    let end = range.end.min(source.len()).max(start);
+    let text = source
+        .get(start..end)
+        .unwrap_or_default()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim();
+    const CLIP: usize = 120;
+    if text.chars().count() > CLIP {
+        format!("{}…", text.chars().take(CLIP).collect::<String>())
+    } else {
+        text.to_string()
+    }
+}
+
 /// Formats `original`, returning the reprinted text. Returns the input unchanged
 /// if it doesn't lex/parse, if the printer hits a construct it doesn't yet handle,
 /// or if the reprint would change the code (see the safety note).
+///
+/// A caller that must tell "already canonical" from "declined" calls
+/// [`reprint`] instead — this one cannot say which happened, by construction.
 ///
 /// Canonical Vilan is LF and carries no BOM (`windows-support.md` §2), so the
 /// whole reprint runs over the NORMALIZED text: a CRLF file formats to its LF
@@ -2917,39 +3088,7 @@ fn parse(source: &str) -> Option<NodeList<'_>> {
 /// still returns the ORIGINAL bytes: a file the formatter does not fully
 /// understand is not one to rewrite, not even its line endings.
 pub fn format(original: &str) -> String {
-    let normalized = crate::util::normalize_newlines(crate::util::strip_bom(original));
-    let source: &str = &normalized;
-    let Some(original_tokens) = code_tokens(source) else {
-        return original.to_string();
-    };
-    let Some(items) = parse(source) else {
-        return original.to_string();
-    };
-    let mut printer = Printer {
-        out: String::new(),
-        indent: 0,
-        comments: extract_comments(source),
-        cursor: 0,
-        source,
-        bailed: false,
-        split: Split::Off,
-        probing: false,
-        atomic_elements: false,
-    };
-    let prev_end = printer.print_items(&items, 0, true);
-    // Comments after the last item (trailing end-of-file comments).
-    printer.flush_comments_before(source.len(), prev_end);
-    printer.out.push('\n');
-    if printer.bailed {
-        return original.to_string();
-    }
-    let matches = code_tokens(&printer.out)
-        .is_some_and(|reprinted| normalize(reprinted) == normalize(original_tokens));
-    if matches {
-        printer.out
-    } else {
-        original.to_string()
-    }
+    reprint(original).unwrap_or_else(|_| original.to_string())
 }
 
 /// The column budget for ONE rendered line. A line whose inline rendering is
@@ -3010,7 +3149,10 @@ struct Printer<'src> {
     comments: Vec<(Span, &'src str)>,
     cursor: usize,
     source: &'src str,
-    bailed: bool,
+    /// What the printer had no rule for, if anything — N90's replacement for a
+    /// bare `bailed: bool`. The SPAN is the whole point: a tool that reports a
+    /// decline has to name the construct, and a boolean names nothing.
+    declined: Option<DeclinedAt>,
     /// The pending [`Split`] permission for the next expression printed.
     split: Split,
     /// True while a seam probe is rendering a chain link to see whether it spans
@@ -3027,6 +3169,16 @@ struct Printer<'src> {
 }
 
 impl<'src> Printer<'src> {
+    /// Records that the printer has no rule for the construct at `span`, which
+    /// makes [`reprint`] hand the original bytes back with a [`Decline`] naming
+    /// it (N90). The FIRST decline is kept: it is the one nearest the gap, and
+    /// a later one is usually the same construct met again on the way out.
+    fn decline(&mut self, span: Option<Span>) {
+        if self.declined.is_none() {
+            self.declined = Some(DeclinedAt { span });
+        }
+    }
+
     /// Whether the source between `from` and `to` contains a blank line (a run of
     /// only-whitespace with two or more newlines), used to preserve paragraph gaps.
     fn has_blank_between(&self, from: usize, to: usize) -> bool {
@@ -3770,7 +3922,7 @@ impl<'src> Printer<'src> {
         )
     }
 
-    /// Prints one top-level / block item. Sets `bailed` for anything not yet
+    /// Prints one top-level / block item. Declines anything not yet
     /// handled, so `format` falls back to the original source.
     fn print_item(&mut self, item: &Spanned<Node<'src>>) {
         match &item.0 {
@@ -4334,7 +4486,10 @@ impl<'src> Printer<'src> {
                 self.print_type(&template.0);
                 self.out.push(')');
             }
-            _ => self.bailed = true,
+            // No span to offer: `print_type` takes a bare node, and every
+            // caller that has one is a type POSITION rather than the construct
+            // a reader would go and look at. The file is still named.
+            _ => self.decline(None),
         }
     }
 
@@ -5326,7 +5481,7 @@ impl<'src> Printer<'src> {
     /// belong together, and one canonical shape is the formatter's whole design.
     ///
     /// Whether the file formats at all still rides on this arm existing. There
-    /// are three `_ => self.bailed = true` fallbacks, the bail set is asserted
+    /// are three `_ => self.decline(..)` fallbacks, the bail set is asserted
     /// EMPTY by `parse_differential::formatter_never_silently_bails`, and a bail
     /// returns the whole FILE unformatted while `--check` calls it clean.
     fn print_css(&mut self, body: &crate::node::CssBody<'src>) {
@@ -6035,7 +6190,7 @@ impl<'src> Printer<'src> {
         }
         let start = self.out.len();
         let cursor = self.cursor;
-        let bailed = self.bailed;
+        let declined = self.declined.clone();
         let split = self.split;
         let indent = self.indent;
         self.probing = true;
@@ -6047,7 +6202,7 @@ impl<'src> Printer<'src> {
         let over = self.first_line_over_budget(start);
         self.out.truncate(start);
         self.cursor = cursor;
-        self.bailed = bailed;
+        self.declined = declined;
         self.split = split;
         self.indent = indent;
         over
@@ -6076,7 +6231,7 @@ impl<'src> Printer<'src> {
     fn link_spans_lines(&mut self, step: &Spanned<Node<'src>>) -> bool {
         let start = self.out.len();
         let cursor = self.cursor;
-        let bailed = self.bailed;
+        let declined = self.declined.clone();
         let split = self.split;
         self.probing = true;
         self.print_postfix_suffix(step);
@@ -6084,7 +6239,7 @@ impl<'src> Printer<'src> {
         let spans = self.out[start..].contains('\n');
         self.out.truncate(start);
         self.cursor = cursor;
-        self.bailed = bailed;
+        self.declined = declined;
         self.split = split;
         spans
     }
@@ -6098,7 +6253,7 @@ impl<'src> Printer<'src> {
         }
         let start = self.out.len();
         let cursor = self.cursor;
-        let bailed = self.bailed;
+        let declined = self.declined.clone();
         let split = self.split;
         self.probing = true;
         self.print_expr(expr);
@@ -6106,7 +6261,7 @@ impl<'src> Printer<'src> {
         let spans = self.out[start..].contains('\n');
         self.out.truncate(start);
         self.cursor = cursor;
-        self.bailed = bailed;
+        self.declined = declined;
         self.split = split;
         spans
     }
@@ -6149,7 +6304,7 @@ impl<'src> Printer<'src> {
             Node::TryAssert(_) => self.out.push('!'),
             Node::Lifted(_) => self.out.push('?'),
             // `postfix_spine` yields only the four forms above.
-            _ => self.bailed = true,
+            _ => self.decline(Some(step.1)),
         }
     }
 
@@ -6393,7 +6548,7 @@ impl<'src> Printer<'src> {
         self.source.get(range.start..end)
     }
 
-    /// Prints any expression. Sets `bailed` for forms not yet handled.
+    /// Prints any expression. Declines forms not yet handled.
     fn print_expr(&mut self, expr: &Spanned<Node<'src>>) {
         // Take the pending split permission here, so that every form *drops* it
         // by default and only the arms below re-arm it explicitly (via
@@ -6977,7 +7132,7 @@ impl<'src> Printer<'src> {
             }
             Node::Element(body) => self.print_element(body),
             Node::Css(body) => self.print_css(body),
-            _ => self.bailed = true,
+            _ => self.decline(Some(expr.1)),
         }
     }
 
@@ -14343,5 +14498,131 @@ mod binary_chain_layout {
             );
             assert_eq!(format(&once), once, "not a fixed point: {once}");
         }
+    }
+}
+
+#[cfg(test)]
+mod declines {
+    //! N90: `vilan fmt --check` could not tell "clean" from "BAILED".
+    //!
+    //! [`format`] answers the ORIGINAL bytes on every way out — a source that
+    //! does not lex, one that does not parse, a construct the printer has no
+    //! rule for, a reprint the safety net threw away — so a caller comparing
+    //! its answer to the file on disk sees "already formatted" in all four
+    //! cases. That is how `export let x = 1;` went a whole order unformatted
+    //! with `vilan fmt --check vilan/std` green over it, and how
+    //! `[deprecated(..)]` did the same until an idempotency pin on one file
+    //! caught it: a printer gap was invisible to the gate whose whole job is to
+    //! find one.
+    //!
+    //! [`reprint`] is the honest half, and these pin what it says.
+
+    use super::{
+        Decline, DeclineReason, DeclinedAt, Printer, Split, decline, extract_comments,
+        first_line_at, format, line_of, reprint,
+    };
+    use crate::node::Node;
+
+    #[test]
+    fn a_clean_file_reprints_and_a_reprint_is_not_a_decline() {
+        let source = "fun main() {\n\tlet x = 1;\n}\n";
+        assert_eq!(reprint(source), Ok(source.to_string()));
+    }
+
+    #[test]
+    fn a_source_that_does_not_parse_declines_where_format_stayed_silent() {
+        let source = "fun main() {\n\tlet x = ;\n}\n";
+        // The silence the item is about: `format` hands back exactly what it
+        // was given, which a caller reads as "already formatted".
+        assert_eq!(format(source), source);
+        let declined = reprint(source).expect_err("a source that does not parse declines");
+        assert_eq!(declined.reason, DeclineReason::DoesNotParse);
+        assert_eq!(declined.sentence(), "it does not parse");
+    }
+
+    #[test]
+    fn a_source_that_does_not_lex_declines_too() {
+        // An unterminated string: the lexer, not the parser, is what refuses.
+        let source = "fun main() {\n\tlet x = \"open;\n}\n";
+        assert_eq!(format(source), source);
+        let declined = reprint(source).expect_err("a source that does not lex declines");
+        assert_eq!(declined.reason, DeclineReason::DoesNotLex);
+        assert_eq!(declined.sentence(), "it does not lex");
+    }
+
+    #[test]
+    fn a_printer_gap_is_recorded_with_the_span_of_what_it_met() {
+        // The bail set is EMPTY today (`parse_differential::
+        // formatter_never_silently_bails` holds it there), so the gap is
+        // PLANTED rather than found: `Node::Error` is a variant no printer arm
+        // handles and no clean parse produces. What is under test is not which
+        // construct is missing — it is that the printer RECORDS one, with the
+        // span a tool needs to name it. A bare `bailed: bool` could not.
+        let source = "fun main() {\n\tlet x = 1;\n}\n";
+        let mut printer = Printer {
+            out: String::new(),
+            indent: 0,
+            comments: extract_comments(source),
+            cursor: 0,
+            source,
+            declined: None,
+            split: Split::Off,
+            probing: false,
+            atomic_elements: false,
+        };
+        // The span of `let x = 1;` on line 2, so the recorded construct is one
+        // a reader can go and look at.
+        let start = source.find("let x").expect("the fixture's second line");
+        let span = (start..start + "let x = 1;".len()).into();
+        printer.print_expr(&(Node::Error, span));
+        assert_eq!(printer.declined, Some(DeclinedAt { span: Some(span) }));
+
+        let declined = decline(source, DeclineReason::NoRule, Some(span));
+        assert_eq!(
+            declined,
+            Decline {
+                reason: DeclineReason::NoRule,
+                construct: "let x = 1;".to_string(),
+                line: Some(2),
+            }
+        );
+        assert_eq!(
+            declined.sentence(),
+            "the printer has no rule for this construct yet: `let x = 1;`"
+        );
+    }
+
+    #[test]
+    fn a_probe_leaves_no_decline_behind() {
+        // The seam probes render and take the rendering back out, and the bail
+        // flag went with it. It still does, now that the flag carries a span:
+        // a probe that met a gap must not make the whole file decline.
+        let source = "fun main() {\n\tlet x = 1;\n}\n";
+        let mut printer = Printer {
+            out: String::new(),
+            indent: 0,
+            comments: extract_comments(source),
+            cursor: 0,
+            source,
+            declined: None,
+            split: Split::Off,
+            probing: false,
+            atomic_elements: false,
+        };
+        let start = source.find("let x").expect("the fixture's second line");
+        let span = (start..start + "let x = 1;".len()).into();
+        assert!(!printer.expr_spans_lines(&(Node::Error, span)));
+        assert_eq!(printer.declined, None, "a probe leaves no trace");
+    }
+
+    #[test]
+    fn the_construct_a_decline_names_is_one_line_of_the_source() {
+        let source = "fun one() {\n}\n\nfun two() {\n}\n";
+        let span = (0..source.len()).into();
+        // The first line, trimmed — not the whole item, which would print a
+        // screenful into a tool's output.
+        assert_eq!(first_line_at(source, span), "fun one() {");
+        let second = source.find("fun two").expect("the second item");
+        assert_eq!(line_of(source, (second..source.len()).into()), 4);
     }
 }

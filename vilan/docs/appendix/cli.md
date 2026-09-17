@@ -320,10 +320,22 @@ is the current directory. Formatting is conservative and a fixed point:
   before and after. `Style + Style` operands are never reordered: that merge's
   order is yours.
 - A file the formatter cannot yet print faithfully is left byte-for-byte
-  untouched, never half-formatted.
+  untouched, never half-formatted — and **said out loud**, not silently. One
+  `declined <file>:<line>` line names it and what the formatter met: a
+  construct the printer has no rule for yet, a reprint its own safety net
+  threw away, or a file that does not lex or parse.
 
 `--check` reports the files that would change and exits 1 if any (the
 CI spelling). Nothing is rewritten.
+
+**Three outcomes, three exit codes.** `0` is clean. `1` is "this tree is not
+formatted" — `--check` found files that would change, or a write failed. `2` is
+"the formatter could not format a file", the `declined` lines above it saying
+which and why, and it holds in both modes because a run that skipped a file
+wrote nothing for it either. `2` outranks `1`: a run that met a file it could
+not format has established nothing about the rest of the tree. Before this,
+every one of those ways out answered the file's own bytes, so `--check`
+reported a file the printer had bailed on as already-formatted.
 
 **Generated sources are skipped.** A package that declares
 `[package] generated = "…"` is saying that directory holds *products* — files

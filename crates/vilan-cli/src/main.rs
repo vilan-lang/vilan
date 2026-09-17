@@ -2028,6 +2028,13 @@ fn fmt(paths: &[PathBuf], check: bool) -> ExitCode {
     exclude_generated(&mut files);
     let mut changed = 0;
     let mut failed = false;
+    // N90: files the printer DECLINED — a construct it has no rule for, or a
+    // reprint its own safety net threw away. Counted apart from `changed`
+    // because they are a different outcome with a different owner: a file that
+    // "would reformat" is the author's to fix, a file the printer declined is
+    // the FORMATTER's, and a run reporting the second as the first is how a
+    // printer gap stays invisible.
+    let mut declined = 0;
     for file in &files {
         let source = match fs::read_to_string(file) {
             Ok(source) => source,
@@ -2041,7 +2048,20 @@ fn fmt(paths: &[PathBuf], check: bool) -> ExitCode {
                 continue;
             }
         };
-        let formatted = vilan_core::formatter::format(&source);
+        // N90: `format` answers the original bytes on every way out, so a file
+        // the printer DECLINED reads exactly like one that was already
+        // canonical — `export let x = 1;` bailed for a whole order with
+        // `fmt --check vilan/std` green over it, and an idempotency pin on one
+        // file is what caught it. `reprint` says which happened, and a decline
+        // is reported by name here instead of being counted as clean.
+        let formatted = match vilan_core::formatter::reprint(&source) {
+            Ok(formatted) => formatted,
+            Err(decline) => {
+                report_decline(file, &decline);
+                declined += 1;
+                continue;
+            }
+        };
         if formatted == source {
             continue;
         }
@@ -2067,11 +2087,51 @@ fn fmt(paths: &[PathBuf], check: bool) -> ExitCode {
             );
         }
     }
-    if failed || (check && changed > 0) {
+    // Three outcomes, three codes (N90). `2` is the distinct one, and it says
+    // something `1` cannot: the formatter could not format a file, as opposed
+    // to the tree not being formatted. It holds in BOTH modes, because a
+    // `vilan fmt` that skipped a file did not write it either, and the silence
+    // is what the item is about. It also OUTRANKS `1`: a run that met a file it
+    // could not format has not established anything about the rest.
+    if declined > 0 {
+        eprintln!(
+            "{} {declined} file(s) did not format (see the `declined` lines above); \
+             `vilan fmt` says nothing about whether the rest of the tree is clean",
+            paint::error_prefix(),
+        );
+        ExitCode::from(DECLINED)
+    } else if failed || (check && changed > 0) {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// `vilan fmt`'s exit code for a file it could NOT format (N90) — distinct
+/// from `1`, which `--check` already spends on "the tree is not formatted", so
+/// a CI leg (and `scripts/ci-local.sh`'s `vilan-fmt`) can tell a formatter that
+/// declined from a tree that is merely unformatted, by the code alone.
+///
+/// Before this, `format` answered the original bytes on every way out and the
+/// run reported the file as already-formatted: a printer gap was invisible to
+/// the gate whose whole job is to find one, and so was a `.vl` file that does
+/// not parse.
+const DECLINED: u8 = 2;
+
+/// Reports one file that did not format: the path, the line, and the construct
+/// in the words of the source. Naming the CONSTRUCT is the point — "this file
+/// did not format" sends a reader into a 900-line std module looking for what.
+fn report_decline(file: &Path, decline: &vilan_core::formatter::Decline) {
+    let where_ = match decline.line {
+        Some(line) => format!("{}:{line}", file.display()),
+        None => file.display().to_string(),
+    };
+    eprintln!(
+        "{} {}  {}",
+        paint::out(paint::Style::YELLOW, "declined"),
+        paint::out(paint::Style::BOLD, &where_),
+        decline.sentence(),
+    );
 }
 
 /// Drops every file that lives under a declared `generated` root, and says so

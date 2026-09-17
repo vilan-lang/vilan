@@ -84,6 +84,12 @@ leg_fmt() {
 #
 # If the exclusion is ever lifted, the reflow is its own commit (N55's shape):
 # reformat first, gate second, so the diff is readable as one thing.
+#
+# The leg reads the EXIT CODE, and since N90 there are three: 0 clean, 1 the
+# tree is not formatted, 2 the formatter could not format a file (the
+# `declined` lines say which and why). Both non-zero codes fail this leg - the
+# distinction is for the reader, who otherwise cannot tell an unformatted tree
+# from a printer gap, and before N90 a printer gap read as a clean 0.
 leg_vilan_fmt() {
     cargo run --quiet -p vilan-cli -- fmt --check .
 }
