@@ -1368,3 +1368,37 @@ fn a_generic_lazy_parameter_at_a_data_type_still_compiles() {
         "true\n",
     );
 }
+
+// --- B345: the view-capture scan walks a call's SUBJECT ---------------------
+
+/// Rule 3 over a lazy argument whose view sits in a nested call SUBJECT. The
+/// scan walked a call's arguments and not the expression being CALLED, so a
+/// view named inside `(build(seen.label))()` was invisible to it — and a thunk
+/// is a closure, so this is rule 3's own refusal arriving where it always
+/// should have.
+#[test]
+fn a_view_inside_a_nested_call_subject_in_a_lazy_argument_is_a_view_capture() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        struct Holder { label: str }
+
+        fun build(text: str): || str {
+            || text
+        }
+
+        fun message(lazy text: str): i32 {
+            print(text);
+            0
+        }
+
+        fun main() {
+            let holder = Holder { label = "a" };
+            let seen = &holder;
+            message((build(seen.label))());
+        }
+        "#,
+        "a closure cannot capture the view 'seen'",
+    );
+}

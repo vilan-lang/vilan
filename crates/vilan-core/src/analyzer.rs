@@ -23626,7 +23626,26 @@ impl<'src> Analyzer<'src> {
             }
             Expr::Call(call_id) => {
                 if let Some(function_call) = self.function_calls.get(&call_id) {
-                    for argument in function_call.argument_ids.clone() {
+                    let subject_id = function_call.subject_id;
+                    let argument_ids = function_call.argument_ids.clone();
+                    // B345: the SUBJECT, not only the arguments. A plain call's
+                    // subject is `Expr::Local(callee)` and walking it finds
+                    // nothing, which is why the omission went unnoticed — but a
+                    // call whose callee is itself computed (`make(view)()`, a
+                    // closure read out of a field or an index) carries the whole
+                    // inner expression there, and every view named inside it was
+                    // invisible to this scan. Pre-existing, and now also on the
+                    // lazy path: a thunk is a closure, so rule 3 runs over a
+                    // lazy argument through this same walk.
+                    self.scan_closure_view_captures(
+                        subject_id,
+                        view_bindings,
+                        saw_await,
+                        declared_inside,
+                        captured,
+                        visited,
+                    );
+                    for argument in argument_ids {
                         self.scan_closure_view_captures(
                             argument,
                             view_bindings,
