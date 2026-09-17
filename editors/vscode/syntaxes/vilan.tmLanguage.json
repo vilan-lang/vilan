@@ -597,26 +597,17 @@
      ]
     },
     {
-     "comment": "A property name and its `:` — the span-adjacent name-`-`-name run the grammar reads, custom properties (`--brand-ink`) and vendor prefixes (`-webkit-…`) included.",
-     "match": "(-{0,2}[a-zA-Z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*)\\s*(:)",
-     "captures": {
+     "comment": "A DECLARATION, which since A101 is a CALL: the property name — the span-adjacent name-`-`-name run the grammar reads, custom properties (`--brand-ink`) and vendor prefixes (`-webkit-…`) included — and then its argument list, whose contents are ordinary vilan. begin/end rather than a match, because the arguments are expressions and a value may span lines; the parens carry the scopes the `{expression}` hole used to, since they mark the same thing it did — where CSS stops and vilan starts.",
+     "begin": "(-{0,2}[a-zA-Z][a-zA-Z0-9_]*(?:-[a-zA-Z0-9_]+)*)\\s*(\\()",
+     "beginCaptures": {
       "1": {
        "name": "support.type.property-name.vilan"
       },
       "2": {
-       "name": "punctuation.separator.key-value.vilan"
-      }
-     }
-    },
-    {
-     "comment": "A `{expression}` hole. Nested rules are matched first and take their own braces, so a bare `{` inside a block is always a hole; its contents are ordinary vilan.",
-     "begin": "\\{",
-     "beginCaptures": {
-      "0": {
        "name": "punctuation.section.embedded.begin.vilan"
       }
      },
-     "end": "\\}",
+     "end": "\\)",
      "endCaptures": {
       "0": {
        "name": "punctuation.section.embedded.end.vilan"

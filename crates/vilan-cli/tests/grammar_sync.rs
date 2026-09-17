@@ -1622,6 +1622,60 @@ fun probe(cell: SignalCell<[i32; 4]>) {
 }
 ";
 
+/// A101's exhibit: a `css` block whose declarations are CALLS. The property
+/// keeps the CSS vocabulary; everything inside the parens is ordinary vilan.
+const CSS_CALL_DECLARATIONS: &str = "\
+fun card() {
+\tcss {
+\t\twidth(pct(100));
+\t\t--brand-ink(gray(900));
+\t\t.hover {
+\t\t\tcolor(hex(\"#fafafa\"));
+\t\t}
+\t}
+}
+";
+
+#[test]
+fn a101_a_declaration_head_is_a_property_and_its_arguments_are_ordinary_vilan() {
+    let Some(painting) = painting(CSS_CALL_DECLARATIONS) else {
+        return;
+    };
+    // The property vocabulary reaches the CALL head, hyphenated names and
+    // custom properties included — the grammar's own span-adjacent run.
+    assert_eq!(
+        painting.scope_at("width"),
+        "support.type.property-name.vilan"
+    );
+    assert_eq!(
+        painting.scope_at("--brand-ink"),
+        "support.type.property-name.vilan"
+    );
+    // And it stops at the `(`: the value is vilan, painted by `$self`, which is
+    // what the `{expression}` hole's own scopes used to mark.
+    assert_eq!(
+        painting.scope_at("(pct"),
+        "punctuation.section.embedded.begin.vilan"
+    );
+    assert_ne!(
+        painting.scope_at("pct"),
+        "support.type.property-name.vilan",
+        "an argument is an expression, not a property name"
+    );
+    assert_ne!(
+        painting.scope_at("hex"),
+        "support.type.property-name.vilan",
+        "an argument inside a nested rule is an expression too"
+    );
+    // The dotted head is untouched: a combinator, not a property.
+    assert_eq!(painting.scope_at("hover"), "entity.name.function.vilan");
+    // A string argument is a string, with its own delimiters.
+    assert_eq!(
+        painting.scope_at("\"#fafafa\""),
+        "punctuation.definition.string.begin.vilan"
+    );
+}
+
 #[test]
 fn e161_a_generic_head_is_a_list_a_tag_is_a_tag_and_a_comparison_is_an_operator() {
     let Some(painting) = painting(GENERIC_HEADS_AND_MARKUP) else {

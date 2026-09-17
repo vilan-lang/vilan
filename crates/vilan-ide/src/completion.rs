@@ -707,7 +707,7 @@ fn error_tag_name_end(source: &str, start: usize, end: usize) -> Option<usize> {
     (name > 0).then_some(start + 1 + name)
 }
 
-/// The candidates for one of §7.1's four positions in a `css` body.
+/// The candidates for one of §7.1's positions in a `css` body.
 ///
 /// The part that matters is where the vocabulary comes from. E67 refused to
 /// invent an HTML attribute list, on the ground that it "would be a second
@@ -721,44 +721,72 @@ fn error_tag_name_end(source: &str, start: usize, end: usize) -> Option<usize> {
 ///
 /// Table order is canonical order (S3's sorter reads the same rows), so the
 /// list arrives in the sequence `vilan fmt` would put the declarations in.
-fn css_block_completions(position: CssPosition) -> Vec<Completion> {
-    match position {
-        CssPosition::Property => {
-            // E153: std's slots FIRST, in canonical order — those are the
-            // properties this system has a typed method for, and the sequence
-            // `vilan fmt` would put them in — then the rest of the CSS
-            // property index (`css_properties::CSS_PROPERTIES`), which is what
-            // the block exists to reach: `raw` writes ANY property, and the
-            // fifty-odd std slots were silent about `mask`, `contain` and
-            // `scroll-snap-type`. Ordering is the whole difference between the
-            // two halves; both are offered as fields.
-            let mut seen: HashSet<&str> = HashSet::new();
-            STYLE_PROPERTY_METHODS
+///
+/// A101 took one row off the table and half-dissolved another. There is no
+/// VALUE position any more — a declaration's value is an ordinary argument, so
+/// [`css_position`] declines inside the parens and the cursor falls through to
+/// expression completion, which is where `pct(`, `Color::` and every name in
+/// scope already live. And the property row inserts the `(` with the name,
+/// because a declaration is a call.
+impl Analysis<'_, '_> {
+    fn css_block_completions(&self, position: CssPosition) -> Vec<Completion> {
+        match position {
+            CssPosition::Property => {
+                // E153: std's slots FIRST, in canonical order — those are the
+                // properties this system has a typed method for, and the
+                // sequence `vilan fmt` would put them in — then the rest of the
+                // CSS property index (`css_properties::CSS_PROPERTIES`), which
+                // is what the block exists to reach: `raw` writes ANY property,
+                // and the fifty-odd std slots were silent about `mask`,
+                // `contain` and `scroll-snap-type`. Ordering is the whole
+                // difference between the two halves; both are offered as
+                // fields.
+                let mut seen: HashSet<&str> = HashSet::new();
+                STYLE_PROPERTY_METHODS
+                    .iter()
+                    .flat_map(|method| method.properties.iter().copied())
+                    .chain(vilan_core::css_properties::CSS_PROPERTIES.iter().copied())
+                    .filter(|property| seen.insert(property))
+                    .map(|property| {
+                        let mut completion =
+                            Completion::bare(property.to_string(), CompletionKind::Field);
+                        // A101: the `(` comes with the name, and the cursor
+                        // lands where the value goes. Plain text rather than a
+                        // snippet — there is no tab-stop to place, and a client
+                        // without snippet support would surface a `$0`.
+                        completion.insert = Some(InsertText {
+                            text: format!("{property}("),
+                            is_snippet: false,
+                        });
+                        completion
+                    })
+                    .collect()
+            }
+            // E183 widens this to every reachable `impl Style` method; the
+            // rename is A101's, because a dotted head takes a chain LINK too.
+            CssPosition::DottedHead => STYLE_CONDITION_METHODS
                 .iter()
-                .flat_map(|method| method.properties.iter().copied())
-                .chain(vilan_core::css_properties::CSS_PROPERTIES.iter().copied())
-                .filter(|property| seen.insert(property))
-                .map(|property| Completion::bare(property.to_string(), CompletionKind::Field))
-                .collect()
+                .filter(|(condition, _)| *condition != "element")
+                .map(|(condition, _)| {
+                    Completion::bare((*condition).to_string(), CompletionKind::Method)
+                })
+                .collect(),
+            // The same rows, as the free CONSTRUCTORS a set is summed from. They
+            // are functions here and methods above, which is exactly the
+            // difference between `hover()` (the condition) and `.hover { … }`
+            // (the sugar that puts a style under it) — and `element` appears
+            // only here, because it is a value with no combinator twin.
+            CssPosition::ConditionValue => STYLE_CONDITION_METHODS
+                .iter()
+                .map(|(condition, _)| {
+                    Completion::bare(condition.to_string(), CompletionKind::Function)
+                })
+                .collect(),
+            // The one v1 blank left (Q4), and blank rather than absent: falling
+            // through to the enclosing scope is what an element head refuses for
+            // the same reason — nothing in scope is a custom property.
+            CssPosition::CustomProperty => Vec::new(),
         }
-        CssPosition::Condition => STYLE_CONDITION_METHODS
-            .iter()
-            .filter(|(condition, _)| *condition != "element")
-            .map(|(condition, _)| Completion::bare(condition.to_string(), CompletionKind::Method))
-            .collect(),
-        // The same rows, as the free CONSTRUCTORS a set is summed from. They
-        // are functions here and methods above, which is exactly the difference
-        // between `hover()` (the condition) and `.hover { … }` (the sugar that
-        // puts a style under it) — and `element` appears only here, because it
-        // is a value with no combinator twin.
-        CssPosition::ConditionValue => STYLE_CONDITION_METHODS
-            .iter()
-            .map(|(condition, _)| Completion::bare(condition.to_string(), CompletionKind::Function))
-            .collect(),
-        // Both v1 blanks (Q4), and blank rather than absent: falling through to
-        // the enclosing scope is what an element head refuses for the same
-        // reason — nothing in scope is a CSS value or a custom property.
-        CssPosition::CustomProperty | CssPosition::Value => Vec::new(),
     }
 }
 
@@ -818,8 +846,10 @@ fn in_element_head(
     depth == 0
 }
 
-/// Which of §7.1's four positions `offset` (LIVE space) sits in, or `None` when
-/// the cursor is not in a `css` body at all.
+/// Which of §7.1's positions `offset` (LIVE space) sits in, or `None` when the
+/// cursor is not in a `css` body at all — which since A101 includes a
+/// declaration's ARGUMENTS, because those are ordinary expression ground and
+/// the cursor there belongs to ordinary expression completion.
 ///
 /// Two questions, in the element head's own order. [`innermost_css_body_start`]
 /// answers *which body* from the raw parse; the token walk below answers *where
@@ -827,12 +857,10 @@ fn in_element_head(
 /// arguments are ordinary expression ground, and both are bracket-deep, so the
 /// depth clause declines them exactly as the head's does.
 ///
-/// Within one item the two markers are the grammar's own: the leading `.` is the
-/// whole declaration/combinator disambiguator (§3), and the `:` separates the
-/// property from its value. A `;` starts the next item — and so does a nested
-/// rule's closing `}`, which is why that one arm is guarded on `dotted`: a
-/// HOLE's `}` closes no item, and reading it as one would put the rest of the
-/// value in property position.
+/// Within one item the marker is the grammar's own: the leading `.` is the whole
+/// declaration/combinator disambiguator (§3). A `;` starts the next item — and
+/// so does a nested rule's closing `}`, which is why that one arm is guarded on
+/// `dotted`.
 fn css_position(
     root: Option<&RawRoot<'_>>,
     text: &str,
@@ -853,7 +881,6 @@ fn css_position(
     };
     let mut depth = 0usize;
     let mut dotted = false;
-    let mut after_colon = false;
     // The one place inside a head's arguments whose vocabulary is known (A95
     // S3): `combinator` is the dotted item's name, `on_head` says the cursor is
     // inside THAT name's argument list, and the two trailing tokens say whether
@@ -892,19 +919,14 @@ fn css_position(
             Token::Ctrl('}') if depth == 1 && dotted => {
                 depth = 0;
                 dotted = false;
-                after_colon = false;
             }
             Token::Ctrl(')' | ']' | '}') => depth = depth.saturating_sub(1),
             Token::Ctrl(';') if depth == 0 => {
                 dotted = false;
-                after_colon = false;
                 combinator = None;
                 on_head = false;
             }
-            // The declaration's separator is an OPERATOR token, not a control
-            // one (`parse_css_declaration` reads it with `peek_is_op`).
-            Token::Op(":") if depth == 0 => after_colon = true,
-            Token::Ctrl('.') if depth == 0 && !after_colon => dotted = true,
+            Token::Ctrl('.') if depth == 0 => dotted = true,
             _ => {}
         }
     }
@@ -914,11 +936,8 @@ fn css_position(
     if depth != 0 {
         return None;
     }
-    if after_colon {
-        return Some(CssPosition::Value);
-    }
     if dotted {
-        return Some(CssPosition::Condition);
+        return Some(CssPosition::DottedHead);
     }
     // A property name is a span-adjacent `name`-`-`-`name` run, so the name
     // being typed reaches back over hyphens as well as identifier bytes — which
@@ -1104,19 +1123,16 @@ enum CssPosition {
     /// properties declared in this build, which is nothing in v1 (Q4) — and it
     /// is deliberately not the standard list, which no `--` name can match.
     CustomProperty,
-    /// An item's head after the `.` that commits it to a condition combinator.
-    Condition,
+    /// An item's head after the `.` — a condition combinator or any other
+    /// `impl Style` method (E183; renamed from `Condition`, which named only
+    /// half of what the position admits).
+    DottedHead,
     /// Inside an `.on(<set>)` head, at a place a condition VALUE goes: directly
     /// after the `(`, or after a `+` (A95 S3). The head's arguments are
     /// ordinary expression ground everywhere else, and this is the one place in
     /// one head where the vocabulary is known — the same rows the combinator
     /// list reads, as the free constructors the set is built from.
     ConditionValue,
-    /// After the `:` — the declaration's value. Empty in v1 (Q4): offering
-    /// `flex` after `display:` needs a property->enum map that does not exist,
-    /// and the enclosing scope is not an answer either (a value is source text,
-    /// so a binding's NAME is what would land on the sheet).
-    Value,
 }
 
 /// What the cursor is IN — the classification [`Analysis::completion`]
@@ -1454,7 +1470,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
             // below.
             CursorContext::MacroName => return self.macro_name_completions(),
             CursorContext::ElementHead { chain } => return self.element_head_completions(chain),
-            CursorContext::CssBlock(position) => return css_block_completions(position),
+            CursorContext::CssBlock(position) => return self.css_block_completions(position),
             // A field position offers the struct's fields and NOTHING else
             // (E160) — the element head's rule, for the element head's reason:
             // a name in scope is not a field name, and the one thing the author

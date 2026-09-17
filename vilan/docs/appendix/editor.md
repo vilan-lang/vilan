@@ -186,7 +186,7 @@ sees it.
 
 ## Quick fixes
 
-Twelve, each attached to the diagnostic that earns it:
+Eleven, each attached to the diagnostic that earns it:
 
 | Action | Offered on |
 |---|---|
@@ -194,7 +194,6 @@ Twelve, each attached to the diagnostic that earns it:
 | ``Change to `entries` `` | a `did you mean …?` note on a misspelled struct-initializer field |
 | ``Insert `;` `` | ``expected `;` to end this statement``, at the gap the diagnostic points at |
 | ``Remove `;` `` | ``the `;` discards this body's last value`` — it finds the right `;` from the diagnostic's own bookkeeping, and declines rather than guess when a comment sits in the gap |
-| ``Wrap as `{Color::hex("#333")}` `` | a `#` in a `css` block's value. The `css` parser refuses it there — the character is a real token elsewhere, the import reach marker — and the diagnostic is one column wide, so the fix reads the whole colour off the line and routes it through `Color`, which carries its own `:root` line. Offered only when the run really is a colour (3, 4, 6 or 8 hex digits) |
 | ``Import as `#hidden` `` | a plain import of an item its module does not export. A zero-width insertion of the reach marker at the leaf — the whole edit — which says the reach was deliberate and silences the warning |
 | ``Delete the `#` `` | a reach marker on an item that IS exported. The marker states a belief about the module that is not true, and the fix removes the one character |
 | ``Use `.md { … }` `` | ``@media (min-width: …)`` in a `css` block. The breakpoint is chosen by the query's own min-width, and an arbitrary one becomes `.media("900px")` rather than no fix. The other at-rules have no combinator spelling, so they get the explanation alone |
@@ -236,16 +235,16 @@ diagnostic or on the file:
 | Action | Does |
 |---|---|
 | **Convert to a `style()` chain** | rewrites the `css { … }` block the cursor is in as the builder chain it lowers to — a declaration becomes a `.raw` link, a nested rule becomes a combinator link carrying the inner chain |
-| **Convert to a `css` block** | the inverse, on a `style()` chain — seeded by any path ending in `style()`, so `style::style()` (what the web prelude publishes) reads as one. A typed property method is converted by *inlining its std body*: `.padding_x(space(4))` is `with_length("padding-left", value).with_length("padding-right", value)`, so it writes both declarations with the argument in each hole. A link with no block spelling — a user extension, a method whose body is not a chain (`.border(…)`), `.class_list()` — *splits* the chain instead of refusing it: everything before it becomes the block and the rest is written as a postfix chain on it (`css { … }.select_off()`). Not offered when no link converts |
+| **Convert to a `css` block** | the inverse, on a `style()` chain — seeded by any path ending in `style()`, so `style::style()` (what the web prelude publishes) reads as one. A typed property method is converted by *inlining its std body*: `.padding_x(space(4))` is `with_length("padding-left", value).with_length("padding-right", value)`, so it writes both declarations with the argument in each. A link with no block spelling — a user extension, a method whose body is not a chain (`.border(…)`), `.class_list()` — *splits* the chain instead of refusing it: everything before it becomes the block and the rest is written as a postfix chain on it (`css { … }.select_off()`). Not offered when no link converts |
 
 Both directions decline rather than guess. A **comment** inside the
 construct stops the conversion, because its attachment is not recoverable
 across the reshape — the same refusal `vilan fmt` makes when it declines to
-reorder a commented block. So does a value carrying a **backslash**: a
-chain's string literal has its escapes processed at emission and a block's
-token run does not, so the two spellings would stop meaning the same thing.
-A quoted value is fine — escaping a `"` into the literal round-trips
-exactly — and the two directions are inverses on everything they accept.
+reorder a commented block. So does a declaration with **several
+arguments** (`margin(px(4), px(8))`): its chain twin needs
+`std::style::piece`, which is ambient inside a block and nowhere else, so
+the chain written out would name something the file does not import. The
+two directions are inverses on everything they accept.
 
 ## What it does while you type
 
