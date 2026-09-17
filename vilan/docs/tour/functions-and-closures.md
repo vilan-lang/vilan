@@ -234,6 +234,15 @@ inside the callee rather than where it is written:
 signature. It combines with none of `own`, `&`, `&mut`, `mut` or `...`,
 and it is written first: `fun f(lazy message: str)`.
 
+Four std members take a lazy argument, and they are the ones whose
+argument is only ever needed on the unhappy path: `Option::expect(lazy
+message)`, `Option::unwrap_or(lazy fallback)`, `Result::expect(lazy
+message)` and `Result::unwrap_or(lazy fallback)`. So
+`opt.unwrap_or(expensive())` runs `expensive()` only when `opt` is `None`,
+and `res.expect(i"no row for {key}")` builds no message when the row is
+there. `unwrap_or_else` is still there for a fallback you would rather
+write as a closure — and on a `Result` it is the one that sees the error.
+
 ## Closures
 
 A closure is an inline function value. Where JavaScript writes

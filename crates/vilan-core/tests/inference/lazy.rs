@@ -952,3 +952,453 @@ fn a_bare_lazy_says_what_the_form_is() {
         "a lazy binding is `lazy let name: T = <initializer>;`",
     );
 }
+
+// --- §6b, S3: the std retrofit (A103) -------------------------------------
+//
+// Four members take a lazy argument: `Option::expect`, `Option::unwrap_or`,
+// `Result::expect` and `Result::unwrap_or`. Each pin reads the retrofit off
+// BEHAVIOUR — a counting side effect in the argument position, which the eager
+// spelling ran on the happy path and the lazy one does not — because that is
+// the whole of what §6b changed. `unwrap_or_else` stays the explicit form and
+// is pinned unchanged beside them.
+
+/// §6b: "`opt.unwrap_or(expensive())` runs `expensive()` on the `Some` path
+/// too" — no longer. The `Some` path leaves the counter at zero; the `None`
+/// path runs it exactly once.
+#[test]
+fn option_unwrap_or_defers_its_fallback_to_the_none_path() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        mut built = 0;
+
+        fun expensive(): i32 {
+            built += 1;
+            99
+        }
+
+        fun main() {
+            let present: Option<i32> = Some(7);
+            print(present.unwrap_or(expensive()));
+            print(i"built {built}");
+            let absent: Option<i32> = None;
+            print(absent.unwrap_or(expensive()));
+            print(i"built {built}");
+        }
+        "#,
+        "7\nbuilt 0\n99\nbuilt 1\n",
+    );
+}
+
+/// §6b: "New `expect(self, lazy message: str)` lands alongside" — `Option` had
+/// no `expect` at all before the retrofit, and the one it has builds no message
+/// on the `Some` path.
+#[test]
+fn option_expect_builds_its_message_only_on_the_none_path() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        mut built = 0;
+
+        fun why(): str {
+            built += 1;
+            "no row"
+        }
+
+        fun main() {
+            let present: Option<i32> = Some(7);
+            print(present.expect(i"{why()}"));
+            print(i"built {built}");
+        }
+        "#,
+        "7\nbuilt 0\n",
+    );
+}
+
+/// The `None` path forces the message and panics with the author's own text —
+/// the message is a real `str` by the time `panic` sees it, not a cell.
+#[test]
+fn option_expect_panics_with_the_message_it_was_given() {
+    assert_run_panics(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            let name = "ada";
+            let absent: Option<i32> = None;
+            print(absent.expect(i"no row for {name}"));
+        }
+        "#,
+        "no row for ada",
+    );
+}
+
+/// `Result`'s twin of `unwrap_or`: the `Ok` path runs no fallback.
+#[test]
+fn result_unwrap_or_defers_its_fallback_to_the_err_path() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::result::Result::{ self, Ok, Err };
+
+        mut built = 0;
+
+        fun expensive(): i32 {
+            built += 1;
+            99
+        }
+
+        fun main() {
+            let good: Result<i32, str> = Ok(7);
+            print(good.unwrap_or(expensive()));
+            print(i"built {built}");
+            let bad: Result<i32, str> = Err("boom");
+            print(bad.unwrap_or(expensive()));
+            print(i"built {built}");
+        }
+        "#,
+        "7\nbuilt 0\n99\nbuilt 1\n",
+    );
+}
+
+/// `Result`'s twin of `expect`: the `Ok` path builds no message.
+#[test]
+fn result_expect_builds_its_message_only_on_the_err_path() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::result::Result::{ self, Ok, Err };
+
+        mut built = 0;
+
+        fun why(): str {
+            built += 1;
+            "no row"
+        }
+
+        fun main() {
+            let good: Result<i32, str> = Ok(7);
+            print(good.expect(i"{why()}"));
+            print(i"built {built}");
+        }
+        "#,
+        "7\nbuilt 0\n",
+    );
+}
+
+/// The memo, through a std member: `unwrap_or`'s fallback is evaluated at most
+/// ONCE however many times the value is asked for, and a forwarding chain into
+/// it is still one memo (§1's rule reaching std).
+#[test]
+fn a_lazy_std_fallback_forwards_from_a_lazy_parameter_without_forcing() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        mut built = 0;
+
+        fun expensive(): i32 {
+            built += 1;
+            99
+        }
+
+        fun settle(slot: Option<i32>, lazy fallback: i32): i32 {
+            slot.unwrap_or(fallback)
+        }
+
+        fun main() {
+            print(settle(Some(1), expensive()));
+            print(i"built {built}");
+            print(settle(None, expensive()));
+            print(i"built {built}");
+        }
+        "#,
+        "1\nbuilt 0\n99\nbuilt 1\n",
+    );
+}
+
+/// The emission half, which behaviour cannot tell apart: the retrofitted
+/// positions THUNK at the call site (`__lazy`), and the forwarding hop above
+/// passes the cell straight through.
+#[test]
+fn the_retrofitted_std_members_thunk_at_the_call_site() {
+    let source = r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        import std::result::Result::{ self, Ok, Err };
+
+        fun main() {
+            let absent: Option<i32> = None;
+            print(absent.unwrap_or(1));
+            let bad: Result<i32, str> = Err("boom");
+            print(bad.unwrap_or(2));
+            let present: Option<i32> = Some(3);
+            print(present.expect("gone"));
+        }
+        "#;
+    assert_emits_containing(source, "__lazy(\"fallback\", () => {");
+    assert_emits_containing(source, "__lazy(\"message\", () => {");
+}
+
+/// `unwrap_or_else` is untouched by the retrofit (§6b: "`unwrap_or_else`
+/// remains the explicit form"), and a closure argument is not a thunk.
+#[test]
+fn unwrap_or_else_is_not_retrofitted() {
+    let source = r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        mut built = 0;
+
+        fun expensive(): i32 {
+            built += 1;
+            99
+        }
+
+        fun main() {
+            let present: Option<i32> = Some(7);
+            print(present.unwrap_or_else(|| expensive()));
+            print(i"built {built}");
+        }
+        "#;
+    assert_compiles_and_runs(source, "7\nbuilt 0\n");
+    let js = compile(source).expect("a clean compile");
+    assert!(
+        !js.contains("__lazy("),
+        "a closure argument is not a thunk; emitted:\n{js}"
+    );
+}
+
+/// The copy the eager form made is still made: the fallback is evaluated inside
+/// the thunk, but the CLONE stays in the callee, so a `List` fallback hands back
+/// a copy and the caller's binding is untouched (R1). A regression here would be
+/// an aliasing miscompile the differential's prints could not see.
+#[test]
+fn a_list_fallback_is_still_copied_out_of_the_callers_binding() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            mut spare: List<i32> = [];
+            let absent: Option<List<i32>> = None;
+            mut got = absent.unwrap_or(spare);
+            got.push(1);
+            print(i"got {got.len()} spare {spare.len()}");
+            spare.push(9);
+            print(i"got {got.len()} spare {spare.len()}");
+        }
+        "#,
+        "got 1 spare 0\ngot 1 spare 1\n",
+    );
+}
+
+// --- B344: the data-only rule at a GENERIC lazy parameter ------------------
+//
+// `lazy fallback: T` is not a resource at the declaration, and inside a generic
+// the value standing in the position is `T`-typed too, so both ends of §1's
+// "data only" rule used to read clean while the thunk really did own a
+// resource. Two fixes, two shapes: the argument check no longer depends on the
+// expression map carrying a type a bare name never puts there, and the rule is
+// asked again at every resource INSTANTIATION, where the indirect case lives.
+
+/// A resource the caller PRODUCES in a lazy position: no binding is named, so
+/// R9's capture scan sees nothing, and the thunk owns a `Res` that nothing
+/// forces and nothing destroys. Refused at the instantiation.
+#[test]
+fn a_generic_lazy_parameter_instantiated_at_a_produced_resource_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::drop::{ Drop, drop };
+        import std::io::print;
+
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) {
+                print(i"drop {self.tag}");
+            }
+        }
+
+        fun hold<T>(flag: bool, lazy fallback: T): bool {
+            flag
+        }
+
+        fun make(): Res {
+            Res { tag = "made" }
+        }
+
+        fun main() {
+            print(i"{hold(true, make())}");
+        }
+        "#,
+        "`lazy` parameter `fallback` at the resource `Res`",
+    );
+}
+
+/// The INDIRECT case: a generic hands its own `T` on to another generic's lazy
+/// parameter. Nothing at the inner call site is concretely anything — the
+/// argument is a `T`-typed parameter — so only the instantiation knows, and it
+/// learns it by the same propagation that carries R11 there. The type does not
+/// ground at that hop, so the message says "a resource type" rather than naming
+/// the `T` it was written with.
+#[test]
+fn a_generic_forwarding_its_own_type_into_a_lazy_parameter_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::drop::{ Drop, drop };
+        import std::io::print;
+
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) {
+                print(i"drop {self.tag}");
+            }
+        }
+
+        fun hold<T>(flag: bool, lazy fallback: T): bool {
+            flag
+        }
+
+        fun forward<T>(flag: bool, own value: T): bool {
+            hold(flag, value)
+        }
+
+        fun sink(own value: Res) {
+            drop(value);
+        }
+
+        fun main() {
+            let conn = Res { tag = "indirect" };
+            print(i"{forward(true, conn)}");
+        }
+        "#,
+        "`lazy` parameter `fallback` at a resource type",
+    );
+}
+
+/// A MODULE-LEVEL resource named bare in a lazy position. R9's thunk capture
+/// scan exempts it (process lifetime), and the argument check could not see it
+/// either, because a bare `Expr::Local` carries no type on its own id — so this
+/// was refused by nobody. The argument check owns it now, at the argument's own
+/// span.
+#[test]
+fn a_module_level_resource_in_a_lazy_position_is_refused_at_the_argument() {
+    assert_fails_with(
+        r#"
+        import std::drop::{ Drop, drop };
+        import std::io::print;
+
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) {
+                print(i"drop {self.tag}");
+            }
+        }
+
+        let shared: Res = Res { tag = "module" };
+
+        fun hold<T>(flag: bool, lazy fallback: T): bool {
+            flag
+        }
+
+        fun main() {
+            print(i"{hold(true, shared)}");
+        }
+        "#,
+        "this argument is the resource `Res`, and it stands in the `lazy` parameter `fallback`",
+    );
+}
+
+/// B5, the other half of the same change: a resource LOCAL named bare stays
+/// R9's, in R9's own words (lazy.md §8), and the instantiation check stands
+/// down rather than saying the same thing a second time.
+#[test]
+fn a_resource_local_in_a_lazy_position_is_still_only_the_r9_capture() {
+    let source = r#"
+        import std::drop::{ Drop, drop };
+        import std::io::print;
+
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) {
+                print(i"drop {self.tag}");
+            }
+        }
+
+        fun hold<T>(flag: bool, lazy fallback: T): bool {
+            flag
+        }
+
+        fun main() {
+            let conn = Res { tag = "local" };
+            print(i"{hold(true, conn)}");
+        }
+        "#;
+    assert_fails_with(source, "a closure cannot capture the resource `conn`");
+    assert_fails_without(source, "instantiates");
+    assert_fails_without(source, "this argument is the resource");
+}
+
+/// A lazy parameter instantiated at DATA is untouched — the check is the delta
+/// of the instantiation, so nothing about an ordinary generic changes.
+#[test]
+fn a_generic_lazy_parameter_at_a_data_type_still_compiles() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Note { text: str }
+
+        fun hold<T>(flag: bool, lazy fallback: T): bool {
+            flag
+        }
+
+        fun main() {
+            let note = Note { text = "fine" };
+            print(i"{hold(true, note)}");
+        }
+        "#,
+        "true\n",
+    );
+}
+
+// --- B345: the view-capture scan walks a call's SUBJECT ---------------------
+
+/// Rule 3 over a lazy argument whose view sits in a nested call SUBJECT. The
+/// scan walked a call's arguments and not the expression being CALLED, so a
+/// view named inside `(build(seen.label))()` was invisible to it — and a thunk
+/// is a closure, so this is rule 3's own refusal arriving where it always
+/// should have.
+#[test]
+fn a_view_inside_a_nested_call_subject_in_a_lazy_argument_is_a_view_capture() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        struct Holder { label: str }
+
+        fun build(text: str): || str {
+            || text
+        }
+
+        fun message(lazy text: str): i32 {
+            print(text);
+            0
+        }
+
+        fun main() {
+            let holder = Holder { label = "a" };
+            let seen = &holder;
+            message((build(seen.label))());
+        }
+        "#,
+        "a closure cannot capture the view 'seen'",
+    );
+}

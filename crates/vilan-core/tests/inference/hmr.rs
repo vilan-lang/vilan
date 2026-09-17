@@ -406,3 +406,87 @@ fn hmr_take_and_on_teardown_accept_plain_usage() {
         "#,
     );
 }
+
+// --- A102 (R13): a `lazy let` carries its VALUE, and only when it has one -----
+
+#[test]
+fn hmr_lazy_binding_adopts_its_value_and_exposes_it_without_forcing() {
+    // A `lazy let` of plain data is the `LazyValue` form: the cell is always the
+    // NEW bundle's (its thunk closes over the new bundle's functions) and it is
+    // handed to `__hmr_adopt_lazy`, which writes the carried value in and marks
+    // it done. The getter reads the cell through `__hmr_lazy_value`, which does
+    // NOT force — exposing a lazy binding must not run an initializer the
+    // program chose not to run.
+    let js = compile_hmr(
+        r#"
+        import std::io::print;
+        lazy let label: str = "hi";
+        fun main() { print(label); }
+        "#,
+    );
+    assert!(
+        js.contains(r#"const label = __hmr_adopt_lazy("pkg::label", "#),
+        "a lazy binding adopts through __hmr_adopt_lazy: {js}"
+    );
+    assert!(
+        js.contains(r#"__lazy("label", () => {"#),
+        "the cell itself is still minted by this bundle: {js}"
+    );
+    assert!(
+        js.contains(r#"__hmr_expose("pkg::label", "#),
+        "a lazy binding is exposed: {js}"
+    );
+    assert!(
+        js.contains("return __hmr_lazy_value(label);"),
+        "the getter reads the cell without forcing it: {js}"
+    );
+    assert!(
+        !js.contains("return __force(label);"),
+        "the getter must not force the cell: {js}"
+    );
+}
+
+#[test]
+fn hmr_lazy_binding_of_an_untransferable_type_stays_excluded() {
+    // The value is what crosses, so a lazy binding whose value carries code is
+    // excluded exactly as an eager one is — no adopt wrap, never exposed.
+    let js = compile_hmr(
+        r#"
+        import std::io::print;
+        struct Holder { action: || i32 }
+        lazy let holder: Holder = Holder { action = || 42 };
+        fun main() { print((holder.action)()); }
+        "#,
+    );
+    assert!(
+        !js.contains("pkg::holder"),
+        "an excluded lazy binding is neither adopted nor exposed: {js}"
+    );
+    assert!(
+        js.contains(r#"const holder = __lazy("holder", "#),
+        "it still emits its plain memo cell: {js}"
+    );
+}
+
+#[test]
+fn hmr_lazy_binding_keeps_its_initializer_inside_the_thunk() {
+    // The adopt wrap must not hoist the initializer out of the thunk: a swap
+    // that carries nothing has to leave the binding pending, which is only true
+    // if the initializer is still inside the cell's own closure.
+    let js = compile_hmr(
+        r#"
+        import std::io::print;
+        fun build(): i32 { print("built"); 7 }
+        lazy let value: i32 = build();
+        fun main() { print(value); }
+        "#,
+    );
+    assert!(
+        js.contains(r#"__hmr_adopt_lazy("pkg::value", "#),
+        "the lazy binding adopts: {js}"
+    );
+    assert!(
+        js.contains("return build();"),
+        "the initializer is the thunk's body, not the adopt call's argument: {js}"
+    );
+}

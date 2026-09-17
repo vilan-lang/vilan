@@ -11,6 +11,25 @@ function __env(key) {
 	const value = process.env[key];
 	return value === undefined ? [ 1 ] : [ 0, value ];
 }
+function __force(cell) {
+	if (cell.state === 2) return cell.value;
+	if (cell.state === 1) throw "lazy initialization cycle: `" + cell.name + "`";
+	if (cell.state === 3) throw "lazy `" + cell.name + "` is poisoned: its initializer panicked: " + cell.value;
+	cell.state = 1;
+	try {
+		cell.value = cell.thunk();
+	} catch (failure) {
+		cell.state = 3;
+		cell.value = failure;
+		throw failure;
+	}
+	cell.state = 2;
+	cell.thunk = null;
+	return cell.value;
+}
+function __lazy(name, thunk) {
+	return { name: name, state: 0, value: undefined, thunk: thunk };
+}
 function $c(self, fallback) {
 	const $d = self;
 	let $e = null;
@@ -18,7 +37,7 @@ function $c(self, fallback) {
 		const x = __clone($d[1]);
 		$e = x;
 	} else {
-		$e = __clone(fallback);
+		$e = __clone(__force(fallback));
 	}
 	return $e;
 }
@@ -33,4 +52,6 @@ if ($a[0] === 0) {
 	$b = console.log("unset");
 }
 $b;
-console.log($c(__env("DEFINITELY_NOT_SET_XYZ"), "unset"));
+console.log($c(__env("DEFINITELY_NOT_SET_XYZ"), __lazy("fallback", () => {
+	return "unset";
+})));

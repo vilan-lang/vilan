@@ -8,6 +8,25 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
+function __force(cell) {
+	if (cell.state === 2) return cell.value;
+	if (cell.state === 1) throw "lazy initialization cycle: `" + cell.name + "`";
+	if (cell.state === 3) throw "lazy `" + cell.name + "` is poisoned: its initializer panicked: " + cell.value;
+	cell.state = 1;
+	try {
+		cell.value = cell.thunk();
+	} catch (failure) {
+		cell.state = 3;
+		cell.value = failure;
+		throw failure;
+	}
+	cell.state = 2;
+	cell.thunk = null;
+	return cell.value;
+}
+function __lazy(name, thunk) {
+	return { name: name, state: 0, value: undefined, thunk: thunk };
+}
 function __list_pop(list) {
 	return list.length === 0 ? [ 1 ] : [ 0, list.pop() ];
 }
@@ -65,7 +84,7 @@ function $i(self, fallback) {
 		const x = __clone($j[1]);
 		$k = x;
 	} else {
-		$k = __clone(fallback);
+		$k = __clone(__force(fallback));
 	}
 	return $k;
 }
@@ -122,15 +141,25 @@ let numbers = $a();
 const a = $b(numbers, 10);
 const b = $b(numbers, 20);
 console.log($e(numbers));
-console.log($i($f(numbers, a), -(1)));
+console.log($i($f(numbers, a), __lazy("fallback", () => {
+	return -(1);
+})));
 $l(numbers, b, 99);
-console.log($i($f(numbers, b), -(1)));
-console.log($i($n(numbers, b), -(1)));
+console.log($i($f(numbers, b), __lazy("fallback", () => {
+	return -(1);
+})));
+console.log($i($n(numbers, b), __lazy("fallback", () => {
+	return -(1);
+})));
 console.log($p($f(numbers, b)));
 const c = $b(numbers, 30);
-console.log($i($f(numbers, c), -(1)));
+console.log($i($f(numbers, c), __lazy("fallback", () => {
+	return -(1);
+})));
 console.log($p($f(numbers, b)));
-console.log($i($f(numbers, a), -(1)));
+console.log($i($f(numbers, a), __lazy("fallback", () => {
+	return -(1);
+})));
 let graph = $a();
 const leaf1 = $s(graph, [ 2, [  ] ]);
 const leaf2 = $s(graph, [ 3, [  ] ]);

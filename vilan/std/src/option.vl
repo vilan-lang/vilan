@@ -81,11 +81,26 @@ impl Option<type T> {
 		}
 	}
 
-	/// `fallback` is a LOAN (R3), so at a resource instantiation this rejects:
-	/// `Some(v).unwrap_or(f)` has to destroy `f`, and a generic body cannot
-	/// destroy a `T`. `unwrap_or_else` is the resource-clean spelling — it
-	/// PRODUCES the fallback on the `None` path instead of discarding it.
-	fun unwrap_or(own self, fallback: T): T {
+	/// Panic with `message` when there is no value. The message is `lazy`, so
+	/// the text is BUILT only on the `None` path — `opt.expect(i"no row for
+	/// {key}")` costs nothing when the row is there (proposal/lazy.md §6b).
+	fun expect(own self, lazy message: str): T {
+		match self {
+			Some(let x) => x,
+			_ => panic(message),
+		}
+	}
+
+	/// `fallback` is `lazy` (proposal/lazy.md §6b): it is evaluated on the
+	/// `None` path only, at most once — `opt.unwrap_or(expensive())` no longer
+	/// runs `expensive()` when `opt` is `Some`. `unwrap_or_else` remains the
+	/// explicit spelling for a fallback you want to write as a closure.
+	///
+	/// `fallback` is still a LOAN (R3), so at a resource instantiation this
+	/// rejects: `Some(v).unwrap_or(f)` has to destroy `f`, and a generic body
+	/// cannot destroy a `T`. `unwrap_or_else` is the resource-clean spelling —
+	/// it PRODUCES the fallback on the `None` path instead of discarding it.
+	fun unwrap_or(own self, lazy fallback: T): T {
 		match self {
 			Some(let x) => x,
 			_ => fallback,

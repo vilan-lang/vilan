@@ -10073,3 +10073,31 @@ fn e157_the_separated_spelling_is_accepted() {
         "one\ngreen\n",
     );
 }
+
+/// B345: rule 3's capture scan walks a call's SUBJECT, not only its arguments.
+/// A plain call's subject is the callee's own name and walking it finds
+/// nothing, which is why the omission survived — but a call whose callee is
+/// COMPUTED carries the whole inner expression there, and a view named inside
+/// it was missed by the scan that exists to find exactly that.
+#[test]
+fn a_view_inside_a_nested_call_subject_is_a_closure_capture() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        struct Holder { label: str }
+
+        fun build(text: str): || str {
+            || text
+        }
+
+        fun main() {
+            let holder = Holder { label = "a" };
+            let seen = &holder;
+            let show = || (build(seen.label))();
+            print(show());
+        }
+        "#,
+        "a closure cannot capture the view 'seen'",
+    );
+}

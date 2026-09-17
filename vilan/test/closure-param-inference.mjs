@@ -4,6 +4,25 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
+function __force(cell) {
+	if (cell.state === 2) return cell.value;
+	if (cell.state === 1) throw "lazy initialization cycle: `" + cell.name + "`";
+	if (cell.state === 3) throw "lazy `" + cell.name + "` is poisoned: its initializer panicked: " + cell.value;
+	cell.state = 1;
+	try {
+		cell.value = cell.thunk();
+	} catch (failure) {
+		cell.state = 3;
+		cell.value = failure;
+		throw failure;
+	}
+	cell.state = 2;
+	cell.thunk = null;
+	return cell.value;
+}
+function __lazy(name, thunk) {
+	return { name: name, state: 0, value: undefined, thunk: thunk };
+}
 function $a(self, fn) {
 	const $b = self;
 	let $c = null;
@@ -22,7 +41,7 @@ function $d(self, fallback) {
 		const x = __clone($e[1]);
 		$f = x;
 	} else {
-		$f = __clone(fallback);
+		$f = __clone(__force(fallback));
 	}
 	return $f;
 }
@@ -63,7 +82,9 @@ function $l(self, predicate) {
 const p = [ 0, [ 3, 4 ] ];
 console.log($d($a(p, (q) => {
 	return q[0] + q[1];
-}), 0));
+}), __lazy("fallback", () => {
+	return 0;
+})));
 console.log($g(p, (q) => {
 	return q[0] === 3;
 }));

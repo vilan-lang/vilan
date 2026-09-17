@@ -4,6 +4,25 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
+function __force(cell) {
+	if (cell.state === 2) return cell.value;
+	if (cell.state === 1) throw "lazy initialization cycle: `" + cell.name + "`";
+	if (cell.state === 3) throw "lazy `" + cell.name + "` is poisoned: its initializer panicked: " + cell.value;
+	cell.state = 1;
+	try {
+		cell.value = cell.thunk();
+	} catch (failure) {
+		cell.state = 3;
+		cell.value = failure;
+		throw failure;
+	}
+	cell.state = 2;
+	cell.thunk = null;
+	return cell.value;
+}
+function __lazy(name, thunk) {
+	return { name: name, state: 0, value: undefined, thunk: thunk };
+}
 function __option_replace(slot, value) {
 	const old = slot.slice();
 	slot[0] = 0;
@@ -23,10 +42,16 @@ function drop(self) {
 function data_take_replace() {
 	let a = [ 0, 5 ];
 	const taken = __option_take(a);
-	console.log("take-data taken=" + $a(taken, 0) + " left_none=" + $d(a));
+	console.log("take-data taken=" + $a(taken, __lazy("fallback", () => {
+		return 0;
+	})) + " left_none=" + $d(a));
 	let b = [ 0, 1 ];
 	const old = __option_replace(b, 2);
-	console.log("replace-data old=" + $a(old, 0) + " now=" + $a(b, 0));
+	console.log("replace-data old=" + $a(old, __lazy("fallback", () => {
+		return 0;
+	})) + " now=" + $a(b, __lazy("fallback", () => {
+		return 0;
+	})));
 }
 function take_resource() {
 	let opt = [ 0, [ "taken" ] ];
@@ -194,7 +219,7 @@ function $a(self, fallback) {
 		const x = __clone($b[1]);
 		$c = x;
 	} else {
-		$c = __clone(fallback);
+		$c = __clone(__force(fallback));
 	}
 	return $c;
 }

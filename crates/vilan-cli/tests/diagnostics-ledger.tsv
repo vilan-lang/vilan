@@ -566,3 +566,4 @@ row	flagship	key
 541	-	every `impl {subject}` in {modules} is exported, so the reach marker is redundant — delete the `#`
 542	-	`[derive({name})]` could not expand: this toolchain has no `macro_std` beside its `std`, so std's own `{module}` never registered its `{name}` macro — `std` is at `{}`, and `macro_std` was looked for at `{}`
 543	-	`[service]` could not expand: this toolchain has no `macro_std` beside its `std`, so std::rpc's `service` macro never registered — `std` is at `{}`, and `macro_std` was looked for at `{}`
+544	-	this instantiates `{callee}`'s `lazy` parameter `{name}` at {at}: a lazy argument is carried by a thunk, and a thunk owning a resource is what R9 forbids

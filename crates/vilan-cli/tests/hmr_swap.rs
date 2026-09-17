@@ -7,7 +7,10 @@
 //! stub: state is mutated, a rebuilt bundle is swapped in, and the carry / reset
 //! matrix is asserted (value + signal payload carried; excluded + fingerprint-
 //! changed + function-local reset; `on_teardown` ran; `stash`/`take` round-trip;
-//! the old bundle's subscriptions disposed).
+//! the old bundle's subscriptions disposed). A102 adds the `lazy let` row of
+//! that matrix, which needs a ROUND to say anything at all: a cell forced before
+//! the swap carries its value and the new bundle's initializer never runs, and
+//! one still pending carries nothing and is re-minted.
 //!
 //! The second e2e here is the same machinery pointed at the swap's OTHER
 //! teardown (tracker A96): an app that dials a `SocketDuplex` before it mounts
@@ -195,10 +198,22 @@ fun fresh_strap(): Strap {
 	Strap { fire = || {} }
 }
 
+fun seed_motto(): i32 {
+	mark("motto-init");
+	41
+}
+
+fun seed_dormant(): i32 {
+	mark("dormant-init");
+	7
+}
+
 mut count = seed_count();
 let tally: SignalCell<i32> = Signal::new(0);
 let cfg: Cfg = seed_cfg();
 let strap: Strap = fresh_strap();
+lazy let motto: i32 = seed_motto();
+lazy let dormant: i32 = seed_dormant();
 
 fun bump() {
 	count = count + 1;
@@ -210,6 +225,10 @@ fun main() {
 	mark("mount");
 	let restored: Option<i32> = dev::take("saved");
 	record("restored", restored.unwrap_or(-1));
+	record("motto", motto);
+	if restored is Some(_) {
+		record("dormant", dormant);
+	}
 	record("cfg-a", cfg.a);
 	(strap.fire)();
 	dev::on_teardown(|| mark("teardown"));
@@ -257,10 +276,22 @@ fun fresh_strap(): Strap {
 	Strap { fire = || {} }
 }
 
+fun seed_motto(): i32 {
+	mark("motto-init");
+	99
+}
+
+fun seed_dormant(): i32 {
+	mark("dormant-init");
+	8
+}
+
 mut count = seed_count();
 let tally: SignalCell<i32> = Signal::new(0);
 let cfg: Cfg = seed_cfg();
 let strap: Strap = fresh_strap();
+lazy let motto: i32 = seed_motto();
+lazy let dormant: i32 = seed_dormant();
 
 fun bump() {
 	count = count + 1;
@@ -272,6 +303,10 @@ fun main() {
 	mark("mount");
 	let restored: Option<i32> = dev::take("saved");
 	record("restored", restored.unwrap_or(-1));
+	record("motto", motto);
+	if restored is Some(_) {
+		record("dormant", dormant);
+	}
 	record("cfg-a", cfg.a);
 	(strap.fire)();
 	dev::on_teardown(|| mark("teardown"));
@@ -316,6 +351,11 @@ check(marks["cfg-init"] === 1, "A: cfg initializer ran once");
 check(marks["strap-init"] === 1, "A: strap initializer ran once");
 check(marks["mount"] === 1, "A: main ran once");
 check(records["restored"] === -1, "A: first-boot take() is None");
+// A102: `motto` is read in main, so its cell is forced before the swap;
+// `dormant` is read only on the restored path, so its cell is still pending.
+check(marks["motto-init"] === 1, "A: the forced lazy binding initialized once");
+check(records["motto"] === 41, "A: the forced lazy binding read its own value");
+check(marks["dormant-init"] === undefined, "A: the unforced lazy binding never ran");
 const tallyA = signals["tally"];
 check(!!tallyA && tallyA[1].v.length === 1, "A: tally has one live subscriber");
 
@@ -357,6 +397,15 @@ check(marks["mount"] === 2, "swap: main re-ran (function-local state reset)");
 check(hmr.exposed["pkg::count"].getter() === 3, "swap: count value carried");
 check(hmr.exposed["pkg::tally"].getter() === 3, "swap: signal payload carried");
 check(records["restored"] === 3, "swap: stash/take round-tripped");
+// A102 (R13), both halves. `motto` was `done` before the swap, so its VALUE
+// crosses and the new bundle's cell starts forced — bundle B's initializer
+// would have answered 99 and never runs. `dormant` was `pending`, so it
+// carries nothing: bundle B mints it fresh and the read on the restored path
+// runs B's initializer for the first time, answering B's 8.
+check(marks["motto-init"] === 1, "swap: the forced lazy binding carried (initializer not re-run)");
+check(records["motto"] === 41, "swap: the carried lazy value is the old bundle's, not the new initializer's");
+check(marks["dormant-init"] === 1, "swap: the pending lazy binding re-minted and forced fresh");
+check(records["dormant"] === 8, "swap: the re-minted lazy binding ran the NEW bundle's initializer");
 check(tallyA[1].v.length === 0, "swap: bundle A subscription disposed (old subscribers dead)");
 check(!globalThis.__reloaded, "swap: completed without a fallback reload");
 

@@ -29,7 +29,8 @@ impl Option<type T> {
 
 	// extraction
 	fun unwrap(own self): T                  // panics on None
-	fun unwrap_or(own self, fallback: T): T
+	fun expect(own self, lazy message: str): T    // panic with your message
+	fun unwrap_or(own self, lazy fallback: T): T
 	fun unwrap_or_else(own self, fn: || T): T
 
 	// in-place partial move — read/replace the slot through `&mut self`,
@@ -99,7 +100,9 @@ use-after-move error, and `opt` is not torn down at all (the payload
 you now hold is). The pure predicates — `is_some`, `is_none` — keep a
 borrowing `self` and never consume, so they stay free on a resource.
 
-Reaching a resource payload is a `match`, not a guarded `unwrap`: `match opt
+`expect` is `unwrap` with your own panic message, and its message is
+deferred: it costs nothing on the path that has a value. Reaching a
+resource payload is a `match`, not a guarded `unwrap`: `match opt
 { Some(let value) => .., None => .. }` consumes `opt` on *every* path, which
 is what R7 requires. `if (opt.is_some()) { opt.unwrap() }` moves `opt` on one
 path only and is rejected as a conditional move (before this was checked it
@@ -145,9 +148,9 @@ impl Result<type T, type E> {
 	// extraction
 	fun unwrap(self): T                      // panics on Err
 	fun unwrap_err(self): E                  // panics on Ok
-	fun unwrap_or(self, fallback: T): T
+	fun unwrap_or(self, lazy fallback: T): T
 	fun unwrap_or_else(self, fn: |E| T): T
-	fun expect(self, message: str): T        // panic with your message
+	fun expect(self, lazy message: str): T   // panic with your message
 	fun expect_err(self, message: str): E
 
 	// transformation
@@ -201,16 +204,17 @@ fun main() {
 
 - Prefer `!` (propagate) and `unwrap_or*` over `unwrap`: `unwrap` is for
   invariants, and it panics.
-- `unwrap_or`'s fallback and `expect`'s message are **evaluated eagerly**
-  today: `opt.unwrap_or(expensive())` runs `expensive()` on the `Some`
-  path too, and `res.expect(i"no row for {key}")` builds the message on
-  the happy path. Use `unwrap_or_else` when the fallback costs something.
-  The language now has [`lazy` parameters](../tour/functions-and-closures.md#lazy-parameters),
-  which is what these positions will eventually take — a `lazy fallback`
-  is deferred to the read that needs it, at most once — and adopting them
-  here changes the observable behaviour of a call site whose fallback has
-  a side effect, so it is a deliberate sweep rather than a quiet one.
-  Until it lands, the two spellings above are the ones that defer.
+- `unwrap_or`'s fallback and `expect`'s message are
+  [**`lazy`**](../tour/functions-and-closures.md#lazy-parameters) on all
+  four of `Option::expect`, `Option::unwrap_or`, `Result::expect` and
+  `Result::unwrap_or`: the expression you write in that position is
+  evaluated only on the path that needs it, at most once. So
+  `opt.unwrap_or(expensive())` does not run `expensive()` when `opt` is
+  `Some`, and `res.expect(i"no row for {key}")` builds no message when the
+  row is there. `unwrap_or_else` remains the explicit spelling — a
+  closure, and on a `Result` the one that sees the error — and it is still
+  the resource-clean one, because it PRODUCES the fallback instead of
+  discarding it.
 - Application errors belong in `Result`'s `E`; only unreachable
   states panic.
 - `match` with `Some(let x)` / `Ok(let x)` patterns is always available

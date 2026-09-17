@@ -86,7 +86,10 @@ impl Result<type T, type E> {
 		}
 	}
 
-	fun unwrap_or(self, fallback: T): T {
+	/// `fallback` is `lazy` (proposal/lazy.md §6b): it is evaluated on the
+	/// `Err` path only, at most once. `unwrap_or_else` remains the explicit
+	/// spelling, and is the one that sees the error.
+	fun unwrap_or(self, lazy fallback: T): T {
 		match self {
 			Ok(let x) => x,
 			_ => fallback,
@@ -100,7 +103,10 @@ impl Result<type T, type E> {
 		}
 	}
 
-	fun expect(self, message: str): T {
+	/// `message` is `lazy` (proposal/lazy.md §6b): the text is BUILT on the
+	/// `Err` path only, so `res.expect(i"no row for {key}")` costs nothing when
+	/// the row is there.
+	fun expect(self, lazy message: str): T {
 		match self {
 			Ok(let x) => x,
 			_ => panic(message),

@@ -4,6 +4,25 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
+function __force(cell) {
+	if (cell.state === 2) return cell.value;
+	if (cell.state === 1) throw "lazy initialization cycle: `" + cell.name + "`";
+	if (cell.state === 3) throw "lazy `" + cell.name + "` is poisoned: its initializer panicked: " + cell.value;
+	cell.state = 1;
+	try {
+		cell.value = cell.thunk();
+	} catch (failure) {
+		cell.state = 3;
+		cell.value = failure;
+		throw failure;
+	}
+	cell.state = 2;
+	cell.thunk = null;
+	return cell.value;
+}
+function __lazy(name, thunk) {
+	return { name: name, state: 0, value: undefined, thunk: thunk };
+}
 function __parse_i32(text) {
 	const trimmed = text.trim();
 	const value = Number(trimmed);
@@ -88,7 +107,7 @@ function $c(self, fallback) {
 		const x = __clone($d[1]);
 		$e = x;
 	} else {
-		$e = __clone(fallback);
+		$e = __clone(__force(fallback));
 	}
 	return $e;
 }
@@ -99,12 +118,16 @@ function $w(self, fallback) {
 		const x = __clone($x[1]);
 		$y = x;
 	} else {
-		$y = __clone(fallback);
+		$y = __clone(__force(fallback));
 	}
 	return $y;
 }
-console.log($c(doubled("hit"), 0 - 1));
-console.log($c(doubled("miss"), 0 - 1));
+console.log($c(doubled("hit"), __lazy("fallback", () => {
+	return 0 - 1;
+})));
+console.log($c(doubled("miss"), __lazy("fallback", () => {
+	return 0 - 1;
+})));
 const $j = sum("40", "2");
 let $k = null;
 if ($j[0] === 0) {
@@ -148,4 +171,6 @@ $u;
 const a = 1;
 const b = 2;
 console.log(a !== b);
-console.log($w(is_twenty_one(), false));
+console.log($w(is_twenty_one(), __lazy("fallback", () => {
+	return false;
+})));

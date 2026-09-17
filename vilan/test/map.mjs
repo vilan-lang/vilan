@@ -4,8 +4,27 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
+function __force(cell) {
+	if (cell.state === 2) return cell.value;
+	if (cell.state === 1) throw "lazy initialization cycle: `" + cell.name + "`";
+	if (cell.state === 3) throw "lazy `" + cell.name + "` is poisoned: its initializer panicked: " + cell.value;
+	cell.state = 1;
+	try {
+		cell.value = cell.thunk();
+	} catch (failure) {
+		cell.state = 3;
+		cell.value = failure;
+		throw failure;
+	}
+	cell.state = 2;
+	cell.thunk = null;
+	return cell.value;
+}
 function __hash(value) {
 	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
+}
+function __lazy(name, thunk) {
+	return { name: name, state: 0, value: undefined, thunk: thunk };
 }
 function __map_get(map, key) {
 	return map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];
@@ -53,7 +72,7 @@ function $h(self, fallback) {
 		const x = __clone($i[1]);
 		$j = x;
 	} else {
-		$j = __clone(fallback);
+		$j = __clone(__force(fallback));
 	}
 	return $j;
 }
@@ -88,7 +107,7 @@ function $t(self, fallback) {
 		const x = __clone($u[1]);
 		$v = x;
 	} else {
-		$v = __clone(fallback);
+		$v = __clone(__force(fallback));
 	}
 	return $v;
 }
@@ -124,11 +143,17 @@ $b(scores, "carol", 3);
 console.log($c(scores));
 console.log($d(scores, "bob"));
 console.log($d(scores, "dave"));
-console.log($h($e(scores, "bob"), 0));
-console.log($h($e(scores, "dave"), -(1)));
+console.log($h($e(scores, "bob"), __lazy("fallback", () => {
+	return 0;
+})));
+console.log($h($e(scores, "dave"), __lazy("fallback", () => {
+	return -(1);
+})));
 console.log($k($e(scores, "alice")));
 $b(scores, "bob", 22);
-console.log($h($e(scores, "bob"), 0));
+console.log($h($e(scores, "bob"), __lazy("fallback", () => {
+	return 0;
+})));
 console.log($c(scores));
 $m(scores, "bob");
 console.log($d(scores, "bob"));
@@ -141,8 +166,12 @@ console.log($d(copy, "dave"));
 let names = $a();
 $p(names, 1, "one");
 $p(names, 2, "two");
-console.log($t($q(names, 1), "?"));
-console.log($t($q(names, 9), "?"));
+console.log($t($q(names, 1), __lazy("fallback", () => {
+	return "?";
+})));
+console.log($t($q(names, 9), __lazy("fallback", () => {
+	return "?";
+})));
 let letters = $a();
 $b(letters, "a", 10);
 $b(letters, "b", 20);

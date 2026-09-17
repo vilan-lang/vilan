@@ -4,6 +4,25 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
+function __force(cell) {
+	if (cell.state === 2) return cell.value;
+	if (cell.state === 1) throw "lazy initialization cycle: `" + cell.name + "`";
+	if (cell.state === 3) throw "lazy `" + cell.name + "` is poisoned: its initializer panicked: " + cell.value;
+	cell.state = 1;
+	try {
+		cell.value = cell.thunk();
+	} catch (failure) {
+		cell.state = 3;
+		cell.value = failure;
+		throw failure;
+	}
+	cell.state = 2;
+	cell.thunk = null;
+	return cell.value;
+}
+function __lazy(name, thunk) {
+	return { name: name, state: 0, value: undefined, thunk: thunk };
+}
 function __list_get(list, index) {
 	return index >= 0 && index < list.length ? [ 0, __clone(list[index]) ] : [ 1 ];
 }
@@ -17,7 +36,7 @@ function $a(self, fallback) {
 		const x = __clone($b[1]);
 		$c = x;
 	} else {
-		$c = __clone(fallback);
+		$c = __clone(__force(fallback));
 	}
 	return $c;
 }
@@ -35,16 +54,32 @@ let xs = [  ];
 xs.push(10);
 xs.push(20);
 xs.push(30);
-console.log($a(__list_get(xs, 0), 0));
-console.log($a(__list_get(xs, 2), 0));
-console.log($a(__list_get(xs, 5), 0));
+console.log($a(__list_get(xs, 0), __lazy("fallback", () => {
+	return 0;
+})));
+console.log($a(__list_get(xs, 2), __lazy("fallback", () => {
+	return 0;
+})));
+console.log($a(__list_get(xs, 5), __lazy("fallback", () => {
+	return 0;
+})));
 console.log($d(__list_get(xs, 9)));
-console.log($a($f(xs), 0));
-console.log($a($g(xs), 0));
-console.log($a(__list_pop(xs), 0));
+console.log($a($f(xs), __lazy("fallback", () => {
+	return 0;
+})));
+console.log($a($g(xs), __lazy("fallback", () => {
+	return 0;
+})));
+console.log($a(__list_pop(xs), __lazy("fallback", () => {
+	return 0;
+})));
 console.log(xs.length);
-console.log($a($g(xs), 0));
+console.log($a($g(xs), __lazy("fallback", () => {
+	return 0;
+})));
 let single = [  ];
 single.push(7);
-console.log($a(__list_pop(single), 0));
+console.log($a(__list_pop(single), __lazy("fallback", () => {
+	return 0;
+})));
 console.log($d(__list_pop(single)));
