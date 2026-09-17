@@ -5076,3 +5076,297 @@ fn b217_a_hand_written_type_miss_is_still_reported_where_it_was_written() {
         "cannot find type 'AlsoMissing'",
     );
 }
+
+// --- E189: a closure handed to a call that did not resolve ------------------
+//
+// B229's hole, third lid, and the one that cascaded furthest. The call-graph
+// collector reads a call's operands out of `function_calls` — the calls the
+// solver WIRED — and an unwired METHOD call has no `entity_map` entry either,
+// so the walk stopped at the head of the chain: every call written inside the
+// unresolved one lost its owner (which reads back as "entered from outside the
+// graph"), and every closure literal among them lost its lexical parent (which
+// the coverage rule reads as uncovered). On kolt at d783fbf4 with its nine
+// retired `View` methods still written that turned nine real errors into 184,
+// 74 of them in a generated module that writes no closure at all.
+// `Program::unwired_calls` keeps the shape the walk needs.
+
+/// The kolt shape, minimised: a method that does not exist, handed a closure
+/// whose body reaches a context read. ONE error — the method — and no coverage
+/// fence anywhere under it.
+#[test]
+fn e189_a_closure_argument_of_an_unresolved_call_does_not_fence_its_reads() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+struct Thing {
+    label: str,
+}
+
+let current: Context<i32> = Context::new();
+
+fun host(body: (|| void) context current) {
+    current.run(1, body);
+}
+
+fun leaf() {
+    print(current.get());
+}
+
+fun page() {
+    leaf();
+}
+
+fun main() {
+    let thing = Thing { label = "x" };
+    host(|| {
+        thing.no_such_method(|| page());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "Thing has no method 'no_such_method'");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// The same hole through a FREE call the scope never resolved: the closure is
+/// an argument either way, and `Expr::Call` records the wired shape only.
+#[test]
+fn e189_a_closure_argument_of_an_unresolved_free_call_does_not_fence_its_reads() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let current: Context<i32> = Context::new();
+
+fun host(body: (|| void) context current) {
+    current.run(1, body);
+}
+
+fun leaf() {
+    print(current.get());
+}
+
+fun main() {
+    host(|| {
+        no_such_fn(|| leaf());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "cannot find 'no_such_fn' in this scope");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+}
+
+/// The half the coverage rule cannot see on its own: the calls written inside
+/// an unresolved one keep their OWNER, so a function called only from there is
+/// not read as entered from outside the graph. Without it kolt still reported
+/// 115 of its 184 — every icon in the generated module among them, reached
+/// only through a chain whose head did not resolve.
+#[test]
+fn e189_a_call_inside_an_unresolved_call_keeps_its_owner() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+struct Thing {
+    label: str,
+}
+
+let current: Context<i32> = Context::new();
+
+fun host(body: (|| void) context current) {
+    current.run(1, body);
+}
+
+fun leaf(): str {
+    print(current.get());
+    "leaf"
+}
+
+fun main() {
+    let thing = Thing { label = "x" };
+    host(|| {
+        thing.no_such_method(leaf());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "Thing has no method 'no_such_method'");
+    assert_fails_without(source, "is read here, but this code can be reached without");
+    assert_fails_without(source, "so it can't be used as a value");
+}
+
+/// The invariant neither rule may weaken: a program whose ONLY fault is the
+/// missing `run` still fences. Nothing here is unresolved, so nothing stands
+/// down and nothing is deferred.
+#[test]
+fn e189_a_clean_program_with_an_uncovered_read_still_fences() {
+    assert_fails_once_with(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let current: Context<i32> = Context::new();
+
+fun leaf() {
+    print(current.get());
+}
+
+fun main() {
+    leaf();
+}
+main();
+        "#,
+        "context `current` is read here, but this code can be reached without an enclosing `run`",
+    );
+}
+
+/// E191 — one arity error in an ELEMENT HEAD (kolt login.vl:181/286, the
+/// owner's FIXME: `href(href())` "caused a ton of error noise"). The head
+/// lowers to a chain, so an attribute call that does not resolve leaves every
+/// later link and every hole under it unwired — which is E189's hole reached
+/// through the desugar rather than through a retired method. ONE error at this
+/// grain: the arity error, no coverage fence under the head.
+///
+/// The ITEM does not close on this. Measured on a kolt copy at 0decf84 with
+/// `href(href())` restored: 194 errors on the base, 139 with E189's rule (55
+/// gone). The remainder does NOT trace through the head at all — it enters at
+/// `app_shell`'s own body (`views.vl:81`/`:85`) because the failed attribute
+/// poisons the return type of the component the route arm calls, and that is
+/// E189's family reached by a route the narrow rule cannot name. It is what the
+/// BROAD gate was for (with it, the same copy reports 1), and that gate is the
+/// open decision this order hands back.
+#[test]
+fn e191_an_arity_error_in_an_element_head_reports_alone() {
+    let source = r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, mount_root, view };
+
+        fun target(name: str): str {
+            "/" + name
+        }
+
+        fun counter(count: SignalCell<i32>): View {
+            count.effect(|value| print(value));
+            view("span")
+        }
+
+        fun link(count: SignalCell<i32>): View {
+            <a
+                href(target())
+                title("Sign up")
+                on:click(|event| {
+                    print("clicked");
+                })
+                .child(counter(count))
+            >
+                "Sign Up"
+            </a>
+        }
+
+        fun main() {
+            let count = Signal::new(0);
+            let _root = mount_root("app", || view("div").child(link(count)));
+        }
+        "#;
+    assert_fails_browser_once_with(source, "`target` expects 1 argument, but got 0 instead");
+    assert_fails_browser_without(source, "is read here, but this code can be reached without");
+}
+
+// --- B343 (R9): where the `context` clause sits on a declaration ------------
+//
+// RULED 2026-09-17: it stays after the return type (contexts.md §3), and the
+// ONE shape that position cannot spell is refused rather than mis-bound. The
+// type grammar's own `context` suffix is greedy, so an un-parenthesized closure
+// return type swallows the clause onto its OWN return type — which cannot carry
+// one — and the declaration means neither of the two things it could have
+// meant. Both are a parenthesis away and the refusal spells both.
+
+/// The ambiguous form, refused — and refused ONCE: the clause is taken off as
+/// it is reported, so the analyzer does not add its own "a `context` clause is
+/// only supported on a closure type" beside it.
+#[test]
+fn b343_an_unparenthesized_closure_return_carrying_a_clause_is_refused() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let c: Context<i32> = Context::new();
+
+fun make(): || void context c {
+    || print(c.get())
+}
+
+fun main() {
+    c.run(1, || {
+        let body = make();
+        body();
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "UN-PARENTHESIZED closure return type");
+    assert_fails_without(source, "only supported on a closure type");
+}
+
+/// Both parenthesized readings still compile, which is what makes the refusal a
+/// steer rather than a prohibition: the clause on the FUNCTION, and the clause
+/// on the closure it returns.
+#[test]
+fn b343_both_parenthesized_readings_still_compile() {
+    assert_compiles(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let c: Context<i32> = Context::new();
+
+fun make(): (|| void) context c {
+    || print(c.get())
+}
+
+fun reads(): i32 context c {
+    c.get()
+}
+
+fun main() {
+    c.run(1, || {
+        let body = make();
+        body();
+        print(reads());
+    });
+}
+main();
+        "#,
+    );
+}
+
+/// The nested shape the refusal must NOT take: a closure that returns an
+/// INJECTED closure. The inner type is parenthesized, so the clause is its own
+/// and nothing is ambiguous.
+#[test]
+fn b343_a_returned_closure_whose_own_return_is_injected_is_untouched() {
+    assert_compiles(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let c: Context<i32> = Context::new();
+
+fun outer(): || (|| void) context c {
+    || || print(c.get())
+}
+
+fun main() {
+    c.run(1, || {
+        let make = outer();
+        let body = make();
+        body();
+    });
+}
+main();
+        "#,
+    );
+}

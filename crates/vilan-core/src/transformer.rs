@@ -3,7 +3,7 @@ use crate::analyzer::{
     GenericDispatch, Intrinsic, LiftDispatch, Program, RENDER_MEMBER, TransferForm, TryDispatch,
 };
 use crate::call_graph::{CallTarget, IndirectReason};
-use crate::error::Error;
+use crate::error::{Error, Note};
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::impl_select;
@@ -2253,6 +2253,16 @@ struct AdmissionMiss {
     /// decided this (`visibility.md` §3.5), which is NOT necessarily the file
     /// that instantiated the body.
     importer: crate::analyzer::SourceId,
+    /// E185: the body itself, so the refusal can NAME the importing module.
+    /// `importer` is `[derive(..)]`-synthesized code's sentinel source
+    /// ([`crate::analyzer::DERIVED_SOURCE`]) whenever the emitting body is a
+    /// generated one — which is every `Wire` visitor, and so every miss the
+    /// sweep actually saw — and that sentinel is outside `sources`, so the
+    /// module name came out as the placeholder `that module`, sixteen times in
+    /// one report. The entity resolves through `note_source_of` to the file the
+    /// derive was WRITTEN in, which is the file whose import the reader has to
+    /// widen.
+    importing_body: Option<Id>,
     /// The file declaring the `impl` the lookup would otherwise have taken.
     declared_in: crate::analyzer::SourceId,
 }
@@ -2401,7 +2411,21 @@ struct Transformer<'src> {
     // output is `function f(self) {\n}`: a clean compile whose first use of the
     // result is a runtime `TypeError`. Collected here and turned into a hard
     // compile error at assembly, so the class cannot recur silently.
-    bodyless_emissions: Vec<Id>,
+    // E190 adds the REQUESTER: the function whose body was being emitted when
+    // the requirement was first reached, as `(bodyless function, requester)`.
+    // The bodyless function's own span is the requirement's NAME in std, which
+    // the CLI never renders — the refusal printed one bare `Error:` line with no
+    // file, no line and no hint which of kolt's 19 files to look in, and the
+    // integrator had to instrument this seam by hand to learn that `app_shell`
+    // was the frame that asked. That frame is the only location the reader can
+    // act on, so it is recorded WITH the emission rather than reconstructed
+    // afterwards.
+    bodyless_emissions: Vec<(Id, Option<Id>)>,
+    // E190: the emission frames currently on the stack, innermost last.
+    // `emitting` above is a SET (its question is "am I already inside this
+    // body?", which order cannot answer), and `function_with_name` is the one
+    // funnel every emitted callable passes through, so the stack is kept here.
+    emitting_stack: Vec<Id>,
     // B135: memo for `reaches_bare_requirement` — whether a function's body,
     // transitively through the program call graph, contains a dispatch that
     // would fall through to a bodyless trait requirement if emitted without a
@@ -2775,6 +2799,7 @@ impl<'src> Transformer<'src> {
             used_imports: BTreeMap::new(),
             hmr: options.hmr,
             bodyless_emissions: Vec::new(),
+            emitting_stack: Vec::new(),
             bare_requirement_memo: HashMap::default(),
             unresolved_drop_sinks: Vec::new(),
             unrendered_concatenations: Vec::new(),
@@ -3173,19 +3198,28 @@ impl<'src> Transformer<'src> {
         // as ruled. Checked FIRST because it is the specific diagnosis of the
         // general symptom below.
         if let Some(miss) = self.admission_miss.borrow_mut().take() {
-            let module = |source: crate::analyzer::SourceId| -> String {
+            let module = |source: crate::analyzer::SourceId| -> Option<String> {
                 self.program
                     .canonical_sources
                     .get(source.0 as usize)
                     .and_then(|path: &std::path::PathBuf| path.file_stem())
                     .and_then(|stem| stem.to_str())
-                    .unwrap_or("that module")
-                    .to_string()
+                    .map(str::to_owned)
             };
             let member = miss.member;
-            let declaring = module(miss.declared_in);
-            let here = module(miss.importer);
-            return Err(Error {
+            let declaring = module(miss.declared_in).unwrap_or_else(|| "that module".to_string());
+            // E185: the importing module's SPELLED name. The body that asked
+            // may be `[derive(..)]`-synthesized, whose source id is the
+            // sentinel outside `sources` — `note_source_of` resolves it to the
+            // file the derive was written in, which is the file whose import
+            // the steer below asks the reader to widen.
+            let here = miss
+                .importing_body
+                .and_then(|body| self.program.note_source_of(body))
+                .and_then(module)
+                .or_else(|| module(miss.importer))
+                .unwrap_or_else(|| "that module".to_string());
+            let error = Error {
                 trace: Vec::new(),
                 note: None,
                 span: Span::default(),
@@ -3196,7 +3230,23 @@ impl<'src> Transformer<'src> {
                      the CALLER does not reach it. Widen `{here}`'s own import of \
                      `{declaring}` — `(impl _)` admits every implementation it declares"
                 ),
+            };
+            // E185: and PLACED — through the one anchoring rule every
+            // post-`analyze` pass uses (E16), which re-spans generated code at
+            // the attribute that generated it. The file rides in the note, the
+            // channel the CLI reads a transformer refusal's location from; the
+            // refusal used to carry `0..0` against the entry, so it rendered at
+            // the entry's first byte whatever module it was about.
+            let Some(body) = miss.importing_body else {
+                return Err(error);
+            };
+            let (mut error, source) = self.program.anchored(error, body);
+            error.note = Some(Note {
+                span: error.span,
+                msg: format!("`{here}` is the module whose import decides this"),
+                source: Some(source),
             });
+            return Err(error);
         }
 
         // Never-silent (B55): refuse to ship a program that emitted a body-less
@@ -3204,7 +3254,7 @@ impl<'src> Transformer<'src> {
         // yields `undefined` and the first use of the result is a runtime
         // `TypeError` — from a compile that reported nothing. Whatever failed to
         // resolve upstream, it must not leave here quietly.
-        if let Some(&function_id) = self.bodyless_emissions.first() {
+        if let Some(&(function_id, requester)) = self.bodyless_emissions.first() {
             let function = self.program.functions.get(&function_id);
             let name = function.map(|function| function.name).unwrap_or("?");
             let declaring_trait = self
@@ -3217,18 +3267,46 @@ impl<'src> Transformer<'src> {
                 Some(trait_name) => format!("`{trait_name}`'s requirement `{name}`"),
                 None => format!("`{name}`"),
             };
-            return Err(Error {
-                trace: Vec::new(),
-                note: None,
-                span: function
+            // E190: the frame that asked. The requirement's own name span sits
+            // in std (or wherever the trait is declared), and the CLI attributes
+            // a transformer refusal to the ENTRY — so the span rendered nothing
+            // at all. The requester's name span is a real location in a file the
+            // author owns, and the note carries the file so the attribution can
+            // follow it.
+            let requester = requester.and_then(|id| {
+                let frame = self.program.functions.get(&id)?;
+                let file = self.program.source_of(id);
+                let path = file
+                    .and_then(|source| self.program.source_path(source))
+                    .map(|path| path.display().to_string());
+                Some((frame.name, frame.name_span, file, path))
+            });
+            let asked = bodyless_refusal_frame(
+                requester
+                    .as_ref()
+                    .map(|(frame, _, _, path)| (*frame, path.as_deref())),
+            );
+            let span = match &requester {
+                Some((_, name_span, _, _)) => *name_span,
+                None => function
                     .map(|function| function.name_span)
                     .unwrap_or_default(),
+            };
+            let note = requester.as_ref().map(|(frame, name_span, file, _)| Note {
+                span: *name_span,
+                msg: format!("`{frame}` is the body that reached the requirement"),
+                source: *file,
+            });
+            return Err(Error {
+                trace: Vec::new(),
+                note,
+                span,
                 msg: format!(
                     "internal: a call resolved to {source}, which has no body — \
                      emitting it would produce an empty function and a runtime \
                      `TypeError`. The receiver's type could not be resolved to a \
-                     concrete implementation at this call; please report this \
-                     program"
+                     concrete implementation at this call{asked}; please report \
+                     this program"
                 ),
             });
         }
@@ -7956,8 +8034,12 @@ impl<'src> Transformer<'src> {
         // it is never the answer to a call, only what a call falls back to when
         // the receiver's generic never got bound. Record it; assembly refuses.
         if !function.has_body {
-            self.bodyless_emissions.push(function.id);
+            // E190: with the frame that asked for it — the innermost emission
+            // already on the stack, which is the caller's body, not this one.
+            let requester = self.emitting_stack.last().copied();
+            self.bodyless_emissions.push((function.id, requester));
         }
+        self.emitting_stack.push(function.id);
         let parameters = function
             .parameters
             .iter()
@@ -7976,6 +8058,7 @@ impl<'src> Transformer<'src> {
         // the split form when the last use is short of the end; this wraps the
         // whole body otherwise, keeping parameters last in the reverse order.
         let body = self.wrap_own_param_drops(function, body);
+        self.emitting_stack.pop();
         js::Node::Function(js::Function {
             name,
             parameters,
@@ -10159,6 +10242,7 @@ impl<'src> Transformer<'src> {
         *self.admission_miss.borrow_mut() = Some(AdmissionMiss {
             member: member.to_string(),
             importer,
+            importing_body: self.emitting_stack.last().copied(),
             declared_in,
         });
         None
@@ -12139,9 +12223,48 @@ fn collect_reached_names(scope: &JsScope, reached: &mut HashSet<String>) {
     }
 }
 
+/// E190 — the sentence the never-silent body-less refusal (B55) adds naming
+/// the frame that asked for the requirement, and where that frame is written.
+///
+/// A free function because the refusal's live trigger is a compiler defect: the
+/// one on record is B351's reproduction, which is another lane's to rebuild, and
+/// the construction still has to be held to the tree. The rest of the message is
+/// the ledger's row 330.
+fn bodyless_refusal_frame(requester: Option<(&str, Option<&str>)>) -> String {
+    match requester {
+        Some((frame, Some(path))) => {
+            format!(". It was first reached while emitting `{frame}` ({path})")
+        }
+        Some((frame, None)) => format!(". It was first reached while emitting `{frame}`"),
+        None => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Formatter, unescape_string};
+    use super::{Formatter, bodyless_refusal_frame, unescape_string};
+
+    /// E190 — the body-less refusal names the frame that asked and its file.
+    /// kolt's report was one bare `Error:` line with no file, no line and no
+    /// hint which of nineteen files to look in; the integrator had to
+    /// instrument `ensure_function_emitted` by hand to learn that `app_shell`
+    /// was the frame. That answer is in the message now.
+    #[test]
+    fn the_bodyless_refusal_names_the_frame_that_asked() {
+        assert_eq!(
+            bodyless_refusal_frame(Some(("app_shell", Some("src/views.vl")))),
+            ". It was first reached while emitting `app_shell` (src/views.vl)"
+        );
+        // A frame whose file the program cannot name still names the frame —
+        // half an answer beats the bare `Error:` line this replaces.
+        assert_eq!(
+            bodyless_refusal_frame(Some(("app_shell", None))),
+            ". It was first reached while emitting `app_shell`"
+        );
+        // And a requirement reached from no frame at all (an emission root)
+        // adds nothing rather than an empty parenthesis.
+        assert_eq!(bodyless_refusal_frame(None), "");
+    }
 
     /// The junctions where dropping the padding would change the token stream.
     /// Only `- -` is reachable from Vilan source today (`-` is the only

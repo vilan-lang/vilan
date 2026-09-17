@@ -236,7 +236,11 @@ own declared requirement instead (§8.6): `fun f(): i32 context flavor`
 says what the body may read, while `fun f(): (|| i32) context flavor`
 says what the returned closure demands of its caller. The return type
 decides which reading applies, because only a closure type can carry a
-clause at all.
+clause at all. The parentheses are required for the closure reading:
+`fun f(): || i32 context flavor` is refused, because the type grammar's
+greed takes the clause onto the closure's own return type — `i32`, which
+cannot carry one — and the declaration then means neither of the two
+things it could have meant.
 
 Because the binding is deferred, an injected value may only flow where
 the threading can follow it: it can be **called**, **forwarded** to a

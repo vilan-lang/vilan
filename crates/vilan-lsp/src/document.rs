@@ -5873,6 +5873,22 @@ impl Document {
                     replacement: hole,
                     target: None,
                 });
+            } else if diagnostic
+                .msg
+                .starts_with(vilan_core::parsing::MISBOUND_RETURN_CLAUSE)
+                && let Some(replacement) = parenthesized_return_clause(&self.text, diagnostic.span)
+            {
+                // B343 (R9): the refusal names BOTH readings, and the fix takes
+                // the one the position exists for — the clause on the FUNCTION.
+                // Its span is the whole written return type, so the edit is the
+                // parentheses and nothing else, and the other reading stays one
+                // hand edit away rather than being guessed at here.
+                fixes.push(QuickFix {
+                    title: "Parenthesize the closure type".to_string(),
+                    span: diagnostic.span,
+                    replacement,
+                    target: None,
+                });
             } else if diagnostic.msg.starts_with(AT_IS_NOT_A_TOKEN)
                 && let Some(fix) = media_rule_fix(&self.text, diagnostic.span.start)
             {
@@ -7484,6 +7500,32 @@ fn media_rule_fix(text: &str, at: usize) -> Option<QuickFix> {
 /// nothing guarantees against structurally.
 const MISSING_TERMINATOR_MESSAGE: &str = "expected `;` to end this statement";
 
+/// B343 (R9)'s fix: `|| void context c` → `(|| void) context c`, the reading
+/// that gives the clause to the FUNCTION.
+///
+/// `span` is the WRITTEN return type whole (the parser spans the refusal there
+/// for this), and the clause is its trailing `context …`, so the edit is a pair
+/// of parentheses around what precedes it. The clause is found from the RIGHT,
+/// at a word boundary and followed by a name or the multi form's `(` — a type
+/// may perfectly well name `my_context`, and a clause may name a context called
+/// `context`, and neither must be mistaken for the keyword.
+fn parenthesized_return_clause(text: &str, span: Span) -> Option<String> {
+    let written = text.get(span.into_range())?;
+    let at = written
+        .match_indices("context")
+        .filter(|(at, _)| {
+            written[..*at].ends_with([' ', '\t'])
+                && written[at + "context".len()..].starts_with([' ', '\t', '('])
+        })
+        .map(|(at, _)| at)
+        .last()?;
+    let head = written[..at].trim_end();
+    if head.is_empty() {
+        return None;
+    }
+    Some(format!("({head}) {}", &written[at..]))
+}
+
 /// Regime 1's message suffix (`analyzer.rs::missing_return_value_message`) —
 /// matched by SUFFIX (own sentence, own period) so it can't fire on regime
 /// 1's sibling wording ("this body ends without producing a value.") which
@@ -8169,6 +8211,69 @@ pub(crate) mod tests {
         );
         let mut applied = text.to_string();
         applied.replace_range(rewrite[0].span.into_range(), &rewrite[0].replacement);
+        let entry = dir.join("main.vl");
+        std::fs::write(&entry, &applied).unwrap();
+        let reanalyzed = Document::analyze(&applied, &std_root(), &entry);
+        assert!(
+            reanalyzed.diagnostics.is_empty(),
+            "applying the fix should leave the file clean: {:#?}",
+            reanalyzed.diagnostics
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B343 (R9): the refusal for an un-parenthesized closure return type
+    /// carrying a clause offers the parenthesizing edit, and applying it leaves
+    /// the file clean. The fix takes the reading the position exists for — the
+    /// clause on the FUNCTION — and the refusal's own text is what names the
+    /// other one.
+    #[test]
+    fn quickfix_parenthesizes_a_misbound_return_clause() {
+        let source = "import std::io::print;\n\
+                      import std::context::Context;\n\
+                      \n\
+                      let c: Context<i32> = Context::new();\n\
+                      \n\
+                      fun make(): || void context c {\n\
+                      \t|| print(c.get())\n\
+                      }\n\
+                      \n\
+                      fun main() {\n\
+                      \tc.run(1, || {\n\
+                      \t\tlet body = make();\n\
+                      \t\tbody();\n\
+                      \t});\n\
+                      }\n\
+                      main();\n";
+        let (dir, document) = analyze_workspace(&[("main.vl", source)]);
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
+        let parenthesize: Vec<_> = fixes
+            .iter()
+            .filter(|fix| fix.title == "Parenthesize the closure type")
+            .collect();
+        assert_eq!(
+            parenthesize.len(),
+            1,
+            "exactly one parenthesizing fix is offered: {:?}",
+            fixes.iter().map(|fix| &fix.title).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            &text[parenthesize[0].span.into_range()],
+            "|| void context c",
+            "the edit covers the written return type and nothing else",
+        );
+        assert_eq!(parenthesize[0].replacement, "(|| void) context c");
+        let mut applied = text.to_string();
+        applied.replace_range(
+            parenthesize[0].span.into_range(),
+            &parenthesize[0].replacement,
+        );
         let entry = dir.join("main.vl");
         std::fs::write(&entry, &applied).unwrap();
         let reanalyzed = Document::analyze(&applied, &std_root(), &entry);

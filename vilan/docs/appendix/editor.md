@@ -186,7 +186,7 @@ sees it.
 
 ## Quick fixes
 
-Twelve, each attached to the diagnostic that earns it:
+Thirteen, each attached to the diagnostic that earns it:
 
 | Action | Offered on |
 |---|---|
@@ -201,6 +201,7 @@ Twelve, each attached to the diagnostic that earns it:
 | ``Declare the inferred contexts`` | ``…'s body reads context `b`, which this `context` clause does not declare`` — a `fun`'s declared `context` clause narrower than what its body reads. The refusal spells the clause the body needs and the fix writes exactly that, over the clause's own name list |
 | ``Declare it `const let` `` | either half of G24's `const` steer — ``a `const` expression reads only compile-time-known bindings`` at a read, or ``a `const` result must be plain data; this evaluates to a closure`` at a `let x = const ..`. One edit either way: the declaration keyword. At a read it is a zero-width `const ` in front of the binding the message names, ahead of the read and only where this file's own text still opens it with `let`; at the closure result the `const` MOVES to the head of the declaration, which is entirely the text in front of the diagnostic's span |
 | ``Remove `!important` `` | ``!important`` in a `css` block — a `Style` merges by record update, so a later declaration on the same property already wins. Takes the space before the marker with it |
+| ``Parenthesize the closure type`` | a `fun` whose RETURN type is an un-parenthesized closure type carrying a `context` clause (B343) — the type grammar's own `context` suffix is greedy, so the clause lands on the closure's own return type, which cannot carry one. The edit covers the written return type and adds the parentheses that give the clause to the FUNCTION; the refusal also names the other reading (the clause on the closure that is RETURNED), which is a second pair of parentheses and yours to choose |
 | ``Rewrite as `child(each(…))` `` | one of the six `View` methods A99 retired — `when`, `swap`, `swap_split`, `bind_each`, `bind_each_values`, `bind_each_by`. The edit covers the call alone, so the receiver, the chain around it and the arguments are untouched text; the `{each(…)}` hole the diagnostic also names is left to you, since whether a hole is right is a question about the markup around the call |
 
 and two source actions:

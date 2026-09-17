@@ -3306,6 +3306,11 @@ pub struct Analyzer<'src> {
     /// Calls refused on ARITY, before anything was wired, as `(call entity,
     /// subject entity)`. See [`Program::arity_invalid_calls`].
     arity_invalid_calls: Vec<(Id, Id)>,
+    /// Every call's `(call entity, subject entity, argument entities)` triple,
+    /// banked at WALK time exactly as `call_subjects` banks the subject alone
+    /// (B204). Filtered down to the calls that never wired when the `Program`
+    /// is built — see [`Program::unwired_calls`].
+    written_call_arguments: Vec<(Id, Id, Vec<Id>)>,
     struct_initializer_field_spans: Vec<(SourceId, Span, Id, usize)>,
     /// E119: the platform this analysis runs under, and why (the latter already
     /// rendered) — copied off the call's arguments and the `Workspace` so the
@@ -5652,6 +5657,7 @@ impl<'src> Analyzer<'src> {
             member_name_spans: HashMap::default(),
             unresolved_method_calls: Vec::new(),
             arity_invalid_calls: Vec::new(),
+            written_call_arguments: Vec::new(),
             struct_initializer_field_spans: Vec::new(),
             current_source_id: SourceId(0),
             or_operand_end: None,
@@ -28189,6 +28195,11 @@ impl<'src> Analyzer<'src> {
                                             .collect()
                                     })
                                     .unwrap_or_else(Vec::new);
+                                self.written_call_arguments.push((
+                                    id,
+                                    subject_id,
+                                    argument_ids.clone(),
+                                ));
                                 self.constraints.push(Constraint::MethodCall {
                                     id,
                                     subject_id,
@@ -29185,6 +29196,15 @@ impl<'src> Analyzer<'src> {
                             .collect()
                     })
                     .unwrap_or_else(Vec::new);
+                // E189: bank the argument entities as the WALK saw them,
+                // beside the subject above. `function_calls` records the same
+                // list, but only for a call that RESOLVED, so a closure
+                // written as the argument of a call that did not is recorded
+                // nowhere — and the call-graph walk, which reads the arguments
+                // out of `function_calls`, never reaches it to give it its
+                // lexical parent.
+                self.written_call_arguments
+                    .push((id, subject_id, argument_ids.clone()));
                 // Defer call type-checking to constraint solving.
                 self.constraints
                     .push(Constraint::CallSubject(CallSubjectConstraint::from_walk(
@@ -50005,6 +50025,25 @@ pub struct Program<'src> {
     /// the shape the program stated: the call WAS written, and it names its
     /// callee, whatever the argument list got wrong.
     pub arity_invalid_calls: Vec<(Id, Id)>,
+    /// E189 — every call that never wired, as `(call entity, subject entity,
+    /// argument entities)`, banked at walk time and filtered here.
+    ///
+    /// B229 and B241 kept the SHAPE of a call the solver could not select
+    /// because a pass that scans `function_calls` cannot tell "never written"
+    /// from "written and unresolvable". This is the third face of the same
+    /// hole, and the one that cascades furthest: the call-graph collector
+    /// reads a call's arguments out of `function_calls` too, so a closure
+    /// written as the argument of a call that did not resolve is never walked
+    /// from its defining body and gets NO lexical parent. The context pass
+    /// reads that parent to decide whether a captured closure is covered, and
+    /// a parentless one is uncovered by default — so one unresolved call made
+    /// every context read the closure reaches report "this code can be reached
+    /// without an enclosing `run`" (173 of kolt's 180 errors at d783fbf4).
+    ///
+    /// Recorded for every call and narrowed to the unwired ones at
+    /// construction, because "did this call wire?" is not answerable while the
+    /// walk is running.
+    pub unwired_calls: Vec<(Id, Id, Vec<Id>)>,
     /// Use-site identifier spans for struct-initializer field KEYS: `(file, name
     /// span, owning struct id, field index)`, one per `x` in `Point { x = 1 }`.
     ///
@@ -59023,6 +59062,13 @@ fn analyze_over_world<'src>(
         .collect();
     let curated_modules = analyzer.curated_modules.clone();
     let exposed_private_types = std::mem::take(&mut analyzer.exposed_private_types);
+    // E189: the calls the walk WROTE, minus the ones that wired — what is left
+    // is every call whose arguments no later pass can find.
+    let unwired_calls: Vec<(Id, Id, Vec<Id>)> =
+        std::mem::take(&mut analyzer.written_call_arguments)
+            .into_iter()
+            .filter(|(call_id, _, _)| !analyzer.function_calls.contains_key(call_id))
+            .collect();
 
     Some(Program {
         hidden_impls,
@@ -59140,6 +59186,7 @@ fn analyze_over_world<'src>(
         member_name_spans: analyzer.member_name_spans,
         unresolved_method_calls: std::mem::take(&mut analyzer.unresolved_method_calls),
         arity_invalid_calls: std::mem::take(&mut analyzer.arity_invalid_calls),
+        unwired_calls,
         struct_initializer_field_spans: analyzer.struct_initializer_field_spans,
         struct_initializer_to_def: analyzer.struct_initializer_to_def,
         struct_literal_expectations,

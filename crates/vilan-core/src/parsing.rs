@@ -242,6 +242,23 @@ const A_NAME_AFTER_PATH_SEPARATOR_ON_THIS_LINE: &str = "a name after `::` on the
      at the end of a line joins whatever the next line starts with — join the line, or import \
      the path under a shorter name (`import a::b::c as d;`) and write `d`";
 
+/// The rule `fun f(): || void context c` breaks (B343, R9 RULED 2026-09-17).
+/// Curated (diagnostics-standard.md B6): the prohibition explains itself, and
+/// the two ways out are the two things the author can actually have meant.
+///
+/// The clause's POSITION stays where contexts.md §3 put it — after the return
+/// type — and this is the whole cost of keeping it there. A type's own
+/// `context` suffix parses greedily, so an un-parenthesized closure return type
+/// swallows the clause onto its OWN return type, which cannot carry one; the
+/// declaration then means neither of the two things it could have meant. Both
+/// are one parenthesis away, and both are spelled here rather than left to be
+/// guessed at.
+pub const MISBOUND_RETURN_CLAUSE: &str = "a `context` clause after an UN-PARENTHESIZED closure return type binds to the \
+     closure's own return type, which cannot carry one. Parenthesize the closure type to say \
+     which clause you mean: `fun f(): (|| void) context c` declares `c` for the FUNCTION, and \
+     `fun f(): (|| void context d) context c` declares `d` for the closure that is RETURNED \
+     and `c` for the function itself";
+
 /// The rule a program written before the `css` promotion breaks. Curated
 /// (diagnostics-standard.md B6 — the prohibition explains itself and names the
 /// sanctioned spelling): `css` became a hard keyword with the `css { … }` block
@@ -590,6 +607,49 @@ fn return_type_carries_its_own_clause(node: &Node<'_>) -> bool {
         grouped,
         Node::ClosureType(..) | Node::AsyncType(..) | Node::SyncType(..)
     )
+}
+
+/// B343 (R9, RULED 2026-09-17) — the ONE shape the "clause after the return
+/// type" position cannot spell, reported instead of mis-bound.
+///
+/// `fun f(): || void context c` has three readings and the grammar takes the
+/// one nobody means: `parse_type` is greedy, so `context c` lands on the
+/// CLOSURE'S OWN return type `void`, which cannot carry a clause at all. The two
+/// readings a writer could have meant are both a parenthesis away — `(|| void)
+/// context c` gives the clause to the FUNCTION, `(|| void context c)` gives it
+/// to the closure that is returned — and contexts.md §3's position (after the
+/// return type) is kept for every other shape, so this is the whole cost of
+/// keeping it.
+///
+/// Takes the clause off as it reports it, so the analyzer does not refuse the
+/// same mistake a second time with its own ("a `context` clause is only
+/// supported on a closure type") — one mistake, one diagnostic, and the rest of
+/// the signature reads exactly as it would have without the clause.
+///
+/// Answers `false` for every legal shape, including the nested one: `fun f(): ||
+/// (|| void) context c` returns a closure that returns an INJECTED closure, and
+/// the clause is that inner closure type's — [`return_type_carries_its_own_
+/// clause`] is the same predicate the peel below uses, so the two readings are
+/// decided in one place.
+fn take_misbound_return_clause(node: &mut Node<'_>) -> bool {
+    let closure = match node {
+        Node::AsyncType(inner) | Node::SyncType(inner) => &mut inner.0,
+        other => other,
+    };
+    let Node::ClosureType(_, Some(returns)) = closure else {
+        return false;
+    };
+    let Node::TypeWithContexts(inner, _) = &returns.0 else {
+        return false;
+    };
+    if return_type_carries_its_own_clause(&inner.0) {
+        return false;
+    }
+    let Node::TypeWithContexts(inner, _) = std::mem::replace(&mut returns.0, Node::Error) else {
+        unreachable!("just matched");
+    };
+    **returns = *inner;
+    true
 }
 
 fn starts_item(token: &Token<'_>) -> bool {
@@ -5558,7 +5618,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             );
         }
         self.reject_misplaced_spread(&parameters.0);
-        let return_type = if self.eat_op(":") {
+        let mut return_type = if self.eat_op(":") {
             Some(Box::new(self.in_context("return type", Self::parse_type)?))
         } else {
             None
@@ -5587,7 +5647,23 @@ impl<'a, 'src> Parser<'a, 'src> {
         // normalizes the two arrivals into ONE printed position — last, after
         // `borrows` (E146 rule 3) — through a token canonicalization its
         // safety net shares, so either way in is the same way out.
-        let mut return_type = return_type;
+        // B343 (R9): the one shape the position cannot spell, refused at the
+        // head rather than mis-bound. See [`take_misbound_return_clause`].
+        if let Some(annotation) = return_type.as_deref_mut() {
+            // The WRITTEN return type, taken before the clause comes off: it
+            // spans `|| void context c` whole, which is what the editor's
+            // parenthesizing fix rewrites and what makes the refusal point at
+            // the thing it is asking to be changed rather than at one name.
+            let written = annotation.1;
+            if take_misbound_return_clause(&mut annotation.0) {
+                self.errors.push(ParseError {
+                    span: written,
+                    reason: ParseErrorReason::Rule(MISBOUND_RETURN_CLAUSE),
+                    context: Vec::new(),
+                    hint: None,
+                });
+            }
+        }
         let mut contexts: Option<(Vec<Spanned<&'src str>>, Span)> = None;
         if let Some(annotation) = return_type.take() {
             match annotation.0 {

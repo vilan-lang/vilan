@@ -335,6 +335,20 @@ pub fn assert_fails_browser_once_with(source: &str, message_part: &str) {
     }
 }
 
+/// The browser twin of [`assert_fails_without`]: the compile fails, and NO
+/// diagnostic mentions `message_part` — for a cascade whose point is that it is
+/// gone, not that a better message was added beside it.
+#[track_caller]
+pub fn assert_fails_browser_without(source: &str, message_part: &str) {
+    match compile_browser(source) {
+        Ok(_) => panic!("expected a browser compile error, but it compiled cleanly"),
+        Err(errors) => assert!(
+            errors.iter().all(|error| !error.contains(message_part)),
+            "a browser diagnostic still contains {message_part:?}; got: {errors:#?}"
+        ),
+    }
+}
+
 /// The browser twin of [`assert_fails_spanning`]. Only a browser build rejects
 /// the `@process` layer, so a coloring anchor can only be pinned there.
 #[track_caller]

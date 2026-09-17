@@ -201,6 +201,15 @@ impl CallGraph {
         let bindings = program.module_level_bindings();
         let module_bindings: HashSet<Id> = bindings.iter().copied().collect();
         let const_exprs: HashSet<Id> = program.const_exprs.iter().copied().collect();
+        // E189: the shape of the calls that never wired, so the walk below can
+        // descend into them exactly as it descends into the ones that did.
+        // Empty on a program with no resolution error, which is every program
+        // the emitting pipeline ever reaches.
+        let unwired: HashMap<Id, (Id, &[Id])> = program
+            .unwired_calls
+            .iter()
+            .map(|(call_id, subject_id, arguments)| (*call_id, (*subject_id, arguments.as_slice())))
+            .collect();
 
         for (id, function) in &program.functions {
             // A signature-only trait method has no body to walk.
@@ -211,6 +220,7 @@ impl CallGraph {
                 Node::Function(*id),
                 program,
                 &module_bindings,
+                &unwired,
                 |collector| {
                     collector.walk_all(&function.body.0);
                     collector.walk(function.body.1);
@@ -222,9 +232,15 @@ impl CallGraph {
         // roots directly; the walk of their defining body only records the
         // lexical parent link (it does not descend into the closure).
         for (id, closure) in &program.closures {
-            graph.add_node(Node::Closure(*id), program, &module_bindings, |collector| {
-                collector.walk(closure.return_);
-            });
+            graph.add_node(
+                Node::Closure(*id),
+                program,
+                &module_bindings,
+                &unwired,
+                |collector| {
+                    collector.walk(closure.return_);
+                },
+            );
         }
 
         // Module-level bindings: their initializers are code too — they run
@@ -251,6 +267,7 @@ impl CallGraph {
                 global_references: Vec::new(),
                 function_references: Vec::new(),
                 await_sites: Vec::new(),
+                unwired: &unwired,
                 visited: HashSet::default(),
             };
             collector.walk(initial);
@@ -321,6 +338,7 @@ impl CallGraph {
                 global_references: Vec::new(),
                 function_references: Vec::new(),
                 await_sites: Vec::new(),
+                unwired: &unwired,
                 visited: HashSet::default(),
             };
             collector.walk(region);
@@ -345,11 +363,12 @@ impl CallGraph {
 
     /// Walks one node's body with a fresh collector, recording its forward
     /// edges and the parent link of any closure defined directly inside it.
-    fn add_node(
+    fn add_node<'a>(
         &mut self,
         node: Node,
-        program: &Program,
-        module_bindings: &HashSet<Id>,
+        program: &'a Program,
+        module_bindings: &'a HashSet<Id>,
+        unwired: &'a HashMap<Id, (Id, &'a [Id])>,
         walk: impl FnOnce(&mut Collector),
     ) {
         self.nodes.push(node);
@@ -361,6 +380,7 @@ impl CallGraph {
             global_references: Vec::new(),
             function_references: Vec::new(),
             await_sites: Vec::new(),
+            unwired,
             visited: HashSet::default(),
         };
         walk(&mut collector);
@@ -672,6 +692,16 @@ struct Collector<'a, 'src> {
     /// initializer needs the sites themselves, to span its refusal at the
     /// `await` the user wrote.
     await_sites: Vec<Id>,
+    /// E189 — the SUBJECT and ARGUMENT entities of the calls that never wired,
+    /// by call entity. A call's operands otherwise come out of
+    /// `function_calls`, which holds only the calls the solver SELECTED — and
+    /// an unwired METHOD call has no `entity_map` entry either, so the walk
+    /// stopped at the head of the chain and everything written inside it fell
+    /// out of this graph: the nested calls (their owner unrecorded, which reads
+    /// back as "entered from outside the graph") and the lexical parent link of
+    /// every closure literal among them. Empty for every program that
+    /// type-checks.
+    unwired: &'a HashMap<Id, (Id, &'a [Id])>,
     visited: HashSet<Id>,
 }
 
@@ -687,6 +717,27 @@ impl<'a, 'src> Collector<'a, 'src> {
         // so a single walk can't loop.
         if !self.visited.insert(id) {
             return;
+        }
+        // E189: a call the solver never wired. Whether a call RESOLVED says
+        // nothing about what it lexically CONTAINS, and this walk is about what
+        // it contains — so its operands are walked exactly as a wired call's
+        // are. Checked here rather than in the `Expr::Call` arm below because an
+        // unwired METHOD call never reaches that arm: the walk records
+        // `Expr::Call` when the call WIRES, so a method call that did not has no
+        // entity at all and the bail below would end the descent at the head of
+        // the chain. The subject is pre-marked exactly as the wired arm marks
+        // it, so naming a callee here is not read as taking it as a value.
+        if let Some(&(subject_id, arguments)) = self.unwired.get(&id) {
+            let subject_names_a_function = match self.program.entity_map.get(&subject_id) {
+                Some(Expr::Local(binding)) => self.program.functions.contains_key(binding),
+                Some(Expr::Function(_)) => true,
+                _ => false,
+            };
+            if subject_names_a_function {
+                self.visited.insert(subject_id);
+            }
+            self.walk(subject_id);
+            self.walk_all(arguments);
         }
         let Some(expr) = self.program.entity_map.get(&id) else {
             return;

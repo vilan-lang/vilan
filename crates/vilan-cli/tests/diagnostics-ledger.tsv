@@ -361,7 +361,7 @@ row	flagship	key
 327	-	`[[build.hook]]` `{name}` declares an empty `{key}` entry: each one is a file or directory path relative to the manifest
 328	-	`[[build.hook]]` `{name}` declares `{key}` entry `{path}`, which contains `{metacharacter}`: freshness digests the paths you declare, and there is no glob matching — name the directory (`src/static`) or the files themselves
 329	-	Cannot execute program without a main function
-330	flagship	internal: a call resolved to {source}, which has no body — emitting it would produce an empty function and a runtime `TypeError`. The receiver's type could not be resolved to a concrete implementation at this call; please report this program
+330	flagship	internal: a call resolved to {source}, which has no body — emitting it would produce an empty function and a runtime `TypeError`. The receiver's type could not be resolved to a concrete implementation at this call{asked}; please report this program
 331	flagship	internal: the type of this `drop` argument could not be resolved, so the sink cannot tell a resource from data and would tear nothing down; please report this program
 332	flagship	`std::{name}` was removed: `{name}` is a primitive and is always in scope — delete the import (its module path, if you need it, is `std::{home}::{name}`)
 333	flagship	`std::{name}` was removed: `{name}` is in the default prelude (no import needed), and its module path is `std::{home}::{name}`
@@ -528,3 +528,4 @@ row	flagship	key
 503	-	`--backend rust` builds ONE entry, not a workspace: a workspace's legs are a
 504	-	`--backend rust` runs ONE entry, not a workspace: a workspace's legs are a
 505	-	`--backend rust` has no `--watch` yet: the native round is a full
+506	-	a `context` clause after an UN-PARENTHESIZED closure return type binds to the closure's own return type, which cannot carry one. Parenthesize the closure type to say which clause you mean: {...}

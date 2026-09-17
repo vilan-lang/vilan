@@ -626,7 +626,11 @@ first, and the declaration peels it back off only when the return type
 cannot carry one. So `fun f(): i32 context settings` binds its clause to the
 FUNCTION (`i32` is the return type), while `fun f(): (|| i32) context
 settings` leaves it on the closure TYPE — the returned closure is injected
-(§8.5). With no return type at all the clause is read by the function
+(§8.5). The one shape this position cannot spell is an UN-PARENTHESIZED
+closure return type carrying a clause (`fun f(): || i32 context settings`):
+the greed takes the clause onto the closure's own return type, which cannot
+carry one, so the form is refused with both parenthesized readings named.
+With no return type at all the clause is read by the function
 production above instead. Written after the return type it precedes a
 `borrows` clause, and written without one it follows it; the formatter
 prints it where it was written.

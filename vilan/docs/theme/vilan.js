@@ -78,12 +78,16 @@
 		};
 		// `context` and `sync` are CONTEXTUAL: the lexer hands both back as
 		// identifiers, so they only read as keywords in the one position each
-		// occupies — `context` after a closure type's `)`, `sync` right after
-		// the `(` that opens one. Anchored, so a variable named `context` or a
-		// type named `Sync` is untouched.
+		// occupies — `sync` right after the `(` that opens a closure type, and
+		// `context` after what its clause follows: a closure type's `)`, a
+		// parameter list's `)`, or the RETURN type of a `fun` declaration
+		// (`fun f(): i32 context settings` — contexts.md §3's position, kept by
+		// B343/R9). Guarded on both sides, so a variable named `context` and the
+		// reads through it (`context.run(..)`, `context.get()`) stay plain, as
+		// does a type named `Sync`.
 		const CONTEXT_CLAUSE = {
 			className: "keyword",
-			begin: "(?<=\\)\\s{0,8})context\\b",
+			begin: "(?<=[A-Za-z0-9_>\\)\\]]\\s{1,8})context\\b(?=\\s{0,8}[\\(A-Za-z_])",
 		};
 		const SYNC_MARKER = {
 			className: "keyword",

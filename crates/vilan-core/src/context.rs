@@ -997,6 +997,20 @@ fn analyze(
                 .iter()
                 .map(|(_, subject_id)| *subject_id),
         )
+        // E189: and the subject of every call that never wired at all — the
+        // third face of the same hole. `f(bad)` where `bad` does not type
+        // leaves `f` named in call position and recorded nowhere, so the scan
+        // above read it as `f` taken AS A VALUE: a "reads context, so it can't
+        // be used as a value" refusal at a call, and a callee the value-use
+        // entry then holds permanently uncovered for its whole transitive read
+        // set. A call written with an argument that did not type is still a
+        // CALL of the name it wrote.
+        .chain(
+            program
+                .unwired_calls
+                .iter()
+                .map(|(_, subject_id, _)| *subject_id),
+        )
         .collect();
     let value_taken: HashSet<Id> = program
         .entity_map
@@ -1125,6 +1139,37 @@ fn analyze(
             _ => true,
         }
     };
+
+    // --- E189: the closures an UNRESOLVED call was handed. ---
+    //
+    // A call the solver never wired is recorded in `function_calls` nowhere, and
+    // the call-graph collector reads a call's arguments out of exactly that map
+    // — so a closure LITERAL written as such a call's argument is never reached
+    // from its defining body and carries no `closure_parent_of` link. Coverage
+    // reads that link ("a captured closure is covered iff its defining scope
+    // is") and a link that is absent answers "uncovered", so ONE unresolved call
+    // made every context read anywhere under its closure report a missing `run`:
+    // 173 of kolt's 180 errors at d783fbf4 came from seven retired `View`
+    // methods this way, 74 of them in a generated module that writes no closure
+    // at all.
+    //
+    // The premise of that path FAILED — the call the closure was written for
+    // resolved to nothing, so where the closure runs, and under what, is not a
+    // question this pass can answer and not one the program is asking yet. Such
+    // a closure is a covered boundary here, exactly like a `run` body: the
+    // primary error (the call that did not resolve) stands alone, and the
+    // coverage verdict for its inside is deferred to the compile after it is
+    // fixed. Nothing is threaded on the strength of it — the program carries a
+    // diagnostic, so no plan of this pass is ever applied.
+    let unresolved_argument_closures: HashSet<Id> = program
+        .unwired_calls
+        .iter()
+        .flat_map(|(_, _, arguments)| arguments)
+        .filter_map(|argument| match program.entity_map.get(argument) {
+            Some(Expr::Closure(closure_id)) => Some(*closure_id),
+            _ => None,
+        })
+        .collect();
 
     // --- Injected (`context`-typed) closures — proposal/ambient-owner.md §5,
     // B309. ---
@@ -1704,6 +1749,13 @@ fn analyze(
                 || deferred
                     .get(&context)
                     .is_some_and(|closures| closures.contains(&id))
+                // E189: and a closure handed to a call that never resolved.
+                // The parameter it was written for is exactly what could not
+                // be found, so whether it would have carried a clause is the
+                // unanswerable question — and answering it "no" charges the
+                // creator with a requirement the closure may well have been
+                // given. The premise failed; the walk stops here.
+                || unresolved_argument_closures.contains(&id)
         };
         // Backward reachability: a caller of a needs-context node needs it too
         // — through direct edges, through dispatch (B14), and — for CAPTURING
@@ -1899,6 +1951,12 @@ fn analyze(
                                 .flatten()
                                 .all(|caller| bound.contains(caller))
                     }
+                } else if unresolved_argument_closures.contains(&id) {
+                    // E189: the call this closure was written for resolved to
+                    // nothing, so it has no defining scope on record and the
+                    // question below has no honest answer. Covered here; the
+                    // unresolved call is the one error.
+                    true
                 } else {
                     // A captured closure is covered iff its defining scope is.
                     graph

@@ -6732,18 +6732,27 @@ fn compile_to_js(
                         error.note.as_ref().map(|note| note.msg.clone()),
                     ));
                     // The entry, and not as a fallback (E16's leftover, resolved
-                    // by looking): `transform` has exactly ONE failure —
-                    // `transform_entry_ast`'s missing `main`
-                    // (`transformer.rs`) — and it is STRUCTURAL. Its subject is
-                    // the ABSENCE of a definition, so there is no span to take a
+                    // by looking): `transform_entry_ast`'s missing `main`
+                    // (`transformer.rs`) is STRUCTURAL. Its subject is the
+                    // ABSENCE of a definition, so there is no span to take a
                     // source from (it carries `0..0` for that reason), and the
-                    // entity whose absence it reports is the entry's `main`. The
-                    // span-source rule the post-analyze passes follow needs a
-                    // span that indexes a file; this one indexes nothing, and
-                    // the entry is where the missing definition was looked for.
-                    // A future transformer error WITH a real span must attribute
-                    // through `program.source_of(..)` like everything else.
-                    analyzer_errors.push((SourceId(0), error.span.into_range(), error.msg));
+                    // entity whose absence it reports is the entry's `main`.
+                    //
+                    // E190: a refusal that DOES know where to point says so in
+                    // its note, whose `source` is the file its span indexes —
+                    // the channel every other diagnostic attributes through,
+                    // reached here without a second one. B55's body-less
+                    // emission is the first to use it: its span was the
+                    // requirement's name in std, rendered against the entry, so
+                    // the terminal printed one bare `Error:` line with no file
+                    // and no line at all.
+                    let located = error
+                        .note
+                        .as_ref()
+                        .and_then(|note| note.source)
+                        .unwrap_or(SourceId(0));
+                    load_diagnostic_file(&mut diagnostic_files, &program, located);
+                    analyzer_errors.push((located, error.span.into_range(), error.msg));
                 }
             }
         }
