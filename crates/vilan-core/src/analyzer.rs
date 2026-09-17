@@ -32263,9 +32263,30 @@ impl<'src> Analyzer<'src> {
             return;
         };
         for (constraint_id, type_id) in bindings {
+            // B351: an expectation that is ITSELF another call's still-abstract
+            // own generic is not evidence. A `{{ .. }}` child hole lands in
+            // `View::child<C: Slot>`, so the hole's tail is expected at the
+            // bare `C` — and binding `run<U>`'s `U` to it froze `U` at a
+            // parameter only the enclosing call could ever ground. `child`
+            // then took `U` for its own `C`, and the emitter reached `Slot`'s
+            // body-less `place` (B55, with no span) on the program kolt's
+            // `app_shell` writes.
+            //
+            // An enclosing DECLARATION's binder is a different thing and still
+            // binds: inside `fun g<U>(v: U): U { f(v) }` the expectation `U` is
+            // a name in scope at the call, rigid for the whole body, and
+            // `f`'s own generic taking it is exactly right.
+            //
+            // `generic_is_enclosing_binder` is the same question this loop
+            // already asks about the CONSTRAINT, asked about the VALUE.
+            let expectation_is_a_foreign_generic = match *type_id.borrow_type(self) {
+                Type::Generic(named) => !self.generic_is_enclosing_binder(named, call_id),
+                _ => false,
+            };
             if open.contains(&constraint_id)
                 && !self.generic_is_enclosing_binder(constraint_id, call_id)
                 && *type_id.borrow_type(self) != Type::Generic(constraint_id)
+                && !expectation_is_a_foreign_generic
                 && !self.type_has_hole(type_id)
             {
                 substitution.insert(constraint_id, type_id);

@@ -10448,3 +10448,183 @@ fn b347_a_wrong_render_body_reports_once_with_no_owner_scope_cascade() {
         "no `owner_scope` cascade behind it: {errors:#?}"
     );
 }
+
+// --- B351: a block hole whose tail is a generic METHOD over a nested `swap` --
+//
+// The shape kolt's `app_shell` writes (views.vl:94, the `FIXME` and the
+// `let shell: View = ..` that works around it). Three things have to be true
+// together: the hole is a BLOCK hole (`{{ .. }}`), its tail is a call to a
+// GENERIC METHOD whose type argument comes only from its closure's return, and
+// that closure builds a NESTED `swap` one of whose render closures is a
+// `match`. `run`'s `U` then never bound, so the hole's own `child<C: Slot>`
+// took `U` for its `C` and the emitter reached `Slot::place` — a body-less
+// trait requirement, B55's never-silent refusal with no span.
+//
+// The five variants below all COMPILED on d783fbf4 and are pinned so the fix
+// cannot regress one of them into the reproduction. Two the filing listed as
+// passing do NOT (see the lane report): an expression-bodied `run` body and
+// both render closures annotated both still fail, so the trigger is not what
+// the twenty-line note said it was — and the generic may be a USER method as
+// well as an `external` one.
+
+/// B351's shared fixture: two enums to `match` on and a context to `run`.
+const A_NESTED_SWAP_WORLD: &str = r#"
+        import std::context::Context;
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, mount_root, swap, view };
+
+        [derive(PartialEq)]
+        enum Tab { A, B }
+
+        [derive(PartialEq)]
+        enum Leaf { X, Y }
+
+        struct User { name: str }
+
+        let user_context: Context<User> = Context::new();
+"#;
+
+/// The nested `swap` itself, written once — every pin below places the same
+/// expression somewhere different.
+const A_NESTED_SWAP: &str = r#"<section .child(swap(tab, |x| match x {
+                    Tab::A => <p/>,
+                    Tab::B => <div .child(swap(leaf, |y| match y {
+                        Leaf::X => <span/>,
+                        Leaf::Y => <b/>,
+                    })) />,
+                })) />"#;
+
+/// **B351 — the reproduction.** A block hole whose tail is `context.run(v, ||
+/// { .. })` over the nested `swap`.
+#[test]
+fn b351_a_block_hole_tailed_by_a_generic_method_over_a_nested_swap_resolves() {
+    assert_compiles_browser(&format!(
+        r#"
+        {A_NESTED_SWAP_WORLD}
+        fun main() {{
+            let tab = Signal::new(Tab::A);
+            let leaf = Signal::new(Leaf::X);
+            let _root = mount_root("app", || <div>
+                {{{{
+                    user_context.run(User {{ name = "s" }}, || {{
+                        {A_NESTED_SWAP}
+                    }})
+                }}}}
+            </div>);
+        }}
+        "#
+    ));
+}
+
+/// Variant 1 — a USER FREE FUNCTION with the same signature. The free path
+/// binds `U`; this one has always compiled and is the control that says the
+/// fix belongs on the method side.
+#[test]
+fn b351_a_free_generic_in_the_same_block_hole_still_compiles() {
+    assert_compiles_browser(&format!(
+        r#"
+        {A_NESTED_SWAP_WORLD}
+        fun ident<U>(body: || U): U {{ body() }}
+
+        fun main() {{
+            let tab = Signal::new(Tab::A);
+            let leaf = Signal::new(Leaf::X);
+            let _root = mount_root("app", || <div>
+                {{{{
+                    ident(|| {{
+                        {A_NESTED_SWAP}
+                    }})
+                }}}}
+            </div>);
+        }}
+        "#
+    ));
+}
+
+/// Variant 2 — a SINGLE (un-nested) `swap` under the same `run`.
+#[test]
+fn b351_a_single_swap_under_the_same_run_still_compiles() {
+    assert_compiles_browser(&format!(
+        r#"
+        {A_NESTED_SWAP_WORLD}
+        fun main() {{
+            let tab = Signal::new(Tab::A);
+            let _root = mount_root("app", || <div>
+                {{{{
+                    user_context.run(User {{ name = "s" }}, || {{
+                        <section .child(swap(tab, |x| match x {{
+                            Tab::A => <p/>,
+                            Tab::B => <b/>,
+                        }})) />
+                    }})
+                }}}}
+            </div>);
+        }}
+        "#
+    ));
+}
+
+/// Variant 3 — the same `run` in a PLAIN `{expression}` hole rather than a
+/// block hole.
+#[test]
+fn b351_the_same_run_in_a_plain_child_hole_still_compiles() {
+    assert_compiles_browser(&format!(
+        r#"
+        {A_NESTED_SWAP_WORLD}
+        fun main() {{
+            let tab = Signal::new(Tab::A);
+            let leaf = Signal::new(Leaf::X);
+            let _root = mount_root("app", || <div>
+                {{user_context.run(User {{ name = "s" }}, || {{
+                    {A_NESTED_SWAP}
+                }})}}
+            </div>);
+        }}
+        "#
+    ));
+}
+
+/// Variant 4 — the block hole WITHOUT the `run`: the nested `swap` is the
+/// hole's own tail.
+#[test]
+fn b351_a_block_hole_over_the_nested_swap_alone_still_compiles() {
+    assert_compiles_browser(&format!(
+        r#"
+        {A_NESTED_SWAP_WORLD}
+        fun main() {{
+            let tab = Signal::new(Tab::A);
+            let leaf = Signal::new(Leaf::X);
+            let _root = mount_root("app", || <div>
+                {{{{
+                    {A_NESTED_SWAP}
+                }}}}
+            </div>);
+        }}
+        "#
+    ));
+}
+
+/// Variant 5 — kolt's WORKAROUND, pinned as a variant because it is the
+/// program the estate actually carries until the integrator drops the
+/// `FIXME`: the same call through an ANNOTATED binding, which gives `U` an
+/// expectation that is not the hole's own `C`.
+#[test]
+fn b351_the_annotated_binding_workaround_still_compiles() {
+    assert_compiles_browser(&format!(
+        r#"
+        {A_NESTED_SWAP_WORLD}
+        fun main() {{
+            let tab = Signal::new(Tab::A);
+            let leaf = Signal::new(Leaf::X);
+            let _root = mount_root("app", || <div>
+                {{{{
+                    let shell: View = user_context.run(User {{ name = "s" }}, || {{
+                        {A_NESTED_SWAP}
+                    }});
+                    shell
+                }}}}
+            </div>);
+        }}
+        "#
+    ));
+}
