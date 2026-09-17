@@ -7208,6 +7208,7 @@ fn b335_a_module_owning_a_file_and_a_directory_reports_its_own_file() {
 /// the measurement that reads it then DECLINES rather than reporting a wall
 /// number wearing a CPU label (M15). The same reader `base_cache.rs` carries,
 /// for the same reason; the two test binaries share no code.
+#[cfg(target_os = "linux")]
 fn process_cpu_ms() -> Option<f64> {
     let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
     let rest = stat.rsplit_once(')')?.1;
@@ -7219,6 +7220,7 @@ fn process_cpu_ms() -> Option<f64> {
     Some((utime + stime) as f64 * 10.0)
 }
 
+#[cfg(target_os = "linux")]
 fn loadavg_1m() -> String {
     std::fs::read_to_string("/proc/loadavg")
         .ok()
@@ -7232,6 +7234,7 @@ fn loadavg_1m() -> String {
 /// do with either. The two legs differ in NOTHING else: same files, same
 /// statement count, same impl count, same member count, so the CPU between
 /// them is what a banked collision costs.
+#[cfg(target_os = "linux")]
 fn m75_files(colliding: bool, members: usize, statements: usize) -> Vec<(String, String)> {
     let block = |prefix: &str| {
         let mut body = String::from("import pkg::a::Thing;\n\nexport impl Thing {\n");
@@ -7269,6 +7272,7 @@ fn m75_files(colliding: bool, members: usize, statements: usize) -> Vec<(String,
 /// the CPU of the second analysis, which is a base-cache hit — so the std
 /// closure's own load is out of the number and what is left is the package and
 /// its checks.
+#[cfg(target_os = "linux")]
 fn m75_cpu_ms(label: &str, colliding: bool, members: usize, statements: usize) -> Option<f64> {
     let directory = scratch::root().join(format!(
         "vilan_m75_{label}_{}_{:?}",
@@ -7337,6 +7341,10 @@ fn m75_cpu_ms(label: &str, colliding: bool, members: usize, statements: usize) -
 /// sits inside one 10 ms tick of the `/proc` clock, which makes for a pin that
 /// cannot tell the two implementations apart. 250 colliding members and 1,500
 /// statements lift it to 650 ms against the index's 60.
+// The reader is `/proc/self/stat`, so the pin exists only where that file does
+// (Order 37's seal: the Windows shard has no process CPU clock to read and the
+// bound would be a wall number wearing a CPU label — M15).
+#[cfg(target_os = "linux")]
 #[test]
 fn m75_a_collisions_refusal_does_not_scale_with_the_importers_statement_count() {
     const MEMBERS: usize = 250;

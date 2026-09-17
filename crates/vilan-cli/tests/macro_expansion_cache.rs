@@ -79,22 +79,22 @@ fn cache_file(dir: &Path) -> PathBuf {
 /// holding exactly one entry after a fresh package is checked is the premise,
 /// and it is asserted.
 fn cache_dir(dir: &Path) -> PathBuf {
+    // The CLI's own canonical form and the CLI's own hasher (`expansion_cache_root`),
+    // so the two cannot disagree: `std::fs::canonicalize` answers the extended-length
+    // `\\?\C:\…` form on Windows where `canonical_path` does not, and Order 37's seal
+    // found the four pins of this file looking under a hash nobody wrote to.
     let root = check_cache_root();
-    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let canonical = vilan_core::util::canonical_path(dir);
     let mut hasher = DefaultHasher::new();
     canonical.hash(&mut hasher);
     root.join(format!("{:016x}", hasher.finish()))
         .join(".cache")
 }
 
-/// `~/.vilan/check-cache`, under the same home rules the toolchain's other
-/// caches use.
+/// `~/.vilan/check-cache` — the toolchain's own answer, under its home rules
+/// (`USERPROFILE` first on Windows), so the test looks where the CLI writes.
 fn check_cache_root() -> PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .map(|home| home.join(".vilan").join("check-cache"))
-        .unwrap_or_else(|| std::env::temp_dir().join("vilan-check-cache"))
+    vilan_embedded_std::default_check_cache_root()
 }
 
 /// The BUILD's table, which stays where N63 put it: `dist/.cache`, inside the
