@@ -46,6 +46,8 @@
 // borrows self` hands back a view, and a write through it is visible through
 // every other handle to the same cell.
 
+import pkg::option::Option::{ self, None, Some };
+
 export *;
 
 external struct Shared<T>;
@@ -86,4 +88,58 @@ impl Shared<type T> {
 	/// answer to "is this the same cell", never a wire value and never a key
 	/// anything persists.
 	external fun identity(self): i32;
+
+	/// A WEAK handle to this cell: one that names the cell without keeping it
+	/// alive. The handle this is taken from is unaffected — `downgrade` adds no
+	/// holder, which is its whole purpose.
+	///
+	/// Reach for it at a BACK EDGE: an edge that must be followed but must not
+	/// decide the lifetime. std has exactly two (`observe`'s captured value
+	/// cell, `Subscription`'s alias of the subscriber list), and both are the
+	/// same shape — a thing reachable FROM the cell holding the cell, which
+	/// under counting is a cycle no count can collect.
+	external fun downgrade(&self): Weak<T>;
+}
+
+/// A weak handle to a `Shared<T>` cell: it names the cell, and it does not keep
+/// it alive. `Shared::downgrade` is where one comes from; `upgrade` and `get`
+/// are the two ways back, and they differ in what they promise about the
+/// cell's lifetime rather than in what they read.
+///
+/// **`upgrade` is for KEEPING the cell alive; `get` is for TOUCHING it.**
+/// `upgrade` hands back a strong handle — a holder, which is what makes the
+/// cell outlive the call. `get` hands back a second-class view, good for its
+/// lexical extent and storable nowhere (`claims-and-epochs.md` §5a), which
+/// takes no holder at all.
+///
+/// **On this backend both answers are always `Some`, and that is the shape
+/// landing ahead of the guarantee.** `Shared`'s JS backing is a plain object
+/// the host collector reclaims: nothing counts, so nothing can say a cell is
+/// gone, and `downgrade` is the identity. The DETERMINISTIC `None` — `Some`
+/// while a strong handle lives, `None` the instant the last one dies, with no
+/// collector in the answer — arrives with the counted representation on the
+/// native backend (C14 S4, `destruction.md` §10; the GC-timing `WeakRef`
+/// spelling was rejected 2026-07-07 for exactly the reason that it cannot
+/// promise this). Write against the `Option`: a program that handles `None`
+/// today is a program that keeps working when the count is real, and a program
+/// that assumes `Some` is one that breaks.
+external struct Weak<T>;
+
+impl Weak<type T> {
+	/// A strong handle to the cell, or `None` if the cell is gone. The `Some`
+	/// case RETAINS: while the returned handle lives, so does the cell.
+	///
+	/// Always `Some` on this backend — see the type's note.
+	external fun upgrade(self): Option<Shared<T>>;
+
+	/// A view of the cell's value, or `None` if the cell is gone — the scoped,
+	/// NON-retaining twin of `upgrade`, and the same verb and shape as
+	/// `Arena::get`. `borrows self`: the view is second-class, so it may be
+	/// read and written through where it stands and stored nowhere.
+	///
+	/// Always `Some` on this backend — see the type's note. Under counting it
+	/// pins the cell for the view's extent, so a last release inside that
+	/// extent defers the cell's drop to the view's block end: deterministic,
+	/// merely later.
+	external fun get(&self): Option<&T> borrows self;
 }

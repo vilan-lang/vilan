@@ -1,8 +1,9 @@
 # Cells reference
 
-The two sharing tools: `std::shared::Shared` (one shared mutable cell) and
-`std::arena::Arena` (stable identities for graphs). When to reach for
-which: [the memory model](../tour/memory-model.md).
+The two sharing tools: `std::shared::Shared` (one shared mutable cell, with
+`Weak<T>` for the edges that must not own it) and `std::arena::Arena` (stable
+identities for graphs). When to reach for which:
+[the memory model](../tour/memory-model.md).
 
 ## `Shared<T>`
 
@@ -16,6 +17,7 @@ impl Shared<type T> {
 	fun clone(self): Shared<T>             // another handle to the SAME cell
 	fun write(self): &mut T borrows self   // a writable view of the contents
 	fun identity(self): i32                // which CELL this is, stamped on first ask
+	fun downgrade(&self): Weak<T>          // a handle that does NOT keep the cell alive
 }
 ```
 
@@ -48,6 +50,56 @@ fun main() {
   stamped on the cell the first time anything asks, so a program that never
   asks pays nothing. Local by construction: never a wire value, never a key to
   persist.
+
+## `Weak<T>`
+
+A handle that **names** a cell without **keeping it alive** — the edge you
+follow but do not own.
+
+```vilan,fragment
+impl Weak<type T> {
+	fun upgrade(self): Option<Shared<T>>       // a strong handle again, or None
+	fun get(&self): Option<&T> borrows self    // a view of the contents, or None
+}
+```
+
+```vilan
+import std::option::Option::{ None, Some };
+import std::shared::{ Shared, Weak };
+
+fun main() {
+	let cell: Shared<i32> = Shared::new(1);
+	let weak: Weak<i32> = cell.downgrade();
+	cell.write() = 42;
+	match weak.get() {
+		Some(let value) => print(i"{*value}"),
+		None => print("gone"),
+	}
+}
+```
+
+- `upgrade()` is for **keeping** the cell alive; `get()` is for **touching**
+  it. The first hands back a holder, so the cell outlives the call; the
+  second hands back a view, good where it stands and storable nowhere, and
+  takes no holder at all.
+- `get()` is the same verb and the same shape as `Arena::get` below, on
+  purpose: every dynamic alias in the language answers `Option<&T>`.
+- `downgrade()` leaves the handle it was taken from alone. It adds no holder,
+  which is the whole point of it.
+
+> **Both answers are `Some` today, and you should still write the `None`
+> arm.** Nothing counts on the JavaScript backend: a cell is an object the
+> host collector reclaims, so there is no moment at which the language can
+> say a cell is gone. The deterministic `None` — `Some` while a strong
+> handle lives, `None` the instant the last one dies — arrives with the
+> counted representation on the native backend. A program that handles
+> `None` today is a program that keeps working then; one that assumes `Some`
+> is one that breaks.
+
+Reach for a weak handle at a **back edge**: an edge that must be followed
+but must not decide a lifetime. The standard library has exactly two, and
+both are the same shape — something reachable *from* a cell holding that
+cell, which under counting is a cycle no count can collect.
 
 ## `Arena<T>` + `Handle<T>`
 

@@ -310,6 +310,7 @@ std/browser.md h2 stdrouter
 std/browser.md h2 stdstorage
 std/cells.md h1 cells-reference
 std/cells.md h2 sharedt
+std/cells.md h2 weakt
 std/cells.md h2 arenat--handlet
 std/cells.md h3 handles-cross-the-wire
 std/collections.md h1 collections-reference

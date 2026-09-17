@@ -7674,6 +7674,33 @@ impl<'src> Transformer<'src> {
             }
             // `shared.clone()` -> the same cell (the receiver, unchanged).
             Intrinsic::SharedClone => args.next().unwrap_or(js::Node::Void),
+            // `shared.downgrade()` -> the same cell, for `clone`'s reason and
+            // one more: nothing counts on this backend, so a weak handle has
+            // nothing to be weaker THAN and the cell object is the whole of it
+            // (C14 S2). What lands is the SHAPE — the type, the `Option` on the
+            // way back, the graph edge that says "follow me, do not keep me
+            // alive" — ahead of the count that makes `None` reachable (C14 S4).
+            Intrinsic::SharedDowngrade => args.next().unwrap_or(js::Node::Void),
+            // `weak.upgrade()` -> `[ 0, cell ]`, the `Some` arm of the Option
+            // array form. Always `Some` here; under counting, `Some` while a
+            // strong handle lives and `None` the instant the last one dies.
+            Intrinsic::WeakUpgrade => js::Node::Array(vec![
+                js::Node::Number("0".to_string(), None),
+                args.next().unwrap_or(js::Node::Void),
+            ]),
+            // `weak.get()` -> `[ 0, cell.v ]`: `Some` of the same slot
+            // `SharedValue` names. The payload is a VIEW (`Option<&T> borrows
+            // self`), so — unlike a `read()` in a storing position — the clone
+            // pass never wraps it, which is what makes this its own intrinsic.
+            // `Arena::get` lowers to the same shape (`[ 0, slot ]`), which is
+            // the point of the two verbs matching.
+            Intrinsic::WeakGet => js::Node::Array(vec![
+                js::Node::Number("0".to_string(), None),
+                js::Node::Property(
+                    Box::new(args.next().unwrap_or(js::Node::Void)),
+                    "v".to_string(),
+                ),
+            ]),
             // `shared.identity()` -> the cell's stamped identity, taken on the
             // first ask (M66). The stamp goes on the cell OBJECT, beside its
             // `v` slot, so every handle to the cell reads the one number and a
