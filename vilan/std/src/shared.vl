@@ -1,8 +1,39 @@
-// `std::shared` — `Shared<T>`, reference-counted shared mutable state for when
-// ownership is genuinely diffuse (several independent subjects holding the *same*
-// mutable value, with no natural arena owner). This is the one place reference
-// identity and shared mutation are explicit in the type, so the cost is legible
-// at the use site — prefer an `Arena` + `Handle` whenever an owner exists.
+// `std::shared` — `Shared<T>`, the shared mutable cell behind a value-copied
+// handle. Rule 1 copies every binding, argument, field initialization and
+// return (spec §6.1), so a struct passed around by value cannot carry mutable
+// state in a plain field; a cell is what the language leaves. This is the one
+// place reference identity and shared mutation are explicit in the type, so
+// the cost is legible at the use site.
+//
+// WHICH TIER — `Shared` or `Arena` + `Handle`. Reach for `Shared` when
+// ownership is genuinely DIFFUSE: several independent holders of the one
+// mutable value, no single place that decides when it dies (a signal's value
+// and its subscriber list, an rpc mirror's lease counts, a module-level
+// registry). Reach for an `Arena` + `Handle` when what you need is a GRAPH or
+// a STABLE IDENTITY: nodes that point at each other, entities a wire message
+// names, storage whose deletion must leave outstanding references answering
+// `None` rather than a ghost. The two are one object at two granularities
+// (`destruction.md` §10: a `Shared` is a one-slot counted arena, `clone` is
+// the retain and `Weak` is the handle) — the tier follows what the code needs
+// to SAY, not which is cheaper.
+//
+// This headnote used to read "prefer an `Arena` + `Handle` whenever an owner
+// exists". The C14 census measured that advice against the estate and found
+// 0 of std's 154 `Shared` sites and 0 of kolt's 13 following it: no owner owns
+// a cell (only four types are `Disposable`), and what every one of those sites
+// wants is interior mutability behind a value-copied handle, which is not a
+// slab (`proposal/signal-cell-representation.md` §2.4 finding 1, D8).
+//
+// NOT for state a closure merely writes. A closure captures the BINDING, not
+// the value (spec §6.9), so a `mut` local that closures in the same frame
+// assign and read needs no cell at all — M71 retired eight std cells that were
+// spelling exactly that the long way.
+//
+// COUNTING. `clone()` is a retain and a handle's death is a release in the
+// design (`destruction.md` §10); today nothing counts, because the JS backend's
+// host collector reclaims the box and a cycle through it is the collector's
+// problem. The real count arrives with the native backend (C14 S4); what lands
+// before it is `Weak<T>` (C1), the edge that makes the graph acyclic.
 //
 // `Shared` is `external` (an opaque cell): unlike an ordinary aggregate it is
 // *not* deep-copied, so `clone()` and ordinary binding share the one underlying
@@ -14,6 +45,8 @@
 // `cell.read().len()`, copies nothing; `write(self): &mut T
 // borrows self` hands back a view, and a write through it is visible through
 // every other handle to the same cell.
+
+import pkg::option::Option::{ self, None, Some };
 
 export *;
 
@@ -55,4 +88,58 @@ impl Shared<type T> {
 	/// answer to "is this the same cell", never a wire value and never a key
 	/// anything persists.
 	external fun identity(self): i32;
+
+	/// A WEAK handle to this cell: one that names the cell without keeping it
+	/// alive. The handle this is taken from is unaffected — `downgrade` adds no
+	/// holder, which is its whole purpose.
+	///
+	/// Reach for it at a BACK EDGE: an edge that must be followed but must not
+	/// decide the lifetime. std has exactly two (`observe`'s captured value
+	/// cell, `Subscription`'s alias of the subscriber list), and both are the
+	/// same shape — a thing reachable FROM the cell holding the cell, which
+	/// under counting is a cycle no count can collect.
+	external fun downgrade(&self): Weak<T>;
+}
+
+/// A weak handle to a `Shared<T>` cell: it names the cell, and it does not keep
+/// it alive. `Shared::downgrade` is where one comes from; `upgrade` and `get`
+/// are the two ways back, and they differ in what they promise about the
+/// cell's lifetime rather than in what they read.
+///
+/// **`upgrade` is for KEEPING the cell alive; `get` is for TOUCHING it.**
+/// `upgrade` hands back a strong handle — a holder, which is what makes the
+/// cell outlive the call. `get` hands back a second-class view, good for its
+/// lexical extent and storable nowhere (`claims-and-epochs.md` §5a), which
+/// takes no holder at all.
+///
+/// **On this backend both answers are always `Some`, and that is the shape
+/// landing ahead of the guarantee.** `Shared`'s JS backing is a plain object
+/// the host collector reclaims: nothing counts, so nothing can say a cell is
+/// gone, and `downgrade` is the identity. The DETERMINISTIC `None` — `Some`
+/// while a strong handle lives, `None` the instant the last one dies, with no
+/// collector in the answer — arrives with the counted representation on the
+/// native backend (C14 S4, `destruction.md` §10; the GC-timing `WeakRef`
+/// spelling was rejected 2026-07-07 for exactly the reason that it cannot
+/// promise this). Write against the `Option`: a program that handles `None`
+/// today is a program that keeps working when the count is real, and a program
+/// that assumes `Some` is one that breaks.
+external struct Weak<T>;
+
+impl Weak<type T> {
+	/// A strong handle to the cell, or `None` if the cell is gone. The `Some`
+	/// case RETAINS: while the returned handle lives, so does the cell.
+	///
+	/// Always `Some` on this backend — see the type's note.
+	external fun upgrade(self): Option<Shared<T>>;
+
+	/// A view of the cell's value, or `None` if the cell is gone — the scoped,
+	/// NON-retaining twin of `upgrade`, and the same verb and shape as
+	/// `Arena::get`. `borrows self`: the view is second-class, so it may be
+	/// read and written through where it stands and stored nowhere.
+	///
+	/// Always `Some` on this backend — see the type's note. Under counting it
+	/// pins the cell for the view's extent, so a last release inside that
+	/// extent defers the cell's drop to the view's block end: deterministic,
+	/// merely later.
+	external fun get(&self): Option<&T> borrows self;
 }

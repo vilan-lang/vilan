@@ -787,14 +787,14 @@ fun gate_upgrade(
 			// the life of the socket, and `accept_socket` re-arms the same
 			// timer for the greeting bound, so an authorized connection must
 			// not be destroyed later by the listener this arm left behind.
-			let settled: Shared<bool> = Shared::new(false);
-			let expired: Shared<bool> = Shared::new(false);
+			mut settled = false;
+			mut expired = false;
 			if service.authorize_timeout > 0 {
 				socket.set_timeout(service.authorize_timeout);
 				socket.on_signal("timeout", || {
-					if !settled.read() {
-						settled.write() = true;
-						expired.write() = true;
+					if !settled {
+						settled = true;
+						expired = true;
 						// Answered HERE and not by the caller: the point of
 						// the bound is to release the socket now, and the
 						// caller does not run again until the hook returns —
@@ -812,12 +812,12 @@ fun gate_upgrade(
 			if service.authorize_timeout > 0 {
 				socket.set_timeout(0);
 			}
-			if expired.read() {
+			if expired {
 				// The socket is already gone; the hook's answer, whenever it
 				// came, is discarded rather than written to it.
 				ret Err(Reject::TooMany);
 			}
-			settled.write() = true;
+			settled = true;
 			outcome
 		},
 	}
@@ -1149,10 +1149,10 @@ fun accept_socket(
 		}
 	});
 	connections.write().push((id, wire_end));
-	let closed: Shared<bool> = Shared::new(false);
+	mut closed = false;
 	let teardown = || {
-		if !closed.read() {
-			closed.write() = true;
+		if !closed {
+			closed = true;
 			service.live.write() = service.live.read() - 1;
 			drop_connection(id);
 			drop_client_channel(id);
@@ -1162,19 +1162,19 @@ fun accept_socket(
 	// The greeting bound (A40): armed here, disarmed by the first inbound
 	// byte, so a socket that upgrades and then says nothing costs one timer
 	// rather than a connection slot for the life of the process.
-	let greeted: Shared<bool> = Shared::new(false);
+	mut greeted = false;
 	if service.handshake_timeout > 0 {
 		socket.set_timeout(service.handshake_timeout);
 		socket.on_signal("timeout", || {
-			if !greeted.read() {
+			if !greeted {
 				socket.destroy();
 			}
 		});
 	}
 	let parser = WsParser::new();
 	let receive = |chunk: Bytes| {
-		if !greeted.read() {
-			greeted.write() = true;
+		if !greeted {
+			greeted = true;
 			if service.handshake_timeout > 0 {
 				socket.set_timeout(0);
 			}

@@ -10011,6 +10011,14 @@ impl<'src> Analyzer<'src> {
                 // A bare `Signal`/`Shared` COMPONENT is not transferable-as-value —
                 // only a top-level `SignalCell<T>`/`Shared<T>` binding transfers, via
                 // its payload form (handled in `hmr_transfer_form`).
+                //
+                // `Weak<T>` (C1) needs no arm of its own and deliberately gets
+                // none: it is a bodyless `external struct`, which the
+                // empty-fields rule below already excludes, and exclusion is the
+                // right answer — a weak handle has no payload form, and
+                // transferring one would carry the OLD module's cell object
+                // across, which is the one thing a handle that does not decide a
+                // lifetime must not do. Pinned in `inference/weak.rs`.
                 if Some(id) == signal_id || Some(id) == shared_id {
                     return (false, true);
                 }
@@ -10514,7 +10522,15 @@ impl<'src> Analyzer<'src> {
     /// member descent is what keeps that one mistake to one diagnostic.
     fn resource_rejecting_containers(&self) -> Vec<(Id, &'static str)> {
         let mut containers: Vec<(Id, &'static str)> = Vec::new();
-        for name in ["List", "Map", "Set", "NativeMap", "Shared", "Context"] {
+        for name in [
+            "List",
+            "Map",
+            "Set",
+            "NativeMap",
+            "Shared",
+            "Weak",
+            "Context",
+        ] {
             if let Some(id) = self.primitive_struct_ids.get(name).copied() {
                 containers.push((id, name));
             }
@@ -23084,6 +23100,56 @@ impl<'src> Analyzer<'src> {
             .collect()
     }
 
+    /// C1: the declaration ids of `Weak::get` — the one EXTERN in the language
+    /// whose declared return is a wrapped view (`Option<&T> borrows self`).
+    ///
+    /// `function_returns_wrapped_view` reads a body's tail leaves, which is the
+    /// only place the `&` of an `Option<&T>` is visible: a view is a property of
+    /// an EXPRESSION, not of a `Type` (there is no view variant in `Type`), so a
+    /// bodiless declaration cannot say it in its signature. Found the way
+    /// [`Self::shared_members`] finds `Shared`'s four — by the primitive's
+    /// identity, so a user's own `Weak`-named type is untouched.
+    fn weak_get_declarations(&self) -> HashSet<Id> {
+        let mut ids: HashSet<Id> = HashSet::default();
+        let Some(weak_struct_id) = self.primitive_struct_ids.get("Weak").copied() else {
+            return ids;
+        };
+        for implementation in &self.implementations {
+            let subject_is_weak = matches!(
+                self.type_id_to_type_map.get(&implementation.subject),
+                Some(Type::Struct(id, _)) if *id == weak_struct_id
+            );
+            if subject_is_weak && let Some(id) = implementation.declarations.get("get").copied() {
+                ids.insert(id);
+            }
+        }
+        ids
+    }
+
+    /// The wrapped-view shape of a call to one of the externs above.
+    ///
+    /// `(mutable = false, scalar = false)`: the view is READONLY (`Option<&T>`,
+    /// never `&mut`), and it is not a `(base, key)` pair — the lowering is
+    /// `[ 0, cell.v ]`, the slot's own value for a scalar `T` and the cell's
+    /// aggregate reference otherwise, which is exactly what `Arena::get` emits
+    /// for the same signature. What the shape buys is the CAPTURE: `Some(let v)`
+    /// over it binds a view, so `*v` is the only way to read a value out of it
+    /// and handing `v` anywhere that wants one is refused.
+    fn extern_wrapped_view_shape(
+        &self,
+        call_id: Id,
+        weak_get_ids: &HashSet<Id>,
+    ) -> Option<(bool, bool)> {
+        if weak_get_ids.is_empty() {
+            return None;
+        }
+        let function_call = self.function_calls.get(&call_id)?;
+        match self.expr_id_to_expr_map.get(&function_call.subject_id)? {
+            Expr::Local(function_id) if weak_get_ids.contains(function_id) => Some((false, false)),
+            _ => None,
+        }
+    }
+
     /// If a call resolves to a function returning a wrapped view, that view's
     /// `(mutable, scalar)` (see `function_returns_wrapped_view`).
     fn call_returns_wrapped_view(&self, call_id: Id) -> Option<(bool, bool)> {
@@ -23099,6 +23165,7 @@ impl<'src> Analyzer<'src> {
     /// aggregate's reference), so it is a view binding. Maps each such capture to
     /// the view's `(mutable, scalar)`.
     fn compute_wrapped_view_captures(&self) -> HashMap<Id, (bool, bool)> {
+        let weak_get_ids = self.weak_get_declarations();
         let mut captures = HashMap::default();
         for expr in self.expr_id_to_expr_map.values() {
             let Expr::Match(subject_id, legs) = expr else {
@@ -23108,7 +23175,9 @@ impl<'src> Analyzer<'src> {
             // inline transient in the subject (`match Some(&mut a)`, incl. the
             // conditional form) — both bind the capture to the view.
             let call_return_shape = match self.expr_id_to_expr_map.get(subject_id) {
-                Some(Expr::Call(call_id)) => self.call_returns_wrapped_view(*call_id),
+                Some(Expr::Call(call_id)) => self
+                    .call_returns_wrapped_view(*call_id)
+                    .or_else(|| self.extern_wrapped_view_shape(*call_id, &weak_get_ids)),
                 _ => None,
             };
             let Some(shape) =
@@ -25953,14 +26022,28 @@ impl<'src> Analyzer<'src> {
     /// write mutates in place (the classification), and where the reads are.
     ///
     /// **Why unions rather than a root comparison.** `place_root` answers
-    /// "which binding is this path rooted at", which is not cell identity:
-    /// `Subscription`'s `subscribers` field is initialized from `SignalCell`'s,
-    /// so a write through one reaches a read through the other, and `let g =
-    /// h.clone()` hands the same cell to a second name outright. Every way a
-    /// handle can move between slots is one of four forms — a binding's
-    /// initializer, a construction slot, an assignment, and `clone()` — so
-    /// unioning at those four and dropping everything ELSE into `Unknown`
-    /// covers the relation without an alias analysis.
+    /// "which binding is this path rooted at", which is not cell identity: a
+    /// local minted by `Shared::new` and then stored in a struct field is one
+    /// cell under two names, and `let g = h.clone()` hands the same cell to a
+    /// second name outright, so a write through either reaches a read through
+    /// the other. Every way a handle can move between slots is one of four
+    /// forms — a binding's initializer, a construction slot, an assignment,
+    /// and `clone()` — so unioning at those four and dropping everything ELSE
+    /// into `Unknown` covers the relation without an alias analysis.
+    ///
+    /// **Under a counted `Shared` this walk stays, and becomes easier to
+    /// justify** (C14 §11 Q7). It approximates cell identity statically
+    /// because today there is no runtime answer to approximate: nothing
+    /// counts, so nothing in a running program knows which handles name one
+    /// cell, and the approximation is load-bearing for CORRECTNESS — every
+    /// hole in the `Unknown` sink is a copy that should have been taken and
+    /// was not, which is a miscompile (the match-capture hole in pass 2 below
+    /// was exactly that, measured). Counting (C14 S4) produces the runtime
+    /// answer, and this walk becomes what it always wanted to be: an ELISION
+    /// heuristic over a fact the runtime also holds, where a wrong
+    /// approximation costs a copy nobody needed rather than one somebody did.
+    /// A strictly better failure mode, reached by adding a count rather than
+    /// by making the walk cleverer.
     fn compute_shared_cells(&self) -> SharedCells {
         let Some([new_ids, read_ids, write_ids, clone_ids]) = self.shared_members() else {
             return SharedCells::default();
@@ -26027,6 +26110,31 @@ impl<'src> Analyzer<'src> {
                 && self.type_is_shared_handle(parameter.type_id, shared_struct_id)
             {
                 cells.union(CellSlot::Binding(*parameter_id), CellSlot::Unknown);
+            }
+        }
+        // A handle BINDING with no initializer got its cell from somewhere this
+        // walk cannot follow, for the same reason a parameter did — so it joins
+        // `Unknown` the same way. The shape that reaches this is a MATCH
+        // CAPTURE, and `Weak::upgrade` (C1) is the first API in the language
+        // that produces one: `match weak.upgrade() { Some(let strong) => .. }`
+        // binds a handle to the cell through a pattern, and a capture has no
+        // `initial` for pass 2 to chase.
+        //
+        // Without it the capture is a SINGLETON component nothing ever mutates,
+        // so B267's elision hands out the cell's own storage — measured, before
+        // this line: `let copy = strong.read()` followed by
+        // `cell.write().push(9)` through the original handle printed a length
+        // of 2 where the same program written without the upgrade printed 1.
+        // The original handle is tainted by pass 3 (it was the receiver of a
+        // `downgrade`, which is not one of the four benign calls), so joining
+        // the capture to `Unknown` too is what puts the two ends of one cell in
+        // one component again.
+        for variable in self.variables.values() {
+            if variable.initial.is_none()
+                && let Some(shared_struct_id) = self.primitive_struct_ids.get("Shared").copied()
+                && self.type_is_shared_handle(variable.type_id, shared_struct_id)
+            {
+                cells.union(CellSlot::Binding(variable.id), CellSlot::Unknown);
             }
         }
         for expr in self.expr_id_to_expr_map.values() {
@@ -49060,6 +49168,22 @@ pub enum Intrinsic {
     // A92's eager `SignalCell.id` field made every program in every corpus
     // golden mint an id per cell for a dedup almost none of them use.
     SharedIdentity,
+    // `Shared.downgrade(): Weak<T>` -> the same cell (identity): just the
+    // receiver, exactly like `SharedClone`. On JS a weak handle IS the cell —
+    // nothing counts, so there is nothing for a weak handle to be weaker THAN,
+    // and the surface lands ahead of the guarantee (C14 S2; the deterministic
+    // `None` arrives with the counted representation, C14 S4).
+    SharedDowngrade,
+    // `Weak.upgrade(): Option<Shared<T>>` -> `[ 0, cell ]`, the `Some` arm of
+    // the Option array form. Always `Some` here, for `SharedDowngrade`'s
+    // reason; under counting it is `Some` while a strong handle lives.
+    WeakUpgrade,
+    // `Weak.get(): Option<&T> borrows self` -> `[ 0, cell.v ]`: the same slot
+    // `SharedValue` names, in the Option's `Some` arm. The payload is a VIEW,
+    // so it is never `__clone`d — that is the whole difference between this and
+    // a `read()` in a storing position, and it is why this is its own intrinsic
+    // rather than a spelling of `SharedValue`.
+    WeakGet,
     // `Set::new(): Set<T>` -> `new Set()`.
     SetNew,
     // `Set.insert(value)` -> native `.add(value)`.
@@ -57496,6 +57620,16 @@ fn analyze_inner<'src>(
             .insert("Shared", shared_struct_id);
     }
 
+    // `Weak<T>` (C1), the cell's other handle, out of the same module and
+    // keyed the same way: a weak handle names the cell without holding it.
+    let weak_struct_id = module_scopes
+        .get("shared")
+        .and_then(|scope_id| analyzer.scopes.get(scope_id))
+        .and_then(|scope| scope.name_to_id_map.get("Weak").copied());
+    if let Some(weak_struct_id) = weak_struct_id {
+        analyzer.primitive_struct_ids.insert("Weak", weak_struct_id);
+    }
+
     // The `std::reactive` `SignalCell` struct, if `reactive.vl` loaded — captured
     // the same way as `Shared`, for the HMR transfer classification (`hmr.md` §4):
     // a `SignalCell<T>` binding carries its payload across a hot swap. The rule is
@@ -58477,6 +58611,29 @@ fn analyze_over_world<'src>(
                     ("read", Intrinsic::SharedValue),
                     ("write", Intrinsic::SharedWrite),
                     ("identity", Intrinsic::SharedIdentity),
+                    ("downgrade", Intrinsic::SharedDowngrade),
+                ] {
+                    if let Some(id) =
+                        external_intrinsic_declaration(&analyzer, implementation, name)
+                    {
+                        intrinsics.insert(id, intrinsic);
+                    }
+                }
+            }
+        }
+    }
+    // `Weak`'s two ways back to the cell, keyed on the primitive's identity the
+    // way `Shared`'s five are (C1 / C14 S2).
+    if let Some(weak_struct_id) = analyzer.primitive_struct_ids.get("Weak").copied() {
+        for implementation in &analyzer.implementations {
+            let subject_is_weak = matches!(
+                analyzer.type_id_to_type_map.get(&implementation.subject),
+                Some(Type::Struct(id, _)) if *id == weak_struct_id
+            );
+            if subject_is_weak {
+                for (name, intrinsic) in [
+                    ("upgrade", Intrinsic::WeakUpgrade),
+                    ("get", Intrinsic::WeakGet),
                 ] {
                     if let Some(id) =
                         external_intrinsic_declaration(&analyzer, implementation, name)

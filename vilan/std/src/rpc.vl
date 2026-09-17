@@ -257,7 +257,7 @@ export fun connect_split(base_url: str): SplitDuplex {
 	let decoder = new_text_decoder();
 	let inbound: Shared<Option<|Frame| void>> = Shared::new(None);
 	let early: Shared<List<Frame>> = Shared::new([]);
-	let connection: Shared<str> = Shared::new("");
+	mut connection = "";
 	// Route one inbound frame (SSE delivers text, so it arrives as `Frame::Text`):
 	// the handler if one is set, else the early queue (flushed to the first
 	// handler by `on_frame`).
@@ -268,7 +268,7 @@ export fun connect_split(base_url: str): SplitDuplex {
 		}
 	};
 	mut buffer = "";
-	for connection.read() == "" {
+	for connection == "" {
 		let chunk = reader.read_chunk();
 		if chunk.finished() {
 			jump break;
@@ -276,7 +276,7 @@ export fun connect_split(base_url: str): SplitDuplex {
 		buffer += decoder.decode(chunk.payload());
 		buffer = drain_sse(buffer, |frame| {
 			if frame.starts_with("__conn:") {
-				connection.write() = frame.substring(7, frame.len());
+				connection = frame.substring(7, frame.len());
 			} else {
 				dispatch(frame);
 			}
@@ -299,8 +299,8 @@ export fun connect_split(base_url: str): SplitDuplex {
 		}
 	};
 	SplitDuplex {
-		connection = parse_announced(connection.read()),
-		send_url = i"{base_url}/send?c={connection.read()}",
+		connection = parse_announced(connection),
+		send_url = i"{base_url}/send?c={connection}",
 		inbound,
 		early,
 	}
@@ -825,8 +825,8 @@ export fun dial(
 ): Result<(WebSocket, i32), DialFailure> {
 	let socket = new_web_socket(url, protocols);
 	socket.set_binary_type("arraybuffer");
-	let connection: Shared<str> = Shared::new("");
-	let refused: Shared<str> = Shared::new("");
+	mut connection = "";
+	mut refused = "";
 	let opened = await dial_promise(|finish: |bool| void| {
 		socket.set_on_close(|| finish(false));
 		socket.set_on_error(|| finish(false));
@@ -836,13 +836,13 @@ export fun dial(
 				ret;
 			}
 			let frame = message.data();
-			if connection.read() == "" && frame.starts_with("__conn:") {
-				connection.write() = frame.substring(7, frame.len());
+			if connection == "" && frame.starts_with("__conn:") {
+				connection = frame.substring(7, frame.len());
 				finish(true);
-			} else if connection.read() == "" && frame.starts_with(reject_announcement_prefix()) {
+			} else if connection == "" && frame.starts_with(reject_announcement_prefix()) {
 				// The server has answered the handshake and is closing. Record
 				// the status BEFORE finishing, so the arm below reads it.
-				refused.write() = frame.substring(reject_announcement_prefix().len(), frame.len());
+				refused = frame.substring(reject_announcement_prefix().len(), frame.len());
 				socket.close();
 				finish(false);
 			} else {
@@ -851,9 +851,9 @@ export fun dial(
 		});
 	});
 	if opened {
-		Ok((socket, parse_announced(connection.read())))
-	} else if refused.read() != "" {
-		Err(DialFailure::Refused(refused.read()))
+		Ok((socket, parse_announced(connection)))
+	} else if refused != "" {
+		Err(DialFailure::Refused(refused))
 	} else {
 		Err(DialFailure::Unreachable(i"could not reach {url}"))
 	}
@@ -4454,7 +4454,7 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	/// arm's semantics). The whole patch lands as one write to the cache, so a
 	/// multi-op change is one notification rather than one per op.
 	fun apply(self, ops: List<Delta<K, T>>) {
-		let fault: Shared<Option<str>> = Shared::new(None);
+		mut fault: Option<str> = None;
 		// `update` + `take`/`replace`, not `get`/`set` (A54). A `SignalCell`'s
 		// `get` COPIES its value and its `set` copies it back, so this used to
 		// deep-copy the whole mirror twice per patch — O(N) on the RECEIVING
@@ -4500,7 +4500,7 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 					Delta::Update(let key, let value) => {
 						match self.index_of(list, key) {
 							Some(let at) => list[at] = value,
-							None => fault.write() = first_fault(fault.read(), "an Update named a key the mirror does not hold"),
+							None => fault = first_fault(fault, "an Update named a key the mirror does not hold"),
 						}
 					},
 					Delta::Remove(let key) => {
@@ -4511,14 +4511,14 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 								// Everything after the hole moved one place left.
 								self.reindex(list, at);
 							},
-							None => fault.write() = first_fault(fault.read(), "a Remove named a key the mirror does not hold"),
+							None => fault = first_fault(fault, "a Remove named a key the mirror does not hold"),
 						}
 					},
 				}
 			}
 			let _replaced = held.replace(list);
 		});
-		match fault.read() {
+		match fault {
 			None => {},
 			Some(let reason) => match self.fault.get() {
 				None => self.fault.set(Some(reason)),

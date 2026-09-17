@@ -86,7 +86,7 @@ function drain(turn) {
 		draining_turns.v.push(__clone(turn));
 		__with_finally(() => {
 			let budget = 100000;
-			while (!($m(turn[0].v)) && budget > 0) {
+			while (!($o(turn[0].v)) && budget > 0) {
 				const wave = turn[0].v;
 				turn[0].v = [  ];
 				turn[1].v = new Map();
@@ -103,16 +103,16 @@ function drain(turn) {
 		});
 	}
 }
-function flush($r) {
-	const $s = $r;
-	let $t = null;
-	if ($s[0] === 0) {
-		const turn = $s[1];
-		$t = drain(turn);
+function flush($t) {
+	const $u = $t;
+	let $v = null;
+	if ($u[0] === 0) {
+		const turn = $u[1];
+		$v = drain(turn);
 	} else {
-		$t = undefined;
+		$v = undefined;
 	}
-	return $t;
+	return $v;
 }
 async function tick() {
 
@@ -128,72 +128,79 @@ function $d(signal, observer) {
 	const id = fresh_id();
 	const cell = signal[0];
 	signal[1].v.push([ id, () => {
-		observer(cell.v);
-		return;
+		const $e = [ 0, cell ];
+		let $f = null;
+		if ($e[0] === 0) {
+			const live = $e[1];
+			$f = observer(live.v);
+		} else {
+			$f = undefined;
+		}
+		return $f;
 	} ]);
 	return [ signal[1], id, __shared_new([ 1 ]) ];
 }
-function $e(self) {
+function $g(self) {
 	return __clone(self[0].v);
 }
 function $c(self, observer) {
 	const subscription = $d(self, observer);
-	observer($e(self));
+	observer($g(self));
 	return subscription;
 }
-function $m(self) {
+function $o(self) {
 	return self.length === 0;
 }
-function $n(self) {
+function $p(self) {
 	return __list_get(self, self.length - 1);
 }
-function $i(self, $j) {
-	const $k = $j;
-	let $l = null;
-	if ($k[0] === 0) {
-		const turn = $k[1];
-		$l = enqueue(turn, self[1].v);
+function $k(self, $l) {
+	const $m = $l;
+	let $n = null;
+	if ($m[0] === 0) {
+		const turn = $m[1];
+		$n = enqueue(turn, self[1].v);
 	} else {
-		const $o = $n(draining_turns.v);
-		let $p = null;
-		if ($o[0] === 0) {
-			const draining = $o[1];
-			$p = enqueue(draining, self[1].v);
+		const $q = $p(draining_turns.v);
+		let $r = null;
+		if ($q[0] === 0) {
+			const draining = $q[1];
+			$r = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
 				subscriber[1]();
 			}
-			$p = undefined;
+			$r = undefined;
 		}
-		$l = $p;
+		$n = $r;
 	}
-	return $l;
+	return $n;
 }
-function $g(self, value, $h) {
+function $i(self, value, $j) {
 	self[0].v = __clone(value);
-	$i(self, $h);
+	$k(self, $j);
 }
-function $w(policy, body) {
+function $y(policy, body) {
 	const fresh = new2();
 	const result = body(fresh);
 	drain(fresh);
 	fresh[3].v = true;
 	return result;
 }
-function $y(body, $z) {
-	const $A = $z;
-	let $B = null;
-	if ($A[0] === 0) {
-		const current = $A[1];
-		$B = body(current);
+function $A(body, $B) {
+	const $C = $B;
+	let $D = null;
+	if ($C[0] === 0) {
+		const current = $C[1];
+		$D = body(current);
 	} else {
 		const fresh = new2();
 		const result = body(fresh);
 		drain(fresh);
 		fresh[3].v = true;
-		$B = result;
+		$D = result;
 	}
-	return $B;
+	return $D;
 }
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
@@ -207,44 +214,44 @@ $c(b, (value) => {
 });
 const turn_a = new2();
 const turn_b = new2();
-(($f) => {
-	$g(a, 1, [ 0, $f ]);
+(($h) => {
+	$i(a, 1, [ 0, $h ]);
 	return;
 })(turn_a);
-(($q) => {
-	$g(b, 1, [ 0, $q ]);
-	flush([ 0, $q ]);
+(($s) => {
+	$i(b, 1, [ 0, $s ]);
+	flush([ 0, $s ]);
 	return;
 })(turn_b);
 console.log("mid");
-(($u) => {
-	return flush([ 0, $u ]);
+(($w) => {
+	return flush([ 0, $w ]);
 })(turn_a);
-$w([ 0 ], ($v) => {
-	$g(a, 2, [ 0, $v ]);
-	$g(b, 2, [ 0, $v ]);
+$y([ 0 ], ($x) => {
+	$i(a, 2, [ 0, $x ]);
+	$i(b, 2, [ 0, $x ]);
 	console.log("inside");
 	return;
 });
-$y(($x) => {
-	$g(a, 3, [ 0, $x ]);
+$A(($z) => {
+	$i(a, 3, [ 0, $z ]);
 	console.log("batched");
 	return;
 }, [ 1 ]);
-$w([ 0 ], ($C) => {
-	$y(($D) => {
-		$g(a, 4, [ 0, $D ]);
+$y([ 0 ], ($E) => {
+	$A(($F) => {
+		$i(a, 4, [ 0, $F ]);
 		return;
-	}, [ 0, $C ]);
+	}, [ 0, $E ]);
 	console.log("joined");
 	return;
 });
 const turn_c = new2();
-(($E) => {
+(($G) => {
 	__task(async () => {
 		await (await (tick()));
-		$g(a, 5, [ 0, $E ]);
-		flush([ 0, $E ]);
+		$i(a, 5, [ 0, $G ]);
+		flush([ 0, $G ]);
 		return;
 	}, "main");
 	return;
