@@ -5924,10 +5924,11 @@ impl Document {
             {
                 // B318 §4's "Export `S`". The warning is spanned at the
                 // EXPORTED ITEM's own name — one warning per declaration,
-                // whichever signature position found the exposure — so the
-                // type it names is recovered from the message and resolved
-                // against this file's recorded type references.
-                if let Some(definition) = self.exposed_type_definition(program, &warning.msg)
+                // whichever signature position found the exposure — and the
+                // analyzer recorded the private type it is about beside it
+                // (E188), so the fix resolves a definition rather than a
+                // spelling.
+                if let Some(definition) = self.exposed_type_definition(program, warning.span)
                     && let Some(fix) = self.export_declaration_fix(program, definition)
                 {
                     fixes.push(fix);
@@ -6064,41 +6065,24 @@ impl Document {
             .or_else(|| std::fs::read_to_string(path).ok())
     }
 
-    /// The private TYPE a §4 exposure warning names — `S` in "`S` is used in
-    /// the signature …" — resolved to its definition.
+    /// The private TYPE a §4 exposure warning is about — `S` in "`S` is used in
+    /// the signature …" — read off the analyzer's own record (E188).
     ///
-    /// The warning is spanned at the exported ITEM's declaration name and
-    /// carries the type only as text, so the name is read off the front of the
-    /// message and matched against this file's recorded type references: a
-    /// signature that names `S` records `S` at its own span, whatever the
-    /// position was. If the file's references for that name disagree about
-    /// which definition it is — two `S`es in one file, which nothing in the
-    /// estate writes — the fix is declined rather than guessed at.
-    fn exposed_type_definition(&self, program: &Program, message: &str) -> Option<Id> {
-        let exposed = message.strip_prefix('`')?.split('`').next()?;
-        let mut found: Option<Id> = None;
-        for (source, span, definition, _) in &program.type_references {
-            if *source != SourceId(0) {
-                continue;
-            }
-            let Some(definition) = *definition else {
-                continue;
-            };
-            if crate::references::name_of(program, Definition::Entity(definition)) != Some(exposed)
-            {
-                continue;
-            }
-            // An import path's own segments resolve to the same definitions its
-            // leaves bind; a signature's reference is the one this is about,
-            // but either answers the same definition, so only DISAGREEMENT
-            // matters.
-            if found.is_some_and(|seen| seen != definition) {
-                return None;
-            }
-            found = Some(definition);
-            let _ = span;
-        }
-        found
+    /// E177 read the name out of the message and matched it against this file's
+    /// recorded type references, which is exact only while one spelling means
+    /// one type: a file naming two different `S`es — a local struct and an
+    /// imported one — made the references disagree and the fix DECLINED rather
+    /// than guess, on the very shape B318 §4 exists to catch. The walk that
+    /// wrote the sentence had the entity, so it records it beside the warning
+    /// and this is a lookup. The key is `(this file, the warning's span)`: the
+    /// warning is spanned at the exported item's own declaration name and there
+    /// is exactly one per declaration, so no two share it.
+    fn exposed_type_definition(&self, program: &Program, span: Span) -> Option<Id> {
+        program
+            .exposed_private_types
+            .iter()
+            .find(|(source, recorded, _)| *source == SourceId(0) && *recorded == span)
+            .map(|(_, _, definition)| *definition)
     }
 
     /// A99's quick fix: `parent.bind_each(a, b, c)` names one of the six `View`
@@ -8825,6 +8809,79 @@ pub(crate) mod tests {
         );
         let mut applied = text.clone();
         applied.replace_range(export.span.into_range(), &export.replacement);
+        assert!(applied.starts_with("export struct Secret {"), "{applied:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // E188: the fix reads the analyzer's own record of WHICH TYPE the warning
+    // is about, so it answers where reading the name back out of the message
+    // could not.
+    //
+    // E177 recovered `S` from the sentence and resolved it against THIS file's
+    // recorded type references — exact whenever the file names the type, and
+    // silent whenever it does not. §4's warning does not require that: an
+    // exported module-level `let` whose value comes from a sibling is warned
+    // about HERE, naming a private type declared THERE, and `main.vl` below
+    // never writes `Secret` at all. So the file's references held nothing to
+    // match and the fix was not offered — on a warning whose whole content is a
+    // declaration the package can edit. The walk that wrote the sentence had
+    // the entity in hand; it records `(file, warning span, entity)` beside it
+    // now, and the fix is a lookup that cannot miss and cannot guess.
+    #[test]
+    fn quickfix_exports_an_exposed_type_this_file_never_names() {
+        const MODULE: &str =
+            "struct Secret {\n\tn: i32,\n}\n\nexport fun make(): Secret {\n\tSecret { n = 1 }\n}\n";
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::other::make;\n\nexport let handle = make();\n",
+            ),
+            ("other.vl", MODULE),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text().to_string();
+        // The premise, stated rather than assumed: `main.vl` records no type
+        // reference named `Secret`, which is exactly what E177's resolution
+        // had to find and could not.
+        let named_here = program
+            .type_references
+            .iter()
+            .any(|(source, _, definition, _)| {
+                *source == SourceId(0)
+                    && definition.is_some_and(|definition| {
+                        crate::references::name_of(program, Definition::Entity(definition))
+                            == Some("Secret")
+                    })
+            });
+        assert!(
+            !named_here,
+            "the fixture must not name `Secret` here, or the pin is vacuous"
+        );
+        let whole = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        let export = fixes
+            .iter()
+            .find(|fix| fix.title == "Export `Secret`")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no export fix: {:?}",
+                    fixes.iter().map(|fix| &fix.title).collect::<Vec<_>>()
+                )
+            });
+        let target = export
+            .target
+            .as_ref()
+            .expect("the declaration lives in the sibling");
+        assert!(target.path.ends_with("other.vl"), "{:?}", target.path);
+        assert_eq!(export.replacement, "export ");
+        assert_eq!(target.range.start, target.range.end, "an insertion");
+        assert_eq!(target.range.start.line, 0);
+        assert_eq!(target.range.start.character, 0);
+        let mut applied = MODULE.to_string();
+        applied.insert_str(0, "export ");
         assert!(applied.starts_with("export struct Secret {"), "{applied:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
