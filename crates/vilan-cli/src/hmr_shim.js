@@ -4,7 +4,7 @@
 // name are template-substituted at write time. It installs a
 // `window.__VILAN_HMR__` singleton (a re-evaluated
 // bundle reuses it), defines the instrumentation globals the compiled bundle
-// calls (`__hmr_adopt*`/`__hmr_expose`, hmr.md §5) plus the `std::dev` host
+// calls (`__hmr_adopt*`/`__hmr_expose`/`__hmr_lazy_value`, hmr.md §5) plus the `std::dev` host
 // globals (`__hmr_register_teardown`/`__hmr_stash`/`__hmr_take`), and reacts to
 // the dev channel: live-reload, CSS hot-swap, an error overlay, and the
 // state-preserving `swap` (hmr.md §3/§4).
@@ -106,6 +106,36 @@
             }
         }
         return cell;
+    };
+    // A `lazy let` (A102, lazy.md §2): the cell is always the NEW bundle's — its
+    // thunk closes over the new bundle's functions — so what a swap carries is
+    // the VALUE, and only from a cell that reached `done` (state 2). The seed
+    // hit writes it straight in and drops the thunk, so the binding reads as
+    // already forced and the new initializer never runs; a miss (nothing was
+    // forced before the swap, or the initializer had panicked) leaves the fresh
+    // cell pending, which is v1's answer for every lazy binding.
+    globalThis.__hmr_adopt_lazy = function (key, fp, cell) {
+        var entry = seed[key];
+        if (entry) {
+            if (entry.fp === fp) {
+                cell.state = 2;
+                cell.value = entry.value;
+                cell.thunk = null;
+            } else {
+                note(key);
+            }
+        }
+        return cell;
+    };
+    // The exposing side of the same rule. It does NOT force: exposing a lazy
+    // binding must not run an initializer the program chose not to run. A cell
+    // that is not `done` throws, and the capture skips a throwing getter — which
+    // is exactly "this key carries nothing, re-init it".
+    globalThis.__hmr_lazy_value = function (cell) {
+        if (cell.state !== 2) {
+            throw "vilan: lazy binding not forced";
+        }
+        return cell.value;
     };
     globalThis.__hmr_expose = function (key, fp, getter) {
         exposed[key] = { fp: fp, getter: getter };

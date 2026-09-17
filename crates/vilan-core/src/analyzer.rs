@@ -9856,15 +9856,25 @@ impl<'src> Analyzer<'src> {
                 Some(variable) => (variable.type_id, variable.name.to_string()),
                 None => continue,
             };
-            // lazy.md §2: a `lazy let` is not transferable. What HMR carries
-            // across a swap is a VALUE, and a lazy binding may not have one yet
-            // — adopting a cell would hand the new bundle the old bundle's
-            // thunk, closed over the old bundle's functions. Fresh init on each
-            // swap is the honest answer, and it is the one every excluded form
-            // already takes. (A lazy binding whose state must survive a swap is
-            // a candidate item, not a v1 shape.)
+            // lazy.md §2 / A102 (R13): a `lazy let` carries its VALUE, and only
+            // when it has one. The thunk never crosses — it is closed over the
+            // old bundle's functions — so what a swap can carry is the forced
+            // value and nothing else: a cell at `done` hands it over and the new
+            // bundle's own cell starts forced, and a cell still `pending` or
+            // `poisoned` re-mints exactly as v1 did for every lazy binding.
+            //
+            // The payload forms are deliberately NOT reached here. A lazy
+            // `SignalCell`/`Shared` would have to carry a payload INTO a cell
+            // that may not exist yet, which is two questions (has it forced, and
+            // what is in it) answered at one site; `transferable_as_value` says
+            // no to a bare signal or shared, so those stay `Excluded` and the
+            // shape stays a candidate item rather than a guess.
             let form = if self.lazy_cells.contains(&binding_id) {
-                TransferForm::Excluded
+                if self.transferable_as_value(type_id) {
+                    TransferForm::LazyValue
+                } else {
+                    TransferForm::Excluded
+                }
             } else {
                 self.hmr_transfer_form(type_id)
             };
@@ -50259,6 +50269,15 @@ pub enum TransferForm {
     SignalPayload,
     /// A `Shared<T>` with transferable `T`: the payload crosses into a fresh cell.
     SharedPayload,
+    /// A `lazy let` whose VALUE is plain data (A102, R13): the value crosses
+    /// only when the old bundle's cell reached `done`. The thunk never crosses —
+    /// it closes over the old bundle's functions — so the new bundle mints its
+    /// own cell and the carried value is written straight into it, already
+    /// forced. A cell still `pending` (nothing read it) or `poisoned` (its
+    /// initializer panicked) carries nothing and re-mints, which is what the
+    /// exposing getter says by THROWING: the swap's capture skips a key whose
+    /// getter throws, and that is already how it spells "not seeded".
+    LazyValue,
     /// Not safely transferable (a closure-holder, a view, a resource, a bare
     /// `Signal`/`Shared`, an unresolved type): fresh init, not exposed.
     Excluded,

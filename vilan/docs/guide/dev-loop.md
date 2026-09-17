@@ -113,6 +113,15 @@ A swap re-evaluates the whole client bundle. Two things survive it:
   In a full-stack app that is *most* of your durable state, which is why the
   swap can afford to be simple about the rest.
 
+A `lazy let` carries its value too, once it *has* one. Its thunk never
+crosses — that closure belongs to the old bundle — so what travels is the
+forced value, written straight into the new bundle's own cell: the binding
+reads as already initialized and the new initializer never runs, exactly as
+an eager binding's does. A lazy binding nothing had forced yet carries
+nothing and stays deferred on the other side, which is the same answer as
+before it was touched: the first read after the swap is the first read, and
+it runs the *new* bundle's initializer.
+
 Top-level bindings like these keep their live values while you edit the view
 that renders them:
 

@@ -3145,6 +3145,17 @@ impl<'src> Transformer<'src> {
                     TransferForm::SharedPayload => {
                         js::Node::Property(Box::new(js::Node::Local(name)), "v".to_string())
                     }
+                    // A102: the getter reads the memo cell WITHOUT forcing it —
+                    // exposing a lazy binding must not run the initializer the
+                    // program chose not to run — and throws when the cell is not
+                    // `done`, which is how the capture already spells "this key
+                    // carries nothing" (`hmr.md` §3 step 1 skips a throwing
+                    // getter). So a pending or poisoned binding re-mints, and a
+                    // forced one hands over its value.
+                    TransferForm::LazyValue => js::Node::Call(
+                        Box::new(js::Node::Local("__hmr_lazy_value".to_string())),
+                        vec![js::Node::Local(name)],
+                    ),
                     TransferForm::Excluded => unreachable!("filtered above"),
                 };
                 let getter = js::Node::Closure(js::Closure {
@@ -5554,10 +5565,15 @@ impl<'src> Transformer<'src> {
                 // every statement its lowering needs goes inside, exactly as a
                 // lazy argument's does — so module load evaluates one object
                 // literal and the initializer waits for the first read, which
-                // `Expr::Local`'s `__force` arm performs. HMR is skipped here
-                // because `compute_hmr_bindings` already excluded every lazy
-                // binding; the branch order makes that visible rather than
-                // implicit.
+                // `Expr::Local`'s `__force` arm performs.
+                //
+                // A102 (R13): under HMR the fresh cell is handed to
+                // `__hmr_adopt_lazy`, which writes the OLD bundle's value into
+                // it and marks it `done` when the seed carries one at a matching
+                // fingerprint. The cell is always minted here — the new bundle's
+                // thunk is the new bundle's, and adopting the old one would run
+                // the old bundle's functions — so this is the one adopt shape
+                // that takes the built value rather than a thunk to skip.
                 let value = if self.program.lazy_cells.contains(id) {
                     let name = self
                         .program
@@ -5580,7 +5596,7 @@ impl<'src> Transformer<'src> {
                     }
                     self.seal_pending_temporaries(mark, &mut thunk_block);
                     self.used_helpers.insert("__lazy");
-                    js::Node::Call(
+                    let cell = js::Node::Call(
                         Box::new(js::Node::Local("__lazy".to_string())),
                         vec![
                             js::Node::String(Cow::Owned(name.to_string())),
@@ -5591,7 +5607,18 @@ impl<'src> Transformer<'src> {
                                 origin: None,
                             }),
                         ],
-                    )
+                    );
+                    match hmr_binding {
+                        Some(hmr_binding) => js::Node::Call(
+                            Box::new(js::Node::Local("__hmr_adopt_lazy".to_string())),
+                            vec![
+                                js::Node::String(Cow::Owned(hmr_binding.key.clone())),
+                                js::Node::Number(hmr_binding.fingerprint.to_string(), None),
+                                cell,
+                            ],
+                        ),
+                        None => cell,
+                    }
                 } else if let Some(hmr_binding) = hmr_binding {
                     let mut thunk_block = Vec::new();
                     let inner = initial
@@ -5636,6 +5663,9 @@ impl<'src> Transformer<'src> {
                         TransferForm::Value => "__hmr_adopt",
                         TransferForm::SignalPayload => "__hmr_adopt_signal",
                         TransferForm::SharedPayload => "__hmr_adopt_shared",
+                        // A lazy binding never reaches this arm: its cell is
+                        // built by the branch above, which wraps it itself.
+                        TransferForm::LazyValue => unreachable!("the lazy branch owns this"),
                         TransferForm::Excluded => unreachable!("filtered above"),
                     };
                     js::Node::Call(
