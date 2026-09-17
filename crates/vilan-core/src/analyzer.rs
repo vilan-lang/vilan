@@ -43870,6 +43870,23 @@ impl<'src> Analyzer<'src> {
     /// nothing is committed, defaulted, or diagnosed — constraints the
     /// entry may still bind stay open for the final build to finish.
     fn resolve_world(&mut self) {
+        // M73's instrument: the sub-split of this pass, printed on the
+        // `[vilan phase]` line when `VILAN_PHASE_TIMING` asks — the same
+        // treatment `const-lower`/`const-interp` give the const pass (N43),
+        // and for the same reason. `base` says how long the pre-entry resolve
+        // took and `build` how long the post-entry one did, and neither says
+        // WHICH of this function's eleven stages the time is in; M70 left the
+        // question open by attributing an open module's 150 ms to "the
+        // preludes, the `use` drain and the constraint fixpoint", and the
+        // first reading taken through this split says the preludes and the
+        // drain are 0.0 ms and the fixpoint is all of it. A reader should be
+        // able to take that reading without patching the compiler.
+        //
+        // Off, this is one cached `bool` load and nothing else; on, eleven
+        // `Instant::now()` calls per pass, which is noise next to the pass.
+        let split_on = crate::phase_timing_enabled() && !crate::macros::in_macro_world();
+        let mut split_mark = crate::PhaseClock::now();
+        let mut split: Vec<(&'static str, std::time::Duration)> = Vec::new();
         // Resolve imports/re-exports to a fixpoint: a re-export may name an item
         // bound by another re-export resolved in a later pass (a chain of relay
         // modules), so keep retrying the unresolved ones until a pass binds
@@ -43907,8 +43924,16 @@ impl<'src> Analyzer<'src> {
         // explicit import of a prelude name is already in the scope that
         // `or_insert` must yield to) and before any name resolves against a
         // scope (so nothing has memoized a lookup the prelude would change).
+        if split_on {
+            split.push(("imports", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         self.seed_preludes();
 
+        if split_on {
+            split.push(("preludes", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         // --- Resolve `use` statements ---
         // `use Namespace::{ a, b }` binds items out of a namespace — a module,
         // an enum (whose namespace holds its variants) or a struct (whose
@@ -44038,6 +44063,10 @@ impl<'src> Analyzer<'src> {
             self.attribute_new_diagnostics(use_diagnostics_before, source_id);
         }
 
+        if split_on {
+            split.push(("use-drain", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         // --- Deferred binder-bound inheritance --- an `impl Wrapper<type T>`
         // walked before `struct Wrapper<T: Greeter>` couldn't see the bound;
         // every declaration exists now, so attach it to the binder's
@@ -44092,6 +44121,10 @@ impl<'src> Analyzer<'src> {
             self.resolve_prepped_local(id, name);
         }
 
+        if split_on {
+            split.push(("binder-bounds", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         // --- Wire assignments to their variables ---
         // Each assignment targets a (now resolved) local. The assigned value
         // joins the variable's constraint so reassignments are type checked
@@ -44113,6 +44146,10 @@ impl<'src> Analyzer<'src> {
             self.wire_prepped_assignment(target_id, value_id);
         }
 
+        if split_on {
+            split.push(("locals", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         // B184: every struct's hidden parameters, decided before the first
         // mention resolves — see `resolve_hidden_struct_parameters` for why it
         // cannot ride along in the drain below.
@@ -45355,6 +45392,10 @@ impl<'src> Analyzer<'src> {
             }
         }
 
+        if split_on {
+            split.push(("types", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         // --- Check trait conformance for `impl Subject with Trait` ---
         for check in std::mem::take(&mut self.prepped_trait_impls) {
             let trait_id = match self.try_get_expr_id_by_name(check.trait_name, check.scope_id) {
@@ -45783,6 +45824,10 @@ impl<'src> Analyzer<'src> {
         // world and again after the entry walks — so the answer a constraint
         // acts on is the answer the finished program carries, which is the
         // answer the editor's paint reads back.
+        if split_on {
+            split.push(("conformance", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         self.divergence_leaves = self.compute_divergence_leaves();
 
         // B222: and the guard clauses, decided with those leaves in hand — the
@@ -45828,6 +45873,10 @@ impl<'src> Analyzer<'src> {
             self.wire_prepped_assignment(target_id, value_id);
         }
 
+        if split_on {
+            split.push(("divergence+guards", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         // --- Resolve `context` clauses (ambient-owner.md §5, B242, B309) ---
         // after the import fixpoint (a clause may name an imported context) and
         // BEFORE the fixpoint below, so the clause a closure type carries is
@@ -45835,6 +45884,10 @@ impl<'src> Analyzer<'src> {
         // performs.
         self.resolve_context_clauses();
 
+        if split_on {
+            split.push(("contexts", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         // --- Constraint solving loop ---
         // A true fixpoint: each pass resolves the constraints whose dependencies
         // have landed (their blocked dependents resolve on later passes), in
@@ -45927,6 +45980,14 @@ impl<'src> Analyzer<'src> {
             if fruitless_backstops >= 2 {
                 break;
             }
+        }
+        if split_on {
+            split.push(("fixpoint", split_mark.elapsed()));
+            let stages: Vec<String> = split
+                .iter()
+                .map(|(name, duration)| format!("{name} {:.1}ms", duration.as_secs_f64() * 1000.0))
+                .collect();
+            eprintln!("[vilan phase] resolve_world {}", stages.join(" "));
         }
     }
 
