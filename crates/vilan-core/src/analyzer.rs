@@ -50533,7 +50533,15 @@ pub(crate) fn document_overlay_paths() -> Vec<PathBuf> {
     overlay.keys().cloned().collect()
 }
 
-pub(crate) fn document_overlay_get(path: &Path) -> Option<String> {
+/// The open buffer registered for `path`, or `None` when the editor has none.
+///
+/// Public for the same reason [`document_overlay_contains`] is (E187): a
+/// front-end that reads a DECLARING file to edit it — a cross-file quick fix,
+/// the css converter's sibling `impl Style` bodies — must read the buffer the
+/// user is looking at rather than the last thing saved, and the overlay the
+/// server already maintains is that buffer. Inside the compiler the module
+/// loader reaches it through `resolve_module_file`; outside, this is the door.
+pub fn document_overlay_get(path: &Path) -> Option<String> {
     let overlay = DOCUMENT_OVERLAY.get()?;
     let overlay = overlay
         .lock()

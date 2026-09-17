@@ -5984,10 +5984,12 @@ impl Document {
     /// The declaration's file comes from the reference index, which carries a
     /// declaration row for every definition in the program and not only for
     /// this file's — so the fix reaches the sibling module the warning is
-    /// really about without the LSP guessing at a path. Its own text is read
-    /// from DISK when it is not this buffer (the same bargain go-to-definition
-    /// makes), and the range is converted through THAT file's line index here,
-    /// because the handler has only this document's.
+    /// really about without the LSP guessing at a path. Its own text comes from
+    /// [`Self::sibling_text`] when it is not this buffer — the OPEN buffer when
+    /// the editor has one (E187), because this fix EDITS the file it reads and
+    /// an offset computed from the saved text lands in the wrong place in an
+    /// edited one — and the range is converted through THAT file's line index
+    /// here, because the handler has only this document's.
     ///
     /// Four refusals, each of them a place a wrong edit would be worse than no
     /// action:
@@ -6026,7 +6028,7 @@ impl Document {
                 target: None,
             });
         }
-        let text = std::fs::read_to_string(&path).ok()?;
+        let text = Self::sibling_text(&path)?;
         let at = top_level_item_start(&text, declaration.span.start)?;
         let range = LineIndex::new(&text).range(&Span::from(at..at));
         Some(QuickFix {
@@ -6036,6 +6038,30 @@ impl Document {
             replacement: "export ".to_string(),
             target: Some(FixTarget { path, range }),
         })
+    }
+
+    /// The text of another file of the analyzed program: the OPEN BUFFER when
+    /// the editor has one, and the file on disk otherwise (E187).
+    ///
+    /// The order is the whole point. Go-to-definition makes the disk bargain
+    /// because it only has to land a cursor, and a stale line is a small
+    /// annoyance; the two callers here are different in kind. One EDITS the
+    /// file it reads — B318's cross-file "Export `S`" inserts one word at an
+    /// offset computed from the text it read, so reading the saved text and
+    /// applying the edit to the live buffer means a stale offset in a file the
+    /// user has since changed, which corrupts rather than merely disappoints.
+    /// The other INLINES what it reads into this buffer — the css converter's
+    /// sibling `impl Style` bodies — so the saved text silently produces a
+    /// block the author's own edits contradict.
+    ///
+    /// The server already maintains exactly this map: `did_open`/`did_change`
+    /// register each buffer with the analyzer's document overlay, which is what
+    /// makes a DEPENDENT's analysis see unsaved edits at all (backlog E6). So
+    /// this adds no second notion of "what the file says" — it reads the one
+    /// the analysis it is answering about already read.
+    fn sibling_text(path: &Path) -> Option<String> {
+        vilan_core::analyzer::document_overlay_get(path)
+            .or_else(|| std::fs::read_to_string(path).ok())
     }
 
     /// The private TYPE a §4 exposure warning names — `S` in "`S` is used in
@@ -6232,7 +6258,7 @@ impl Document {
                         .is_some_and(|name| name == "style.vl")
                 })
         })?;
-        let text = std::fs::read_to_string(program.source_path(source)?).ok()?;
+        let text = Self::sibling_text(program.source_path(source)?)?;
         Some((source, text))
     }
 
@@ -6250,10 +6276,13 @@ impl Document {
     /// so the blocks whose subject head is `Style` name their own sources and
     /// nothing else is read.
     ///
-    /// Read from DISK, like std's own file: the conversion is a code action on
-    /// one document, and a sibling's unsaved buffer lives in the server's
-    /// document map, not in this one. A sibling edited but unsaved inlines its
-    /// last saved body, which is the same bargain go-to-definition makes.
+    /// Read through [`Self::sibling_text`], like std's own file: the OPEN
+    /// buffer when the editor has one (E187). E175 read the saved text and said
+    /// so — "the same bargain go-to-definition makes" — but this reader INLINES
+    /// what it finds into the current buffer, so a sibling edited and not yet
+    /// saved produced a block the author's own `theme.vl` already contradicted.
+    /// The overlay the server maintains for every open document is the one the
+    /// analysis this answers about already read.
     ///
     /// `skip` is std's own source, already read by
     /// [`Self::std_style_source`]; `SourceId(0)` is skipped because the current
@@ -6275,7 +6304,7 @@ impl Document {
             }
             seen.push(implementation.source);
             if let Some(path) = program.source_path(implementation.source)
-                && let Ok(text) = std::fs::read_to_string(path)
+                && let Some(text) = Self::sibling_text(path)
             {
                 texts.push(text);
             }
@@ -8665,6 +8694,67 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // E187: the declaring file is read from the OPEN BUFFER, not from disk.
+    //
+    // The fix computes an insertion offset from the text it reads and hands the
+    // editor a range in THAT file's coordinates. Reading the saved text while
+    // the analysis read the buffer is not a stale answer — it is a WRONG one:
+    // the declaration's span comes from the buffer, so converting it through
+    // the saved file's line index names a line the user is not looking at, and
+    // applying it inserts `export ` in the middle of something else. The
+    // unsaved edit here is two lines above the declaration, which moves it from
+    // line 2 to line 4.
+    #[test]
+    fn quickfix_exports_a_declaration_at_the_line_the_unsaved_buffer_puts_it_on() {
+        const SAVED: &str = "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n";
+        const UNSAVED: &str = "// an edit the user has not saved\n// and a second line of it\n\
+             export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n";
+        let (dir, _) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::hidden;\n\nfun main() {\n\tlet _ = hidden();\n}\n",
+            ),
+            ("a.vl", SAVED),
+        ]);
+        let module = dir.join("a.vl");
+        vilan_core::analyzer::set_document_overlay(&module, Some(UNSAVED.to_string()));
+        let entry = dir.join("main.vl");
+        let text = std::fs::read_to_string(&entry).expect("the entry");
+        let document = Document::analyze(&text, &std_root(), &entry);
+        let program = document.program.as_ref().expect("a program");
+        let whole = Span {
+            start: 0,
+            end: document.line_index.text().len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        let export = fixes
+            .iter()
+            .find(|fix| fix.title == "Export `hidden`")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no export fix: {:?}",
+                    fixes.iter().map(|fix| &fix.title).collect::<Vec<_>>()
+                )
+            });
+        let target = export.target.as_ref().expect("a cross-file edit");
+        assert!(target.path.ends_with("a.vl"), "{:?}", target.path);
+        assert_eq!(
+            target.range.start.line, 4,
+            "the declaration is on line 4 of the BUFFER (line 2 of the saved file)"
+        );
+        assert_eq!(target.range.start.character, 0);
+        // Applied to the buffer, it exports the declaration the warning names.
+        let mut applied = UNSAVED.to_string();
+        let at = UNSAVED.find("fun hidden").expect("the declaration");
+        applied.insert_str(at, "export ");
+        assert!(
+            applied.contains("export fun hidden"),
+            "the edit lands on the declaration: {applied}"
+        );
+        vilan_core::analyzer::set_document_overlay(&module, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // The QUALIFIED reach (§5's second door): `import pkg::a;` then
     // `a::hidden()`. There is no leaf to mark, so "Export" is the only fix the
     // paper names for it — and it is the same cross-file edit.
@@ -9383,6 +9473,40 @@ pub(crate) mod tests {
             "css {\n\t\tdisplay: {Display::Flex.value()};\n\t\tflex-direction: {FlexDirection::Row.value()};\n\t\tborder-radius: {Length::px(4)};\n\t\tletter-spacing: {Length::px(1)};\n\t\toutline: none;\n\t}",
             "{conversion:?}"
         );
+    }
+
+    // E187, the converter's half: a sibling's `impl Style` is INLINED into this
+    // buffer, so reading its saved text produces a block the author's own
+    // unsaved edit already contradicts — a wrong answer dressed as a refactor,
+    // not a stale one. The sibling below declares `letter-spacing` on disk and
+    // `word-spacing` in the buffer; the conversion must write the buffer's.
+    #[test]
+    fn refactor_inlines_a_siblings_unsaved_impl_style_body() {
+        const SAVED: &str = "import std::style::{ Length, Style };\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.with_length(\"letter-spacing\", Length::px(1))\n\t}\n}\n";
+        const UNSAVED: &str = "import std::style::{ Length, Style };\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.with_length(\"word-spacing\", Length::px(2))\n\t}\n}\n";
+        let source = "import std::style::{ Length, Style, style };\nimport pkg::theme;\n\n\
+             fun button_style(): Style {\n\tsty~le()\n\t\t.radius(Length::px(4))\n\t\t.script_label()\n}\n";
+        let offset = source.find('~').expect("fixture needs a `~` cursor");
+        let text = source.replace('~', "");
+        let (dir, _) = analyze_workspace(&[("main.vl", &text), ("theme.vl", SAVED)]);
+        let sibling = dir.join("theme.vl");
+        vilan_core::analyzer::set_document_overlay(&sibling, Some(UNSAVED.to_string()));
+        let entry = dir.join("main.vl");
+        let entry_text = std::fs::read_to_string(&entry).expect("the entry");
+        let document = Document::analyze(&entry_text, &std_root(), &entry);
+        let conversion = document
+            .css_spelling_conversion(Span {
+                start: offset,
+                end: offset,
+            })
+            .expect("a chain reaching the sibling converts");
+        assert_eq!(
+            conversion.replacement,
+            "css {\n\t\tborder-radius: {Length::px(4)};\n\t\tword-spacing: {Length::px(2)};\n\t}",
+            "the BUFFER's body, not the saved one"
+        );
+        vilan_core::analyzer::set_document_overlay(&sibling, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The reach is the IMPL TABLE's, not "every file in the package": a sibling
