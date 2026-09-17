@@ -3,7 +3,7 @@ use crate::analyzer::{
     GenericDispatch, Intrinsic, LiftDispatch, Program, RENDER_MEMBER, TransferForm, TryDispatch,
 };
 use crate::call_graph::{CallTarget, IndirectReason};
-use crate::error::Error;
+use crate::error::{Error, Note};
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::impl_select;
@@ -2401,7 +2401,21 @@ struct Transformer<'src> {
     // output is `function f(self) {\n}`: a clean compile whose first use of the
     // result is a runtime `TypeError`. Collected here and turned into a hard
     // compile error at assembly, so the class cannot recur silently.
-    bodyless_emissions: Vec<Id>,
+    // E190 adds the REQUESTER: the function whose body was being emitted when
+    // the requirement was first reached, as `(bodyless function, requester)`.
+    // The bodyless function's own span is the requirement's NAME in std, which
+    // the CLI never renders — the refusal printed one bare `Error:` line with no
+    // file, no line and no hint which of kolt's 19 files to look in, and the
+    // integrator had to instrument this seam by hand to learn that `app_shell`
+    // was the frame that asked. That frame is the only location the reader can
+    // act on, so it is recorded WITH the emission rather than reconstructed
+    // afterwards.
+    bodyless_emissions: Vec<(Id, Option<Id>)>,
+    // E190: the emission frames currently on the stack, innermost last.
+    // `emitting` above is a SET (its question is "am I already inside this
+    // body?", which order cannot answer), and `function_with_name` is the one
+    // funnel every emitted callable passes through, so the stack is kept here.
+    emitting_stack: Vec<Id>,
     // B135: memo for `reaches_bare_requirement` — whether a function's body,
     // transitively through the program call graph, contains a dispatch that
     // would fall through to a bodyless trait requirement if emitted without a
@@ -2775,6 +2789,7 @@ impl<'src> Transformer<'src> {
             used_imports: BTreeMap::new(),
             hmr: options.hmr,
             bodyless_emissions: Vec::new(),
+            emitting_stack: Vec::new(),
             bare_requirement_memo: HashMap::default(),
             unresolved_drop_sinks: Vec::new(),
             unrendered_concatenations: Vec::new(),
@@ -3204,7 +3219,7 @@ impl<'src> Transformer<'src> {
         // yields `undefined` and the first use of the result is a runtime
         // `TypeError` — from a compile that reported nothing. Whatever failed to
         // resolve upstream, it must not leave here quietly.
-        if let Some(&function_id) = self.bodyless_emissions.first() {
+        if let Some(&(function_id, requester)) = self.bodyless_emissions.first() {
             let function = self.program.functions.get(&function_id);
             let name = function.map(|function| function.name).unwrap_or("?");
             let declaring_trait = self
@@ -3217,18 +3232,46 @@ impl<'src> Transformer<'src> {
                 Some(trait_name) => format!("`{trait_name}`'s requirement `{name}`"),
                 None => format!("`{name}`"),
             };
-            return Err(Error {
-                trace: Vec::new(),
-                note: None,
-                span: function
+            // E190: the frame that asked. The requirement's own name span sits
+            // in std (or wherever the trait is declared), and the CLI attributes
+            // a transformer refusal to the ENTRY — so the span rendered nothing
+            // at all. The requester's name span is a real location in a file the
+            // author owns, and the note carries the file so the attribution can
+            // follow it.
+            let requester = requester.and_then(|id| {
+                let frame = self.program.functions.get(&id)?;
+                let file = self.program.source_of(id);
+                let path = file
+                    .and_then(|source| self.program.source_path(source))
+                    .map(|path| path.display().to_string());
+                Some((frame.name, frame.name_span, file, path))
+            });
+            let asked = bodyless_refusal_frame(
+                requester
+                    .as_ref()
+                    .map(|(frame, _, _, path)| (*frame, path.as_deref())),
+            );
+            let span = match &requester {
+                Some((_, name_span, _, _)) => *name_span,
+                None => function
                     .map(|function| function.name_span)
                     .unwrap_or_default(),
+            };
+            let note = requester.as_ref().map(|(frame, name_span, file, _)| Note {
+                span: *name_span,
+                msg: format!("`{frame}` is the body that reached the requirement"),
+                source: *file,
+            });
+            return Err(Error {
+                trace: Vec::new(),
+                note,
+                span,
                 msg: format!(
                     "internal: a call resolved to {source}, which has no body — \
                      emitting it would produce an empty function and a runtime \
                      `TypeError`. The receiver's type could not be resolved to a \
-                     concrete implementation at this call; please report this \
-                     program"
+                     concrete implementation at this call{asked}; please report \
+                     this program"
                 ),
             });
         }
@@ -7956,8 +7999,12 @@ impl<'src> Transformer<'src> {
         // it is never the answer to a call, only what a call falls back to when
         // the receiver's generic never got bound. Record it; assembly refuses.
         if !function.has_body {
-            self.bodyless_emissions.push(function.id);
+            // E190: with the frame that asked for it — the innermost emission
+            // already on the stack, which is the caller's body, not this one.
+            let requester = self.emitting_stack.last().copied();
+            self.bodyless_emissions.push((function.id, requester));
         }
+        self.emitting_stack.push(function.id);
         let parameters = function
             .parameters
             .iter()
@@ -7976,6 +8023,7 @@ impl<'src> Transformer<'src> {
         // the split form when the last use is short of the end; this wraps the
         // whole body otherwise, keeping parameters last in the reverse order.
         let body = self.wrap_own_param_drops(function, body);
+        self.emitting_stack.pop();
         js::Node::Function(js::Function {
             name,
             parameters,
@@ -12139,9 +12187,48 @@ fn collect_reached_names(scope: &JsScope, reached: &mut HashSet<String>) {
     }
 }
 
+/// E190 — the sentence the never-silent body-less refusal (B55) adds naming
+/// the frame that asked for the requirement, and where that frame is written.
+///
+/// A free function because the refusal's live trigger is a compiler defect: the
+/// one on record is B351's reproduction, which is another lane's to rebuild, and
+/// the construction still has to be held to the tree. The rest of the message is
+/// the ledger's row 330.
+fn bodyless_refusal_frame(requester: Option<(&str, Option<&str>)>) -> String {
+    match requester {
+        Some((frame, Some(path))) => {
+            format!(". It was first reached while emitting `{frame}` ({path})")
+        }
+        Some((frame, None)) => format!(". It was first reached while emitting `{frame}`"),
+        None => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Formatter, unescape_string};
+    use super::{Formatter, bodyless_refusal_frame, unescape_string};
+
+    /// E190 — the body-less refusal names the frame that asked and its file.
+    /// kolt's report was one bare `Error:` line with no file, no line and no
+    /// hint which of nineteen files to look in; the integrator had to
+    /// instrument `ensure_function_emitted` by hand to learn that `app_shell`
+    /// was the frame. That answer is in the message now.
+    #[test]
+    fn the_bodyless_refusal_names_the_frame_that_asked() {
+        assert_eq!(
+            bodyless_refusal_frame(Some(("app_shell", Some("src/views.vl")))),
+            ". It was first reached while emitting `app_shell` (src/views.vl)"
+        );
+        // A frame whose file the program cannot name still names the frame —
+        // half an answer beats the bare `Error:` line this replaces.
+        assert_eq!(
+            bodyless_refusal_frame(Some(("app_shell", None))),
+            ". It was first reached while emitting `app_shell`"
+        );
+        // And a requirement reached from no frame at all (an emission root)
+        // adds nothing rather than an empty parenthesis.
+        assert_eq!(bodyless_refusal_frame(None), "");
+    }
 
     /// The junctions where dropping the padding would change the token stream.
     /// Only `- -` is reachable from Vilan source today (`-` is the only
