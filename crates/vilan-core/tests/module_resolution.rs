@@ -7139,3 +7139,97 @@ fn b349_a_module_level_initializer_obeys_the_declaring_files_selector() {
         "expected an emitted program: {emitted}"
     );
 }
+
+/// The `#(impl ..)` fixture B350's pins run on: `ext.vl` provides `tag` for
+/// `Boxed<i32>`, `exported` or not per case, and `marker` makes the module
+/// CURATED so a plain `impl` really is hidden.
+fn marked_selector_files(block_export: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "t.vl",
+            "export trait Tagged {\n\tfun tag(self): i32;\n}\n".to_string(),
+        ),
+        (
+            "item.vl",
+            concat!(
+                "export struct Boxed<T> { value: T }\n\n",
+                "export impl Boxed<type T> {\n",
+                "\tfun make(value: T): Boxed<T> { Boxed { value = value } }\n}\n",
+            )
+            .to_string(),
+        ),
+        (
+            "ext.vl",
+            format!(
+                concat!(
+                    "import pkg::item::Boxed;\nimport pkg::t::Tagged;\n\n",
+                    "export fun marker(): i32 {{ 0 }}\n\n",
+                    "{block_export}impl Boxed<i32> with Tagged {{\n",
+                    "\tfun tag(self): i32 {{ 1 }}\n}}\n",
+                ),
+                block_export = block_export
+            ),
+        ),
+    ]
+}
+
+fn marked_selector_warnings(block_export: &str, marker: &str) -> Vec<String> {
+    let mut owned = marked_selector_files(block_export);
+    owned.push((
+        "c.vl",
+        format!(
+            concat!(
+                "import pkg::item::Boxed;\nimport pkg::t::Tagged;\n",
+                "import pkg::ext::{{ {marker}(impl Boxed<i32>) }};\n\n",
+                "fun main() {{\n\tlet _ = Boxed::make(3).tag();\n}}\n",
+            ),
+            marker = marker
+        ),
+    ));
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    analyze_package_warnings(&files, "c.vl", Platform::default())
+}
+
+/// **B350 — the `#` on a selector whose blocks the module EXPORTS is
+/// redundant.** The impl twin of §9 S2's leaf warning, and the symmetry B318
+/// §14/§15 left open: a marker says "this block is hidden from me and I am
+/// taking it anyway", and on an exported block that is a statement about the
+/// author's belief that is not true. A warning, not a refusal — the import
+/// means the same thing either way — and the fix is to delete a character, so
+/// the message ends in the same sentence the leaf twin ends in and the editor's
+/// "Delete the `#`" arm reads it unchanged.
+#[test]
+fn b350_a_marker_on_an_exported_impl_block_warns() {
+    let redundant = marked_selector_warnings("export ", "#");
+    assert!(
+        redundant.iter().any(|warning| warning
+            == "every `impl Boxed<i32>` in `ext` is exported, so the reach marker is \
+                redundant — delete the `#`"),
+        "a marker on an exported block warns: {redundant:#?}"
+    );
+}
+
+/// B350's two controls, which are what make the warning mean something: the
+/// marker on a genuinely HIDDEN block is silent (it is doing its job), and an
+/// unmarked selector over an exported block is silent too (there is nothing to
+/// delete).
+#[test]
+fn b350_a_marker_on_a_hidden_block_and_a_bare_selector_stay_silent() {
+    let hidden = marked_selector_warnings("", "#");
+    assert!(
+        !hidden
+            .iter()
+            .any(|warning| warning.contains("reach marker is redundant")),
+        "a marker that reaches a hidden block is silent: {hidden:#?}"
+    );
+    let bare = marked_selector_warnings("export ", "");
+    assert!(
+        !bare
+            .iter()
+            .any(|warning| warning.contains("reach marker is redundant")),
+        "an unmarked selector has no marker to delete: {bare:#?}"
+    );
+}

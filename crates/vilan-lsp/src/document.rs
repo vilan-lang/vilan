@@ -8605,6 +8605,68 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // B350: the `#` on an `(impl ..)` SELECTOR whose blocks the module exports
+    // is the impl twin of the leaf marker above, and it takes the SAME fix.
+    // The analyzer's new warning ends in the sentence `REACH_IS_REDUNDANT`
+    // names and is spanned on the selector, whose `#` sits one byte before it
+    // — so the arm reads it unchanged, and this pin is what says so.
+    #[test]
+    fn quickfix_deletes_a_redundant_marker_on_an_impl_selector() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                concat!(
+                    "import pkg::item::Boxed;\nimport pkg::t::Tagged;\n",
+                    "import pkg::ext::{ #(impl Boxed<i32>) };\n\n",
+                    "fun main() {\n\tlet _ = Boxed::make(3).tag();\n}\n",
+                ),
+            ),
+            ("t.vl", "export trait Tagged {\n\tfun tag(self): i32;\n}\n"),
+            (
+                "item.vl",
+                concat!(
+                    "export struct Boxed<T> { value: T }\n\n",
+                    "export impl Boxed<type T> {\n",
+                    "\tfun make(value: T): Boxed<T> { Boxed { value = value } }\n}\n",
+                ),
+            ),
+            (
+                "ext.vl",
+                concat!(
+                    "import pkg::item::Boxed;\nimport pkg::t::Tagged;\n\n",
+                    "export fun marker(): i32 { 0 }\n\n",
+                    "export impl Boxed<i32> with Tagged {\n\tfun tag(self): i32 { 1 }\n}\n",
+                ),
+            ),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let text = document.line_index.text().to_string();
+        let whole = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole);
+        let delete = fixes
+            .iter()
+            .find(|fix| fix.title == "Delete the `#`")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no delete fix: {:?}",
+                    fixes.iter().map(|f| &f.title).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(&text[delete.span.into_range()], "#");
+        assert!(delete.replacement.is_empty());
+        // Applied, the selector loses its marker and keeps its meaning.
+        let mut applied = text.clone();
+        applied.replace_range(delete.span.into_range(), &delete.replacement);
+        assert!(
+            applied.contains("import pkg::ext::{ (impl Boxed<i32>) };"),
+            "{applied:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // E177: B318 §5's OTHER way out of a plain reach — export the thing. The
     // edit lands in `a.vl`, which is what `QuickFix` could not say before: the
     // type carried a span in this document and nothing else, so the paper's

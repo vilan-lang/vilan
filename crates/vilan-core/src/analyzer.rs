@@ -59195,6 +59195,9 @@ pub fn build_impl_admission(program: &mut Program) {
     // B338: selectors that admitted nothing, reported once the walk is done so
     // the diagnostics come back in source order.
     let mut selector_misses: Vec<(SourceId, Span, String)> = Vec::new();
+    // B350: `#(impl T)` selectors whose blocks the module exports anyway — a
+    // WARNING, banked the same way so it lands in source order too.
+    let mut redundant_markers: Vec<(SourceId, Span, String)> = Vec::new();
     // Per statement, the files its walk carried — the input the collision
     // refusal reads, and the same answer the admission loop below computes.
     // Built for EVERY statement only when a collision is banked; otherwise only
@@ -59240,6 +59243,8 @@ pub fn build_impl_admission(program: &mut Program) {
         for selector in &row.selectors {
             let mut members: Vec<Id> = Vec::new();
             let mut subject_reached = false;
+            // B350: whether the `#` on this selector reached anything HIDDEN.
+            let mut reached_a_hidden_block = false;
             for implementation in &program.implementations {
                 if !sources.contains(&implementation.source)
                     || !selector_admits(program, implementation.subject, selector.subject)
@@ -59247,6 +59252,7 @@ pub fn build_impl_admission(program: &mut Program) {
                     continue;
                 }
                 subject_reached = true;
+                reached_a_hidden_block |= hidden.contains(&implementation.impl_id);
                 for (name, member_id) in &implementation.declarations {
                     if selector.members.is_empty()
                         || selector.members.iter().any(|(taken, _)| taken == name)
@@ -59254,6 +59260,34 @@ pub fn build_impl_admission(program: &mut Program) {
                         members.push(*member_id);
                     }
                 }
+            }
+            // B350 (§14/§15's open symmetry): the IMPL twin of S2's
+            // "`{module}` exports `{leaf}`, so the reach marker is redundant".
+            // A `#` says "this block is hidden from me and I am taking it
+            // anyway"; written on a selector every one of whose blocks the
+            // module exports, it says something about the author's belief that
+            // is not true, and the fix is to delete a character. A WARNING and
+            // not a refusal, exactly as the leaf twin is: the import means the
+            // same thing with the marker as without it.
+            //
+            // Silent when the selector reached NO block at all — that is
+            // B338's miss, already reported above, and a second sentence about
+            // a marker on a selector that admits nothing would bury it.
+            if selector.reached && subject_reached && !reached_a_hidden_block {
+                let subject = &selector.text;
+                let modules = sources
+                    .iter()
+                    .map(|source| format!("`{}`", module_stem(program, *source)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                redundant_markers.push((
+                    row.source,
+                    selector.span,
+                    format!(
+                        "every `impl {subject}` in {modules} is exported, so the reach marker \
+                         is redundant — delete the `#`"
+                    ),
+                ));
             }
             // B338: a selector that admits NOTHING is almost certainly a typo,
             // and it used to be silent — the mistake surfaced later, as the
@@ -59320,6 +59354,21 @@ pub fn build_impl_admission(program: &mut Program) {
             },
             source,
         );
+    }
+    // B350's warnings, in the same canonical order. Deduplicated by SITE: a
+    // package with two entries resolves a shared module's imports once per
+    // entry world, and one selector is one mistake (B5, the leaf twin's rule).
+    redundant_markers.sort_by_key(|(source, span, _)| (source.0, span.start, span.end));
+    redundant_markers
+        .dedup_by(|left, right| left.0 == right.0 && left.1 == right.1 && left.2 == right.2);
+    for (source, span, msg) in redundant_markers {
+        program.warnings.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span,
+            msg,
+        });
+        program.warning_sources.push(source);
     }
     program.impl_admission = ImplAdmission {
         restricting,
