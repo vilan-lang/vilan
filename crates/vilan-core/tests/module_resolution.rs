@@ -7077,3 +7077,190 @@ fn b335_a_module_owning_a_file_and_a_directory_reports_its_own_file() {
         "a duplicate one-id range would demote `source_lookup`"
     );
 }
+
+/// The process CPU this process has burned, in milliseconds — every thread's,
+/// summed, read off `/proc/self/stat`'s `utime`/`stime` (fields 14 and 15).
+///
+/// Wall is not an instrument on this tree's box: the number below is taken
+/// beside other lanes and the load average swings by an order of magnitude
+/// between runs. `None` where the file is not there (every non-Linux host), and
+/// the measurement that reads it then DECLINES rather than reporting a wall
+/// number wearing a CPU label (M15). The same reader `base_cache.rs` carries,
+/// for the same reason; the two test binaries share no code.
+fn process_cpu_ms() -> Option<f64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let rest = stat.rsplit_once(')')?.1;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    // `sysconf(_SC_CLK_TCK)` is 100 on every Linux this runs on; the value is
+    // fixed in the kernel ABI (USER_HZ), not a tunable.
+    Some((utime + stime) as f64 * 10.0)
+}
+
+fn loadavg_1m() -> String {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| text.split_whitespace().next().map(str::to_string))
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// M75's subject: two modules extending one type, `members` inherent members
+/// each — the same names when `colliding`, disjoint ones when not — and an
+/// entry carrying `statements` further import statements that have nothing to
+/// do with either. The two legs differ in NOTHING else: same files, same
+/// statement count, same impl count, same member count, so the CPU between
+/// them is what a banked collision costs.
+fn m75_files(colliding: bool, members: usize, statements: usize) -> Vec<(String, String)> {
+    let block = |prefix: &str| {
+        let mut body = String::from("import pkg::a::Thing;\n\nexport impl Thing {\n");
+        for index in 0..members {
+            body.push_str(&format!("\tfun {prefix}{index}(self): i32 {{ {index} }}\n"));
+        }
+        body.push_str("}\n");
+        body
+    };
+    let mut filler = String::new();
+    for index in 0..statements {
+        filler.push_str(&format!("export fun v{index}(): i32 {{ {index} }}\n"));
+    }
+    let mut app = String::from("import pkg::a::Thing;\nimport pkg::x;\nimport pkg::z;\n");
+    for index in 0..statements {
+        app.push_str(&format!("import pkg::filler::v{index};\n"));
+    }
+    app.push_str("\nfun main() {\n\tlet _thing = Thing { x = 1 };\n}\n");
+    vec![
+        (
+            "a.vl".to_string(),
+            "export struct Thing { x: i32 }\n".to_string(),
+        ),
+        ("x.vl".to_string(), block("tag")),
+        (
+            "z.vl".to_string(),
+            block(if colliding { "tag" } else { "zag" }),
+        ),
+        ("filler.vl".to_string(), filler),
+        ("app.vl".to_string(), app),
+    ]
+}
+
+/// Analyzes one [`m75_files`] package TWICE from a stable directory and returns
+/// the CPU of the second analysis, which is a base-cache hit — so the std
+/// closure's own load is out of the number and what is left is the package and
+/// its checks.
+fn m75_cpu_ms(label: &str, colliding: bool, members: usize, statements: usize) -> Option<f64> {
+    let directory = std::env::temp_dir().join(format!(
+        "vilan_m75_{label}_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("package dir");
+    for (relative, contents) in m75_files(colliding, members, statements) {
+        std::fs::write(directory.join(relative), contents).expect("write module");
+    }
+    let entry_path = directory.join("app.vl");
+    let source = std::fs::read_to_string(&entry_path).expect("read entry");
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let spec = std_spec();
+    let analyze = || {
+        analyze_source(
+            leaked,
+            &spec,
+            &directory,
+            &entry_path,
+            Some(Platform::default()),
+            &Workspace::default(),
+        )
+    };
+    let (_program, first) = analyze();
+    let banked = first
+        .iter()
+        .filter(|error| error.msg.contains("is already defined for 'Thing'"))
+        .count();
+    assert_eq!(
+        banked > 0,
+        colliding,
+        "the {label} leg must{} refuse: {banked} collision diagnostics",
+        if colliding { "" } else { " not" }
+    );
+    let before = process_cpu_ms();
+    let _ = analyze();
+    let cpu = before.zip(process_cpu_ms()).map(|(a, b)| b - a);
+    let _ = std::fs::remove_dir_all(&directory);
+    cpu
+}
+
+/// **M75 — what a two-package collision costs must not follow the importing
+/// file's STATEMENT COUNT.**
+///
+/// `refuse_imported_member_collisions` answers two questions per (collision,
+/// file) pair: which import statement carried each block, and whether this
+/// file's namespace admits each member. Both used to be linear scans — the
+/// first over `carried`, which holds one row per import statement in the WHOLE
+/// program, the second over `program.implementations` — so the refusal was
+/// O(collisions x files x statements). Nothing on the estate pays it, because
+/// the whole function is gated on a banked collision; the first real
+/// two-package collision in a large program paid all of it.
+///
+/// The bound is a SHAPE, not a budget: the same collision is measured with a
+/// tenth of the statements and with all of them, and the large leg may not cost
+/// materially more than the small one. A ratio survives the profile (every
+/// number here is a debug number under `cargo test`) and the load average in a
+/// way an absolute millisecond figure would not, and it is the exact property
+/// an index has and a scan does not.
+///
+/// **The sizes are larger than the item's 500 statements**, and deliberately:
+/// the scan's cost is the PRODUCT `collisions x files x statements`, and at 50
+/// collisions and 500 statements the whole of it — about 3 million row visits —
+/// sits inside one 10 ms tick of the `/proc` clock, which makes for a pin that
+/// cannot tell the two implementations apart. 250 colliding members and 1,500
+/// statements lift it to 650 ms against the index's 60.
+#[test]
+fn m75_a_collisions_refusal_does_not_scale_with_the_importers_statement_count() {
+    const MEMBERS: usize = 250;
+    const SMALL: usize = 150;
+    const LARGE: usize = 1500;
+    let load = loadavg_1m();
+
+    let small_clean = m75_cpu_ms("small_clean", false, MEMBERS, SMALL);
+    let small_collide = m75_cpu_ms("small_collide", true, MEMBERS, SMALL);
+    let large_clean = m75_cpu_ms("large_clean", false, MEMBERS, LARGE);
+    let large_collide = m75_cpu_ms("large_collide", true, MEMBERS, LARGE);
+
+    let (Some(small_clean), Some(small_collide), Some(large_clean), Some(large_collide)) =
+        (small_clean, small_collide, large_clean, large_collide)
+    else {
+        panic!(
+            "no process CPU clock on this host (no /proc/self/stat), so this \
+             bound would be a wall number wearing a CPU label (M15)"
+        );
+    };
+    let small_delta = small_collide - small_clean;
+    let large_delta = large_collide - large_clean;
+    println!(
+        "M75 profile={} members={MEMBERS} small({SMALL} statements) clean={small_clean:.0} ms \
+         collide={small_collide:.0} ms delta={small_delta:.0} ms · large({LARGE} statements) \
+         clean={large_clean:.0} ms collide={large_collide:.0} ms delta={large_delta:.0} ms \
+         load={load}",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+    );
+    // `carried` is still BUILT per statement (one `statement_sources` walk each,
+    // once, outside the product), so the large leg is allowed to cost more —
+    // just not in PROPORTION, which is the whole difference between an index
+    // and a scan. The allowance covers that one pass plus the /proc clock's own
+    // 10 ms tick: measured on this tree at these sizes, the index answers
+    // small=10 ms / large=60 ms and the scan it replaces answers 80 ms /
+    // 650 ms, so the bound sits between them with room on both sides.
+    let allowance = 120.0;
+    assert!(
+        large_delta <= small_delta.max(0.0) * 2.0 + allowance,
+        "a collision cost {large_delta:.0} ms with {LARGE} import statements in the \
+         entry and {small_delta:.0} ms with {SMALL} — it is following the statement \
+         count, which is the linear scan M75 removed"
+    );
+}

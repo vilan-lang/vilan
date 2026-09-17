@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use vilan_core::{PackageSpec, Platform, Workspace, analyze_source};
+use vilan_core::{EntryMode, MacroLimits, PackageSpec, Platform, Workspace, analyze_source};
 
 fn std_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std")
@@ -365,5 +365,195 @@ fn one_retained_world_weighs_what_the_shipped_factor_says_it_does() {
          `BASE_CACHE_WEIGHT_FACTOR` says {shipped:.0}x — the budget is \
          denominated on that factor, so re-measure it (the harness above prints \
          the raw figures) rather than widening this band"
+    );
+}
+
+/// M74's fixture: a three-module package with a cycle through one file, so
+/// that file can be analyzed BOTH ways from the same sources — as an ordinary
+/// entry (whose world is stored RESOLVED) and as a module the front end handed
+/// over as the entry (whose world is stored UNRESOLVED, keyed by the module it
+/// excludes; M70). The two shapes hold the same texts and the same `TypeId`
+/// census, so `base_cache_world_bytes` records them near-identically, and any
+/// difference in what they WEIGH is the derived tables the resolve fills.
+fn write_m74_package(root: &Path) -> PathBuf {
+    let _ = std::fs::remove_dir_all(root);
+    std::fs::create_dir_all(root).expect("package dir");
+    std::fs::write(
+        root.join("theme.vl"),
+        "export *;\n\nimport pkg::palette::base;\nimport pkg::views::icon;\n\n\
+         fun color(): i32 {\n\tbase() + icon()\n}\n",
+    )
+    .expect("write theme");
+    std::fs::write(
+        root.join("palette.vl"),
+        "export *;\n\nfun base(): i32 {\n\t1\n}\n",
+    )
+    .expect("write palette");
+    let views = root.join("views.vl");
+    std::fs::write(&views, M74_VIEWS).expect("write views");
+    // The RESOLVED leg's entry: the same text under a name nothing imports
+    // back, so it is an ordinary entry whose world resolves before the store.
+    // Analyzing `views.vl` itself in `Declared` mode would not do — there the
+    // alias is refused (B226, "the entry cannot be imported at all"), so
+    // `theme.vl`'s `icon` never binds and the world's derived tables come out
+    // LESS filled than a real resolved world's, which would bias the
+    // comparison toward the shape this measurement is trying to tell apart.
+    std::fs::write(root.join("plain.vl"), M74_VIEWS).expect("write plain");
+    views
+}
+
+const M74_VIEWS: &str = "export *;\n\nimport std::io::print;\nimport std::list::List;\n\
+                         import std::map::Map;\nimport std::json;\n\
+                         import pkg::theme::color;\n\n\
+                         fun icon(): i32 {\n\t3\n}\n\n\
+                         fun total(): i32 {\n\tcolor() + icon()\n}\n\n\
+                         fun main() {\n\tprint(total());\n}\n";
+
+/// One shape's weighing: `worlds` distinct keys minted through `macro_limits`,
+/// against a same-key control that pays the identical per-analysis transient.
+/// Returns (rss growth, control growth, recorded bytes, retained count).
+fn weigh_shape(
+    spec: &PackageSpec,
+    root: &Path,
+    entry: &Path,
+    open: bool,
+    worlds: u64,
+) -> (Option<usize>, Option<usize>, usize, usize) {
+    let make_workspace = |fuel: u64| Workspace {
+        entry_mode: if open {
+            EntryMode::OpenFile {
+                declared_entries: Vec::new(),
+            }
+        } else {
+            EntryMode::default()
+        },
+        macro_limits: MacroLimits {
+            fuel: 1_000_000 + fuel,
+            ..Workspace::default().macro_limits
+        },
+        ..Workspace::default()
+    };
+    let analyze = |fuel: u64| {
+        let (program, _errors) = analyze_source(
+            M74_VIEWS,
+            spec,
+            root,
+            entry,
+            Some(Platform::default()),
+            &make_workspace(fuel),
+        );
+        drop(program);
+    };
+    // Per-process but not per-world, warmed first: the parse cache's leaked
+    // texts and trees, the interner, the allocator's arenas.
+    vilan_core::analyzer::base_cache_clear();
+    analyze(0);
+    vilan_core::analyzer::base_cache_clear();
+
+    let control_before = resident_bytes();
+    for _ in 0..worlds {
+        analyze(0);
+    }
+    let control = resident_bytes()
+        .zip(control_before)
+        .map(|(after, before)| after.saturating_sub(before));
+    vilan_core::analyzer::base_cache_clear();
+
+    let before = resident_bytes();
+    for fuel in 0..worlds {
+        analyze(fuel);
+    }
+    let growth = resident_bytes()
+        .zip(before)
+        .map(|(after, before)| after.saturating_sub(before));
+    let count = vilan_core::analyzer::base_cache_retained();
+    let recorded = vilan_core::analyzer::base_cache_retained_bytes();
+    vilan_core::analyzer::base_cache_clear();
+    (growth, control, recorded, count)
+}
+
+/// **M74 — what an ENTRY-SHAPED world weighs, against the RESOLVED world
+/// [`BASE_CACHE_WEIGHT_FACTOR`] was measured on.**
+///
+/// M50's 24x is the ratio between resident bytes and
+/// `base_cache_world_bytes`'s recorded figure (the world's source texts plus
+/// M41's per-`TypeId` census), and it was measured over worlds that had
+/// RESOLVED — the ~229 derived tables the resolve fills are the gap it names.
+/// M70 then put a second SHAPE in the cache: a module opened as the entry
+/// stores its world BEFORE the resolve, so those tables are exactly the ones it
+/// has not filled, and it is billed at a rate measured on a world that filled
+/// them. That matters to M67's 192 MiB budget, which is denominated in the
+/// recorded figure and divided by this factor.
+///
+/// **One shape per test, because nextest gives each test its own process.**
+/// Weighing both inside one process cannot work: `base_cache_clear` between
+/// the legs frees the first shape's worlds, the second shape then allocates
+/// into pages this process already holds, and its resident growth reads as
+/// near zero whatever it actually weighs. The two tests below are the same
+/// package and the same module set, measured the same way, in two processes.
+/// Both print and assert nothing but the instrument's own validity: this is a
+/// MEASUREMENT, like the two weighings above it, and it is `#[ignore]`d.
+#[test]
+#[ignore = "M74: a MEASUREMENT of the RESOLVED world's weight; run deliberately, and read it beside its entry-shaped twin"]
+fn m74_a_resolved_world_weighs_what_the_shipped_factor_says() {
+    weigh_m74_shape("resolved", false);
+}
+
+#[test]
+#[ignore = "M74: a MEASUREMENT of the ENTRY-SHAPED world's weight; run deliberately, and read it beside its resolved twin"]
+fn m74_an_entry_shaped_world_weighs_what_its_unfilled_tables_weigh() {
+    weigh_m74_shape("entry-shaped", true);
+}
+
+/// The body both M74 tests share: build the package, weigh `WORLDS` worlds of
+/// one shape, print the factor the reading gives against the shipped one.
+fn weigh_m74_shape(label: &'static str, open: bool) {
+    let load = loadavg_1m();
+    const WORLDS: u64 = 8;
+    let root = std::env::temp_dir().join(format!(
+        "vilan_m74_{}_{}",
+        label.replace('-', "_"),
+        std::process::id()
+    ));
+    let views = write_m74_package(&root);
+    let entry = if open { views } else { root.join("plain.vl") };
+    let spec = vilan_core::manifest::resolve_std(&std_root());
+
+    let (growth, control, recorded, count) = {
+        let root = root.clone();
+        let spec = spec.clone();
+        on_one_thread(move || weigh_shape(&spec, &root, &entry, open, WORLDS))
+    };
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert_eq!(
+        count, WORLDS as usize,
+        "the {label} leg retained {count} worlds, not {WORLDS} — it is weighing \
+         something other than {WORLDS} worlds"
+    );
+    let (Some(growth), Some(control)) = (growth, control) else {
+        println!("M74-WEIGHT {label} DECLINED: no /proc/self/statm on this host");
+        return;
+    };
+    let recorded_per_world = recorded / count.max(1);
+    if growth <= control {
+        println!(
+            "M74-WEIGHT {label} DECLINED: rss_growth={growth} B did not exceed \
+             rss_control={control} B (recorded_per_world={recorded_per_world} B, load={load})"
+        );
+        return;
+    }
+    let per_world = (growth - control) / (WORLDS as usize - 1);
+    let factor = per_world as f64 / recorded_per_world.max(1) as f64;
+    println!(
+        "M74-WEIGHT {label} profile={} rss_growth={growth} B rss_control={control} B \
+         rss_per_world={per_world} B recorded_per_world={recorded_per_world} B \
+         measured_factor={factor:.1} shipped_factor={} load={load}",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+        vilan_core::analyzer::BASE_CACHE_WEIGHT_FACTOR,
     );
 }

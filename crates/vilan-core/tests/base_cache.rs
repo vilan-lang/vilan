@@ -122,9 +122,11 @@ fn a_distinct_import_set_misses() {
     let _ = misses_after_c;
 }
 
-/// The bypasses: entries the world-building loop would entangle — macro or
-/// derive text, `[service]` blocks — and any active overlay skip the cache
-/// entirely (neither hit nor store).
+/// The bypasses: entries the world-building loop would entangle — macro
+/// DEFINING text — skip the cache entirely (neither hit nor store). Derive
+/// USERS cache since the hoist (§6.13) and `[service]` entries since M72;
+/// an overlay outside std never blocked the cache and a std one is governed
+/// by CONTENT.
 #[test]
 fn world_entangling_entries_and_overlays_bypass() {
     let _guard = CACHE_LOCK
@@ -3090,4 +3092,88 @@ fn a_packages_legs_share_one_world_exactly_when_their_seed_sets_agree() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A `[service]` ENTRY, twice: the second analysis is served from the cache.
+///
+/// M72. The bypass predates the derive/macro hoist (§6.13): a `[service]`
+/// expanded inside the world-building loop, so its generated impls would have
+/// been stored in the world and leaked into the next entry's analysis. Since
+/// the hoist a cacheable entry expands through `expand_entry_over_world`,
+/// AFTER the store, exactly as a `[derive]` user does — and the only thing a
+/// service asks of the LOAD is `std::rpc`, which is seeded into the key beside
+/// the entry's written `std::` references, so a service world is never handed
+/// to an entry that wrote no service.
+///
+/// The cost this pin protects is kolt's: `store.vl` is a `[service]` entry and
+/// paid its package's whole pre-entry world on every keystroke, with 0 hits and
+/// 0 misses because it never consulted the cache at all.
+const SERVICE_A: &str = "import std::reactive::{ Signal, SignalCell };\n\
+                         [service(TickClient)]\n\
+                         struct Ticker {\n\t[expose] latest: SignalCell<i53>,\n}\n\
+                         impl Ticker {\n\t[rpc]\n\tfun record(self, at: i53): i53 {\n\t\tat\n\t}\n}\n\
+                         fun main() {\n\tlet _ticker = Ticker { latest = Signal::new(0i53) };\n}\n";
+const SERVICE_B: &str = "import std::reactive::{ Signal, SignalCell };\n\
+                         [service(TickClient)]\n\
+                         struct Ticker {\n\t[expose] latest: SignalCell<i53>,\n}\n\
+                         impl Ticker {\n\t[rpc]\n\tfun record(self, at: i53): i53 {\n\t\tat + 1\n\t}\n}\n\
+                         fun main() {\n\tlet _ticker = Ticker { latest = Signal::new(1i53) };\n}\n";
+
+#[test]
+fn a_service_entry_hits_the_cache_on_its_second_analysis() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::base_cache_clear();
+
+    let first = observe(SERVICE_A);
+    assert_eq!(first.0, "[]", "the service fixture compiles");
+    let (hits_before, misses_before) = stats();
+    let cached = observe(SERVICE_B);
+    let (hits_after, misses_after) = stats();
+    assert_eq!(
+        hits_after - hits_before,
+        1,
+        "a `[service]` entry's second analysis must be SERVED, not bypassed \
+         (0 hits and 0 misses is the bypass this pin retires)"
+    );
+    assert_eq!(
+        misses_after, misses_before,
+        "a hit is not also a miss for a service entry"
+    );
+
+    // And the served world answers identically to a fresh one — the whole
+    // reason the bypass existed.
+    vilan_core::analyzer::base_cache_clear();
+    let fresh = observe(SERVICE_B);
+    assert_eq!(cached.0, fresh.0, "diagnostics differ cached vs fresh");
+    assert_eq!(cached.1, fresh.1, "warnings differ cached vs fresh");
+    assert_eq!(cached.2, fresh.2, "emitted JS differs cached vs fresh");
+}
+
+/// A service world is never handed to an entry that wrote no service: the
+/// `std::rpc` the `[service]` scan seeds is part of the key, so the two entries
+/// below are two worlds even though their written imports are identical.
+const SERVICE_NEIGHBOUR: &str = "import std::reactive::{ Signal, SignalCell };\n\
+                                 fun main() {\n\tlet _cell: SignalCell<i53> = Signal::new(0i53);\n}\n";
+
+#[test]
+fn the_service_seed_is_part_of_the_world_key() {
+    let _guard = CACHE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::base_cache_clear();
+
+    let _ = observe(SERVICE_A);
+    let (hits_before, misses_before) = stats();
+    let neighbour = observe(SERVICE_NEIGHBOUR);
+    let (hits_after, misses_after) = stats();
+    assert_eq!(neighbour.0, "[]", "the neighbour fixture compiles");
+    assert_eq!(
+        (hits_after - hits_before, misses_after - misses_before),
+        (0, 1),
+        "an entry with no `[service]` must not be served the service world \
+         (`std::rpc` is loaded there and nowhere in this entry's own seeds)"
+    );
+    vilan_core::analyzer::base_cache_clear();
 }

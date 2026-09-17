@@ -43870,6 +43870,23 @@ impl<'src> Analyzer<'src> {
     /// nothing is committed, defaulted, or diagnosed — constraints the
     /// entry may still bind stay open for the final build to finish.
     fn resolve_world(&mut self) {
+        // M73's instrument: the sub-split of this pass, printed on the
+        // `[vilan phase]` line when `VILAN_PHASE_TIMING` asks — the same
+        // treatment `const-lower`/`const-interp` give the const pass (N43),
+        // and for the same reason. `base` says how long the pre-entry resolve
+        // took and `build` how long the post-entry one did, and neither says
+        // WHICH of this function's eleven stages the time is in; M70 left the
+        // question open by attributing an open module's 150 ms to "the
+        // preludes, the `use` drain and the constraint fixpoint", and the
+        // first reading taken through this split says the preludes and the
+        // drain are 0.0 ms and the fixpoint is all of it. A reader should be
+        // able to take that reading without patching the compiler.
+        //
+        // Off, this is one cached `bool` load and nothing else; on, eleven
+        // `Instant::now()` calls per pass, which is noise next to the pass.
+        let split_on = crate::phase_timing_enabled() && !crate::macros::in_macro_world();
+        let mut split_mark = crate::PhaseClock::now();
+        let mut split: Vec<(&'static str, std::time::Duration)> = Vec::new();
         // Resolve imports/re-exports to a fixpoint: a re-export may name an item
         // bound by another re-export resolved in a later pass (a chain of relay
         // modules), so keep retrying the unresolved ones until a pass binds
@@ -43907,8 +43924,16 @@ impl<'src> Analyzer<'src> {
         // explicit import of a prelude name is already in the scope that
         // `or_insert` must yield to) and before any name resolves against a
         // scope (so nothing has memoized a lookup the prelude would change).
+        if split_on {
+            split.push(("imports", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         self.seed_preludes();
 
+        if split_on {
+            split.push(("preludes", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         // --- Resolve `use` statements ---
         // `use Namespace::{ a, b }` binds items out of a namespace — a module,
         // an enum (whose namespace holds its variants) or a struct (whose
@@ -44038,6 +44063,10 @@ impl<'src> Analyzer<'src> {
             self.attribute_new_diagnostics(use_diagnostics_before, source_id);
         }
 
+        if split_on {
+            split.push(("use-drain", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         // --- Deferred binder-bound inheritance --- an `impl Wrapper<type T>`
         // walked before `struct Wrapper<T: Greeter>` couldn't see the bound;
         // every declaration exists now, so attach it to the binder's
@@ -44092,6 +44121,10 @@ impl<'src> Analyzer<'src> {
             self.resolve_prepped_local(id, name);
         }
 
+        if split_on {
+            split.push(("binder-bounds", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         // --- Wire assignments to their variables ---
         // Each assignment targets a (now resolved) local. The assigned value
         // joins the variable's constraint so reassignments are type checked
@@ -44113,6 +44146,10 @@ impl<'src> Analyzer<'src> {
             self.wire_prepped_assignment(target_id, value_id);
         }
 
+        if split_on {
+            split.push(("locals", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         // B184: every struct's hidden parameters, decided before the first
         // mention resolves — see `resolve_hidden_struct_parameters` for why it
         // cannot ride along in the drain below.
@@ -45355,6 +45392,10 @@ impl<'src> Analyzer<'src> {
             }
         }
 
+        if split_on {
+            split.push(("types", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         // --- Check trait conformance for `impl Subject with Trait` ---
         for check in std::mem::take(&mut self.prepped_trait_impls) {
             let trait_id = match self.try_get_expr_id_by_name(check.trait_name, check.scope_id) {
@@ -45783,6 +45824,10 @@ impl<'src> Analyzer<'src> {
         // world and again after the entry walks — so the answer a constraint
         // acts on is the answer the finished program carries, which is the
         // answer the editor's paint reads back.
+        if split_on {
+            split.push(("conformance", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         self.divergence_leaves = self.compute_divergence_leaves();
 
         // B222: and the guard clauses, decided with those leaves in hand — the
@@ -45828,6 +45873,10 @@ impl<'src> Analyzer<'src> {
             self.wire_prepped_assignment(target_id, value_id);
         }
 
+        if split_on {
+            split.push(("divergence+guards", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         // --- Resolve `context` clauses (ambient-owner.md §5, B242, B309) ---
         // after the import fixpoint (a clause may name an imported context) and
         // BEFORE the fixpoint below, so the clause a closure type carries is
@@ -45835,6 +45884,10 @@ impl<'src> Analyzer<'src> {
         // performs.
         self.resolve_context_clauses();
 
+        if split_on {
+            split.push(("contexts", split_mark.elapsed()));
+            split_mark = crate::PhaseClock::now();
+        }
         // --- Constraint solving loop ---
         // A true fixpoint: each pass resolves the constraints whose dependencies
         // have landed (their blocked dependents resolve on later passes), in
@@ -45927,6 +45980,14 @@ impl<'src> Analyzer<'src> {
             if fruitless_backstops >= 2 {
                 break;
             }
+        }
+        if split_on {
+            split.push(("fixpoint", split_mark.elapsed()));
+            let stages: Vec<String> = split
+                .iter()
+                .map(|(name, duration)| format!("{name} {:.1}ms", duration.as_secs_f64() * 1000.0))
+                .collect();
+            eprintln!("[vilan phase] resolve_world {}", stages.join(" "));
         }
     }
 
@@ -54668,8 +54729,9 @@ fn base_cache_store(key: BaseCacheKey, world: &World<'_>) {
     // namespace display names go through it too, and the three entry slots
     // (the only places entry-borrowed data ever lands before the entry walk)
     // were just emptied. The store path is additionally gated on
-    // `base_cacheable` (no services, no macro-DEFINING entry text), so no
-    // other entry-derived state exists in the world.
+    // `base_cacheable` (no macro-DEFINING entry text), and the entry's own
+    // expansion is hoisted past this store (§6.13), so no other entry-derived
+    // state exists in the world.
     let static_world: World<'static> = unsafe { std::mem::transmute(scrubbed) };
     // Backlog M11: this map is the compiler's largest per-process retention
     // and the tally could not see it. Record what the world is worth on the
@@ -55088,8 +55150,10 @@ fn analyze_inner<'src>(
     // names, its `pkg::` sibling set and package root, the workspace, the
     // expansion budgets) whenever the entry brings no world-entangling
     // features. The bypass list is conservative and syntactic where it must
-    // be: `[service]` blocks and macro-DEFINING text expand inside the
-    // world-building loop, so such entries build fresh and are never stored.
+    // be: macro-DEFINING text expands inside the world-building loop, so such
+    // entries build fresh and are never stored. `[service]` USED to bypass too
+    // (M72) — it expands like any other attribute, after the store, and the one
+    // module it seeds (`std::rpc`) is in the key.
     // `pkg::` siblings USED to bypass too (M21) — they load inside the loop,
     // which is a reason to key on them, not a reason to refuse: they are in
     // the key above and content-validated per hit like every other loaded
@@ -55132,6 +55196,16 @@ fn analyze_inner<'src>(
                     .map(|module| seed_module(&std_roots, module)),
             )
             .collect();
+        // M72: and `std::rpc`, which a `[service]` in the entry seeds without
+        // naming (the load loop's `contains_service` push below). Same rule as
+        // B341's desugar seeds, for the same reason: a seed the key omits says
+        // two entries build one world when they build two — and here the world
+        // that differs is the one holding the `service` MACRO, so an entry
+        // wrote no service could be served a world it never asked for and a
+        // service entry could be served one whose registry cannot expand it.
+        if contains_service(&nodes.0) {
+            names.push(seed_module(&std_roots, "rpc"));
+        }
         names.sort();
         names.dedup();
         names
@@ -55214,7 +55288,17 @@ fn analyze_inner<'src>(
     };
     let base_cacheable = allow_cache
         && !entry_is_inside_std
-        && !contains_service(&nodes.0)
+        // M72: `[service]` entries USED to bypass here. The bypass predated
+        // the derive/macro hoist (§6.13): a service expanded inside the
+        // world-building loop, so its generated impls landed in the world the
+        // store would have snapshotted. Since the hoist a cacheable entry's
+        // expansion runs through `expand_entry_over_world` — after the store,
+        // identically on hit and miss — so a service entangles a stored world
+        // no more than a derive USER does. What a service asks of the LOAD is
+        // one module, `std::rpc`, and that is in the key above. The cost of
+        // the bypass was kolt's `store.vl`: a `[service]` entry paying its
+        // package's whole pre-entry world on every keystroke, with 0 hits and
+        // 0 misses because it never consulted the cache at all.
         // Macro-DEFINING entries stay bypassed: their definitions register
         // into the registry the world carries, which would leak one entry's
         // macros into another's analysis (E23's blanked-source entanglement).
@@ -59195,24 +59279,44 @@ fn refuse_imported_member_collisions(
     carried: &[(SourceId, Span, Vec<SourceId>)],
 ) {
     let mut violations: Vec<(Error, SourceId, Option<crate::error::Note>)> = Vec::new();
+    // M75: the three lookups below used to be LINEAR SCANS inside the
+    // collision x importer product, which made this O(collisions x files x
+    // statements): `carried` is one row per import STATEMENT in the whole
+    // program (std's included), `program.implementations` is one row per
+    // `impl` block in it, and both were re-walked four times per pair per
+    // file. Zero on the estate, because the whole function is gated on a
+    // banked collision — and the first real two-package collision in a large
+    // program paid all of it. Each is built ONCE here, in the iteration order
+    // the scan it replaces had, so FIRST-WINS stays first-wins.
+    let importers: Vec<SourceId> = program
+        .source_ranges
+        .iter()
+        .map(|range| range.source)
+        .collect();
+    // (importing file, block's file) -> the span of the FIRST statement in
+    // that file that carried it.
+    let mut carried_at: HashMap<(SourceId, SourceId), Span> = HashMap::default();
+    for (file, span, sources) in carried {
+        for source in sources {
+            carried_at.entry((*file, *source)).or_insert(*span);
+        }
+    }
+    // member id -> the index of the FIRST implementation declaring it.
+    let mut implementation_of_member: HashMap<Id, usize> = HashMap::default();
+    for (index, implementation) in program.implementations.iter().enumerate() {
+        for member_id in implementation.declarations.values() {
+            implementation_of_member.entry(*member_id).or_insert(index);
+        }
+    }
     for collision in collisions {
-        for importer in program
-            .source_ranges
-            .iter()
-            .map(|range| range.source)
-            .collect::<Vec<_>>()
-        {
+        for importer in importers.iter().copied() {
             // The statement that brought each block in. A file DECLARING one of
             // them needs no import for it: its own blocks are always its own.
             let statement_for = |source: SourceId| -> Option<Option<Span>> {
                 if source == importer {
                     return Some(None);
                 }
-                carried
-                    .iter()
-                    .filter(|(file, _, sources)| *file == importer && sources.contains(&source))
-                    .map(|(_, span, _)| Some(*span))
-                    .next()
+                carried_at.get(&(importer, source)).map(|span| Some(*span))
             };
             let (Some(first_at), Some(second_at)) = (
                 statement_for(collision.first_source),
@@ -59224,15 +59328,9 @@ fn refuse_imported_member_collisions(
             // its problem: the export gate and the file's own selectors are
             // asked exactly as a call would ask them.
             let admits = |member_id: Id| -> bool {
-                program
-                    .implementations
-                    .iter()
-                    .find(|implementation| {
-                        implementation
-                            .declarations
-                            .values()
-                            .any(|id| *id == member_id)
-                    })
+                implementation_of_member
+                    .get(&member_id)
+                    .and_then(|index| program.implementations.get(*index))
                     .is_some_and(|implementation| {
                         program
                             .impl_admission
