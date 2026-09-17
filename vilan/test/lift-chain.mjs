@@ -4,6 +4,25 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
+function __force(cell) {
+	if (cell.state === 2) return cell.value;
+	if (cell.state === 1) throw "lazy initialization cycle: `" + cell.name + "`";
+	if (cell.state === 3) throw "lazy `" + cell.name + "` is poisoned: its initializer panicked: " + cell.value;
+	cell.state = 1;
+	try {
+		cell.value = cell.thunk();
+	} catch (failure) {
+		cell.state = 3;
+		cell.value = failure;
+		throw failure;
+	}
+	cell.state = 2;
+	cell.thunk = null;
+	return cell.value;
+}
+function __lazy(name, thunk) {
+	return { name: name, state: 0, value: undefined, thunk: thunk };
+}
 function __parse_i32(text) {
 	const trimmed = text.trim();
 	const value = Number(trimmed);
@@ -60,7 +79,7 @@ function $d(self, fallback) {
 		const x = __clone($e[1]);
 		$f = x;
 	} else {
-		$f = __clone(fallback);
+		$f = __clone(__force(fallback));
 	}
 	return $f;
 }
@@ -71,7 +90,7 @@ function $i(self, fallback) {
 		const x = __clone($j[1]);
 		$k = x;
 	} else {
-		$k = __clone(fallback);
+		$k = __clone(__force(fallback));
 	}
 	return $k;
 }
@@ -82,7 +101,9 @@ if ($b[0] === 1) {
 } else {
 	$c = [ 0, $b[1][0] ];
 }
-console.log($d($c, "?"));
+console.log($d($c, __lazy("fallback", () => {
+	return "?";
+})));
 const $g = find("hit");
 let $h = null;
 if ($g[0] === 1) {
@@ -90,7 +111,9 @@ if ($g[0] === 1) {
 } else {
 	$h = [ 0, $g[1][1].length ];
 }
-console.log($i($h, 0 - 1));
+console.log($i($h, __lazy("fallback", () => {
+	return 0 - 1;
+})));
 const $l = find("miss");
 let $m = null;
 if ($l[0] === 1) {
@@ -98,7 +121,9 @@ if ($l[0] === 1) {
 } else {
 	$m = [ 0, $l[1][0] ];
 }
-console.log($d($m, "?"));
+console.log($d($m, __lazy("fallback", () => {
+	return "?";
+})));
 const $n = find("hit");
 let $o = null;
 if ($n[0] === 1) {
@@ -106,7 +131,9 @@ if ($n[0] === 1) {
 } else {
 	$o = shelf($n[1]);
 }
-console.log($d($o, "?"));
+console.log($d($o, __lazy("fallback", () => {
+	return "?";
+})));
 const $q = find("miss");
 let $r = null;
 if ($q[0] === 1) {
@@ -114,7 +141,9 @@ if ($q[0] === 1) {
 } else {
 	$r = shelf($q[1]);
 }
-console.log($d($r, "?"));
+console.log($d($r, __lazy("fallback", () => {
+	return "?";
+})));
 const $u = to_number("40");
 let $v = null;
 if ($u[0] === 1) {
@@ -149,5 +178,9 @@ if ($A[0] === 0) {
 	$B = console.log(e2);
 }
 $B;
-console.log($d(headline("hit"), "?"));
-console.log($d(headline("miss"), "?"));
+console.log($d(headline("hit"), __lazy("fallback", () => {
+	return "?";
+})));
+console.log($d(headline("miss"), __lazy("fallback", () => {
+	return "?";
+})));

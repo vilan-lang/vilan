@@ -952,3 +952,250 @@ fn a_bare_lazy_says_what_the_form_is() {
         "a lazy binding is `lazy let name: T = <initializer>;`",
     );
 }
+
+// --- §6b, S3: the std retrofit (A103) -------------------------------------
+//
+// Four members take a lazy argument: `Option::expect`, `Option::unwrap_or`,
+// `Result::expect` and `Result::unwrap_or`. Each pin reads the retrofit off
+// BEHAVIOUR — a counting side effect in the argument position, which the eager
+// spelling ran on the happy path and the lazy one does not — because that is
+// the whole of what §6b changed. `unwrap_or_else` stays the explicit form and
+// is pinned unchanged beside them.
+
+/// §6b: "`opt.unwrap_or(expensive())` runs `expensive()` on the `Some` path
+/// too" — no longer. The `Some` path leaves the counter at zero; the `None`
+/// path runs it exactly once.
+#[test]
+fn option_unwrap_or_defers_its_fallback_to_the_none_path() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        mut built = 0;
+
+        fun expensive(): i32 {
+            built += 1;
+            99
+        }
+
+        fun main() {
+            let present: Option<i32> = Some(7);
+            print(present.unwrap_or(expensive()));
+            print(i"built {built}");
+            let absent: Option<i32> = None;
+            print(absent.unwrap_or(expensive()));
+            print(i"built {built}");
+        }
+        "#,
+        "7\nbuilt 0\n99\nbuilt 1\n",
+    );
+}
+
+/// §6b: "New `expect(self, lazy message: str)` lands alongside" — `Option` had
+/// no `expect` at all before the retrofit, and the one it has builds no message
+/// on the `Some` path.
+#[test]
+fn option_expect_builds_its_message_only_on_the_none_path() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        mut built = 0;
+
+        fun why(): str {
+            built += 1;
+            "no row"
+        }
+
+        fun main() {
+            let present: Option<i32> = Some(7);
+            print(present.expect(i"{why()}"));
+            print(i"built {built}");
+        }
+        "#,
+        "7\nbuilt 0\n",
+    );
+}
+
+/// The `None` path forces the message and panics with the author's own text —
+/// the message is a real `str` by the time `panic` sees it, not a cell.
+#[test]
+fn option_expect_panics_with_the_message_it_was_given() {
+    assert_run_panics(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            let name = "ada";
+            let absent: Option<i32> = None;
+            print(absent.expect(i"no row for {name}"));
+        }
+        "#,
+        "no row for ada",
+    );
+}
+
+/// `Result`'s twin of `unwrap_or`: the `Ok` path runs no fallback.
+#[test]
+fn result_unwrap_or_defers_its_fallback_to_the_err_path() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::result::Result::{ self, Ok, Err };
+
+        mut built = 0;
+
+        fun expensive(): i32 {
+            built += 1;
+            99
+        }
+
+        fun main() {
+            let good: Result<i32, str> = Ok(7);
+            print(good.unwrap_or(expensive()));
+            print(i"built {built}");
+            let bad: Result<i32, str> = Err("boom");
+            print(bad.unwrap_or(expensive()));
+            print(i"built {built}");
+        }
+        "#,
+        "7\nbuilt 0\n99\nbuilt 1\n",
+    );
+}
+
+/// `Result`'s twin of `expect`: the `Ok` path builds no message.
+#[test]
+fn result_expect_builds_its_message_only_on_the_err_path() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::result::Result::{ self, Ok, Err };
+
+        mut built = 0;
+
+        fun why(): str {
+            built += 1;
+            "no row"
+        }
+
+        fun main() {
+            let good: Result<i32, str> = Ok(7);
+            print(good.expect(i"{why()}"));
+            print(i"built {built}");
+        }
+        "#,
+        "7\nbuilt 0\n",
+    );
+}
+
+/// The memo, through a std member: `unwrap_or`'s fallback is evaluated at most
+/// ONCE however many times the value is asked for, and a forwarding chain into
+/// it is still one memo (§1's rule reaching std).
+#[test]
+fn a_lazy_std_fallback_forwards_from_a_lazy_parameter_without_forcing() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        mut built = 0;
+
+        fun expensive(): i32 {
+            built += 1;
+            99
+        }
+
+        fun settle(slot: Option<i32>, lazy fallback: i32): i32 {
+            slot.unwrap_or(fallback)
+        }
+
+        fun main() {
+            print(settle(Some(1), expensive()));
+            print(i"built {built}");
+            print(settle(None, expensive()));
+            print(i"built {built}");
+        }
+        "#,
+        "1\nbuilt 0\n99\nbuilt 1\n",
+    );
+}
+
+/// The emission half, which behaviour cannot tell apart: the retrofitted
+/// positions THUNK at the call site (`__lazy`), and the forwarding hop above
+/// passes the cell straight through.
+#[test]
+fn the_retrofitted_std_members_thunk_at_the_call_site() {
+    let source = r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        import std::result::Result::{ self, Ok, Err };
+
+        fun main() {
+            let absent: Option<i32> = None;
+            print(absent.unwrap_or(1));
+            let bad: Result<i32, str> = Err("boom");
+            print(bad.unwrap_or(2));
+            let present: Option<i32> = Some(3);
+            print(present.expect("gone"));
+        }
+        "#;
+    assert_emits_containing(source, "__lazy(\"fallback\", () => {");
+    assert_emits_containing(source, "__lazy(\"message\", () => {");
+}
+
+/// `unwrap_or_else` is untouched by the retrofit (§6b: "`unwrap_or_else`
+/// remains the explicit form"), and a closure argument is not a thunk.
+#[test]
+fn unwrap_or_else_is_not_retrofitted() {
+    let source = r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        mut built = 0;
+
+        fun expensive(): i32 {
+            built += 1;
+            99
+        }
+
+        fun main() {
+            let present: Option<i32> = Some(7);
+            print(present.unwrap_or_else(|| expensive()));
+            print(i"built {built}");
+        }
+        "#;
+    assert_compiles_and_runs(source, "7\nbuilt 0\n");
+    let js = compile(source).expect("a clean compile");
+    assert!(
+        !js.contains("__lazy("),
+        "a closure argument is not a thunk; emitted:\n{js}"
+    );
+}
+
+/// The copy the eager form made is still made: the fallback is evaluated inside
+/// the thunk, but the CLONE stays in the callee, so a `List` fallback hands back
+/// a copy and the caller's binding is untouched (R1). A regression here would be
+/// an aliasing miscompile the differential's prints could not see.
+#[test]
+fn a_list_fallback_is_still_copied_out_of_the_callers_binding() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            mut spare: List<i32> = [];
+            let absent: Option<List<i32>> = None;
+            mut got = absent.unwrap_or(spare);
+            got.push(1);
+            print(i"got {got.len()} spare {spare.len()}");
+            spare.push(9);
+            print(i"got {got.len()} spare {spare.len()}");
+        }
+        "#,
+        "got 1 spare 0\ngot 1 spare 1\n",
+    );
+}
