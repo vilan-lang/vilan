@@ -35,6 +35,28 @@ pub fn default_cache_root() -> PathBuf {
     toolchain_cache("std-cache")
 }
 
+/// Where a READ-ONLY command's on-disk memory lives: `~/.vilan/check-cache`,
+/// beside the std cache and under the same home-directory rules (tracker N92).
+///
+/// `dist/.cache` is the BUILD's (N63, ruled 2026-09-07), and the argument for
+/// it is `rm -rf dist` — one gesture that means "recompile everything, macro
+/// worlds included". `vilan check` emits no artifacts at all, so it has no
+/// `dist/` of its own to keep memory in: writing one created a build directory
+/// in a tree nobody asked to build, and made a command that reads a package
+/// MUTATE it. (`split.rs`'s fixture loader read every entry of its directory
+/// and failed ten tests with `IsADirectory` when one was left behind, which is
+/// how the cost of that showed up.)
+///
+/// So a check's table is keyed by the package's canonical path under this root
+/// instead. The objection N63 raised to a machine-global cache — a stale one is
+/// unreachable to `rm -rf` — is answered by `vilan cache prune`, which sweeps
+/// this root beside the std trees, and by the table's own header, which carries
+/// the toolchain version and a hash of `macro_std` and discards the whole file
+/// when either moves.
+pub fn default_check_cache_root() -> PathBuf {
+    toolchain_cache("check-cache")
+}
+
 /// Where **git dependencies** are cached: `~/.vilan/git-deps`, beside the std
 /// cache and under the same home-directory rules (`home_dir`, below). The
 /// toolchain's `~/.vilan` layout lives in one crate so the CLI and the language

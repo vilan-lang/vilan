@@ -185,6 +185,15 @@ nothing, and runs no `[build] run` hooks. Same path forms and flags
 every entry, each under its own platform. Exit is non-zero when
 diagnostics were reported.
 
+**Writes nothing means nothing.** A check remembers its macro expansions
+across processes — that is what makes a second check of an unchanged package
+compile no macro world at all — and that memory lives under
+`~/.vilan/check-cache/`, keyed by the package's path, *not* in the package.
+`dist/.cache` belongs to `vilan build`, which has a `dist/` because it has
+artifacts; a check has neither, and creating one would make a read-only
+command mutate the tree it was pointed at. `vilan cache prune` sweeps the
+check tables beside the std trees.
+
 One thing it does that `build` does not: when the file has a **syntax
 error**, `check` reports it and then type-checks the rest of the file
 anyway. The parser recovers at the next statement or item boundary, so a
@@ -691,7 +700,8 @@ a newer release exists and changes nothing.
 
 ## `vilan cache prune`
 
-Deletes materialized std trees no binary can use any more.
+Deletes materialized std trees no binary can use any more, and the macro
+expansion tables `vilan check` keeps beside them.
 
 An installed `vilan` carries its standard library inside the binary and
 writes it out once, to `~/.vilan/std-cache/<content hash>/`, so the
@@ -714,3 +724,12 @@ vilan cache prune --all      # every entry, guard and all
 
 The tree this binary itself uses is never deleted, `--all` included: the
 next command would write it straight back.
+
+Two roots are swept, and each reports its own line. `~/.vilan/std-cache/`
+is the one above. `~/.vilan/check-cache/` holds one macro expansion table
+per package a `vilan check` has warmed — the same content-keyed, stamped
+file `vilan build` keeps in `dist/.cache`, put where a command that emits
+nothing can keep memory without writing into your tree. Deleting a table
+costs a recompile of that package's macro worlds and nothing else; the
+same seven-day guard applies, because a check running right now is holding
+its own table open.
