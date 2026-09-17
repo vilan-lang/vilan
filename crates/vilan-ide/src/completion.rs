@@ -762,15 +762,7 @@ impl Analysis<'_, '_> {
                     })
                     .collect()
             }
-            // E183 widens this to every reachable `impl Style` method; the
-            // rename is A101's, because a dotted head takes a chain LINK too.
-            CssPosition::DottedHead => STYLE_CONDITION_METHODS
-                .iter()
-                .filter(|(condition, _)| *condition != "element")
-                .map(|(condition, _)| {
-                    Completion::bare((*condition).to_string(), CompletionKind::Method)
-                })
-                .collect(),
+            CssPosition::DottedHead => self.css_dotted_head_completions(),
             // The same rows, as the free CONSTRUCTORS a set is summed from. They
             // are functions here and methods above, which is exactly the
             // difference between `hover()` (the condition) and `.hover { … }`
@@ -787,6 +779,76 @@ impl Analysis<'_, '_> {
             // the same reason — nothing in scope is a custom property.
             CssPosition::CustomProperty => Vec::new(),
         }
+    }
+
+    /// E183: every `impl Style` method the file can reach, at the dotted head.
+    ///
+    /// The combinators come FIRST, because a dotted head is most often a
+    /// condition rule and the fourteen rows are the vocabulary the block's own
+    /// grammar is shaped around. Then every OTHER method on `Style` — std's
+    /// non-condition members (`raw`, `on`, the typed property methods) and the
+    /// program's own extensions, which is what an app actually writes there:
+    /// kolt's `script_label` in `theme.vl`, its `flex_row` a few lines up
+    /// `styles.vl`. The table the members come from is the analyzed IMPL TABLE,
+    /// the one source that already knows both halves — so this cannot drift
+    /// from what a call at the same position would resolve to, and the
+    /// playground reaches it unchanged.
+    ///
+    /// The B318 visibility bit is read off the impl BLOCK, which is what
+    /// `export impl` marks, under the uncurated-module exemption: a module that
+    /// has curated nothing offers everything, exactly as `Analyzer::
+    /// is_exported_in` decides it everywhere else.
+    ///
+    /// Insertion: a nested-rule entry opens a body (`.hover() { }` — the head's
+    /// own parens, then the block), a plain method ends its item (`.raw();`),
+    /// because those are the two shapes the grammar admits after a dotted head.
+    fn css_dotted_head_completions(&self) -> Vec<Completion> {
+        let program = self.program;
+        let mut items: Vec<Completion> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for (condition, _) in STYLE_CONDITION_METHODS
+            .iter()
+            .filter(|(condition, _)| *condition != "element")
+        {
+            seen.insert((*condition).to_string());
+            let mut completion = Completion::bare((*condition).to_string(), CompletionKind::Method);
+            completion.insert = Some(InsertText {
+                text: format!("{condition}() {{ }}"),
+                is_snippet: false,
+            });
+            items.push(completion);
+        }
+        let Some(style_id) = self.nominal_id_by_name("Style") else {
+            return items;
+        };
+        for implementation in &program.implementations {
+            if nominal_type_id(program, implementation.subject) != Some(style_id) {
+                continue;
+            }
+            if program
+                .curated_modules
+                .contains(&implementation.module_scope)
+                && !program.exported_entities.contains(&implementation.impl_id)
+            {
+                continue;
+            }
+            for (name, member_id) in &implementation.declarations {
+                if !seen.insert((*name).to_string()) {
+                    continue;
+                }
+                let mut completion =
+                    self.entity_completion((*name).to_string(), *member_id, CompletionKind::Method);
+                // A dotted head is a call in progress, so the shaping post-pass
+                // must not add a second pair of parens on top of this one.
+                completion.call_parameters = None;
+                completion.insert = Some(InsertText {
+                    text: format!("{name}();"),
+                    is_snippet: false,
+                });
+                items.push(completion);
+            }
+        }
+        items
     }
 }
 

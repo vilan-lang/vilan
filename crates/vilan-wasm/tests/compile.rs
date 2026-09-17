@@ -705,6 +705,31 @@ fn member_completion_answers_from_the_retained_analysis() {
     );
 }
 
+/// E183, on the playground: the `css` block's dotted head is `vilan-ide`'s
+/// answer, so the page reaches it unchanged — the combinators first, then every
+/// `impl Style` method the program declares, out of the analyzed impl table the
+/// last compile retained.
+#[test]
+fn css_dotted_head_completion_reaches_the_playground() {
+    let compiled = "import std::style::{ Style, style };\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.raw(\"font-family\", \"monospace\")\n\t}\n}\n\nfun main() {\n\tlet card = css {\n\t};\n}\n";
+    let live = compiled.replace(
+        "\tlet card = css {\n\t};",
+        "\tlet card = css {\n\t\t.\n\t};",
+    );
+    let items = complete_after(compiled, &live, 10, 3);
+    let offered = labels(&items);
+    for method in ["hover", "md", "script_label", "raw"] {
+        assert!(
+            offered.contains(&method),
+            "`{method}` missing at the dotted head: {offered:?}"
+        );
+    }
+    assert!(
+        !offered.contains(&"flex-direction"),
+        "a dotted item is never a property: {offered:?}"
+    );
+}
+
 /// Import-path completion with no filesystem: `import std::` enumerates the
 /// embedded toolchain's modules out of the document overlay (the
 /// `modules_in_root` overlay listing, pinned in core), plus the names std's

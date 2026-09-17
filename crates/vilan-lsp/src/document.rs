@@ -14031,6 +14031,96 @@ pub(crate) mod tests {
         );
     }
 
+    // E183: the dotted head is not only the fourteen combinators. Every
+    // `impl Style` method the file can reach is offered there, because that is
+    // what the grammar admits after the dot (A69's chain link) and what an app
+    // actually writes — the vocabulary comes from the analyzed IMPL TABLE, so
+    // it cannot drift from what a call at the same position would resolve to.
+    #[test]
+    fn e183_the_dotted_head_offers_a_user_impl_style_method() {
+        let labels = css_block_completions(
+            "}\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.raw(\"font-family\", \"monospace\")\n\t}\n}\n\nfun card() {\n\tlet card = css {\n\t\t.~\n\t};\n",
+        );
+        assert!(
+            labels.contains(&"script_label".to_string()),
+            "the file's own `impl Style` method: {labels:?}"
+        );
+        // std's non-condition members reach it too — `raw` and `on` are exactly
+        // what the position admitted and never offered.
+        for method in ["raw", "on", "padding"] {
+            assert!(
+                labels.contains(&method.to_string()),
+                "`{method}` is a `Style` method: {labels:?}"
+            );
+        }
+        // The combinators still come FIRST: a dotted head is most often a
+        // condition rule, and the fourteen rows are the block's own vocabulary.
+        let last_condition = ["hover", "md", "within", "children"]
+            .iter()
+            .filter_map(|name| labels.iter().position(|label| label == name))
+            .max()
+            .expect("the combinators are offered");
+        let first_other = ["script_label", "raw", "padding"]
+            .iter()
+            .filter_map(|name| labels.iter().position(|label| label == name))
+            .min()
+            .expect("the other methods are offered");
+        assert!(
+            last_condition < first_other,
+            "the combinators come first: {labels:?}"
+        );
+        // And a property name is still not offered at a DOTTED head.
+        assert!(
+            !labels.contains(&"flex-direction".to_string()),
+            "a dotted item is never a property: {labels:?}"
+        );
+    }
+
+    // E175's reach, at the dotted head: a sibling file's `impl Style` is in the
+    // same analyzed impl table, so the popup finds it with no extra reading.
+    #[test]
+    fn e183_the_dotted_head_reaches_a_sibling_files_impl_style() {
+        let source = "import std::style::{ Style, style };\nimport pkg::theme;\n\nfun card() {\n\tlet card = css {\n\t\t.~\n\t};\n}\n";
+        let sibling = "import std::style::{ Style, style };\n\nexport impl Style {\n\tfun themed(self): Style {\n\t\tself.raw(\"color\", \"red\")\n\t}\n}\n";
+        let offset = source.find('~').expect("a cursor");
+        let text = source.replace('~', "");
+        let (directory, document) = analyze_workspace(&[("main.vl", &text), ("theme.vl", sibling)]);
+        let labels: Vec<String> = document
+            .completion(offset)
+            .into_iter()
+            .map(|completion| completion.label)
+            .collect();
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(
+            labels.contains(&"themed".to_string()),
+            "a sibling's `impl Style` method: {labels:?}"
+        );
+    }
+
+    // The insertion, which is the shape the grammar takes after a dotted head:
+    // a combinator opens a BODY, a plain method ends its ITEM.
+    #[test]
+    fn e183_the_dotted_head_inserts_the_shape_the_grammar_takes() {
+        let source = format!(
+            "{CSS_BLOCK_PRELUDE}impl Style {{\n\tfun script_label(self): Style {{\n\t\tself.raw(\"font-family\", \"monospace\")\n\t}}\n}}\n\nfun card() {{\n\tlet card = css {{\n\t\t.~\n\t}};\n}}\n"
+        );
+        let offset = source.find('~').expect("a cursor");
+        let text = source.replace('~', "");
+        let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
+        let candidates = document.completion(offset);
+        let insert = |label: &str| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.label == label)
+                .unwrap_or_else(|| panic!("no `{label}` offered"))
+                .insert
+                .as_ref()
+                .map(|insert| insert.text.clone())
+        };
+        assert_eq!(insert("hover"), Some("hover() { }".to_string()));
+        assert_eq!(insert("script_label"), Some("script_label();".to_string()));
+    }
+
     // §7.1's new row (A95 S3): inside an `.on(<set>)` head the vocabulary is the
     // condition VALUES — the same rows the combinator list reads, as the free
     // constructors a set is summed from. The head's arguments are ordinary
