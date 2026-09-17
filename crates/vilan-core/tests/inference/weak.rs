@@ -509,3 +509,48 @@ fn a_read_through_an_upgraded_handle_copies_like_every_other_read() {
         "upgraded=1\ndirect=1\n",
     );
 }
+
+// --- The const channel needs no arm of its own -------------------------------
+
+#[test]
+fn a_weak_handle_works_in_the_const_interpreter() {
+    // The const-eval interpreter evaluates the EMITTED JavaScript, and `Weak`'s
+    // three intrinsics lower to shapes it already knows — an array literal
+    // (`[ 0, cell ]`) and a property read (`cell.v`) — so unlike `Shared::new`
+    // and `Shared::identity`, neither needs a runtime helper or an interpreter
+    // arm. Pinned in both directions, because "no arm was needed" is a claim
+    // about behaviour and not about a line of code that is not there.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ None, Some };
+        import std::shared::{ Shared, Weak };
+
+        const fun through_upgrade(): i32 {
+            let cell: Shared<i32> = Shared::new(7);
+            let weak: Weak<i32> = cell.downgrade();
+            match weak.upgrade() {
+                Some(let live) => live.read() + 1,
+                None => 0,
+            }
+        }
+
+        const fun through_get(): i32 {
+            let cell: Shared<List<i32>> = Shared::new([1, 2, 3]);
+            let weak: Weak<List<i32>> = cell.downgrade();
+            match weak.get() {
+                Some(let view) => (*view).len(),
+                None => 0,
+            }
+        }
+
+        const let upgraded: i32 = through_upgrade();
+        const let counted: i32 = through_get();
+
+        fun main() {
+            print(i"{upgraded} {counted}");
+        }
+        "#,
+        "8 3\n",
+    );
+}
