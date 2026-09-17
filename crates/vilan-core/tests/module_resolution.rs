@@ -7077,3 +7077,65 @@ fn b335_a_module_owning_a_file_and_a_directory_reports_its_own_file() {
         "a duplicate one-id range would demote `source_lookup`"
     );
 }
+
+// --- B349/B350: the module-level seam, and the redundant impl marker --------
+
+/// B349's fixture: §3.5's monomorphization exhibit with the call moved to a
+/// MODULE-LEVEL binding — `a.vl` admits only `ext.vl`'s `Boxed<i32>` block, and
+/// the entry instantiates `a.vl`'s generic at `Boxed<str>` from a top-level
+/// `let`, which is the statement position `current_admitting_file` had no
+/// writer for.
+fn module_level_files(a_selector: &str, entry_selector: &str) -> Vec<(&'static str, String)> {
+    let mut files = monomorphization_files(a_selector, entry_selector);
+    files.retain(|(name, _)| *name != "c.vl");
+    files.push((
+        "c.vl",
+        format!(
+            concat!(
+                "import pkg::a::label;\nimport pkg::item::Boxed;\n",
+                "import pkg::ext::{{ (impl {entry_selector}) }};\n\n",
+                "let top = label(Boxed::make(\"a\"));\n\n",
+                "fun main() {{\n\tlet _ = top;\n}}\n",
+            ),
+            entry_selector = entry_selector
+        ),
+    ));
+    files
+}
+
+fn transform_module_level(a_selector: &str, entry_selector: &str) -> Result<String, String> {
+    let owned = module_level_files(a_selector, entry_selector);
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    transform_package(&files, "c.vl", Platform::default())
+}
+
+/// **B349 — a MODULE-LEVEL body resolves under a file, and §3.5's rule reaches
+/// it.** The transformer's `current_admitting_file` had exactly one writer,
+/// `enter_instance`, which is a FUNCTION-body seam: a top-level initializer
+/// walked under `None`, and `None` means "no file restricts anything". It was
+/// harmless in the estate — a module binding sits in the file that declares it,
+/// and that file admits its own blocks — so this pin is the WALL rather than a
+/// program that changed: it says a module-level call through a
+/// selector-restricted import is refused, exactly as the same call inside
+/// `main` is.
+#[test]
+fn b349_a_module_level_initializer_obeys_the_declaring_files_selector() {
+    let refused = transform_module_level("Boxed<i32>", "Boxed<str>")
+        .expect_err("a module-level call must not escape `a.vl`'s own selector");
+    assert!(
+        refused.contains("'tag' is provided by an `impl` in module `ext`")
+            && refused.contains("module `a` does not admit it"),
+        "the refusal should name the member and the declaring module: {refused}"
+    );
+    // The control, one selector wider: `a.vl` admitting both blocks emits the
+    // same module-level binding.
+    let emitted = transform_module_level("Boxed<_>", "Boxed<str>")
+        .expect("`a.vl` admitting both blocks resolves its own body");
+    assert!(
+        emitted.contains("function"),
+        "expected an emitted program: {emitted}"
+    );
+}

@@ -87,7 +87,11 @@ pub fn transform_functions<'src>(
     // The macro world emits the same `const` declarations as a normal build, so
     // it needs the same initialization order (`b33-emission-order.md` §4).
     let global_variables = crate::init_order::initialization_order(program, program.call_graph());
-    let t_global_variables = transformer.walk_list(&global_variables);
+    // B349: each binding under ITS OWN declaring file, as `assemble` does.
+    let t_global_variables: Vec<js::Node<'src>> = global_variables
+        .iter()
+        .flat_map(|&binding| transformer.walk_module_binding(binding))
+        .collect();
 
     let mut names = HashMap::default();
     for root in roots {
@@ -2886,7 +2890,7 @@ impl<'src> Transformer<'src> {
         let binding_nodes: Vec<(Id, Vec<js::Node<'src>>)> = global_variables
             .iter()
             .filter(|binding| reachable_bindings.contains(binding))
-            .map(|&binding| (binding, self.walk_list(&[binding])))
+            .map(|&binding| (binding, self.walk_module_binding(binding)))
             .collect();
 
         let saved_instance = self.enter_instance(main_fn.id, Vec::new());
@@ -3409,6 +3413,30 @@ impl<'src> Transformer<'src> {
                 Box::new(value),
             )),
         }
+    }
+
+    /// One MODULE-LEVEL binding, walked under the file that DECLARES it
+    /// (B349, `visibility.md` §3.5).
+    ///
+    /// `current_admitting_file` had exactly one writer — `enter_instance`, a
+    /// FUNCTION-body seam — so a top-level initializer resolved its members
+    /// under `None`, which is "no file restricts anything": every impl in the
+    /// program was admissible from a module-level `let`, however narrow the
+    /// declaring file's own `(impl ..)` selector was. It was harmless in the
+    /// estate only because a module binding sits in the file that declares it
+    /// and that file admits its own blocks — a coincidence of where the code
+    /// is written, not the rule §3.5 states — and a binding whose initializer
+    /// calls a GENERIC whose body needs an impl the declaring file does not
+    /// admit went through the hole.
+    ///
+    /// `admitting_file` answers `None` when nothing in the program restricts
+    /// anything, so a program with no selector walks exactly as before.
+    fn walk_module_binding(&mut self, binding: Id) -> Vec<js::Node<'src>> {
+        let file = self.program.admitting_file(binding);
+        let saved = std::mem::replace(&mut self.current_admitting_file, file);
+        let nodes = self.walk_list(&[binding]);
+        self.current_admitting_file = saved;
+        nodes
     }
 
     fn walk_list(&mut self, list: &[Id]) -> Vec<js::Node<'src>> {
