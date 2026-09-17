@@ -4498,7 +4498,7 @@ mod snapshot_consistency_tests {
     async fn the_css_spelling_refactor_is_offered_through_the_real_handler() {
         let (service, _socket) = backend();
         let backend = service.inner();
-        let source = "import std::style::{ Style, style };\n\nfun card(): Style {\n\tcss {\n\t\tdisplay: flex;\n\t}\n}\n";
+        let source = "import std::style::{ Style, style };\n\nfun card(): Style {\n\tcss {\n\t\tdisplay(\"flex\");\n\t}\n}\n";
         let (_dir, document) = crate::document::tests::analyze_workspace(&[("main.vl", source)]);
         let cursor = document
             .line_index

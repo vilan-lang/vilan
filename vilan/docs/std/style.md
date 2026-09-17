@@ -206,6 +206,27 @@ Pass the value, not its text: `space(4).text` is the string
 `var(--space-4)` with the declaration left behind, and a `str` carries no
 token.
 
+Two free functions sit beside `raw`, both ambient inside a `css` block:
+
+```vilan,fragment
+fun var(name: str): str             // a custom property READ: var("--brand-ink")
+fun piece<V: CssPiece>(value: V): str   // one part of a value built by hand
+```
+
+`var` is how a declaration reads a custom property — `--brand-ink` is not
+an expression, so CSS's `var(--x)` is spelled with the name as a string,
+and the dashes are checked (a name without them is not a reference at
+all). `Length::var` and `Color::var` are the same thing at those two
+types, for a position that wants the type.
+
+`piece` renders one part of a value and puts its `:root` line on the
+sheet on the way past — `CssPiece` is `CssValue`'s twin over `str`,
+`Length`, `Color` and the numbers, because a part sits inside text that
+supplies the unit while a whole value must carry its own. A declaration
+with SEVERAL arguments joins them with a space through `piece`
+automatically; write it yourself only where the parts are glued:
+`padding(i"calc({piece(space(4))} + 2px)");`.
+
 ## Conditions
 
 A condition is a **value**, and a set of them is the same value. `on` puts a
@@ -219,7 +240,8 @@ fun on<C: IntoConditions>(self, conditions: C, inner: Style): Style
 ### The condition values
 
 Free functions in `std::style` (and in `std::style::prelude`, which is ambient
-inside a `css` block):
+inside a `css` block, along with `var`, `piece`, the `Length`/`Color`
+constructors and `s()`):
 
 ```vilan,fragment
 fun hover(): Condition          // :hover

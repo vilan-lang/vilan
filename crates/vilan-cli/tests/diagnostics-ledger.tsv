@@ -479,7 +479,6 @@ row	flagship	key
 454	-	an `import`/`use` path is `::`-separated NAMES, ending in a name or a `{ a, b }` set, with an optional `as` alias on the leaf — `import pkg::a::{ b, c as d };` — and this token begins none of those
 455	-	`export` takes an ITEM — a `fun`, `struct`, `enum`, `trait`, `impl`, `mod`, a module-level `let`, or an `import`/`use` to re-export (`export import pkg::io::print;`) — plus `*;` for the whole module and a `(in PATH)` scope before any of them (`export(in pkg) fun f()`): an expression is none of those, and publishes nothing, checks nothing and emits nothing
 456	-	`{type}` {position}. `{item}` is exported, but `{type}` is not. A consumer can {verb} `{item}` but cannot name {noun}.
-457	flagship	`#` is not a colour here: in a `css` block a colour is a hole — `color: {Color::hex("#333")};` — which routes it through the `Color` type that carries its own `:root` line
 458	-	`{path}` is not exported by `{module}`. Importing it anyway is allowed — mark the reach: `import {module}::{ #{leaf} };`
 459	-	`{module}` exports `{leaf}`, so the reach marker is redundant — delete the `#`
 460	-	`[doc(hidden)]` is superseded by visibility: an item its module does not `export` is already reachable and absent from completion, which is the whole of what this marker meant — delete it, and write `export` on the names consumers are meant to find
@@ -567,3 +566,4 @@ row	flagship	key
 542	-	`[derive({name})]` could not expand: this toolchain has no `macro_std` beside its `std`, so std's own `{module}` never registered its `{name}` macro — `std` is at `{}`, and `macro_std` was looked for at `{}`
 543	-	`[service]` could not expand: this toolchain has no `macro_std` beside its `std`, so std::rpc's `service` macro never registered — `std` is at `{}`, and `macro_std` was looked for at `{}`
 544	-	this instantiates `{callee}`'s `lazy` parameter `{name}` at {at}: a lazy argument is carried by a thunk, and a thunk owning a resource is what R9 forbids
+545	flagship	a `css` declaration is a CALL: write `padding(space(4));`, not `padding: space(4);`. The property is the name and its value is ordinary vilan expressions, so a typed value needs no `{ }` hole — and several arguments join with one space, as CSS's own value lists do (`margin(px(4), px(8))`)

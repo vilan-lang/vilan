@@ -669,20 +669,45 @@ export impl Color with CssPiece {
 	}
 }
 
-/// One hole of a multi-piece `css` value: its text, with its `:root` line put
-/// on the sheet on the way past.
+/// One piece of a multi-argument `css` value: its text, with its `:root` line
+/// put on the sheet on the way past.
 ///
-/// This is what a `css` block's mixed value lowers each of its holes to, so
-/// `border: 1px solid {Color::gray(500)};` emits `1px solid var(--gray-500)`
-/// AND `:root{--gray-500:#6b7280}` — the token discipline the single-hole
-/// path has always had, reaching the position that had no correct spelling at
-/// all. Compile-time only, like every other emitter here.
+/// This is what a `css` declaration's arguments lower through when there are
+/// several of them (A101 R10), so `border("1px solid", Color::gray(500));`
+/// emits `1px solid var(--gray-500)` AND `:root{--gray-500:#6b7280}` — the
+/// token discipline the one-argument path has always had, reaching the position
+/// that had no correct spelling at all. Compile-time only, like every other
+/// emitter here.
 export fun piece<V: CssPiece>(value: V): str {
 	let root = value.piece_root();
 	if root != "" {
 		emit("css", root);
 	}
 	value.piece_text()
+}
+
+/// A CUSTOM PROPERTY read as a whole value — `color(var("--brand-ink"));`
+/// (A101 R12).
+///
+/// A declaration's arguments are ordinary vilan expressions, and `--brand-ink`
+/// is not one: the dashes are operators and the name is a keyword or an
+/// identifier, so CSS's own `var(--x)` has no expression spelling. It is a
+/// STRING here, which is what CSS's grammar makes it anyway — `var()` takes a
+/// custom-property name, not a value.
+///
+/// A `str`, and deliberately not a `Length` or a `Color`: a reference declares
+/// no token (`root` would be `""` either way — see `Length::var`'s own note),
+/// and a value with no unit of its own is exactly what "a complete CSS value,
+/// written verbatim" means. `Length::var` and `Color::var` stay for the
+/// positions that want the TYPE — a `Length` arithmetic site, a `Color::alpha`
+/// call.
+///
+/// The name carries its dashes, checked here as everywhere else (A90):
+/// `var("button-color")` is not a broken reference, it is not a reference at
+/// all, and nothing says so until the page renders wrong.
+export fun var(name: str): str {
+	check_custom_property_name(name);
+	i"var({name})"
 }
 
 // --- keyword properties ---------------------------------------------------------

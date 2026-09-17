@@ -434,15 +434,13 @@ child        = element | STRING | ISTRING | "{" expression "}" ;
 css-block    = "css" css-body ;        (* atom position; excluded in conditions *)
 css-body     = "{" { css-item } "}" ;
 css-item     = css-declaration | css-rule | css-link ;
-css-declaration = css-property ":" css-value ";" ;
+css-declaration = css-property "(" [ expression { "," expression } [ "," ] ]
+               ")" ";" ;               (* a CALL: the property is the name *)
 css-property = { "-" } element-name ;  (* span-adjacent, as an element name is *)
 css-rule     = "." IDENT [ "(" [ expression { "," expression } [ "," ] ] ")" ]
                css-body ;
 css-link     = "." IDENT [ "(" [ expression { "," expression } [ "," ] ] ")" ]
                ";" ;                   (* a chain link, verbatim *)
-css-value    = css-piece { css-piece } ;   (* to the ";" at brace depth 0 *)
-css-piece    = "{" expression "}"          (* a hole *)
-             | TOKEN ;                     (* any token but ";", "{", "}" *)
 ```
 
 `Name<Args>` is read as a generic path head only when `::` immediately
@@ -512,20 +510,25 @@ empty argument list are the same call, so `.ghost;` and `.ghost();`
 both mean `.ghost()`. A property name is a
 span-adjacent name-`-`-name run, the element-name rule (so
 `flex-direction` is three tokens and `--color-ink` is five, while
-`data - id` is arithmetic). The `;` is **required** after every
-declaration, the last one included: the formatter may never invent a
-token, and a required terminator makes value scanning decidable in one
-pass. A value is a run of tokens and `{expression}` holes — there is no
-typed value grammar, and typed values arrive through the holes. A
-condition rule's parenthesized arguments are ordinary expressions
+`data - id` is arithmetic). A declaration is a **call**: the property is
+the name and the value is its ordinary vilan expression arguments
+(`outline("none");`, `width(pct(100));`, `--brand-ink(gray(900));`), so
+there is no value grammar and no `{expression}` hole — a typed value is
+simply an argument, checked where the type system already lives. SEVERAL
+arguments are ONE value joined by a single space, CSS's own list
+separator (`margin(px(4), px(8))` is `margin:4px 8px`). The `;` is
+**required** after every declaration, the last one included: the
+formatter may never invent a token. A condition rule's parenthesized
+arguments are ordinary expressions
 (`.on(within(attribute("data-theme").eq("dark")) + hover()) { … }`).
 
 Like an element, a block is an ordinary expression that desugars before
 analysis — to the `std::style` chain: `style()`, then `.raw(property,
 value)` per declaration and `.name(args…, style() … )` per condition
 rule, with the rule's own chain appended as the final argument, in
-written order. `#` and `@` do not lex at all, so there are no hex
-literals and no at-rules inside one (lexical spec §2.4).
+written order. `@` does not lex at all, so there are no at-rules inside
+one (lexical spec §2.4); `#` lexes (it is the import reach marker) but
+begins no expression, so there are no hex literals either.
 
 ## 3.7 Operator precedence
 

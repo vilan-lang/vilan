@@ -262,8 +262,14 @@ impl CssItem<'_> {
     }
 }
 
-/// `property: value;` — one declaration, lowering to exactly one
+/// `property(value);` — one declaration, lowering to exactly one
 /// `.raw(property, value)` call (§5.2).
+///
+/// A101: a declaration is a CALL, the strategy element syntax took for
+/// attributes (`type("checkbox")`). The property keeps its hyphenated CSS name
+/// and its ARGUMENTS are ordinary vilan expressions — so there is no value
+/// grammar, no `{ }` hole and no CSS token soup, and the type system decides
+/// what a value means exactly where it already lives.
 #[derive(Debug)]
 pub struct CssDeclaration<'src> {
     /// The property name's SPAN, not a slice: a hyphenated or custom property
@@ -271,26 +277,16 @@ pub struct CssDeclaration<'src> {
     /// joined text, and the parser has no source access — the desugar slices
     /// it where the source is in scope, exactly as an element's tag name is.
     pub property: Span,
-    pub value: Vec<CssValuePiece<'src>>,
-    /// The value's whole extent, `:` exclusive and `;` exclusive. The slice
-    /// the mixed-value row of §5.2's table renders, and the anchor a
-    /// wrong-typed value reports at.
-    pub value_span: Span,
+    /// The declaration's arguments, ordinary vilan expressions. ONE argument
+    /// is the value and passes through to `raw` untouched, keeping its type
+    /// and its `:root` line; N are joined by a single space — CSS's own list
+    /// separator (A101 R10) — so `margin(px(4), px(8))` is `margin:4px 8px`.
+    pub arguments: Vec<Spanned<Node<'src>>>,
+    /// The argument list's `( … )` span: the anchor a wrong-typed value
+    /// reports at, and the extent the joined value's generated node takes.
+    pub parens: Span,
     /// The declaration's own span, `;` inclusive.
     pub span: Span,
-}
-
-/// One piece of a declaration's value: a `{expr}` hole, or a run of source
-/// text between holes. A value is a TOKEN RUN, not a typed grammar — typed
-/// values arrive through holes, which is where the type system already lives
-/// (§10).
-#[derive(Debug)]
-pub enum CssValuePiece<'src> {
-    /// `{expression}` — the hole's expression, and the span of the whole
-    /// `{…}` including its braces (what a reprint has to reproduce).
-    Hole(Spanned<Node<'src>>, Span),
-    /// A run of value text, verbatim from source.
-    Text(Span),
 }
 
 /// `.name;` / `.name(a, b);` — a CHAIN LINK (A69), lowering to exactly the
@@ -1527,7 +1523,7 @@ pub enum BinaryOp {
 }
 
 /// Visits every expression position inside a `css` block, at any nesting
-/// depth: each declaration value's holes and each nested rule's head
+/// depth: each declaration's arguments and each nested rule's head
 /// arguments. Free rather than a method so [`Node::for_each_child`]'s
 /// borrow-shaped visitor can recurse through a `CssBody`, which is not a node.
 fn visit_css_body<'a, 'src>(
@@ -1537,10 +1533,8 @@ fn visit_css_body<'a, 'src>(
     for item in &body.items {
         match item {
             CssItem::Declaration(declaration) => {
-                for piece in &declaration.value {
-                    if let CssValuePiece::Hole(expression, _) = piece {
-                        visit(expression);
-                    }
+                for argument in &declaration.arguments {
+                    visit(argument);
                 }
             }
             CssItem::Nested(nested) => {

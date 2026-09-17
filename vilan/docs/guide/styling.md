@@ -62,12 +62,12 @@ import std::ui::{ view, View, mount_root };
 import std::style::{ style, space, Style, Color };
 
 let card = css {
-	display: flex;
-	gap: {space(2)};
-	padding: {space(4)};
-	background-color: {Color::gray(100)};
+	display("flex");
+	gap(space(2));
+	padding(space(4));
+	background-color(Color::gray(100));
 	.hover {
-		background-color: {Color::gray(200)};
+		background-color(Color::gray(200));
 	}
 };
 
@@ -86,7 +86,7 @@ fun main() {
 ```
 
 **One rule, and the whole feature falls out of it.** An undotted
-`property: value;` is a declaration and becomes `.raw(property, value)`;
+`property(value);` is a declaration and becomes `.raw(property, value)`;
 a dotted `.name { … }` is a condition combinator and becomes
 `.name(style() … )`, with the block's own chain as its last argument.
 The dot is the only thing the grammar looks at, so every condition
@@ -96,18 +96,18 @@ has no nesting order to get wrong.
 
 ```vilan,fragment
 let panel = css {
-	color: {Color::gray(900)};
+	color(Color::gray(900));
 
 	.on(within(attribute("data-theme").eq("dark"))) {
-		color: {Color::gray(50)};
+		color(Color::gray(50));
 	}
 
 	.on(hover() + active().not()) {
-		color: {Color::blue(600)};
+		color(Color::blue(600));
 	}
 
 	.children {
-		margin-top: {space(2)};
+		margin-top(space(2));
 	}
 };
 ```
@@ -115,36 +115,54 @@ let panel = css {
 The condition constructors are ambient inside a block, like the token
 vocabulary below, so a head needs no import.
 
-Values are text and **holes**. Anything you can write in CSS rides
-through verbatim — `repeat(3, 1fr)`, `url("tile.png")`, `50%`, `1.5rem`
-— and `{expression}` drops a typed vilan value in. A value that is
-*exactly* one hole keeps its type, which is what carries a token's
-`:root` line onto the sheet, so write `gap: {space(4)};` rather than
-`gap: 1rem;` when you mean the scale. A hole **mid-value** carries its
-token too: `border: 1px solid {Color::gray(500)};` writes
+**A declaration is a call, and its values are ordinary vilan
+expressions.** That is the whole of the value rule: there is no CSS token
+soup to learn and no `{ }` hole to remember, because a value was never
+anything but an expression. A typed value keeps its type, which is what
+carries a token's `:root` line onto the sheet, so write `gap(space(4));`
+rather than `gap("1rem");` when you mean the scale. Anything CSS can say
+and vilan cannot is a **string** — `grid-template-columns("repeat(3, 1fr)");`,
+`background-image("url(\"tile.png\")");` — and a string is a value like any
+other.
+
+**Several arguments are one value, joined by a single space** — CSS's own
+list separator. `margin(px(4), px(8));` is `margin:4px 8px`, and
+`border("1px solid", Color::gray(500));` writes
 `1px solid var(--gray-500)` and puts the `:root` line that declares
-`--gray-500` on the sheet beside it.
+`--gray-500` on the sheet beside it. Where the parts are glued rather
+than spaced, build the one value yourself with an i-string and `piece`,
+which renders a value and carries its token:
+`padding(i"calc({piece(space(4))} + 2px)");`.
+
+**A custom property is a call head too**, and reading one is `var`:
+
+```vilan,fragment
+let themed = css {
+	--brand-ink(gray(900));
+	color(var("--brand-ink"));
+};
+```
 
 **Inside a block, the token vocabulary is ambient.** `rem`, `px`, `em`,
 `pct`, `vh`, `vw`, `auto` and `space`; `black`, `white`, `transparent`,
 `hex`, `gray`, `blue`, `red`, `green`, `rgba` and `oklch`; and the condition
 constructors a `.on(..)` head takes — `hover`, `focus`, `active`, `disabled`,
 `first`, `last`, `pseudo`, `element`, `attribute`, `within`, `children`,
-`divide`, `media`, `sm`, `md`, `lg`, `xl`. That is the `std::style::prelude`
-module, in scope inside a `css` block and nowhere else, so a hole reads as the
-CSS it stands for:
+`divide`, `media`, `sm`, `md`, `lg`, `xl`; and `var` and `piece`. That is the
+`std::style::prelude` module, in scope inside a `css` block and nowhere else, so
+a value reads as the CSS it stands for:
 
 ```vilan,fragment
 let chip = css {
-	padding: {space(2)};
-	color: {gray(700)};
-	border: 1px solid {gray(300)};
-	border-radius: {rem(0.25)};
+	padding(space(2));
+	color(gray(700));
+	border("1px solid", gray(300));
+	border-radius(rem(0.25));
 };
 ```
 
 Your own names always win: a `let rem = …` or an `import` in scope is
-what a hole means, and the module is only asked when nothing else
+what the name means, and the module is only asked when nothing else
 answers. Outside a block these are ordinary imports —
 `import std::style::prelude::{ rem, gray };` binds them bare, and
 `import std::style::prelude;` qualifies through the name.
@@ -162,8 +180,8 @@ impl Style {
 
 let toolbar = css {
 	.flex_row();
-	gap: {space(2)};
-	padding: {space(1)};
+	gap(space(2));
+	padding(space(1));
 };
 ```
 
@@ -177,19 +195,19 @@ chain records its rules as it is built, and the build writes the ones
 the program kept onto the stylesheet when evaluation ends — so the
 chain spelling needs `const` in front of it, and the block does not: it writes
 the word for you. `let card = css { … };` is the whole declaration. What
-that does *not* buy you is reading a runtime value: a hole that reads a
-function parameter or a signal is refused at the hole, because there is
-nothing compile-time to put on the sheet. Writing `const css { … }`
+that does *not* buy you is reading a runtime value: an argument that
+reads a function parameter or a signal is refused at the argument,
+because there is nothing compile-time to put on the sheet. Writing `const css { … }`
 yourself still compiles and means exactly the same thing.
 
 Four things the block does not do, each on purpose:
 
 - **The `;` is required**, including after the last declaration.
-- **`#` and `@` are not vilan characters.** A colour is
-  `{Color::hex("#663399")}` — which routes it through `Color`, so its
-  `:root` line travels with it — and a media query is `.md { … }`.
-  There are no at-rules; a declaration block under a selector of your
-  own is [`declare`](../std/style.md#declaration-blocks).
+- **`#` and `@` begin no expression.** A colour is
+  `hex("#663399")` — which routes it through `Color`, so its `:root`
+  line travels with it — and a media query is `.md { … }`. There are no
+  at-rules; a declaration block under a selector of your own is
+  [`declare`](../std/style.md#declaration-blocks).
 - **`!important` is refused.** Merging a style is a record update, so a
   later declaration on the same property already wins.
 - **A block is brace-initial**, like a struct literal, so a condition,
@@ -197,8 +215,8 @@ Four things the block does not do, each on purpose:
   parentheses: `if (css { … }).class_list() != "" { … }`.
 
 **`vilan fmt` orders a block, and orders it exactly as it orders the
-chain.** One item per line, nested rules one level in, holes tidied like
-any other vilan expression — and the items sorted into the canonical
+chain.** One item per line, nested rules one level in, arguments tidied
+like any other vilan expression — and the items sorted into the canonical
 order: properties in Tailwind's category sequence, then the condition
 rules in the order the selector nests them (media, relation, attribute,
 pseudo-class). So the two spellings of one style format alike, and
@@ -215,10 +233,10 @@ explaining the wrong declaration.
 ```vilan,fragment
 // formats as: display, padding, then `.md` before `.hover`
 let button = css {
-	.hover { background-color: {Color::gray(200)}; }
-	padding: {space(2)};
-	.md { padding: {space(4)}; }
-	display: flex;
+	.hover { background-color(Color::gray(200)); }
+	padding(space(2));
+	.md { padding(space(4)); }
+	display("flex");
 };
 ```
 

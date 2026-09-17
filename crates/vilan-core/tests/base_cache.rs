@@ -1243,7 +1243,7 @@ fn an_entrys_desugar_seeds_are_part_of_its_world_key() {
     const PLAIN: &str = "import std::io::print;\n\nfun main() {\n\tprint(\"plain\");\n}\n";
     const ELEMENT: &str =
         "import std::io::print;\n\nfun main() {\n\tlet _x = <div/>;\n\tprint(\"element\");\n}\n";
-    const CSS: &str = "import std::io::print;\n\nfun main() {\n\tlet _s = css { color: \"red\"; };\n\t\
+    const CSS: &str = "import std::io::print;\n\nfun main() {\n\tlet _s = css { color(\"\\\"red\\\"\"); };\n\t\
          print(\"css\");\n}\n";
 
     // The repro's own order: the plain entry sorts first, so it builds the

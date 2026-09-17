@@ -405,30 +405,32 @@ const EXPRESSION_FIXTURES: &[&str] = &[
     "<p>\"a\" <b/> {c}</p>",
     "x < <div/>",            // a comparison whose right operand is an element
     "<div hidden.show(f)/>", // bare attr, then a chain link, no space (positional)
-    // --- `css` blocks (css-block S2) ---------------------------------------
+    // --- `css` blocks (css-block S2; A101's call form) ----------------------
     "css { }",
-    "css { display: flex; }",
-    "css { display: flex; padding: 1rem; }",
-    "css { flex-direction: column; }",      // a hyphenated property
-    "css { --color-ink: white; }",          // a custom property
-    "css { -webkit-mask-composite: add; }", // one leading hyphen
-    "css { type: a; }",                     // a KEYWORD property name
-    "css { width: 1px; }",                  // a dimension lexes as one token
-    "css { width: 1.5rem; }",
-    "css { width: 50%; }",
-    "css { width: calc(100% - 2rem); }",
-    "css { background: url(\"a.png\"); }",
-    "css { grid-template-columns: repeat(3, 1fr); }",
-    "css { gap: {space(4)}; }",  // a one-hole value
-    "css { padding: {a} {b}; }", // a mixed value
-    "css { padding: calc({a} + 2px); }",
-    "css { .hover { color: red; } }",
-    "css { .within(\"data-theme\", \"dark\") { color: red; } }",
-    "css { .md { .hover { .attribute(\"data-open\", \"true\") { color: red; } } } }",
-    "css { color: red; .hover { color: blue; } padding: 1rem; }",
-    "css { display: flex; } + other",      // an ordinary operand
-    "css { display: flex; }.class_list()", // postfix hangs off it
-    "const css { display: flex; }",
+    "css { display(\"flex\"); }",
+    "css { display(\"flex\"); padding(rem(1)); }",
+    "css { flex-direction(\"column\"); }",      // a hyphenated property
+    "css { --color-ink(\"white\"); }",          // a custom property (R12)
+    "css { -webkit-mask-composite(\"add\"); }", // one leading hyphen
+    "css { type(\"a\"); }",                     // a KEYWORD property name
+    "css { width(px(1)); }",                   // a typed value
+    "css { width(rem(1.5)); }",
+    "css { width(pct(50)); }",
+    "css { width(\"calc(100% - 2rem)\"); }",    // what CSS says and vilan cannot
+    "css { background(url_value); }",
+    "css { grid-template-columns(\"repeat(3, 1fr)\"); }",
+    "css { gap(space(4)); }",       // a typed value, straight through
+    "css { padding(a, b); }",       // N arguments, space-joined (R10)
+    "css { padding(px(4), px(8),); }", // a trailing comma
+    "css { padding(i\"calc({piece(a)} + 2px)\"); }",
+    "css { color(var(\"--brand-ink\")); }", // a custom property READ (R12)
+    "css { .hover { color(\"red\"); } }",
+    "css { .within(\"data-theme\", \"dark\") { color(\"red\"); } }",
+    "css { .md { .hover { .attribute(\"data-open\", \"true\") { color(\"red\"); } } } }",
+    "css { color(\"red\"); .hover { color(\"blue\"); } padding(rem(1)); }",
+    "css { display(\"flex\"); } + other",      // an ordinary operand
+    "css { display(\"flex\"); }.class_list()", // postfix hangs off it
+    "const css { display(\"flex\"); }",
 ];
 
 /// Fixtures parsed in CONDITION position (`if <fixture> { }`) — struct literals are
@@ -470,8 +472,8 @@ const CONDITION_FIXTURES: &[&str] = &[
     // A `css` block is brace-initial, so a condition takes it only in parens —
     // the same escape hatch a struct literal has (css-block.md §4.2). The
     // DECLINER list carries the bare form.
-    "(css { display: flex; })",
-    "(css { display: flex; }).class_list().len() > 0",
+    "(css { display(\"flex\"); })",
+    "(css { display(\"flex\"); }).class_list().len() > 0",
 ];
 
 /// WHOLE-FILE fixtures: item-free programs (statement sequences) that both
@@ -526,14 +528,19 @@ const DECLINER_FIXTURES: &[&str] = &[
     // `attempt` truncated the message away with the branch that made it.
     "<div name(a, b)></div>",
     "<div>< /div>",      // a non-adjacent `</` is not a close marker
-    // --- `css` blocks (css-block S2) ---------------------------------------
+    // --- `css` blocks (css-block S2; A101's call form) ----------------------
     "css",                            // the keyword alone is no expression
-    "css { display: flex }",          // the `;` is required, including on the last
-    "css { display flex; }",          // the `:` is required
-    "css { 1px: red; }",              // a property is a name, not a value token
-    "css { color: red;",              // an unclosed block
-    "css { color: #333; }",           // `#` does not lex
-    "css { @media { color: red; } }", // `@` does not lex
-    "css { color: red !important; }", // refused permanently, with its fix
-    "css { .1 { color: red; } }",     // a combinator head is a name
+    "css { display(\"flex\") }",        // the `;` is required, including on the last
+    "css { display \"flex\"; }",        // a declaration is a CALL: the `(` is required
+    // The CSS spelling, refused with its rule. Two pieces on purpose: a whole
+    // `css { … }` block in one literal is what the A101 codemod migrates, and
+    // this is the one fixture that must keep the spelling A101 retired.
+    concat!("css { display", ": flex; }"),
+    "css { 1px(\"red\"); }",            // a property is a name, not a value token
+    "css { color(\"red\");",            // an unclosed block
+    "css { color(#333); }",           // `#` begins no expression
+    "css { outline(); }",             // a declaration takes at least one value
+    "css { @media { color(\"red\"); } }", // `@` does not lex
+    "css { color(red !important); }", // refused permanently, with its fix
+    "css { .1 { color(\"red\"); } }",    // a combinator head is a name
 ];
