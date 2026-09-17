@@ -522,3 +522,5 @@ row	flagship	key
 497	-	no `impl {subject}` this statement carries declares {named}: the selector admits nothing
 498	-	`{module}::{leaf}` is exported only into `{scope}`, and this file is outside it. Importing it anyway is allowed — mark the reach: `import {module}::{{ #{leaf} }};`
 499	-	`{module}::{leaf}` is exported only into `{scope}`, and this path reaches it from outside. The spelling that says so is a marked import: `import {module}::{{ #{leaf} }};`, and then `{leaf}` on its own
+NEW	-	`[derive({name})]` could not expand: this toolchain has no `macro_std` beside its `std`, so std's own `{module}` never registered its `{name}` macro — `std` is at `{}`, and `macro_std` was looked for at `{}`
+NEW	-	`[service]` could not expand: this toolchain has no `macro_std` beside its `std`, so std::rpc's `service` macro never registered — `std` is at `{}`, and `macro_std` was looked for at `{}`

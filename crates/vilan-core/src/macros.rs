@@ -316,11 +316,21 @@ impl MacroDef {
             Some(world) => world,
             None => {
                 let Some(macro_std) = resolve_macro_std(std) else {
+                    // B346: both paths, because "not found beside `std`" names
+                    // neither the `std` that was resolved nor the `macro_std`
+                    // that was wanted, and the whole mistake is WHICH `std`.
+                    let (package, macro_std) = crate::manifest::split_toolchain(std)
+                        .unwrap_or_else(|| (std.base_root.clone(), std.base_root.clone()));
                     return Err(vec![Error {
                         trace: Vec::new(),
                         note: None,
                         span: (0..0).into(),
-                        msg: "the `macro_std` package was not found beside `std`".to_string(),
+                        msg: format!(
+                            "the `macro_std` package was not found beside `std`: `std` resolved \
+                             to `{}`, so `macro_std` was looked for at `{}`",
+                            package.display(),
+                            macro_std.display(),
+                        ),
                     }]);
                 };
                 let world = compile_world(
@@ -351,17 +361,19 @@ impl MacroDef {
 }
 
 /// The `macro_std` package, resolved from its toolchain location beside `std`
-/// (`<roots>/std/src` → `<roots>/macro_std`). `None` when absent — an error is
+/// (`<root>/std/src` → `<root>/macro_std`). `None` when absent — an error is
 /// reported only when a program actually defines a macro.
+///
+/// The root is [`crate::manifest::toolchain_root`]'s and nothing else's (B346):
+/// one root answers for both packages, and a root carrying only `std` is
+/// refused by [`crate::manifest::split_toolchain`] rather than quietly served
+/// from a second one.
 pub(crate) fn resolve_macro_std(std: &PackageSpec) -> Option<PackageSpec> {
-    let dir = std.base_root.parent()?.parent()?.join("macro_std");
-    let manifest = dir.join("vilan.toml");
-    // Buffered counts as present, the same way it does for a source file: with
-    // no filesystem behind the compiler (the wasm build) the toolchain lives
-    // entirely in the overlay, and an `is_file()` gate alone would report
-    // `macro_std` missing for every program that defines a macro.
-    let present = manifest.is_file() || crate::analyzer::document_overlay_contains(&manifest);
-    present.then(|| crate::manifest::resolve_std(&dir))
+    let dir = crate::manifest::macro_std_dir(std)?;
+    if crate::manifest::split_toolchain(std).is_some() {
+        return None;
+    }
+    Some(crate::manifest::resolve_std(&dir))
 }
 
 /// The top-level `macro fun`s of a file, with each definition's full span.
@@ -455,13 +467,25 @@ pub(crate) fn register_file(
         .or_else(|| blocks.first().map(|(_, span)| *span))
         .unwrap_or_else(|| (0..0).into());
     let Some(macro_std) = resolve_macro_std(std) else {
+        // B346: a `std` copied, packaged or cached away from its own tree
+        // resolves perfectly and arrives with no `macro_std` behind it, and the
+        // sentence this used to end on named neither half. Both paths, so the
+        // reader can see which `std` won and where its sibling was expected.
+        let (package, macro_std) = crate::manifest::split_toolchain(std)
+            .unwrap_or_else(|| (std.base_root.clone(), std.base_root.clone()));
         diagnostics.push(Error {
             trace: Vec::new(),
             note: None,
             span: first_span,
-            msg: "the `macro_std` package was not found beside `std`: macros need the \
-                  toolchain's `macro_std`"
-                .to_string(),
+            msg: format!(
+                "the `macro_std` package was not found beside `std`: macros need the \
+                 toolchain's `macro_std`, and this `std` has none — `std` resolved to `{}`, \
+                 so `macro_std` was looked for at `{}`. A `std` moved away from its toolchain \
+                 (a copy, a packaged std, `$VILAN_STD` pointing outside the checkout) is half \
+                 a toolchain: point it at a `std` whose own directory has `macro_std` beside it",
+                package.display(),
+                macro_std.display(),
+            ),
         });
         return;
     };
@@ -1736,6 +1760,35 @@ impl Expander<'_, '_> {
                         // compiles one file against `macro_std` to read its
                         // macro bodies — so the expansion is simply skipped.
                     } else if let Some(module) = std_derive_module(name) {
+                        // B346: before either sentence below, the third
+                        // possibility — this toolchain is missing half of
+                        // itself, so std's `{module}` never got to register
+                        // anything. Both sentences are false of that state: the
+                        // std DOES carry the module, and nothing about the load
+                        // order went wrong. Blaming the compiler for a
+                        // configuration mistake is the worst of the three, and
+                        // it is what shipped: a `cp -a` of `vilan/std` answered
+                        // `[derive(PartialEq)]` with "a compiler load-ordering
+                        // bug (B21's class); please report how this module is
+                        // reached".
+                        if let Some((package, macro_std)) =
+                            crate::manifest::split_toolchain(self.std)
+                        {
+                            self.diagnostics.push(Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: *name_span,
+                                msg: format!(
+                                    "`[derive({name})]` could not expand: this toolchain has no \
+                                     `macro_std` beside its `std`, so std's own `{module}` never \
+                                     registered its `{name}` macro — `std` is at `{}`, and \
+                                     `macro_std` was looked for at `{}`",
+                                    package.display(),
+                                    macro_std.display(),
+                                ),
+                            });
+                            continue;
+                        }
                         // There is no second generator to fall back to (N79).
                         // There used to be — a Rust twin of the `Json`/`Wire`/
                         // `PartialEq`/`Default`/`Debug`/`Hashable` macros std
@@ -1851,7 +1904,23 @@ impl Expander<'_, '_> {
                         // surfaces). A std with no `rpc.vl` in it at all is not
                         // a bug: it is a std that does not carry the attribute,
                         // and the author of that std is the reader.
-                        let msg = if self.std.base_root.join("rpc.vl").is_file() {
+                        //
+                        // B346: and before either of them, the third — a
+                        // toolchain with no `macro_std` beside its `std`, where
+                        // std's `service` macro never registered because no
+                        // macro in std could. The derive arm above carries the
+                        // same guard for the same reason.
+                        let msg = if let Some((package, macro_std)) =
+                            crate::manifest::split_toolchain(self.std)
+                        {
+                            format!(
+                                "`[service]` could not expand: this toolchain has no `macro_std` \
+                                 beside its `std`, so std::rpc's `service` macro never registered \
+                                 — `std` is at `{}`, and `macro_std` was looked for at `{}`",
+                                package.display(),
+                                macro_std.display(),
+                            )
+                        } else if self.std.base_root.join("rpc.vl").is_file() {
                             "`[service]` expanded before std::rpc's `service` macro was loaded: \
                              a compiler load-ordering bug (B21's class); please report how this \
                              module is reached"

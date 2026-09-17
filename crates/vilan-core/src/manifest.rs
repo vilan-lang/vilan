@@ -1675,6 +1675,62 @@ pub fn resolve_std(std_dir: &Path) -> PackageSpec {
     resolve_library(std_dir)
 }
 
+/// The toolchain root a resolved `std` belongs to — the directory that holds
+/// the `std` package, and so the one place `macro_std` is looked for.
+///
+/// # One root answers for both packages (tracker B346)
+///
+/// A toolchain is TWO packages, `std` and `macro_std`, and only the first has a
+/// discovery path a user can point at: `$VILAN_STD`, `vilan.stdPath`, the
+/// ancestor walk for a checkout's `vilan/std`, the embedded std's
+/// materialization. `macro_std` has never had one — it is found by walking up
+/// from the resolved `std` and looking for a sibling, which reads the
+/// filesystem rather than the configuration.
+///
+/// That is fine as long as it is the SAME root, and the rule here is that it
+/// must be: whatever named `std`, `macro_std` comes from the directory holding
+/// it and from nowhere else. Falling back to a second root — the binary's
+/// embedded toolchain, an ancestor checkout — is the one outcome worse than
+/// refusing, because it mixes two std worlds in one compile and the mixture is
+/// invisible: B346's repro was a `cp -a` of `vilan/std` whose `diff -r` was
+/// empty and which mis-analyzed std anyway.
+///
+/// So the root is named once, here. [`split_toolchain`] is what a caller asks
+/// when the answer is that the root carries only half a toolchain.
+pub fn toolchain_root(std: &PackageSpec) -> Option<&Path> {
+    // `base_root` is the std package's SOURCE root (`<package>/src`), so the
+    // package directory is one level up and the toolchain root is two.
+    std.base_root.parent()?.parent()
+}
+
+/// This toolchain's `macro_std` package directory: `<root>/macro_std`, with
+/// `<root>` from [`toolchain_root`]. `None` only when the resolved `std` sits
+/// so close to the filesystem root that it has no grandparent.
+pub fn macro_std_dir(std: &PackageSpec) -> Option<PathBuf> {
+    Some(toolchain_root(std)?.join("macro_std"))
+}
+
+/// `Some((std package directory, the `macro_std` path))` when the root that
+/// answers for this `std` carries no `macro_std` — a SPLIT toolchain, which is
+/// what a `std` copied, packaged or cached away from its own tree leaves
+/// behind. `None` when the toolchain is whole, which is the only state that
+/// compiles macros.
+///
+/// The two paths come back because they are what a refusal has to say: "no
+/// `macro_std`" names nothing a reader can act on, while "this `std`, that
+/// missing `macro_std`" names the mistake and the fix at once.
+pub fn split_toolchain(std: &PackageSpec) -> Option<(PathBuf, PathBuf)> {
+    let package = std.base_root.parent()?.to_path_buf();
+    let macro_std = macro_std_dir(std)?;
+    // Buffered counts as present, exactly as it does for a source file: with no
+    // filesystem behind the compiler (the wasm build) the toolchain lives
+    // entirely in the document overlay, and an `is_file()` gate alone would
+    // report every wasm compile as a split toolchain.
+    let manifest = macro_std.join("vilan.toml");
+    let present = manifest.is_file() || crate::analyzer::document_overlay_contains(&manifest);
+    (!present).then_some((package, macro_std))
+}
+
 /// Builds a [`PackageSpec`] for the `[library]` rooted at `dir`: its base root
 /// (default `src`) plus each declared layer (root default `src/<name>`, with the
 /// platform patterns it serves), the already-resolved dependency edges, and
