@@ -55,7 +55,7 @@ fn fixture(part: &str) -> PathBuf {
 /// whether the manifest keeps its `split = true` line, so the same sources can
 /// be built both ways and compared.
 fn stage(tag: &str, split: bool) -> PathBuf {
-    let staged = std::env::temp_dir().join(format!("vilan_split_{tag}_{}", std::process::id()));
+    let staged = support::scratch_root().join(format!("vilan_split_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staged);
     std::fs::create_dir_all(&staged).expect("create the staging directory");
     for entry in std::fs::read_dir(fixture("project")).expect("read the fixture") {
@@ -734,7 +734,8 @@ fn a_split_build_warns_when_the_gate_costs_more_than_it_defers() {
 /// prints and returns. `vilan run` needs a node leg to launch, and the fixture
 /// package (browser-only) has none.
 fn stage_workspace(tag: &str) -> PathBuf {
-    let staged = std::env::temp_dir().join(format!("vilan_split_run_{tag}_{}", std::process::id()));
+    let staged =
+        support::scratch_root().join(format!("vilan_split_run_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staged);
     std::fs::create_dir_all(staged.join("src")).expect("create the staging directory");
     std::fs::write(

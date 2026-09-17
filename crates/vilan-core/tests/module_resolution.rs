@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use vilan_core::manifest::PreludeSpec;
+
+mod scratch;
 use vilan_core::{
     EntryMode, Error, Layer, MacroLimits, PackageSpec, Platform, PlatformPattern, PreludeRepair,
     Workspace, analyze_source,
@@ -25,7 +27,7 @@ fn std_spec() -> PackageSpec {
 fn analyze_package_raw(files: &[(&str, &str)], entry: &str, platform: Platform) -> Vec<Error> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("vilan_modres_{}_{unique}", std::process::id()));
+    let dir = scratch::root().join(format!("vilan_modres_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for (relative, contents) in files {
         let path = dir.join(relative);
@@ -151,7 +153,7 @@ fn an_absent_overlay_module_still_fails_to_resolve() {
 fn the_overlay_outranks_the_file_on_disk() {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = scratch::root().join(format!(
         "vilan_overlay_disk_{}_{unique}",
         std::process::id()
     ));
@@ -183,8 +185,7 @@ fn the_overlay_outranks_the_file_on_disk() {
 fn a_buffer_keeps_its_byte_order_mark_while_a_disk_read_drops_one() {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir =
-        std::env::temp_dir().join(format!("vilan_overlay_bom_{}_{unique}", std::process::id()));
+    let dir = scratch::root().join(format!("vilan_overlay_bom_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("bom.vl");
@@ -310,7 +311,7 @@ fn analyze_workspace_files(
 ) -> Vec<String> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_ws_{}_{unique}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_ws_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
 
     let app_dir = root.join("app");
@@ -434,7 +435,7 @@ fn dependency_pkg_self_reference_is_isolated() {
     // The entry's own `pkg::helper` sibling lives next to the entry.
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_wsiso_{}_{unique}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_wsiso_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let app_dir = root.join("app");
     std::fs::create_dir_all(&app_dir).unwrap();
@@ -649,7 +650,7 @@ fn platform_modules_load_for_typing_under_opposite_platform() {
 fn analyze_layered(entry: &str, platform: Platform) -> Vec<String> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_layer_{}_{unique}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_layer_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let app = root.join("app");
     std::fs::create_dir_all(&app).unwrap();
@@ -774,7 +775,7 @@ fn base_lib_reexporting_a_layer_module_errors() {
     // the public surface must be platform-agnostic, so this is a Q4 violation.
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_q4_{}_{unique}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_q4_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let app = root.join("app");
     std::fs::create_dir_all(&app).unwrap();
@@ -902,7 +903,7 @@ fn contract_violations(
 ) -> Vec<String> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_contract_{}_{unique}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_contract_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let put = |dir: &std::path::Path, files: &[(&str, &str)]| {
         std::fs::create_dir_all(dir).unwrap();
@@ -1119,7 +1120,7 @@ fn analyze_package_attributed(
 ) -> Vec<(String, String, Option<String>)> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("vilan_attr_{}_{unique}", std::process::id()));
+    let dir = scratch::root().join(format!("vilan_attr_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for (relative, contents) in files {
         let path = dir.join(relative);
@@ -1173,7 +1174,7 @@ fn analyze_package_spanned(
 ) -> Vec<(String, String, std::ops::Range<usize>)> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("vilan_span_{}_{unique}", std::process::id()));
+    let dir = scratch::root().join(format!("vilan_span_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for (relative, contents) in files {
         let path = dir.join(relative);
@@ -1844,8 +1845,7 @@ fn synthesized_enum_members_parse_through_the_content_cache() {
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root =
-        std::env::temp_dir().join(format!("vilan_synthesized_{}_{unique}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_synthesized_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     // A std whose loader-forced modules are empty stubs: a backed enum's
     // `value()`/`parse()` and its `Hashable` impl are synthesized regardless —
@@ -2078,7 +2078,7 @@ fn an_opted_in_analysis_owns_overlay_served_modules_and_reclaims_them() {
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("vilan_m9_core_{}_{unique}", std::process::id()));
+    let dir = scratch::root().join(format!("vilan_m9_core_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let entry_path = dir.join("main.vl");
@@ -2248,7 +2248,7 @@ fn a_dependency_packages_overlaid_module_is_owned_and_reclaimed() {
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_m9_memo_{}_{unique}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_m9_memo_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let app_dir = root.join("app");
     std::fs::create_dir_all(&app_dir).unwrap();
@@ -2892,7 +2892,7 @@ fn analyze_under_prelude_repaired(
 ) -> Vec<String> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("vilan_prelude_{}_{unique}", std::process::id()));
+    let dir = scratch::root().join(format!("vilan_prelude_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for (relative, contents) in files {
         let path = dir.join(relative);
@@ -3298,7 +3298,7 @@ fn a_dependency_resolves_under_its_own_prelude_not_the_consumers() {
     // base one — `Some` resolves inside it and `Signal` must not.
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_preliso_{}_{unique}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_preliso_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let app_dir = root.join("app");
     std::fs::create_dir_all(&app_dir).unwrap();
@@ -3721,8 +3721,7 @@ fn analyze_package_with_warnings(
 ) -> (Vec<String>, Vec<String>) {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir =
-        std::env::temp_dir().join(format!("vilan_selfimport_{}_{unique}", std::process::id()));
+    let dir = scratch::root().join(format!("vilan_selfimport_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for (relative, contents) in files {
         let path = dir.join(relative);
@@ -3919,7 +3918,7 @@ fn analyze_package_as(
 ) -> (Vec<String>, Vec<String>) {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("vilan_openfile_{}_{unique}", std::process::id()));
+    let dir = scratch::root().join(format!("vilan_openfile_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for (relative, contents) in files {
         let path = dir.join(relative);
@@ -4336,7 +4335,7 @@ fn b240_a_dependency_file_opened_as_the_entry_keeps_its_own_derives() {
     // uncacheable, so there was no mark to undo.)
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_depentry_{}_{unique}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_depentry_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let app_dir = root.join("app");
     std::fs::create_dir_all(&app_dir).unwrap();
@@ -4401,7 +4400,7 @@ fn b240_a_dependency_file_opened_as_the_entry_keeps_its_own_derives() {
 fn analyze_dependency_file_as_entry(helper_src: &str) -> Vec<String> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("vilan_b250_{}_{unique}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_b250_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let app_dir = root.join("app");
     std::fs::create_dir_all(&app_dir).unwrap();
@@ -5458,7 +5457,7 @@ fn analyze_package_warnings(
 ) -> Vec<String> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("vilan_warn_{}_{unique}", std::process::id()));
+    let dir = scratch::root().join(format!("vilan_warn_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for (relative, contents) in files {
         let path = dir.join(relative);
@@ -5519,7 +5518,7 @@ fn b318_export_all_is_a_module_level_item_like_every_other_export() {
 fn write_module_tree(files: &[(&str, &str)]) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("vilan_vis_{}_{unique}", std::process::id()));
+    let dir = scratch::root().join(format!("vilan_vis_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for (relative, contents) in files {
         let path = dir.join(relative);
@@ -6350,7 +6349,7 @@ fn transform_package(
 ) -> Result<String, String> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("vilan_modres_tx_{}_{unique}", std::process::id()));
+    let dir = scratch::root().join(format!("vilan_modres_tx_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for (relative, contents) in files {
         let path = dir.join(relative);
@@ -6480,8 +6479,7 @@ fn b279_the_file_filter_narrows_the_candidate_list_and_never_widens_it() {
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir =
-        std::env::temp_dir().join(format!("vilan_modres_b279_{}_{unique}", std::process::id()));
+    let dir = scratch::root().join(format!("vilan_modres_b279_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let files = [
         ("t.vl", "export trait Tagged {\n\tfun tag(self): i32;\n}\n"),
@@ -6834,8 +6832,7 @@ fn e178_the_program_visibility_fields_agree_with_module_importables() {
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir =
-        std::env::temp_dir().join(format!("vilan_modres_e178_{}_{unique}", std::process::id()));
+    let dir = scratch::root().join(format!("vilan_modres_e178_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let files = [
         (
@@ -7084,8 +7081,7 @@ fn b336_a_general_export_scope_narrows_to_its_own_subtree() {
 fn b335_a_module_owning_a_file_and_a_directory_reports_its_own_file() {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir =
-        std::env::temp_dir().join(format!("vilan_modres_b335_{}_{unique}", std::process::id()));
+    let dir = scratch::root().join(format!("vilan_modres_b335_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for (relative, contents) in [
         ("x.vl", "export fun body(): i32 { 1 }\n"),

@@ -34,6 +34,8 @@ use std::path::{Path, PathBuf};
 use vilan_core::options::{BuildOptions, Preset};
 use vilan_core::{PackageSpec, Platform, Workspace, analyze_source, transform};
 
+mod scratch;
+
 fn std_spec() -> PackageSpec {
     vilan_core::manifest::resolve_std(
         &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std"),
@@ -77,7 +79,7 @@ fn run(javascript: &str, label: &str) -> (String, i32) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
+    let path = scratch::root().join(format!(
         "vilan_release_names_{}_{unique}_{label}.mjs",
         std::process::id()
     ));

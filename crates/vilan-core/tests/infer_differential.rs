@@ -70,6 +70,7 @@ use std::path::{Path, PathBuf};
 use vilan_core::options::{BuildOptions, Preset};
 use vilan_core::{PackageSpec, Platform, Workspace, analyze_source, transform};
 
+mod scratch;
 #[macro_use]
 mod corpus_harness;
 use corpus_harness::{

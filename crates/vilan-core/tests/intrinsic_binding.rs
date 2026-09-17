@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 
 use vilan_core::{BuildOptions, PackageSpec, Platform, Workspace, analyze_source, transform};
 
+mod scratch;
+
 fn toolchain() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan")
 }
@@ -40,7 +42,7 @@ const PROGRAM: &str = r#"
 /// require) with `std::list`'s `remove` declaration replaced by `replacement`.
 /// Returns the std spec to compile against, and the directory to clean up.
 fn scratch_toolchain(tag: &str, replacement: &str) -> (PackageSpec, PathBuf) {
-    let root = std::env::temp_dir().join(format!("vilan-b265-{tag}-{}", std::process::id()));
+    let root = scratch::root().join(format!("vilan-b265-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     copy_tree(&toolchain().join("std"), &root.join("std"));
     copy_tree(&toolchain().join("macro_std"), &root.join("macro_std"));
@@ -95,7 +97,7 @@ fn compile_against(spec: &PackageSpec) -> Result<String, Vec<String>> {
 }
 
 fn run(js: &str, tag: &str) -> String {
-    let path = std::env::temp_dir().join(format!("vilan-b265-{tag}-{}.mjs", std::process::id()));
+    let path = scratch::root().join(format!("vilan-b265-{tag}-{}.mjs", std::process::id()));
     std::fs::write(&path, js).expect("write the emitted program");
     let output = std::process::Command::new("node")
         .arg(&path)

@@ -331,7 +331,7 @@ fn scratch_cwd() -> PathBuf {
     // temp root (Windows spells it as an 8.3 short name) and re-attaches the
     // leaf, so both sides of any later comparison are like with like.
     vilan_core::util::canonical_path_of_unwritten(
-        std::env::temp_dir().join(format!("vilan_node_cwd_{}_{unique}", std::process::id())),
+        crate::scratch::root().join(format!("vilan_node_cwd_{}_{unique}", std::process::id())),
     )
 }
 
@@ -392,7 +392,7 @@ pub fn run(javascript: &str, gate: &str, label: &str) -> Result<(String, i32), S
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
+    let path = crate::scratch::root().join(format!(
         "vilan_{gate}_diff_{}_{unique}_{label}.mjs",
         std::process::id()
     ));

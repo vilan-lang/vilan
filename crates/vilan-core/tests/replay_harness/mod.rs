@@ -51,7 +51,7 @@ pub fn write_module_package(name: &str, module_source: &str) -> (PathBuf, PathBu
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let directory = std::env::temp_dir().join(format!(
+    let directory = crate::scratch::root().join(format!(
         "vilan_m19_t1_{name}_{}_{unique}",
         std::process::id()
     ));

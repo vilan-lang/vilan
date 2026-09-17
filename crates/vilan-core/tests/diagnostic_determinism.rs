@@ -29,6 +29,8 @@ use vilan_core::analyzer::SourceId;
 use vilan_core::error::Error;
 use vilan_core::{PackageSpec, Platform, Program, Workspace, analyze_source};
 
+mod scratch;
+
 /// The number of cold attempts each pin compares. Enough that a coin-flip
 /// answer is missed with probability 2^-29; the regressions this file guards
 /// were measured at 13/30 and 15/30 when planted back.
@@ -164,7 +166,7 @@ fn cold_package_renderings(
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
     let directory =
-        std::env::temp_dir().join(format!("vilan_determinism_{}_{unique}", std::process::id()));
+        scratch::root().join(format!("vilan_determinism_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&directory);
     for (relative, contents) in files {
         let path = directory.join(relative);

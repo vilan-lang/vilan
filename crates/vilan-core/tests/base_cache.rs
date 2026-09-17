@@ -14,6 +14,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+mod scratch;
+
 use vilan_core::{
     BuildOptions, EntryMode, PackageSpec, Platform, Workspace, analyze_source, transform,
 };
@@ -264,7 +266,7 @@ fn a_std_edit_evicts_by_content() {
 
     // A private, mutable copy of std.
     let scratch_parent =
-        std::env::temp_dir().join(format!("vilan_s3c_toolchain_{}", std::process::id()));
+        scratch::root().join(format!("vilan_s3c_toolchain_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&scratch_parent);
     let scratch = scratch_parent.join("std");
     copy_tree(&std_root(), &scratch);
@@ -606,7 +608,7 @@ fn a_world_that_loaded_an_overlaid_source_is_stored_and_claims_its_copies() {
     // the files a multi-package workspace has open in the editor, and — like
     // a `pkg::` sibling since M21 — they are loaded into the world the cache
     // stores.
-    let root = std::env::temp_dir().join(format!("vilan_m23_claim_{}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_m23_claim_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let app_dir = root.join("app");
     std::fs::create_dir_all(&app_dir).expect("app dir");
@@ -1095,7 +1097,7 @@ fn a_pkg_importing_entry_hits_the_cache_on_its_second_analysis() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    let root = std::env::temp_dir().join(format!("vilan_m21_pkg_{}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_m21_pkg_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("package dir");
     std::fs::write(root.join("helper.vl"), "fun helper(): i32 {\n\t7\n}\n").expect("write helper");
@@ -1326,7 +1328,7 @@ fn an_open_modules_world_is_stored_under_a_key_that_excludes_it() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    let root = std::env::temp_dir().join(format!("vilan_m70_cycle_{}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_m70_cycle_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("package dir");
     // THREE modules with a cycle through the entry: the open file `views.vl`,
@@ -1522,7 +1524,7 @@ fn the_base_cache_evicts_least_recently_hit_worlds_to_a_byte_budget() {
     // world is the same size — the sibling texts are fixed-width, so the
     // budget arithmetic below is exact rather than approximate.
     const ENTRIES: usize = 6;
-    let root = std::env::temp_dir().join(format!("vilan_m24_budget_{}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_m24_budget_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("scratch dir");
     let mut entry_paths = Vec::new();
@@ -1707,7 +1709,7 @@ fn a_live_entrys_world_is_never_the_budgets_victim() {
     let spec = vilan_core::manifest::resolve_std(&std_root());
 
     const ENTRIES: usize = 3;
-    let root = std::env::temp_dir().join(format!("vilan_m67_live_{}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_m67_live_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("scratch dir");
     let mut entry_paths = Vec::new();
@@ -1882,7 +1884,7 @@ fn write_reuse_package(name: &str) -> (PathBuf, PathBuf) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!(
+    let root = scratch::root().join(format!(
         "vilan_m19_reuse_{name}_{}_{unique}",
         std::process::id()
     ));
@@ -2237,7 +2239,7 @@ fn the_world_tally_counts_the_type_id_census_and_moves_when_a_world_gains_types(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let spec = vilan_core::manifest::resolve_std(&std_root());
 
-    let root = std::env::temp_dir().join(format!("vilan_m41_census_{}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_m41_census_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("package dir");
     // Type-dense: thirty-two nominals, each minting types of its own.
@@ -2896,7 +2898,7 @@ fn two_entries_differing_in_a_resource_declaration_share_one_enrolment_record() 
     vilan_core::analyzer::set_world_reuse(true);
     vilan_core::analyzer::base_cache_clear();
 
-    let root = std::env::temp_dir().join(format!("vilan_m49_split_{}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_m49_split_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("package dir");
     std::fs::write(root.join("loaded.vl"), M49_MODULE).expect("write module");
@@ -3025,7 +3027,7 @@ fn a_packages_legs_share_one_world_exactly_when_their_seed_sets_agree() {
     let _guard = CACHE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let root = std::env::temp_dir().join(format!("vilan_m52_legs_{}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_m52_legs_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("package dir");
     std::fs::write(root.join("shared.vl"), M52_MODULE).expect("write module");

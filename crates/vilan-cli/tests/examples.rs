@@ -81,7 +81,8 @@ fn tracked_files_under(directory: &str) -> Vec<String> {
 /// example (a workspace member, a sibling module) still resolve.
 fn stage(directory: &str) -> PathBuf {
     let tag = directory.rsplit('/').next().expect("example name");
-    let staged = std::env::temp_dir().join(format!("vilan_example_{tag}_{}", std::process::id()));
+    let staged =
+        support::scratch_root().join(format!("vilan_example_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staged);
 
     let root = repo_root();
@@ -391,7 +392,8 @@ fn every_example_directory_is_a_vilan_project() {
 /// A fresh scratch tree shaped like a staged example, with the given
 /// `(relative path, contents)` files written into it.
 fn scratch_tree(tag: &str, files: &[(&str, &str)]) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("vilan_example_pin_{tag}_{}", std::process::id()));
+    let root =
+        support::scratch_root().join(format!("vilan_example_pin_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     for (relative, contents) in files {
         let path = root.join(relative);

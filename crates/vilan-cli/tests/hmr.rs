@@ -51,7 +51,7 @@ mod support;
 fn temp_project(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = support::scratch_root().join(format!(
         "vilan_hmr_cli_{tag}_{}_{unique}",
         std::process::id()
     ));
