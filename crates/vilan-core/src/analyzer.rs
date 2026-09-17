@@ -54668,8 +54668,9 @@ fn base_cache_store(key: BaseCacheKey, world: &World<'_>) {
     // namespace display names go through it too, and the three entry slots
     // (the only places entry-borrowed data ever lands before the entry walk)
     // were just emptied. The store path is additionally gated on
-    // `base_cacheable` (no services, no macro-DEFINING entry text), so no
-    // other entry-derived state exists in the world.
+    // `base_cacheable` (no macro-DEFINING entry text), and the entry's own
+    // expansion is hoisted past this store (§6.13), so no other entry-derived
+    // state exists in the world.
     let static_world: World<'static> = unsafe { std::mem::transmute(scrubbed) };
     // Backlog M11: this map is the compiler's largest per-process retention
     // and the tally could not see it. Record what the world is worth on the
@@ -55088,8 +55089,10 @@ fn analyze_inner<'src>(
     // names, its `pkg::` sibling set and package root, the workspace, the
     // expansion budgets) whenever the entry brings no world-entangling
     // features. The bypass list is conservative and syntactic where it must
-    // be: `[service]` blocks and macro-DEFINING text expand inside the
-    // world-building loop, so such entries build fresh and are never stored.
+    // be: macro-DEFINING text expands inside the world-building loop, so such
+    // entries build fresh and are never stored. `[service]` USED to bypass too
+    // (M72) — it expands like any other attribute, after the store, and the one
+    // module it seeds (`std::rpc`) is in the key.
     // `pkg::` siblings USED to bypass too (M21) — they load inside the loop,
     // which is a reason to key on them, not a reason to refuse: they are in
     // the key above and content-validated per hit like every other loaded
@@ -55132,6 +55135,16 @@ fn analyze_inner<'src>(
                     .map(|module| seed_module(&std_roots, module)),
             )
             .collect();
+        // M72: and `std::rpc`, which a `[service]` in the entry seeds without
+        // naming (the load loop's `contains_service` push below). Same rule as
+        // B341's desugar seeds, for the same reason: a seed the key omits says
+        // two entries build one world when they build two — and here the world
+        // that differs is the one holding the `service` MACRO, so an entry
+        // wrote no service could be served a world it never asked for and a
+        // service entry could be served one whose registry cannot expand it.
+        if contains_service(&nodes.0) {
+            names.push(seed_module(&std_roots, "rpc"));
+        }
         names.sort();
         names.dedup();
         names
@@ -55214,7 +55227,17 @@ fn analyze_inner<'src>(
     };
     let base_cacheable = allow_cache
         && !entry_is_inside_std
-        && !contains_service(&nodes.0)
+        // M72: `[service]` entries USED to bypass here. The bypass predated
+        // the derive/macro hoist (§6.13): a service expanded inside the
+        // world-building loop, so its generated impls landed in the world the
+        // store would have snapshotted. Since the hoist a cacheable entry's
+        // expansion runs through `expand_entry_over_world` — after the store,
+        // identically on hit and miss — so a service entangles a stored world
+        // no more than a derive USER does. What a service asks of the LOAD is
+        // one module, `std::rpc`, and that is in the key above. The cost of
+        // the bypass was kolt's `store.vl`: a `[service]` entry paying its
+        // package's whole pre-entry world on every keystroke, with 0 hits and
+        // 0 misses because it never consulted the cache at all.
         // Macro-DEFINING entries stay bypassed: their definitions register
         // into the registry the world carries, which would leak one entry's
         // macros into another's analysis (E23's blanked-source entanglement).
