@@ -68,14 +68,15 @@ const HIGHLIGHT_THEME: &str = "vilan/docs/theme/vilan.js";
 /// Words a grammar may colour as keywords although the lexer hands them back
 /// as identifiers. Each is CONTEXTUAL — a keyword in one position and a plain
 /// name anywhere else — and the grammars match it by position (the TextMate
-/// grammar and `vilan.js` both anchor `context` after a closure type's `)` and
-/// `sync` after the `(` that opens one). Pinned to lex as `Token::Ident`: the
-/// day one is promoted to a real keyword (a `KEYWORDS` row), this list must
-/// shrink by it.
+/// grammar and `vilan.js` both anchor `context` after what a clause follows —
+/// a closure type's `)`, a parameter list's `)`, or a declaration's RETURN type
+/// — and `sync` after the `(` that opens a closure type). Pinned to lex as
+/// `Token::Ident`: the day one is promoted to a real keyword (a `KEYWORDS`
+/// row), this list must shrink by it.
 const CONTEXTUAL_WORDS: &[(&str, &str)] = &[
     (
         "context",
-        "the clause on a closure type: `(|| void) context owner`",
+        "the clause on a closure type or a declaration: `(|| void) context owner`, `fun f(): i32 context settings`",
     ),
     (
         "sync",
@@ -558,6 +559,53 @@ fn the_import_alias_as_is_coloured_by_position_in_both_grammars() {
             regex_matches(&rule.regex, NOT_ALIASES),
             vec![false; NOT_ALIASES.len()],
             "{file}: {:?} colours `as` where it is an ordinary name ({NOT_ALIASES:?})",
+            rule.regex,
+        );
+    }
+}
+
+/// B343 (R9) — `context` colours as a keyword in BOTH grammars wherever a
+/// CLAUSE can sit, and nowhere a value named `context` sits.
+///
+/// The clause's position is contexts.md §3's — after the return type — and R9
+/// kept it there, so the grammars have to read it there: `fun f(): i32 context
+/// settings` painted `context` as an ordinary identifier, because both rules
+/// were anchored on the `)` of a closure type and nothing else. The guard is
+/// two-sided now, which is also what keeps the reads THROUGH a context binding
+/// (`context.run(..)`, `context.get()`) plain — the old one-sided rule painted
+/// those wherever a `)` happened to precede them.
+#[test]
+fn the_context_clause_is_coloured_by_position_in_both_grammars() {
+    const CLAUSES: &[&str] = &[
+        "fun f(): i32 context settings",
+        "fun f(): (|| void) context owner_scope",
+        "fun f(): List<i32> context settings",
+        "fun f(x: i32) context settings {",
+        "fun f(): i32 context (a, b)",
+        "let body: (|| View) context owner_scope = || view(\"div\");",
+    ];
+    const NOT_CLAUSES: &[&str] = &[
+        "let context = 1;",
+        "let x = context;",
+        "context.run(1, || {})",
+        "import std::context::Context;",
+        "let value = read(x).context;",
+    ];
+    for (file, grammar, key) in [
+        (TEXTMATE_GRAMMAR, textmate_grammar(&[]), "keywords"),
+        (HIGHLIGHT_THEME, highlight_grammar(&[]), "keyword"),
+    ] {
+        let rule = contextual_rule(&grammar, key, "context");
+        assert_eq!(
+            regex_matches(&rule.regex, CLAUSES),
+            vec![true; CLAUSES.len()],
+            "{file}: {:?} misses a `context` clause among {CLAUSES:?}",
+            rule.regex,
+        );
+        assert_eq!(
+            regex_matches(&rule.regex, NOT_CLAUSES),
+            vec![false; NOT_CLAUSES.len()],
+            "{file}: {:?} colours `context` where it is an ordinary name ({NOT_CLAUSES:?})",
             rule.regex,
         );
     }

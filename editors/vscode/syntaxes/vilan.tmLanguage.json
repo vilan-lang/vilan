@@ -316,8 +316,8 @@
      "match": "\\b(with|borrows|css)\\b"
     },
     {
-     "comment": "The `context` CLAUSE on a closure type \u2014 `(|| void) context owner_scope`, multi `context (a, b)`. It is a contextual keyword (a value or module may be NAMED `context`), and the clause only ever follows a parenthesized closure type \u2014 so the guard is: keyword only right after a `)`.",
-     "match": "(?<=\\))\\s+(context)\\b",
+     "comment": "The `context` CLAUSE \u2014 on a closure type (`(|| void) context owner_scope`, multi `context (a, b)`) and on a `fun` DECLARATION, where it sits after the RETURN type (`fun f(): i32 context settings`, contexts.md \u00a73; B343/R9 keeps that position). It is a contextual keyword (a value or module may be NAMED `context`), so it is guarded on BOTH sides: something a type or a parameter list can END with before it, and a NAME or the multi form's `(` after it \u2014 which is what keeps `context.run(..)` and `context.get()` plain.",
+     "match": "(?<=[A-Za-z0-9_>\\)\\]])\\s+(context)\\b(?=\\s*[\\(A-Za-z_])",
      "captures": {
       "1": {
        "name": "keyword.other.vilan"

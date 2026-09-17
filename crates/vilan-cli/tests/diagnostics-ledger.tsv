@@ -522,3 +522,4 @@ row	flagship	key
 497	-	no `impl {subject}` this statement carries declares {named}: the selector admits nothing
 498	-	`{module}::{leaf}` is exported only into `{scope}`, and this file is outside it. Importing it anyway is allowed — mark the reach: `import {module}::{{ #{leaf} }};`
 499	-	`{module}::{leaf}` is exported only into `{scope}`, and this path reaches it from outside. The spelling that says so is a marked import: `import {module}::{{ #{leaf} }};`, and then `{leaf}` on its own
+NEW	-	a `context` clause after an UN-PARENTHESIZED closure return type binds to the closure's own return type, which cannot carry one. Parenthesize the closure type to say which clause you mean: {...}

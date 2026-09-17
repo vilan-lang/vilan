@@ -5275,3 +5275,98 @@ fn e191_an_arity_error_in_an_element_head_reports_alone() {
     assert_fails_browser_without(source, "is read here, but this code can be reached without");
 }
 
+// --- B343 (R9): where the `context` clause sits on a declaration ------------
+//
+// RULED 2026-09-17: it stays after the return type (contexts.md §3), and the
+// ONE shape that position cannot spell is refused rather than mis-bound. The
+// type grammar's own `context` suffix is greedy, so an un-parenthesized closure
+// return type swallows the clause onto its OWN return type — which cannot carry
+// one — and the declaration means neither of the two things it could have
+// meant. Both are a parenthesis away and the refusal spells both.
+
+/// The ambiguous form, refused — and refused ONCE: the clause is taken off as
+/// it is reported, so the analyzer does not add its own "a `context` clause is
+/// only supported on a closure type" beside it.
+#[test]
+fn b343_an_unparenthesized_closure_return_carrying_a_clause_is_refused() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let c: Context<i32> = Context::new();
+
+fun make(): || void context c {
+    || print(c.get())
+}
+
+fun main() {
+    c.run(1, || {
+        let body = make();
+        body();
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(source, "UN-PARENTHESIZED closure return type");
+    assert_fails_without(source, "only supported on a closure type");
+}
+
+/// Both parenthesized readings still compile, which is what makes the refusal a
+/// steer rather than a prohibition: the clause on the FUNCTION, and the clause
+/// on the closure it returns.
+#[test]
+fn b343_both_parenthesized_readings_still_compile() {
+    assert_compiles(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let c: Context<i32> = Context::new();
+
+fun make(): (|| void) context c {
+    || print(c.get())
+}
+
+fun reads(): i32 context c {
+    c.get()
+}
+
+fun main() {
+    c.run(1, || {
+        let body = make();
+        body();
+        print(reads());
+    });
+}
+main();
+        "#,
+    );
+}
+
+/// The nested shape the refusal must NOT take: a closure that returns an
+/// INJECTED closure. The inner type is parenthesized, so the clause is its own
+/// and nothing is ambiguous.
+#[test]
+fn b343_a_returned_closure_whose_own_return_is_injected_is_untouched() {
+    assert_compiles(
+        r#"
+import std::io::print;
+import std::context::Context;
+
+let c: Context<i32> = Context::new();
+
+fun outer(): || (|| void) context c {
+    || || print(c.get())
+}
+
+fun main() {
+    c.run(1, || {
+        let make = outer();
+        let body = make();
+        body();
+    });
+}
+main();
+        "#,
+    );
+}

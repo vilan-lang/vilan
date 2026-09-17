@@ -1092,7 +1092,7 @@ fn editor_page_code_action_titles_are_the_servers() {
         });
     let number_words = [
         "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven",
-        "Twelve",
+        "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen",
     ];
     assert_eq!(
         number_words
