@@ -25763,14 +25763,28 @@ impl<'src> Analyzer<'src> {
     /// write mutates in place (the classification), and where the reads are.
     ///
     /// **Why unions rather than a root comparison.** `place_root` answers
-    /// "which binding is this path rooted at", which is not cell identity:
-    /// `Subscription`'s `subscribers` field is initialized from `SignalCell`'s,
-    /// so a write through one reaches a read through the other, and `let g =
-    /// h.clone()` hands the same cell to a second name outright. Every way a
-    /// handle can move between slots is one of four forms — a binding's
-    /// initializer, a construction slot, an assignment, and `clone()` — so
-    /// unioning at those four and dropping everything ELSE into `Unknown`
-    /// covers the relation without an alias analysis.
+    /// "which binding is this path rooted at", which is not cell identity: a
+    /// local minted by `Shared::new` and then stored in a struct field is one
+    /// cell under two names, and `let g = h.clone()` hands the same cell to a
+    /// second name outright, so a write through either reaches a read through
+    /// the other. Every way a handle can move between slots is one of four
+    /// forms — a binding's initializer, a construction slot, an assignment,
+    /// and `clone()` — so unioning at those four and dropping everything ELSE
+    /// into `Unknown` covers the relation without an alias analysis.
+    ///
+    /// **Under a counted `Shared` this walk stays, and becomes easier to
+    /// justify** (C14 §11 Q7). It approximates cell identity statically
+    /// because today there is no runtime answer to approximate: nothing
+    /// counts, so nothing in a running program knows which handles name one
+    /// cell, and the approximation is load-bearing for CORRECTNESS — every
+    /// hole in the `Unknown` sink is a copy that should have been taken and
+    /// was not, which is a miscompile (the match-capture hole in pass 2 below
+    /// was exactly that, measured). Counting (C14 S4) produces the runtime
+    /// answer, and this walk becomes what it always wanted to be: an ELISION
+    /// heuristic over a fact the runtime also holds, where a wrong
+    /// approximation costs a copy nobody needed rather than one somebody did.
+    /// A strictly better failure mode, reached by adding a count rather than
+    /// by making the walk cleverer.
     fn compute_shared_cells(&self) -> SharedCells {
         let Some([new_ids, read_ids, write_ids, clone_ids]) = self.shared_members() else {
             return SharedCells::default();
