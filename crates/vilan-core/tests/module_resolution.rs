@@ -4808,6 +4808,14 @@ fn a65_an_overlay_only_nested_module_resolves() {
 // means with nothing said. The collision is an ambiguity error now, which is
 // what the file-level twin (`a.vl` beside `a/lib.vl`) has been since A65 — one
 // rule for both collisions.
+//
+// THE BOUND, stated because it used to be missed (tracker B342). The rule reads
+// each loaded module's CHILDREN SCOPE, and a child has one only because
+// something loaded it, so the collision is reported for a path something walks
+// THROUGH — whatever that path's spelling, and however many spell it — and not
+// for one nothing has ever named. `a67_a_collision_nothing_walks_into_is_not_
+// reported` pins that end of it and carries the measurement that chose it over
+// listing every loaded module's directory on every keystroke.
 
 #[test]
 fn a67_a_declaration_shadowing_a_directory_child_is_ambiguous() {
@@ -4839,10 +4847,16 @@ fn a67_a_declaration_shadowing_a_directory_child_is_ambiguous() {
 }
 
 #[test]
-fn a67_the_collision_is_reported_with_no_import_of_the_path() {
-    // The ambiguity is a fact about the TREE, not about one import: the file is
-    // unreachable whoever asks. `pkg::a` alone loads both halves, and the
-    // refusal names the pair without anything spelling `pkg::a::b`.
+fn a67_an_aliased_import_walks_the_same_collision() {
+    // The refusal does not depend on the SPELLING of the import that reached
+    // the child: `as taken` binds a different name and walks the same path, so
+    // the pair is named the same way.
+    //
+    // This test used to be called `a67_the_collision_is_reported_with_no_import_
+    // of_the_path`, and its comment said "`pkg::a` alone loads both halves".
+    // Neither was true of its own fixture, which imports `pkg::a::b` — a path
+    // that walks THROUGH the child (tracker B342). The rule as it is, and why
+    // it is that, is the test below.
     let files = &[
         ("a.vl", "fun b(): i32 { 1 }\n"),
         ("a/b.vl", "fun greet(): i32 { 2 }\n"),
@@ -4857,6 +4871,53 @@ fn a67_the_collision_is_reported_with_no_import_of_the_path() {
             .iter()
             .any(|error| error.contains("is ambiguous in module")),
         "an aliased import walks the same collision: {errors:#?}"
+    );
+}
+
+#[test]
+fn a67_a_collision_nothing_walks_into_is_not_reported() {
+    // B342, and the rule AS IT IS rather than as the heading above once claimed
+    // it. A67 reads each loaded module's CHILDREN SCOPE, and a child has a
+    // scope only because something loaded it — so `import pkg::a;` on its own,
+    // with `a.vl` declaring `b` beside an `a/b.vl` nobody has ever named,
+    // reports nothing. The ambiguity is real and latent; it is announced the
+    // moment any path walks through `a::b`, which is the test above.
+    //
+    // Closing it means LISTING each loaded module's directory instead of
+    // reading its children scope — a `read_dir` per loaded module per analysis,
+    // and the analysis is every keystroke, because the rule runs in
+    // `post_analysis_passes`. Measured on a copy of the owner's application
+    // (kolt, 24 modules plus the generated `lucide` root the manifest excludes,
+    // `submodules_in_directory` over the directory each loaded module names,
+    // 200 passes, thread CPU, loadavg 104-106, and again on a quiet box at
+    // 13 for the same answer — the cost is syscalls, not contention): kolt's
+    // own 28 module directories cost 0.68-0.70 ms median / 0.82-1.40 ms p95,
+    // and the kolt + std
+    // set an analysis actually loads — 93 directories, of which 7 exist — costs
+    // 2.90 ms median / 3.9-4.6 ms p95. The bar was 1 ms per analysis. It is
+    // over it, on a pass whose whole yield is announcing an ambiguity earlier
+    // than the first import that would announce it anyway, so the heading was
+    // corrected instead and this pin holds the rule honest.
+    let files = &[
+        ("a.vl", "fun b(): i32 { 1 }\n"),
+        ("a/b.vl", "fun greet(): i32 { 2 }\n"),
+        (
+            "main.vl",
+            "import pkg::a;\n\nfun main() { let _ = a::b(); }\n",
+        ),
+    ];
+    let errors = analyze_package(files, "main.vl", Platform::default());
+    assert!(
+        !errors
+            .iter()
+            .any(|error| error.contains("is ambiguous in module")),
+        "a child nothing loaded has no scope for the rule to read, so the \
+         collision is latent rather than reported: {errors:#?}"
+    );
+    assert!(
+        errors.is_empty(),
+        "and the declaration wins in silence, which is the fact B342 names — \
+         not an error, a latency: {errors:#?}"
     );
 }
 
