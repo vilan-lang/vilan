@@ -13680,6 +13680,60 @@ pub(crate) mod tests {
         assert_eq!(labels, vec!["x".to_string(), "y".to_string()], "{labels:?}");
     }
 
+    // E193: the head resolves through the SCOPE CHAIN and, when it is
+    // qualified, through B190's `type-path` — not by scanning the program for
+    // the first struct with that spelling.
+    //
+    // The GO-day kolt sweep filed E193 over the FIXME at `store.vl:238` ("auto
+    // complete does not work in the struct initializer"), which E160 closed one
+    // order earlier — the comment predates the fix and the pins beside this one
+    // are its own shape. What E160 left is the resolution: it took the first
+    // struct in `Program::structs` whose name matched, which is right only
+    // while one spelling means one struct.
+    #[test]
+    fn struct_initializer_completion_prefers_this_files_own_struct_over_a_siblings() {
+        let labels = workspace_completions_at_cursor(&[
+            (
+                "src/main.vl",
+                "import pkg::marks;\n\
+                 struct Dot { x: i32, y: i32 }\n\
+                 fun main() {\n\tlet d = Dot { |\n\tlet _ = marks::Dot { ink = \"a\" };\n}\n",
+            ),
+            ("src/marks.vl", "export struct Dot { ink: str }\n"),
+            ("vilan.toml", "[package]\nname = \"probe\"\n"),
+        ]);
+        assert_eq!(
+            labels,
+            vec!["x".to_string(), "y".to_string()],
+            "the `Dot` this file's scope binds, not the sibling's: {labels:?}"
+        );
+    }
+
+    // …and a QUALIFIED head answers for the namespace it names, whichever
+    // module the program happened to record first.
+    #[test]
+    fn struct_initializer_completion_reads_a_qualified_head_through_its_namespace() {
+        for imports in [
+            "import pkg::marks;\nimport pkg::shapes;\n",
+            "import pkg::shapes;\nimport pkg::marks;\n",
+        ] {
+            let labels = workspace_completions_at_cursor(&[
+                (
+                    "src/main.vl",
+                    &format!("{imports}fun main() {{\n\tlet d = shapes::Dot {{ |\n}}\n"),
+                ),
+                ("src/marks.vl", "export struct Dot { ink: str }\n"),
+                ("src/shapes.vl", "export struct Dot { x: i32, y: i32 }\n"),
+                ("vilan.toml", "[package]\nname = \"probe\"\n"),
+            ]);
+            assert_eq!(
+                labels,
+                vec!["x".to_string(), "y".to_string()],
+                "`shapes::Dot`'s fields, under `{imports}`: {labels:?}"
+            );
+        }
+    }
+
     // The exhibit's own shape (kolt `store.vl:265`): a multi-line list, one
     // assigned field and three shorthands, the cursor on a fresh line.
     #[test]

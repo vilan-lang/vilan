@@ -1302,7 +1302,10 @@ fn member_context<'text>(tokens: &[(Token, Span)], start: usize) -> Option<Curso
 ///    comma-separated run it sits in carries no `=` yet. `Point { x = p|` is a
 ///    value position, and falls through to the ordinary gatherers so the
 ///    expression being written there completes normally.
-fn struct_initializer_head(tokens: &[(Token<'_>, Span)], start: usize) -> Option<(usize, usize)> {
+fn struct_initializer_head(
+    tokens: &[(Token<'_>, Span)],
+    start: usize,
+) -> Option<(usize, std::ops::RangeInclusive<usize>)> {
     let mut index = tokens
         .iter()
         .rposition(|(_, span)| span.into_range().end <= start)?;
@@ -1370,7 +1373,7 @@ fn struct_initializer_head(tokens: &[(Token<'_>, Span)], start: usize) -> Option
     {
         return None;
     }
-    Some((open, head))
+    Some((open, path_start..=head))
 }
 
 /// The field names already written in the initializer opened at token `open`
@@ -1711,7 +1714,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
         // it looks like (`Point { x = origin.|` completes `origin`'s members).
         // What it does outrank is the bare scope position, which is the whole
         // defect — `KoltStore { us|` used to list every binding in scope.
-        if let Some(context) = self.struct_initializer_context(tokens, start) {
+        if let Some(context) = self.struct_initializer_context(tokens, offset, start) {
             return context;
         }
         CursorContext::Expression
@@ -1760,32 +1763,81 @@ impl<'a, 'src> Analysis<'a, 'src> {
         items
     }
 
-    /// The struct-initializer field position at `start`, with the head name
-    /// resolved against the program (E160). `None` when the token walk finds no
+    /// The struct-initializer field position at `start`, with the head resolved
+    /// against the program (E160, E193). `None` when the token walk finds no
     /// initializer, or when its head names no struct — which is how a block
     /// whose head happens to be an identifier (`match value {`, `for x in xs
     /// {`) declines without the classifier needing a parse.
     ///
-    /// The head is looked up by NAME, which is what a generic struct needs: the
-    /// fields are the DECLARATION's, `Holder<i32> { … }` and `Holder<str> { … }`
-    /// name the same ones, and the argument list the author wrote plays no part
-    /// in which names are offered.
+    /// The head resolves through the SCOPE CHAIN and, for the qualified form,
+    /// through B190's `type-path` (E193). E160 looked the last segment up by
+    /// name over the whole program and took the first struct that matched,
+    /// which is right only while one spelling means one struct: a file with its
+    /// own `struct Dot` beside a sibling's was offered the SIBLING's fields at
+    /// `Dot { ▎`, and `shapes::Dot { ▎` ignored the namespace it was told and
+    /// answered whichever `Dot` the program recorded first.
+    ///
+    /// The generic ARGUMENTS play no part, here or below: the fields are the
+    /// DECLARATION's, and `Holder<i32> { … }` and `Holder<str> { … }` name the
+    /// same ones (`struct_initializer_head` walks back over them for exactly
+    /// that reason).
+    ///
+    /// The program-wide scan survives as a LAST resort, and only as one: a
+    /// buffer mid-edit may not have bound the name yet — a freshly typed
+    /// `struct` above the cursor, a file whose scopes did not survive the
+    /// analysis — and answering with the declaration that exists beats
+    /// answering with nothing, which is what this position did before E160.
     fn struct_initializer_context<'text>(
         &self,
         tokens: &[(Token<'_>, Span)],
+        offset: usize,
         start: usize,
     ) -> Option<CursorContext<'text>> {
-        let (open, head) = struct_initializer_head(tokens, start)?;
-        let Token::Ident(name) = tokens[head].0 else {
-            return None;
-        };
-        let struct_id = *self
-            .program
-            .structs
-            .iter()
-            .find(|(_, structure)| structure.name == name)?
-            .0;
+        let (open, path) = struct_initializer_head(tokens, start)?;
+        // `a :: b :: Name` — the idents at the even offsets of the run.
+        let mut segments: Vec<&str> = Vec::new();
+        for index in path.clone().step_by(2) {
+            let Token::Ident(segment) = tokens[index].0 else {
+                return None;
+            };
+            segments.push(segment);
+        }
+        let (&name, namespace) = segments.split_last()?;
+        let analyzed_offset = self.to_analyzed_offset(offset);
+        let struct_id = self
+            .path_struct_id(namespace, name, analyzed_offset)
+            .or_else(|| {
+                // Nothing in scope answers: the program-wide first match, which
+                // is all E160 ever asked and is still better than silence.
+                self.program
+                    .structs
+                    .iter()
+                    .find(|(_, structure)| structure.name == name)
+                    .map(|(id, _)| *id)
+            })?;
         Some(CursorContext::StructInitializer { struct_id, open })
+    }
+
+    /// The struct a written head names, resolved the way the analyzer resolves
+    /// it (E193): the leading segment out of the SCOPE at the cursor, each
+    /// further segment out of the namespace before it, and the last one held to
+    /// being a struct.
+    ///
+    /// `None` when any step fails, which is a decline and not a guess — the
+    /// caller's fallback is what decides whether a guess is better than silence.
+    fn path_struct_id(&self, namespace: &[&str], name: &str, analyzed_offset: usize) -> Option<Id> {
+        let Some((first, rest)) = namespace.split_first() else {
+            // Unqualified: the binding this file's scope chain gives the name.
+            return self
+                .binding_in_scope(name, analyzed_offset)
+                .filter(|id| self.program.structs.contains_key(id));
+        };
+        let mut current = self.namespace_in_scope(first, analyzed_offset)?;
+        for segment in rest {
+            current = self.namespace_entry_id(current, segment)?;
+        }
+        self.namespace_entry_id(current, name)
+            .filter(|id| self.program.structs.contains_key(id))
     }
 
     /// The candidates at a struct-initializer field position (E160): the
