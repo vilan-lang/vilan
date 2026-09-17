@@ -665,7 +665,7 @@ mod tests {
     #[test]
     fn a_declaration_lowers_to_raw() {
         let (block, chain) = shapes_match(
-            "css { display: flex; }",
+            "css { display(\"flex\"); }",
             r#"style().raw("display", "flex")"#,
         );
         assert_eq!(block, chain);
@@ -675,10 +675,8 @@ mod tests {
     fn a_one_argument_value_passes_its_expression_through() {
         // The row that keeps a `Length` a `Length`: ONE argument is the
         // expression itself, never a string.
-        let (block, chain) = shapes_match(
-            "css { gap: {space(4)}; }",
-            r#"style().raw("gap", space(4))"#,
-        );
+        let (block, chain) =
+            shapes_match("css { gap(space(4)); }", r#"style().raw("gap", space(4))"#);
         assert_eq!(block, chain);
     }
 
@@ -707,14 +705,14 @@ mod tests {
         // The control A34 rests on: ONE argument still passes its expression
         // through untouched, so the value keeps its TYPE and reaches
         // `Style::raw`, which carries the `:root` line itself.
-        let tree = lowered("css { gap: {space(4)}; }");
+        let tree = lowered("css { gap(space(4)); }");
         assert!(!tree.contains("piece"), "{tree}");
     }
 
     #[test]
     fn a_nested_rule_lowers_to_a_combinator_with_the_chain_last() {
         let (block, chain) = shapes_match(
-            "css { .hover { color: red; } }",
+            "css { .hover { color(\"red\"); } }",
             r#"style().hover(style().raw("color", "red"))"#,
         );
         assert_eq!(block, chain);
@@ -723,7 +721,7 @@ mod tests {
     #[test]
     fn a_nested_head_with_arguments_keeps_them_before_the_chain() {
         let (block, chain) = shapes_match(
-            r#"css { .within("data-theme", Some("dark")) { color: red; } }"#,
+            r#"css { .within("data-theme", Some("dark")) { color("red"); } }"#,
             r#"style().within("data-theme", Some("dark"), style().raw("color", "red"))"#,
         );
         assert_eq!(block, chain);
@@ -735,7 +733,7 @@ mod tests {
         // is the items in the order they were written, a nested rule in the
         // middle included.
         let (block, chain) = shapes_match(
-            "css { color: red; .hover { color: blue; } padding: 1rem; }",
+            "css { color(\"red\"); .hover { color(\"blue\"); } padding(rem(1)); }",
             r#"style().raw("color", "red").hover(style().raw("color", "blue")).raw("padding", rem(1))"#,
         );
         assert_eq!(block, chain);
@@ -768,7 +766,7 @@ mod tests {
         // nothing, and a link's position is what it means (an opaque method
         // may write any property at all).
         let (block, chain) = shapes_match(
-            "css { color: red; .ghost(); padding: 1rem; }",
+            "css { color(\"red\"); .ghost(); padding(rem(1)); }",
             r#"style().raw("color", "red").ghost().raw("padding", rem(1))"#,
         );
         assert_eq!(block, chain);
@@ -788,7 +786,7 @@ mod tests {
         // the condition rule is untouched — its inner chain still rides in as
         // the last argument.
         let (block, chain) = shapes_match(
-            "css { .hover { color: red; } }",
+            "css { .hover { color(\"red\"); } }",
             r#"style().hover(style().raw("color", "red"))"#,
         );
         assert_eq!(block, chain);
@@ -817,7 +815,7 @@ mod tests {
         // The one generated seed with a real span, so a diagnostic about the
         // block's value underlines the word that asked for one. `let probe = `
         // is 12 bytes, so the keyword is 12..15.
-        let tree = lowered("css { display: flex; }");
+        let tree = lowered("css { display(\"flex\"); }");
         assert!(
             tree.contains("(StdItem(\"style\", \"style\"), 12..15)"),
             "{tree}"
@@ -833,7 +831,7 @@ mod tests {
         // `style` MODULE — can be what it reaches. The resolution half is
         // pinned in `inference::styling` and `module_resolution`; this is the
         // TREE half, which is where the bare accessor used to be.
-        let tree = lowered("css { display: flex; }");
+        let tree = lowered("css { display(\"flex\"); }");
         assert!(tree.contains("StdItem(\"style\", \"style\")"), "{tree}");
         assert!(!tree.contains("Accessor(\"style\")"), "{tree}");
     }
@@ -843,7 +841,7 @@ mod tests {
         // Every seed is hygienic, not just the outer one: a condition rule's
         // inner chain is a `style()` too, and a site binding must not capture it
         // there either.
-        let tree = lowered("css { .hover { color: red; } }");
+        let tree = lowered("css { .hover { color(\"red\"); } }");
         assert_eq!(
             tree.matches("StdItem(\"style\", \"style\")").count(),
             2,
@@ -854,7 +852,7 @@ mod tests {
     #[test]
     fn the_raw_accessor_is_zero_width_at_the_property() {
         // `let probe = css { display: flex; }` — `display` starts at 18.
-        let tree = lowered("css { display: flex; }");
+        let tree = lowered("css { display(\"flex\"); }");
         assert!(tree.contains("(Accessor(\"raw\"), 18..18)"), "{tree}");
         // …and the property NAME keeps its own real span, which is what a
         // property-position diagnostic and the semantic-token painter need.
@@ -864,7 +862,7 @@ mod tests {
     #[test]
     fn a_combinator_accessor_is_zero_width_at_its_head() {
         // `let probe = css { .hover { color: red; } }` — the `.` is at 18.
-        let tree = lowered("css { .hover { color: red; } }");
+        let tree = lowered("css { .hover { color(\"red\"); } }");
         assert!(tree.contains("(Accessor(\"hover\"), 18..18)"), "{tree}");
     }
 
@@ -873,7 +871,7 @@ mod tests {
         // The inner `style()` anchors on the body's `{` (at 24), NOT on the
         // combinator head — a generated accessor sharing the head would paint
         // `.hover` as a method reference.
-        let tree = lowered("css { .hover { color: red; } }");
+        let tree = lowered("css { .hover { color(\"red\"); } }");
         assert!(
             tree.contains("(StdItem(\"style\", \"style\"), 25..25)"),
             "{tree}"
@@ -923,7 +921,7 @@ mod tests {
         // The pass runs BEFORE the element desugar, so it descends into an
         // element's head items and children itself — otherwise a block written
         // inside markup would reach the analyzer as a `Node::Css`.
-        let tree = lowered("<div .styled(const css { display: flex; }) />");
+        let tree = lowered("<div .styled(const css { display(\"flex\"); }) />");
         assert!(
             !tree.contains("Css("),
             "a block inside markup survived: {tree}"

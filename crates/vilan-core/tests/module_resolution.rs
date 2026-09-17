@@ -3161,7 +3161,7 @@ fn b270_a_css_block_compiles_under_the_web_preludes_ambient_style_module() {
     // the same file is the control: the ambient MODULE is untouched and still
     // qualifies, which the interim workaround (a per-file
     // `import std::style::{ Length, style };`) cost the file.
-    let entry = "let card = const css { display: flex; };\n\
+    let entry = "let card = const css { display(\"flex\"); };\n\
         fun main() {\n\
         \tlet gap = style::Length::rem(1);\n\
         \tprint(card.class_list());\n\
@@ -3184,7 +3184,7 @@ fn b270_a_local_style_binding_does_not_capture_a_block_under_a_prelude() {
     // wins nothing at all for the desugar's seed.
     let entry = "fun main() {\n\
         \tlet style = 1;\n\
-        \tlet card = const css { display: flex; };\n\
+        \tlet card = const css { display(\"flex\"); };\n\
         \tprint(card.class_list());\n\
         \tprint(i\"{style}\");\n\
         }\n";

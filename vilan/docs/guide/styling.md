@@ -62,12 +62,12 @@ import std::ui::{ view, View, mount_root };
 import std::style::{ style, space, Style, Color };
 
 let card = css {
-	display: flex;
-	gap: {space(2)};
-	padding: {space(4)};
-	background-color: {Color::gray(100)};
+	display("flex");
+	gap(space(2));
+	padding(space(4));
+	background-color(Color::gray(100));
 	.hover {
-		background-color: {Color::gray(200)};
+		background-color(Color::gray(200));
 	}
 };
 
@@ -96,18 +96,18 @@ has no nesting order to get wrong.
 
 ```vilan,fragment
 let panel = css {
-	color: {Color::gray(900)};
+	color(Color::gray(900));
 
 	.on(within(attribute("data-theme").eq("dark"))) {
-		color: {Color::gray(50)};
+		color(Color::gray(50));
 	}
 
 	.on(hover() + active().not()) {
-		color: {Color::blue(600)};
+		color(Color::blue(600));
 	}
 
 	.children {
-		margin-top: {space(2)};
+		margin-top(space(2));
 	}
 };
 ```
@@ -154,10 +154,10 @@ a value reads as the CSS it stands for:
 
 ```vilan,fragment
 let chip = css {
-	padding: {space(2)};
-	color: {gray(700)};
-	border: 1px solid {gray(300)};
-	border-radius: {rem(0.25)};
+	padding(space(2));
+	color(gray(700));
+	border("1px solid", gray(300));
+	border-radius(rem(0.25));
 };
 ```
 
@@ -180,8 +180,8 @@ impl Style {
 
 let toolbar = css {
 	.flex_row();
-	gap: {space(2)};
-	padding: {space(1)};
+	gap(space(2));
+	padding(space(1));
 };
 ```
 
@@ -233,10 +233,10 @@ explaining the wrong declaration.
 ```vilan,fragment
 // formats as: display, padding, then `.md` before `.hover`
 let button = css {
-	.hover { background-color: {Color::gray(200)}; }
-	padding: {space(2)};
-	.md { padding: {space(4)}; }
-	display: flex;
+	.hover { background-color(Color::gray(200)); }
+	padding(space(2));
+	.md { padding(space(4)); }
+	display("flex");
 };
 ```
 

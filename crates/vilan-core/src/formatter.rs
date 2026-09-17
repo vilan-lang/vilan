@@ -7917,8 +7917,8 @@ mod bailing_constructs {
         // A hole is an ordinary vilan expression and canonicalizes as one; the
         // value text around it is CSS and does not.
         assert_construct(
-            "fun f() {\n\tcss {\n\t\tdisplay:flex;\n\t\tgap: {space( 4 )};\n\t}\n}\n",
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\tgap: {space(4)};\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\tgap(space( 4 ));\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\tgap(space(4));\n\t}\n}\n",
         );
     }
 
@@ -7927,8 +7927,8 @@ mod bailing_constructs {
         // The `let active = const css { padding: {space(6)}; };` shape (§2):
         // one declaration, no comment, and it fits — so it stays on the line.
         assert_construct(
-            "fun f(){let a=css{color:red;};a}\n",
-            "fun f() {\n\tlet a = css { color: red; };\n\ta\n}\n",
+            "fun f(){let a=css{color(\"red\");};a}\n",
+            "fun f() {\n\tlet a = css { color(\"red\"); };\n\ta\n}\n",
         );
     }
 
@@ -7943,8 +7943,8 @@ mod bailing_constructs {
         // never collapses — not even the one-declaration one the OUTER block
         // would have collapsed. The head's arguments print as any call's do.
         assert_construct(
-            "fun f() {\n\tcss { .within(\"data-theme\",\"dark\") { color: red; } }\n}\n",
-            "fun f() {\n\tcss {\n\t\t.within(\"data-theme\", \"dark\") {\n\t\t\tcolor: red;\n\t\t}\n\t}\n}\n",
+            "fun f() {\n\tcss { .within(\"data-theme\",\"dark\") { color(\"red\"); } }\n}\n",
+            "fun f() {\n\tcss {\n\t\t.within(\"data-theme\", \"dark\") {\n\t\t\tcolor(\"red\");\n\t\t}\n\t}\n}\n",
         );
     }
 
@@ -7955,8 +7955,8 @@ mod bailing_constructs {
         // unknown declaration. `display` stays after `.ghost();` here, though
         // the canonical order would put it first.
         assert_construct(
-            "fun f() {\n\tcss {\n\t\tpadding: {space(4)};\n\t\t.ghost();\n\t\tdisplay: flex;\n\t}\n}\n",
-            "fun f() {\n\tcss {\n\t\tpadding: {space(4)};\n\t\t.ghost();\n\t\tdisplay: flex;\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tpadding(space(4));\n\t\t.ghost();\n\t\tdisplay(\"flex\");\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tpadding(space(4));\n\t\t.ghost();\n\t\tdisplay(\"flex\");\n\t}\n}\n",
         );
     }
 
@@ -8011,8 +8011,8 @@ mod bailing_constructs {
         // (layout), `.md` (media) before `.hover` (pseudo), every condition
         // after every declaration.
         assert_construct(
-            "fun f() {\n\tcss {\n\t\t.hover {\n\t\t\tcolor: blue;\n\t\t}\n\t\tpadding: {space(4)};\n\t\t.md {\n\t\t\tpadding: {space(6)};\n\t\t}\n\t\tdisplay: flex;\n\t}\n}\n",
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\tpadding: {space(4)};\n\t\t.md {\n\t\t\tpadding: {space(6)};\n\t\t}\n\t\t.hover {\n\t\t\tcolor: blue;\n\t\t}\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\t.hover {\n\t\t\tcolor(\"blue\");\n\t\t}\n\t\tpadding(space(4));\n\t\t.md {\n\t\t\tpadding(space(6));\n\t\t}\n\t\tdisplay(\"flex\");\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\tpadding(space(4));\n\t\t.md {\n\t\t\tpadding(space(6));\n\t\t}\n\t\t.hover {\n\t\t\tcolor(\"blue\");\n\t\t}\n\t}\n}\n",
         );
     }
 
@@ -8023,8 +8023,8 @@ mod bailing_constructs {
         // holds its index absolutely, exactly as an unknown METHOD does in a
         // chain. `padding` may not cross it to reach `display`.
         assert_construct(
-            "fun f() {\n\tcss {\n\t\tpadding: {space(4)};\n\t\t--brand-ink: red;\n\t\tdisplay: flex;\n\t}\n}\n",
-            "fun f() {\n\tcss {\n\t\tpadding: {space(4)};\n\t\t--brand-ink: red;\n\t\tdisplay: flex;\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tpadding(space(4));\n\t\t--brand-ink(\"red\");\n\t\tdisplay(\"flex\");\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tpadding(space(4));\n\t\t--brand-ink(\"red\");\n\t\tdisplay(\"flex\");\n\t}\n}\n",
         );
     }
 
@@ -8041,16 +8041,16 @@ mod bailing_constructs {
         // swap, which is exactly the miscompile the family rule exists to
         // prevent. Written the other way round this pin would pass either way.
         assert_construct(
-            "fun f() {\n\tcss {\n\t\tpadding-left: {space(6)};\n\t\tpadding: {space(4)};\n\t\tdisplay: flex;\n\t}\n}\n",
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\tpadding-left: {space(6)};\n\t\tpadding: {space(4)};\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tpadding-left(space(6));\n\t\tpadding(space(4));\n\t\tdisplay(\"flex\");\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\tpadding-left(space(6));\n\t\tpadding(space(4));\n\t}\n}\n",
         );
     }
 
     #[test]
     fn a_nested_rules_own_items_sort_too() {
         assert_construct(
-            "fun f() {\n\tcss {\n\t\t.hover {\n\t\t\tpadding: {space(4)};\n\t\t\tdisplay: flex;\n\t\t}\n\t}\n}\n",
-            "fun f() {\n\tcss {\n\t\t.hover {\n\t\t\tdisplay: flex;\n\t\t\tpadding: {space(4)};\n\t\t}\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\t.hover {\n\t\t\tpadding(space(4));\n\t\t\tdisplay(\"flex\");\n\t\t}\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\t.hover {\n\t\t\tdisplay(\"flex\");\n\t\t\tpadding(space(4));\n\t\t}\n\t}\n}\n",
         );
     }
 
@@ -8060,7 +8060,7 @@ mod bailing_constructs {
         // wrong item — the comment cursor only moves forward — so a block with
         // a comment anywhere inside it prints canonically in WRITTEN order.
         // `padding` would otherwise sort after `display`.
-        let source = "fun f() {\n\tcss {\n\t\t// a note\n\t\tpadding: {space(4)};\n\t\tdisplay: flex;\n\t}\n}\n";
+        let source = "fun f() {\n\tcss {\n\t\t// a note\n\t\tpadding(space(4));\n\t\tdisplay(\"flex\");\n\t}\n}\n";
         assert_construct(source, source);
         assert_eq!(format(source).matches("// a note").count(), 1);
         // Anti-vacuity, built the way
@@ -8070,7 +8070,7 @@ mod bailing_constructs {
         let commentless = source.replace("\t\t// a note\n", "");
         assert_eq!(
             format(&commentless),
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\tpadding: {space(4)};\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\tpadding(space(4));\n\t}\n}\n",
             "the fixture must be out of canonical order, or the refusal proves nothing"
         );
     }
@@ -8080,7 +8080,7 @@ mod bailing_constructs {
         // The refusal is by the block's own braces, so a comment buried in a
         // nested rule pins the outer body too: reordering around it would move
         // the rule the comment is inside away from the comment above it.
-        let source = "fun f() {\n\tcss {\n\t\t.hover {\n\t\t\t// a note\n\t\t\tcolor: red;\n\t\t}\n\t\tdisplay: flex;\n\t}\n}\n";
+        let source = "fun f() {\n\tcss {\n\t\t.hover {\n\t\t\t// a note\n\t\t\tcolor(\"red\");\n\t\t}\n\t\tdisplay(\"flex\");\n\t}\n}\n";
         assert_construct(source, source);
     }
 
@@ -8090,16 +8090,16 @@ mod bailing_constructs {
         // first commit — so a comment written above the second declaration
         // prints above the second declaration, not below the statement.
         assert_construct(
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\t// about the padding\n\t\tpadding: {space(4)};\n\t}\n}\n",
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\t// about the padding\n\t\tpadding: {space(4)};\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\t// about the padding\n\t\tpadding(space(4));\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\t// about the padding\n\t\tpadding(space(4));\n\t}\n}\n",
         );
     }
 
     #[test]
     fn a_comment_after_the_last_item_stays_inside_the_braces() {
         assert_construct(
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\t// trailing\n\t}\n}\n",
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\t// trailing\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\t// trailing\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\t// trailing\n\t}\n}\n",
         );
     }
 
@@ -8109,8 +8109,8 @@ mod bailing_constructs {
         // between items that no longer belong together, so the block has one
         // shape: item, item, item.
         assert_construct(
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\n\t\tpadding: {space(4)};\n\t}\n}\n",
-            "fun f() {\n\tcss {\n\t\tdisplay: flex;\n\t\tpadding: {space(4)};\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\n\t\tpadding(space(4));\n\t}\n}\n",
+            "fun f() {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\tpadding(space(4));\n\t}\n}\n",
         );
     }
 
@@ -8121,8 +8121,8 @@ mod bailing_constructs {
         // block (the formatter reparses SOURCE and there is no `style ( )` token
         // run in one); the block has its own pair, reading the same tables.
         assert_construct(
-            "fun f() {\n\tlet a = style().padding(x).display(y);\n\tlet b = css {\n\t\tpadding: x;\n\t\tdisplay: y;\n\t};\n\tb\n}\n",
-            "fun f() {\n\tlet a = style().display(y).padding(x);\n\tlet b = css {\n\t\tdisplay: y;\n\t\tpadding: x;\n\t};\n\tb\n}\n",
+            "fun f() {\n\tlet a = style().padding(x).display(y);\n\tlet b = css {\n\t\tpadding(\"x\");\n\t\tdisplay(\"y\");\n\t};\n\tb\n}\n",
+            "fun f() {\n\tlet a = style().display(y).padding(x);\n\tlet b = css {\n\t\tdisplay(\"y\");\n\t\tpadding(\"x\");\n\t};\n\tb\n}\n",
         );
     }
 
@@ -8130,8 +8130,8 @@ mod bailing_constructs {
     fn a_block_inside_an_element_head_prints_canonically() {
         // The two sugars compose: a block in a head item is still a block.
         assert_construct(
-            "fun f() {\n\t<div .styled(const css{color:red;}) />\n}\n",
-            "fun f() {\n\t<div .styled(const css { color: red; }) />\n}\n",
+            "fun f() {\n\t<div .styled(const css{color(\"red\");}) />\n}\n",
+            "fun f() {\n\t<div .styled(const css { color(\"red\"); }) />\n}\n",
         );
     }
 

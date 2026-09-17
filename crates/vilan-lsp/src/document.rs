@@ -9132,7 +9132,7 @@ pub(crate) mod tests {
         assert!(conversion.1.starts_with("style()"), "{conversion:?}");
         assert_eq!(
             conversion.2,
-            "css {\n\t\tdisplay: flex;\n\t\tgap: {space(4)};\n\t\t.md {\n\t\t\tpadding: {space(6)};\n\t\t}\n\t}",
+            "css {\n\t\tdisplay(\"flex\");\n\t\tgap(space(4));\n\t\t.md {\n\t\t\tpadding(space(6));\n\t\t}\n\t}",
             "{conversion:?}"
         );
     }
@@ -9152,7 +9152,7 @@ pub(crate) mod tests {
         assert!(!conversion.0, "chain -> block");
         assert_eq!(
             conversion.2,
-            "css {\n\t\tpadding-left: {space(4)};\n\t\tpadding-right: {space(4)};\n\t\tcolor: {Color::gray(900)};\n\t\tgap: {space(2)};\n\t}",
+            "css {\n\t\tpadding-left(space(4));\n\t\tpadding-right(space(4));\n\t\tcolor(Color::gray(900));\n\t\tgap(space(2));\n\t}",
             "{conversion:?}"
         );
     }
@@ -9174,7 +9174,7 @@ pub(crate) mod tests {
             "the whole chain is replaced"
         );
         assert_eq!(
-            conversion.2, "css {\n\t\tdisplay: flex;\n\t\tpadding: {style::space(4)};\n\t}",
+            conversion.2, "css {\n\t\tdisplay(\"flex\");\n\t\tpadding(style::space(4));\n\t}",
             "{conversion:?}"
         );
     }
@@ -9202,7 +9202,7 @@ pub(crate) mod tests {
         .expect("a kolt-shaped chain converts");
         assert_eq!(
             conversion.2,
-            "css {\n\t\tpadding: {space(4)};\n\t\toutline: none;\n\t\tborder-radius: {Length::px(4)};\n\t\t.attribute(\"disabled\", None) {\n\t\t\tcolor: {Color::gray(300)};\n\t\t}\n\t}.select_off().hover(style().background(Color::gray(100)))",
+            "css {\n\t\tpadding(space(4));\n\t\toutline(\"none\");\n\t\tborder-radius(Length::px(4));\n\t\t.attribute(\"disabled\", None) {\n\t\t\tcolor(Color::gray(300));\n\t\t}\n\t}.select_off().hover(style().background(Color::gray(100)))",
             "{conversion:?}"
         );
     }
@@ -9223,7 +9223,7 @@ pub(crate) mod tests {
         assert!(!conversion.0, "chain -> block");
         assert_eq!(
             conversion.2,
-            "css {\n\t\tdisplay: {Display::Flex.value()};\n\t\tflex-direction: {FlexDirection::Row.value()};\n\t\tgap: {space(2)};\n\t\talign-items: {AlignItems::Center.value()};\n\t\tborder-radius: {Length::px(4)};\n\t\tcolor: {color};\n\t}",
+            "css {\n\t\tdisplay(Display::Flex.value());\n\t\tflex-direction(FlexDirection::Row.value());\n\t\tgap(space(2));\n\t\talign-items(AlignItems::Center.value());\n\t\tborder-radius(Length::px(4));\n\t\tcolor(color);\n\t}",
             "{conversion:?}"
         );
     }
@@ -9241,7 +9241,7 @@ pub(crate) mod tests {
         .expect("a delegating extension converts");
         assert_eq!(
             conversion.2,
-            "css {\n\t\tpointer-events: none;\n\t\tdisplay: {Display::Flex.value()};\n\t\tflex-direction: {FlexDirection::Row.value()};\n\t\tborder-radius: {Length::px(4)};\n\t}.themed().raw(\"outline\", \"none\")",
+            "css {\n\t\tpointer-events(\"none\");\n\t\tdisplay(Display::Flex.value());\n\t\tflex-direction(FlexDirection::Row.value());\n\t\tborder-radius(Length::px(4));\n\t}.themed().raw(\"outline\", \"none\")",
             "{conversion:?}"
         );
     }
@@ -9268,7 +9268,7 @@ pub(crate) mod tests {
         .expect("a chain reaching a sibling's extension converts");
         assert_eq!(
             conversion.2,
-            "css {\n\t\tdisplay: {Display::Flex.value()};\n\t\tflex-direction: {FlexDirection::Row.value()};\n\t\tborder-radius: {Length::px(4)};\n\t\tletter-spacing: {Length::px(1)};\n\t\toutline: none;\n\t}",
+            "css {\n\t\tdisplay(Display::Flex.value());\n\t\tflex-direction(FlexDirection::Row.value());\n\t\tborder-radius(Length::px(4));\n\t\tletter-spacing(Length::px(1));\n\t\toutline(\"none\");\n\t}",
             "{conversion:?}"
         );
     }
@@ -9288,7 +9288,7 @@ pub(crate) mod tests {
         .expect("the convertible prefix converts");
         assert_eq!(
             conversion.2,
-            "css {\n\t\tborder-radius: {Length::px(4)};\n\t}.themed().raw(\"outline\", \"none\")",
+            "css {\n\t\tborder-radius(Length::px(4));\n\t}.themed().raw(\"outline\", \"none\")",
             "{conversion:?}"
         );
     }
@@ -9305,7 +9305,7 @@ pub(crate) mod tests {
         .expect("the convertible prefix converts");
         assert_eq!(
             conversion.2,
-            "css {\n\t\tpadding: {space(4)};\n\t}.border(Length::px(1), Color::gray(300))",
+            "css {\n\t\tpadding(space(4));\n\t}.border(Length::px(1), Color::gray(300))",
             "{conversion:?}"
         );
     }
@@ -9330,7 +9330,7 @@ pub(crate) mod tests {
     // the block again, byte for byte, nesting included.
     #[test]
     fn the_two_conversions_round_trip() {
-        let block = "css {\n\t\tdisplay: flex;\n\t\tgap: {space(4)};\n\t\t.md {\n\t\t\tpadding: {space(6)};\n\t\t}\n\t}";
+        let block = "css {\n\t\tdisplay(\"flex\");\n\t\tgap(space(4));\n\t\t.md {\n\t\t\tpadding(space(6));\n\t\t}\n\t}";
         let to_chain = css_conversion(&format!("\t{}\n", block.replacen("display", "dis~play", 1)))
             .expect("a block converts");
         assert!(to_chain.0, "block -> chain");
@@ -11517,7 +11517,7 @@ pub(crate) mod tests {
         // outer `style()`, at the `css` keyword, so the missing-import note can
         // underline the word that asked for a `Style` — is suppressed here,
         // exactly as `<div`'s Function token is.
-        let text = "import std::style::{ Color, Style, space, style };\n\nfun card(): Style {\n\tcss {\n\t\tdisplay: flex;\n\t\tflex-direction: column;\n\t\tgap: {space(4)};\n\t\t--brand-ink: {Color::gray(900)};\n\t\t.md {\n\t\t\tcolor: {Color::gray(50)};\n\t\t}\n\t}\n}\n";
+        let text = "import std::style::{ Color, Style, space, style };\n\nfun card(): Style {\n\tcss {\n\t\tdisplay(\"flex\");\n\t\tflex-direction(\"column\");\n\t\tgap(space(4));\n\t\t--brand-ink(Color::gray(900));\n\t\t.md {\n\t\t\tcolor(Color::gray(50));\n\t\t}\n\t}\n}\n";
         let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
         let tokens = document.semantic_tokens();
         let kind_of = |snippet: &str, occurrence: usize| -> Option<TokenKind> {
@@ -14212,7 +14212,7 @@ pub(crate) mod tests {
     #[test]
     fn css_completion_fires_inside_a_nested_rule() {
         let labels = css_block_completions(
-            "\tlet card = css {\n\t\tdisplay: flex;\n\t\t.md {\n\t\t\tpad~\n\t\t}\n\t};\n",
+            "\tlet card = css {\n\t\tdisplay(\"flex\");\n\t\t.md {\n\t\t\tpad~\n\t\t}\n\t};\n",
         );
         assert!(
             labels.contains(&"padding".to_string()) && labels.contains(&"padding-left".to_string()),
@@ -14221,7 +14221,7 @@ pub(crate) mod tests {
         // And after a completed nested rule the OUTER body is property
         // position again — the rule's `}` closes its item.
         let after = css_block_completions(
-            "\tlet card = css {\n\t\t.md {\n\t\t\tpadding: 1px;\n\t\t}\n\t\tdisp~\n\t};\n",
+            "\tlet card = css {\n\t\t.md {\n\t\t\tpadding(px(1));\n\t\t}\n\t\tdisp~\n\t};\n",
         );
         assert!(
             after.contains(&"display".to_string()),
@@ -14235,7 +14235,7 @@ pub(crate) mod tests {
     #[test]
     fn a_css_condition_argument_is_not_a_css_position() {
         let labels = css_block_completions(
-            "\tlet theme = \"dark\";\n\tlet card = css {\n\t\t.within(\"data-theme\", the~) {\n\t\t\tdisplay: flex;\n\t\t}\n\t};\n",
+            "\tlet theme = \"dark\";\n\tlet card = css {\n\t\t.within(\"data-theme\", the~) {\n\t\t\tdisplay(\"flex\");\n\t\t}\n\t};\n",
         );
         assert!(
             labels.contains(&"theme".to_string()),

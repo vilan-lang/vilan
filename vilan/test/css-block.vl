@@ -19,17 +19,17 @@ import std::style::{ Color, Length, Style, space, style };
 // holds the file to it in both spellings.
 fun card(): Style {
 	css {
-		display: flex;
-		flex-direction: column;
-		gap: {space(4)};
-		padding: {space(4)};
-		background-color: {Color::gray(50)};
-		border-radius: {Length::px(8)};
+		display("flex");
+		flex-direction("column");
+		gap(space(4));
+		padding(space(4));
+		background-color(Color::gray(50));
+		border-radius(Length::px(8));
 		.md {
-			padding: {space(6)};
+			padding(space(6));
 		}
 		.hover {
-			background-color: {Color::gray(100)};
+			background-color(Color::gray(100));
 		}
 	}
 }
@@ -64,21 +64,21 @@ fun values(): Style {
 		// What CSS can say and vilan cannot is a string, and a string is a
 		// value like any other: commas, parens and quotes inside it are its
 		// own bytes.
-		grid-template-columns: repeat(3, 1fr);
-		width: 50%;
-		max-width: 37px;
+		grid-template-columns("repeat(3, 1fr)");
+		width(pct(50));
+		max-width(px(37));
 		// A dimension is a TYPED constructor now (`pct`, `px`, `rem`); a
 		// value with no unit of its own is the string it reads as.
-		line-height: 1.5;
-		background-image: url("tile.png");
+		line-height("1.5");
+		background-image("url(\"tile.png\")");
 		// A value whose parts are GLUED is ONE argument, built by hand: an
 		// i-string with each part through `piece`, which renders it and
 		// carries its token. Spaced parts are N arguments instead.
-		transition-duration: {150}ms;
+		transition-duration(i"{piece(150)}ms");
 		// A custom property is span-adjacency, nothing new: `--brand-ink` is
 		// five tokens the parser joins and the desugar slices — and it is a
 		// CALL HEAD like any other property (R12).
-		--brand-ink: {Color::gray(900)};
+		--brand-ink(Color::gray(900));
 	}
 }
 
@@ -91,23 +91,23 @@ fun values(): Style {
 // conditions by axis, and the values inside a head by the same axis order.
 fun conditions(): Style {
 	css {
-		color: {Color::gray(900)};
+		color(Color::gray(900));
 		.md {
 			.on(within(attribute("data-theme").eq("dark")) + attribute("data-open").eq("true") + hover()) {
-				color: {Color::gray(50)};
+				color(Color::gray(50));
 			}
 		}
 		.on(within(attribute("data-theme").eq("dark"))) {
-			color: {Color::gray(50)};
+			color(Color::gray(50));
 			.hover {
-				color: {Color::gray(100)};
+				color(Color::gray(100));
 			}
 		}
 		.children {
-			margin-top: {space(2)};
+			margin-top(space(2));
 		}
 		.divide {
-			margin-top: {space(4)};
+			margin-top(space(4));
 		}
 	}
 }
@@ -121,7 +121,7 @@ fun main() {
 	print(const values().class_list());
 	print(const conditions().class_list());
 	// A block is an ordinary expression: `+` still combines, and last wins.
-	let wider = const css { padding: {space(6)}; };
+	let wider = const css { padding(space(6)); };
 	print((block + wider).class_list());
 }
 main();

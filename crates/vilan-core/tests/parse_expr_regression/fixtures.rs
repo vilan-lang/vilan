@@ -472,8 +472,8 @@ const CONDITION_FIXTURES: &[&str] = &[
     // A `css` block is brace-initial, so a condition takes it only in parens —
     // the same escape hatch a struct literal has (css-block.md §4.2). The
     // DECLINER list carries the bare form.
-    "(css { display: flex; })",
-    "(css { display: flex; }).class_list().len() > 0",
+    "(css { display(\"flex\"); })",
+    "(css { display(\"flex\"); }).class_list().len() > 0",
 ];
 
 /// WHOLE-FILE fixtures: item-free programs (statement sequences) that both

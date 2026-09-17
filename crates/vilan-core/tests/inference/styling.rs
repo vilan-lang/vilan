@@ -2664,7 +2664,7 @@ fn a_css_block_head_takes_a_condition_set() {
                 .on(attribute("disabled").not() + hover(), style().raw("color", "red"));
             let block = const css {
                 .on(attribute("disabled").not() + hover()) {
-                    color: red;
+                    color("red");
                 }
             };
             print(chain.class_list() == block.class_list());
@@ -5507,23 +5507,23 @@ const TWIN_PROGRAM: &str = r#"
 "#;
 
 const TWIN_BLOCK: &str = r#"css {
-            display: flex;
-            gap: {space(4)};
-            padding: {space(4)};
-            background-color: {Color::gray(50)};
-            border-radius: {Length::px(8)};
-            grid-template-columns: repeat(3, 1fr);
+            display("flex");
+            gap(space(4));
+            padding(space(4));
+            background-color(Color::gray(50));
+            border-radius(Length::px(8));
+            grid-template-columns("repeat(3, 1fr)");
             .md {
-                padding: {space(6)};
+                padding(space(6));
             }
             .hover {
-                background-color: {Color::gray(100)};
+                background-color(Color::gray(100));
             }
             .within("data-theme", Some("dark")) {
-                color: {Color::gray(50)};
+                color(Color::gray(50));
             }
             .children {
-                margin-top: {space(2)};
+                margin-top(space(2));
             }
         }"#;
 
@@ -5662,8 +5662,8 @@ fn a_css_block_is_an_ordinary_expression() {
         import std::io::print;
         import std::style::{ style, space };
         fun main() {
-            let base = const css { padding: {space(4)}; };
-            let wider = const css { padding: {space(6)}; };
+            let base = const css { padding(space(4)); };
+            let wider = const css { padding(space(6)); };
             print((base + wider).class_list());
         }
         main();
@@ -5680,7 +5680,7 @@ fn a_one_hole_value_carries_its_tokens_root_line() {
     let css = style_css(
         r#"
         import std::style::{ style, space };
-        let _s = const css { gap: {space(4)}; };
+        let _s = const css { gap(space(4)); };
         fun main() {}
         main();
         "#,
@@ -5709,7 +5709,7 @@ fn a_mid_value_token_carries_its_root_line() {
     let css = style_css(
         r#"
         import std::style::{ style, Color };
-        let _s = const css { border: 1px solid {Color::gray(500)}; };
+        let _s = const css { border("1px solid", Color::gray(500)); };
         fun main() {}
         main();
         "#,
@@ -5725,7 +5725,7 @@ fn a_mid_value_length_carries_its_root_line_too() {
     let css = style_css(
         r#"
         import std::style::{ style, space };
-        let _s = const css { padding: calc({space(4)} + 2px); };
+        let _s = const css { padding(i"calc({piece(space(4))} + 2px)"); };
         fun main() {}
         main();
         "#,
@@ -5746,7 +5746,7 @@ fn the_single_hole_path_is_unchanged_by_the_mid_value_one() {
     let block = style_css(
         r#"
         import std::style::{ style, space };
-        let _s = const css { gap: {space(4)}; };
+        let _s = const css { gap(space(4)); };
         fun main() {}
         main();
         "#,
@@ -5807,7 +5807,7 @@ fn a_mixed_css_value_still_admits_a_string_hole() {
         fun main() {}
         let width = "100%";
         let inset = 2;
-        let _s = const css { width: calc({width} - {inset}rem); };
+        let _s = const css { width(i"calc({piece(width)} - {piece(inset)}rem)"); };
         main();
         "#,
     );
@@ -5823,10 +5823,10 @@ fn a_hole_free_value_is_its_own_source_slice() {
         r#"
         import std::style::style;
         let _s = const css {
-            grid-template-columns: repeat(3, 1fr);
-            background-image: url("tile.png");
-            width: 50%;
-            line-height: 1.5;
+            grid-template-columns("repeat(3, 1fr)");
+            background-image("url(\"tile.png\")");
+            width(pct(50));
+            line-height("1.5");
         };
         fun main() {}
         main();
@@ -5849,7 +5849,7 @@ fn a_custom_property_is_span_adjacency_and_nothing_new() {
     let css = style_css(
         r#"
         import std::style::{ style, Color };
-        let _s = const css { --brand-ink: {Color::gray(900)}; };
+        let _s = const css { --brand-ink(Color::gray(900)); };
         fun main() {}
         main();
         "#,
@@ -5868,13 +5868,13 @@ fn nested_rules_lower_to_the_shipped_relation_combinators() {
         import std::style::{ style, space, Color };
         let _s = const css {
             .within("data-theme", Some("dark")) {
-                color: {Color::gray(50)};
+                color(Color::gray(50));
             }
             .children {
-                margin-top: {space(2)};
+                margin-top(space(2));
             }
             .divide {
-                margin-top: {space(4)};
+                margin-top(space(4));
             }
         };
         fun main() {}
@@ -5902,7 +5902,7 @@ fn nesting_order_is_combinator_order() {
                 .within("data-theme", Some("dark")) {
                     .attribute("data-open", Some("true")) {
                         .hover {
-                            color: {Color::gray(50)};
+                            color(Color::gray(50));
                         }
                     }
                 }
@@ -5929,7 +5929,7 @@ fn a_misnested_condition_still_refuses_by_name() {
         let _s = const css {
             .hover {
                 .md {
-                    color: {Color::gray(50)};
+                    color(Color::gray(50));
                 }
             }
         };
@@ -5972,7 +5972,7 @@ fn a_css_block_inside_markup_desugars() {
         import std::ui::{ View, view };
         import std::style::{ style, space };
         fun main() {
-            let _card = <div .styled(const css { padding: {space(4)}; }) />;
+            let _card = <div .styled(const css { padding(space(4)); }) />;
         }
         "#,
     );
@@ -6079,7 +6079,7 @@ fn a_block_in_condition_position_asks_for_parentheses() {
         r#"
         import std::io::print;
         fun main() {
-            if css { color: red; } { print("x"); }
+            if css { color("red"); } { print("x"); }
         }
         main();
         "#,
@@ -6095,7 +6095,7 @@ fn a_parenthesized_block_is_admitted_in_a_condition() {
         import std::io::print;
         import std::style::style;
         fun main() {
-            if (const css { color: red; }).class_list() != "" {
+            if (const css { color("red"); }).class_list() != "" {
                 print("styled");
             }
         }
@@ -6130,7 +6130,7 @@ fn a_chain_link_calls_an_apps_own_style_helper() {
         }
         let card = css {
             .flex_row();
-            gap: 1rem;
+            gap(rem(1));
             .ghost();
         };
         fun main() {}
@@ -6154,7 +6154,7 @@ fn a_chain_link_takes_arguments_and_a_block_still_equals_its_chain() {
         impl Style {
             fun nudge(self, value: Length): Style { self.raw("margin-top", value) }
         }
-        let a = css { color: red; .nudge(Length::px(4)); padding: 1rem; };
+        let a = css { color("red"); .nudge(Length::px(4)); padding(rem(1)); };
         fun main() {}
         main();
         "#,
@@ -6198,9 +6198,9 @@ fn a_hole_reaches_the_style_prelude_with_no_import() {
     let css = style_css(
         r#"
         let card = css {
-            gap: {space(4)};
-            padding: {rem(1)};
-            color: {gray(500)};
+            gap(space(4));
+            padding(rem(1));
+            color(gray(500));
         };
         fun main() {}
         main();
@@ -6222,7 +6222,7 @@ fn a_local_binding_beats_the_ambient_style_prelude() {
         import std::style::Length;
         fun main() {}
         fun rem(value: f64): Length { Length::px(value) }
-        let card = css { padding: {rem(4)}; };
+        let card = css { padding(rem(4)); };
         main();
         "#,
     );
@@ -6309,7 +6309,7 @@ fn the_style_prelude_is_not_ambient_outside_a_block() {
 fn a_block_needs_no_const_written_in_front_of_it() {
     let css = style_css(
         r#"
-        let plain = css { padding: 1rem; };
+        let plain = css { padding(rem(1)); };
         fun main() {}
         main();
         "#,
@@ -6325,14 +6325,14 @@ fn a_written_const_block_still_compiles_and_means_the_same() {
     // tree and one rule on the sheet.
     let written = style_css(
         r#"
-        let a = const css { padding: 1rem; };
+        let a = const css { padding(rem(1)); };
         fun main() {}
         main();
         "#,
     );
     let bare = style_css(
         r#"
-        let a = css { padding: 1rem; };
+        let a = css { padding(rem(1)); };
         fun main() {}
         main();
         "#,
@@ -6349,7 +6349,7 @@ fn a_block_in_an_element_head_needs_no_const_either() {
             r#"
         import std::ui::mount_root;
         fun main() {
-            mount_root("app", || <div .styled(css { display: flex; })>"hi"</div>);
+            mount_root("app", || <div .styled(css { display("flex"); })>"hi"</div>);
         }
         main();
         "#
@@ -6370,7 +6370,7 @@ fn a_runtime_hole_is_refused_at_the_hole() {
     assert_fails_spanning_nth(
         r#"
         fun styled(width: str) {
-            let _s = css { width: {width}; };
+            let _s = css { width(width); };
         }
         fun main() { styled("10px"); }
         main();
@@ -6401,7 +6401,7 @@ fn a_block_needs_no_style_import_at_all() {
     // means std's `style()`, and the sheet still gets the declaration.
     let css = style_css(
         r#"
-        let _s = const css { display: flex; };
+        let _s = const css { display("flex"); };
         fun main() {}
         main();
         "#,
@@ -6418,7 +6418,7 @@ fn a_local_style_binding_does_not_capture_the_blocks_seed() {
         r#"
         fun main() {
             let style = 1;
-            let _s = const css { display: flex; };
+            let _s = const css { display("flex"); };
             let _n = style + 1;
         }
         main();
@@ -6436,7 +6436,7 @@ fn an_aliased_style_import_leaves_the_blocks_seed_alone() {
         r#"
         import std::style::style as s;
         let _a = const s().raw("color", "red");
-        let _b = const css { display: flex; };
+        let _b = const css { display("flex"); };
         fun main() {}
         main();
         "#,
