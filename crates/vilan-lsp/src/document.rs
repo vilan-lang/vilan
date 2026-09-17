@@ -5227,12 +5227,42 @@ impl Document {
                 .iter()
                 .any(|statement| statement.start <= span.start && span.end <= statement.end)
         };
+        // E192, the one exception, and kolt's `views.vl:2-4`: an `(impl S)`
+        // SELECTOR's subject is not a path segment. It is an ordinary type
+        // reference in a type position that happens to be written inside an
+        // import (visibility.md §3.6 — which is why it navigates and renames),
+        // and it needs the name in scope: deleting `import std::map::Map;` from
+        // a copy of kolt made `Map` unresolvable, emptied the selector and
+        // stranded three method calls. So the exclusion above must not cover
+        // it, or a type import whose only job is to name a subject fades — and,
+        // because the fade and the prune are one predicate (E114), Organize
+        // Imports deletes it and breaks a green build.
+        //
+        // It counts exactly when the SELECTOR does. A subject whose selector is
+        // itself about to be pruned is keeping nothing alive, and making the
+        // two answers agree is what lets one pass settle both rather than
+        // leaving a statement to be pruned by the next invocation.
+        let inside_a_live_selector = |span: Span| {
+            program
+                .impl_selector_members
+                .iter()
+                .any(|((source, selector), members)| {
+                    *source == entry
+                        && selector.start <= span.start
+                        && span.end <= selector.end
+                        && self.selector_member_is_used(members, import_spans)
+                })
+        };
         let used_here = |occurrence: &crate::references::Occurrence| match occurrence.source {
             // Derive-generated code indexes a template, so its offsets are not
             // this file's and there is no import list to exclude — any reference
             // among them is a real use.
             DERIVED_SOURCE => true,
-            source => source == entry && !written_in_an_import(occurrence.span),
+            source => {
+                source == entry
+                    && (!written_in_an_import(occurrence.span)
+                        || inside_a_live_selector(occurrence.span))
+            }
         };
 
         // (1) The file's own code names the definition — as a type, as a value,
@@ -16459,6 +16489,95 @@ pub(crate) mod tests {
             "the fade and the prune describe the same element (E114)",
         );
         let _ = std::fs::remove_dir_all(&unused_dir);
+    }
+
+    // E192, kolt's `views.vl:2-4` in miniature: a TYPE import whose only use is
+    // a SELECTOR's subject.
+    //
+    // The owner's FIXME said "considered unused, but it is used for the type
+    // below", and it is: deleting `import std::map::Map;` from a copy of kolt
+    // and running `vilan check` produced five errors — `cannot find type 'Map';
+    // import it first`, the selector then admitting nothing, and three method
+    // calls losing their impl. So the selector resolves its subject through the
+    // FILE's import, the fade was a false positive, and — because the fade and
+    // the prune are one predicate (E114) — Organize Imports would have DELETED
+    // the import and broken a green build.
+    //
+    // The cause is rule (1)'s exclusion of references written inside an import
+    // statement, which exists so a path segment cannot let a statement justify
+    // itself. A selector's SUBJECT is not a path segment: it is an ordinary
+    // type reference in a type position that happens to live inside an import
+    // (`visibility.md` §3.6 — which is why it navigates and renames), and it
+    // requires the name to be in scope. So it counts, and it counts exactly
+    // when the selector itself survives: a subject whose selector is about to
+    // be pruned is keeping nothing alive.
+    #[test]
+    fn a_type_import_used_only_by_a_selector_subject_is_not_faded() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::Widget;\nimport pkg::a::{ (impl Widget) };\nimport pkg::b::widget;\n\n\
+                 fun main(): i32 {\n\twidget().bump()\n}\n",
+            ),
+            (
+                "b.vl",
+                "import pkg::a::{ Widget, (impl Widget) };\n\n\
+                 fun widget(): Widget {\n\tWidget::make()\n}\n",
+            ),
+            ("a.vl", SELECTOR_HELPER),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|error| &error.msg)
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            faded(&document).is_empty(),
+            "the subject is what `(impl Widget)` resolves through: {:?}",
+            faded(&document)
+        );
+        assert_eq!(
+            organized(&document),
+            None,
+            "and the action that fade promises must not delete the import",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The other side of the same rule, so it cannot degrade into "a subject is
+    // always a use": when the SELECTOR is unused, its subject keeps nothing
+    // alive and both go in one pass.
+    #[test]
+    fn a_type_import_whose_selector_is_itself_unused_still_fades() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::a::Widget;\nimport pkg::a::{ (impl Widget) };\nimport pkg::a::b;\n\n\
+                 fun main(): i32 {\n\tb()\n}\n",
+            ),
+            ("a.vl", SELECTOR_HELPER),
+        ]);
+        assert!(
+            document.diagnostics.is_empty(),
+            "the pin needs a green program: {:?}",
+            document
+                .diagnostics
+                .iter()
+                .map(|error| &error.msg)
+                .collect::<Vec<_>>(),
+        );
+        let mut faded_leaves = faded(&document);
+        faded_leaves.sort();
+        assert_eq!(
+            faded_leaves,
+            vec!["(impl Widget)".to_string(), "Widget".to_string()],
+            "nothing this file writes resolves through either",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The rewrite fires only when nothing survives the leaf question: a brace
