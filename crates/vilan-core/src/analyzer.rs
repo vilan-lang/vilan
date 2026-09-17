@@ -39857,6 +39857,37 @@ impl<'src> Analyzer<'src> {
             if matches!(argument_type, Type::Unresolved) {
                 return Resolution::Deferred;
             }
+            // B353 — an UNANNOTATED closure parameter whose one-shot slot has
+            // not been filled yet is `Unknown`, and `Unknown` reconciles with
+            // everything. This check ran ONCE and answered `Resolved`, so a
+            // call written inside a closure body was checked against a
+            // parameter that had no type yet and then never checked again:
+            //
+            //     let cell = Signal::new("a string");   // SignalCell<str>
+            //     cell.effect(|incoming| flag.set(incoming));  // flag: <bool>
+            //
+            // compiled, and the emitted program printed a `str` out of a
+            // `SignalCell<bool>`. It is a MISCOMPILE and not merely a missed
+            // diagnostic: nothing downstream re-checks the argument, and the
+            // JS is untyped. The annotated form (`|incoming: str|`) was
+            // refused, and so was an annotated RECEIVER (`let cell:
+            // SignalCell<str> = ..`) — the two orders differ only in when the
+            // enclosing call resolves, which is exactly what "checked while
+            // the slot was still open" means.
+            //
+            // The free-function path has never had this hole: its positional
+            // loop meets the same argument and either adopts the declared type
+            // (B13) or DEFERS. Deferring is what this one does — the enclosing
+            // call fills the slot, the retry sees a real type, and the
+            // ordinary "Expected bool, but got str" lands on the argument. A
+            // slot NOTHING ever fills is B131's starved-parameter refusal,
+            // which names the parameter and asks for an annotation, so the
+            // deferral cannot go silent.
+            if matches!(argument_type, Type::Unknown)
+                && self.is_unknown_closure_parameter(*argument_id)
+            {
+                return Resolution::Deferred;
+            }
             argument_types.push(argument_type);
         }
         for (index, argument_type) in argument_types.into_iter().enumerate() {

@@ -10696,3 +10696,93 @@ fn b352_an_explicit_type_argument_still_refuses_a_contradicting_argument() {
         "Expected Option<str>, but got Option<i32> instead.",
     );
 }
+
+/// **B353 — a call inside an UNANNOTATED closure body is checked.** The
+/// miscompile: `flag` is a `SignalCell<bool>`, `cell` a `SignalCell<str>`, and
+/// the emitted program printed `flag = a string`. Nothing downstream re-checks
+/// the argument, so this is a `miscompile` and not a missed diagnostic.
+#[test]
+fn b353_a_method_call_inside_an_unannotated_closure_body_is_checked() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Owner, Signal, SignalCell, owner_scope };
+
+        fun main() {
+            owner_scope.run(Owner::new(), || {
+                let flag: SignalCell<bool> = Signal::new(false);
+                let cell = Signal::new("a string");
+                cell.effect(|incoming| {
+                    flag.set(incoming);
+                });
+                print(i"flag = {flag.get()}");
+            });
+        }
+        "#,
+        "Expected bool, but got str instead.",
+    );
+}
+
+/// B353 through a USER `Source` impl and a `Result` destructure — the
+/// exhibit's own shape (kolt views.vl:222, the commented `channels.set(
+/// incoming)` without its `if incoming is Some(..)` guard). An
+/// `Option<List<i53>>` stored where a `List<i53>` is read: the run printed
+/// `len=2`, the `Option`'s own two-slot representation read as a list.
+#[test]
+fn b353_the_remote_source_effect_shape_is_checked_too() {
+    assert_fails_with(
+        r#"
+        import std::reactive::{ Owner, Signal, SignalCell, Source, Subscription, owner_scope };
+
+        struct Stored<T> { inner: SignalCell<T> }
+
+        impl Stored<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+            [must_use]
+            fun on_change(self, observer: |T| void): Subscription {
+                self.inner.on_change(observer)
+            }
+        }
+
+        impl Stored<type T> {
+            fun new(value: T): Stored<T> { Stored { inner = Signal::new(value) } }
+        }
+
+        fun remote<T>(value: T): Result<Stored<T>, str> { Ok(Stored::new(value)) }
+
+        fun main() {
+            owner_scope.run(Owner::new(), || {
+                let channels: SignalCell<List<i53>> = Signal::new([]);
+                let got = remote(Some([1i53]));
+                if got is Ok(let incoming) {
+                    incoming.effect(|incoming| {
+                        channels.set(incoming);
+                    });
+                }
+            });
+        }
+        "#,
+        "Expected List<i53>, but got Option<List<i53>> instead.",
+    );
+}
+
+/// The CONTROL for B353's deferral: a closure body whose calls AGREE with the
+/// parameter its enclosing call supplies must still compile, and the parameter
+/// must still be typed by that enclosing call and by nothing nearer.
+#[test]
+fn b353_an_agreeing_closure_body_still_compiles() {
+    assert_compiles(
+        r#"
+        import std::reactive::{ Owner, Signal, SignalCell, owner_scope };
+
+        fun main() {
+            owner_scope.run(Owner::new(), || {
+                let mirror: SignalCell<str> = Signal::new("");
+                let cell = Signal::new("a string");
+                cell.effect(|incoming| {
+                    mirror.set(incoming);
+                });
+            });
+        }
+        "#,
+    );
+}
