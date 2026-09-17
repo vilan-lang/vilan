@@ -42,6 +42,8 @@ use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod scratch;
+
 /// The extension a corpus golden carries. Corpus programs are bare files with
 /// no manifest, so `vilan build` compiles them for the default platform (Node)
 /// and writes `.mjs` — the process legs take the extension that declares ESM to
@@ -221,7 +223,7 @@ fn every_corpus_golden_is_byte_identical() {
     // A full copy: corpus programs may import sibling modules — and may bundle
     // sibling RESOURCES — and building in place would overwrite the goldens
     // under comparison.
-    let work = std::env::temp_dir().join(format!("vilan_corpus_gate_{}", std::process::id()));
+    let work = scratch::root().join(format!("vilan_corpus_gate_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).expect("create corpus work dir");
     let mut programs: Vec<String> = Vec::new();
@@ -610,7 +612,7 @@ fn emitted_js_is_independent_of_import_order() {
         "{display_import}{base64_import}{print_import}{bytes_import}{math_import_shuffled}{body}"
     );
 
-    let work = std::env::temp_dir().join(format!("vilan_import_order_{}", std::process::id()));
+    let work = scratch::root().join(format!("vilan_import_order_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     // Same basename in separate directories, so nothing but the import order
     // varies (the emitted JS embeds no source path — verified: identical dirs
@@ -682,8 +684,7 @@ fn concurrent_builds_of_one_program_agree_byte_for_byte() {
     const WORKERS: usize = 4;
 
     let corpus = corpus_dir();
-    let root =
-        std::env::temp_dir().join(format!("vilan_corpus_concurrency_{}", std::process::id()));
+    let root = scratch::root().join(format!("vilan_corpus_concurrency_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     // A private copy per worker — corpus programs import sibling modules, and
     // two workers writing one directory would race on the output, not on the
@@ -775,7 +776,7 @@ fn concurrent_builds_of_one_program_agree_byte_for_byte() {
 fn eight_concurrent_runs_of_the_filesystem_program_agree_byte_for_byte() {
     const COPIES: usize = 8;
 
-    let work = std::env::temp_dir().join(format!("vilan_file_corpus_{}", std::process::id()));
+    let work = scratch::root().join(format!("vilan_file_corpus_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).expect("create the work directory");
     let source = work.join("file.vl");

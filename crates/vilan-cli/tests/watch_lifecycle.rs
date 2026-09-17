@@ -22,7 +22,7 @@ mod support;
 /// `node` child is gone before the interrupt lands: what remains on disk is
 /// exactly the temp script, with no orphan to clean up after the assertion.
 fn temp_package(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("vilan_watch_{tag}_{}", std::process::id()));
+    let dir = support::scratch_root().join(format!("vilan_watch_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("vilan.toml"), "[package]\nname = \"app\"\n").unwrap();
@@ -63,6 +63,10 @@ fn ctrl_c_removes_the_watch_script_and_exits_130() {
         .expect("spawn the watcher");
 
     // The round's temp script is keyed by the watcher's pid.
+    // NOT the harness's scratch root (N86): this path is the BINARY's.
+    // `vilan run --watch` writes its script to `env::temp_dir()`
+    // (`main.rs`'s `watch_script_path`), and a test that looks anywhere else
+    // waits five minutes for a file nothing will write.
     let script = std::env::temp_dir().join(format!("vilan-watch-{}.mjs", watcher.id()));
     wait_for("the watch script to be written", || script.exists());
 

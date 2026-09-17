@@ -54,7 +54,7 @@ use support::port::{free_port, wait_for_port};
 fn temp_project(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let staged = std::env::temp_dir().join(format!(
+    let staged = support::scratch_root().join(format!(
         "vilan_document_{tag}_{}_{unique}",
         std::process::id()
     ));

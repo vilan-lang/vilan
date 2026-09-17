@@ -11,6 +11,12 @@
 //!
 //! Failures report `file — nearest heading` so a broken example is a one-jump
 //! fix.
+//!
+//! Two prose gates ride here too, for the same reason: a list a reader trusts,
+//! held to the compiler's own tables rather than to a lane's diligence. The
+//! reserved-word lists (N64, N87) are held to `lexing::KEYWORDS`, and std's doc
+//! comments are held to the names std still declares (N88) — in a library whose
+//! doc comment IS its documentation.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -306,46 +312,99 @@ fn the_sidebar_covers_every_page() {
 /// gated rather than trusted: a hand-copied word list is one commit from being
 /// wrong (the three-place rule's own history, and N60's "nine" one file over).
 ///
-/// The spec's two lists (§2.2, §A.2) are outside this gate deliberately: they
-/// are prose-formatted with the boolean and null literals called out separately,
-/// and `grammar_sync.rs` already holds the machine-read grammars to the same
-/// table. This is the reader-facing list, held to the same source.
+/// `grammar_sync.rs` holds the machine-read grammars to the same table; this is
+/// the reader-facing list, and N87 added the spec's two below.
 #[test]
 fn the_tours_reserved_words_are_the_lexers_keywords() {
-    let page = docs_root().join("tour/values-and-types.md");
+    assert_reserved_words_match(
+        &reserved_word_fence("tour/values-and-types.md", "## Reserved words"),
+        "the tour's reserved-word list",
+        "add it to `## Reserved words` in `vilan/docs/tour/values-and-types.md`, \
+         alphabetically.",
+    );
+}
+
+/// The `text` fence under `heading` in a docs page, as a set of words.
+///
+/// Every reserved-word list in the tree is written this way — one fence, words
+/// separated by whitespace — so the three gates below read them the same way
+/// and a list that stops being a fence reds loudly rather than going empty.
+fn reserved_word_fence(relative: &str, heading: &str) -> BTreeSet<String> {
+    let page = docs_root().join(relative);
     let text = std::fs::read_to_string(&page)
         .unwrap_or_else(|error| panic!("{}: {error}", page.display()));
-    let heading = "## Reserved words";
     let after = text
         .split_once(heading)
         .unwrap_or_else(|| panic!("`{heading}` is gone from {}", page.display()))
         .1;
     let fence = after
         .split_once("```text\n")
-        .expect("the reserved-word section opens a `text` fence")
+        .unwrap_or_else(|| panic!("{heading} opens no `text` fence in {relative}"))
         .1
         .split_once("```")
-        .expect("that fence closes")
+        .unwrap_or_else(|| panic!("{heading}'s fence does not close in {relative}"))
         .0;
-    let listed: BTreeSet<&str> = fence.split_whitespace().collect();
-    let lexed: BTreeSet<&str> = vilan_core::lexing::KEYWORDS
-        .iter()
-        .map(|(word, _)| *word)
-        .collect();
+    fence.split_whitespace().map(str::to_string).collect()
+}
 
-    let missing: Vec<&&str> = lexed.difference(&listed).collect();
+/// The lexer's keyword table, as a set of words.
+fn lexed_keywords() -> BTreeSet<String> {
+    vilan_core::lexing::KEYWORDS
+        .iter()
+        .map(|(word, _)| word.to_string())
+        .collect()
+}
+
+/// Held both ways: `listed` is `lexed_keywords()`, or the assertion says which
+/// direction failed and where to fix it.
+fn assert_reserved_words_match(listed: &BTreeSet<String>, where_: &str, fix: &str) {
+    let lexed = lexed_keywords();
+    let missing: Vec<&String> = lexed.difference(listed).collect();
     assert!(
         missing.is_empty(),
-        "the tour's reserved-word list is missing {missing:?}. A reader who \
-         cannot see the word cannot avoid it — add it to `## Reserved words` in \
-         `vilan/docs/tour/values-and-types.md`, alphabetically."
+        "{where_} is missing {missing:?}. A word a reader cannot see is a word \
+         they cannot avoid — {fix}"
     );
-    let unknown: Vec<&&str> = listed.difference(&lexed).collect();
+    let unknown: Vec<&String> = listed.difference(&lexed).collect();
     assert!(
         unknown.is_empty(),
-        "the tour lists {unknown:?} as reserved, and the lexer does not. A word \
-         that stopped being a keyword is a word the tour is telling readers not \
+        "{where_} lists {unknown:?} as reserved, and the lexer does not. A word \
+         that stopped being a keyword is a word the docs are telling readers not \
          to use for nothing."
+    );
+}
+
+/// The SPEC's two reserved-word lists are the lexer's too (tracker N87).
+///
+/// Only the tour's was gated, and the spec's pair drifted exactly as a
+/// hand-copied list does: §A.2 had been missing `css` from the day the css
+/// block shipped until a lane added it and `lazy` by hand, and at the moment
+/// this gate was written §2.2 was still missing `lazy` — the normative list, in
+/// the document that defines what an identifier may be, naming 33 of 34
+/// keywords. Nothing could have said so. The tour's gate carried a note
+/// arguing the spec's two were outside it because they are "prose-formatted
+/// with the boolean and null literals called out separately"; they are not
+/// prose, they are `text` fences with the literals inside them and the
+/// call-out in a sentence underneath, so there was nothing to except.
+///
+/// Both lists are held, not one: they are two lists, and a rule that holds the
+/// appendix while the normative section drifts is the same failure one level
+/// down.
+#[test]
+fn the_specs_reserved_words_are_the_lexers_keywords() {
+    // §2.2 opens with the IDENT grammar's own fence, so the anchor is the
+    // sentence that introduces the list rather than the heading above both.
+    assert_reserved_words_match(
+        &reserved_word_fence("spec/lexical.md", "keyword tokens and are never `IDENT`:"),
+        "the spec's §2.2 reserved-word list",
+        "add it to the fence in `vilan/docs/spec/lexical.md`, alphabetically, \
+         with the two boolean literals last.",
+    );
+    assert_reserved_words_match(
+        &reserved_word_fence("spec/appendix.md", "## A.2 Reserved words"),
+        "the spec's §A.2 reserved-word list",
+        "add it to the fence in `vilan/docs/spec/appendix.md`, alphabetically, \
+         with the two boolean literals last.",
     );
 }
 
@@ -471,4 +530,180 @@ mod extract_pins {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].source, "fun after() {}\n");
     }
+}
+
+/// Names the standard library retired, which its own prose may not go on
+/// spelling as if they were live (tracker N88).
+///
+/// A99 retired six `View` methods in favour of the free slot values, and A95 S2
+/// deleted the raw child-relation hatch. The DECLARATIONS went in those orders;
+/// the sentences about them did not, and std's doc comments went on teaching
+/// `bind_each` — sixteen lines across `reactive.vl` and `rpc.vl`, plus one in
+/// `math.vl` — in a library where the doc comment IS the documentation. A
+/// reader who writes what the comment says gets "`View` has no method
+/// `bind_each`", which is the failure the A99 steer exists to soften and which
+/// nothing should have been leading them into.
+///
+/// Whole identifiers only: `fence_child_relation` is a live helper in
+/// `style.vl` and is not this list's business. Comment text only, for the same
+/// reason a live identifier is not a retired one.
+const RETIRED_STD_NAMES: &[&str] = &[
+    "bind_each",
+    "bind_each_values",
+    "bind_each_by",
+    "child_relation",
+];
+
+/// The comment lines allowed to name one anyway — each a sentence whose
+/// SUBJECT is the retirement, which is the one thing that cannot be said
+/// without the old name. Keyed on a distinctive run of the line.
+const RETIREMENT_NOTES: &[(&str, &str)] = &[
+    (
+        "browser/ui.vl",
+        "one-line sugar over them — `when`, `swap`, `swap_split`, `bind_each`,",
+    ),
+    (
+        "browser/ui.vl",
+        "`bind_each_values`, `bind_each_by` — are retired",
+    ),
+    ("browser/ui.vl", "Named `each` and not `bind_each`"),
+    (
+        "browser/ui.vl",
+        "where `{bind_each(..)}` read as a setter that had escaped",
+    ),
+    (
+        "style.vl",
+        "all and pushed authors onto the deleted `child_relation` as a",
+    ),
+];
+
+#[test]
+fn no_std_comment_names_a_retired_method() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std/src");
+    let mut files = Vec::new();
+    collect_vl_files(&root, &mut files);
+    assert!(files.len() > 20, "the std walk found {} files", files.len());
+
+    let mut named = Vec::new();
+    for path in &files {
+        let relative = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        for (number, line) in text.lines().enumerate() {
+            let Some(comment) = comment_text(line) else {
+                continue;
+            };
+            if RETIREMENT_NOTES
+                .iter()
+                .any(|(file, run)| *file == relative && line.contains(run))
+            {
+                continue;
+            }
+            for retired in RETIRED_STD_NAMES {
+                if names_identifier(comment, retired) {
+                    named.push(format!(
+                        "  {relative}:{}\n      {retired}: {}",
+                        number + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        named.is_empty(),
+        "{} std comment line(s) name something std no longer declares. The doc \
+         comment IS the documentation here, so a reader who writes what it says \
+         gets a refusal. Write the live spelling (`each`, `each_values`, \
+         `each_by`, `attribute(..)`), or — if the sentence is ABOUT the \
+         retirement — record it in RETIREMENT_NOTES:\n{}",
+        named.len(),
+        named.join("\n")
+    );
+
+    // The inverse (N42's rule): a note excusing a line that no longer exists
+    // is an exemption bought for nothing, and it is how a list like this goes
+    // quietly out of date.
+    let stale: Vec<String> = RETIREMENT_NOTES
+        .iter()
+        .filter(|(file, run)| {
+            !files.iter().any(|path| {
+                path.to_string_lossy().replace('\\', "/").ends_with(file)
+                    && std::fs::read_to_string(path)
+                        .unwrap_or_default()
+                        .contains(*run)
+            })
+        })
+        .map(|(file, run)| format!("  {file}: {run:?}"))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "{} retirement note(s) name a line that is gone:\n{}",
+        stale.len(),
+        stale.join("\n")
+    );
+}
+
+/// Every `.vl` file under `directory`, recursively.
+fn collect_vl_files(directory: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let mut sorted: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    sorted.sort();
+    for path in sorted {
+        if path.is_dir() {
+            collect_vl_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("vl") {
+            out.push(path);
+        }
+    }
+}
+
+/// The comment half of a `.vl` line, or `None` when the line carries none.
+///
+/// A `//` inside a string literal is not a comment, and std writes plenty of
+/// them (urls, selectors); the scan tracks quotes so `"https://…"` is not read
+/// as one.
+fn comment_text(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if in_string => index += 1,
+            b'"' => in_string = !in_string,
+            b'/' if !in_string && bytes.get(index + 1) == Some(&b'/') => {
+                return Some(&line[index..]);
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Whether `text` names `identifier` as a WHOLE word — `fence_child_relation`
+/// does not name `child_relation`.
+fn names_identifier(text: &str, identifier: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = text[from..].find(identifier) {
+        let start = from + offset;
+        let end = start + identifier.len();
+        let before_ok = start == 0 || !is_identifier_byte(bytes[start - 1]);
+        let after_ok = end == bytes.len() || !is_identifier_byte(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }

@@ -3,9 +3,22 @@
 //! overflow.
 //!
 //! The walk recurses once per level of syntactic nesting with the largest
-//! frame in the analyzer (~36 KiB per level unoptimized, `VILAN_DEPTH_STATS`
-//! measured), which is how a modest server program's analysis closed a CI
-//! worker's ~2 MiB margin in the v0.36.0 incident (commit 0fb5e5f0). The
+//! frame in the analyzer — 42,464 bytes (41.5 KiB) per level unoptimized at
+//! this sha, re-measured for N97 two ways that agree to the byte: gdb's frame
+//! deltas down one 60-level recursion (sixty of the sixty-three deltas are
+//! exactly 42,464) and `VILAN_DEPTH_STATS` over chains of 13/33/63/103/203/403
+//! levels. The binary agrees to the byte and says where it goes:
+//! `walk_expr_node_inner`'s prologue probes down `0xa000` and then subtracts
+//! `0x1a8` — 41,384 bytes of locals — and the outer `walk_expr_node` subtracts
+//! `0x408`, which with the pushes and the two return addresses is exactly the
+//! 42,464 gdb reads. That local area is ONE `sub rsp` taken on every call, so
+//! every level of nesting pays for every arm's locals whichever arm runs.
+//! It was ~36 KiB when this comment was written; Order 36's lazy,
+//! const, callable and visibility arms landed IN that frame while the
+//! recursion stayed put, which is how a nine-level module-cycle pin came to
+//! abort the Windows shard at the seal. That is the same shape as the v0.36.0
+//! incident, where a modest server program's analysis closed a CI worker's
+//! ~2 MiB margin (commit 0fb5e5f0). The
 //! worker below spawns with 64 MiB ON PURPOSE — not the harness convention's
 //! 256 MiB: the plant's 5000 levels cost the UNBOUNDED walk ~180 MiB
 //! unoptimized and overflowed exactly this spawn before the bound existed,
@@ -153,6 +166,82 @@ fn a_5000_deep_parenthesized_expression_is_refused_cleanly() {
         refusals[0].contains("lift inner expressions into `let` bindings"),
         "the refusal must steer toward the flattening fix, got: {}",
         refusals[0]
+    );
+}
+
+/// N97's CANARY: a thirty-level chain fits libtest's own 2 MiB thread.
+///
+/// At Order 36's seal, `b250_a_declared_leg_with_no_manifest_is_unchanged`
+/// ABORTED the Windows shard with `0xc00000fd` — a stack overflow, at NINE
+/// levels of nesting, in a module-cycle pin nobody would call deep. The walk's
+/// recursion had not changed; `walk_expr_node_inner`'s FRAME had, because
+/// Order 36 landed the lazy, const, callable and visibility arms in it. Linux
+/// passed at 2 MiB and failed at 1 MiB, so nothing here could see it coming,
+/// and the seal fix raised the whole suite's threads to 8 MiB
+/// (`.cargo/config.toml`'s `RUST_MIN_STACK`) — which buys margin and buys no
+/// warning at all.
+///
+/// This is the warning. Thirty levels of chain, on a thread pinned at libtest's
+/// ORIGINAL 2 MiB, measured against the frame as it is today:
+///
+/// | codegen | bytes per level of `expr-walk` | 30 levels + baseline |
+/// |---|---|---|
+/// | debug | 42,464 B (41.5 KiB) | 1.49 MiB |
+/// | release | ~4,650 B (4.5 KiB) | 0.23 MiB |
+///
+/// So the debug leg — the one the suite runs — sits at 75% of a 2 MiB thread,
+/// and the canary reds when the frame grows by about a third, or when twelve
+/// more levels of it are needed. Optimized, the same walk costs a NINTH of
+/// that, which is why nothing the binaries do has ever been near the cliff and
+/// why the suite is the only place this can be caught. Measured with the tree's
+/// own instrument (`VILAN_DEPTH_STATS=1 vilan check` over chains of
+/// 13/33/63/103/203/403 levels; the per-level figure is the DELTA between two
+/// depths, so the analysis's own baseline — 0.15 MiB debug, 0.08 MiB optimized
+/// — falls out of it). A chain and not parentheses on purpose: a method chain
+/// is FLAT to the parser and deep only to the walk, so this measures the frame
+/// N97 is about and not `parse`'s. The release column is the instrument's and
+/// not gdb's: `[profile.release]` sets `strip = true`, so a symbol-level read
+/// of the optimized frame wants `cargo build --profile profiling`.
+///
+/// **A red here is a SIGABRT, not an assertion.** A stack overflow takes the
+/// process, so there is no message from the `assert!` below — the runtime
+/// prints `thread '<unknown>' has overflowed its stack` and aborts, and nextest
+/// reports `SIGABRT … (test aborted with signal 6)` rather than `FAIL`. Read
+/// the sentence above, not the assertion. Nextest's process-per-test is what
+/// keeps that from taking the rest of the binary down with it, and it is why
+/// the thread is pinned rather than left to `RUST_MIN_STACK`:
+/// `Builder::stack_size` is what libtest's own worker does, and the suite-wide
+/// 8 MiB would hide exactly the growth this exists to catch.
+///
+/// Planted red by running it at 1 MiB, where it aborts as designed.
+#[test]
+fn a_thirty_level_chain_still_fits_libtests_own_two_mib_thread() {
+    let source = format!(
+        "fun main() {{\n\tlet x = \"seed\"{};\n}}\n",
+        ".trim()".repeat(30)
+    );
+    let produced = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, _errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("canary.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            program.is_some()
+        })
+        .expect("spawn the 2 MiB worker")
+        .join()
+        .expect("the worker panicked");
+    assert!(
+        produced,
+        "thirty levels of chain must analyze on a 2 MiB thread — that is \
+         libtest's own worker, and the margin above it is what the Windows \
+         shard spent at Order 36's seal"
     );
 }
 

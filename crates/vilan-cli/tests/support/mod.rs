@@ -12,6 +12,74 @@ pub mod boot;
 pub mod ladder;
 pub mod port;
 
+/// The directory this test binary's scratch goes in — cargo's own
+/// `CARGO_TARGET_TMPDIR` under `target/`, never `std::env::temp_dir()`
+/// (tracker N82, swept by N86).
+///
+/// `/tmp` on the owner's machine is a 12 GiB tmpfs shared by every worktree,
+/// and a full suite under nine lanes filled it: `No space left on device`
+/// failures that are green on a re-run, which is a red indistinguishable from
+/// a real one. `CARGO_TARGET_TMPDIR` is expanded where this module is
+/// COMPILED, once per including suite, so two suites never share a root even
+/// when they write the same file name.
+pub fn scratch_root() -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let _ = std::fs::create_dir_all(&root);
+    root
+}
+
+/// A scratch DIRECTORY named `name` under [`scratch_root`], emptied first.
+pub fn scratch_dir(name: &str) -> PathBuf {
+    let directory = scratch_root().join(name);
+    let _ = std::fs::remove_dir_all(&directory);
+    directory
+}
+
+/// An IO failure on a scratch path, with the free space NAMED when the
+/// filesystem is out of it — so an ENOSPC red arrives saying what it is
+/// instead of as `Os { code: 28 }` inside a list of diagnostics (N82's guard).
+pub fn storage_failure(path: &Path, error: &std::io::Error) -> String {
+    let full = error.kind() == std::io::ErrorKind::StorageFull || error.raw_os_error() == Some(28);
+    if !full {
+        return format!("{}: {error}", path.display());
+    }
+    format!(
+        "{}: {error} — the harness's scratch filesystem is FULL{}. This is \
+         tracker N82's shape: the red is the disk's, not the compiler's. Free \
+         space and re-run before believing it.",
+        path.display(),
+        scratch_free_space(path),
+    )
+}
+
+/// What `df` says is left where `path` lives, as a parenthetical. Empty where
+/// there is no `df` to ask, because a guard that cannot answer says nothing.
+fn scratch_free_space(path: &Path) -> String {
+    let Some(parent) = path.parent() else {
+        return String::new();
+    };
+    let Ok(output) = std::process::Command::new("df")
+        .arg("-Pk")
+        .arg(parent)
+        .output()
+    else {
+        return String::new();
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let Some(line) = text.lines().nth(1) else {
+        return String::new();
+    };
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let (Some(available), Some(mount)) = (fields.get(3), fields.last()) else {
+        return String::new();
+    };
+    let Ok(kib) = available.parse::<u64>() else {
+        return String::new();
+    };
+    format!(" ({} MiB free on `{mount}`)", kib / 1024)
+}
+
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -128,8 +196,7 @@ pub fn reference_compile() -> Duration {
 }
 
 fn measure_reference_compile() -> Duration {
-    let project =
-        std::env::temp_dir().join(format!("vilan_reference_compile_{}", std::process::id()));
+    let project = scratch_root().join(format!("vilan_reference_compile_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&project);
     let written = std::fs::create_dir_all(project.join("src")).and_then(|()| {
         std::fs::write(
@@ -193,6 +260,10 @@ fn spawn_reference_build(project: &std::path::Path) -> Option<Child> {
 /// delete in `run_watch`, the Ctrl-C hook) is unchanged and is what a real
 /// session relies on.
 pub fn kill_watcher(watcher: &mut Child) {
+    // NOT [`scratch_root`] (N86): this path is the BINARY's. `vilan run
+    // --watch` writes its script to `env::temp_dir()` (`main.rs`'s
+    // `watch_script_path`), and a harness that looks anywhere else waits for
+    // a file nothing will write.
     let script = std::env::temp_dir().join(format!("vilan-watch-{}.mjs", watcher.id()));
     let _ = watcher.kill();
     let _ = watcher.wait();

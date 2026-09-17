@@ -3789,7 +3789,13 @@ impl<'src> Printer<'src> {
     /// as already-formatted). S6's curation is what made it reachable: five of
     /// std's module-level `let`s carry the marker.
     fn needs_semicolon(node: &Node<'src>) -> bool {
-        if let Node::Export(_, inner) = node {
+        // `const` ASKS THE DECLARATION UNDER IT for the same reason (N89, G24):
+        // `const fun f()` takes no `;` and `const let x = 1;` takes one. Without
+        // this the printer wrote `const fun f() { .. };`, which does not
+        // re-parse — so the verification bailed and the whole FILE came back
+        // unformatted, exactly as `export let` did before B318 S6, and just as
+        // silently.
+        if let Node::Export(_, inner) | Node::Const(inner) = node {
             return Self::needs_semicolon(&inner.0);
         }
         !matches!(
@@ -4003,6 +4009,19 @@ impl<'src> Printer<'src> {
                 self.print_export_scope(scope.as_deref());
                 self.out.push(' ');
                 self.print_item(exported);
+            }
+            // G24's `const fun` — a DECLARATION under a marker, printed the way
+            // `export` above prints one (N89). The expression printer's own
+            // `const` arm handles `const <expr>` and `const let`, and it prints
+            // its inner node as an OPERAND: a `fun` declaration is not one, so
+            // it fell to that printer's `_ => self.bailed = true` and the whole
+            // FILE came back unformatted while `--check` called it clean. No
+            // estate file writes the form, which is why nothing noticed —
+            // `formatter_never_silently_bails` asserts the bail set over the
+            // tree, and the tree had no exhibit.
+            Node::Const(inner) if matches!(inner.0, Node::Func(_)) => {
+                self.out.push_str("const ");
+                self.print_item(inner);
             }
             // `export *;` — the module-wide marker. It carries no inner item, so
             // `needs_semicolon` leaves it out of its exclusion list and the
@@ -8558,6 +8577,48 @@ mod bailing_constructs {
 }
 
 #[cfg(test)]
+mod const_declaration_printing {
+    //! G24's `const let` / `const fun`, and the `export` marker over them
+    //! (N89) — this module's family, found the way E13's constructs were: by
+    //! writing the form and watching the file come back unchanged.
+    //!
+    //! `const fun` reached the EXPRESSION printer's `const` arm, which prints
+    //! its inner node as an operand — and a `fun` declaration is not one, so it
+    //! fell to that printer's `_ => bailed` and the whole file returned
+    //! unformatted while `--check` called it clean. The `;` was wrong under it:
+    //! `needs_semicolon` asked the node under `export` and not the one under
+    //! `const`, so the printer wrote `const fun f() { .. };`, which does not
+    //! re-parse. Nothing caught either, because no file in the estate writes
+    //! the form and `formatter_never_silently_bails` asserts the bail set over
+    //! the tree.
+
+    use super::bailing_constructs::assert_construct;
+
+    #[test]
+    fn a_const_declaration_prints_and_the_export_marker_rides_it() {
+        assert_construct(
+            "const fun answer():i32 {\n  42\n}\n",
+            "const fun answer(): i32 {\n\t42\n}\n",
+        );
+        assert_construct(
+            "export const fun answer():i32 {\n  42\n}\n",
+            "export const fun answer(): i32 {\n\t42\n}\n",
+        );
+        // The `const let` half already printed — through the expression
+        // printer, whose `let` arm IS an operand — and is pinned beside it so
+        // the pair cannot drift apart.
+        assert_construct(
+            "const let    value: i32 = 1;\n",
+            "const let value: i32 = 1;\n",
+        );
+        assert_construct(
+            "export const let    value: i32 = 1;\n",
+            "export const let value: i32 = 1;\n",
+        );
+    }
+}
+
+#[cfg(test)]
 mod paren_groups {
     //! **User-written parentheses are preserved.** A `(…)` group the user wrote
     //! reprints as a group — the formatter does not adjudicate whether it was
@@ -11062,9 +11123,12 @@ mod element_layout {
 
     #[test]
     fn a_chain_link_holding_an_inline_element_stays_inline() {
+        // The keyed-run shape as it is written today: `each` is the free slot
+        // value and `child` places it at the parent's end (A99 retired the
+        // `bind_each` METHOD this pin used to spell).
         assert_construct(
-            "fun demo(): View {\n\t<ul .bind_each(items, |t| t.id, |t| <li>{t}</li>) />\n}\n",
-            "fun demo(): View {\n\t<ul .bind_each(items, |t| t.id, |t| <li>{t}</li>) />\n}\n",
+            "fun demo(): View {\n\t<ul .child(each(items, |t| t.id, |t| <li>{t}</li>)) />\n}\n",
+            "fun demo(): View {\n\t<ul .child(each(items, |t| t.id, |t| <li>{t}</li>)) />\n}\n",
         );
     }
 
@@ -11110,16 +11174,16 @@ mod element_layout {
         );
     }
 
-    /// A closure argument nested INSIDE an element head — the `bind_each` shape
+    /// A closure argument nested INSIDE an element head — the keyed-run shape
     /// the inline pin above uses, with a body that splits. The rule applies at
     /// that depth too, measured from the head-item line the closure sits on.
     #[test]
     fn a_closure_argument_element_inside_an_element_head_breaks_too() {
         assert_construct(
-            "fun demo(): View {\n\t<ul .bind_each(items, |t| t.id, |t| \
-             <li><b>{t}</b></li>) />\n}\n",
-            "fun demo(): View {\n\t<ul\n\t\t.bind_each(items, |t| t.id, |t|\n\
-             \t\t\t<li>\n\t\t\t\t<b>{t}</b>\n\t\t\t</li>)\n\t/>\n}\n",
+            "fun demo(): View {\n\t<ul .child(each(items, |t| t.id, |t| \
+             <li><b>{t}</b></li>)) />\n}\n",
+            "fun demo(): View {\n\t<ul\n\t\t.child(each(items, |t| t.id, |t|\n\
+             \t\t\t<li>\n\t\t\t\t<b>{t}</b>\n\t\t\t</li>))\n\t/>\n}\n",
         );
     }
 }

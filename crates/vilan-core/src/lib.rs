@@ -123,9 +123,12 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
     fn declares(path: &Path, name: &str) -> bool {
         fn node_declares(node: &Node, name: &str) -> bool {
             match node {
-                Node::Export(_, inner) | Node::Derive(_, inner) | Node::Service(_, inner) => {
-                    node_declares(&inner.0, name)
-                }
+                // N89: `const` is a wrapper like the rest — `const fun f()`
+                // declares `f`.
+                Node::Export(_, inner)
+                | Node::Derive(_, inner)
+                | Node::Service(_, inner)
+                | Node::Const(inner) => node_declares(&inner.0, name),
                 Node::Func(function) => function.name.0 == name,
                 Node::Struct(declared, ..)
                 | Node::Enum(declared, ..)
@@ -605,12 +608,14 @@ fn analyze_source_unfenced(
         }
         let mut defined = std::collections::HashSet::new();
         for (node, _span) in root.0.iter() {
+            // N89: through the wrappers — `export`, `const`, or both — because
+            // what the prelude must not shadow is the NAME, whatever marks it.
+            let mut node = node;
+            while let Node::Export(_, inner) | Node::Const(inner) = node {
+                node = &inner.0;
+            }
             let function = match node {
                 Node::Func(function) => Some(function),
-                Node::Export(_, inner) => match &inner.0 {
-                    Node::Func(function) => Some(function),
-                    _ => None,
-                },
                 _ => None,
             };
             if let Some(function) = function {

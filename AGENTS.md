@@ -92,6 +92,25 @@ Rust workspace, six crates, plus the language's own tree:
    `cargo fmt` run under `rust-toolchain.toml`'s pin, which is what makes your
    answer and CI's the same answer. A dependency change also owes
    `cargo audit --deny unsound` (its own CI leg) alongside the notices gate.
+7. **The suite runs on 8 MiB test threads, and that is a MARGIN, not a
+   licence** (N97). libtest gives every `#[test]` a 2 MiB thread, and the
+   analyzer's expression walk spends one frame per level of source nesting —
+   ~41.5 KiB of it unoptimized, ~11.3 KiB optimized, measured with
+   `VILAN_DEPTH_STATS=1` over chains of known depth. Order 36's arms grew that
+   frame while the recursion stayed put, and a nine-level module-cycle pin
+   aborted the Windows shard with `0xc00000fd`; the fix was
+   `.cargo/config.toml`'s `[env] RUST_MIN_STACK = "8388608"`, which cargo and
+   nextest both hand to the test processes (a value written by the shell still
+   wins — there is no `force`). **Do not raise it further, and do not lean on
+   it**: a deeper frame is a finding, not a number to tune.
+   `deep_nesting.rs`'s `a_thirty_level_chain_still_fits_libtests_own_two_mib_thread`
+   pins a thread at the original 2 MiB so growth reds here rather than on
+   Windows — and reds as an ABORT, since a stack overflow takes the process and
+   prints no `FAIL` line to grep for. A test that genuinely needs more spawns
+   its own worker with an explicit `stack_size` and says in a comment why that
+   size (`deep_nesting.rs`'s 64 MiB is the model: it is sized so that the
+   UNBOUNDED walk would still overflow it, which is what keeps the pin
+   non-vacuous).
 
 ## Invariants and scar tissue (each of these has bitten before)
 

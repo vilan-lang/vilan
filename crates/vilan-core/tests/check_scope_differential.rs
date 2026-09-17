@@ -15,6 +15,7 @@
 //! would quietly turn the differential vacuous.
 
 mod replay_harness;
+mod scratch;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -262,7 +263,7 @@ fn write_module_package(name: &str, module_source: &str) -> (PathBuf, PathBuf) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let directory = std::env::temp_dir().join(format!(
+    let directory = scratch::root().join(format!(
         "vilan_m19_t1_{name}_{}_{unique}",
         std::process::id()
     ));
@@ -361,7 +362,7 @@ fn n66_the_harness_refuses_a_packages_manifest_directory() {
     // of 69 and reported 22 "cannot find … in the imported path" errors, which
     // reads as a finding about the package and is a finding about the argument.
     // Both halves are pinned here: the resolution, and the refusal.
-    let directory = std::env::temp_dir().join(format!("vilan_n66_{}", std::process::id()));
+    let directory = scratch::root().join(format!("vilan_n66_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&directory);
     std::fs::create_dir_all(directory.join("src")).expect("create the package");
 

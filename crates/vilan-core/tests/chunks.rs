@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use vilan_core::manifest::{PreludeSpec, WEB_PRELUDE};
 use vilan_core::{Platform, Workspace, analyze_source};
 
+mod scratch;
+
 /// Plans `source` under the BASE prelude — the ambient scope a package with no
 /// `prelude` key resolves under, and the right one for the self-contained
 /// fixtures below, which name every import they use.
@@ -502,7 +504,7 @@ fn a_sibling_chunks_function_is_read_at_the_use_and_an_eager_one_is_snapshotted(
 #[test]
 fn a_chunk_evaluated_before_its_dependency_still_calls_it() {
     let split = emit_the_crossing_split();
-    let staged = std::env::temp_dir().join(format!("vilan_chunk_crossing_{}", std::process::id()));
+    let staged = scratch::root().join(format!("vilan_chunk_crossing_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staged);
     std::fs::create_dir_all(&staged).expect("create the staging directory");
     for chunk in &split.chunks {

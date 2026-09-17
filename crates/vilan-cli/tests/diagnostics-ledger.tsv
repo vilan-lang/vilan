@@ -529,3 +529,37 @@ row	flagship	key
 504	-	`--backend rust` runs ONE entry, not a workspace: a workspace's legs are a
 505	-	`--backend rust` has no `--watch` yet: the native round is a full
 506	-	a `context` clause after an UN-PARENTHESIZED closure return type binds to the closure's own return type, which cannot carry one. Parenthesize the closure type to say which clause you mean: {...}
+507	-	{} is not available at expansion time
+508	-	output during evaluation (an inferred fold must be observably silent)
+509	-	a process exit during evaluation (an inferred fold must be observably silent)
+510	-	host bindings ([extern])
+511	-	`{helper}`
+512	-	`{name}`
+513	-	`{base}.{method}`
+514	-	`with_finally_async`
+515	-	async (macro bodies are synchronous)
+516	-	await (macro bodies are synchronous)
+517	-	the array method `{other}`
+518	-	the Set method `{other}`
+519	-	the Map method `{other}`
+520	-	the string method `{other}`
+521	-	the method `{method}` on {}
+522	-	replaceAll with an empty pattern
+523	-	stringifying a function
+524	-	a BigInt beyond 128 bits (the expansion engine's v1 bound)
+525	-	`Shared::identity` over {}
+526	-	the build's staging registry (`asset::stage`)
+527	-	the build's staging registry (`asset::staged`)
+528	-	the project's files (`asset::read`)
+529	-	the project's files (`asset::digest`)
+530	-	the project's files (`{spelling}`)
+531	-	`asset::schedule_at_end` on an anonymous closure (it takes a named function: the name is the identity that makes a repeat request a no-op, and a closure's captured scope does not outlive the evaluation that made it)
+532	-	a `const` result must be plain data; this evaluates to {what}
+533	-	the macro did not return a `Source` (build one with `macro_std::source(..)`)
+534	-	the fuel budget was exhausted
+535	-	the call-depth cap was exceeded
+536	-	lazy initialization cycle: `{name}`
+537	-	lazy `{name}` is poisoned: its initializer panicked: {poison}
+538	-	{name}: {value} is not one of its values
+539	-	index out of bounds: the length is {length} but the index is {index}
+540	-	substring out of range: the length is {length} but the range is {start}..{end} — substring requires 0 <= start <= end <= len and never clamps or swaps; to drop a known affix use strip_prefix/strip_suffix, and for the rest of the string pass s.len() as the end

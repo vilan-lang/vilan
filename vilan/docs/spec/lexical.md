@@ -34,11 +34,11 @@ Identifiers are ASCII. The following words are **reserved**; they lex as
 keyword tokens and are never `IDENT`:
 
 ```text
-async     await  borrows  const  css   else    enum  export
-external  for    fun      if     impl  import  in    is
-jump      let    macro    match  mod   mut     null  own
-resource  ret    struct   trait  type  use     with  true
-false
+async     await     borrows  const   css    else    enum  export
+external  for       fun      if      impl   import  in    is
+jump      lazy      let      macro   match  mod     mut   null
+own       resource  ret      struct  trait  type    use   with
+true      false
 ```
 
 (`true`/`false` lex as boolean literals; `null` as the null literal.)

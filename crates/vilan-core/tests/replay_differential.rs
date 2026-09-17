@@ -15,6 +15,7 @@
 //! that stayed behind.
 
 mod replay_harness;
+mod scratch;
 
 use std::path::PathBuf;
 

@@ -415,8 +415,9 @@ export impl View {
 	/// an unlayered author declaration is the highest-priority author layer
 	/// there is, so `.sX{display:flex}` beats the reset whatever its
 	/// specificity, and `show` was a silent no-op on every flex container in a
-	/// real app (kolt's `child_relation("not([hidden])", …)` is that defect
-	/// wearing a HACK comment). No cascade layer can fix it, because there is
+	/// real app (kolt's raw `not([hidden])` child relation — the selector
+	/// escape hatch A95 S2 deleted — is that defect wearing a HACK comment).
+	/// No cascade layer can fix it, because there is
 	/// no layer above "unlayered"; `!important` is refused permanently
 	/// (css-block.md §10). So hiding writes the INLINE `display: none`, which
 	/// beats every rule in the sheet, and showing writes back the element's own
@@ -1044,7 +1045,7 @@ export fun swap_split<T: PartialEq, S: Source<T>, C: Slot>(
 	// continuations below have always done, and exactly as an event handler's
 	// would. Threading an ambient turn in from the build instead is what made
 	// this function a context node, which the gate cannot afford.
-	let wire: (|| void) context owner_scope = || {
+	let wire = || {
 		source.effect(|value: T| turn(FlushPolicy::AtSuspension, || {
 			// Claim this navigation's generation before anything can await, so
 			// a continuation can tell whether it is still the latest.

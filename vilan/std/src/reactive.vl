@@ -446,7 +446,7 @@ export impl Subscription with Disposable {
 /// An owner has a DISPOSED state (tracker B291), and it is the half that makes
 /// ownership hold across `await`. A registration is a PROMISE to release, and an
 /// async continuation registers whenever it happens to run — a route switched
-/// away before a handle's reply, a `bind_each` row rebuilt while its first fetch
+/// away before a handle's reply, an `each` row rebuilt while its first fetch
 /// is in flight. Without the flag such a late `take` parked a cleanup on a list
 /// nothing ever runs again: the subscription fired for the rest of the session
 /// and only a SECOND `dispose` released it. With it, the promise is kept the
@@ -490,7 +490,7 @@ export impl Owner {
 	}
 
 	/// Register a plain cleanup to run at disposal — for teardown that isn't a
-	/// single `Disposable` (e.g. `bind_each` disposing whichever rows are live).
+	/// single `Disposable` (e.g. `each` disposing whichever rows are live).
 	/// On a disposed owner the cleanup runs immediately, for `take`'s reason.
 	fun defer(self, cleanup: || void) {
 		if self.disposed.read() {
@@ -696,7 +696,7 @@ export trait Source<T> {
 	/// A derived signal: `transform` of this one's value, recomputed on every
 	/// change. DETACHABLE (A28): the subscription into this signal is handed to
 	/// the ambient owner, so a derivation made inside a boundary — a mounted
-	/// view, a `bind_each` row — dies when that boundary is disposed instead of
+	/// view, an `each` row — dies when that boundary is disposed instead of
 	/// notifying a dead derived signal for the rest of the session. Made
 	/// outside every boundary (module level, the top of `main`) it lives as long
 	/// as its source, which is what a module-level `current_path().map(parse)`
@@ -1048,7 +1048,7 @@ export impl Selector<type T: Hashable + PartialEq> {
 	///
 	/// Creates the key's cell on first ask (seeded against the current value)
 	/// and hands back that same cell every time after. The entry's REMOVAL is
-	/// deferred to the ambient owner, so asking from inside a `bind_each` row
+	/// deferred to the ambient owner, so asking from inside an `each` row
 	/// frees the entry when the row is disposed and the map stays the size of
 	/// the live list rather than of every list the session ever showed.
 	fun of(self, key: T): SignalCell<bool> {
@@ -1142,7 +1142,7 @@ export impl type S: Source<Option<type I: Source<type U>>> {
 	}
 }
 
-// === Keyed list reconciliation (backlog A3) — `bind_each`'s engine ===
+// === Keyed list reconciliation (backlog A3) — `each`'s engine ===
 //
 // Aligns a keyed row set with a new list of items. Per new item, in order:
 // KEEP a same-key row whose item is unchanged, REFRESH a same-key row whose
@@ -1150,13 +1150,13 @@ export impl type S: Source<Option<type I: Source<type U>>> {
 // FRESH when the key is new. Old rows whose keys left the list are REMOVED.
 // A duplicate key claims its old row once — later duplicates render fresh.
 // Pure logic (no DOM), so its edge cases pin in ordinary node tests; the
-// browser's `bind_each` applies the plan to elements.
+// browser's `each` applies the plan to elements.
 //
 // "Unchanged" is the CALLER's predicate (`same`), not `T: PartialEq` (A42).
 // The key decides identity and the element MOVES; `same` decides, for a
 // surviving key, reuse against dispose-and-rebuild — two different questions
-// that the old bound conflated into one. `bind_each` passes `==` and behaves
-// exactly as it always has; `bind_each_by` passes "always the same", which is
+// that the old bound conflated into one. `each` passes `==` and behaves
+// exactly as it always has; `each_by` passes "always the same", which is
 // what lets it take a `T` with no equality at all and update a kept row
 // through its own cell instead of rebuilding it.
 

@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 use vilan_embedded_std::{CONTENT_HASH, FILES, materialize_into};
 
+mod scratch;
+
 fn vilan_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan")
 }
@@ -71,7 +73,7 @@ fn the_table_matches_the_working_tree_in_both_directions() {
 
 #[test]
 fn materialization_is_complete_and_idempotent() {
-    let cache_root = std::env::temp_dir().join(format!(
+    let cache_root = scratch::root().join(format!(
         "vilan-embedded-std-test-{}-{CONTENT_HASH}",
         std::process::id()
     ));
@@ -112,7 +114,7 @@ fn pruning_removes_only_entries_older_than_the_guard() {
     use vilan_embedded_std::prune_stale;
 
     let cache_root =
-        std::env::temp_dir().join(format!("vilan-embedded-std-prune-{}", std::process::id()));
+        scratch::root().join(format!("vilan-embedded-std-prune-{}", std::process::id()));
     let _ = fs::remove_dir_all(&cache_root);
     for entry in [
         "fresh-entry",
@@ -164,7 +166,7 @@ fn pruning_removes_only_entries_older_than_the_guard() {
 /// this call just wrote is present at the end.
 #[test]
 fn materializing_a_new_hash_prunes_a_stale_sibling_and_keeps_a_fresh_one() {
-    let cache_root = std::env::temp_dir().join(format!(
+    let cache_root = scratch::root().join(format!(
         "vilan-embedded-std-materialize-prune-{}",
         std::process::id()
     ));
@@ -205,7 +207,7 @@ fn materializing_a_new_hash_prunes_a_stale_sibling_and_keeps_a_fresh_one() {
 /// resolution writes it straight back.
 #[test]
 fn the_current_hash_survives_its_own_prune_however_old_it_is() {
-    let cache_root = std::env::temp_dir().join(format!(
+    let cache_root = scratch::root().join(format!(
         "vilan-embedded-std-current-survives-{}",
         std::process::id()
     ));
@@ -243,7 +245,7 @@ fn the_current_hash_survives_its_own_prune_however_old_it_is() {
 #[test]
 fn a_dry_run_names_what_would_go_and_removes_nothing() {
     let cache_root =
-        std::env::temp_dir().join(format!("vilan-embedded-std-dry-run-{}", std::process::id()));
+        scratch::root().join(format!("vilan-embedded-std-dry-run-{}", std::process::id()));
     let _ = fs::remove_dir_all(&cache_root);
     for entry in ["fresh-entry", "stale-entry", ".staging-stale"] {
         fs::create_dir_all(cache_root.join(entry).join("std")).expect("seed entry");
@@ -280,7 +282,7 @@ fn a_dry_run_names_what_would_go_and_removes_nothing() {
 /// L21: `--all` drops the age guard and nothing else — `prune(.., None, ..)`.
 #[test]
 fn pruning_everything_ignores_the_age_guard_and_keeps_the_current_tree() {
-    let cache_root = std::env::temp_dir().join(format!(
+    let cache_root = scratch::root().join(format!(
         "vilan-embedded-std-prune-all-{}",
         std::process::id()
     ));

@@ -34,6 +34,7 @@ use vilan_core::{
     BuildOptions, PackageSpec, Platform, Workspace, analyze_source, transform, transform_to_ast,
 };
 
+mod scratch;
 #[macro_use]
 mod corpus_harness;
 use corpus_harness::{
@@ -125,8 +126,8 @@ fn both_ways(source: String, root: PathBuf, fuel: u64) -> Result<BothWays, Strin
             use std::sync::atomic::{AtomicU32, Ordering};
             static COUNTER: AtomicU32 = AtomicU32::new(0);
             let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir()
-                .join(format!("vilan_equiv_{}_{unique}.mjs", std::process::id()));
+            let path =
+                scratch::root().join(format!("vilan_equiv_{}_{unique}.mjs", std::process::id()));
             std::fs::write(&path, text).map_err(|error| error.to_string())?;
             let run = run_node_within(&path, NODE_TIMEOUT);
             let _ = std::fs::remove_file(&path);
@@ -390,7 +391,7 @@ fn scratch_js(tag: &str, source: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
+    let path = scratch::root().join(format!(
         "vilan_run_node_{tag}_{}_{unique}.mjs",
         std::process::id()
     ));

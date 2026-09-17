@@ -28,7 +28,7 @@ fn temp_dir(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir =
-        std::env::temp_dir().join(format!("vilan_init_{tag}_{}_{unique}", std::process::id()));
+        support::scratch_root().join(format!("vilan_init_{tag}_{}_{unique}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create the temp directory");
     dir

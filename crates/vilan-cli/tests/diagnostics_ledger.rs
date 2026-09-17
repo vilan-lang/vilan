@@ -28,11 +28,15 @@
 //!    `vilan/std`. A reworded or deleted message reds the row that keys on it.
 //!    This is the L13 re-key, run by the suite instead of by a lane.
 //! 3. **Every diagnostic is rowed**
-//!    ([`every_diagnostic_the_compiler_builds_is_indexed`]). Two anchors are
-//!    enumerated in full — every `Error { .. msg: <literal> }` in the compiler
-//!    crates, and every `errors.push(<literal>)` in `manifest.rs` (the manifest
-//!    refusal family) — and a message no row's key matches as a prefix reds,
-//!    named by file, line and text.
+//!    ([`every_diagnostic_the_compiler_builds_is_indexed`]). Three anchor
+//!    families are enumerated in full — every `Error { .. msg: <literal> }` in
+//!    the compiler crates, every `errors.push(<literal>)` in `manifest.rs` (the
+//!    manifest refusal family), and (N96) every `Failure::new(FailureKind::_,
+//!    <literal>)` and `Failure::unsupported(<literal>)`, which is how the const
+//!    channel and the macro engine refuse — and a message no row's key matches
+//!    as a prefix reds, named by file, line and text. The host runtime's own
+//!    sentences, reproduced verbatim for equivalence, are fenced in
+//!    [`MESSAGES_THAT_ARE_THE_HOSTS`] rather than rowed.
 //! 4. **Every appendix entry still names a live message**
 //!    ([`every_errors_appendix_entry_still_names_a_live_message`]) — the same
 //!    fixed-string search over each `**"..."**` head.
@@ -58,6 +62,11 @@
 //!    a message, are each an exemption subtracting a check for nothing — and
 //!    each stays green forever without this, because a list that only ever
 //!    subtracts work cannot red by being wrong.
+//! 8. **No rowed literal swallows a line continuation** (N94,
+//!    [`no_rowed_diagnostic_literal_swallows_a_line_continuation`]). A message
+//!    whose `\`-continuations were lost keeps the source indentation as a run
+//!    of spaces mid-sentence; three in a row is the threshold, over the
+//!    enumeration's messages and the index's keys.
 //!
 //! # What this file does NOT verify
 //!
@@ -77,19 +86,26 @@
 //! - **`Note { .. msg: .. }` sites are deliberately not rowed.** A C3 note is
 //!   recorded inside its primary's row, which is the convention every ledger
 //!   batch has used. They are enumerated only to be skipped.
-//! - **The INTERPRETER's failures are outside the walk too, and they are user
-//!   text.** The const channel refuses through `Failure` — `Failure::new` and
-//!   `Failure::unsupported` — not through `Error { .. msg: .. }`, so check (3)
-//!   has never enumerated one: `asset::emit` reached outside a `const`
-//!   expression, `check_emit_kind`'s three refusals about what a kind may
-//!   name, `asset::stage`/`staged`/`read`/`digest`/`schedule_at_end`. They are
-//!   rowed (N85, the owner's ruling: they are user-visible, so they are the
-//!   ledger's), which means check (2) holds a REWORD of each; a brand-new one
-//!   in that family still escapes check (3), exactly as the `msg:` families
-//!   above do. Widening the walk to `Failure::new`/`unsupported` is a real
-//!   option and a larger one — the family also carries the macro engine's
-//!   "not available at expansion time" limits, which are a different audience
-//!   — and it is not taken here.
+//! - **`Failure::internal` is outside the walk, deliberately.** Its own doc
+//!   calls it "a compiler or interpreter bug, not a user error", it prints
+//!   under the internal-error envelope with the please-report steer, and the 46
+//!   of them state semantic impossibilities no program is supposed to reach.
+//!   Rowing them would fill the ledger with sentences whose audience is this
+//!   repository.
+//! - **A `Failure` built from a `Result<_, String>` is outside it too.** The
+//!   const channel's project-file and staging helpers in `const_eval.rs` return
+//!   `Err(String)` and are re-wrapped at `Err(message) => Err(Failure::new(..,
+//!   message))` — a variable, not a literal, so the walk reads nothing there,
+//!   exactly as it reads nothing at a helper-built `msg:`. The largest of those
+//!   is `asset::staged`'s "reads the registry AFTER evaluation has finished",
+//!   which is unrowed at this sha and is filed.
+//! - **The `unsupported` family is rowed on its SUBJECT, not on its sentence.**
+//!   `Failure::unsupported` composes `"{what} is not available at expansion
+//!   time"`, and the two halves live apart, so the envelope has a row of its
+//!   own and each subject has one keyed on the literal written at the site —
+//!   which is what check (2) can search for. What a green therefore does NOT
+//!   say is that the two halves still compose into the sentence the ledger's
+//!   prose records.
 //! - **Nothing here proves a message is REACHABLE.** A row whose site is dead
 //!   code still passes check (2) as long as the literal is in the tree.
 //!
@@ -112,13 +128,47 @@ const MIN_FRAGMENT: usize = 8;
 /// the user reads is assembled from literals that live apart, so there is no
 /// one string to search for. Check (3) still covers them, because the
 /// enumeration finds the composing literal at its own site.
-const KEYS_WITHOUT_A_FRAGMENT: &[(&str, &str)] = &[(
-    "291",
-    "`{headline}{subject}: {}{}` — const evaluation's failure envelope; the two \
-     headlines (`const evaluation failed`, `const evaluation did not finish \
-     within the compile-time budget`) are separate literals in `const_eval.rs`, \
-     and G24's `const let` steer is a third",
-)];
+///
+/// **Keyed by the row's KEY, not by its number** (N76's rule, applied to this
+/// list by N96 — the sibling list has carried it since Order 33 and this one
+/// had not been asked for a row since). A row number is the LEDGER's to assign
+/// at integration, so a lane shipping a composed head writes `NEW` and has no
+/// number to record; two lanes writing `NEW` in one order would exempt each
+/// other's row. The entry is the key IN FULL and matches exactly, where
+/// [`ROWS_THE_ENUMERATION_CANNOT_REACH`] takes a prefix: a fragmentless key is
+/// short by construction, and one of them (`` `{name}` ``) is a PREFIX of
+/// other rows' keys, so a prefix rule could not name it at all.
+/// [`every_hand_rowed_row_is_in_the_index`] holds each entry to exactly one row.
+const KEYS_WITHOUT_A_FRAGMENT: &[(&str, &str)] = &[
+    (
+        "{headline}{subject}: {}{}",
+        "const evaluation's failure envelope; the two headlines (`const \
+         evaluation failed`, `const evaluation did not finish within the \
+         compile-time budget`) are separate literals in `const_eval.rs`, and \
+         G24's `const let` steer is a third",
+    ),
+    // N96's three, and all three are one shape: a host capability the
+    // expansion environment does not have, named by the SPELLING the program
+    // wrote. There is nothing else in the sentence — `Failure::unsupported`
+    // supplies the rest — so the key is a pair of backticks around a slot,
+    // and an exact match against the site's own literal is the whole of what
+    // can be held. Which is enough: each names exactly the sites that write
+    // it, and a fourth spelling of the same shape would land unrowed rather
+    // than be swallowed by one of these.
+    (
+        "`{helper}`",
+        "the impure-helper refusal — a `std` helper the const subset excludes",
+    ),
+    (
+        "`{name}`",
+        "the host-global and host-call refusals (`__scan`, `fetch`, \
+         `setTimeout`, `__timer`, …), which name the binding and nothing else",
+    ),
+    (
+        "`{base}.{method}`",
+        "the host-METHOD refusal, which names receiver and method the same way",
+    ),
+];
 
 /// Rows the enumeration cannot reach, ROWED BY HAND, with why the walk does
 /// not get to each (N41).
@@ -248,6 +298,36 @@ const ROWS_THE_ENUMERATION_CANNOT_REACH: &[(&str, &str)] = &[
     (
         "`-` negates a number, and `{label}` is a trait: no trait names",
         "`-`'s trait-typed arm",
+    ),
+];
+
+/// Messages the widened walk reads that are the HOST RUNTIME's own words
+/// rather than this compiler's, with the JavaScript error each reproduces.
+///
+/// The interpreter's contract is behavioural equivalence with the emitted JS
+/// (AGENTS.md's first invariant), so where a `const` expression hits a limit
+/// JavaScript itself refuses, it throws JavaScript's sentence verbatim and the
+/// two backends fail alike. Rowing one would put V8's wording in a ledger
+/// whose whole subject is the wording this project chose, and a REWORD here
+/// would be a bug rather than a re-key — which is the opposite of what a row
+/// is for. Fenced by their exact text, so a change to any of them reds
+/// [`every_hosts_message_is_still_thrown`] instead of passing silently.
+///
+/// This is not the same exemption as `ROWS_THE_ENUMERATION_CANNOT_REACH`:
+/// those are the tree's own messages the walk cannot READ. These the walk
+/// reads perfectly well and the ledger does not want.
+const MESSAGES_THAT_ARE_THE_HOSTS: &[(&str, &str)] = &[
+    (
+        "Invalid count value",
+        "V8's RangeError from `String.prototype.repeat`",
+    ),
+    (
+        "Division by zero",
+        "V8's RangeError from BigInt `/` and `%`",
+    ),
+    (
+        "Do not know how to serialize a BigInt",
+        "V8's TypeError from `JSON.stringify`",
     ),
 ];
 
@@ -902,6 +982,97 @@ fn anchored_messages(path: &Path, anchor: &str) -> Vec<Site> {
     sites
 }
 
+/// The const channel's refusals: `Failure::new(FailureKind::_, <literal>)` and
+/// `Failure::unsupported(<literal>)`.
+///
+/// Its own walk rather than one more [`anchored_messages`] anchor, because
+/// `Failure::new`'s message is its SECOND argument, behind a `FailureKind::…`
+/// the reader has to step over.
+///
+/// `Failure::unsupported`'s literal is a COMPOSED head, in exactly the sense
+/// [`KEYS_WITHOUT_A_FRAGMENT`] means it: the constructor is
+/// `format!("{} is not available at expansion time", what)`, so the sentence
+/// the user reads is the site's literal followed by an envelope that lives in
+/// one place. The site's own literal is what is enumerated and what a row is
+/// keyed on — the envelope gets a row of its own — because that is the half
+/// check (2) can search for. Keying on the whole sentence would key on a run
+/// that appears nowhere in the tree, and every row in the family would go
+/// stale the day it landed.
+///
+/// `Failure::internal` is deliberately absent: its own doc calls it "a
+/// compiler or interpreter bug, not a user error", it prints under the
+/// internal-error envelope with the please-report steer, and rowing 46 of
+/// those would fill the ledger with sentences no program is supposed to
+/// reach.
+fn failure_messages(path: &Path) -> Vec<Site> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let chars: Vec<char> = text.chars().collect();
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("?")
+        .to_string();
+    let mut sites = Vec::new();
+    let mut line = 1usize;
+    let mut index = 0usize;
+    while index < chars.len() {
+        if chars[index] == '\n' {
+            line += 1;
+        }
+        for anchor in ["Failure::unsupported(", "Failure::new("] {
+            let anchor_chars: Vec<char> = anchor.chars().collect();
+            if !chars[index..].starts_with(anchor_chars.as_slice()) {
+                continue;
+            }
+            let mut cursor = index + anchor_chars.len();
+            let mut ok = true;
+            loop {
+                match chars.get(cursor) {
+                    Some(' ' | '\t' | '\n' | '\r') => cursor += 1,
+                    Some('"') => break,
+                    Some(_) => {
+                        let rest: String = chars[cursor..(cursor + 24).min(chars.len())]
+                            .iter()
+                            .collect();
+                        if let Some(builder) = ["format!(", "String::from("]
+                            .into_iter()
+                            .find(|builder| rest.starts_with(builder))
+                        {
+                            cursor += builder.chars().count();
+                        } else if rest.starts_with("FailureKind::") {
+                            // The kind, and the comma after it.
+                            match chars[cursor..].iter().position(|c| *c == ',') {
+                                Some(offset) => cursor += offset + 1,
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && let Some((message, _)) = string_literal(&chars, cursor) {
+                sites.push(Site {
+                    file: name.clone(),
+                    line,
+                    message,
+                    is_note: false,
+                });
+            }
+        }
+        index += 1;
+    }
+    sites
+}
+
 /// The message surface this file claims to enumerate — see the header for what
 /// it deliberately leaves out.
 fn enumerated_sites() -> Vec<Site> {
@@ -922,6 +1093,7 @@ fn enumerated_sites() -> Vec<Site> {
         );
         for path in paths {
             sites.extend(anchored_messages(&path, "msg:"));
+            sites.extend(failure_messages(&path));
         }
     }
     sites.extend(anchored_messages(
@@ -1053,7 +1225,7 @@ fn the_index_is_well_formed() {
         );
         let exempt = KEYS_WITHOUT_A_FRAGMENT
             .iter()
-            .any(|(number, _)| *number == row.number);
+            .any(|(key, _)| *key == row.key);
         assert!(
             exempt || longest_fragment(&row.key).is_some(),
             "row {}'s key has no literal run of {MIN_FRAGMENT} characters to search for: {:?}.\n\
@@ -1111,13 +1283,20 @@ fn every_diagnostic_the_compiler_builds_is_indexed() {
         .map(|row| {
             let composed = KEYS_WITHOUT_A_FRAGMENT
                 .iter()
-                .any(|(number, _)| *number == row.number);
+                .any(|(key, _)| *key == row.key);
             (row, composed)
         })
         .collect();
     let mut unrowed = Vec::new();
     for site in enumerated_sites() {
         if site.is_note {
+            continue;
+        }
+        // N96: the host runtime's own sentences, reproduced for equivalence.
+        if MESSAGES_THAT_ARE_THE_HOSTS
+            .iter()
+            .any(|(message, _)| *message == site.message)
+        {
             continue;
         }
         if rows.iter().any(|(row, composed)| {
@@ -1142,6 +1321,60 @@ fn every_diagnostic_the_compiler_builds_is_indexed() {
          by the criteria in the index header — or `-`:\n{}",
         unrowed.len(),
         unrowed.join("\n")
+    );
+}
+
+/// N94: no rowed diagnostic literal carries a SWALLOWED line continuation.
+///
+/// Rust's `\` + newline + indentation is stripped before the program ever
+/// sees it, which is how every long message in this tree is written: four
+/// lines in the file, one run in the binary. A literal that LOSES its
+/// backslashes — joined by a tool, reflowed by hand — keeps the indentation
+/// instead, and ships with a run of eighteen spaces in the middle of a
+/// sentence. Two did: `const_eval.rs`'s `asset::staged` refusal, which a user
+/// reads, and an `analyzer.rs` test assertion, which a maintainer reads. Both
+/// predate Order 36 and neither was noticed by anything, because a run of
+/// spaces breaks no test and renders as a gap only when the message is shown.
+///
+/// THREE is the threshold and it is not arbitrary: no message in this tree
+/// separates words by more than one space, the tightest swallow (a
+/// four-space indent minus nothing) is four, and two would fire on the
+/// double space after a full stop that a message could legitimately carry.
+///
+/// The reach is the ROWED surface — every message the enumeration in check
+/// (3) reads at its anchor, plus every key in the index, which is the half
+/// that would otherwise carry the run forward into the ledger's prose. It is
+/// deliberately not "every string literal in the compiler": the aligned
+/// tables in `formatter.rs` and `bindgen.rs`'s report columns are runs of
+/// spaces on purpose, and a gate that has to except them stops being a gate.
+/// What that leaves uncovered is named in the header.
+#[test]
+fn no_rowed_diagnostic_literal_swallows_a_line_continuation() {
+    /// A run this long is indentation. Nothing writes it on purpose.
+    const RUN: &str = "   ";
+
+    let mut swallowed = Vec::new();
+    for site in enumerated_sites() {
+        if site.message.contains(RUN) {
+            swallowed.push(format!(
+                "  {}:{}\n      {:?}",
+                site.file, site.line, site.message
+            ));
+        }
+    }
+    for row in index() {
+        if row.key.contains(RUN) {
+            swallowed.push(format!("  {INDEX} row {}\n      {:?}", row.number, row.key));
+        }
+    }
+    assert!(
+        swallowed.is_empty(),
+        "{} diagnostic literal(s) carry a run of three or more spaces, which is \
+         a line continuation whose `\\` was lost — the indentation is now part \
+         of the message. Restore the backslashes, or write the literal as \
+         concatenated lines:\n{}",
+        swallowed.len(),
+        swallowed.join("\n")
     );
 }
 
@@ -1286,6 +1519,26 @@ fn every_hand_rowed_row_is_in_the_index() {
          first:\n{}",
         unresolved.join("\n")
     );
+
+    // The same question of the other key-addressed list (N96). A composed row
+    // buys its exemption from check (2) with an exact match in check (3), and
+    // an entry naming no row buys nothing while looking like it does.
+    let missing: Vec<String> = KEYS_WITHOUT_A_FRAGMENT
+        .iter()
+        .filter_map(
+            |(key, reason)| match rows.iter().filter(|row| row.key == *key).count() {
+                1 => None,
+                0 => Some(format!("  no row is keyed {key:?} ({reason})")),
+                several => Some(format!("  {several} rows are keyed {key:?}")),
+            },
+        )
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "key(s) recorded in KEYS_WITHOUT_A_FRAGMENT do not name exactly one row \
+         of `{INDEX}`:\n{}",
+        missing.join("\n")
+    );
 }
 
 #[test]
@@ -1379,6 +1632,33 @@ fn every_hand_rowed_row_is_still_out_of_the_enumerations_reach() {
 }
 
 #[test]
+fn every_hosts_message_is_still_thrown() {
+    // N42's shape for the third list (N96). `MESSAGES_THAT_ARE_THE_HOSTS`
+    // subtracts a row's worth of work on a claim about the TREE — "this text
+    // is V8's and the interpreter copies it" — and a claim about the tree is
+    // a thing that goes stale. If the site is gone, or its text moved a
+    // character, the fence is excusing a message nobody throws while the one
+    // that IS thrown goes unrowed.
+    let thrown: BTreeSet<String> = enumerated_sites()
+        .into_iter()
+        .map(|site| site.message)
+        .collect();
+    let stale: Vec<String> = MESSAGES_THAT_ARE_THE_HOSTS
+        .iter()
+        .filter(|(message, _)| !thrown.contains(*message))
+        .map(|(message, reason)| format!("  {message:?}\n      fenced as {reason}"))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "{} fenced message(s) are no longer thrown at any enumerated site. The \
+         fence excuses text nothing prints. Delete the entry — and if the \
+         message merely moved, row the one that replaced it:\n{}",
+        stale.len(),
+        stale.join("\n")
+    );
+}
+
+#[test]
 fn every_fragmentless_key_still_has_no_fragment() {
     // The same inverse for the other list (tracker N42). `KEYS_WITHOUT_A_FRAGMENT`
     // exempts a row from check (2) — from being searched for in the tree at all —
@@ -1390,7 +1670,7 @@ fn every_fragmentless_key_still_has_no_fragment() {
         .filter(|row| {
             KEYS_WITHOUT_A_FRAGMENT
                 .iter()
-                .any(|(number, _)| *number == row.number)
+                .any(|(key, _)| *key == row.key)
         })
         .filter_map(|row| {
             longest_fragment(&row.key)
@@ -1423,6 +1703,18 @@ fn the_enumeration_reaches_the_message_surface_it_claims() {
     assert!(
         sites.iter().any(|site| site.file == "manifest.rs"),
         "the manifest refusal family is no longer enumerated"
+    );
+    // N96's half of the same guard: the `Failure` anchors have their own
+    // cursor, and a rename of either constructor would take 50-odd const-channel
+    // and macro-engine refusals out of check (3) without a single row reding.
+    let failures = sites
+        .iter()
+        .filter(|site| site.file == "interpreter.rs")
+        .count();
+    assert!(
+        failures > 40,
+        "the enumeration found only {failures} `Failure` sites; the \
+         `Failure::new`/`Failure::unsupported` anchors have stopped matching"
     );
     let files: BTreeSet<&str> = sites.iter().map(|site| site.file.as_str()).collect();
     assert!(files.len() > 5, "the enumeration reaches only {files:?}");
