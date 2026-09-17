@@ -32,6 +32,12 @@ const WORKSPACE_CRATES: &[&str] = &[
     "vilan-embedded-std",
     "vilan-lsp",
     "vilan-ide",
+    // The emit-Rust backend (F1 S1a). `vilan-rt` is the one to look at twice:
+    // it is a workspace member that the compiler never links — the programs it
+    // emits do — and it takes NO crates.io dependencies at all, so it adds
+    // nothing to the notices in either direction.
+    "vilan-rust",
+    "vilan-rt",
 ];
 
 #[test]

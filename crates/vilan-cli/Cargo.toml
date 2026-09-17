@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 vilan-core = { path = "../vilan-core" }
+vilan-rust = { path = "../vilan-rust" }
 vilan-embedded-std = { path = "../vilan-embedded-std" }
 ariadne = "0.6.0"
 clap = { version = "4", features = ["derive"] }

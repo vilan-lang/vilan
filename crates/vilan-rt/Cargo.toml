@@ -1,0 +1,27 @@
+# The native runtime for the emit-Rust backend (tracker F1, slice S1a).
+#
+# DEPENDENCY-FREE, and that is a ruling rather than an accident (Order 37 R8,
+# `native-apps.md` §8 Q7): a native binary's whole dependency footprint in this
+# slice is Rust's own `std`, so the probe's 1.15 s release build stays a
+# representative number for the developer's inner loop, and AGENTS.md's
+# new-dependency stop condition is answered by there being none. The render
+# stack S3 will need (wgpu, a 2D renderer, text shaping, a layout engine) is a
+# SEPARATE crate when it arrives; it must not be smuggled in here early.
+#
+# It is a workspace MEMBER so that fmt, clippy and its own unit tests reach it,
+# and it is a dependency of no other member: the compiler never links it. What
+# links it is the cargo project `vilan build --backend rust` writes, through a
+# path dependency on this directory.
+[package]
+name = "vilan-rt"
+version = "0.40.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "The runtime for programs the vilan compiler emits as Rust."
+publish = false
+
+[dependencies]
+
+# The workspace clippy exception list (root Cargo.toml, backlog N21).
+[lints]
+workspace = true

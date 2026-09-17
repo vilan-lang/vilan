@@ -7,6 +7,14 @@ members = [
     "crates/vilan-ide",
     "crates/vilan-embedded-std",
     "crates/vilan-wasm",
+    # The emit-Rust backend (tracker F1, slice S1a): the emitter, and the
+    # runtime the programs it emits link against. `vilan-rt` is a member so the
+    # workspace's own gates (fmt, clippy, its unit tests) reach it — it is NOT a
+    # dependency of any other member, because the compiler never links it. What
+    # links it is the cargo project `vilan build --backend rust` writes, through
+    # a path dependency on this directory.
+    "crates/vilan-rust",
+    "crates/vilan-rt",
 ]
 
 # The clippy gate's exception list (backlog N21). `cargo clippy --workspace

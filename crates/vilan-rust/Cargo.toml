@@ -1,0 +1,18 @@
+# The emit-Rust backend (tracker F1, slice S1a) — the emitter, beside
+# `transformer.rs` rather than inside it: the same `Program` in, a cargo project
+# out. Its only dependency is the compiler it reads the program from; the
+# runtime the emitted program links (`vilan-rt`) is deliberately NOT one, so
+# nothing here can reach into it by accident and the two evolve against the
+# emitted source rather than against each other's internals.
+[package]
+name = "vilan-rust"
+version = "0.40.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+vilan-core = { path = "../vilan-core" }
+
+# The workspace clippy exception list (root Cargo.toml, backlog N21).
+[lints]
+workspace = true

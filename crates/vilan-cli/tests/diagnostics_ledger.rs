@@ -571,7 +571,13 @@ fn walk(directory: &Path, extension: &str, out: &mut Vec<PathBuf>) {
 fn message_sources() -> Vec<PathBuf> {
     let root = repository_root();
     let mut paths = Vec::new();
-    for crate_directory in ["vilan-core", "vilan-cli", "vilan-lsp", "vilan-wasm"] {
+    for crate_directory in [
+        "vilan-core",
+        "vilan-cli",
+        "vilan-lsp",
+        "vilan-wasm",
+        "vilan-rust",
+    ] {
         walk(
             &root.join("crates").join(crate_directory).join("src"),
             "rs",
@@ -896,7 +902,13 @@ fn anchored_messages(path: &Path, anchor: &str) -> Vec<Site> {
 fn enumerated_sites() -> Vec<Site> {
     let root = repository_root();
     let mut sites = Vec::new();
-    for crate_directory in ["vilan-core", "vilan-cli", "vilan-lsp", "vilan-wasm"] {
+    for crate_directory in [
+        "vilan-core",
+        "vilan-cli",
+        "vilan-lsp",
+        "vilan-wasm",
+        "vilan-rust",
+    ] {
         let mut paths = Vec::new();
         walk(
             &root.join("crates").join(crate_directory).join("src"),

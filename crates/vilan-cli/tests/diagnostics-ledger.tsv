@@ -523,3 +523,8 @@ row	flagship	key
 498	-	`{module}::{leaf}` is exported only into `{scope}`, and this file is outside it. Importing it anyway is allowed — mark the reach: `import {module}::{{ #{leaf} }};`
 499	-	`{module}::{leaf}` is exported only into `{scope}`, and this path reaches it from outside. The spelling that says so is a marked import: `import {module}::{{ #{leaf} }};`, and then `{leaf}` on its own
 NEW	-	a view cannot escape its scope: this closure captures one, and `{callee}` keeps what it is handed past the call
+NEW	-	the `rust` backend does not emit {what} yet
+NEW	-	`--backend rust` does not split: route chunks are a browser artifact
+NEW	-	`--backend rust` builds ONE entry, not a workspace: a workspace's legs are a
+NEW	-	`--backend rust` runs ONE entry, not a workspace: a workspace's legs are a
+NEW	-	`--backend rust` has no `--watch` yet: the native round is a full

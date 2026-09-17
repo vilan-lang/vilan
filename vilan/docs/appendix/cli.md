@@ -86,8 +86,17 @@ its own, with the default prelude and no dependencies.
   ([the dev loop](../guide/dev-loop.md#shipping-routes-separately)).
 - `--explain`: after the build, print where every output came from — see
   below.
-- `--backend js`: the only backend today; the flag exists so a future
-  one has somewhere to live.
+- `--backend <js|rust>`: which emitter runs. `js` is the default. `rust`
+  emits the program as Rust, writes a cargo project under `dist/native/`
+  and builds it with the host's `cargo` — **in debug**, because rustc is
+  the inner loop from there on (`--release` is yours to run over the
+  generated project). It is a first cut whose scope is structs, enums,
+  `Option`/`Result`, `str`, `List`, `Map`/`Set`, closures, `impl`s,
+  `print` and `panic`; anything outside that — a generic function, a
+  module-level binding, `async`, any host binding — is refused by name
+  rather than mis-compiled. [Native binaries](../guide/native.md) has the
+  whole list. `vilan run --backend rust` runs the binary it built; it
+  takes no `--watch`.
 
 Every build of a `browser` entry writes `<name>.chunks.json`, the leg's
 build manifest — what it emitted, for `std::build::build_of` to read. A
