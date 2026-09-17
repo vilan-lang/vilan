@@ -522,3 +522,37 @@ row	flagship	key
 497	-	no `impl {subject}` this statement carries declares {named}: the selector admits nothing
 498	-	`{module}::{leaf}` is exported only into `{scope}`, and this file is outside it. Importing it anyway is allowed — mark the reach: `import {module}::{{ #{leaf} }};`
 499	-	`{module}::{leaf}` is exported only into `{scope}`, and this path reaches it from outside. The spelling that says so is a marked import: `import {module}::{{ #{leaf} }};`, and then `{leaf}` on its own
+NEW	-	{} is not available at expansion time
+NEW	-	output during evaluation (an inferred fold must be observably silent)
+NEW	-	a process exit during evaluation (an inferred fold must be observably silent)
+NEW	-	host bindings ([extern])
+NEW	-	`{helper}`
+NEW	-	`{name}`
+NEW	-	`{base}.{method}`
+NEW	-	`with_finally_async`
+NEW	-	async (macro bodies are synchronous)
+NEW	-	await (macro bodies are synchronous)
+NEW	-	the array method `{other}`
+NEW	-	the Set method `{other}`
+NEW	-	the Map method `{other}`
+NEW	-	the string method `{other}`
+NEW	-	the method `{method}` on {}
+NEW	-	replaceAll with an empty pattern
+NEW	-	stringifying a function
+NEW	-	a BigInt beyond 128 bits (the expansion engine's v1 bound)
+NEW	-	`Shared::identity` over {}
+NEW	-	the build's staging registry (`asset::stage`)
+NEW	-	the build's staging registry (`asset::staged`)
+NEW	-	the project's files (`asset::read`)
+NEW	-	the project's files (`asset::digest`)
+NEW	-	the project's files (`{spelling}`)
+NEW	-	`asset::schedule_at_end` on an anonymous closure (it takes a named function: the name is the identity that makes a repeat request a no-op, and a closure's captured scope does not outlive the evaluation that made it)
+NEW	-	a `const` result must be plain data; this evaluates to {what}
+NEW	-	the macro did not return a `Source` (build one with `macro_std::source(..)`)
+NEW	-	the fuel budget was exhausted
+NEW	-	the call-depth cap was exceeded
+NEW	-	lazy initialization cycle: `{name}`
+NEW	-	lazy `{name}` is poisoned: its initializer panicked: {poison}
+NEW	-	{name}: {value} is not one of its values
+NEW	-	index out of bounds: the length is {length} but the index is {index}
+NEW	-	substring out of range: the length is {length} but the range is {start}..{end} — substring requires 0 <= start <= end <= len and never clamps or swaps; to drop a known affix use strip_prefix/strip_suffix, and for the rest of the string pass s.len() as the end
