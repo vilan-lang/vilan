@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 
 use vilan_core::{EntryMode, MacroLimits, PackageSpec, Platform, Workspace, analyze_source};
 
+mod scratch;
+
 fn std_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std")
 }
@@ -510,7 +512,7 @@ fn m74_an_entry_shaped_world_weighs_what_its_unfilled_tables_weigh() {
 fn weigh_m74_shape(label: &'static str, open: bool) {
     let load = loadavg_1m();
     const WORLDS: u64 = 8;
-    let root = std::env::temp_dir().join(format!(
+    let root = scratch::root().join(format!(
         "vilan_m74_{}_{}",
         label.replace('-', "_"),
         std::process::id()

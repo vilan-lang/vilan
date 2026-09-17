@@ -7209,7 +7209,7 @@ fn m75_files(colliding: bool, members: usize, statements: usize) -> Vec<(String,
 /// closure's own load is out of the number and what is left is the package and
 /// its checks.
 fn m75_cpu_ms(label: &str, colliding: bool, members: usize, statements: usize) -> Option<f64> {
-    let directory = std::env::temp_dir().join(format!(
+    let directory = scratch::root().join(format!(
         "vilan_m75_{label}_{}_{:?}",
         std::process::id(),
         std::thread::current().id()
