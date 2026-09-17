@@ -1,8 +1,39 @@
-// `std::shared` — `Shared<T>`, reference-counted shared mutable state for when
-// ownership is genuinely diffuse (several independent subjects holding the *same*
-// mutable value, with no natural arena owner). This is the one place reference
-// identity and shared mutation are explicit in the type, so the cost is legible
-// at the use site — prefer an `Arena` + `Handle` whenever an owner exists.
+// `std::shared` — `Shared<T>`, the shared mutable cell behind a value-copied
+// handle. Rule 1 copies every binding, argument, field initialization and
+// return (spec §6.1), so a struct passed around by value cannot carry mutable
+// state in a plain field; a cell is what the language leaves. This is the one
+// place reference identity and shared mutation are explicit in the type, so
+// the cost is legible at the use site.
+//
+// WHICH TIER — `Shared` or `Arena` + `Handle`. Reach for `Shared` when
+// ownership is genuinely DIFFUSE: several independent holders of the one
+// mutable value, no single place that decides when it dies (a signal's value
+// and its subscriber list, an rpc mirror's lease counts, a module-level
+// registry). Reach for an `Arena` + `Handle` when what you need is a GRAPH or
+// a STABLE IDENTITY: nodes that point at each other, entities a wire message
+// names, storage whose deletion must leave outstanding references answering
+// `None` rather than a ghost. The two are one object at two granularities
+// (`destruction.md` §10: a `Shared` is a one-slot counted arena, `clone` is
+// the retain and `Weak` is the handle) — the tier follows what the code needs
+// to SAY, not which is cheaper.
+//
+// This headnote used to read "prefer an `Arena` + `Handle` whenever an owner
+// exists". The C14 census measured that advice against the estate and found
+// 0 of std's 154 `Shared` sites and 0 of kolt's 13 following it: no owner owns
+// a cell (only four types are `Disposable`), and what every one of those sites
+// wants is interior mutability behind a value-copied handle, which is not a
+// slab (`proposal/signal-cell-representation.md` §2.4 finding 1, D8).
+//
+// NOT for state a closure merely writes. A closure captures the BINDING, not
+// the value (spec §6.9), so a `mut` local that closures in the same frame
+// assign and read needs no cell at all — M71 retired eight std cells that were
+// spelling exactly that the long way.
+//
+// COUNTING. `clone()` is a retain and a handle's death is a release in the
+// design (`destruction.md` §10); today nothing counts, because the JS backend's
+// host collector reclaims the box and a cycle through it is the collector's
+// problem. The real count arrives with the native backend (C14 S4); what lands
+// before it is `Weak<T>` (C1), the edge that makes the graph acyclic.
 //
 // `Shared` is `external` (an opaque cell): unlike an ordinary aggregate it is
 // *not* deep-copied, so `clone()` and ordinary binding share the one underlying
