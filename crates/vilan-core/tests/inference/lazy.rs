@@ -1199,3 +1199,172 @@ fn a_list_fallback_is_still_copied_out_of_the_callers_binding() {
         "got 1 spare 0\ngot 1 spare 1\n",
     );
 }
+
+// --- B344: the data-only rule at a GENERIC lazy parameter ------------------
+//
+// `lazy fallback: T` is not a resource at the declaration, and inside a generic
+// the value standing in the position is `T`-typed too, so both ends of §1's
+// "data only" rule used to read clean while the thunk really did own a
+// resource. Two fixes, two shapes: the argument check no longer depends on the
+// expression map carrying a type a bare name never puts there, and the rule is
+// asked again at every resource INSTANTIATION, where the indirect case lives.
+
+/// A resource the caller PRODUCES in a lazy position: no binding is named, so
+/// R9's capture scan sees nothing, and the thunk owns a `Res` that nothing
+/// forces and nothing destroys. Refused at the instantiation.
+#[test]
+fn a_generic_lazy_parameter_instantiated_at_a_produced_resource_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::drop::{ Drop, drop };
+        import std::io::print;
+
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) {
+                print(i"drop {self.tag}");
+            }
+        }
+
+        fun hold<T>(flag: bool, lazy fallback: T): bool {
+            flag
+        }
+
+        fun make(): Res {
+            Res { tag = "made" }
+        }
+
+        fun main() {
+            print(i"{hold(true, make())}");
+        }
+        "#,
+        "`lazy` parameter `fallback` at the resource `Res`",
+    );
+}
+
+/// The INDIRECT case: a generic hands its own `T` on to another generic's lazy
+/// parameter. Nothing at the inner call site is concretely anything — the
+/// argument is a `T`-typed parameter — so only the instantiation knows, and it
+/// learns it by the same propagation that carries R11 there. The type does not
+/// ground at that hop, so the message says "a resource type" rather than naming
+/// the `T` it was written with.
+#[test]
+fn a_generic_forwarding_its_own_type_into_a_lazy_parameter_is_refused() {
+    assert_fails_with(
+        r#"
+        import std::drop::{ Drop, drop };
+        import std::io::print;
+
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) {
+                print(i"drop {self.tag}");
+            }
+        }
+
+        fun hold<T>(flag: bool, lazy fallback: T): bool {
+            flag
+        }
+
+        fun forward<T>(flag: bool, own value: T): bool {
+            hold(flag, value)
+        }
+
+        fun sink(own value: Res) {
+            drop(value);
+        }
+
+        fun main() {
+            let conn = Res { tag = "indirect" };
+            print(i"{forward(true, conn)}");
+        }
+        "#,
+        "`lazy` parameter `fallback` at a resource type",
+    );
+}
+
+/// A MODULE-LEVEL resource named bare in a lazy position. R9's thunk capture
+/// scan exempts it (process lifetime), and the argument check could not see it
+/// either, because a bare `Expr::Local` carries no type on its own id — so this
+/// was refused by nobody. The argument check owns it now, at the argument's own
+/// span.
+#[test]
+fn a_module_level_resource_in_a_lazy_position_is_refused_at_the_argument() {
+    assert_fails_with(
+        r#"
+        import std::drop::{ Drop, drop };
+        import std::io::print;
+
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) {
+                print(i"drop {self.tag}");
+            }
+        }
+
+        let shared: Res = Res { tag = "module" };
+
+        fun hold<T>(flag: bool, lazy fallback: T): bool {
+            flag
+        }
+
+        fun main() {
+            print(i"{hold(true, shared)}");
+        }
+        "#,
+        "this argument is the resource `Res`, and it stands in the `lazy` parameter `fallback`",
+    );
+}
+
+/// B5, the other half of the same change: a resource LOCAL named bare stays
+/// R9's, in R9's own words (lazy.md §8), and the instantiation check stands
+/// down rather than saying the same thing a second time.
+#[test]
+fn a_resource_local_in_a_lazy_position_is_still_only_the_r9_capture() {
+    let source = r#"
+        import std::drop::{ Drop, drop };
+        import std::io::print;
+
+        resource struct Res { tag: str }
+        impl Res with Drop {
+            fun drop(&mut self) {
+                print(i"drop {self.tag}");
+            }
+        }
+
+        fun hold<T>(flag: bool, lazy fallback: T): bool {
+            flag
+        }
+
+        fun main() {
+            let conn = Res { tag = "local" };
+            print(i"{hold(true, conn)}");
+        }
+        "#;
+    assert_fails_with(source, "a closure cannot capture the resource `conn`");
+    assert_fails_without(source, "instantiates");
+    assert_fails_without(source, "this argument is the resource");
+}
+
+/// A lazy parameter instantiated at DATA is untouched — the check is the delta
+/// of the instantiation, so nothing about an ordinary generic changes.
+#[test]
+fn a_generic_lazy_parameter_at_a_data_type_still_compiles() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Note { text: str }
+
+        fun hold<T>(flag: bool, lazy fallback: T): bool {
+            flag
+        }
+
+        fun main() {
+            let note = Note { text = "fine" };
+            print(i"{hold(true, note)}");
+        }
+        "#,
+        "true\n",
+    );
+}

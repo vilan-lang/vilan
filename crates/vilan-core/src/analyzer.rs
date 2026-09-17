@@ -15292,6 +15292,7 @@ impl<'src> Analyzer<'src> {
                 self.scan_instantiated_body(instance.callee, &closures, &scan)
             };
             let body_is_move_clean = violations.is_empty();
+            let reported_before = self.diagnostics.len();
             self.emit_r11_violations(instance.callee, instance.call_id, violations);
             self.check_own_generic_exactly_once(
                 &instance,
@@ -15301,6 +15302,19 @@ impl<'src> Analyzer<'src> {
             );
             self.check_generic_drop_forwarding(&instance, &calls, &resources, &mut memo);
             self.check_instantiation_container_resources(&instance, &body_exprs);
+            // B344, LAST and only when this instantiation is otherwise clean.
+            // Every sibling above reports the SAME instantiation, and a body
+            // that already fails R11 fails it for a reason the author can act
+            // on — `Option::unwrap_or` at a resource is "the loaned parameter
+            // `fallback` is moved out", whose steer is `unwrap_or_else`, and
+            // "drop the `lazy`" is not advice a caller of std can take. One
+            // diagnostic per root cause (B5): the lazy rule speaks where
+            // nothing else did, which is the whole of what B344 closed — a
+            // generic whose body never READS the lazy parameter is move-clean,
+            // so R11 has nothing to say and the thunk owns the resource anyway.
+            if self.diagnostics.len() == reported_before {
+                self.check_lazy_parameters_at_instantiation(&instance, &resources, &mut memo);
+            }
 
             // Propagate: the callee's own calls, now under ITS resource
             // parameters — a call passing `T` on to another generic instantiates
@@ -15790,6 +15804,170 @@ impl<'src> Analyzer<'src> {
         for call_id in offending {
             self.emit_generic_drop_forward(instance, call_id);
         }
+    }
+
+    /// B344: lazy.md §1's **data only** rule, asked at the INSTANTIATION.
+    ///
+    /// The declaration check reads the parameter's DECLARED type, and
+    /// `lazy fallback: T` is not a resource; the argument check reads the value
+    /// standing in the position, and inside a generic that value is `T`-typed
+    /// too. So `fun hold<T>(lazy fallback: T)` at `T := Database` slipped both
+    /// ends — nothing was concretely a resource anywhere the two checks looked,
+    /// and R9's capture scan saw no resource BINDING to report either, because
+    /// the binding it would have named is typed `T`. The thunk is real all the
+    /// same: it owns a `Database`, and a thunk nothing forces never destroys the
+    /// resource it captured.
+    ///
+    /// Asked here because this is the one pass that knows a generic is
+    /// instantiated at a resource, and it knows it for the INDIRECT case too
+    /// (a generic handing its own `T` on to another generic's lazy parameter)
+    /// by the same propagation that carries R11 there. The DELTA rule is its
+    /// siblings': a parameter that is a resource without this instantiation is
+    /// the declaration check's, already reported at its own span, so re-reporting
+    /// it here would double-report one mistake at two places (B5).
+    fn check_lazy_parameters_at_instantiation(
+        &mut self,
+        instance: &R11Instance,
+        resources: &HashSet<TypeId>,
+        memo: &mut HashMap<TypeId, bool>,
+    ) {
+        let parameters: Vec<Id> = match self.functions.get(&instance.callee) {
+            Some(function) => function.parameters.clone(),
+            None => return,
+        };
+        let lazy_parameters: Vec<(usize, Id, &'src str, TypeId)> = parameters
+            .iter()
+            .enumerate()
+            .filter_map(|(position, parameter_id)| {
+                self.parameters
+                    .get(parameter_id)
+                    .map(|parameter| (position, parameter))
+            })
+            .filter(|(_, parameter)| parameter.lazy)
+            .map(|(position, parameter)| {
+                (position, parameter.id, parameter.name, parameter.type_id)
+            })
+            .collect();
+        for (position, parameter_id, name, type_id) in lazy_parameters {
+            if !self.type_is_resource_with(type_id, resources, memo) {
+                continue;
+            }
+            if self.type_is_resource(type_id) {
+                continue;
+            }
+            if self.lazy_position_spoken_for_at(instance.call_id, position) {
+                continue;
+            }
+            self.emit_lazy_parameter_instantiation(instance, parameter_id, name, type_id);
+        }
+    }
+
+    /// Whether the value the caller wrote in this lazy position is ALREADY the
+    /// subject of a refusal, so B344's instantiation message would be the second
+    /// account of one mistake (B5).
+    ///
+    /// Asked as a pure function of the tables rather than off a set the two
+    /// earlier passes record, deliberately: both of them live in M19 T1's Class
+    /// A window and a reusing analysis does not revisit a cached module's sites,
+    /// so a recorded set would come back short and this check would report what
+    /// they had already reported — on the reusing analysis and on no other,
+    /// which is exactly the shape `reported_container_structures` had to be made
+    /// recordable to avoid. The question here needs no record: an argument whose
+    /// own type is concretely a resource is one `check_lazy_arguments` refuses,
+    /// or — when it names a binding — one R9's thunk capture scan does, and that
+    /// is decidable from the argument alone.
+    fn lazy_position_spoken_for_at(&mut self, call_id: Id, position: usize) -> bool {
+        let Some(argument_id) = self
+            .function_calls
+            .get(&call_id)
+            .and_then(|call| call.argument_ids.get(position).copied())
+        else {
+            return false;
+        };
+        let Some(type_id) = self.lazy_argument_type_id(argument_id) else {
+            return false;
+        };
+        self.type_is_resource(type_id)
+    }
+
+    /// B344's diagnostic: primary at the instantiation, note at the `lazy`
+    /// parameter in the generic's own signature — the two halves of the mistake,
+    /// which are always in two different places (the caller picked the type, the
+    /// callee wrote the `lazy`).
+    fn emit_lazy_parameter_instantiation(
+        &mut self,
+        instance: &R11Instance,
+        parameter_id: Id,
+        name: &'src str,
+        type_id: TypeId,
+    ) {
+        let callee = self
+            .functions
+            .get(&instance.callee)
+            .map(|function| function.name)
+            .unwrap_or("this generic");
+        // Rendered under the instantiation, so the message names the resource the
+        // CALLER chose (`Database`) rather than the `T` the callee wrote.
+        let at = match self.render_instantiated_parameter(instance, type_id) {
+            Some(rendered) => format!("the resource `{rendered}`"),
+            None => "a resource type".to_string(),
+        };
+        let site = **self.span_map.get(&instance.call_id).unwrap_or(&&EMPTY_SPAN);
+        // The primary is the INSTANTIATION site: the caller's file (B112).
+        let call_source = self.source_of_id(instance.call_id).unwrap_or(SourceId(0));
+        let note = crate::error::Note {
+            span: **self.span_map.get(&parameter_id).unwrap_or(&&EMPTY_SPAN),
+            msg: format!("in `{callee}`, `{name}` is declared `lazy`"),
+            source: self.note_source_against(parameter_id, call_source),
+        };
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                span: site,
+                msg: format!(
+                    "this instantiates `{callee}`'s `lazy` parameter `{name}` at {at}: \
+                     a lazy argument is carried by a thunk, and a \
+                     thunk owning a resource is what R9 forbids — a thunk nothing forces \
+                     never destroys what it captured. Resources stay eager: drop the `lazy` \
+                     from `{name}`, or instantiate `{callee}` at a data type"
+                ),
+                note: Some(note),
+            },
+            instance.call_id,
+        );
+    }
+
+    /// How B344's message names the type standing in a `lazy` parameter: the
+    /// type the CALLER bound it to, when this call grounds it.
+    ///
+    /// The instantiation's own `resources` are generic CONSTRAINT ids — what
+    /// `type_is_resource_with` treats as resources — and a constraint pretty-
+    /// prints as its bound (`any` for an unbounded `T`), which names nothing the
+    /// author wrote. The substitution the call made is the answer, and
+    /// `r11_call_type_bindings` is where its siblings read it: `T` becomes
+    /// `Database`, and `Option<T>` becomes `Option<Database>`.
+    ///
+    /// On the INDIRECT hop it grounds nothing: a generic handing its own `T` to
+    /// another generic's lazy parameter substitutes `T` for `T`, and the
+    /// resource is a fact of the instantiation this worklist entry carries
+    /// rather than of the call site's own text. Naming "the resource `T`" there
+    /// would be a lie in the shape of a type, so the caller gets `None` and says
+    /// "a resource type" instead.
+    fn render_instantiated_parameter(
+        &mut self,
+        instance: &R11Instance,
+        type_id: TypeId,
+    ) -> Option<String> {
+        let bindings = self.r11_call_type_bindings(instance.call_id, instance.callee);
+        let (constraints, bounds): (Vec<TypeId>, Vec<TypeId>) = bindings.into_iter().unzip();
+        let context = Self::instantiation_context(&constraints, &bounds);
+        let instantiated = self
+            .substitute_type(&type_id.get_type(self), &context)
+            .get_type_id(self);
+        if !self.type_is_resource(instantiated) {
+            return None;
+        }
+        Some(self.pretty_print_type(&instantiated.get_type(self), &HashMap::default()))
     }
 
     /// The R11 drop-forwarding diagnostic: primary at the instantiation site, note
@@ -24263,15 +24441,29 @@ impl<'src> Analyzer<'src> {
             .iter()
             .map(|(argument_id, name)| (*argument_id, *name))
             .collect();
+        let module_level = self.module_level_binding_ids();
         for (argument_id, name) in arguments {
             // S1: the refusal anchors at the argument the caller wrote.
             if self.reusable_entity(argument_id) {
                 continue;
             }
-            let Some(type_id) = self.expr_id_to_type_id_map.get(&argument_id).copied() else {
+            let Some(type_id) = self.lazy_argument_type_id(argument_id) else {
                 continue;
             };
             if !self.type_is_resource(type_id) {
+                continue;
+            }
+            // B344's other half: R9 owns a resource BINDING named bare inside a
+            // thunk, and says so in its own words (lazy.md §8) — one diagnostic
+            // per root cause (B5), so this one stands down there. What R9
+            // EXEMPTS is the module-level binding (process lifetime, so the
+            // thunk owns nothing), and that is the shape this refusal exists
+            // for: `lazy fallback: T` at a module-level `Database` was refused
+            // by nobody at all until the type lookup above stopped depending on
+            // the expression map carrying an entry a bare name never puts there.
+            if let Some(Expr::Local(binding)) = self.expr_id_to_expr_map.get(&argument_id)
+                && !module_level.contains(binding)
+            {
                 continue;
             }
             let rendered = self.pretty_print_type(&type_id.get_type(self), &HashMap::default());
@@ -24289,6 +24481,38 @@ impl<'src> Analyzer<'src> {
                 },
                 argument_id,
             );
+        }
+    }
+
+    /// The type of a lazy ARGUMENT, for the data-only refusal above (B344).
+    ///
+    /// `expr_id_to_type_id_map` answers for an expression that carries a type on
+    /// its own id, and a bare `Expr::Local` does not — a reference to a binding
+    /// or a parameter is spelled `Expr::Local(id)` (`Expr::Parameter` is the
+    /// DECLARATION), so the map read alone returned `None` for the form callers
+    /// write most often and the check saw nothing at all. The binding's own
+    /// declared type is the answer. This is the analyzer's twin of
+    /// `expr_type_id` in the transformer, which B328 fixed for the same reason
+    /// at the same shape.
+    fn lazy_argument_type_id(&self, argument_id: Id) -> Option<TypeId> {
+        if let Some(type_id) = self.expr_id_to_type_id_map.get(&argument_id) {
+            return Some(*type_id);
+        }
+        match self.expr_id_to_expr_map.get(&argument_id)? {
+            Expr::Local(binding) | Expr::Variable(binding) => self
+                .variables
+                .get(binding)
+                .map(|variable| variable.type_id)
+                .or_else(|| {
+                    self.parameters
+                        .get(binding)
+                        .map(|parameter| parameter.type_id)
+                }),
+            Expr::Parameter(binding) => self
+                .parameters
+                .get(binding)
+                .map(|parameter| parameter.type_id),
+            _ => None,
         }
     }
 
