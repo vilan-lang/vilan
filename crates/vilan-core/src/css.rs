@@ -672,9 +672,9 @@ mod tests {
     }
 
     #[test]
-    fn a_one_hole_value_passes_its_expression_through() {
-        // The row that keeps a `Length` a `Length`: exactly one hole and
-        // nothing else is the expression itself, never a string.
+    fn a_one_argument_value_passes_its_expression_through() {
+        // The row that keeps a `Length` a `Length`: ONE argument is the
+        // expression itself, never a string.
         let (block, chain) = shapes_match(
             "css { gap: {space(4)}; }",
             r#"style().raw("gap", space(4))"#,
@@ -703,10 +703,10 @@ mod tests {
     }
 
     #[test]
-    fn a_single_hole_value_never_goes_through_piece() {
-        // The control A34 rests on: exactly one hole and nothing else still
-        // passes its expression through untouched, so the value keeps its TYPE
-        // and reaches `Style::raw`, which carries the `:root` line itself.
+    fn a_one_argument_value_never_goes_through_piece() {
+        // The control A34 rests on: ONE argument still passes its expression
+        // through untouched, so the value keeps its TYPE and reaches
+        // `Style::raw`, which carries the `:root` line itself.
         let tree = lowered("css { gap: {space(4)}; }");
         assert!(!tree.contains("piece"), "{tree}");
     }

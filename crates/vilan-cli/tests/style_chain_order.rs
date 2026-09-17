@@ -598,43 +598,38 @@ const CSS_ORDER_SENSITIVE: &str = concat!(
     "fun main() {\n",
     // The shorthand LAST wins the whole box; the longhand last wins one edge.
     // Both must survive the sort, and only the family rule makes them.
-    "\tlet a = const css { color: {Color::gray(900)}; padding-left: {space(1)}; ",
-    "padding: {space(4)}; };\n",
-    "\tlet b = const css { color: {Color::gray(900)}; padding: {space(4)}; ",
-    "padding-left: {space(1)}; };\n",
+    "\tlet a = const css { color(Color::gray(900)); padding-left(space(1)); ",
+    "padding(space(4)); };\n",
+    "\tlet b = const css { color(Color::gray(900)); padding(space(4)); ",
+    "padding-left(space(1)); };\n",
     // `size` writes width and height; `width` writes one of them. In a block
     // there is no `size` property, so the pair is `width`/`height` themselves.
-    "\tlet c = const css { gap: {space(2)}; width: 32px; height: 16px; };\n",
-    // `border-color` is one of `border`'s longhands. The shorthand's value is
-    // written HOLE-FREE (B148): a value that mixes text with a hole lowers to a
-    // `str` concatenation, and `1px solid {Color::gray(500)}` was concatenating
-    // the token's two-field struct — emitting
-    // `1px solid var(--gray-500),:root{--gray-500:#6b7280}`, invalid CSS that
-    // this fixture could not see because it compares two builds of itself. What
-    // is under test is the ORDER of the two properties; the values do not enter
-    // it, and `border-color`'s one-hole token still carries a real one.
-    "\tlet e = const css { display: flex; border-color: {Color::gray(300)}; ",
-    "border: 1px solid black; };\n",
-    "\tlet f = const css { display: flex; border: 1px solid black; ",
-    "border-color: {Color::gray(300)}; };\n",
+    "\tlet c = const css { gap(space(2)); width(px(32)); height(px(16)); };\n",
+    // `border-color` is one of `border`'s longhands. What is under test is the
+    // ORDER of the two properties; the values do not enter it, and
+    // `border-color`'s typed argument still carries a real token.
+    "\tlet e = const css { display(\"flex\"); border-color(Color::gray(300)); ",
+    "border(\"1px solid black\"); };\n",
+    "\tlet f = const css { display(\"flex\"); border(\"1px solid black\"); ",
+    "border-color(Color::gray(300)); };\n",
     // A property the table does not write is a BARRIER: `padding-top` must not
     // cross it to reach `display`, or the vendor rule stops landing where it was
     // written.
-    "\tlet h = const css { padding-top: {space(1)}; -webkit-mask-composite: source-in; ",
-    "display: flex; color: {Color::gray(900)}; };\n",
+    "\tlet h = const css { padding-top(space(1)); -webkit-mask-composite(\"source-in\"); ",
+    "display(\"flex\"); color(Color::gray(900)); };\n",
     // Conditions sort after every declaration, and among themselves by axis —
     // media, relation, attribute, pseudo — which is the order the selector nests
     // them in, so a wrong axis would change what the rule matches.
     "\tlet i = const css {\n",
-    "\t\t.hover { color: {Color::gray(50)}; }\n",
-    "\t\tpadding: {space(2)};\n",
-    "\t\t.within(\"data-theme\", Some(\"dark\")) { color: {Color::gray(100)}; }\n",
-    "\t\tdisplay: flex;\n",
-    "\t\t.md { padding: {space(6)}; }\n",
+    "\t\t.hover { color(Color::gray(50)); }\n",
+    "\t\tpadding(space(2));\n",
+    "\t\t.within(\"data-theme\", Some(\"dark\")) { color(Color::gray(100)); }\n",
+    "\t\tdisplay(\"flex\");\n",
+    "\t\t.md { padding(space(6)); }\n",
     "\t};\n",
     // A nested rule's own body sorts too, with the same rules inside it.
     "\tlet j = const css {\n",
-    "\t\t.hover { padding-left: {space(1)}; padding: {space(4)}; display: flex; }\n",
+    "\t\t.hover { padding-left(space(1)); padding(space(4)); display(\"flex\"); }\n",
     "\t};\n",
     "\tprint(a.class_list());\n",
     "\tprint(b.class_list());\n",
@@ -707,13 +702,13 @@ const E167_CONVERTED_BLOCK: &str = concat!(
     "\n",
     "fun main() {\n",
     "\tlet chain = const css {\n",
-    "\t\tpadding-left: {space(4)};\n",
-    "\t\tpadding-right: {space(4)};\n",
-    "\t\tcolor: {Color::gray(900)};\n",
-    "\t\tborder-radius: {Length::px(4)};\n",
-    "\t\toutline: none;\n",
+    "\t\tpadding-left(space(4));\n",
+    "\t\tpadding-right(space(4));\n",
+    "\t\tcolor(Color::gray(900));\n",
+    "\t\tborder-radius(Length::px(4));\n",
+    "\t\toutline(\"none\");\n",
     "\t\t.hover {\n",
-    "\t\t\tbackground-color: {Color::gray(100)};\n",
+    "\t\t\tbackground-color(Color::gray(100));\n",
     "\t\t}\n",
     "\t};\n",
     "\tprint(chain.class_list());\n",
@@ -805,12 +800,12 @@ const E172_CONVERTED_BLOCK: &str = concat!(
     "\n",
     "fun main() {\n",
     "\tlet chain = const css {\n",
-    "\t\tdisplay: {Display::Flex.value()};\n",
-    "\t\tflex-direction: {FlexDirection::Row.value()};\n",
-    "\t\tgap: {space(2)};\n",
-    "\t\talign-items: {AlignItems::Center.value()};\n",
-    "\t\tborder-radius: {Length::px(4)};\n",
-    "\t\tcolor: {Color::gray(900)};\n",
+    "\t\tdisplay(Display::Flex.value());\n",
+    "\t\tflex-direction(FlexDirection::Row.value());\n",
+    "\t\tgap(space(2));\n",
+    "\t\talign-items(AlignItems::Center.value());\n",
+    "\t\tborder-radius(Length::px(4));\n",
+    "\t\tcolor(Color::gray(900));\n",
     "\t};\n",
     "\tprint(chain.class_list());\n",
     "}\n",
