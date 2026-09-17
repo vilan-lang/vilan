@@ -22011,7 +22011,19 @@ impl<'src> Analyzer<'src> {
             .iter()
             .map(|(_, value_id)| *value_id)
             .collect();
+        // C16 (Order 37, R7): which parameter positions a callee KEEPS past the
+        // call. Computed only when some closure captures a view — for every
+        // other program the set below is asked nothing, so the fixpoint is not
+        // run at all and the check costs what it always cost.
+        let retaining = if capturing.is_empty() {
+            HashMap::default()
+        } else {
+            self.compute_retaining_positions()
+        };
         let mut escapes: Vec<Id> = Vec::new();
+        // C16's own list: the argument id and the callee that keeps it, which is
+        // the whole diagnosis and the reason this escape gets its own sentence.
+        let mut stored_escapes: Vec<(Id, String)> = Vec::new();
         for (expr_id, expr) in self.expr_id_to_expr_map.iter() {
             // S1: every escape this loop finds anchors inside the iterated
             // expression; the precomputes above stay whole-program.
@@ -22053,6 +22065,20 @@ impl<'src> Analyzer<'src> {
                                 .filter(|id| self.escapes_as_view(*id, &view_bindings, &capturing)),
                         );
                     }
+                }
+                // C16: the remainder the arm above names as safe. An ORDINARY
+                // callee only borrows its closure argument for the call — unless
+                // it KEEPS it, and then the closure (and the view it captured)
+                // outlives the frame whose local that view names. C13's pin is
+                // the exhibit: `make(v: &mut i32)` hands `|| *v` to `keep`,
+                // which stores it in the `Holder` it returns, so `outer` gets
+                // back a closure reading a view of its own dead local. Memory-
+                // safe on JS only because the host boxes the place and traces
+                // it; on the emit-Rust backend (F1) it is a freed slot.
+                Expr::Call(call_id) if !capturing.is_empty() => {
+                    stored_escapes.extend(
+                        self.stored_view_capturing_arguments(*call_id, &capturing, &retaining),
+                    );
                 }
                 _ => {}
             }
@@ -22127,6 +22153,216 @@ impl<'src> Analyzer<'src> {
                 msg: "a view cannot escape its scope: it may not be returned, stored in a field, placed in a collection, or carried in an enum payload. Return an owned value or a handle instead.".to_string(),
             }, expr_id);
         }
+        for (expr_id, callee) in stored_escapes {
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: **self.span_map.get(&expr_id).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "a view cannot escape its scope: this closure captures one, and `{callee}` \
+                         keeps what it is handed past the call, so the closure would outlive the \
+                         place its capture views. Read the value out with `*` before the closure, \
+                         or take the view as a closure parameter."
+                    ),
+                },
+                expr_id,
+            );
+        }
+    }
+
+    /// C16: the arguments of `call_id` that are view-capturing closures handed
+    /// to a parameter position the callee KEEPS — each paired with the callee's
+    /// name, which is what the refusal has to say to be actionable.
+    ///
+    /// A variant constructor is not asked here: the arm above already refuses
+    /// every escaping argument of one, and asking twice would report the same
+    /// closure under two sentences.
+    fn stored_view_capturing_arguments(
+        &self,
+        call_id: Id,
+        capturing: &HashSet<Id>,
+        retaining: &HashMap<Id, BTreeSet<u32>>,
+    ) -> Vec<(Id, String)> {
+        if self.call_is_variant_constructor(call_id) {
+            return Vec::new();
+        }
+        let Some(function_call) = self.function_calls.get(&call_id) else {
+            return Vec::new();
+        };
+        let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&function_call.subject_id)
+        else {
+            return Vec::new();
+        };
+        let Some(name) = self.callee_name(*callee_id) else {
+            return Vec::new();
+        };
+        let keeps = self.callee_retaining_positions(*callee_id, retaining);
+        function_call
+            .argument_ids
+            .iter()
+            .enumerate()
+            .filter(|(position, argument_id)| {
+                keeps.contains(&(*position as u32))
+                    && matches!(
+                        self.expr_id_to_expr_map.get(*argument_id),
+                        Some(Expr::Closure(closure_id)) | Some(Expr::Async(closure_id))
+                            if capturing.contains(closure_id)
+                    )
+            })
+            .map(|(_, argument_id)| (*argument_id, name.to_string()))
+            .collect()
+    }
+
+    /// The callee's own name, for the refusal's sentence — a declared function
+    /// or an `external` one; anything else (a closure-typed binding, a value
+    /// call) has no name to print and is answered by [`Self::callee_retaining_
+    /// positions`]'s conservative branch instead.
+    fn callee_name(&self, callee_id: Id) -> Option<&'src str> {
+        self.functions
+            .get(&callee_id)
+            .map(|function| function.name)
+            .or_else(|| {
+                self.external_functions
+                    .get(&callee_id)
+                    .map(|external| external.name)
+            })
+    }
+
+    /// Which of `callee_id`'s parameter positions keep what they are handed.
+    ///
+    /// A BODIED function answers from the summary. Anything else — an
+    /// `external` (the host may keep it; `retains` says so only for the
+    /// destruction rules, and a binding with no body says nothing at all) —
+    /// answers "every position", which is the safe direction: the only
+    /// arguments this decides are view-capturing closures, and there is no
+    /// sound reading under which handing one to a body nobody can read is fine.
+    fn callee_retaining_positions(
+        &self,
+        callee_id: Id,
+        retaining: &HashMap<Id, BTreeSet<u32>>,
+    ) -> BTreeSet<u32> {
+        if let Some(function) = self.functions.get(&callee_id)
+            && function.has_body
+        {
+            return retaining.get(&callee_id).cloned().unwrap_or_default();
+        }
+        let arity = self
+            .functions
+            .get(&callee_id)
+            .map(|function| function.parameters.len())
+            .or_else(|| {
+                self.external_functions
+                    .get(&callee_id)
+                    .map(|external| external.parameters.len())
+            })
+            .unwrap_or(0);
+        (0..arity as u32).collect()
+    }
+
+    /// C16's interprocedural summary: per function, the parameter positions
+    /// whose value is KEPT past the call — stored in a struct field, put in a
+    /// collection or an enum payload, assigned to a place, handed back as the
+    /// return value, or passed on to a callee that keeps it.
+    ///
+    /// The shape is `infer_bumps`'s (a monotone fixpoint over parameter
+    /// positions), and the walk is a GLOBAL sweep rather than a per-function
+    /// recursion: a parameter id is unique to its function, so an escaping
+    /// position anywhere in the program names the function it belongs to
+    /// without an expression-to-function map. The set only grows, so it
+    /// terminates.
+    ///
+    /// Deliberately an OVER-approximation at the edges (an assignment counts
+    /// whatever its target, a callee with no readable body keeps everything):
+    /// the only question it ever decides is whether a view-capturing closure
+    /// may be handed to a callee, and over-approximating there refuses a
+    /// program rather than miscompiling one.
+    fn compute_retaining_positions(&self) -> HashMap<Id, BTreeSet<u32>> {
+        let mut summaries: HashMap<Id, BTreeSet<u32>> = HashMap::default();
+        // Every return position of every bodied function — the tail and each
+        // value-carrying `ret`, the same set the seam walk above reads.
+        for (_, value_id) in self.return_sites.clone() {
+            self.note_retained_parameter(value_id, &mut summaries);
+        }
+        loop {
+            let mut grew = false;
+            for (call_id, expr) in self.expr_id_to_expr_map.iter() {
+                match expr {
+                    Expr::StructInitializer(_, fields) => {
+                        for value_id in fields.values() {
+                            grew |= self.note_retained_parameter(*value_id, &mut summaries);
+                        }
+                    }
+                    Expr::List(ids) | Expr::Tuple(ids) => {
+                        for value_id in ids {
+                            grew |= self.note_retained_parameter(*value_id, &mut summaries);
+                        }
+                    }
+                    Expr::FunctionReturn(Some(value_id)) => {
+                        grew |= self.note_retained_parameter(*value_id, &mut summaries);
+                    }
+                    Expr::Assignment(_, value_id) => {
+                        grew |= self.note_retained_parameter(*value_id, &mut summaries);
+                    }
+                    Expr::Call(call_expr_id) => {
+                        let Some(function_call) = self.function_calls.get(call_expr_id) else {
+                            continue;
+                        };
+                        let keeps = match self.expr_id_to_expr_map.get(&function_call.subject_id) {
+                            Some(Expr::Local(callee_id))
+                                if !self.call_is_variant_constructor(*call_expr_id) =>
+                            {
+                                self.callee_retaining_positions(*callee_id, &summaries)
+                            }
+                            // A variant constructor stores every argument in its
+                            // payload; an unresolvable subject is answered the
+                            // safe way, as above.
+                            _ => (0..function_call.argument_ids.len() as u32).collect(),
+                        };
+                        for (position, argument_id) in function_call.argument_ids.iter().enumerate()
+                        {
+                            if keeps.contains(&(position as u32)) {
+                                grew |= self.note_retained_parameter(*argument_id, &mut summaries);
+                            }
+                        }
+                    }
+                    _ => {
+                        let _ = call_id;
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        summaries
+    }
+
+    /// Records `value_id`'s place root as a retained parameter position, if it
+    /// is one. Answers whether the set grew, which is the fixpoint's condition.
+    fn note_retained_parameter(
+        &self,
+        value_id: Id,
+        summaries: &mut HashMap<Id, BTreeSet<u32>>,
+    ) -> bool {
+        let Some(root) = self.place_root(value_id) else {
+            return false;
+        };
+        let Some(parameter) = self.parameters.get(&root) else {
+            return false;
+        };
+        let function_id = parameter.function_id;
+        let Some(position) = self
+            .functions
+            .get(&function_id)
+            .and_then(|function| function.parameters.iter().position(|id| *id == root))
+        else {
+            return false;
+        };
+        summaries
+            .entry(function_id)
+            .or_default()
+            .insert(position as u32)
     }
 
     /// Whether an expression escapes a view when placed in a return / field /

@@ -7167,15 +7167,22 @@ fn reading_the_value_out_before_the_closure_is_the_fix_the_message_names() {
     );
 }
 
+// --- C16: the escape rule's remainder — a STORING callee (R7, Order 37) ------
+//
+// C13's shape, un-ignored. It printed 3 on this tree until C16: `make` captures
+// its `&mut` parameter, hands the closure to an ordinary function, and `keep`
+// stores it in a struct it returns — so `outer` hands back a closure reading a
+// view of its own dead local. Memory-safe only because JS boxes the place and
+// traces it; under the emit-Rust backend (F1) it is a freed slot, which is why
+// the refusal is that backend's precondition rather than a later tidy-up.
+//
+// The lever is a per-parameter summary of what a callee KEEPS past the call
+// (`compute_retaining_positions`), asked only of arguments that are
+// view-capturing closures — so `twice(|| *v)`, whose callee only calls what it
+// is handed, still compiles, and that control is pinned below.
+
 #[test]
-#[ignore = "C13: the escape rule does not follow a closure through an ordinary call (spec §6.9's honesty limit). Not C12's hole — the capture here is a view PARAMETER — and closing it needs the closure-escape analysis rule 4's dynamic remainder is future work for."]
 fn a_view_capturing_closure_may_not_leave_through_a_storing_callee() {
-    // Measured on this tree: prints 3. `make` captures its `&mut` parameter,
-    // hands the closure to an ordinary function, and `keep` stores it in a
-    // struct it returns — so `outer` hands back a closure reading a view of
-    // its own dead local. `check_view_escape` sees a closure in an ARGUMENT
-    // position, which it skips on purpose (an ordinary callee only borrows
-    // for the call), and never learns that this one is stored.
     assert_fails_with(
         r#"
         import std::io::print;
@@ -7189,6 +7196,101 @@ fn a_view_capturing_closure_may_not_leave_through_a_storing_callee() {
         fun main() { let h = outer(); print((h.f)()); }
         "#,
         "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn the_storing_callee_refusal_names_the_callee_that_keeps_the_closure() {
+    // The whole diagnosis is WHICH callee keeps it: the closure at the argument
+    // position is none of the four things the older sentence enumerates, so the
+    // storing shape gets its own sentence and names the body to look at.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        struct Holder { f: || i32 }
+        fun keep(g: || i32): Holder { Holder { f = g } }
+        fun make(v: &mut i32): Holder { keep(|| *v) }
+        fun outer(): Holder {
+            mut n = 3;
+            make(&mut n)
+        }
+        fun main() { let h = outer(); print((h.f)()); }
+        "#,
+        "`keep` keeps what it is handed past the call",
+    );
+}
+
+#[test]
+fn a_callee_that_only_calls_its_closure_argument_still_compiles() {
+    // The boundary the refusal must not cross, and the reason argument
+    // positions were skipped in the first place: an ordinary callee borrows the
+    // closure for the call, and the view it captured outlives the call by
+    // construction.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun twice(g: || i32): i32 { g() + g() }
+        fun read(v: &mut i32): i32 { twice(|| *v) }
+        fun main() { mut n = 3; print(read(&mut n)); }
+        "#,
+        "6\n",
+    );
+}
+
+#[test]
+fn the_storing_callee_refusal_follows_a_chain_of_callees() {
+    // The summary is a fixpoint, so a parameter handed on to a callee that
+    // keeps it is itself kept: `pass` names `keep`, and the refusal arrives at
+    // the call `make` actually wrote.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        struct Holder { f: || i32 }
+        fun keep(g: || i32): Holder { Holder { f = g } }
+        fun pass(g: || i32): Holder { keep(g) }
+        fun make(v: &mut i32): Holder { pass(|| *v) }
+        fun outer(): Holder { mut n = 3; make(&mut n) }
+        fun main() { let h = outer(); print((h.f)()); }
+        "#,
+        "`pass` keeps what it is handed past the call",
+    );
+}
+
+#[test]
+fn a_callee_that_puts_the_closure_in_a_collection_keeps_it() {
+    // A collection is a store like a field is: the list outlives the call.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        fun collect(g: || i32): List<|| i32> {
+            mut out: List<|| i32> = [];
+            out.push(g);
+            out
+        }
+        fun make(v: &mut i32): List<|| i32> { collect(|| *v) }
+        fun main() { mut n = 3; let fs = make(&mut n); print(fs.len()); }
+        "#,
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn a_closure_capturing_no_view_may_still_be_stored_by_a_callee() {
+    // The other boundary: §6.9 captures BINDINGS, and a binding holding a VALUE
+    // travels with the closure. Only a captured VIEW dangles, so only a
+    // captured view is refused.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Holder { f: || i32 }
+        fun keep(g: || i32): Holder { Holder { f = g } }
+        fun outer(): Holder {
+            mut n = 3;
+            keep(|| n)
+        }
+        fun main() { let h = outer(); print((h.f)()); }
+        "#,
+        "3\n",
     );
 }
 
