@@ -22,18 +22,27 @@ pub const DENO_CURRENT: u32 = 2;
 /// that builds for now.
 pub const BUN_CURRENT: u32 = 1;
 
-/// The emitter backend — the output language. JavaScript today; WASM later.
+/// The emitter backend — the output language. JavaScript and, since F1's slice
+/// S1a, Rust; WASM later.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Backend {
     #[default]
     Js,
+    /// The native backend (`proposal/native-apps.md`): the program is emitted as
+    /// a Rust source file, written into a cargo project, and built by the host's
+    /// `cargo`. A FIRST CUT — its scope is the paper's §5-S1 (structs, enums,
+    /// `Option`/`Result`, `str`, `List`, `Map`/`Set`, closures, `impl`s,
+    /// `print`, `panic`, the cell), and a program outside it is refused by name
+    /// rather than mis-emitted.
+    Rust,
 }
 
 impl Backend {
-    /// Parses a `--backend` value (`js`), or `None` if unrecognized.
+    /// Parses a `--backend` value (`js` / `rust`), or `None` if unrecognized.
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "js" => Some(Backend::Js),
+            "rust" => Some(Backend::Rust),
             _ => None,
         }
     }
@@ -42,6 +51,7 @@ impl Backend {
     pub fn name(self) -> &'static str {
         match self {
             Backend::Js => "js",
+            Backend::Rust => "rust",
         }
     }
 }

@@ -1058,6 +1058,7 @@ dependencies = [
  "sha2",
  "vilan-core",
  "vilan-embedded-std",
+ "vilan-rust",
  "windows-sys",
 ]
 
@@ -1095,6 +1096,17 @@ dependencies = [
  "vilan-embedded-std",
  "vilan-ide",
  "windows-sys",
+]
+
+[[package]]
+name = "vilan-rt"
+version = "0.40.0"
+
+[[package]]
+name = "vilan-rust"
+version = "0.40.0"
+dependencies = [
+ "vilan-core",
 ]
 
 [[package]]

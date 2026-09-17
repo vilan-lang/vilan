@@ -14,6 +14,7 @@ mod explain;
 mod hmr;
 mod init;
 mod job;
+mod native;
 mod paint;
 mod upgrade;
 mod watch_log;
@@ -70,7 +71,8 @@ enum Command {
         /// to it, else `node`. `--target` is an accepted alias.
         #[arg(long, alias = "target")]
         platform: Option<String>,
-        /// The emitter backend: `js` (the only backend today).
+        /// The emitter backend: `js` (the default) or `rust` (the native
+        /// backend; a debug build unless you build the cargo project yourself).
         #[arg(long)]
         backend: Option<String>,
         /// Also emit debug dumps beside the source, one per pipeline stage:
@@ -107,7 +109,8 @@ enum Command {
         /// to it, else `node`. `--target` is an accepted alias.
         #[arg(long, alias = "target")]
         platform: Option<String>,
-        /// The emitter backend: `js` (the only backend today).
+        /// The emitter backend: `js` (the default) or `rust` (the native
+        /// backend; a debug build unless you build the cargo project yourself).
         #[arg(long)]
         backend: Option<String>,
         /// Also emit debug dumps beside the source, one per pipeline stage:
@@ -143,6 +146,11 @@ enum Command {
         /// are not launched. Unnecessary for a single-node workspace.
         #[arg(long)]
         entry: Option<String>,
+        /// The emitter backend: `js` (the default, run with Node) or `rust`
+        /// (F1's native backend — the program is emitted as Rust, built with
+        /// `cargo` in DEBUG by default, and the binary is run).
+        #[arg(long)]
+        backend: Option<String>,
         /// Arguments passed through to the running program (after the file).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -294,7 +302,7 @@ fn run_cli() -> ExitCode {
                 "`--explain` reports what a build wrote, and `--stdout` writes nothing — \
                  it prints a bundle, not a build. Drop one of the two.",
             ),
-            Ok(_backend) => {
+            Ok(backend) => {
                 PRINT_CHUNKS.store(print_chunks, std::sync::atomic::Ordering::Relaxed);
                 if explain {
                     explain::ask();
@@ -309,6 +317,7 @@ fn run_cli() -> ExitCode {
                         file.clone(),
                         stdout,
                         platform.clone(),
+                        backend,
                         debug,
                         rerun_hooks,
                         watch_state.as_mut(),
@@ -340,13 +349,26 @@ fn run_cli() -> ExitCode {
             no_hmr,
             hmr_port,
             entry,
-        } => {
-            if watch {
-                run_watch(file, args, no_hmr, hmr_port, entry)
-            } else {
-                run_once(file, &args, entry.as_deref())
+            backend,
+        } => match effective_backend(backend.as_deref()) {
+            Err(message) => report_error::<ExitCode>(&message),
+            // `--watch` is the JS dev loop — HMR, a swapped bundle, a restarted
+            // node process. None of it exists natively yet (the round would be a
+            // full `cargo build`), so the combination is refused rather than
+            // silently taking the JS path.
+            Ok(Backend::Rust) if watch => report_error::<ExitCode>(concat!(
+                "`--backend rust` has no `--watch` yet: the native round is a full ",
+                "`cargo build`, and the dev loop's swap is the JS backend's. ",
+                "Re-run `vilan run --backend rust` after an edit."
+            )),
+            Ok(backend) => {
+                if watch {
+                    run_watch(file, args, no_hmr, hmr_port, entry)
+                } else {
+                    run_once(file, &args, entry.as_deref(), backend)
+                }
             }
-        }
+        },
         Command::Test { path, watch } => {
             let roots = watch.then(|| watch_roots(&path));
             run_or_watch(roots, move || test(path.clone()))
@@ -449,6 +471,7 @@ fn build_once(
     file: Option<PathBuf>,
     stdout: bool,
     platform: Option<String>,
+    backend: Backend,
     debug: bool,
     rerun_hooks: bool,
     // `Some` only under `--watch` (backlog M22): what the previous round
@@ -470,14 +493,23 @@ fn build_once(
                 ..
             } => match effective_platform(platform.as_deref(), package_platform) {
                 Ok(Platform::None) => no_host_platform(),
-                Ok(platform) => build_single(&unit, stdout, platform, debug),
+                Ok(platform) => build_single(&unit, stdout, platform, backend, debug),
                 Err(message) => report_error(&message),
             },
             // A workspace builds each member for its own declared platform, so the
             // `--platform` flag doesn't apply.
-            Project::Workspace { root, members, .. } => {
+            Project::Workspace { root, members, .. } if backend == Backend::Js => {
                 build_workspace(&root, &members, debug, watch_state)
             }
+            // …and `--backend rust` does not apply either: a workspace's legs
+            // are a browser bundle and a node server, and the native backend
+            // has neither. Refused rather than silently building the JS legs
+            // and calling it a native build.
+            Project::Workspace { .. } => report_error(concat!(
+                "`--backend rust` builds ONE entry, not a workspace: a workspace's legs are a ",
+                "browser bundle and a process server, and the native backend has neither yet. ",
+                "Point it at a `.vl` file."
+            )),
             Project::Library { name, .. } => not_buildable_library(&name),
         }
     })
@@ -623,7 +655,12 @@ fn check_once(file: Option<PathBuf>, platform: Option<String>, debug: bool) -> R
 /// Builds and runs the project once with Node, waiting for it to exit and
 /// propagating its code (the blocking, non-`--watch` path). `entry` picks the
 /// Node leg to run in a multi-node workspace (A15).
-fn run_once(file: Option<PathBuf>, args: &[String], entry: Option<&str>) -> ExitCode {
+fn run_once(
+    file: Option<PathBuf>,
+    args: &[String],
+    entry: Option<&str>,
+    backend: Backend,
+) -> ExitCode {
     with_project(file, |project| {
         // `--rerun-hooks` is a `vilan build` flag: `run` is the dev loop, where
         // the whole point of the staleness gate is that an expensive hook stops
@@ -634,8 +671,8 @@ fn run_once(file: Option<PathBuf>, args: &[String], entry: Option<&str>) -> Exit
         match project {
             Project::Single { unit, platform, .. } => {
                 let platform = platform.unwrap_or_default();
-                if matches!(platform, Platform::Node { .. }) {
-                    run_single(&unit, args)
+                if backend == Backend::Rust || matches!(platform, Platform::Node { .. }) {
+                    run_single(&unit, args, backend)
                 } else {
                     eprintln!(
                         "{} `vilan run` executes with Node, but the package platform is `{}`",
@@ -650,7 +687,15 @@ fn run_once(file: Option<PathBuf>, args: &[String], entry: Option<&str>) -> Exit
                 members,
                 default_entry,
                 ..
-            } => run_workspace(&root, &members, args, entry, &default_entry),
+            } if backend == Backend::Js => {
+                run_workspace(&root, &members, args, entry, &default_entry)
+            }
+            Project::Workspace { .. } => report_error::<RoundOutcome>(concat!(
+                "`--backend rust` runs ONE entry, not a workspace: a workspace's legs are a ",
+                "browser bundle and a process server, and the native backend has neither yet. ",
+                "Point it at a `.vl` file."
+            ))
+            .into(),
             Project::Library { name, .. } => not_buildable_library(&name).into(),
         }
     })
@@ -1463,6 +1508,7 @@ fn hmr_round(
         let compiled = match compile_unit(
             unit,
             *platform,
+            Backend::Js,
             CompileGoal::Emit,
             false,
             matches!(platform, Platform::Browser),
@@ -1817,6 +1863,7 @@ fn build_and_spawn_run(
             let compiled = compile_unit(
                 &unit,
                 Platform::default(),
+                Backend::Js,
                 CompileGoal::Emit,
                 false,
                 false,
@@ -1953,15 +2000,14 @@ fn effective_platform(flag: Option<&str>, package: Option<Platform>) -> Result<P
     }
 }
 
-/// Validates a `--backend` flag value (only `js` today). The returned [`Backend`]
-/// selects nothing yet — there's a single backend — so this exists to reject an
-/// unknown name (e.g. `wasm`, not yet implemented) at the CLI boundary rather than
-/// silently ignoring it.
+/// Validates a `--backend` flag value (`js` / `rust`) and answers which emitter
+/// runs. `rust` is F1's native backend (slice S1a): `build` writes a cargo
+/// project and builds it, `run` runs the binary it produced. An unknown name is
+/// rejected at the CLI boundary rather than silently ignored.
 fn effective_backend(flag: Option<&str>) -> Result<Backend, String> {
     match flag {
-        Some(name) => {
-            Backend::parse(name).ok_or_else(|| format!("unknown backend `{name}` (expected `js`)"))
-        }
+        Some(name) => Backend::parse(name)
+            .ok_or_else(|| format!("unknown backend `{name}` (expected `js` or `rust`)")),
         None => Ok(Backend::default()),
     }
 }
@@ -3952,6 +3998,10 @@ struct Compiled {
 fn compile_unit(
     unit: &Unit,
     platform: Platform,
+    // Which emitter runs (F1 S1a). Threaded rather than read from a global
+    // because it decides what the compile PRODUCES, and a workspace compiles
+    // several legs in one process.
+    backend: Backend,
     goal: CompileGoal,
     emit_debug: bool,
     hmr: bool,
@@ -4017,6 +4067,7 @@ fn compile_unit(
         &unit.entry,
         &unit.pkg_root,
         platform,
+        backend,
         goal,
         &options,
         &workspace,
@@ -4028,7 +4079,16 @@ fn compile_unit(
 
 /// Builds a lone package / bare file, writing `<entry>.mjs` on a process leg
 /// and `<entry>.js` on the browser (or printing to stdout).
-fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool) -> RoundOutcome {
+fn build_single(
+    unit: &Unit,
+    stdout: bool,
+    platform: Platform,
+    backend: Backend,
+    emit_debug: bool,
+) -> RoundOutcome {
+    if backend == Backend::Rust {
+        return native::build(unit, platform, emit_debug, stdout);
+    }
     let mut chunks = Vec::new();
     // A lone package writes `<entry>.<ext>` beside its source, so the entry file's
     // own stem is what its chunks are named after.
@@ -4040,6 +4100,7 @@ fn build_single(unit: &Unit, stdout: bool, platform: Platform, emit_debug: bool)
     let compiled = match compile_unit(
         unit,
         platform,
+        Backend::Js,
         CompileGoal::Emit,
         emit_debug,
         false,
@@ -4149,7 +4210,17 @@ fn check_single(
     let _round = RoundReports::arm();
     let mut ok = true;
     for platform in platforms {
-        ok &= compile_unit(unit, *platform, goal, emit_debug, false, None, None).is_ok();
+        ok &= compile_unit(
+            unit,
+            *platform,
+            Backend::Js,
+            goal,
+            emit_debug,
+            false,
+            None,
+            None,
+        )
+        .is_ok();
     }
     if !ok {
         return RoundOutcome::Failed;
@@ -4163,9 +4234,21 @@ fn check_single(
 }
 
 /// Builds and runs a lone package's entry with Node, forwarding `args`.
-fn run_single(unit: &Unit, args: &[String]) -> ExitCode {
+fn run_single(unit: &Unit, args: &[String], backend: Backend) -> ExitCode {
     let platform = Platform::default();
-    let compiled = match compile_unit(unit, platform, CompileGoal::Emit, false, false, None, None) {
+    if backend == Backend::Rust {
+        return native::run(unit, platform, args);
+    }
+    let compiled = match compile_unit(
+        unit,
+        platform,
+        Backend::Js,
+        CompileGoal::Emit,
+        false,
+        false,
+        None,
+        None,
+    ) {
         Ok(compiled) => compiled,
         Err(code) => return code,
     };
@@ -4801,7 +4884,16 @@ fn compile_leg(
     let mut chunks = Vec::new();
     let sink = (emission == Emission::AsDeclared).then_some((unit.name.as_str(), &mut chunks));
     capture_arm();
-    let compiled = compile_unit(unit, *platform, CompileGoal::Emit, debug, false, None, sink);
+    let compiled = compile_unit(
+        unit,
+        *platform,
+        Backend::Js,
+        CompileGoal::Emit,
+        debug,
+        false,
+        None,
+        sink,
+    );
     LegCompile {
         chunks,
         reports: capture_take(),
@@ -4931,7 +5023,17 @@ fn check_workspace(members: &[(Unit, Platform)], debug: bool) -> RoundOutcome {
         return RoundOutcome::Succeeded;
     };
     let check = |unit: &Unit, platform: Platform| {
-        compile_unit(unit, platform, CompileGoal::Check, debug, false, None, None).is_ok()
+        compile_unit(
+            unit,
+            platform,
+            Backend::Js,
+            CompileGoal::Check,
+            debug,
+            false,
+            None,
+            None,
+        )
+        .is_ok()
     };
 
     // The FIRST member runs alone, on this thread, writing its diagnostics
@@ -5255,6 +5357,7 @@ fn run_test(file: &Path) -> Result<(), String> {
         file,
         &pkg_root,
         Platform::default(),
+        Backend::Js,
         CompileGoal::Emit,
         &options,
         &workspace,
@@ -6184,6 +6287,11 @@ fn compile_to_js(
     file: &Path,
     pkg_root: &Path,
     platform: Platform,
+    // `Backend::Rust` swaps the emitter at the one seam below and changes
+    // nothing else: the same analysis, the same post-passes, the same
+    // diagnostics. `Compiled::javascript` then carries Rust source, which is
+    // what the field's comment says and what its two native callers read.
+    backend: Backend,
     goal: CompileGoal,
     options: &BuildOptions,
     workspace: &Workspace,
@@ -6544,6 +6652,13 @@ fn compile_to_js(
                 _ if !goal.emits_text() => {
                     vilan_core::diagnose(&program, options).map(|()| String::new())
                 }
+                _ if backend == Backend::Rust && split.is_some() => Err(vilan_core::error::Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: vilan_core::span::Span::new((), 0..0),
+                    msg: "`--backend rust` does not split: route chunks are a browser artifact"
+                        .to_string(),
+                }),
                 Some((leg, sink)) => {
                     vilan_core::transform_split(&program, options, leg).map(|split_program| {
                         // Splitting is not free, and below a few KB of
@@ -6562,6 +6677,16 @@ fn compile_to_js(
                         }
                         sink.extend(split_program.chunks);
                         split_program.main
+                    })
+                }
+                // F1 S1a: the ONE seam the native backend changes. Everything
+                // above — analysis, the post-passes, the diagnostics, the
+                // const channel — is the same compile; only the emitter that
+                // reads the finished `Program` differs.
+                None if backend == Backend::Rust => {
+                    vilan_rust::emit(&program, options).map(|emitted| {
+                        native::record_boxed_bindings(emitted.boxed_bindings);
+                        emitted.source
                     })
                 }
                 None => transform(&program, options),

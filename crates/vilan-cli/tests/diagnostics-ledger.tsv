@@ -522,3 +522,9 @@ row	flagship	key
 497	-	no `impl {subject}` this statement carries declares {named}: the selector admits nothing
 498	-	`{module}::{leaf}` is exported only into `{scope}`, and this file is outside it. Importing it anyway is allowed — mark the reach: `import {module}::{{ #{leaf} }};`
 499	-	`{module}::{leaf}` is exported only into `{scope}`, and this path reaches it from outside. The spelling that says so is a marked import: `import {module}::{{ #{leaf} }};`, and then `{leaf}` on its own
+500	-	a view cannot escape its scope: this closure captures one, and `{callee}` keeps what it is handed past the call
+501	-	the `rust` backend does not emit {what} yet
+502	-	`--backend rust` does not split: route chunks are a browser artifact
+503	-	`--backend rust` builds ONE entry, not a workspace: a workspace's legs are a
+504	-	`--backend rust` runs ONE entry, not a workspace: a workspace's legs are a
+505	-	`--backend rust` has no `--watch` yet: the native round is a full
