@@ -58,6 +58,11 @@
 //!    a message, are each an exemption subtracting a check for nothing — and
 //!    each stays green forever without this, because a list that only ever
 //!    subtracts work cannot red by being wrong.
+//! 8. **No rowed literal swallows a line continuation** (N94,
+//!    [`no_rowed_diagnostic_literal_swallows_a_line_continuation`]). A message
+//!    whose `\`-continuations were lost keeps the source indentation as a run
+//!    of spaces mid-sentence; three in a row is the threshold, over the
+//!    enumeration's messages and the index's keys.
 //!
 //! # What this file does NOT verify
 //!
@@ -1125,6 +1130,60 @@ fn every_diagnostic_the_compiler_builds_is_indexed() {
          by the criteria in the index header — or `-`:\n{}",
         unrowed.len(),
         unrowed.join("\n")
+    );
+}
+
+/// N94: no rowed diagnostic literal carries a SWALLOWED line continuation.
+///
+/// Rust's `\` + newline + indentation is stripped before the program ever
+/// sees it, which is how every long message in this tree is written: four
+/// lines in the file, one run in the binary. A literal that LOSES its
+/// backslashes — joined by a tool, reflowed by hand — keeps the indentation
+/// instead, and ships with a run of eighteen spaces in the middle of a
+/// sentence. Two did: `const_eval.rs`'s `asset::staged` refusal, which a user
+/// reads, and an `analyzer.rs` test assertion, which a maintainer reads. Both
+/// predate Order 36 and neither was noticed by anything, because a run of
+/// spaces breaks no test and renders as a gap only when the message is shown.
+///
+/// THREE is the threshold and it is not arbitrary: no message in this tree
+/// separates words by more than one space, the tightest swallow (a
+/// four-space indent minus nothing) is four, and two would fire on the
+/// double space after a full stop that a message could legitimately carry.
+///
+/// The reach is the ROWED surface — every message the enumeration in check
+/// (3) reads at its anchor, plus every key in the index, which is the half
+/// that would otherwise carry the run forward into the ledger's prose. It is
+/// deliberately not "every string literal in the compiler": the aligned
+/// tables in `formatter.rs` and `bindgen.rs`'s report columns are runs of
+/// spaces on purpose, and a gate that has to except them stops being a gate.
+/// What that leaves uncovered is named in the header.
+#[test]
+fn no_rowed_diagnostic_literal_swallows_a_line_continuation() {
+    /// A run this long is indentation. Nothing writes it on purpose.
+    const RUN: &str = "   ";
+
+    let mut swallowed = Vec::new();
+    for site in enumerated_sites() {
+        if site.message.contains(RUN) {
+            swallowed.push(format!(
+                "  {}:{}\n      {:?}",
+                site.file, site.line, site.message
+            ));
+        }
+    }
+    for row in index() {
+        if row.key.contains(RUN) {
+            swallowed.push(format!("  {INDEX} row {}\n      {:?}", row.number, row.key));
+        }
+    }
+    assert!(
+        swallowed.is_empty(),
+        "{} diagnostic literal(s) carry a run of three or more spaces, which is \
+         a line continuation whose `\\` was lost — the indentation is now part \
+         of the message. Restore the backslashes, or write the literal as \
+         concatenated lines:\n{}",
+        swallowed.len(),
+        swallowed.join("\n")
     );
 }
 

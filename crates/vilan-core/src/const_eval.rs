@@ -731,7 +731,11 @@ impl interpreter::AssetReader for ProjectReader {
         let live = self.live_tokens.borrow();
         let Some(live) = live.as_ref() else {
             return Err(
-                "`asset::staged` reads the registry AFTER evaluation has finished, and this                  build is still evaluating — until the last `const` expression has run, a                  token it stages may still be about to be named. Read it from a function                  passed to `asset::schedule_at_end`, which is where the build runs it."
+                "`asset::staged` reads the registry AFTER evaluation has finished, and \
+                 this build is still evaluating — until the last `const` expression has \
+                 run, a token it stages may still be about to be named. Read it from a \
+                 function passed to `asset::schedule_at_end`, which is where the build \
+                 runs it."
                     .to_string(),
             );
         };

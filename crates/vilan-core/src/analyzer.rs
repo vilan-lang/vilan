@@ -60113,7 +60113,8 @@ mod path_tests {
         let second = super::load_package_module(&path).expect("the memo serves the module");
         assert!(
             std::ptr::eq(first.text, second.text) && std::ptr::eq(first.ast, second.ast),
-            "the second load must come from the per-scope memo — the identical              allocation — not a second parse"
+            "the second load must come from the per-scope memo — the identical \
+             allocation — not a second parse"
         );
         assert_eq!(
             leak_tally::bytes(LeakSite::OwnedModuleText),
