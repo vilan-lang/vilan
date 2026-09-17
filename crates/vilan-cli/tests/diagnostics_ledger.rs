@@ -528,11 +528,6 @@ const CURATED_RULE_STATEMENTS: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/vilan-core/src/parsing.rs",
-        "HASH_IS_NOT_A_CSS_VALUE",
-        "`#` is not a colour here: in a `css` block a colour is a hole",
-    ),
-    (
-        "crates/vilan-core/src/parsing.rs",
         "MISBOUND_RETURN_CLAUSE",
         "a `context` clause after an UN-PARENTHESIZED closure return type binds to the",
     ),
