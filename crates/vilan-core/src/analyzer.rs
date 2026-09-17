@@ -59218,24 +59218,44 @@ fn refuse_imported_member_collisions(
     carried: &[(SourceId, Span, Vec<SourceId>)],
 ) {
     let mut violations: Vec<(Error, SourceId, Option<crate::error::Note>)> = Vec::new();
+    // M75: the three lookups below used to be LINEAR SCANS inside the
+    // collision x importer product, which made this O(collisions x files x
+    // statements): `carried` is one row per import STATEMENT in the whole
+    // program (std's included), `program.implementations` is one row per
+    // `impl` block in it, and both were re-walked four times per pair per
+    // file. Zero on the estate, because the whole function is gated on a
+    // banked collision — and the first real two-package collision in a large
+    // program paid all of it. Each is built ONCE here, in the iteration order
+    // the scan it replaces had, so FIRST-WINS stays first-wins.
+    let importers: Vec<SourceId> = program
+        .source_ranges
+        .iter()
+        .map(|range| range.source)
+        .collect();
+    // (importing file, block's file) -> the span of the FIRST statement in
+    // that file that carried it.
+    let mut carried_at: HashMap<(SourceId, SourceId), Span> = HashMap::default();
+    for (file, span, sources) in carried {
+        for source in sources {
+            carried_at.entry((*file, *source)).or_insert(*span);
+        }
+    }
+    // member id -> the index of the FIRST implementation declaring it.
+    let mut implementation_of_member: HashMap<Id, usize> = HashMap::default();
+    for (index, implementation) in program.implementations.iter().enumerate() {
+        for member_id in implementation.declarations.values() {
+            implementation_of_member.entry(*member_id).or_insert(index);
+        }
+    }
     for collision in collisions {
-        for importer in program
-            .source_ranges
-            .iter()
-            .map(|range| range.source)
-            .collect::<Vec<_>>()
-        {
+        for importer in importers.iter().copied() {
             // The statement that brought each block in. A file DECLARING one of
             // them needs no import for it: its own blocks are always its own.
             let statement_for = |source: SourceId| -> Option<Option<Span>> {
                 if source == importer {
                     return Some(None);
                 }
-                carried
-                    .iter()
-                    .filter(|(file, _, sources)| *file == importer && sources.contains(&source))
-                    .map(|(_, span, _)| Some(*span))
-                    .next()
+                carried_at.get(&(importer, source)).map(|span| Some(*span))
             };
             let (Some(first_at), Some(second_at)) = (
                 statement_for(collision.first_source),
@@ -59247,15 +59267,9 @@ fn refuse_imported_member_collisions(
             // its problem: the export gate and the file's own selectors are
             // asked exactly as a call would ask them.
             let admits = |member_id: Id| -> bool {
-                program
-                    .implementations
-                    .iter()
-                    .find(|implementation| {
-                        implementation
-                            .declarations
-                            .values()
-                            .any(|id| *id == member_id)
-                    })
+                implementation_of_member
+                    .get(&member_id)
+                    .and_then(|index| program.implementations.get(*index))
                     .is_some_and(|implementation| {
                         program
                             .impl_admission
