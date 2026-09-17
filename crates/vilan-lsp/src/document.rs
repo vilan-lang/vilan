@@ -9646,7 +9646,7 @@ pub(crate) mod tests {
             .expect("a chain reaching the sibling converts");
         assert_eq!(
             conversion.replacement,
-            "css {\n\t\tborder-radius: {Length::px(4)};\n\t\tword-spacing: {Length::px(2)};\n\t}",
+            "css {\n\t\tborder-radius(Length::px(4));\n\t\tword-spacing(Length::px(2));\n\t}",
             "the BUFFER's body, not the saved one"
         );
         vilan_core::analyzer::set_document_overlay(&sibling, None);
