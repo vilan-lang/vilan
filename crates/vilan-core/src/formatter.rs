@@ -11017,9 +11017,12 @@ mod element_layout {
 
     #[test]
     fn a_chain_link_holding_an_inline_element_stays_inline() {
+        // The keyed-run shape as it is written today: `each` is the free slot
+        // value and `child` places it at the parent's end (A99 retired the
+        // `bind_each` METHOD this pin used to spell).
         assert_construct(
-            "fun demo(): View {\n\t<ul .bind_each(items, |t| t.id, |t| <li>{t}</li>) />\n}\n",
-            "fun demo(): View {\n\t<ul .bind_each(items, |t| t.id, |t| <li>{t}</li>) />\n}\n",
+            "fun demo(): View {\n\t<ul .child(each(items, |t| t.id, |t| <li>{t}</li>)) />\n}\n",
+            "fun demo(): View {\n\t<ul .child(each(items, |t| t.id, |t| <li>{t}</li>)) />\n}\n",
         );
     }
 
@@ -11065,16 +11068,16 @@ mod element_layout {
         );
     }
 
-    /// A closure argument nested INSIDE an element head — the `bind_each` shape
+    /// A closure argument nested INSIDE an element head — the keyed-run shape
     /// the inline pin above uses, with a body that splits. The rule applies at
     /// that depth too, measured from the head-item line the closure sits on.
     #[test]
     fn a_closure_argument_element_inside_an_element_head_breaks_too() {
         assert_construct(
-            "fun demo(): View {\n\t<ul .bind_each(items, |t| t.id, |t| \
-             <li><b>{t}</b></li>) />\n}\n",
-            "fun demo(): View {\n\t<ul\n\t\t.bind_each(items, |t| t.id, |t|\n\
-             \t\t\t<li>\n\t\t\t\t<b>{t}</b>\n\t\t\t</li>)\n\t/>\n}\n",
+            "fun demo(): View {\n\t<ul .child(each(items, |t| t.id, |t| \
+             <li><b>{t}</b></li>)) />\n}\n",
+            "fun demo(): View {\n\t<ul\n\t\t.child(each(items, |t| t.id, |t|\n\
+             \t\t\t<li>\n\t\t\t\t<b>{t}</b>\n\t\t\t</li>))\n\t/>\n}\n",
         );
     }
 }

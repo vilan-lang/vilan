@@ -11,6 +11,12 @@
 //!
 //! Failures report `file — nearest heading` so a broken example is a one-jump
 //! fix.
+//!
+//! Two prose gates ride here too, for the same reason: a list a reader trusts,
+//! held to the compiler's own tables rather than to a lane's diligence. The
+//! reserved-word lists (N64, N87) are held to `lexing::KEYWORDS`, and std's doc
+//! comments are held to the names std still declares (N88) — in a library whose
+//! doc comment IS its documentation.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -524,4 +530,180 @@ mod extract_pins {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].source, "fun after() {}\n");
     }
+}
+
+/// Names the standard library retired, which its own prose may not go on
+/// spelling as if they were live (tracker N88).
+///
+/// A99 retired six `View` methods in favour of the free slot values, and A95 S2
+/// deleted the raw child-relation hatch. The DECLARATIONS went in those orders;
+/// the sentences about them did not, and std's doc comments went on teaching
+/// `bind_each` — sixteen lines across `reactive.vl` and `rpc.vl`, plus one in
+/// `math.vl` — in a library where the doc comment IS the documentation. A
+/// reader who writes what the comment says gets "`View` has no method
+/// `bind_each`", which is the failure the A99 steer exists to soften and which
+/// nothing should have been leading them into.
+///
+/// Whole identifiers only: `fence_child_relation` is a live helper in
+/// `style.vl` and is not this list's business. Comment text only, for the same
+/// reason a live identifier is not a retired one.
+const RETIRED_STD_NAMES: &[&str] = &[
+    "bind_each",
+    "bind_each_values",
+    "bind_each_by",
+    "child_relation",
+];
+
+/// The comment lines allowed to name one anyway — each a sentence whose
+/// SUBJECT is the retirement, which is the one thing that cannot be said
+/// without the old name. Keyed on a distinctive run of the line.
+const RETIREMENT_NOTES: &[(&str, &str)] = &[
+    (
+        "browser/ui.vl",
+        "one-line sugar over them — `when`, `swap`, `swap_split`, `bind_each`,",
+    ),
+    (
+        "browser/ui.vl",
+        "`bind_each_values`, `bind_each_by` — are retired",
+    ),
+    ("browser/ui.vl", "Named `each` and not `bind_each`"),
+    (
+        "browser/ui.vl",
+        "where `{bind_each(..)}` read as a setter that had escaped",
+    ),
+    (
+        "style.vl",
+        "all and pushed authors onto the deleted `child_relation` as a",
+    ),
+];
+
+#[test]
+fn no_std_comment_names_a_retired_method() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std/src");
+    let mut files = Vec::new();
+    collect_vl_files(&root, &mut files);
+    assert!(files.len() > 20, "the std walk found {} files", files.len());
+
+    let mut named = Vec::new();
+    for path in &files {
+        let relative = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        for (number, line) in text.lines().enumerate() {
+            let Some(comment) = comment_text(line) else {
+                continue;
+            };
+            if RETIREMENT_NOTES
+                .iter()
+                .any(|(file, run)| *file == relative && line.contains(run))
+            {
+                continue;
+            }
+            for retired in RETIRED_STD_NAMES {
+                if names_identifier(comment, retired) {
+                    named.push(format!(
+                        "  {relative}:{}\n      {retired}: {}",
+                        number + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        named.is_empty(),
+        "{} std comment line(s) name something std no longer declares. The doc \
+         comment IS the documentation here, so a reader who writes what it says \
+         gets a refusal. Write the live spelling (`each`, `each_values`, \
+         `each_by`, `attribute(..)`), or — if the sentence is ABOUT the \
+         retirement — record it in RETIREMENT_NOTES:\n{}",
+        named.len(),
+        named.join("\n")
+    );
+
+    // The inverse (N42's rule): a note excusing a line that no longer exists
+    // is an exemption bought for nothing, and it is how a list like this goes
+    // quietly out of date.
+    let stale: Vec<String> = RETIREMENT_NOTES
+        .iter()
+        .filter(|(file, run)| {
+            !files.iter().any(|path| {
+                path.to_string_lossy().replace('\\', "/").ends_with(file)
+                    && std::fs::read_to_string(path)
+                        .unwrap_or_default()
+                        .contains(*run)
+            })
+        })
+        .map(|(file, run)| format!("  {file}: {run:?}"))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "{} retirement note(s) name a line that is gone:\n{}",
+        stale.len(),
+        stale.join("\n")
+    );
+}
+
+/// Every `.vl` file under `directory`, recursively.
+fn collect_vl_files(directory: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let mut sorted: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    sorted.sort();
+    for path in sorted {
+        if path.is_dir() {
+            collect_vl_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("vl") {
+            out.push(path);
+        }
+    }
+}
+
+/// The comment half of a `.vl` line, or `None` when the line carries none.
+///
+/// A `//` inside a string literal is not a comment, and std writes plenty of
+/// them (urls, selectors); the scan tracks quotes so `"https://…"` is not read
+/// as one.
+fn comment_text(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if in_string => index += 1,
+            b'"' => in_string = !in_string,
+            b'/' if !in_string && bytes.get(index + 1) == Some(&b'/') => {
+                return Some(&line[index..]);
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Whether `text` names `identifier` as a WHOLE word — `fence_child_relation`
+/// does not name `child_relation`.
+fn names_identifier(text: &str, identifier: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = text[from..].find(identifier) {
+        let start = from + offset;
+        let end = start + identifier.len();
+        let before_ok = start == 0 || !is_identifier_byte(bytes[start - 1]);
+        let after_ok = end == bytes.len() || !is_identifier_byte(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }

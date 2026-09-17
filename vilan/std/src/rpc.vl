@@ -3250,7 +3250,7 @@ export struct RemoteSource<T> {
 /// The trait argument is `Option<T>` and not `T` because the mirror's value is
 /// the Option: `get` cannot invent a `T` before the first frame. So a
 /// `RemoteSource<List<Note>>` is a `Source<Option<List<Note>>>` and does NOT
-/// satisfy `bind_each`'s `Source<List<T>>` — the seam into a list binding is
+/// satisfy `each`'s `Source<List<T>>` — the seam into a list binding is
 /// still `or([])`, exactly as `guide/services.md` writes it. What the impl
 /// buys is everything that reads a source WITHOUT flattening it: `on_change`,
 /// `effect`, `effect_on_change`, and any generic consumer.
@@ -3303,7 +3303,7 @@ export impl RemoteSource<type T> with Source<Option<T>> {
 	}
 
 	/// Observe the mirror through `transform`, as a plain `SignalCell<U>` — the
-	/// one seam into the ordinary reactive world (`bind_each`, `bind_text`,
+	/// one seam into the ordinary reactive world (`each`, `bind_text`,
 	/// `{…}` embedding all take a `Signal`). COUNTED: this is a subscription —
 	/// it opens the channel if nothing else has, and the lease is released when
 	/// the enclosing owner is disposed, which for a view is unmount. So it
@@ -3430,7 +3430,7 @@ export impl RemoteSource<type T> {
 	/// mirror seeds, and deferring it would cost every first paint a turn. 0→1
 	/// with a close pending sends nothing and cancels the close: the channel is
 	/// still open server-side, so a dispose-and-rebuild inside one turn (a
-	/// `bind_each` row refreshing) churns no frames at all.
+	/// `each` row refreshing) churns no frames at all.
 	///
 	/// The third case is R3's (point 3): a DYNAMIC mirror whose channel the
 	/// server already withdrew. There is no id to re-`Subscribe` on, so the
@@ -3566,7 +3566,7 @@ export impl RemoteSource<type T> {
 	/// The deferred half of `release`, and R3's point 1: the turn's settle is
 	/// the FIRST look at whether the close is still owed, and one microtask hop
 	/// is the SECOND. A dispose in one turn and a mount in another — two event
-	/// handlers, a route change, a `bind_each` rebuilding rows across turns —
+	/// handlers, a route change, an `each` rebuilding rows across turns —
 	/// is one MACROTASK, and the hop is what makes that whole macrotask free:
 	/// the re-`acquire` clears `closing`, and the second look sends nothing.
 	///
@@ -3675,7 +3675,7 @@ export struct KeyedCursor {
 /// size of the collection.
 ///
 /// It is a `Source<List<T>>` as well, so the same cell drives a local
-/// `bind_each` with no ceremony — the value view and the op view are one
+/// `each` with no ceremony — the value view and the op view are one
 /// notification, which is what keeps them from ever disagreeing.
 ///
 /// **Where it lives.** Beside `KeyedSource` rather than in `std::reactive`,
@@ -3919,7 +3919,7 @@ export impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
 
 /// The cell IS a `Source<List<T>>` — the local half, with no `Option` in it:
 /// a cell always holds a collection, where a MIRROR may not have been told one
-/// yet. So `bind_each(cell, …)` takes it directly and the `or([])` that a
+/// yet. So `each(cell, …)` takes it directly and the `or([])` that a
 /// `KeyedSource` needs (R5) has nothing to say here.
 export impl KeyedCell<type K: Hashable, type T: Keyed<K>> with Source<List<T>> {
 	fun get(self): List<T> {
@@ -4021,7 +4021,7 @@ export struct KeyedSource<K, T> {
 /// The trait argument is `Option<List<T>>` and not `List<T>` for
 /// `RemoteSource`'s reason: `get` cannot invent a collection before the first
 /// patch, and a keyed mirror that has been told nothing is not an empty one.
-/// So a `KeyedSource<K, T>` does NOT satisfy `bind_each`'s `Source<List<T>>`
+/// So a `KeyedSource<K, T>` does NOT satisfy `each`'s `Source<List<T>>`
 /// and the seam into a list binding stays `or([])` — ruling R5, and the same
 /// sentence `RemoteSource`'s impl carries: `or([])` is the binding SAYING what
 /// an unseeded list renders as. What the impl buys is everything that reads a
@@ -4382,7 +4382,7 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 		}
 	}
 
-	/// Release one key's lease. The deferral is what makes a `bind_each` row
+	/// Release one key's lease. The deferral is what makes an `each` row
 	/// re-rendering inside one turn cost zero frames, per key.
 	fun release_key(self, lease: KeyLease) {
 		let after = lease.count.read() - 1;

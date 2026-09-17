@@ -137,7 +137,7 @@ impl Vec2 with Sub {
 /// Exact component equality — `f64` equality, with everything that implies: a
 /// vector arrived at by arithmetic is rarely `==` one written down. Compare a
 /// `distance` against a tolerance where that matters. It is here because a
-/// `Vec2` in a signal wants the dedupe (`swap`, `bind_each`, `set` on a
+/// `Vec2` in a signal wants the dedupe (`swap`, `each`, `set` on a
 /// `PartialEq` mirror all ask for it) and a hand-written impl is what a std
 /// struct can have — a derive would dispatch a macro at world-load.
 impl Vec2 with PartialEq {
