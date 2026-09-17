@@ -19582,6 +19582,33 @@ impl<'src> Analyzer<'src> {
     /// The substitution a trait's members are typed under when the trait is
     /// used at `arguments` (`Get<i32>` -> `{ Get::T: i32 }`). Empty when the
     /// trait takes no parameters, or when none were supplied.
+    /// B352: a TRAIT subject written WITH arguments (`Signal<Option<str>>::new`)
+    /// seeds this call's bindings from the trait's own parameters.
+    ///
+    /// A nominal subject (`Boxy<i32>::make`) reconciles against the matched
+    /// impl's subject and has always seeded; a trait has no impl to reconcile
+    /// against, so its arguments were INERT — `Signal<i32>::new("x")` compiled,
+    /// the `i32` reaching nothing, and `Signal<Option<str>>::new(None)` took
+    /// its `T` from the payload-less `None` instead, carrying a
+    /// `SignalCell<Option>` whose payload no bound could resolve against. kolt
+    /// spells that shape twice (channel.vl:135, :342) and annotates around it.
+    ///
+    /// The trait's parameters ARE the channel, zipped with what the path wrote
+    /// — the same list [`Self::trait_parameter_substitution`] zips for a
+    /// member reached through a bound.
+    fn seed_trait_static_subject_bindings(&mut self, id: Id, subject_type: &Type) {
+        let Type::Trait(trait_id, arguments) = subject_type else {
+            return;
+        };
+        if arguments.is_empty() {
+            return;
+        }
+        let bindings = self.trait_parameter_substitution(*trait_id, arguments);
+        if !bindings.is_empty() {
+            self.static_subject_bindings.insert(id, bindings);
+        }
+    }
+
     fn trait_parameter_substitution(
         &self,
         trait_id: Id,
@@ -31896,6 +31923,64 @@ impl<'src> Analyzer<'src> {
     /// `self_parameter_offset` is 1 for a method (whose first parameter is
     /// `self`, which no argument stands for) and 0 for a free function or a
     /// static — the ONE place the two call paths differ, so both can share this.
+    /// Record one inferred generic binding, keeping the BETTER of two answers
+    /// when the constraint already has one (B352).
+    ///
+    /// A binding carrying a HOLE — an `Unknown` or `Unresolved` anywhere in its
+    /// structure — is not evidence, and it must not displace one that has none.
+    /// `Box<Option<str>>::new(None)` is the exhibit: the path FIXED `T` at
+    /// `Option<str>`, then the argument `None` typed as `Option<unknown>`,
+    /// unified with it (a hole unifies with anything), and the unification was
+    /// written back — so the call's own substitution said `Box<Option>` and
+    /// every bound on the payload (`unwrap_or_default`'s `T: Default`) resolved
+    /// against nothing. kolt spells that shape `Signal<Option<str>>::new(None)`
+    /// and carries the `|x: Option<str>|` annotation that works around it.
+    ///
+    /// It is not "the explicit argument wins": a CONTRADICTING argument is
+    /// still refused by the reconcile that produced this binding, and a later
+    /// answer with no hole still replaces an earlier one. Only the strictly
+    /// less-resolved answer is declined.
+    fn record_generic_binding(
+        &self,
+        substitution: &mut SubstitutionContext,
+        constraint_id: TypeId,
+        type_id: TypeId,
+    ) {
+        if let Some(existing) = substitution.get(&constraint_id).copied()
+            && existing != type_id
+            && self.binding_is_weaker(type_id, existing)
+        {
+            return;
+        }
+        substitution.insert(constraint_id, type_id);
+    }
+
+    /// Whether `candidate` says strictly LESS about a generic than `held` does
+    /// — the test [`Self::record_generic_binding`] declines on.
+    ///
+    /// Two shapes, and both are "the same answer with something rubbed out":
+    /// a HOLE where the held binding has none (`Option<unknown>` against
+    /// `Option<str>`), and the same nominal head with its arguments ERASED.
+    /// The second is the one `None` produces: a payload-less variant types as
+    /// the bare enum, `Option` with an empty argument list, which carries no
+    /// hole to test for and unifies with every `Option<_>` there is.
+    ///
+    /// Anything else replaces: a different type is a contradiction the
+    /// reconcile that produced it has already judged, and a better-resolved
+    /// answer arriving late is the ordinary way a generic lands.
+    fn binding_is_weaker(&self, candidate: TypeId, held: TypeId) -> bool {
+        if self.type_has_hole(candidate) && !self.type_has_hole(held) {
+            return true;
+        }
+        match (candidate.get_type(self), held.get_type(self)) {
+            (Type::Enum(candidate_id, candidate_args), Type::Enum(held_id, held_args))
+            | (Type::Struct(candidate_id, candidate_args), Type::Struct(held_id, held_args)) => {
+                candidate_id == held_id && candidate_args.is_empty() && !held_args.is_empty()
+            }
+            _ => false,
+        }
+    }
+
     fn bind_callee_own_generics(
         &mut self,
         member_id: Id,
@@ -31983,7 +32068,7 @@ impl<'src> Analyzer<'src> {
             if let Some((_, bindings)) = reconciled {
                 for (constraint_id, type_id) in bindings {
                     if bindable.contains(&constraint_id) {
-                        substitution.insert(constraint_id, type_id);
+                        self.record_generic_binding(substitution, constraint_id, type_id);
                     }
                 }
             }
@@ -38595,7 +38680,11 @@ impl<'src> Analyzer<'src> {
                                 let bindable = self.callee_bindable_generics(target_id);
                                 for (constraint_id, type_id) in bindings {
                                     if bindable.contains(&constraint_id) {
-                                        substitution_context.insert(constraint_id, type_id);
+                                        self.record_generic_binding(
+                                            &mut substitution_context,
+                                            constraint_id,
+                                            type_id,
+                                        );
                                     }
                                 }
                             }
@@ -45059,6 +45148,7 @@ impl<'src> Analyzer<'src> {
                             // binders for the call this accessor subjects —
                             // reconciled impl-first so the bindings key on the
                             // impl's generics.
+                            self.seed_trait_static_subject_bindings(id, &subject_type);
                             let has_concrete_args = matches!(
                                 &subject_type,
                                 Type::Struct(_, args) | Type::Enum(_, args) if !args.is_empty()

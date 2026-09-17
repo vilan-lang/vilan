@@ -10628,3 +10628,71 @@ fn b351_the_annotated_binding_workaround_still_compiles() {
         "#
     ));
 }
+
+// --- B352/B353: the explicit type argument, and the unchecked closure body ---
+
+/// **B352 (2) — an explicit TYPE ARGUMENT survives an argument that knows
+/// less.** `Signal<Option<str>>::new(None)` is the spelling kolt's
+/// `create_new_channel_modal` uses (channel.vl:134). `None` types as
+/// `Option<unknown>`, which unifies with `Option<str>` and was then written
+/// back over the binding the path had already fixed — so the cell was a
+/// `SignalCell<Option>` with nothing in the payload, `unwrap_or_default`'s
+/// `Default` bound resolved against that hole, and emission reached
+/// `Default::default` with no body. The annotation `|x: Option<str>|` was the
+/// workaround; the mistake is one constructor above it.
+#[test]
+fn b352_an_explicit_type_argument_outlives_a_less_resolved_argument() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, mount_root, view };
+
+        fun main() {
+            let error_text = Signal<Option<str>>::new(None);
+            let _root = mount_root("app", || <div .show(error_text.map(|x| x.is_some()))>
+                {error_text.map(|x| x.unwrap_or_default())}
+            </div>);
+        }
+        "#,
+    );
+}
+
+/// The same mistake with no std in sight: a user container, a user static, and
+/// a payload-less variant for the argument. The refusal names the type the
+/// path wrote, which is the shortest statement that the explicit argument won.
+#[test]
+fn b352_an_explicit_type_argument_on_a_user_static_is_not_overwritten() {
+    assert_fails_with(
+        r#"
+        struct Box<T> { v: T }
+        impl Box<type T> {
+            fun new(v: T): Box<T> { Box { v = v } }
+        }
+        fun take(x: Box<i32>) { let _ = x; }
+        fun main() {
+            let b = Box<Option<str>>::new(None);
+            take(b);
+        }
+        "#,
+        "Expected Box<i32>, but got Box<Option<str>> instead.",
+    );
+}
+
+/// The CONTROL: an explicit type argument the argument CONTRADICTS is still a
+/// refusal, and the message still reads in the written argument's terms. The
+/// fix must keep the explicit binding, not stop checking against it.
+#[test]
+fn b352_an_explicit_type_argument_still_refuses_a_contradicting_argument() {
+    assert_fails_with(
+        r#"
+        struct Box<T> { v: T }
+        impl Box<type T> {
+            fun new(v: T): Box<T> { Box { v = v } }
+        }
+        fun main() {
+            let _b = Box<Option<str>>::new(Some(1));
+        }
+        "#,
+        "Expected Option<str>, but got Option<i32> instead.",
+    );
+}
