@@ -4594,6 +4594,19 @@ pub struct Analyzer<'src> {
     // exemption is what stops the compiler punishing them for not having done it
     // yet. Both go when the reach becomes an error at N+1.
     curated_modules: HashSet<Id>,
+    /// E188 — for every B318 §4 exposure warning, the PRIVATE TYPE it is about:
+    /// `(the warning's file, the warning's span, that type's declaration)`.
+    ///
+    /// `check_exposed_unexported_types` has the entity in hand when it writes
+    /// the message and then spells it as text; the editor's "Export `S`" fix
+    /// had to read the name back out of the sentence and re-resolve it against
+    /// the file's type references, which is exact only while one spelling means
+    /// one type. Two `S`es in one file — one local, one imported — and the fix
+    /// declined rather than guess. The answer travels instead.
+    ///
+    /// A Vec rather than a map: one entry per exposure warning in a program, a
+    /// handful at most, and the consumer asks once per code-action request.
+    exposed_private_types: Vec<(SourceId, Span, Id)>,
     // Every import leaf that RESOLVED, for the plain-reach warning (B318 §5).
     // Recorded by `resolve_import` and read once post-`build()`, rather than
     // decided at the import: the module a leaf reaches into may not have been
@@ -5874,6 +5887,7 @@ impl<'src> Analyzer<'src> {
             export_all_modules: HashSet::default(),
             export_scopes: HashMap::default(),
             curated_modules: HashSet::default(),
+            exposed_private_types: Vec::new(),
             import_reaches: Vec::new(),
             reach_marked_spans: HashSet::default(),
         }
@@ -41460,6 +41474,12 @@ impl<'src> Analyzer<'src> {
                      export it."
                 ));
             }
+            // E188: the entity the sentence names, recorded beside the
+            // sentence. The warning is spanned at the exported ITEM's own name
+            // and there is one per declaration, so `(source, span)` identifies
+            // it — and the fix reads a definition rather than a spelling.
+            self.exposed_private_types
+                .push((source, span, exposed_entity));
             self.warnings.push(Error {
                 trace: Vec::new(),
                 note: None,
@@ -49706,6 +49726,15 @@ pub struct Program<'src> {
     /// its module's scope is absent here, which is `Analyzer::is_exported_in`
     /// exactly — a module that has curated nothing offers everything.
     pub curated_modules: HashSet<Id>,
+    /// E188 — for every B318 §4 exposure warning, the PRIVATE TYPE it is about:
+    /// `(the warning's file, the warning's span, that type's declaration)`.
+    ///
+    /// Here so the editor's "Export `S`" fix reads a definition rather than
+    /// re-resolving the name out of the message text. The warning is spanned at
+    /// the exported ITEM's own name and there is exactly one per declaration,
+    /// so the pair is a key; the walk that wrote the sentence had the entity,
+    /// and this is that answer travelling instead of being reconstructed.
+    pub exposed_private_types: Vec<(SourceId, Span, Id)>,
     /// Every generic parameter's bound list, by constraint type id — a
     /// multi-bound's entries, where a single bound is the constraint id
     /// itself. Carried out of the analyzer because the specificity order
@@ -50830,7 +50859,15 @@ pub(crate) fn document_overlay_paths() -> Vec<PathBuf> {
     overlay.keys().cloned().collect()
 }
 
-pub(crate) fn document_overlay_get(path: &Path) -> Option<String> {
+/// The open buffer registered for `path`, or `None` when the editor has none.
+///
+/// Public for the same reason [`document_overlay_contains`] is (E187): a
+/// front-end that reads a DECLARING file to edit it — a cross-file quick fix,
+/// the css converter's sibling `impl Style` bodies — must read the buffer the
+/// user is looking at rather than the last thing saved, and the overlay the
+/// server already maintains is that buffer. Inside the compiler the module
+/// loader reaches it through `resolve_module_file`; outside, this is the door.
+pub fn document_overlay_get(path: &Path) -> Option<String> {
     let overlay = DOCUMENT_OVERLAY.get()?;
     let overlay = overlay
         .lock()
@@ -58985,11 +59022,13 @@ fn analyze_over_world<'src>(
         )
         .collect();
     let curated_modules = analyzer.curated_modules.clone();
+    let exposed_private_types = std::mem::take(&mut analyzer.exposed_private_types);
 
     Some(Program {
         hidden_impls,
         exported_entities,
         curated_modules,
+        exposed_private_types,
         platform,
         closures: analyzer.closures,
         diagnostics: analyzer.diagnostics,

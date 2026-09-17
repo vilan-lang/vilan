@@ -16,7 +16,13 @@
 
 pub mod analysis;
 pub mod completion;
+pub mod html_attributes;
 pub mod line_index;
+
+/// E69's gate: the generated table above, re-rendered from its vendored TSV
+/// and diffed. Test-only — nothing ships it.
+#[cfg(test)]
+mod html_attributes_sync;
 
 pub use analysis::{Analysis, entity_spans, signature_label, source_call_subject, span_of};
 pub use completion::{

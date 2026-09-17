@@ -705,6 +705,51 @@ fn member_completion_answers_from_the_retained_analysis() {
     );
 }
 
+/// E160/E193: a struct initializer's FIELD position reaches the playground —
+/// the remaining fields, the shorthand where a local of that name is in scope,
+/// and not one binding from the enclosing scope.
+#[test]
+fn struct_initializer_completion_offers_the_remaining_fields() {
+    let compiled = "struct Point {\n\tx: i32,\n\ty: i32,\n}\n\nfun main() {\n\tlet x = 1;\n\tlet p = Point { };\n}\n";
+    let live = "struct Point {\n\tx: i32,\n\ty: i32,\n}\n\nfun main() {\n\tlet x = 1;\n\tlet p = Point { \n}\n";
+    let items = complete_after(compiled, live, 7, 17);
+    let offered = labels(&items);
+    assert_eq!(offered, vec!["x", "y"], "the fields and nothing else");
+    // `x` is a local too, so the shorthand is the insertion; `y` is not.
+    assert_eq!(named(&items, "x").insert, "x", "the shorthand");
+    assert_eq!(named(&items, "y").insert, "y = ");
+    assert_eq!(named(&items, "y").kind, "field");
+}
+
+/// E69: the element head's attribute vocabulary reaches the playground
+/// unchanged — the table is a `vilan-ide` const, so the crate that builds for
+/// `wasm32-unknown-unknown` carries it with no protocol and no filesystem.
+#[test]
+fn element_head_completion_offers_the_attribute_table() {
+    let compiled =
+        "import std::ui::view;\n\nfun main() {\n\tlet card = <input/>;\n\tlet _ = card;\n}\n";
+    let live =
+        "import std::ui::view;\n\nfun main() {\n\tlet card = <input />;\n\tlet _ = card;\n}\n";
+    let items = complete_after(compiled, live, 3, 19);
+    let offered = labels(&items);
+    for expected in ["type", "disabled", "value", "class", "id"] {
+        assert!(
+            offered.contains(&expected),
+            "`{expected}` missing from the playground's head popup: {offered:?}"
+        );
+    }
+    assert!(
+        offered.contains(&"on:click"),
+        "the event names too: {offered:?}"
+    );
+    // The call shape an attribute inserts is the front-end's own mapping of
+    // `call_parameters`, not a second rule for the playground.
+    let attribute = named(&items, "type");
+    assert_eq!(attribute.kind, "field");
+    assert_eq!(attribute.insert, "type(${1:value})$0");
+    assert!(attribute.is_snippet);
+}
+
 /// Import-path completion with no filesystem: `import std::` enumerates the
 /// embedded toolchain's modules out of the document overlay (the
 /// `modules_in_root` overlay listing, pinned in core), plus the names std's
