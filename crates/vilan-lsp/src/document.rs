@@ -9527,6 +9527,77 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // E184: the auto-import table is the FOURTH consumer of B318 §1's
+    // visibility bit — the one E178 left behind, because its other route parses
+    // every module's file once per keystroke (four `overlay_module_reclaim`
+    // pins went red on it). visibility-36 put the walk's own answer on
+    // `Program` for exactly this; the filter reads two sets that are already in
+    // hand and parses nothing.
+    #[test]
+    fn a_curated_modules_private_item_is_not_an_auto_import_candidate() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::greet;\n\nfun main() {\n\tgreet();\n\t\n}\n",
+            ),
+            (
+                "helper.vl",
+                "export fun greet() {}\n\nexport fun farewell() {}\n\nfun machinery() {}\n",
+            ),
+        ]);
+        let marker = "greet();\n\t";
+        let text = document.line_index.text();
+        let offset = text.find(marker).unwrap() + marker.len();
+        let labels: Vec<String> = document
+            .completion(offset)
+            .into_iter()
+            .filter(|candidate| candidate.needs_import.is_some())
+            .map(|candidate| candidate.label)
+            .collect();
+        assert!(
+            labels.contains(&"farewell".to_string()),
+            "an EXPORTED sibling is still offered: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"machinery".to_string()),
+            "a curated module's private item is not an add-import target: {labels:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // …and the exemption that carries the estate: a module carrying no marker
+    // anywhere offers everything it declares, exactly as it did before the bit
+    // existed (visibility.md §14).
+    #[test]
+    fn an_uncurated_modules_item_is_still_an_auto_import_candidate() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::helper::greet;\n\nfun main() {\n\tgreet();\n\t\n}\n",
+            ),
+            (
+                "helper.vl",
+                "fun greet() {}\n\nfun farewell() {}\n\nfun machinery() {}\n",
+            ),
+        ]);
+        let marker = "greet();\n\t";
+        let text = document.line_index.text();
+        let offset = text.find(marker).unwrap() + marker.len();
+        let labels: Vec<String> = document
+            .completion(offset)
+            .into_iter()
+            .filter(|candidate| candidate.needs_import.is_some())
+            .map(|candidate| candidate.label)
+            .collect();
+        for name in ["farewell", "machinery"] {
+            assert!(
+                labels.contains(&name.to_string()),
+                "an uncurated module offers `{name}`: {labels:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // A name already offered from SCOPE is never duplicated as an auto-import
     // candidate — the in-scope one is the only match on the menu. (Same
     // natural-name reasoning as above — E59.)

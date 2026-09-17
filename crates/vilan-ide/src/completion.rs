@@ -3986,22 +3986,28 @@ impl AutoImportOrder {
                     continue;
                 };
                 let child_source = source_of.of(child_id);
-                // E178, NOT filtered here, and the reason is worth writing down
-                // where the next reader of this loop will look for it. The bit
-                // lives on `Importable`, which is a syntactic read of a module's
-                // FILE (`module_importables`), and this table is built once per
-                // ANALYSIS, on the analysis thread but OUTSIDE the scope that
-                // owns overlay loads (`document.rs` builds the index after the
-                // analysis returns). Reading every std and pkg module here
-                // therefore parses each one into the process-global,
-                // content-keyed parse cache — and for a module the user has
-                // open, that is a fresh entry per keystroke, which is exactly
-                // §7.5's session leak M9 closed. Measured: four
-                // `overlay_module_reclaim` pins go red (`ParseCleanCacheText`
-                // grew 36 and 272 bytes). The filter the other three consumers
-                // apply needs the analyzer's own `exported_entities` /
-                // `curated_modules` on `Program` to be applied here; that is a
-                // `vilan-core` surface and is filed.
+                // E184 — the FOURTH consumer of B318 §1's visibility bit, and
+                // the one E178 had to leave behind. The bit's other route is
+                // `module_importables`, a syntactic read of a module's FILE,
+                // and this table is built once per ANALYSIS, on the analysis
+                // thread but OUTSIDE the scope that owns overlay loads
+                // (`document.rs` builds the index after the analysis returns).
+                // Asking it here parsed every std and pkg module into the
+                // process-global, content-keyed parse cache — for a module the
+                // user has OPEN, a fresh entry per keystroke, which is exactly
+                // §7.5's session leak M9 closed, and four
+                // `overlay_module_reclaim` pins caught it immediately
+                // (`ParseCleanCacheText` grew 36 and 272 bytes).
+                //
+                // So the answer does not come from the file: visibility-36 put
+                // it on `Program` for this consumer, computed by the walk that
+                // already had it. The predicate below IS
+                // `Analyzer::is_exported_in` — held equal to
+                // `module_importables`' own answer by
+                // `module_resolution.rs::e178_the_program_visibility_fields_
+                // agree_with_module_importables` — and it reads two sets that
+                // are in hand, so the keystroke path parses nothing at all.
+                let curated = program.curated_modules.contains(&child_module.body.1);
                 let module = modules.len() as u32;
                 modules.push(AutoImportModule {
                     path: vec![root.to_string(), child_module.name.to_string()],
@@ -4010,6 +4016,14 @@ impl AutoImportOrder {
                     // Only a name this module DECLARES is an add-import target;
                     // a re-export names an item that lives somewhere else.
                     if source_of.of(entity_id) != child_source {
+                        continue;
+                    }
+                    // E184, under the UNCURATED-MODULE EXEMPTION that carries
+                    // the whole estate (visibility.md §14): a module with no
+                    // `export` marker anywhere offers everything it declares,
+                    // exactly as it did before the bit existed, so no package
+                    // that has not curated loses a candidate.
+                    if curated && !program.exported_entities.contains(&entity_id) {
                         continue;
                     }
                     let kind = kind_of(program, entity_id);
