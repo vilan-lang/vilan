@@ -7891,15 +7891,14 @@ mod idempotency {
         // `reactive_vl` is here precisely to catch a dropped `[must_use]`
         // tripping the safety net into a silent no-op, and it was tripped.
         //
-        // So assert non-bail first, the way `assert_construct` does: appending
-        // blank lines is pure trivia, and a formatter that actually ran
-        // canonicalizes it away, while a bail returns it verbatim.
-        let once = format(source);
-        assert_eq!(
-            format(&format!("{source}\n\n")),
-            once,
-            "formatter silently BAILED on {name} — its fixed-point pin proves nothing"
-        );
+        // So assert non-bail first — and since N90 that is a question with an
+        // answer rather than an inference: `reprint` says which way out it
+        // took, and names the construct when the printer had no rule for one.
+        // (The old detector appended blank lines and compared, which was sound
+        // and could not say WHAT it met.)
+        let once = super::reprint(source).unwrap_or_else(|declined| {
+            panic!("formatter DECLINED {name}: {}", declined.sentence())
+        });
         let twice = format(&once);
         assert_eq!(once, twice, "formatting {name} is not a fixed point");
     }
@@ -7919,6 +7918,13 @@ mod idempotency {
     // enums with payloads, matches, closures, and `[extern]` bindings —
     // `reactive.vl` also exercises `[must_use]` (which the formatter once
     // dropped, tripping its safety check into a silent no-op).
+    //
+    // The last three are std's MACRO-DECLARING modules (tracker N91): `hash.vl`
+    // (1 `export macro fun`), `json.vl` (6) and `rpc.vl` (8) — fifteen after
+    // the curation, and every one of them through the `Node::MacroFun` arm and
+    // the `export` wrapper above it. The item was filed against a printer that
+    // bailed on all three; this is the pin the item asked for, and with
+    // `assert_fixed_point` reading `reprint` it can no longer pass by bailing.
     fixed_point_tests! {
         null_vl => "null.vl",
         boolean_vl => "boolean.vl",
@@ -7932,6 +7938,9 @@ mod idempotency {
         shared_vl => "shared.vl",
         display_vl => "display.vl",
         reactive_vl => "reactive.vl",
+        hash_vl => "hash.vl",
+        json_vl => "json.vl",
+        rpc_vl => "rpc.vl",
     }
 
     /// The bitwise/shift operators and hex literals print back exactly —
@@ -8467,6 +8476,30 @@ mod bailing_constructs {
             "macro fun make(): Source { source(\"\") }\n",
             "macro fun make(): Source {\n\tsource(\"\")\n}\n",
         );
+    }
+
+    // The EXPORTED spelling (tracker N91). Fifteen of std's macros carry it
+    // after S6's curation — `hash.vl`'s one, `json.vl`'s six, `rpc.vl`'s eight —
+    // and the wrapper is its own node: `export`'s arm prints the marker and
+    // recurses, and `needs_semicolon` has to look THROUGH it to find the
+    // `MacroFun` that takes none. `export let x = 1;` is the same rule seen
+    // from the other side, and getting it wrong there printed a statement with
+    // no terminator, which did not re-parse, which bailed the whole file
+    // silently.
+    #[test]
+    fn exported_macro_fun_definition() {
+        assert_construct(
+            "export macro fun make(): Source { source(\"\") }\n",
+            "export macro fun make(): Source {\n\tsource(\"\")\n}\n",
+        );
+    }
+
+    // A macro declared with an `Item` parameter, which is the derive shape all
+    // fifteen of std's exported macros are written in.
+    #[test]
+    fn exported_macro_fun_taking_an_item() {
+        let canonical = "export macro fun Marker(item: Item): Source {\n\tsource(\"\")\n}\n";
+        assert_construct(canonical, canonical);
     }
 
     // A `macro { .. }` block in item position: its body is a statement block and
