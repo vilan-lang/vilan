@@ -33958,12 +33958,34 @@ impl<'src> Analyzer<'src> {
                             // (`|T| U`) types the closure parameter with the
                             // concrete receiver binding (`T = Point`) rather
                             // than the abstract `T`.
-                            let resolved = match expected_type_id.get_type(self) {
+                            //
+                            // STRUCTURALLY, not only when the expected type is
+                            // a BARE `Type::Generic` (B347). `each_by`'s render
+                            // parameter is `|SignalCell<T>| C` — the generic is
+                            // one constructor deep — so the bare-generic arm
+                            // did not reach it and the slot froze at the
+                            // abstract `SignalCell<T>`: `h.get().title` was
+                            // then "cannot access field 'title' on type T",
+                            // with the annotation `|h: SignalCell<Handle>|` the
+                            // only way out. The retired `View::bind_each_by`
+                            // METHOD bound `T` through the receiver path, which
+                            // is why A99's rewrite to the free call was not
+                            // type-preserving for this one signature.
+                            //
+                            // A substitution that binds nothing leaves the type
+                            // as written, which is what the old arm's
+                            // `unwrap_or(expected_type_id)` did for its own
+                            // case, so a call whose generics have not landed
+                            // yet is unchanged.
+                            let expected_type = expected_type_id.get_type(self);
+                            let resolved = match &expected_type {
                                 Type::Generic(constraint_id) => substitution_context
-                                    .get(&constraint_id)
+                                    .get(constraint_id)
                                     .copied()
                                     .unwrap_or(expected_type_id),
-                                _ => expected_type_id,
+                                _ => self
+                                    .substitute_type(&expected_type, substitution_context)
+                                    .get_type_id(self),
                             };
                             if let Some(parameter) = self.parameters.get_mut(parameter_id) {
                                 parameter.type_id = resolved;

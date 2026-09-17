@@ -10346,3 +10346,105 @@ fn b286_a_caller_whose_parameter_carries_no_such_bound_is_still_refused() {
         "cannot infer 'T' for this call",
     );
 }
+
+// --- B347/B351/B352/B353: the VALUE forms' closure typing -------------------
+//
+// A99 retired the six `View` parent methods, and the free calls that replaced
+// them do not bind their generics through a receiver. Four filings came out of
+// that one change, and they are three different seams:
+//
+//   * B347 — the bidirectional fill resolved the expected parameter type
+//     through the call's substitution only when it was a BARE `Type::Generic`,
+//     so `each_by`'s `|SignalCell<T>| C` froze at the abstract `SignalCell<T>`.
+//   * B352 (2) — an explicit type ARGUMENT (`SignalCell<Option<str>>::new`) was
+//     overwritten by a later argument-side reconcile that knew less.
+//   * B353 — a method call INSIDE an unannotated closure body was checked
+//     while the parameter's one-shot slot was still `Unknown`, so the check
+//     passed vacuously and never ran again. That one was UNSOUND.
+//
+// Every program here is std-only and every closure parameter is written
+// UNANNOTATED, because the annotation is exactly what each filing had to add.
+
+/// The fixture the `each_by` pins run on: a keyed row type with a field the
+/// render closure reads through the row's own cell.
+const A_KEYED_ROW: &str = r#"
+        [derive(PartialEq)]
+        struct Handle { id: i32, title: str }
+"#;
+
+/// **B347 — `each_by`'s `T` reaches an UNANNOTATED render closure.**
+///
+/// The retired `View::bind_each_by` METHOD bound `T` through the receiver path;
+/// the free call does not, and the render parameter is `SignalCell<T>` — one
+/// constructor deep, which is what the bare-`Type::Generic` arm of the
+/// bidirectional fill could not see. `h` froze at `SignalCell<T>` and every use
+/// of the row was "cannot access field 'title' on type T".
+#[test]
+fn b347_each_by_types_an_unannotated_render_closure_from_its_source() {
+    assert_compiles_browser(&format!(
+        r#"
+        import std::reactive::{{ Signal, SignalCell }};
+        import std::ui::{{ View, each_by, mount_root, view }};
+        {A_KEYED_ROW}
+        fun main() {{
+            let handles = Signal::new([Handle {{ id = 1, title = "one" }}]);
+            let _root = mount_root("app", || view("nav")
+                .child(each_by(handles, |h| h.id, |h| view("li")
+                    .bind_text(h.map(|c| c.title)))));
+        }}
+        "#
+    ));
+}
+
+/// B347's other reader of the same row: the cell read DIRECTLY, with no inner
+/// `map` to carry the blame. `h.get().title` is the shortest statement that the
+/// parameter is a `SignalCell<Handle>` and not a `SignalCell<T>`.
+#[test]
+fn b347_the_each_by_row_cell_reads_its_own_field() {
+    assert_compiles_browser(&format!(
+        r#"
+        import std::reactive::{{ Signal, SignalCell }};
+        import std::ui::{{ View, each_by, mount_root, view }};
+        {A_KEYED_ROW}
+        fun main() {{
+            let handles = Signal::new([Handle {{ id = 1, title = "one" }}]);
+            let _root = mount_root("app", || view("nav")
+                .child(each_by(handles, |h| h.id, |h| view("li").text(h.get().title))));
+        }}
+        "#
+    ));
+}
+
+/// B347's second half, and the reason the filing called the cascade spurious:
+/// a render closure that is genuinely wrong reports ONCE, at the field, with no
+/// `owner_scope … can be reached without an enclosing run` behind it. The
+/// cascade was the frozen parameter's shadow — an unresolved row type left the
+/// chain's `Slot` unselected and every sibling link inherited the complaint —
+/// so the only honest way to hold it is to write a real mistake and count.
+#[test]
+fn b347_a_wrong_render_body_reports_once_with_no_owner_scope_cascade() {
+    let errors = compile_browser(&format!(
+        r#"
+        import std::reactive::{{ Signal, SignalCell }};
+        import std::ui::{{ View, each_by, mount_root, view }};
+        {A_KEYED_ROW}
+        fun main() {{
+            let handles = Signal::new([Handle {{ id = 1, title = "one" }}]);
+            let _root = mount_root("app", || view("nav")
+                .child(view("h1").text("header"))
+                .child(each_by(handles, |h| h.id, |h| view("li").text(h.get().missing)))
+                .child(view("footer").text("footer")));
+        }}
+        "#
+    ))
+    .expect_err("a field the row does not have is still a mistake");
+    assert_eq!(errors.len(), 1, "one mistake, one diagnostic: {errors:#?}");
+    assert!(
+        errors[0].contains("missing"),
+        "the one diagnostic names the field: {errors:#?}"
+    );
+    assert!(
+        !errors.iter().any(|error| error.contains("owner_scope")),
+        "no `owner_scope` cascade behind it: {errors:#?}"
+    );
+}

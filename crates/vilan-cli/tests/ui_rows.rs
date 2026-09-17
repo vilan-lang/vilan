@@ -124,7 +124,7 @@ fun main() {
 				print(i"values renders {name}");
 				view("li").text(name)
 			})))
-			.child(view("nav").child(each_by(handles, |handle: Handle| handle.id, |handle: SignalCell<Handle>| {
+			.child(view("nav").child(each_by(handles, |handle| handle.id, |handle| {
 				print(i"by renders {handle.get().id}");
 				view("li").bind_text(handle.map(|current| current.title))
 			})))
@@ -216,7 +216,7 @@ fun main() {
 		Handle { id = 1, title = "one", act = || "act" },
 	]);
 	let _root = mount_root("app", || {
-		view("ul").child(each_by(handles, |handle: Handle| handle.id, |handle: SignalCell<Handle>| {
+		view("ul").child(each_by(handles, |handle| handle.id, |handle| {
 			view("li").bind_text(handle.map(|current| current.title))
 		}))
 	});
@@ -790,7 +790,7 @@ fun main() {
 		Handle { id = 6, text = "f", act = || "act" },
 	]);
 	let _root = mount_root("app", || {
-		view("ul").child(each_by(rows, |row: Handle| row.id, |row: SignalCell<Handle>| {
+		view("ul").child(each_by(rows, |row| row.id, |row| {
 			view("li").bind_text(row.map(|current| current.text))
 		}))
 	});
@@ -2229,7 +2229,7 @@ fun main() {
 			.child(view("hr"))
 			.child(each_values(rows, |item: str| view("p").text(item)))
 			.child(view("hr"))
-			.child(each_by(rows, |item: str| item, |cell: SignalCell<str>| view("q").bind_text(cell)))
+			.child(each_by(rows, |item| item, |cell| view("q").bind_text(cell)))
 			.child(when(more, || view("b").text("M")))
 			.child(swap(page, |n: i32| view("section").text(i"p{n}")))
 			.child(view("footer").text("F"))
