@@ -405,9 +405,16 @@ const IMPORT_PATH_IS_NAMES_AND_SETS: &str = "an `import`/`use` path is `::`-sepa
 /// diagnostics-standard B5 forbids.
 fn export_takes(node: &Node<'_>) -> bool {
     match node {
-        Node::Derive(_, inner) | Node::Service(_, inner) | Node::MacroAttribute(_, _, _, inner) => {
-            export_takes(&inner.0)
-        }
+        // G24's `const let` / `const fun` is the same kind of wrapper (N89): it
+        // marks WHEN the declaration under it runs, not what kind of statement
+        // it is, and `export const fun answer(): i32 { 42 }` publishes exactly
+        // the function a bare `const fun` declares. Asked about its inner node
+        // for the attribute wrappers' reason — `const (1 + 1)` is an expression
+        // and is still refused, by the same test one level down.
+        Node::Derive(_, inner)
+        | Node::Service(_, inner)
+        | Node::MacroAttribute(_, _, _, inner)
+        | Node::Const(inner) => export_takes(&inner.0),
         Node::Func(_)
         | Node::MacroFun(_)
         | Node::MacroInvocation(..)

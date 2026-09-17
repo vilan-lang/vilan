@@ -20066,10 +20066,13 @@ impl<'src> Analyzer<'src> {
             analyzer.declare_scope_item(module_scope_id, name, id);
         };
         match node {
+            // N89: `const` joins the wrapper list — a generated `const fun`
+            // declares its name exactly as a generated `fun` does.
             Node::Export(_, inner)
             | Node::Derive(_, inner)
             | Node::Service(_, inner)
-            | Node::MacroAttribute(_, _, _, inner) => {
+            | Node::MacroAttribute(_, _, _, inner)
+            | Node::Const(inner) => {
                 self.hoist_generated_declarations(&inner.0, expansion_scope_id, module_scope_id);
             }
             Node::Func(function) => move_name(self, function.name.0),

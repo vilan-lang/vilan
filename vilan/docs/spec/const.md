@@ -254,3 +254,20 @@ A `const` expression that reads a plain binding, and a `let x = const
 ..` whose result is a closure, are both refused — and both refusals
 name `const let` as the declaration that admits what was wanted. The
 editor offers the edit as a quick fix.
+
+Both forms take the `export` marker, which wraps the declaration under
+the keyword exactly as it wraps a plain `fun` or a module-level `let`
+(§4 of the visibility rules). A module publishes a compile-time helper
+and the binding it computes the same way it publishes anything else:
+
+```vilan
+export const fun scale_step(rem: f64): |f64| f64 {
+	|n: f64| rem * n
+}
+
+export const let space = scale_step(0.25);
+
+fun main() {
+	print(space(8f));
+}
+```

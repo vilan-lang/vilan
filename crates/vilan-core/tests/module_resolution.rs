@@ -5593,6 +5593,70 @@ fn b318_the_export_bit_round_trips_through_module_importables() {
 }
 
 #[test]
+fn n89_export_const_publishes_the_declaration_under_the_marker() {
+    use vilan_core::analyzer::{Visibility, module_importables, module_is_curated};
+
+    // G24 gave `const` a DECLARATION form, and `export` is a wrapper over a
+    // declaration — so `export const fun` and `export const let` are two
+    // wrappers over one item, and every consumer of the export marker has to
+    // see through both. `export_takes` saw through neither: the form was
+    // refused outright, with a message about expressions ("an expression is
+    // none of those") that a `const fun` is not.
+    let dir = write_module_tree(&[(
+        "marked.vl",
+        concat!(
+            "export const fun answer(): i32 { 42 }\n",
+            "\n",
+            "export const let value: i32 = answer();\n",
+            "\n",
+            "const fun kept(): i32 { 7 }\n",
+        ),
+    )]);
+    let rows = module_importables(&dir.join("marked.vl"));
+    let named = |name: &str| {
+        rows.iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("no row for {name}"))
+            .exported
+            .clone()
+    };
+    assert_eq!(named("answer"), Visibility::Exported);
+    assert_eq!(named("value"), Visibility::Exported);
+    // And the marker is not INVENTED: an unmarked `const fun` in the same
+    // curated module stays the module's own.
+    assert_eq!(named("kept"), Visibility::Private);
+    assert!(module_is_curated(&rows));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The whole way through: another module imports both and the program is
+    // clean. A `const let` initialized by an imported `const fun` is the
+    // shape `const.md` §9.6 documents, one module over.
+    let errors = analyze_package(
+        &[
+            (
+                "a.vl",
+                concat!(
+                    "export const fun answer(): i32 { 42 }\n",
+                    "\n",
+                    "export const let value: i32 = answer();\n",
+                ),
+            ),
+            (
+                "main.vl",
+                concat!(
+                    "import pkg::a::{ answer, value };\n",
+                    "\n",
+                    "fun main() { let _ = answer() + value; }\n",
+                ),
+            ),
+        ],
+        "main.vl",
+        Platform::default(),
+    );
+    assert!(errors.is_empty(), "`export const` imports: {errors:#?}");
+}
+
+#[test]
 fn b318_an_unexported_item_still_imports() {
     // Visibility NEVER gates ACCESS (§1): `resolve_import` binds what the path
     // names, exported or not. The release-N posture is a WARNING, and the

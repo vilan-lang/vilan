@@ -1398,13 +1398,15 @@ fn names_bound_in(source: &str) -> HashSet<String> {
     let mut names = HashSet::new();
     if let (Some(tree), _) = vilan_core::parsing::parse(source) {
         for item in &tree.0 {
-            // An item under `export`, a derive, a service attribute or a user
-            // macro attribute still declares its own name.
+            // An item under `export`, a derive, a service attribute, a user
+            // macro attribute or G24's `const` still declares its own name
+            // (N89).
             let mut node = &item.0;
             while let Node::Export(_, inner)
             | Node::Derive(_, inner)
             | Node::Service(_, inner)
-            | Node::MacroAttribute(_, _, _, inner) = node
+            | Node::MacroAttribute(_, _, _, inner)
+            | Node::Const(inner) = node
             {
                 node = &inner.0;
             }
