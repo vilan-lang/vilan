@@ -7,7 +7,7 @@ conflict, `CLAUDE.md` wins.
 
 ## The lay of the land
 
-Rust workspace, six crates, plus the language's own tree:
+Rust workspace, eight crates, plus the language's own tree:
 
 - `crates/vilan-core` — the whole compiler as a library. Pipeline order: `lexing.rs` /
   `token.rs` → `parsing.rs` (a handwritten recursive-descent frontend; replaced
@@ -49,6 +49,13 @@ Rust workspace, six crates, plus the language's own tree:
   N15 moved the design memory out of this tree) — design documents. Semantics
   are settled there **before** code; the proposal named in your work order is
   the spec for your change.
+- `crates/vilan-rust` — the emit-Rust backend (F1 S1a, Order 37): the same `Program` the JS
+  emitter reads, one `main.rs` out, a cargo project under `dist/native/<entry>/`; scoped to
+  what the platform-free corpus needs — no async, UI, rpc or `std::fs` yet.
+- `crates/vilan-rt` — the runtime that emitted Rust links against: `Rc<str>`, `Vec`, the
+  ordered `Map`/`Set`, `Shared`/`Captured` cells, `guarded` panics and node's `console.log`
+  rendering, so a native binary prints byte-for-byte what the JS build prints. No
+  dependencies beyond Rust's std, by rule.
 
 ## Definition of done (the gates)
 

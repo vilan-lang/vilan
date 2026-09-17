@@ -135,9 +135,15 @@ pub fn platform_free_programs() -> Vec<String> {
 }
 
 /// A staged copy of the corpus, so a build writes its artifacts beside a copy
-/// rather than into the tree.
+/// rather than into the tree. Per PROCESS: nextest runs each test of this binary
+/// in its own process, concurrently, and a staging directory the four shared —
+/// each one beginning by removing it — was a race the Order 37 seal lost
+/// (`cannot create ./dist/native/bool/src`: a sibling test had just deleted the
+/// working directory out from under the build). The shared cargo target
+/// directory stays shared on purpose; cargo locks it itself.
 fn stage() -> PathBuf {
-    let staged = Path::new(env!("CARGO_TARGET_TMPDIR")).join("native-differential-src");
+    let staged = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("native-differential-src-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staged);
     std::fs::create_dir_all(&staged).expect("create the staging directory");
     for entry in std::fs::read_dir(corpus_dir())

@@ -1084,7 +1084,7 @@ const STUB: &str = concat!(
 /// pin below drives, so that rule is asserted over a tree a test owns rather
 /// than by planting something in the committed fixture.
 fn stage_from(source: &Path, tag: &str, split: bool) -> PathBuf {
-    let staged = std::env::temp_dir().join(format!("vilan_split_{tag}_{}", std::process::id()));
+    let staged = support::scratch_root().join(format!("vilan_split_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staged);
     std::fs::create_dir_all(&staged).expect("create the staging directory");
     for entry in std::fs::read_dir(source).expect("read the fixture") {
@@ -1119,7 +1119,7 @@ fn stage_from(source: &Path, tag: &str, split: bool) -> PathBuf {
 /// could act on, and the fixture it accused was innocent.
 #[test]
 fn the_loader_skips_a_directory_instead_of_reading_it_as_a_file() {
-    let source = std::env::temp_dir().join(format!("vilan_split_src_{}", std::process::id()));
+    let source = support::scratch_root().join(format!("vilan_split_src_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&source);
     std::fs::create_dir_all(source.join("dist/.cache")).expect("a left-behind build directory");
     std::fs::write(source.join("dist/.cache/macro-expansions"), "x").expect("a cache file");
