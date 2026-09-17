@@ -5222,3 +5222,56 @@ main();
     );
 }
 
+/// E191 — one arity error in an ELEMENT HEAD (kolt login.vl:181/286, the
+/// owner's FIXME: `href(href())` "caused a ton of error noise"). The head
+/// lowers to a chain, so an attribute call that does not resolve leaves every
+/// later link and every hole under it unwired — which is E189's hole reached
+/// through the desugar rather than through a retired method. ONE error at this
+/// grain: the arity error, no coverage fence under the head.
+///
+/// The ITEM does not close on this. Measured on a kolt copy at 0decf84 with
+/// `href(href())` restored: 194 errors on the base, 139 with E189's rule (55
+/// gone). The remainder does NOT trace through the head at all — it enters at
+/// `app_shell`'s own body (`views.vl:81`/`:85`) because the failed attribute
+/// poisons the return type of the component the route arm calls, and that is
+/// E189's family reached by a route the narrow rule cannot name. It is what the
+/// BROAD gate was for (with it, the same copy reports 1), and that gate is the
+/// open decision this order hands back.
+#[test]
+fn e191_an_arity_error_in_an_element_head_reports_alone() {
+    let source = r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        import std::ui::{ View, mount_root, view };
+
+        fun target(name: str): str {
+            "/" + name
+        }
+
+        fun counter(count: SignalCell<i32>): View {
+            count.effect(|value| print(value));
+            view("span")
+        }
+
+        fun link(count: SignalCell<i32>): View {
+            <a
+                href(target())
+                title("Sign up")
+                on:click(|event| {
+                    print("clicked");
+                })
+                .child(counter(count))
+            >
+                "Sign Up"
+            </a>
+        }
+
+        fun main() {
+            let count = Signal::new(0);
+            let _root = mount_root("app", || view("div").child(link(count)));
+        }
+        "#;
+    assert_fails_browser_once_with(source, "`target` expects 1 argument, but got 0 instead");
+    assert_fails_browser_without(source, "is read here, but this code can be reached without");
+}
+
