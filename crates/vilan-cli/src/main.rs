@@ -390,19 +390,61 @@ fn run_cli() -> ExitCode {
     }
 }
 
-/// `vilan cache prune` (L21): drop materialized std trees, reporting what went
-/// and what it freed.
+/// `vilan cache prune` (L21): drop materialized std trees and the check tables
+/// beside them, reporting what went and what it freed.
 ///
 /// The age guard is the default because it is the safe one — an entry younger
 /// than a week may belong to a compile running right now, which reads std files
 /// lazily — and `--all` is the gesture for a machine that knows it is idle. The
 /// running binary's own tree is kept under both, so the command can never make
 /// the very next command re-materialize.
+///
+/// TWO roots since N92. `~/.vilan/check-cache` holds one macro expansion table
+/// per package a `vilan check` has ever warmed, and it is here for the reason
+/// N63 gave for keeping the BUILD's table in `dist/`: a machine-global cache
+/// nobody can reach is the bad kind. This is the gesture that reaches it, and
+/// the age guard covers it for the same reason (a check running right now is
+/// holding its table open).
 fn cache_prune(all: bool, dry_run: bool) -> ExitCode {
-    let root = vilan_embedded_std::default_cache_root();
     let max_age = (!all).then_some(vilan_embedded_std::STALE_AFTER);
-    let before = vilan_embedded_std::cache_entries(&root).len();
-    let removed = vilan_embedded_std::prune(&root, max_age, dry_run);
+    let std_trees = prune_one_cache_root(
+        &vilan_embedded_std::default_cache_root(),
+        max_age,
+        dry_run,
+        all,
+        Some("this binary's own tree is never pruned"),
+    );
+    let check_tables = prune_one_cache_root(
+        &vilan_embedded_std::default_check_cache_root(),
+        max_age,
+        dry_run,
+        all,
+        None,
+    );
+    if std_trees == ExitCode::SUCCESS {
+        check_tables
+    } else {
+        std_trees
+    }
+}
+
+/// One cache root pruned and reported. Split out when the check tables became a
+/// second root (N92): the reporting was the whole function, and two roots
+/// printing two different shapes of summary is how a reader stops trusting
+/// either.
+fn prune_one_cache_root(
+    root: &Path,
+    max_age: Option<std::time::Duration>,
+    dry_run: bool,
+    all: bool,
+    // What this root protects unconditionally, if anything. The std root keeps
+    // the running binary's own tree — pruning it would make the very next
+    // command re-materialize — and the check root protects nothing of the kind:
+    // its entries are one package's table each, and no package is "current".
+    protected: Option<&str>,
+) -> ExitCode {
+    let before = vilan_embedded_std::cache_entries(root).len();
+    let removed = vilan_embedded_std::prune(root, max_age, dry_run);
     let kept = before - removed.len();
     let freed: u64 = removed.iter().map(|entry| entry.bytes).sum();
     if removed.is_empty() {
@@ -433,20 +475,24 @@ fn cache_prune(all: bool, dry_run: bool) -> ExitCode {
         );
     }
     // The rule, not a claim about the survivors: with `--all` the only entry
-    // that CAN survive is this binary's own, and there may be none.
+    // that CAN survive is one this root protects, and there may be none.
     if kept > 0 {
+        let age_rule = (!all).then_some("nothing created in the last seven days is pruned");
+        let rule = match (protected, age_rule) {
+            (Some(protected), Some(age)) => format!("{protected}, and {age}"),
+            (Some(protected), None) => protected.to_string(),
+            (None, Some(age)) => age.to_string(),
+            // `--all` on a root that protects nothing: an entry survived only
+            // because its removal failed, which the removal count already says.
+            (None, None) => "the removal did not reach them".to_string(),
+        };
         println!(
             "{}",
             paint::out(
                 paint::Style::DIM,
                 &format!(
-                    "{kept} entr{} kept: this binary's own tree is never pruned{}",
-                    if kept == 1 { "y" } else { "ies" },
-                    if all {
-                        ""
-                    } else {
-                        ", nor is anything created in the last seven days"
-                    }
+                    "{kept} entr{} kept: {rule}",
+                    if kept == 1 { "y" } else { "ies" }
                 )
             )
         );
@@ -2074,6 +2120,13 @@ fn fmt(paths: &[PathBuf], check: bool) -> ExitCode {
     exclude_generated(&mut files);
     let mut changed = 0;
     let mut failed = false;
+    // N90: files the printer DECLINED — a construct it has no rule for, or a
+    // reprint its own safety net threw away. Counted apart from `changed`
+    // because they are a different outcome with a different owner: a file that
+    // "would reformat" is the author's to fix, a file the printer declined is
+    // the FORMATTER's, and a run reporting the second as the first is how a
+    // printer gap stays invisible.
+    let mut declined = 0;
     for file in &files {
         let source = match fs::read_to_string(file) {
             Ok(source) => source,
@@ -2087,7 +2140,20 @@ fn fmt(paths: &[PathBuf], check: bool) -> ExitCode {
                 continue;
             }
         };
-        let formatted = vilan_core::formatter::format(&source);
+        // N90: `format` answers the original bytes on every way out, so a file
+        // the printer DECLINED reads exactly like one that was already
+        // canonical — `export let x = 1;` bailed for a whole order with
+        // `fmt --check vilan/std` green over it, and an idempotency pin on one
+        // file is what caught it. `reprint` says which happened, and a decline
+        // is reported by name here instead of being counted as clean.
+        let formatted = match vilan_core::formatter::reprint(&source) {
+            Ok(formatted) => formatted,
+            Err(decline) => {
+                report_decline(file, &decline);
+                declined += 1;
+                continue;
+            }
+        };
         if formatted == source {
             continue;
         }
@@ -2113,11 +2179,51 @@ fn fmt(paths: &[PathBuf], check: bool) -> ExitCode {
             );
         }
     }
-    if failed || (check && changed > 0) {
+    // Three outcomes, three codes (N90). `2` is the distinct one, and it says
+    // something `1` cannot: the formatter could not format a file, as opposed
+    // to the tree not being formatted. It holds in BOTH modes, because a
+    // `vilan fmt` that skipped a file did not write it either, and the silence
+    // is what the item is about. It also OUTRANKS `1`: a run that met a file it
+    // could not format has not established anything about the rest.
+    if declined > 0 {
+        eprintln!(
+            "{} {declined} file(s) did not format (see the `declined` lines above); \
+             `vilan fmt` says nothing about whether the rest of the tree is clean",
+            paint::error_prefix(),
+        );
+        ExitCode::from(DECLINED)
+    } else if failed || (check && changed > 0) {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// `vilan fmt`'s exit code for a file it could NOT format (N90) — distinct
+/// from `1`, which `--check` already spends on "the tree is not formatted", so
+/// a CI leg (and `scripts/ci-local.sh`'s `vilan-fmt`) can tell a formatter that
+/// declined from a tree that is merely unformatted, by the code alone.
+///
+/// Before this, `format` answered the original bytes on every way out and the
+/// run reported the file as already-formatted: a printer gap was invisible to
+/// the gate whose whole job is to find one, and so was a `.vl` file that does
+/// not parse.
+const DECLINED: u8 = 2;
+
+/// Reports one file that did not format: the path, the line, and the construct
+/// in the words of the source. Naming the CONSTRUCT is the point — "this file
+/// did not format" sends a reader into a 900-line std module looking for what.
+fn report_decline(file: &Path, decline: &vilan_core::formatter::Decline) {
+    let where_ = match decline.line {
+        Some(line) => format!("{}:{line}", file.display()),
+        None => file.display().to_string(),
+    };
+    eprintln!(
+        "{} {}  {}",
+        paint::out(paint::Style::YELLOW, "declined"),
+        paint::out(paint::Style::BOLD, &where_),
+        decline.sentence(),
+    );
 }
 
 /// Drops every file that lives under a declared `generated` root, and says so
@@ -3955,6 +4061,13 @@ impl CompileGoal {
         matches!(self, CompileGoal::Check | CompileGoal::CheckModule)
     }
 
+    /// Whether this goal writes ARTIFACTS — which is what decides where its
+    /// macro expansion table lives (N92): `dist/` belongs to a build, and a
+    /// command that emits nothing has no business creating one.
+    fn emits_artifacts(self) -> bool {
+        matches!(self, CompileGoal::Emit)
+    }
+
     /// Whether this goal runs the emission walk. `CheckModule` does not: a
     /// module is not a program, and emission's only diagnostic says so.
     fn emits(self) -> bool {
@@ -4053,10 +4166,18 @@ fn compile_unit(
     // where `build` writes and where a user goes to delete it. A bare file with
     // no manifest has no build directory and gets none — it has no `dist/` for
     // the same reason it has no package.
+    //
+    // N92: except when the goal EMITS NOTHING. `dist/.cache` is the build's
+    // memory and `rm -rf dist` is the sentence that justifies it, but `vilan
+    // check` writes no artifacts — so it was creating a build directory in a
+    // tree nobody asked to build, and a read-only-sounding command mutated the
+    // package it was pointed at. A checking goal keys its table under
+    // `~/.vilan/check-cache/<hash of the package>` instead, which is out of the
+    // tree and swept by `vilan cache prune`.
     workspace.macro_expansion_cache = unit
         .package_dir
         .as_ref()
-        .map(|directory| directory.join("dist"));
+        .map(|directory| expansion_cache_root(directory, goal));
     // HMR instrumentation is opt-in per compile (an HMR-active `run --watch`,
     // browser legs only) — every other caller passes `false`, so `build`/`run`/
     // `check` output stays byte-identical.
@@ -4075,6 +4196,32 @@ fn compile_unit(
         overlay,
         split,
     )
+}
+
+/// Where THIS compile keeps its cross-process macro expansion table (M33, N92).
+///
+/// Two roots, chosen by what the compile writes. A goal that EMITS uses the
+/// package's own `dist/`, which is where its artifacts go and what `rm -rf
+/// dist` is about: one gesture, "recompile everything, macro worlds included".
+/// A CHECKING goal emits nothing, so it has no build directory of its own to
+/// put memory in — and creating one made `vilan check` mutate the package it
+/// was pointed at, which is the whole of N92. Its table lives under
+/// `~/.vilan/check-cache/<hash>` instead, keyed by the package's canonical
+/// path so two packages never share a table and one package's two spellings
+/// do.
+///
+/// The hash and not the path itself: a directory name has to be one path
+/// segment on every platform, and a project path is neither (it carries
+/// separators, and on Windows a drive letter and a colon).
+fn expansion_cache_root(package_dir: &Path, goal: CompileGoal) -> PathBuf {
+    if goal.emits_artifacts() {
+        return package_dir.join("dist");
+    }
+    let canonical = vilan_core::util::canonical_path(package_dir);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&canonical, &mut hasher);
+    vilan_embedded_std::default_check_cache_root()
+        .join(format!("{:016x}", std::hash::Hasher::finish(&hasher)))
 }
 
 /// Builds a lone package / bare file, writing `<entry>.mjs` on a process leg

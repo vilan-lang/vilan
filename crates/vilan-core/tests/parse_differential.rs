@@ -468,23 +468,26 @@ fn formatter_output_token_matches_input() {
 
 /// The corpus files the formatter currently BAILS on, by base name (sorted).
 ///
-/// Detector: `format` is a total canonicalizer over parseable input, so it must
-/// map a source and a token-preserving perturbation of it to the SAME output.
-/// Appending blank lines is such a perturbation (trailing newlines are trivia,
-/// always normalized away, and change no comment). If `format(source)` and
-/// `format(source + "\n\n")` DIFFER, the formatter bailed on this file — it
-/// returned each input verbatim (with the extra newlines surviving) instead of
-/// canonicalizing. A truly-canonical file is NOT flagged: both map to itself.
-/// (Verified: every flagged file returns BOTH inputs verbatim — `format(x)==x` —
-/// while controls strip the perturbation, the clean bail-vs-canonical signal.)
+/// Detector: `formatter::reprint` — [`formatter::format`]'s honest half (N90).
+/// It answers the reprint, or the [`formatter::Decline`] saying which of the
+/// four ways out it took, so a bail is READ here rather than inferred.
+///
+/// It used to be inferred, and the inference was sound but indirect: `format`
+/// is a total canonicalizer over parseable input, so it must map a source and a
+/// token-preserving perturbation of it (two appended blank lines — trivia,
+/// always normalized away, changing no comment) to the SAME output; a file
+/// where the two DIFFER was returned verbatim, which is a bail. That flagged
+/// the right files and could not say WHAT the printer met, which is the half
+/// `Decline` adds — so a bail this gate reports now names its own construct and
+/// the line it is on, and a file that merely does not parse is told apart from
+/// a printer gap instead of being counted as one.
 fn current_bail_set() -> Vec<String> {
     let mut bails: Vec<String> = formattable_files()
         .into_iter()
         .filter_map(|path| {
             let source = std::fs::read_to_string(&path).ok()?;
-            let base = formatter::format(&source);
-            let perturbed = formatter::format(&format!("{source}\n\n"));
-            (base != perturbed).then(|| label(&path))
+            let declined = formatter::reprint(&source).err()?;
+            Some(format!("{} ({})", label(&path), declined.sentence()))
         })
         .collect();
     bails.sort();

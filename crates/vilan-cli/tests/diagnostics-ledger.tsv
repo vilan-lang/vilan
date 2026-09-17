@@ -564,3 +564,5 @@ row	flagship	key
 539	-	index out of bounds: the length is {length} but the index is {index}
 540	-	substring out of range: the length is {length} but the range is {start}..{end} — substring requires 0 <= start <= end <= len and never clamps or swaps; to drop a known affix use strip_prefix/strip_suffix, and for the rest of the string pass s.len() as the end
 541	-	every `impl {subject}` in {modules} is exported, so the reach marker is redundant — delete the `#`
+542	-	`[derive({name})]` could not expand: this toolchain has no `macro_std` beside its `std`, so std's own `{module}` never registered its `{name}` macro — `std` is at `{}`, and `macro_std` was looked for at `{}`
+543	-	`[service]` could not expand: this toolchain has no `macro_std` beside its `std`, so std::rpc's `service` macro never registered — `std` is at `{}`, and `macro_std` was looked for at `{}`

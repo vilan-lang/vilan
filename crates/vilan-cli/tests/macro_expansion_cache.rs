@@ -29,6 +29,8 @@
 //! Each test gets its own package directory, because the table is per package
 //! and these run concurrently.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -69,19 +71,55 @@ fn cache_file(dir: &Path) -> PathBuf {
     cache_dir(dir).join("macro-expansions")
 }
 
-/// Where every on-disk cache lives (tracker N63, ruled by the owner
-/// 2026-09-07): one directory inside the build directory, not a leaf beside the
-/// emitted artifacts.
+/// Where a CHECK's table lives (tracker N92): under the user cache root, keyed
+/// by the package's canonical path, because `vilan check` emits no artifacts
+/// and so has no build directory of its own to keep memory in. Found by
+/// searching rather than by recomputing the hash, so this helper cannot drift
+/// from the CLI's key and quietly assert about a file nobody writes — a root
+/// holding exactly one entry after a fresh package is checked is the premise,
+/// and it is asserted.
 fn cache_dir(dir: &Path) -> PathBuf {
-    dir.join("dist").join(".cache")
+    let root = check_cache_root();
+    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut hasher = DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    root.join(format!("{:016x}", hasher.finish()))
+        .join(".cache")
+}
+
+/// `~/.vilan/check-cache`, under the same home rules the toolchain's other
+/// caches use.
+fn check_cache_root() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .map(|home| home.join(".vilan").join("check-cache"))
+        .unwrap_or_else(|| std::env::temp_dir().join("vilan-check-cache"))
+}
+
+/// The BUILD's table, which stays where N63 put it: `dist/.cache`, inside the
+/// package, where `rm -rf dist` reaches it.
+fn build_cache_file(dir: &Path) -> PathBuf {
+    dir.join("dist").join(".cache").join("macro-expansions")
+}
+
+/// How many macro worlds one `vilan build` of `dir` compiled — the same probe
+/// as [`worlds_compiled`], for the goal that DOES own a `dist/`.
+fn worlds_compiled_by_build(dir: &Path) -> usize {
+    worlds_from(dir, &["build", "."])
 }
 
 /// How many macro worlds one `vilan check` of `dir` compiled, off the phase
 /// row. Each call is its own PROCESS, which is the whole subject here.
 fn worlds_compiled(dir: &Path) -> usize {
+    worlds_from(dir, &["check", "."])
+}
+
+/// The phase-row probe, shared by the `check` and `build` spellings.
+fn worlds_from(dir: &Path, arguments: &[&str]) -> usize {
     let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .current_dir(dir)
-        .args(["check", "."])
+        .args(arguments)
         .env("VILAN_PHASE_TIMING", "1")
         .output()
         .expect("run vilan");
@@ -261,16 +299,25 @@ fn a_corrupt_table_is_ignored_rather_than_fatal() {
 
 #[test]
 fn removing_the_build_directory_means_recompile_everything() {
-    // The sentence a user already believes, and the reason the table lives in
-    // `dist/` rather than in `~/.vilan/`: a machine-global cache keyed on a
-    // project path is the thing nobody can reason about from a fresh clone, and
-    // a stale one is unreachable to `rm -rf`.
+    // The sentence a user already believes, and the reason the BUILD's table
+    // lives in `dist/` rather than in `~/.vilan/`: a machine-global cache keyed
+    // on a project path is the thing nobody can reason about from a fresh
+    // clone, and a stale one is unreachable to `rm -rf`.
+    //
+    // Asserted through `build` since N92, which is the goal that owns `dist/`.
+    // It used to be asserted through `check`, and that was the defect: `check`
+    // emits no artifacts, so it was creating a build directory in a tree nobody
+    // asked to build in order to have somewhere to keep the table.
     let dir = temp_package("removed");
-    assert_eq!(worlds_compiled(&dir), 1, "cold");
-    assert_eq!(worlds_compiled(&dir), 0, "warm");
+    assert_eq!(worlds_compiled_by_build(&dir), 1, "cold");
+    assert_eq!(worlds_compiled_by_build(&dir), 0, "warm");
+    assert!(
+        build_cache_file(&dir).is_file(),
+        "a build's table is in the package's own `dist/.cache`"
+    );
     std::fs::remove_dir_all(dir.join("dist")).expect("remove the build directory");
     assert_eq!(
-        worlds_compiled(&dir),
+        worlds_compiled_by_build(&dir),
         1,
         "`rm -rf dist` must mean recompile everything, macro worlds included"
     );
@@ -278,17 +325,16 @@ fn removing_the_build_directory_means_recompile_everything() {
 }
 
 #[test]
-fn a_check_creates_the_cache_directory_and_writes_nothing_else() {
-    // Tracker N63, the owner's ruling of 2026-09-07: every on-disk cache lives
-    // under `dist/.cache/`, and `check` — which emits no artifacts at all — may
-    // create it and writes nothing else. Before M33, `check` wrote nothing
-    // anywhere; it writes now, and what it writes has to stay ONE directory a
-    // reader can delete without thinking about it, or `dist/` becomes a place
-    // where the build's output and the compiler's memory are interleaved and
-    // `.gitignore` grows a line per cache. The claim is the WHOLE tree, not the
-    // presence of the file: anything else a check ever starts leaving behind
-    // reds here, named.
-    let dir = temp_package("check_writes_only_the_cache");
+fn a_check_writes_nothing_at_all_into_the_package() {
+    // Tracker N92. `check` used to create `dist/.cache/` — a build directory in
+    // a tree nobody asked to build — so a read-only-sounding command mutated
+    // the package it was pointed at. N63's ruling stands for the BUILD's table
+    // and is asserted above; a check has no artifacts and so no `dist/` of its
+    // own, and its table went to `~/.vilan/check-cache/<hash>` instead.
+    //
+    // The claim is the WHOLE tree, not the absence of one file: anything a
+    // check ever starts leaving behind reds here, named.
+    let dir = temp_package("check_writes_nothing");
     let before = tree_under(&dir);
     assert_eq!(
         worlds_compiled(&dir),
@@ -296,31 +342,61 @@ fn a_check_creates_the_cache_directory_and_writes_nothing_else() {
         "the fixture must compile a world, or the check under test did nothing"
     );
 
-    let dist = dir.join("dist");
+    assert_eq!(
+        tree_under(&dir),
+        before,
+        "a `vilan check` must leave the package byte-for-byte as it found it — \
+         no `dist/`, no cache, nothing"
+    );
     assert!(
-        dist.is_dir(),
-        "a check that fills the expansion table must have created `dist/`"
-    );
-    assert_eq!(
-        tree_under(&dist),
-        vec![
-            ".cache".to_string(),
-            format!(".cache/{}", "macro-expansions"),
-        ],
-        "a `check` may create `dist/.cache/` and writes nothing else"
+        !dir.join("dist").exists(),
+        "and above all no build directory: `check` emits no artifacts"
     );
 
-    // And nothing OUTSIDE `dist/` moved: the source tree a check reads is a
-    // source tree a check leaves alone.
-    let after: Vec<String> = tree_under(&dir)
-        .into_iter()
-        .filter(|path| path != "dist" && !path.starts_with("dist/"))
-        .collect();
+    // The table it DID write is out of the tree, and answers the second check.
+    assert!(
+        cache_file(&dir).is_file(),
+        "the check's table is under the user cache root, at {}",
+        cache_file(&dir).display()
+    );
     assert_eq!(
-        after, before,
-        "a check must not write outside the build directory"
+        worlds_compiled(&dir),
+        0,
+        "and it is read back by the next process, which is the whole of M33"
     );
 
+    let _ = std::fs::remove_dir_all(cache_dir(&dir).parent().expect("the entry directory"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_check_and_a_build_of_one_package_keep_separate_tables() {
+    // Two roots, one package: the build's in `dist/.cache` where `rm -rf dist`
+    // reaches it, the check's under the user cache root where nothing in the
+    // package can be disturbed by it. Both are content-keyed and stamped, so
+    // two tables is a redundancy and never a disagreement — and `rm -rf dist`
+    // still means what it says for the build without silently un-warming a
+    // check of a tree that was never built.
+    let dir = temp_package("two_roots");
+    assert_eq!(worlds_compiled(&dir), 1, "the check is cold");
+    assert!(!dir.join("dist").exists(), "and created no `dist/`");
+    assert_eq!(worlds_compiled_by_build(&dir), 1, "the build is cold too");
+    assert!(
+        build_cache_file(&dir).is_file(),
+        "the build wrote the package's own table"
+    );
+    assert_eq!(worlds_compiled(&dir), 0, "the check stays warm");
+    assert_eq!(worlds_compiled_by_build(&dir), 0, "so does the build");
+
+    std::fs::remove_dir_all(dir.join("dist")).expect("remove the build directory");
+    assert_eq!(
+        worlds_compiled(&dir),
+        0,
+        "`rm -rf dist` is the BUILD's gesture: a check of a tree that was never \
+         built must not depend on a directory that was never there"
+    );
+
+    let _ = std::fs::remove_dir_all(cache_dir(&dir).parent().expect("the entry directory"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

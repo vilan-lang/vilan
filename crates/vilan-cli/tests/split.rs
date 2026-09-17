@@ -54,23 +54,17 @@ fn fixture(part: &str) -> PathBuf {
 /// Copies the fixture project into a fresh temp directory. `split` decides
 /// whether the manifest keeps its `split = true` line, so the same sources can
 /// be built both ways and compared.
+///
+/// DIRECTORIES in the fixture are skipped, by name (tracker N92). The fixture
+/// is a flat package of source files, and the only directory that ever appears
+/// in it is one a tool LEFT there — `vilan check .` run in this tree used to
+/// write `dist/.cache`, and the next `read_to_string` of it failed with
+/// `IsADirectory`, which is how ten tests in this file reported "cannot read a
+/// fixture file" for something no fixture file had done. The tool stopped
+/// writing there; the loader stops reading a directory as a file, and says
+/// which one it skipped rather than swallowing it.
 fn stage(tag: &str, split: bool) -> PathBuf {
-    let staged = support::scratch_root().join(format!("vilan_split_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&staged);
-    std::fs::create_dir_all(&staged).expect("create the staging directory");
-    for entry in std::fs::read_dir(fixture("project")).expect("read the fixture") {
-        let entry = entry.expect("a fixture entry");
-        let mut text = std::fs::read_to_string(entry.path()).expect("read a fixture file");
-        if !split && entry.file_name() == "vilan.toml" {
-            text = text
-                .lines()
-                .filter(|line| !line.starts_with("split"))
-                .map(|line| format!("{line}\n"))
-                .collect();
-        }
-        std::fs::write(staged.join(entry.file_name()), text).expect("stage a fixture file");
-    }
-    staged
+    stage_from(&fixture("project"), tag, split)
 }
 
 fn build(staged: &Path, extra: &[&str]) -> String {
@@ -1085,3 +1079,75 @@ const STUB: &str = concat!(
     include_str!("support/dom/stub.js"),
     include_str!("support/dom/split.js"),
 );
+
+/// [`stage`] over an arbitrary source directory — the seam the directory-skip
+/// pin below drives, so that rule is asserted over a tree a test owns rather
+/// than by planting something in the committed fixture.
+fn stage_from(source: &Path, tag: &str, split: bool) -> PathBuf {
+    let staged = std::env::temp_dir().join(format!("vilan_split_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staged);
+    std::fs::create_dir_all(&staged).expect("create the staging directory");
+    for entry in std::fs::read_dir(source).expect("read the fixture") {
+        let entry = entry.expect("a fixture entry");
+        if entry.path().is_dir() {
+            eprintln!(
+                "split fixture: skipping the directory {} — the fixture is a flat \
+                 package, so this is something a tool left behind",
+                entry.path().display()
+            );
+            continue;
+        }
+        let mut text = std::fs::read_to_string(entry.path()).expect("read a fixture file");
+        if !split && entry.file_name() == "vilan.toml" {
+            text = text
+                .lines()
+                .filter(|line| !line.starts_with("split"))
+                .map(|line| format!("{line}\n"))
+                .collect();
+        }
+        std::fs::write(staged.join(entry.file_name()), text).expect("stage a fixture file");
+    }
+    staged
+}
+
+/// N92: a DIRECTORY in the source tree is skipped by name, not read as a file.
+///
+/// The loader used to `read_to_string` every entry, so a `dist/` left in the
+/// fixture — which `vilan check .` run in this tree wrote, before N92 moved a
+/// check's table out of the package — failed ten tests in this file with
+/// `IsADirectory` at "read a fixture file". The message named nothing a reader
+/// could act on, and the fixture it accused was innocent.
+#[test]
+fn the_loader_skips_a_directory_instead_of_reading_it_as_a_file() {
+    let source = std::env::temp_dir().join(format!("vilan_split_src_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&source);
+    std::fs::create_dir_all(source.join("dist/.cache")).expect("a left-behind build directory");
+    std::fs::write(source.join("dist/.cache/macro-expansions"), "x").expect("a cache file");
+    std::fs::write(
+        source.join("vilan.toml"),
+        "[package]\nname = \"p\"\nsplit\n",
+    )
+    .expect("a manifest");
+    std::fs::write(source.join("app.vl"), "fun main() {\n}\n").expect("an entry");
+
+    let staged = stage_from(&source, "skips_a_directory", false);
+    let mut staged_names: Vec<String> = std::fs::read_dir(&staged)
+        .expect("read the staged directory")
+        .map(|entry| {
+            entry
+                .expect("a staged entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    staged_names.sort();
+    let _ = std::fs::remove_dir_all(&source);
+    let _ = std::fs::remove_dir_all(&staged);
+    assert_eq!(
+        staged_names,
+        vec!["app.vl".to_string(), "vilan.toml".to_string()],
+        "the files are staged and the directory is skipped, rather than the \
+         whole run failing on a read that was never going to work"
+    );
+}

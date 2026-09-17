@@ -194,6 +194,15 @@ nothing, and runs no `[build] run` hooks. Same path forms and flags
 every entry, each under its own platform. Exit is non-zero when
 diagnostics were reported.
 
+**Writes nothing means nothing.** A check remembers its macro expansions
+across processes — that is what makes a second check of an unchanged package
+compile no macro world at all — and that memory lives under
+`~/.vilan/check-cache/`, keyed by the package's path, *not* in the package.
+`dist/.cache` belongs to `vilan build`, which has a `dist/` because it has
+artifacts; a check has neither, and creating one would make a read-only
+command mutate the tree it was pointed at. `vilan cache prune` sweeps the
+check tables beside the std trees.
+
 One thing it does that `build` does not: when the file has a **syntax
 error**, `check` reports it and then type-checks the rest of the file
 anyway. The parser recovers at the next statement or item boundary, so a
@@ -329,10 +338,22 @@ is the current directory. Formatting is conservative and a fixed point:
   before and after. `Style + Style` operands are never reordered: that merge's
   order is yours.
 - A file the formatter cannot yet print faithfully is left byte-for-byte
-  untouched, never half-formatted.
+  untouched, never half-formatted — and **said out loud**, not silently. One
+  `declined <file>:<line>` line names it and what the formatter met: a
+  construct the printer has no rule for yet, a reprint its own safety net
+  threw away, or a file that does not lex or parse.
 
 `--check` reports the files that would change and exits 1 if any (the
 CI spelling). Nothing is rewritten.
+
+**Three outcomes, three exit codes.** `0` is clean. `1` is "this tree is not
+formatted" — `--check` found files that would change, or a write failed. `2` is
+"the formatter could not format a file", the `declined` lines above it saying
+which and why, and it holds in both modes because a run that skipped a file
+wrote nothing for it either. `2` outranks `1`: a run that met a file it could
+not format has established nothing about the rest of the tree. Before this,
+every one of those ways out answered the file's own bytes, so `--check`
+reported a file the printer had bailed on as already-formatted.
 
 **Generated sources are skipped.** A package that declares
 `[package] generated = "…"` is saying that directory holds *products* — files
@@ -688,7 +709,8 @@ a newer release exists and changes nothing.
 
 ## `vilan cache prune`
 
-Deletes materialized std trees no binary can use any more.
+Deletes materialized std trees no binary can use any more, and the macro
+expansion tables `vilan check` keeps beside them.
 
 An installed `vilan` carries its standard library inside the binary and
 writes it out once, to `~/.vilan/std-cache/<content hash>/`, so the
@@ -711,3 +733,12 @@ vilan cache prune --all      # every entry, guard and all
 
 The tree this binary itself uses is never deleted, `--all` included: the
 next command would write it straight back.
+
+Two roots are swept, and each reports its own line. `~/.vilan/std-cache/`
+is the one above. `~/.vilan/check-cache/` holds one macro expansion table
+per package a `vilan check` has warmed — the same content-keyed, stamped
+file `vilan build` keeps in `dist/.cache`, put where a command that emits
+nothing can keep memory without writing into your tree. Deleting a table
+costs a recompile of that package's macro worlds and nothing else; the
+same seven-day guard applies, because a check running right now is holding
+its own table open.

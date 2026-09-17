@@ -26778,11 +26778,33 @@ impl<'src> Analyzer<'src> {
     /// file-level twin (`a.vl` beside `a/lib.vl`) has been since A65: one rule
     /// for both collisions.
     ///
-    /// Reported at the DECLARATION, once per collision, whether or not anything
-    /// imports the path — the ambiguity is a fact about the tree, and the
-    /// declaration is the half the author can move. Only a module that was
-    /// LOADED has a children scope, which is the same bound the file-level
+    /// Reported at the DECLARATION, once per collision however many imports
+    /// walk it and whatever they spell it — the ambiguity is a fact about the
+    /// tree, and the declaration is the half the author can move.
+    ///
+    /// The BOUND, stated plainly because the sentence above used to end "whether
+    /// or not anything imports the path" and that is not what this does (tracker
+    /// B342). The walk is over CHILDREN SCOPES, and a child has one only because
+    /// something loaded it: a path that goes THROUGH `a::b` loads the child and
+    /// the collision is named, while `import pkg::a;` alone — with `a.vl`
+    /// declaring `b` beside an `a/b.vl` nobody has ever named — leaves the
+    /// declaration winning in silence. It is the same bound the file-level
     /// twin's report has.
+    ///
+    /// Closing it means LISTING each loaded module's directory instead of
+    /// reading its children scope, which is a `read_dir` per loaded module per
+    /// analysis — and the analysis is every keystroke, because this runs in
+    /// `post_analysis_passes`. Measured over a copy of the owner's application
+    /// ([`submodules_in_directory`] over the directory each loaded module names,
+    /// 200 passes, thread CPU, loadavg 104-106 and again on a quiet box at
+    /// 13, which agrees to the fourth decimal because the cost is syscalls and
+    /// not contention): 0.68-0.70 ms median for the
+    /// package's own 28 module directories, 2.90 ms median for the 93 the
+    /// analysis really loads once std is counted. The bar was 1 ms. What the
+    /// pass would buy is announcing an ambiguity earlier than the first import
+    /// that announces it anyway, so the rule keeps its bound and
+    /// `module_resolution::a67_a_collision_nothing_walks_into_is_not_reported`
+    /// holds the tree to it.
     ///
     /// B337: the message names the child AS IT IS SPELLED ON DISK. A child
     /// bodied by `b/lib.vl`, and a pure NAMESPACE child (`a/c/` holding
