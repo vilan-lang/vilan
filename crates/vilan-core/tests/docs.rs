@@ -306,46 +306,99 @@ fn the_sidebar_covers_every_page() {
 /// gated rather than trusted: a hand-copied word list is one commit from being
 /// wrong (the three-place rule's own history, and N60's "nine" one file over).
 ///
-/// The spec's two lists (§2.2, §A.2) are outside this gate deliberately: they
-/// are prose-formatted with the boolean and null literals called out separately,
-/// and `grammar_sync.rs` already holds the machine-read grammars to the same
-/// table. This is the reader-facing list, held to the same source.
+/// `grammar_sync.rs` holds the machine-read grammars to the same table; this is
+/// the reader-facing list, and N87 added the spec's two below.
 #[test]
 fn the_tours_reserved_words_are_the_lexers_keywords() {
-    let page = docs_root().join("tour/values-and-types.md");
+    assert_reserved_words_match(
+        &reserved_word_fence("tour/values-and-types.md", "## Reserved words"),
+        "the tour's reserved-word list",
+        "add it to `## Reserved words` in `vilan/docs/tour/values-and-types.md`, \
+         alphabetically.",
+    );
+}
+
+/// The `text` fence under `heading` in a docs page, as a set of words.
+///
+/// Every reserved-word list in the tree is written this way — one fence, words
+/// separated by whitespace — so the three gates below read them the same way
+/// and a list that stops being a fence reds loudly rather than going empty.
+fn reserved_word_fence(relative: &str, heading: &str) -> BTreeSet<String> {
+    let page = docs_root().join(relative);
     let text = std::fs::read_to_string(&page)
         .unwrap_or_else(|error| panic!("{}: {error}", page.display()));
-    let heading = "## Reserved words";
     let after = text
         .split_once(heading)
         .unwrap_or_else(|| panic!("`{heading}` is gone from {}", page.display()))
         .1;
     let fence = after
         .split_once("```text\n")
-        .expect("the reserved-word section opens a `text` fence")
+        .unwrap_or_else(|| panic!("{heading} opens no `text` fence in {relative}"))
         .1
         .split_once("```")
-        .expect("that fence closes")
+        .unwrap_or_else(|| panic!("{heading}'s fence does not close in {relative}"))
         .0;
-    let listed: BTreeSet<&str> = fence.split_whitespace().collect();
-    let lexed: BTreeSet<&str> = vilan_core::lexing::KEYWORDS
-        .iter()
-        .map(|(word, _)| *word)
-        .collect();
+    fence.split_whitespace().map(str::to_string).collect()
+}
 
-    let missing: Vec<&&str> = lexed.difference(&listed).collect();
+/// The lexer's keyword table, as a set of words.
+fn lexed_keywords() -> BTreeSet<String> {
+    vilan_core::lexing::KEYWORDS
+        .iter()
+        .map(|(word, _)| word.to_string())
+        .collect()
+}
+
+/// Held both ways: `listed` is `lexed_keywords()`, or the assertion says which
+/// direction failed and where to fix it.
+fn assert_reserved_words_match(listed: &BTreeSet<String>, where_: &str, fix: &str) {
+    let lexed = lexed_keywords();
+    let missing: Vec<&String> = lexed.difference(listed).collect();
     assert!(
         missing.is_empty(),
-        "the tour's reserved-word list is missing {missing:?}. A reader who \
-         cannot see the word cannot avoid it — add it to `## Reserved words` in \
-         `vilan/docs/tour/values-and-types.md`, alphabetically."
+        "{where_} is missing {missing:?}. A word a reader cannot see is a word \
+         they cannot avoid — {fix}"
     );
-    let unknown: Vec<&&str> = listed.difference(&lexed).collect();
+    let unknown: Vec<&String> = listed.difference(&lexed).collect();
     assert!(
         unknown.is_empty(),
-        "the tour lists {unknown:?} as reserved, and the lexer does not. A word \
-         that stopped being a keyword is a word the tour is telling readers not \
+        "{where_} lists {unknown:?} as reserved, and the lexer does not. A word \
+         that stopped being a keyword is a word the docs are telling readers not \
          to use for nothing."
+    );
+}
+
+/// The SPEC's two reserved-word lists are the lexer's too (tracker N87).
+///
+/// Only the tour's was gated, and the spec's pair drifted exactly as a
+/// hand-copied list does: §A.2 had been missing `css` from the day the css
+/// block shipped until a lane added it and `lazy` by hand, and at the moment
+/// this gate was written §2.2 was still missing `lazy` — the normative list, in
+/// the document that defines what an identifier may be, naming 33 of 34
+/// keywords. Nothing could have said so. The tour's gate carried a note
+/// arguing the spec's two were outside it because they are "prose-formatted
+/// with the boolean and null literals called out separately"; they are not
+/// prose, they are `text` fences with the literals inside them and the
+/// call-out in a sentence underneath, so there was nothing to except.
+///
+/// Both lists are held, not one: they are two lists, and a rule that holds the
+/// appendix while the normative section drifts is the same failure one level
+/// down.
+#[test]
+fn the_specs_reserved_words_are_the_lexers_keywords() {
+    // §2.2 opens with the IDENT grammar's own fence, so the anchor is the
+    // sentence that introduces the list rather than the heading above both.
+    assert_reserved_words_match(
+        &reserved_word_fence("spec/lexical.md", "keyword tokens and are never `IDENT`:"),
+        "the spec's §2.2 reserved-word list",
+        "add it to the fence in `vilan/docs/spec/lexical.md`, alphabetically, \
+         with the two boolean literals last.",
+    );
+    assert_reserved_words_match(
+        &reserved_word_fence("spec/appendix.md", "## A.2 Reserved words"),
+        "the spec's §A.2 reserved-word list",
+        "add it to the fence in `vilan/docs/spec/appendix.md`, alphabetically, \
+         with the two boolean literals last.",
     );
 }
 
