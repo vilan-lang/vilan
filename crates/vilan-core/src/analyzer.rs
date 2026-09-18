@@ -25963,12 +25963,10 @@ impl<'src> Analyzer<'src> {
                         }
                     }
                 }
-                Expr::Is(subject_id, pattern) => {
-                    if self.is_capture_subject_place(*subject_id) {
-                        let mut captures = Vec::new();
-                        Self::collect_pattern_captures(pattern, &mut captures);
-                        candidates.extend(captures.into_iter().map(|id| (id, *subject_id)));
-                    }
+                Expr::Is(subject_id, pattern) if self.is_capture_subject_place(*subject_id) => {
+                    let mut captures = Vec::new();
+                    Self::collect_pattern_captures(pattern, &mut captures);
+                    candidates.extend(captures.into_iter().map(|id| (id, *subject_id)));
                 }
                 _ => {}
             }
@@ -53032,10 +53030,8 @@ fn collect_std_item_modules(nodes: &NodeList) -> Vec<&'static str> {
             // A70: a `css` block makes `std::style::prelude` ambient inside
             // itself, so the module has to be loaded for a hole to be able to
             // reach it — the same seed, for the same reason.
-            Node::CssScope(_) => {
-                if !found.iter().any(|seen| seen == "style::prelude") {
-                    found.push("style::prelude".to_string());
-                }
+            Node::CssScope(_) if !found.iter().any(|seen| seen == "style::prelude") => {
+                found.push("style::prelude".to_string());
             }
             _ => {}
         }
@@ -53457,7 +53453,7 @@ impl PackageSpec {
             })
             .collect();
         // Stable sort by descending specificity keeps declaration order for ties.
-        matching.sort_by(|a, b| b.0.cmp(&a.0));
+        matching.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         matching
     }
 
@@ -53541,10 +53537,8 @@ fn longest_module_prefix(roots: &[&Path], path: &str) -> Option<String> {
         if resolve_module_in_roots(roots, &candidate).is_some() {
             return Some(candidate);
         }
-        match candidate.rfind("::") {
-            Some(cut) => candidate.truncate(cut),
-            None => return None,
-        }
+        let cut = candidate.rfind("::")?;
+        candidate.truncate(cut);
     }
 }
 
@@ -53572,10 +53566,8 @@ fn longest_namespace_prefix(roots: &[&Path], path: &str, floor: usize) -> Option
         {
             return Some(candidate);
         }
-        match candidate.rfind("::") {
-            Some(cut) => candidate.truncate(cut),
-            None => return None,
-        }
+        let cut = candidate.rfind("::")?;
+        candidate.truncate(cut);
     }
 }
 

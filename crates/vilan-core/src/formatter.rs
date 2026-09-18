@@ -5204,8 +5204,7 @@ impl<'src> Printer<'src> {
         let (_, spine) = Self::postfix_spine(expr);
         spine
             .iter()
-            .filter(|step| Self::is_call_link(&step.0))
-            .next_back()
+            .rfind(|step| Self::is_call_link(&step.0))
             .and_then(|step| match &step.0 {
                 Node::MemberAccessor(_, member) => Some(member),
                 _ => None,

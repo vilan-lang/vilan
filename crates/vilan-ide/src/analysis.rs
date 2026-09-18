@@ -209,10 +209,9 @@ pub fn signature_label(program: &Program, target: Id) -> Option<String> {
 pub fn call_parameter_names(program: &Program, target: Id) -> Option<Vec<String>> {
     let parameter_ids = if let Some(function) = program.functions.get(&target) {
         &function.parameters
-    } else if let Some(external) = program.external_functions.get(&target) {
-        &external.parameters
     } else {
-        return None;
+        let external = program.external_functions.get(&target)?;
+        &external.parameters
     };
     Some(
         parameter_ids

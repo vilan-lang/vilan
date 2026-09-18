@@ -1056,10 +1056,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             matches!(self.program.entity_map.get(&initial), Some(Expr::List(items)) if items.is_empty())
         });
         let annotation = if initializer_needs_a_type {
-            match self.rust_type(variable.type_id, self.span_of(binding)) {
-                Ok(rendered) => format!(": {rendered}"),
-                Err(error) => return Err(error),
-            }
+            let rendered = self.rust_type(variable.type_id, self.span_of(binding))?;
+            format!(": {rendered}")
         } else {
             String::new()
         };

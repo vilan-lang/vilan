@@ -2834,7 +2834,7 @@ fn checked_cache_bytes_per_world() {
         let _ = observe(program);
         let (bytes, records) = vilan_core::analyzer::checked_cache_retained();
         widest = widest.max(bytes);
-        let worlds_in_budget = if bytes == 0 { 0 } else { budget / bytes };
+        let worlds_in_budget = budget.checked_div(bytes).unwrap_or(0);
         println!(
             "PERF {{\"section\":\"checked_cache\",\"corpus\":\"{name}\",\
              \"mode\":\"tables\",\"metric\":\"retained_bytes\",\"profile\":\"{profile}\",\

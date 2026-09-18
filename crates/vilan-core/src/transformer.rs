@@ -103,7 +103,7 @@ pub fn transform_functions<'src>(
         .required_functions
         .into_iter()
         .collect::<Vec<_>>();
-    t_functions.sort_by(|a, b| (a.0.0).cmp(&b.0.0));
+    t_functions.sort_by_key(|a| a.0.0);
     let t_functions = t_functions.into_iter().map(|x| x.1);
     let t_instances = transformer.monomorphized.into_iter();
 
@@ -3376,7 +3376,7 @@ impl<'src> Transformer<'src> {
         }
 
         let mut t_functions = self.required_functions.into_iter().collect::<Vec<_>>();
-        t_functions.sort_by(|a, b| (a.0.0).cmp(&b.0.0));
+        t_functions.sort_by_key(|a| a.0.0);
 
         // The route-chunk partition (`bundle-splitting.md` §1): a function
         // reachable from exactly one route arm and nothing eager leaves the
