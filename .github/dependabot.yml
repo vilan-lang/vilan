@@ -17,6 +17,13 @@ version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
+    # `next`, not the default branch. The workflows change on `next` and reach
+    # `main` only by the release fold, so a bump merged into `main` misses
+    # every `uses:` line `next` has added since, and the fold then leaves one
+    # workflow carrying two pins of the same action. `next` is also where the
+    # whole CI runs against the bump. Dependabot reads THIS file from the
+    # default branch only, so the line takes effect once it is on `main`.
+    target-branch: next
     schedule:
       interval: weekly
     commit-message:
@@ -25,6 +32,15 @@ updates:
       # One PR for the routine bumps rather than one per action: the review
       # that matters here is "did the pinned SHA move to something upstream
       # actually tagged", and that reads better as a single diff.
+      #
+      # Minor and patch only. A major is not routine — it is a different
+      # review (the action's breaking-change notes, read against how the
+      # workflows call it) and it must be revertible alone, above all in
+      # release.yml, which no pull request exercises. Left out of the group,
+      # each major arrives as its own PR.
       actions:
         patterns:
           - "*"
+        update-types:
+          - minor
+          - patch
