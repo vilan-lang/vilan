@@ -168,7 +168,7 @@ jobs:
       # fail-fast is off via the committed .config/nextest.toml — this
       # workflow is the instrument that produces the COMPLETE failure list
       # per push (the exit code still gates).
-      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+      - uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab # v2.87.13
         with:
           tool: cargo-nextest
       # The registry, the git checkouts and `target/`, carried between runs.
@@ -359,7 +359,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # The same installer the suite legs use for nextest, same pin.
-      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+      - uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab # v2.87.13
         with:
           tool: cargo-audit
       - name: No advisory against the dependency tree
