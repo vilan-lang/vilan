@@ -36,6 +36,7 @@ use std::rc;
 use std::rc::Rc;
 
 pub mod executor;
+pub mod http;
 
 // ---------------------------------------------------------------- strings ---
 

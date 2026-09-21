@@ -931,6 +931,11 @@ struct Runtime {
     /// one from here before it grows the slab, which is what keeps a server's
     /// per-request spawns from growing it without bound.
     free_slots: RefCell<Vec<usize>>,
+    /// F18: the external readiness sources the loop polls once per turn — a
+    /// listening socket and its connections. Empty for every program that does
+    /// no I/O, which is what keeps the turn model below EXACTLY J6's for all of
+    /// them.
+    io: RefCell<Vec<Rc<dyn IoSource>>>,
     microtasks: RefCell<VecDeque<TaskId>>,
     timers: RefCell<Vec<Rc<TimerSlot>>>,
     current: Cell<Option<TaskId>>,
@@ -942,6 +947,7 @@ thread_local! {
         Runtime {
             tasks: RefCell::new(Vec::new()),
             free_slots: RefCell::new(Vec::new()),
+            io: RefCell::new(Vec::new()),
             microtasks: RefCell::new(VecDeque::new()),
             timers: RefCell::new(Vec::new()),
             current: Cell::new(None),
@@ -1131,25 +1137,128 @@ fn reap_settled() {
 /// Answers whether anything fired — `false` means the deadline list is empty and
 /// the loop is done.
 fn advance_timers() -> bool {
-    let earliest = RUNTIME.with(|runtime| {
-        let mut timers = runtime.timers.borrow_mut();
-        timers.retain(|slot| !slot.cancelled.get() && !slot.fired.get());
-        timers
-            .iter()
-            .min_by_key(|slot| (slot.deadline, slot.sequence))
-            .cloned()
-    });
-    let Some(slot) = earliest else {
+    let Some(slot) = earliest_timer() else {
         return false;
     };
     let now = Instant::now();
     if slot.deadline > now {
         std::thread::sleep(slot.deadline - now);
     }
+    fire_timer(&slot);
+    true
+}
+
+/// The earliest live entry of the deadline list, with the dead ones swept.
+fn earliest_timer() -> Option<Rc<TimerSlot>> {
+    RUNTIME.with(|runtime| {
+        let mut timers = runtime.timers.borrow_mut();
+        timers.retain(|slot| !slot.cancelled.get() && !slot.fired.get());
+        timers
+            .iter()
+            .min_by_key(|slot| (slot.deadline, slot.sequence))
+            .cloned()
+    })
+}
+
+/// Marks one timer fired and runs its action — the macrotask itself, split out
+/// so the I/O turn (F18) can fire a DUE timer without the wait.
+fn fire_timer(slot: &Rc<TimerSlot>) {
     slot.fired.set(true);
     let action = slot.action.borrow_mut().take();
     if let Some(action) = action {
         action();
+    }
+}
+
+// ------------------------------------------------------------------- I/O ---
+
+/// A source of external readiness the loop looks at once per turn (F18).
+///
+/// This is the whole of the executor's I/O story, and it is deliberately a POLL
+/// rather than a readiness notification. `std::net` offers `set_nonblocking` and
+/// nothing else: an `epoll`/`kqueue`/IOCP registration needs libc, which needs a
+/// dependency and `unsafe`, and this crate has neither by rule (Order 37 R8,
+/// Order 39 R1). So a listening socket is a source that ACCEPTS without
+/// blocking, its connections are sources that read and write without blocking,
+/// and the turn model asks each of them "did anything happen" once per turn.
+///
+/// The cost is bounded and named: with nothing ready and no timer due, the loop
+/// waits [`IO_POLL_INTERVAL`] before looking again, so an idle server wakes a
+/// thousand times a second and a request waits at most a millisecond longer than
+/// it would under a readiness notification. That is the price of the rule, and
+/// the shape to replace when a platform layer is allowed a dependency.
+pub trait IoSource {
+    /// Look for work, without blocking. `true` if anything progressed — a
+    /// connection accepted, bytes read, bytes written, a request dispatched.
+    /// A `true` answer sends the loop back to the microtask queue, exactly as a
+    /// fired timer does.
+    fn poll(&self) -> bool;
+
+    /// Whether this source can still produce work. A closed listener with no
+    /// live connections answers `false`, is dropped from the registry, and the
+    /// loop goes back to exiting when the deadline list empties.
+    fn is_live(&self) -> bool;
+}
+
+/// How long the loop waits when no source is ready and no timer is due.
+const IO_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Registers `source` with the loop. A server calls this when it binds.
+pub fn register_io(source: Rc<dyn IoSource>) {
+    RUNTIME.with(|runtime| runtime.io.borrow_mut().push(source));
+}
+
+fn io_registered() -> bool {
+    RUNTIME.with(|runtime| !runtime.io.borrow().is_empty())
+}
+
+/// Polls every registered source once, dropping the dead ones. `true` if any of
+/// them progressed.
+fn poll_io() -> bool {
+    let sources: Vec<Rc<dyn IoSource>> =
+        RUNTIME.with(|runtime| runtime.io.borrow().iter().map(Rc::clone).collect());
+    let mut progressed = false;
+    for source in &sources {
+        if source.poll() {
+            progressed = true;
+        }
+    }
+    RUNTIME.with(|runtime| runtime.io.borrow_mut().retain(|source| source.is_live()));
+    progressed
+}
+
+/// The non-microtask half of one turn.
+///
+/// With no I/O registered this IS [`advance_timers`], unchanged — which is what
+/// keeps every ordering rule J6 pinned true for every program that does no I/O.
+/// With a live source it is the same one-macrotask-per-turn rule extended by one
+/// kind of macrotask: a poll of the sources, then the single earliest DUE timer
+/// (due, so the wait cannot be spent blind to a socket), then a bounded wait.
+fn advance_macrotasks() -> bool {
+    if !io_registered() {
+        return advance_timers();
+    }
+    if poll_io() {
+        return true;
+    }
+    if let Some(slot) = earliest_timer()
+        && slot.deadline <= Instant::now()
+    {
+        fire_timer(&slot);
+        return true;
+    }
+    if !io_registered() {
+        // Every source died in this turn's poll: back to the plain timer step,
+        // which is allowed to sleep and lets the program exit.
+        return advance_timers();
+    }
+    let wait = earliest_timer()
+        .map(|slot| slot.deadline.saturating_duration_since(Instant::now()))
+        .map_or(IO_POLL_INTERVAL, |remaining| {
+            remaining.min(IO_POLL_INTERVAL)
+        });
+    if !wait.is_zero() {
+        std::thread::sleep(wait);
     }
     true
 }
@@ -1283,7 +1392,7 @@ pub fn block_on<T: Clone + 'static>(body: impl Future<Output = T> + 'static) -> 
             raise(failure);
         }
         reap_settled();
-        if !advance_timers() {
+        if !advance_macrotasks() {
             break;
         }
     }
