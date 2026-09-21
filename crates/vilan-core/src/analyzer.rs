@@ -4058,6 +4058,13 @@ pub struct Analyzer<'src> {
     // (`__force`), which is what makes the callee side "a plain `T`, fully
     // transparent"; the two sets above are the only places a read does not.
     lazy_cells: HashSet<Id>,
+    // M81: the `lazy` PARAMETERS this program lowers eagerly — every call site
+    // fills them with an inert expression, so no cell is built and the
+    // callee's reads do not force. A set beside `lazy_cells` rather than a
+    // removal FROM it: `lazy_cells` is also what the declaration-side refusals
+    // are gated on, and "this parameter's type is a resource" is wrong whether
+    // or not anybody calls it.
+    lazy_eager_parameters: HashSet<Id>,
     // Every `lazy let` DECLARATION, in source order, before it is known whether
     // it is module-level (§2) or a local (§3, excluded). `record_lazy_bindings`
     // partitions it: a module-level one becomes a cell, a local is refused.
@@ -5806,6 +5813,7 @@ impl<'src> Analyzer<'src> {
             lazy_argument_thunks: IndexMap::default(),
             lazy_argument_forwards: HashSet::default(),
             lazy_cells: HashSet::default(),
+            lazy_eager_parameters: HashSet::default(),
             lazy_binding_declarations: Vec::new(),
             lazy_local_bindings: Vec::new(),
             lazy_binding_initializers: IndexMap::default(),
@@ -24703,6 +24711,11 @@ impl<'src> Analyzer<'src> {
             .values()
             .map(|call| (call.subject_id, call.argument_ids.clone()))
             .collect();
+        // M81's first pass: every (lazy parameter, argument) pair this program
+        // actually resolved, banked before anything is recorded, because the
+        // elision below is a fact about the PARAMETER and the arguments decide
+        // it together.
+        let mut lazy_pairs: Vec<(Id, Id, &'src str)> = Vec::new();
         for (subject_id, argument_ids) in calls {
             let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
                 continue;
@@ -24721,21 +24734,82 @@ impl<'src> Analyzer<'src> {
                 if !parameter.lazy {
                     continue;
                 }
-                let name = parameter.name;
-                // A bare reference to a binding that already holds a cell is a
-                // FORWARD: pass the cell, do not force it and do not wrap it in
-                // a second one. Anything else — including a reference wrapped in
-                // so much as a field access — is an expression to defer.
-                if matches!(
-                    self.expr_id_to_expr_map.get(argument_id),
-                    Some(Expr::Local(binding)) if self.lazy_cells.contains(binding)
-                ) {
-                    self.lazy_argument_forwards.insert(*argument_id);
-                } else {
-                    self.lazy_argument_thunks.insert(*argument_id, name);
-                }
+                lazy_pairs.push((*parameter_id, *argument_id, parameter.name));
             }
         }
+        // M81 — **a lazy parameter every call site fills INERTLY is eager in
+        // this program.** 111 of A103's 114 `__lazy` emissions carried a
+        // literal, an enum constant or `[]`, and each one allocated a memo
+        // cell at the call site and paid a `__force` on the callee's hot path
+        // for an expression that cannot have an effect, cannot fail and cannot
+        // cycle.
+        //
+        // The decision is per PARAMETER and not per argument, and it has to
+        // be: the callee is emitted once for every call site it has, so its
+        // reads either force or they do not. A parameter one site thunks and
+        // another fills with `0` keeps its cell at BOTH, which is why the
+        // eager set is the parameters whose every recorded argument is inert
+        // and which forward no cell.
+        //
+        // A parameter with no recorded call site at all is eager too, which is
+        // the only shape here that is not purely an optimization: a function
+        // taken as a VALUE is called through a path `record_lazy_arguments`
+        // never sees, so its lazy parameter received a plain value and the
+        // callee's `__force` read `.state` off it. That was already broken
+        // before this; eliding makes the no-direct-call case correct and
+        // leaves the mixed case as it was (reported as a finding, not fixed
+        // here).
+        // Optimistic, then retracted to a FIXPOINT, because eagerness
+        // propagates along the forwarding chain: a read of an eager
+        // parameter is itself inert (its value was fixed at the outer call
+        // site and a parameter binding is immutable), so `middle`'s hop into
+        // `inner` stays a plain pass-through instead of re-wrapping the value
+        // in a cell the way a per-pair decision would. Each round only ever
+        // removes, so it terminates in at most one round per parameter.
+        let mut eager_parameters: HashSet<Id> = self
+            .parameters
+            .values()
+            .filter(|parameter| parameter.lazy)
+            .map(|parameter| parameter.id)
+            .collect();
+        loop {
+            let retracted: Vec<Id> = lazy_pairs
+                .iter()
+                .filter(|(parameter_id, argument_id, _)| {
+                    eager_parameters.contains(parameter_id)
+                        && !self.lazy_argument_is_inert(*argument_id, &eager_parameters)
+                })
+                .map(|(parameter_id, _, _)| *parameter_id)
+                .collect();
+            if retracted.is_empty() {
+                break;
+            }
+            for parameter_id in retracted {
+                eager_parameters.remove(&parameter_id);
+            }
+        }
+        for (parameter_id, argument_id, name) in &lazy_pairs {
+            if eager_parameters.contains(parameter_id) {
+                continue;
+            }
+            // A bare reference to a binding that already holds a cell is a
+            // FORWARD: pass the cell, do not force it and do not wrap it in
+            // a second one. Anything else — including a reference wrapped in
+            // so much as a field access — is an expression to defer. An EAGER
+            // lazy parameter is in `lazy_cells` and holds no cell, so it is
+            // not a forward; its read thunks like any other value (M81).
+            if matches!(
+                self.expr_id_to_expr_map.get(argument_id),
+                Some(Expr::Local(binding))
+                    if self.lazy_cells.contains(binding)
+                        && !eager_parameters.contains(binding)
+            ) {
+                self.lazy_argument_forwards.insert(*argument_id);
+            } else {
+                self.lazy_argument_thunks.insert(*argument_id, *name);
+            }
+        }
+        self.lazy_eager_parameters = eager_parameters;
         // The effects half, in a second loop so the borrow of `self` the walk
         // takes does not fight the insert above.
         let thunks: Vec<Id> = self.lazy_argument_thunks.keys().copied().collect();
@@ -24750,6 +24824,69 @@ impl<'src> Analyzer<'src> {
                 &mut effects,
             );
             self.lazy_thunk_effects.insert(argument_id, effects);
+        }
+    }
+
+    /// M81 — whether the expression standing in a `lazy` position is INERT:
+    /// evaluating it has no effect, cannot fail, cannot suspend and cannot
+    /// reach a lazy cell, so evaluating it EAGERLY is unobservable.
+    ///
+    /// "Unobservable" is the whole claim, so the set is deliberately the
+    /// smallest one that covers what the retrofit actually sees — a literal, a
+    /// unary operator over one, an EMPTY collection literal and a nullary enum
+    /// constant. Three properties hold of every member and are what the claim
+    /// rests on:
+    ///
+    ///  - **no effects**, so evaluating it at the call site rather than at the
+    ///    first read runs nothing the program did not already run;
+    ///  - **no failure and no cycle**, so `__force`'s poison and
+    ///    initialization-cycle states are unreachable for it — a thunk that
+    ///    cannot throw makes the `at most once` memo an accounting detail;
+    ///  - **one value per evaluation site**, so a callee that reads the
+    ///    parameter twice sees the same value either way (an eager `[]` is
+    ///    one array handed over, exactly as a forced thunk's would be).
+    ///
+    /// A non-empty list literal is deliberately NOT inert: its elements are
+    /// arbitrary expressions. Nor is a `Local` — a bare binding read looks
+    /// inert and may be a lazy CELL, which is the forwarding case, and
+    /// widening this to cover it would change what forwarding means.
+    fn lazy_argument_is_inert(&self, argument_id: Id, eager: &HashSet<Id>) -> bool {
+        match self.expr_id_to_expr_map.get(&argument_id) {
+            Some(Expr::Number(..))
+            | Some(Expr::String(_))
+            | Some(Expr::Bool(_))
+            | Some(Expr::Null) => true,
+            // `-1`, `!false` — an operator over an inert operand is inert.
+            Some(Expr::Unary(_, inner)) => self.lazy_argument_is_inert(*inner, eager),
+            // `[]`. A non-empty literal carries expressions.
+            Some(Expr::List(items)) => items.is_empty(),
+            // `None`, `Ordering::Equal` — a variant constant, which is the
+            // constructor's own value and not a call of it (`Expr::Call`).
+            Some(Expr::EnumVariant(_, _)) => true,
+            // Two locals are inert, and no others.
+            //
+            // A read of a parameter this pass has already decided is EAGER: it
+            // holds a value fixed at the outer call site, and a parameter
+            // binding is immutable, so reading it here or at a later force
+            // yields the same thing. This is the forwarding chain's own rule,
+            // and it is the reason the decision is taken to a fixpoint.
+            //
+            // And a nullary VARIANT — `None`, `Ordering::Equal` — which
+            // reaches here as a reference to the variant's own declaration.
+            // It is a constant: the emission is an array literal and there is
+            // no expression under it.
+            //
+            // Any OTHER local is not: a `mut` module binding read eagerly at
+            // the call site and lazily at the first use can differ, which is
+            // exactly observable.
+            Some(Expr::Local(binding)) => {
+                eager.contains(binding)
+                    || matches!(
+                        self.expr_id_to_expr_map.get(binding),
+                        Some(Expr::EnumVariant(_, _))
+                    )
+            }
+            _ => false,
         }
     }
 
@@ -50830,6 +50967,14 @@ pub struct Program<'src> {
     /// The bindings that hold a memo cell: `lazy` parameters (§1) and `lazy let`
     /// module bindings (§2). A read of one forces it.
     pub lazy_cells: HashSet<Id>,
+    /// M81 — the `lazy` parameters this program lowers EAGERLY: every call site
+    /// filled them with an inert expression (a literal, a unary operator over
+    /// one, `[]`, an enum constant, or a read of another eager lazy
+    /// parameter), so no `__lazy` cell is built at the call site and the
+    /// callee's reads emit no `__force`. A member of this set is still in
+    /// [`Self::lazy_cells`] — the declaration-side facts about it are
+    /// unchanged — and every read of it must consult both.
+    pub lazy_eager_parameters: HashSet<Id>,
     /// A `lazy let`'s initializer expression id, mapped to the binding's name
     /// (§2) — the transformer labels the cell with it, and
     /// `check_lazy_argument_effects` names the binding in its refusals.
@@ -59951,6 +60096,7 @@ fn analyze_over_world<'src>(
         lazy_argument_thunks: std::mem::take(&mut analyzer.lazy_argument_thunks),
         lazy_argument_forwards: std::mem::take(&mut analyzer.lazy_argument_forwards),
         lazy_cells: std::mem::take(&mut analyzer.lazy_cells),
+        lazy_eager_parameters: std::mem::take(&mut analyzer.lazy_eager_parameters),
         lazy_binding_initializers: std::mem::take(&mut analyzer.lazy_binding_initializers),
         lazy_thunk_effects: std::mem::take(&mut analyzer.lazy_thunk_effects),
         suspending_calls: HashSet::default(),

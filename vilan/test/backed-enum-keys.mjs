@@ -4,27 +4,8 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
-function __force(cell) {
-	if (cell.state === 2) return cell.value;
-	if (cell.state === 1) throw "lazy initialization cycle: `" + cell.name + "`";
-	if (cell.state === 3) throw "lazy `" + cell.name + "` is poisoned: its initializer panicked: " + cell.value;
-	cell.state = 1;
-	try {
-		cell.value = cell.thunk();
-	} catch (failure) {
-		cell.state = 3;
-		cell.value = failure;
-		throw failure;
-	}
-	cell.state = 2;
-	cell.thunk = null;
-	return cell.value;
-}
 function __hash(value) {
 	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
-}
-function __lazy(name, thunk) {
-	return { name: name, state: 0, value: undefined, thunk: thunk };
 }
 function __map_get(map, key) {
 	return map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];
@@ -63,7 +44,7 @@ function $f(self, fallback) {
 		const x = __clone($g[1]);
 		$h = x;
 	} else {
-		$h = __clone(__force(fallback));
+		$h = __clone(fallback);
 	}
 	return $h;
 }
@@ -95,12 +76,8 @@ function $q(self, value) {
 let widths = $a();
 $b(widths, "flex-start", 1);
 $b(widths, "flex-end", 2);
-console.log($f($c(widths, "flex-start"), __lazy("fallback", () => {
-	return 0;
-})));
-console.log($f($c(widths, "flex-end"), __lazy("fallback", () => {
-	return 0;
-})));
+console.log($f($c(widths, "flex-start"), 0));
+console.log($f($c(widths, "flex-end"), 0));
 console.log($i(widths, "flex-start"));
 console.log($j(widths));
 let levels = $k();

@@ -8,25 +8,6 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
-function __force(cell) {
-	if (cell.state === 2) return cell.value;
-	if (cell.state === 1) throw "lazy initialization cycle: `" + cell.name + "`";
-	if (cell.state === 3) throw "lazy `" + cell.name + "` is poisoned: its initializer panicked: " + cell.value;
-	cell.state = 1;
-	try {
-		cell.value = cell.thunk();
-	} catch (failure) {
-		cell.state = 3;
-		cell.value = failure;
-		throw failure;
-	}
-	cell.state = 2;
-	cell.thunk = null;
-	return cell.value;
-}
-function __lazy(name, thunk) {
-	return { name: name, state: 0, value: undefined, thunk: thunk };
-}
 function to_string(self) {
 	return "" + self;
 }
@@ -70,7 +51,7 @@ function $c(self, fallback) {
 		const x = __clone($d[1]);
 		$e = x;
 	} else {
-		$e = __clone(__force(fallback));
+		$e = __clone(fallback);
 	}
 	return $e;
 }
@@ -92,9 +73,7 @@ if ($b[0] === 1) {
 } else {
 	$a = [ 0, $b[1] * 2 ];
 }
-console.log($c($a, __lazy("fallback", () => {
-	return -(1);
-})));
+console.log($c($a, -(1)));
 let $f = null;
 const $g = count;
 if ($g[0] === 1) {
@@ -102,9 +81,7 @@ if ($g[0] === 1) {
 } else {
 	$f = [ 0, 2 * $g[1] ];
 }
-console.log($c($f, __lazy("fallback", () => {
-	return -(1);
-})));
+console.log($c($f, -(1)));
 let log = [  ];
 let $h = null;
 const $i = fetch2(log, [ 0, 40 ]);
@@ -119,9 +96,7 @@ if ($i[0] === 1) {
 	}
 }
 const both = $h;
-console.log($c(both, __lazy("fallback", () => {
-	return -(1);
-})));
+console.log($c(both, -(1)));
 console.log(log.length);
 let log2 = [  ];
 let $k = null;
@@ -137,9 +112,7 @@ if ($l[0] === 1) {
 	}
 }
 const bad = $k;
-console.log($c(bad, __lazy("fallback", () => {
-	return -(1);
-})));
+console.log($c(bad, -(1)));
 console.log(log2.length);
 let $n = null;
 const $p = parse("good");
@@ -195,15 +168,9 @@ if ($z[0] === 1) {
 	$y = __at($z[1], 0);
 }
 const first = $y;
-console.log($c(first, __lazy("fallback", () => {
-	return -(1);
-})));
-console.log($c(total([ 0, 4 ], [ 0, 2 ]), __lazy("fallback", () => {
-	return -(1);
-})));
-console.log($c(total([ 0, 4 ], [ 1 ]), __lazy("fallback", () => {
-	return -(1);
-})));
+console.log($c(first, -(1)));
+console.log($c(total([ 0, 4 ], [ 0, 2 ]), -(1)));
+console.log($c(total([ 0, 4 ], [ 1 ]), -(1)));
 const size = [ 0, 4 ];
 let $E = null;
 const $F = size;
@@ -217,9 +184,7 @@ if ($F[0] === 1) {
 		$E = [ 0, $F[1] * $G[1] ];
 	}
 }
-console.log($c($E, __lazy("fallback", () => {
-	return -(1);
-})));
+console.log($c($E, -(1)));
 const boxed = [ 20, "a" ];
 const doubled = $H(boxed, ($I) => {
 	return $I * 2;

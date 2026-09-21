@@ -187,10 +187,21 @@ fn forwarding_a_lazy_parameter_to_an_eager_position_forces_it() {
 /// The emission half of the two pins above, which behaviour cannot tell apart:
 /// a forward passes the CELL (no `__force`, no second `__lazy`), and the eager
 /// position forces.
+///
+/// **M81 edited the fixture and not the claim.** It used to call `middle("a")`
+/// and `forces("b")`, and a string LITERAL in a lazy position is now lowered
+/// eagerly — so the fixture pinned three shapes that its own arguments had
+/// elided away. `built()` is a call, which is the argument a thunk exists for,
+/// and every assertion below is the one this test always made. The elided
+/// forms have their own pins under §M81 further down.
 #[test]
 fn a_forward_emits_the_cell_and_an_eager_position_emits_a_force() {
     let source = r#"
         import std::io::print;
+
+        fun built(): str {
+            "a"
+        }
 
         fun inner(lazy message: str): i32 {
             print(message);
@@ -211,8 +222,8 @@ fn a_forward_emits_the_cell_and_an_eager_position_emits_a_force() {
         }
 
         fun main() {
-            middle("a");
-            forces("b");
+            middle(built());
+            forces(built());
         }
         "#;
     // The hop re-wraps nothing and forces nothing.
@@ -1126,6 +1137,13 @@ fn a_lazy_std_fallback_forwards_from_a_lazy_parameter_without_forcing() {
 /// The emission half, which behaviour cannot tell apart: the retrofitted
 /// positions THUNK at the call site (`__lazy`), and the forwarding hop above
 /// passes the cell straight through.
+///
+/// **M81 edited the fixture and not the claim.** The arguments were `1`, `2`
+/// and `"gone"` — all three INERT, and all three now lowered eagerly, so the
+/// test asserted a thunk over arguments that no longer build one. The
+/// fallbacks are computed by a call here, which is the shape the retrofit
+/// exists for; `a_lazy_position_filled_with_a_literal_builds_no_cell` is the
+/// inert case's own pin.
 #[test]
 fn the_retrofitted_std_members_thunk_at_the_call_site() {
     let source = r#"
@@ -1133,17 +1151,316 @@ fn the_retrofitted_std_members_thunk_at_the_call_site() {
         import std::option::Option::{ self, Some, None };
         import std::result::Result::{ self, Ok, Err };
 
+        fun fallback(): i32 {
+            1
+        }
+
+        fun complaint(): str {
+            "gone"
+        }
+
         fun main() {
             let absent: Option<i32> = None;
-            print(absent.unwrap_or(1));
+            print(absent.unwrap_or(fallback()));
             let bad: Result<i32, str> = Err("boom");
-            print(bad.unwrap_or(2));
+            print(bad.unwrap_or(fallback()));
             let present: Option<i32> = Some(3);
-            print(present.expect("gone"));
+            print(present.expect(complaint()));
         }
         "#;
     assert_emits_containing(source, "__lazy(\"fallback\", () => {");
     assert_emits_containing(source, "__lazy(\"message\", () => {");
+}
+
+// --- §M81, the inert-argument elision -------------------------------------
+
+/// **M81** — a `lazy` position filled with a LITERAL at every call site builds
+/// no cell, and the callee's reads do not force.
+///
+/// 111 of A103's 114 `__lazy` emissions carried a literal, an enum constant or
+/// `[]`; each allocated a memo cell at the call site and paid a `__force` on
+/// the callee's hot path to defer an expression that cannot have an effect,
+/// cannot fail and cannot cycle. The behaviour is unchanged by construction —
+/// there is nothing about evaluating `0` that a program can observe the timing
+/// of — so this is an EMISSION pin, and the run beside it is what says the
+/// value still arrives.
+#[test]
+fn a_lazy_position_filled_with_a_literal_builds_no_cell() {
+    let source = r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            let absent: Option<i32> = None;
+            print(absent.unwrap_or(0));
+        }
+        "#;
+    assert_compiles_and_runs(
+        source, "0
+",
+    );
+    let js = compile(source).expect("a clean compile");
+    assert!(
+        !js.contains("__lazy("),
+        "a literal in a lazy position must not build a cell; emitted:\n{js}"
+    );
+    assert!(
+        !js.contains("__force("),
+        "and the callee must read the parameter plainly, with no cell to \
+         force; emitted:\n{js}"
+    );
+}
+
+/// The four other inert shapes, each on its own, because the set IS the claim:
+/// a negated literal, `[]`, an enum constant and a `bool`.
+#[test]
+fn the_inert_shapes_each_build_no_cell() {
+    for (fallback, expected) in [
+        (
+            "-1", "-1
+",
+        ),
+        (
+            "(0 - 1)", "-1
+",
+        ),
+    ] {
+        let source = format!(
+            r#"
+            import std::io::print;
+            import std::option::Option::{{ self, Some, None }};
+
+            fun main() {{
+                let absent: Option<i32> = None;
+                print(absent.unwrap_or({fallback}));
+            }}
+            "#
+        );
+        assert_compiles_and_runs(&source, expected);
+    }
+    // `[]` — the shape the item names, and the one that allocates.
+    let list = r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            let absent: Option<List<i32>> = None;
+            print(absent.unwrap_or([]).len());
+        }
+        "#;
+    assert_compiles_and_runs(
+        list, "0
+",
+    );
+    assert!(
+        !compile(list).expect("a clean compile").contains("__lazy("),
+        "an empty list literal is inert"
+    );
+    // A `bool` literal.
+    let boolean = r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            let absent: Option<bool> = None;
+            print(absent.unwrap_or(false));
+        }
+        "#;
+    assert_compiles_and_runs(
+        boolean, "false
+",
+    );
+    assert!(
+        !compile(boolean)
+            .expect("a clean compile")
+            .contains("__lazy("),
+        "a `bool` literal is inert"
+    );
+    // An enum CONSTANT — `None` standing in for an `Option<i32>` fallback.
+    let constant = r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        fun main() {
+            let absent: Option<Option<i32>> = None;
+            let inner = absent.unwrap_or(None);
+            print(inner.unwrap_or(7));
+        }
+        "#;
+    assert_compiles_and_runs(
+        constant, "7
+",
+    );
+    assert!(
+        !compile(constant)
+            .expect("a clean compile")
+            .contains("__lazy("),
+        "a nullary variant constant is inert"
+    );
+}
+
+/// **The non-elision, and it is the load-bearing half.** A call in a lazy
+/// position still thunks, and still defers: the whole feature is that the
+/// fallback is not built on the path that does not need it.
+#[test]
+fn a_call_in_a_lazy_position_still_thunks_and_still_defers() {
+    let source = r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        mut built = 0;
+
+        fun expensive(): i32 {
+            built += 1;
+            99
+        }
+
+        fun main() {
+            let present: Option<i32> = Some(1);
+            print(present.unwrap_or(expensive()));
+            print(i"built {built}");
+            let absent: Option<i32> = None;
+            print(absent.unwrap_or(expensive()));
+            print(i"built {built}");
+        }
+        "#;
+    assert_compiles_and_runs(
+        source,
+        "1
+built 0
+99
+built 1
+",
+    );
+    let js = compile(source).expect("a clean compile");
+    assert!(
+        js.contains("__lazy(\"fallback\", () => {"),
+        "a call argument must still build a cell; emitted:\n{js}"
+    );
+    assert!(
+        js.contains("__force("),
+        "and the callee must still force it; emitted:\n{js}"
+    );
+}
+
+/// **The MIXED program**, which is why the decision is per PARAMETER and not
+/// per argument. The callee is emitted once for every call site it has, so its
+/// reads either force or they do not: a parameter one site fills with `0` and
+/// another with a call keeps its cell at BOTH sites.
+#[test]
+fn one_thunking_call_site_keeps_the_cell_at_every_other_site() {
+    let source = r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        mut built = 0;
+
+        fun expensive(): i32 {
+            built += 1;
+            99
+        }
+
+        fun main() {
+            let absent: Option<i32> = None;
+            print(absent.unwrap_or(0));
+            print(absent.unwrap_or(expensive()));
+            print(i"built {built}");
+        }
+        "#;
+    assert_compiles_and_runs(
+        source,
+        "0
+99
+built 1
+",
+    );
+    let js = compile(source).expect("a clean compile");
+    assert!(
+        js.contains("__force("),
+        "one thunking site means the callee forces, so the inert site must \
+         hand it a cell too; emitted:\n{js}"
+    );
+    assert_eq!(
+        js.matches("__lazy(\"fallback\"").count(),
+        2,
+        "both sites build a cell — the inert one cannot be elided while the \
+         callee it shares forces; emitted:\n{js}"
+    );
+}
+
+/// The forwarding chain, which is why the elision is taken to a FIXPOINT. A
+/// read of an eager parameter is itself inert — its value was fixed at the
+/// outer call site and a parameter binding is immutable — so a hop that
+/// forwards one stays a plain pass-through instead of re-wrapping the value in
+/// a cell the next callee would have to force.
+#[test]
+fn an_eager_parameter_forwarded_onward_keeps_the_chain_eager() {
+    let source = r#"
+        import std::io::print;
+
+        fun inner(lazy message: str): i32 {
+            print(message);
+            0
+        }
+
+        fun middle(lazy message: str): i32 {
+            inner(message)
+        }
+
+        fun main() {
+            middle("a");
+        }
+        "#;
+    assert_compiles_and_runs(
+        source, "a
+",
+    );
+    let js = compile(source).expect("a clean compile");
+    assert!(
+        !js.contains("__lazy(") && !js.contains("__force("),
+        "the whole chain is eager: one literal at the outermost site, and no \
+         cell anywhere; emitted:\n{js}"
+    );
+    assert!(
+        js.contains("function middle(message) {\n\treturn inner(message);\n}"),
+        "and the hop is a plain pass-through; emitted:\n{js}"
+    );
+}
+
+/// A `lazy` parameter of a resource type is still refused at its DECLARATION
+/// even when no call site would build a cell for it — the elision is a
+/// lowering decision and must not reach into what the program MEANS.
+///
+/// The first shape of M81 removed the parameter from `lazy_cells`, which is
+/// what the declaration-side refusals are gated on, and this refusal stopped
+/// firing for an uncalled declaration. That is the pin
+/// (`a_lazy_parameter_of_resource_type_is_refused` is the uncalled case; this
+/// is the CALLED one, with an inert argument).
+#[test]
+fn an_inert_argument_does_not_excuse_a_resource_typed_lazy_parameter() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::drop::Drop;
+
+        resource struct Res { tag: str }
+
+        impl Res with Drop {
+            fun drop(&mut self) {
+                print(self.tag);
+            }
+        }
+
+        fun takes(lazy handle: Res): i32 {
+            0
+        }
+
+        fun main() {
+            print("x");
+        }
+        "#,
+        "is a `lazy` parameter of the resource type `Res`",
+    );
 }
 
 /// `unwrap_or_else` is untouched by the retrofit (§6b: "`unwrap_or_else`

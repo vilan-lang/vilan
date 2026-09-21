@@ -4650,7 +4650,11 @@ impl<'src> Transformer<'src> {
                 // another lazy position, and the cell's own declaration — never
                 // reach this arm (`lazy_argument` intercepts the first,
                 // `Expr::Parameter` / the binding emission the second).
-                if self.program.lazy_cells.contains(id) {
+                // M81: a lazy PARAMETER every call site filled inertly holds
+                // the plain value, not a cell, so its reads must not force.
+                if self.program.lazy_cells.contains(id)
+                    && !self.program.lazy_eager_parameters.contains(id)
+                {
                     self.used_helpers.insert("__force");
                     return Some(js::Node::Call(
                         Box::new(js::Node::Local("__force".to_string())),
