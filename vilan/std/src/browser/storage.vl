@@ -11,7 +11,8 @@
 // .local_storage()`) is the form that enumerates and presence-tests a store,
 // and its `get` returns `Option<str>`, so it is also the form that can tell an
 // ABSENT key from one whose stored value is legitimately "". A sweep that
-// deletes the keys an app no longer declares needs `len` + `key_at`; a
+// deletes the keys an app no longer declares needs `keys` (or `len` +
+// `key_at`, counted down); a
 // "initialize this key if unset" pass needs `has`, which `!get(key).is_empty()`
 // answers wrongly for a stored "". Reach for the handle when the store itself
 // is the subject, and for the free functions when a key is.
@@ -117,6 +118,34 @@ export impl Storage {
 		} else {
 			Some(value)
 		}
+	}
+
+	/// Every key the store holds, in the host's own order (A73).
+	///
+	/// The COLLECT-FIRST half of the enumeration, and the one to reach for when
+	/// the pass also WRITES. `len` + `key_at` is the walk, and it has a trap in
+	/// it: removing a key renumbers everything above it, and the host's key order
+	/// is unspecified and may change between visits, so a loop that reads and
+	/// removes in the same pass is only correct counted DOWN. A list of names
+	/// taken before the first write has neither problem — decide per key, remove
+	/// whichever you like, in any order — which is what a sweep that deletes the
+	/// keys an app no longer declares actually wants.
+	///
+	/// A missing index is skipped rather than ending the walk: `len` and `key_at`
+	/// are two host calls, and nothing promises another tab did not remove a key
+	/// between them.
+	fun keys(self): List<str> {
+		mut names: List<str> = [];
+		let count = self.len();
+		mut index = 0;
+		for index < count {
+			match self.key_at(index) {
+				Some(let key) => names.push(key),
+				None => {},
+			}
+			index += 1;
+		}
+		names
 	}
 
 	/// Whether `key` is present at all — including a key stored as "", which is

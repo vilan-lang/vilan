@@ -134,11 +134,20 @@ them — trailing edge. Each `run` pushes the deadline out *and* replaces the
 callback, and there is at most one timer in flight however many times `run` is
 called, so a burst costs one run of the **last** closure.
 
+`flush()` is the explicit-save half: it fires the pending callback **now** and
+calls the window off, so a blur handler, a Save button or a form that unloads
+does not lose the coalesced work. Exactly one run results and nothing runs
+twice — the callback is taken out before it is called, so the parked loop finds
+nothing at the deadline it pre-empted — and a `flush` with nothing pending is a
+no-op. A `run` from inside the flushed callback opens a fresh window in the
+ordinary way.
+
 ```vilan,fragment
 struct Debounce { … }
 impl Debounce {
 	fun new(delay: Duration): Debounce
 	fun run(self, fn: || void)   // pushes the deadline out, replaces the callback
+	fun flush(self)              // fires the pending callback NOW, once
 	fun cancel(self)             // drops the pending callback, calls the timer off
 }
 ```

@@ -336,3 +336,110 @@ fn b277_a_debounce_survives_a_callback_that_throws_and_the_failure_is_reported()
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- A73: `flush` fires the pending callback now -----------------------------
+
+/// Six phases. `flush` is the LEADING half of an explicit save — a blur, a Save
+/// button, a form that unloads before its window would have closed — so what
+/// has to be true is that exactly ONE run results, that it is the LAST
+/// callback, that nothing fires again at the deadline the flush pre-empted, and
+/// that a `flush` with nothing pending is a no-op rather than a second fire.
+const DEBOUNCE_FLUSH: &str = r#"import std::io::print;
+import std::time::{ Debounce, Duration, sleep };
+
+async fun main() {
+	// 1. A burst, flushed: one fire, NOW, with the last callback — and nothing
+	//    at the deadline it pre-empted.
+	let saving = Debounce::new(Duration::seconds(2));
+	saving.run(|| print("flush-first"));
+	saving.run(|| print("flush-last"));
+	saving.flush();
+	print("mark-a");
+	sleep(3000);
+	print("mark-b");
+
+	// 2. A second flush has nothing to fire: the callback was taken out before
+	//    it ran, so this is idempotent rather than a repeat.
+	saving.flush();
+	print("mark-c");
+
+	// 3. …and the debounce is reusable afterwards, on the ordinary trailing
+	//    edge.
+	saving.run(|| print("after-flush"));
+	sleep(3000);
+	print("mark-d");
+
+	// 4. A flush with nothing ever pending is a no-op, not an error.
+	let untouched = Debounce::new(Duration::millis(50));
+	untouched.flush();
+	print("mark-e");
+
+	// 5. A `run` from INSIDE the flushed callback opens a fresh window rather
+	//    than being swallowed by the flush's own cancel.
+	let renewing = Debounce::new(Duration::millis(200));
+	renewing.run(|| {
+		print("renew-flushed");
+		renewing.run(|| print("renew-again"));
+	});
+	renewing.flush();
+	print("mark-f");
+	sleep(2000);
+	print("mark-g");
+
+	// 6. `cancel` after a `run` still fires nothing — flush did not turn the
+	//    two into one verb.
+	let dropped = Debounce::new(Duration::millis(50));
+	dropped.run(|| print("dropped-never"));
+	dropped.cancel();
+	dropped.flush();
+	sleep(1000);
+	print("mark-h");
+}
+"#;
+
+#[test]
+fn a73_flush_fires_the_pending_callback_once_now_and_cancels_the_window() {
+    let dir = temp_project("flush");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", DEBOUNCE_FLUSH);
+    let stdout = run_project(&dir);
+
+    let lines: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let expected = [
+        // One fire, synchronously, and it is the LAST callback — `flush-first`
+        // never appears anywhere.
+        "flush-last",
+        "mark-a",
+        // Nothing at the pre-empted deadline: the parked loop found `pending`
+        // empty and retired at the head.
+        "mark-b",
+        // Idempotent.
+        "mark-c",
+        // Still a working debounce, on the trailing edge.
+        "after-flush",
+        "mark-d",
+        // A flush over nothing.
+        "mark-e",
+        // The re-arm from inside the callback survived the flush's cancel…
+        "renew-flushed",
+        "mark-f",
+        // …and fired on its own window.
+        "renew-again",
+        "mark-g",
+        // A cancelled window is still cancelled, flush or no flush.
+        "mark-h",
+    ];
+    assert_eq!(
+        lines, expected,
+        "the flush exhibit printed the wrong sequence; got:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

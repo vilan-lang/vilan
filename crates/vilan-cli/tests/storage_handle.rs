@@ -336,3 +336,92 @@ done();
         );
     }
 }
+
+// --- 3. A73: `keys()` collects the names before anything is written ---------
+
+/// `keys()` is the COLLECT-FIRST half of the enumeration (A73), and the reason
+/// it exists is the trap in the other half: removing a key renumbers everything
+/// above it, and the host's key order is unspecified, so a `len` + `key_at`
+/// loop that reads AND removes is only correct counted down. A list of names
+/// taken before the first write has neither problem, which is what a sweep that
+/// deletes the keys an app no longer declares wants.
+///
+/// The exhibit therefore does the thing the downward walk exists to make safe —
+/// remove keys while iterating, in FORWARD order — and asserts that every
+/// surviving key is the right one. It also pins the two shapes the walk
+/// mishandles: an empty store answers `[]`, and `keys()` is a SNAPSHOT, so a
+/// removal after the call does not change the list already in hand.
+const KEYS_ENUMERATION: &str = r#"import std::display::Display;
+import std::dom::window;
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::storage;
+
+fun main() {
+	let store = window().local_storage();
+	print(i"empty {store.keys().len()}");
+
+	store.set("keep:a", "1");
+	store.set("drop:b", "2");
+	store.set("keep:c", "3");
+	store.set("drop:d", "4");
+	print(i"all {store.keys().join(\",\")}");
+
+	// A removing sweep, FORWARD, which `len` + `key_at` cannot do: the names
+	// are already in hand, so renumbering cannot skip one.
+	for key in store.keys() {
+		if key.starts_with("drop:") {
+			store.remove(key);
+		}
+	}
+	print(i"swept {store.keys().join(\",\")}");
+	print(i"len {store.len()}");
+
+	// A snapshot: the list keeps the names it was built from.
+	let taken = store.keys();
+	store.remove("keep:a");
+	print(i"snapshot {taken.join(\",\")}");
+	print(i"live {store.keys().join(\",\")}");
+
+	// A key stored as "" is a key — the whole reason the handle exists, and it
+	// must be enumerated like any other.
+	store.set("blank", "");
+	print(i"with-blank {store.keys().join(\",\")}");
+
+	store.clear();
+	print(i"cleared {store.keys().len()}");
+}
+main();
+"#;
+
+#[test]
+fn a73_keys_collects_every_name_and_survives_a_removing_sweep() {
+    let harness = format!(
+        r#"{STORAGE_STUB}
+require("./app.js");
+assert(localStorage.length === 0, "the store is empty when the program is done");
+done();
+"#
+    );
+    let stdout = build_and_run("keys", KEYS_ENUMERATION, &harness);
+    for claim in [
+        "empty 0",
+        // The host's order is insertion order in the stub, and `keys` reports
+        // it as it finds it.
+        "all keep:a,drop:b,keep:c,drop:d",
+        // The forward removing sweep kept exactly the right two.
+        "swept keep:a,keep:c",
+        "len 2",
+        // A snapshot does not follow the store.
+        "snapshot keep:a,keep:c",
+        "live keep:c",
+        // A key stored as "" is still a key.
+        "with-blank keep:c,blank",
+        "cleared 0",
+    ] {
+        assert!(
+            stdout.contains(claim),
+            "`keys()` must print `{claim}`; got:\n{stdout}"
+        );
+    }
+}

@@ -505,6 +505,7 @@ external struct Storage;
 impl Storage {
 	fun len(self): i32
 	fun key_at(self, index: i32): Option<str>   // None past the end
+	fun keys(self): List<str>                   // every name, collected
 	fun get(self, key: str): Option<str>        // None when ABSENT
 	fun has(self, key: str): bool
 	fun set(self, key: str, value: str)
@@ -536,6 +537,27 @@ every run when presence is spelled as non-emptiness.
 Counting **down** is the shape an enumerating sweep wants, because removing a
 key renumbers everything above it — and the host's key order is unspecified
 anyway, so a pass that both reads and removes must not assume it is stable.
+
+`keys()` is the other half, and the easier one when the pass **writes**: it
+collects every name first, so removing whichever you like in whatever order has
+neither problem. It is a snapshot — a removal after the call does not change the
+list already in hand — and a missing index is skipped rather than ending the
+walk, since `len` and `key_at` are two host calls and another tab may remove a
+key between them.
+
+```vilan,browser
+import std::dom::window;
+import std::storage;
+
+fun main() {
+	let store = window().local_storage();
+	for key in store.keys() {
+		if !key.starts_with("app.") {
+			store.remove(key);
+		}
+	}
+}
+```
 
 The two reader verbs live on `Window`, so a module that calls them imports
 **both** `std::dom`'s `window` and `std::storage` — the `impl Window` block is

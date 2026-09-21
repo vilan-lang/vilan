@@ -422,6 +422,30 @@ export impl Debounce {
 		}
 	}
 
+	/// Run the pending callback NOW, and call the window off (A73) — the
+	/// leading half of an explicit save: a form that unloads, a blur handler, a
+	/// Save button, all of which need the coalesced work to happen before the
+	/// window would have closed on its own.
+	///
+	/// Exactly ONE run results, and nothing runs twice: the callback is taken
+	/// out before it is called, so the parked loop finds `pending` empty when
+	/// its cancelled wait resolves and retires at the head. A no-op with
+	/// nothing pending, and therefore idempotent — a second `flush` has nothing
+	/// to fire.
+	///
+	/// The order is take, cancel, THEN call, which is what makes a `run` from
+	/// inside the callback start a fresh window in the ordinary way rather than
+	/// being swallowed by this cancel.
+	fun flush(self) {
+		match self.pending.read() {
+			Some(let (_deadline, latest)) => {
+				self.cancel();
+				latest();
+			},
+			None => {},
+		}
+	}
+
 	/// Drop the pending callback and call the in-flight timer off: nothing
 	/// fires, and the host is released now rather than at the deadline.
 	///
