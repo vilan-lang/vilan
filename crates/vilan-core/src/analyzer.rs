@@ -56332,16 +56332,25 @@ fn expand_entry_over_world<'src>(
 ) -> bool {
     if !crate::macros::in_macro_world() {
         let before = world.analyzer.diagnostics.len();
-        crate::macros::register_file(
-            &mut world.macro_registry,
-            crate::macros::ModuleKey::Entry,
-            &nodes.0,
-            entry_source,
-            entry_path,
-            SourceId(0),
-            std,
-            &mut world.analyzer.diagnostics,
-        );
+        // E212: the same one-refusal rule as the load-region path above. A
+        // stored world was compiled against a WHOLE toolchain, so this fires
+        // only where a session's `std` changed under it — and then the entry's
+        // own registration is the thing to skip, not to report ten times.
+        match crate::macros::split_toolchain_refusal(std) {
+            Some(_) => {
+                crate::macros::push_split_toolchain_refusal(std, &mut world.analyzer.diagnostics)
+            }
+            None => crate::macros::register_file(
+                &mut world.macro_registry,
+                crate::macros::ModuleKey::Entry,
+                &nodes.0,
+                entry_source,
+                entry_path,
+                SourceId(0),
+                std,
+                &mut world.analyzer.diagnostics,
+            ),
+        }
         world
             .analyzer
             .attribute_new_diagnostics(before, SourceId(0));
@@ -58112,6 +58121,18 @@ fn analyze_inner<'src>(
             // expansion below still runs with the empty registry, so std's
             // own derives generate through the Rust fallback.
             if crate::macros::in_macro_world() {
+                return registry;
+            }
+            // E212: a SPLIT toolchain is refused here, once, before the first
+            // registration — a root carrying only `std` compiles no macro at
+            // all, so there is nothing for the loop below to do and no file to
+            // blame. Attributed to the entry at offset 0, which is what puts
+            // the actionable sentence first instead of behind the type errors
+            // the unexpanded derives go on to cause.
+            if crate::macros::split_toolchain_refusal(std).is_some() {
+                let before = analyzer.diagnostics.len();
+                crate::macros::push_split_toolchain_refusal(std, &mut analyzer.diagnostics);
+                analyzer.attribute_new_diagnostics(before, SourceId(0));
                 return registry;
             }
             let before = analyzer.diagnostics.len();
