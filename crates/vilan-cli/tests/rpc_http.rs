@@ -1201,8 +1201,8 @@ fun run_client(url: str) {
 	};
 	print(i"before {client.count().unwrap_or(0)}");
 	match client.drop_row(2i53) {
-		None => print("acked"),
-		Some(let error) => print(i"failed {error.to_json()}"),
+		Ok(_) => print("acked"),
+		Err(let error) => print(i"failed {error.to_json()}"),
 	}
 	print(i"after {client.count().unwrap_or(0)}");
 	exit(0);

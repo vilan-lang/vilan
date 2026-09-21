@@ -4030,7 +4030,7 @@ fn b284_a_client_service_only_struct_without_an_expose_still_compiles() {
 /// It is the one return type that is not Wire and does not have to be: there
 /// is no reply PAYLOAD, so the reply is the ack envelope the protocol already
 /// writes and the generated stub awaits it (`rpc::call_ack`, answering
-/// `Option<RpcError>`). Before this, both spellings were refused — the omitted
+/// `Result<void, RpcError>`). Before this, both spellings were refused — the omitted
 /// one as "must declare a Wire type", the written one as "`void`, which is not
 /// Wire" — and kolt's `store.vl` wrote `bool` for a method with nothing to
 /// report, with a FIXME naming this item.
