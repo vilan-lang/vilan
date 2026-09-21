@@ -12,6 +12,11 @@ async function __hmac_sha512(key, data) {
 	const imported = await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-512" }, false, [ "sign" ]);
 	return new Uint8Array(await crypto.subtle.sign("HMAC", imported, data));
 }
+function __json_kind(value) {
+	if (value === null) return "null";
+	if (Array.isArray(value)) return "array";
+	return typeof value;
+}
 function __list_pop(list) {
 	return list.length === 0 ? [ 1 ] : [ 0, list.pop() ];
 }
@@ -215,7 +220,7 @@ function bool_value(self, value2) {
 function new3(root) {
 	let stack = [  ];
 	stack.push(__clone(root));
-	return [ stack, [ 1 ] ];
+	return [ stack, [ 1 ], [  ] ];
 }
 function ok(self) {
 	const $H = self[1];
@@ -253,55 +258,83 @@ function take(self) {
 	if (!(ok(self))) {
 		return JSON.parse("null");
 	}
-	const $N = __list_pop(self[0]);
-	let $O = null;
-	if ($N[0] === 0) {
-		const value2 = $N[1];
-		$O = value2;
+	const $P = __list_pop(self[0]);
+	let $Q = null;
+	if ($P[0] === 0) {
+		const value2 = $P[1];
+		$Q = value2;
 	} else {
 		report(self, "unexpected end of document");
-		$O = JSON.parse("null");
+		$Q = JSON.parse("null");
 	}
-	return $O;
+	return $Q;
+}
+function expect(self, value2, wanted, name) {
+	if (!(ok(self))) {
+		return false;
+	}
+	if (__json_kind(value2) === wanted) {
+		return true;
+	}
+	report(self, "expected " + name + ", found " + found_kind(value2));
+	return false;
+}
+function found_kind(value2) {
+	const $L = __json_kind(value2);
+	let $M = null;
+	if ($L === "null") {
+		$M = "null";
+	} else if ($L === "boolean") {
+		$M = "a boolean";
+	} else if ($L === "number") {
+		$M = "a number";
+	} else if ($L === "string") {
+		$M = "a string";
+	} else if ($L === "array") {
+		$M = "an array";
+	} else {
+		$M = "an object";
+	}
+	return $M;
 }
 function begin_struct2(self) {
 
 }
 function field2(self, name) {
 	const subject = top(self);
-	let $L = null;
-	if (ok(self)) {
+	let $N = null;
+	if (expect(self, subject, "object", "an object")) {
 		if (Object.hasOwn(subject, name)) {
 			self[0].push(subject[name]);
 		} else {
 			report(self, "missing field \'" + name + "\'");
 		}
-		$L = undefined;
+		$N = undefined;
 	}
-	return $L;
+	return $N;
 }
 function end_struct2(self) {
 	take(self);
 }
 function str_value2(self) {
 	const value2 = take(self);
-	let $P = null;
-	if (ok(self)) {
-		$P = String(value2);
+	let $R = null;
+	if (expect(self, value2, "string", "a string")) {
+		$R = String(value2);
 	} else {
-		$P = "";
+		$R = "";
 	}
-	return $P;
+	return $R;
 }
 function bool_value2(self) {
 	const value2 = take(self);
-	let $R = null;
-	if (ok(self)) {
-		$R = Boolean(value2);
+	let $T = null;
+	if (expect(self, value2, "boolean", "a boolean")) {
+		$T = Boolean(value2);
 	} else {
-		$R = false;
+		$T = false;
 	}
-	return $R;
+	return $T;
 }
 function opened_reader(text) {
 	const $C = __try_parse_json(text);
@@ -383,33 +416,33 @@ async function $l(secret, claims) {
 function $J(self) {
 	return self.length === 0;
 }
-function $M(deserializer) {
+function $O(deserializer) {
 	return str_value2(deserializer);
 }
-function $Q(deserializer) {
+function $S(deserializer) {
 	return bool_value2(deserializer);
 }
 function $G(deserializer) {
 	begin_struct2(deserializer);
 	field2(deserializer, "user");
-	const user = $M(deserializer);
+	const user = $O(deserializer);
 	field2(deserializer, "admin");
-	const admin = $Q(deserializer);
+	const admin = $S(deserializer);
 	end_struct2(deserializer);
 	return [ user, admin ];
 }
 function $B(text) {
 	let reader = opened_reader(text);
 	const value2 = $G(reader);
-	const $S = reader[1];
-	let $T = null;
-	if ($S[0] === 1) {
-		$T = [ 0, value2 ];
+	const $U = reader[1];
+	let $V = null;
+	if ($U[0] === 1) {
+		$V = [ 0, value2 ];
 	} else {
-		const reason = $S[1];
-		$T = [ 1, reason ];
+		const reason = $U[1];
+		$V = [ 1, reason ];
 	}
-	return $T;
+	return $V;
 }
 function $y(segment) {
 	const $z = decode_url(segment);
@@ -417,16 +450,16 @@ function $y(segment) {
 	if ($z[0] === 0) {
 		const payload = $z[1];
 		const decoded = $B(decode_utf8(payload));
-		const $U = decoded;
-		let $V = null;
-		if ($U[0] === 0) {
-			const claims = $U[1];
-			$V = [ 0, __clone(claims) ];
+		const $W = decoded;
+		let $X = null;
+		if ($W[0] === 0) {
+			const claims = $W[1];
+			$X = [ 0, __clone(claims) ];
 		} else {
-			const _reason = $U[1];
-			$V = [ 1 ];
+			const _reason = $W[1];
+			$X = [ 1 ];
 		}
-		$A = $V;
+		$A = $X;
 	} else {
 		$A = [ 1 ];
 	}
@@ -443,13 +476,13 @@ async function $s(secret, token) {
 		let $v = null;
 		if ($u[0] === 0) {
 			const given = $u[1];
-			let $W = null;
+			let $Y = null;
 			if (equals_constant_time(expected, given)) {
-				$W = $y(__at(parts, 1));
+				$Y = $y(__at(parts, 1));
 			} else {
-				$W = [ 1 ];
+				$Y = [ 1 ];
 			}
-			$v = $W;
+			$v = $Y;
 		} else {
 			$v = [ 1 ];
 		}
@@ -472,30 +505,30 @@ const header_segment = "eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9";
 	const secret = encode_utf8("server-signing-key");
 	const token = await ($l(secret, [ "reed", true ]));
 	const verified = await ($s(secret, token));
-	const $X = verified;
-	let $Y = null;
-	if ($X[0] === 0) {
-		const session = $X[1];
-		$Y = console.log("welcome " + session[0] + " (admin=" + session[1] + ")");
-	} else {
-		$Y = console.log("unauthorized");
-	}
-	$Y;
-	const forged = await ($s(encode_utf8("attacker-key"), token));
-	const $Z = forged;
+	const $Z = verified;
 	let $aa = null;
 	if ($Z[0] === 0) {
-		const _s = $Z[1];
-		$aa = console.log("SECURITY BUG");
+		const session = $Z[1];
+		$aa = console.log("welcome " + session[0] + " (admin=" + session[1] + ")");
 	} else {
-		$aa = console.log("forged token rejected");
+		$aa = console.log("unauthorized");
 	}
 	$aa;
+	const forged = await ($s(encode_utf8("attacker-key"), token));
+	const $ab = forged;
+	let $ac = null;
+	if ($ab[0] === 0) {
+		const _s = $ab[1];
+		$ac = console.log("SECURITY BUG");
+	} else {
+		$ac = console.log("forged token rejected");
+	}
+	$ac;
 	const salt = encode_utf8("per-user-salt");
 	const first = await (__pbkdf2_sha512(encode_utf8("hunter2"), salt, 1000, 512));
 	const again = await (__pbkdf2_sha512(encode_utf8("hunter2"), salt, 1000, 512));
 	console.log(equals_constant_time(first, again));
-})().catch(($ab) => {
-	console.error(String($ab));
+})().catch(($ad) => {
+	console.error(String($ad));
 	process.exit(1);
 });

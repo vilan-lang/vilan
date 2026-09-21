@@ -6211,3 +6211,216 @@ fn a118_a_float_range_is_half_open_too() {
         "outside:0\n",
     );
 }
+
+// --- FIND (papers-39): the JSON reader enforces the type it is asked to read -
+//
+// `JsonReader`'s typed reads went straight through the host coercion
+// (`Number(x)`, `String(x)`, `Boolean(x)`) over whatever happened to be on the
+// value stack, and NEVER poisoned: a JSON string read as an `i32` answered
+// `NaN`, `null` answered `0`, `true` answered `1`, `1.5` answered `1.5` typed
+// `i32`, and a list SHORTER than what the caller read answered the enclosing
+// OBJECT as a number. `failed()` kept answering `None` through all of it, so
+// every gate written on it — the `[rpc]` route's `decode_failed`, which does
+// consult it — passed, and a malformed frame routed as a well-formed call.
+//
+// One pin per row of the find's own table, because each reaches the gate
+// differently, plus the arity check and a control. The wire does not move:
+// only malformed input changes behaviour, which is what the frame-level
+// suites (`service_layer`, `reactive_channels`, `rpc_http`) hold.
+
+/// Two `i32`s read out of one JSON list — the find's own shape, with `rpc`
+/// taken out of it. Answers either what it read or the first decode failure.
+const JSON_READER_TWO: &str = r#"
+        import std::io::print;
+        import std::json::json_codec;
+        import std::wire::{ Frame, Wire };
+        fun read_two(text: str): str {
+            let codec = json_codec();
+            mut deserializer = (codec.reader)(Frame::Text(text));
+            (deserializer.begin_struct)();
+            (deserializer.field)("args");
+            let _arity = (deserializer.begin_list)();
+            let left: i32 = i32::rebuild(&mut deserializer);
+            let right: i32 = i32::rebuild(&mut deserializer);
+            match (deserializer.failed)() {
+                Some(let reason) => i"refused:{reason}",
+                None => i"read:{left},{right}",
+            }
+        }
+    "#;
+
+/// The control, and it comes first: a well-formed document still reads.
+#[test]
+fn the_json_reader_still_reads_a_well_formed_list() {
+    assert_compiles_and_runs(
+        &format!(
+            "{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[1,2]}}\")); }}\n"
+        ),
+        "read:1,2\n",
+    );
+}
+
+/// A SHORT list: the second read runs past the list into the request object,
+/// which used to answer `NaN` unpoisoned. This is the row the find opened on.
+#[test]
+fn the_json_reader_refuses_a_list_shorter_than_the_reads() {
+    assert_compiles_and_runs(
+        &format!(
+            "{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[1]}}\")); }}\n"
+        ),
+        "refused:expected a number, found an object\n",
+    );
+}
+
+/// An EMPTY list — the `args: []` an arbitrary HTTP caller sends.
+#[test]
+fn the_json_reader_refuses_an_empty_list_where_a_value_is_read() {
+    assert_compiles_and_runs(
+        &format!("{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[]}}\")); }}\n"),
+        "refused:expected a number, found an object\n",
+    );
+}
+
+/// A STRING where a number is read: `Number("x")` is `NaN`.
+#[test]
+fn the_json_reader_refuses_a_string_where_a_number_is_read() {
+    assert_compiles_and_runs(
+        &format!(
+            "{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[\\\"x\\\",2]}}\")); }}\n"
+        ),
+        "refused:expected a number, found a string\n",
+    );
+}
+
+/// `null` where a number is read: `Number(null)` is `0`, which is a value the
+/// caller never sent.
+#[test]
+fn the_json_reader_refuses_a_null_where_a_number_is_read() {
+    assert_compiles_and_runs(
+        &format!(
+            "{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[null,2]}}\")); }}\n"
+        ),
+        "refused:expected a number, found null\n",
+    );
+}
+
+/// `true` where a number is read: `Number(true)` is `1`.
+#[test]
+fn the_json_reader_refuses_a_boolean_where_a_number_is_read() {
+    assert_compiles_and_runs(
+        &format!(
+            "{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[true,2]}}\")); }}\n"
+        ),
+        "refused:expected a number, found a boolean\n",
+    );
+}
+
+/// A FRACTION where an integer is read — the wrong kind wearing the right one:
+/// `1.5` is a JSON number, and `1.5` typed `i32` is a value outside its type.
+#[test]
+fn the_json_reader_refuses_a_fraction_where_an_integer_is_read() {
+    assert_compiles_and_runs(
+        &format!(
+            "{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[1.5,2]}}\")); }}\n"
+        ),
+        "refused:expected a whole number, found 1.5\n",
+    );
+}
+
+/// And the same rule on the unsigned lane, where the value out of its type is
+/// a negative one.
+#[test]
+fn the_json_reader_refuses_a_negative_number_where_an_unsigned_is_read() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::json_codec;
+        import std::wire::{ Frame, Wire };
+        fun main() {
+            let codec = json_codec();
+            mut deserializer = (codec.reader)(Frame::Text("{\"args\":[-1]}"));
+            (deserializer.begin_struct)();
+            (deserializer.field)("args");
+            let _arity = (deserializer.begin_list)();
+            let only: u32 = u32::rebuild(&mut deserializer);
+            match (deserializer.failed)() {
+                Some(let reason) => print(i"refused:{reason}"),
+                None => print(i"read:{only}"),
+            }
+        }
+        "#,
+        "refused:expected a non-negative number, found -1\n",
+    );
+}
+
+/// The OPENERS take the same gate. A document whose `args` is not a list at
+/// all used to walk into `elements()` on a non-array and read indices off it.
+#[test]
+fn the_json_reader_refuses_a_non_list_where_a_list_is_opened() {
+    assert_compiles_and_runs(
+        &format!("{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":7}}\")); }}\n"),
+        "refused:expected an array, found a number\n",
+    );
+}
+
+/// And a struct read of a document that is not an object at all. This one was
+/// not merely wrong: `has_json_field` is `Object.hasOwn`, which THROWS on
+/// `null`, so a `null` frame took the process rather than reporting — against
+/// the same never-crash contract A116 closed on the derive side.
+#[test]
+fn the_json_reader_refuses_a_null_document_where_a_field_is_read() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::json_codec;
+        import std::wire::{ Frame, Wire };
+        fun main() {
+            let codec = json_codec();
+            mut deserializer = (codec.reader)(Frame::Text("null"));
+            (deserializer.begin_struct)();
+            (deserializer.field)("args");
+            match (deserializer.failed)() {
+                Some(let reason) => print(i"refused:{reason}"),
+                None => print("read"),
+            }
+        }
+        "#,
+        "refused:expected an object, found null\n",
+    );
+}
+
+/// The ARITY check: a list LONGER than what the caller reads used to leave its
+/// tail on the value stack, where whatever read next took an element of it
+/// instead of the value it asked for. `end_list` is where that is caught — a
+/// caller that never closes its list (`std::rpc::open_request` leaves the
+/// argument list open for the route to pull from) simply never reaches it.
+#[test]
+fn the_json_reader_refuses_a_list_longer_than_the_reads_at_its_close() {
+    let program = |document: &str| {
+        format!(
+            r#"
+        import std::io::print;
+        import std::json::json_codec;
+        import std::wire::{{ Frame, Wire }};
+        fun main() {{
+            let codec = json_codec();
+            mut deserializer = (codec.reader)(Frame::Text("{document}"));
+            (deserializer.begin_struct)();
+            (deserializer.field)("args");
+            let _arity = (deserializer.begin_list)();
+            let only: i32 = i32::rebuild(&mut deserializer);
+            (deserializer.end_list)();
+            match (deserializer.failed)() {{
+                Some(let reason) => print(i"refused:{{reason}}"),
+                None => print(i"read:{{only}}"),
+            }}
+        }}
+        "#
+        )
+    };
+    assert_compiles_and_runs(&program("{\\\"args\\\":[1]}"), "read:1\n");
+    assert_compiles_and_runs(
+        &program("{\\\"args\\\":[1,2]}"),
+        "refused:a list had 1 element(s) left unread\n",
+    );
+}
