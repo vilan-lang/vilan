@@ -7615,3 +7615,108 @@ fn b350_a_marker_on_a_hidden_block_and_a_bare_selector_stay_silent() {
         "an unmarked selector has no marker to delete: {bare:#?}"
     );
 }
+
+/// B354's three files, with `thing.vl`'s own reach marker supplied per case: an
+/// exported `Counter` plus a NON-exported `impl Counter with Serialize` in
+/// `w.vl`, a `[derive(Wire)]` struct in `thing.vl`, and the entry serializing
+/// through the counter. `Thing`'s one field is a `thing.vl`-local type with a
+/// hand-written `Wire` impl, so every generic body the derive reaches is
+/// declared in `thing.vl` and this asks about `thing.vl`'s set and nothing
+/// else.
+fn derive_admission_files(thing_selector: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "w.vl",
+            "import std::shared::Shared;\nimport std::wire::Serialize;\n\n\
+             export struct Counter { fields: Shared<i32> }\n\n\
+             export impl Counter {\n\
+             \tfun new(): Counter { Counter { fields = Shared::new(0) } }\n\n\
+             \tfun count(self): i32 { self.fields.read() }\n}\n\n\
+             impl Counter with Serialize {\n\
+             \tfun begin_struct(self, fields: i32) { self.fields.write() = self.fields.read() + fields; }\n\
+             \tfun field(self, name: str) {}\n\
+             \tfun end_struct(self) {}\n\
+             \tfun begin_list(self, length: i32) {}\n\
+             \tfun end_list(self) {}\n\
+             \tfun begin_variant(self, name: str, arity: i32) {}\n\
+             \tfun end_variant(self) {}\n\
+             \tfun null_value(self) {}\n\
+             \tfun some_value(self) {}\n\
+             \tfun str_value(self, value: str) {}\n\
+             \tfun i32_value(self, value: i32) {}\n\
+             \tfun u32_value(self, value: u32) {}\n\
+             \tfun i53_value(self, value: i53) {}\n\
+             \tfun f64_value(self, value: f64) {}\n\
+             \tfun bool_value(self, value: bool) {}\n}\n"
+                .to_string(),
+        ),
+        (
+            "thing.vl",
+            format!(
+                "import std::wire::{{ Deserialize, Serialize, Wire }};\n\
+                 import pkg::w::{{ Counter{thing_selector} }};\n\n\
+                 export *;\n\n\
+                 struct Leaf {{ n: i32 }}\n\n\
+                 impl Leaf with Wire {{\n\
+                 \tfun describe<S: Serialize>(self, serializer: S) {{ serializer.i32_value(self.n); }}\n\n\
+                 \tfun rebuild<D: Deserialize>(deserializer: D): Leaf {{ Leaf {{ n = deserializer.i32_value() }} }}\n}}\n\n\
+                 [derive(Wire)]\n\
+                 struct Thing {{ leaf: Leaf }}\n"
+            ),
+        ),
+        (
+            "c.vl",
+            "import std::io::print;\nimport pkg::thing::{ Leaf, Thing };\nimport pkg::w::Counter;\n\n\
+             fun main() {\n\
+             \tlet counter = Counter::new();\n\
+             \tlet thing = Thing { leaf = Leaf { n = 7 } };\n\
+             \tthing.describe(counter);\n\
+             \tprint(counter.count());\n}\n"
+                .to_string(),
+        ),
+    ]
+}
+
+fn transform_derive_admission(thing_selector: &str) -> Result<String, String> {
+    let owned = derive_admission_files(thing_selector);
+    let files: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(name, body)| (*name, body.as_str()))
+        .collect();
+    transform_package(&files, "c.vl", Platform::default())
+}
+
+/// B354 — **a `[derive(..)]`-SYNTHESIZED body's admitting file is the file the
+/// ATTRIBUTE was written in.** THE PIN THAT FAILS IF ANYONE RESTORES THE
+/// SENTINEL: `source_of` answers `DERIVED_SOURCE` for generated code, and that
+/// sentinel is not a file any import can reach — it declares nothing and it has
+/// reached nothing with `#` — so B318 S4's export gate turned down every
+/// non-exported `impl` in the program for every derived visitor. That is why
+/// E185's placeholder fired sixteen times at Order 36's sweep merge, and the
+/// refusal's own advice was unfollowable: it said "widen `thing`'s own import
+/// of `w`", and `thing.vl` writing `#(impl _)` changed nothing, because
+/// `thing.vl`'s set was not the set being consulted.
+#[test]
+fn b354_a_derived_body_resolves_under_the_file_that_carries_the_derive() {
+    let emitted = transform_derive_admission(", #(impl _)")
+        .expect("`thing.vl`'s own reach marker must answer its derived body");
+    assert!(
+        emitted.contains("function"),
+        "expected an emitted program: {emitted}"
+    );
+}
+
+/// The control, and what keeps the pin above from being "the gate is off for
+/// derived code": drop `thing.vl`'s marker and the same program is refused,
+/// naming the member, the providing module and the deriving one — the gate
+/// still applies to a derived body, it just applies the RIGHT file's set.
+#[test]
+fn b354_a_derived_body_is_still_refused_when_its_own_file_cannot_reach_the_impl() {
+    let refused = transform_derive_admission("")
+        .expect_err("`thing.vl` reaching nothing must not answer its derived body");
+    assert!(
+        refused.contains("'begin_struct' is provided by an `impl` in module `w`")
+            && refused.contains("module `thing` does not admit it"),
+        "the refusal should name the member, the providing module and the deriving one: {refused}"
+    );
+}

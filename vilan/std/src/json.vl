@@ -318,7 +318,7 @@ struct JsonWriter {
 	variant_arities: Shared<List<i32>>,
 }
 
-export impl JsonWriter {
+impl JsonWriter {
 	fun new(): JsonWriter {
 		JsonWriter {
 			out = Shared::new(""),
@@ -385,6 +385,12 @@ export impl JsonWriter {
 
 // The visitor's write half, natively — `describe` monomorphizes straight onto
 // these methods on the direct path.
+// EXPORTED deliberately, and B354 is the reason: a `[derive(Wire)]` visitor is
+// generated code, and its admitting file is the file the ATTRIBUTE was written
+// in - a USER's file, which cannot reach a private std block and cannot be asked
+// to write `#(impl JsonWriter)` for one. The Order 36 sweep exported these under
+// the sentinel rule; they stay exported under the right one. The plain blocks
+// above/below need no export: a derived body only ever calls the VISITOR methods.
 export impl JsonWriter with Serialize {
 	fun begin_struct(self, fields: i32) {
 		self.open("{");
@@ -485,7 +491,7 @@ struct JsonReader {
 	error: Shared<Option<str>>,
 }
 
-export impl JsonReader {
+impl JsonReader {
 	fun new(root: JsonValue): JsonReader {
 		let stack: Shared<List<JsonValue>> = Shared::new([]);
 		stack.write().push(root);
@@ -561,6 +567,12 @@ export impl JsonReader {
 }
 
 // The visitor's read half, natively.
+// EXPORTED deliberately, and B354 is the reason: a `[derive(Wire)]` visitor is
+// generated code, and its admitting file is the file the ATTRIBUTE was written
+// in - a USER's file, which cannot reach a private std block and cannot be asked
+// to write `#(impl JsonReader)` for one. The Order 36 sweep exported these under
+// the sentinel rule; they stay exported under the right one. The plain blocks
+// above/below need no export: a derived body only ever calls the VISITOR methods.
 export impl JsonReader with Deserialize {
 	fun begin_struct(self) {}
 

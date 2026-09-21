@@ -51022,11 +51022,23 @@ impl<'src> Program<'src> {
     /// neither `only` nor a selector. `source_of` is a linear scan of
     /// `source_ranges` (M27's whole-program-loop hazard) and the dispatch
     /// consumers ask it once per SITE, so the guard has to come first.
+    /// B354: a `[derive(..)]`-SYNTHESIZED body's admitting file is the file the
+    /// ATTRIBUTE was written in, which is what [`Self::note_source_of`]
+    /// resolves. `source_of` answers the sentinel [`DERIVED_SOURCE`] for
+    /// generated code, and the sentinel is not a file any import can reach: it
+    /// declares nothing of its own and it has reached nothing with `#`, so the
+    /// export gate turned down every non-exported `impl` in the program for
+    /// every derived visitor. That is WHY E185's placeholder fired sixteen
+    /// times at Order 36's sweep merge and why std had to export the codec
+    /// blocks it had kept private — and the refusal's own advice ("widen
+    /// `thing`'s own import of `w`") could not be taken, because `thing.vl`'s
+    /// set was not the set being consulted. The generated code belongs to the
+    /// module that asked for it; it resolves under that module's imports.
     pub fn admitting_file(&self, id: Id) -> Option<SourceId> {
         if self.impl_admission.is_empty() {
             return None;
         }
-        self.source_of(id)
+        self.note_source_of(id)
     }
 
     pub fn source_of(&self, id: Id) -> Option<SourceId> {
