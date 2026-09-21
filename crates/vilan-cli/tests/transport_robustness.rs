@@ -959,7 +959,7 @@ async fun main() {
 			let reactive = ReactiveClient::new(bridge(socket), json_codec());
 			invalidate_on_reconnect(socket, reactive);
 			let first: Result<i32, RpcError> = call(transport, json_codec(), "subscribe_extra", [
-				|serializer: Serializer| socket.connection.read().describe(serializer),
+				|mut serializer: Serializer| socket.connection.read().describe(&mut serializer),
 			]);
 			let channel = first.unwrap_or(0 - 1);
 			print(i"minted:{channel}");
@@ -978,7 +978,7 @@ async fun main() {
 					// The documented recovery: re-run the rpc that minted the
 					// channel and mirror the id the FRESH session hands back.
 					let again: Result<i32, RpcError> = call(transport, json_codec(), "subscribe_extra", [
-						|serializer: Serializer| socket.connection.read().describe(serializer),
+						|mut serializer: Serializer| socket.connection.read().describe(&mut serializer),
 					]);
 					let fresh: RemoteSource<i32> = reactive.source(again.unwrap_or(0 - 1));
 					let watching_again = fresh.sub(|value| print(i"remade:{value}"));

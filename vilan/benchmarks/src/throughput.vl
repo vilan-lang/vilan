@@ -56,7 +56,7 @@ fun drive<T: Transport>(transport: T, codec: Codec, calls: i32): f64 {
 	for index < calls {
 		let one = 1;
 		let outcome: Result<i32, RpcError> = call(transport, codec, "add", [
-			|s: Serializer| one.describe(s),
+			|mut s: Serializer| one.describe(&mut s),
 		]);
 		match outcome {
 			Ok(let value) => {},

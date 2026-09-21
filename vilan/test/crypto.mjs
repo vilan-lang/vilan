@@ -19,9 +19,6 @@ async function __pbkdf2_sha512(password, salt, iterations, bits) {
 	const imported = await crypto.subtle.importKey("raw", password, "PBKDF2", false, [ "deriveBits" ]);
 	return new Uint8Array(await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations, hash: "SHA-512" }, imported, bits));
 }
-function __shared_new(value) {
-	return { v: value };
-}
 function __substring(text, start, end) {
 	if (0 <= start && start <= end && end <= text.length) return text.substring(start, end);
 	throw "substring out of range: the length is " + text.length + " but the range is " + start + ".." + end + " — substring requires 0 <= start <= end <= len and never clamps or swaps; to drop a known affix use strip_prefix/strip_suffix, and for the rest of the string pass s.len() as the end";
@@ -167,23 +164,23 @@ function equals_constant_time(a, b) {
 	return acc === 0;
 }
 function new2() {
-	return [ __shared_new(""), __shared_new(false), __shared_new([  ]), __shared_new([  ]) ];
+	return [ "", false, [  ], [  ] ];
 }
 function value(self, text) {
-	if (self[1].v) {
-		self[0].v = self[0].v + ",";
+	if (self[1]) {
+		self[0] = self[0] + ",";
 	}
-	self[0].v = self[0].v + text;
-	self[1].v = true;
+	self[0] = self[0] + text;
+	self[1] = true;
 }
 function open(self, opener) {
 	value(self, opener);
-	self[2].v.push(true);
-	self[1].v = false;
+	self[2].push(true);
+	self[1] = false;
 }
 function close(self, closer) {
-	self[0].v = self[0].v + closer;
-	const $q = __list_pop(self[2].v);
+	self[0] = self[0] + closer;
+	const $q = __list_pop(self[2]);
 	let $r = null;
 	if ($q[0] === 0) {
 		const saved = $q[1];
@@ -191,20 +188,20 @@ function close(self, closer) {
 	} else {
 		$r = false;
 	}
-	self[1].v = $r;
+	self[1] = $r;
 }
 function result(self) {
-	return self[0].v;
+	return self[0];
 }
 function begin_struct(self, fields) {
 	open(self, "{");
 }
 function field(self, name) {
-	if (self[1].v) {
-		self[0].v = self[0].v + ",";
+	if (self[1]) {
+		self[0] = self[0] + ",";
 	}
-	self[0].v = self[0].v + JSON.stringify(name) + ":";
-	self[1].v = false;
+	self[0] = self[0] + JSON.stringify(name) + ":";
+	self[1] = false;
 }
 function end_struct(self) {
 	close(self, "}");
@@ -216,12 +213,12 @@ function bool_value(self, value2) {
 	value(self, "" + value2);
 }
 function new3(root) {
-	const stack = __shared_new([  ]);
-	stack.v.push(__clone(root));
-	return [ stack, __shared_new([ 1 ]) ];
+	let stack = [  ];
+	stack.push(__clone(root));
+	return [ stack, [ 1 ] ];
 }
 function ok(self) {
-	const $H = self[1].v;
+	const $H = self[1];
 	let $I = null;
 	if ($H[0] === 0) {
 		const _reason = $H[1];
@@ -232,24 +229,23 @@ function ok(self) {
 	return $I;
 }
 function report(self, reason) {
-	const $E = self[1].v;
+	const $E = self[1];
 	let $F = null;
 	if ($E[0] === 0) {
 		const _first = $E[1];
 		$F = undefined;
 	} else {
-		self[1].v = [ 0, reason ];
+		self[1] = [ 0, reason ];
 		$F = undefined;
 	}
 	return $F;
 }
 function top(self) {
 	let $K = null;
-	if (!(ok(self)) || $J(self[0].v)) {
+	if (!(ok(self)) || $J(self[0])) {
 		$K = JSON.parse("null");
 	} else {
-		const values = __clone(self[0].v);
-		$K = __at(values, values.length - 1);
+		$K = __clone(__at(self[0], self[0].length - 1));
 	}
 	return $K;
 }
@@ -257,7 +253,7 @@ function take(self) {
 	if (!(ok(self))) {
 		return JSON.parse("null");
 	}
-	const $N = __list_pop(self[0].v);
+	const $N = __list_pop(self[0]);
 	let $O = null;
 	if ($N[0] === 0) {
 		const value2 = $N[1];
@@ -276,7 +272,7 @@ function field2(self, name) {
 	let $L = null;
 	if (ok(self)) {
 		if (Object.hasOwn(subject, name)) {
-			self[0].v.push(subject[name]);
+			self[0].push(subject[name]);
 		} else {
 			report(self, "missing field \'" + name + "\'");
 		}
@@ -314,7 +310,7 @@ function opened_reader(text) {
 		const root = $C[1];
 		$D = new3(root);
 	} else {
-		const reader = new3(JSON.parse("null"));
+		let reader = new3(JSON.parse("null"));
 		report(reader, "malformed JSON");
 		$D = reader;
 	}
@@ -374,7 +370,7 @@ function $n(self, serializer) {
 	end_struct(serializer);
 }
 function $m(value2) {
-	const writer = new2();
+	let writer = new2();
 	$n(value2, writer);
 	return result(writer);
 }
@@ -403,9 +399,9 @@ function $G(deserializer) {
 	return [ user, admin ];
 }
 function $B(text) {
-	const reader = opened_reader(text);
+	let reader = opened_reader(text);
 	const value2 = $G(reader);
-	const $S = reader[1].v;
+	const $S = reader[1];
 	let $T = null;
 	if ($S[0] === 1) {
 		$T = [ 0, value2 ];

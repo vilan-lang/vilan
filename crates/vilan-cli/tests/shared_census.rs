@@ -12,35 +12,31 @@
 //! in the same frame write and read is already shared storage, and the cell
 //! around it is an allocation and an indirection bought for nothing.
 //!
-//! M71 retired the eight F cells that were reachable without a surface change
+//! M71 retired the eight F cells that were reachable without a surface change,
+//! and A108 retired the ten the Wire visitor's by-value receivers had forced
 //! (see `FRAME_SCOPED_RETIRED`). This gate is what keeps the class at zero:
 //! the per-file counts below are a committed census, so a new `Shared::new`
 //! anywhere in std fails here until someone has classified it. A cell that is
 //! genuinely R, O or E updates its file's row; a cell that is F does not get
 //! written in the first place.
 //!
-//! The two F residues that a surface change still blocks are recorded in
-//! `FRAME_SCOPED_BLOCKED` with the reason each. Neither is an oversight: both
-//! are the language telling the code what shape it may have.
+//! **`json.vl` and `binary.vl` have no rows at all now**, which is the shape of
+//! the answer: they held ten cells between them and hold none, because
+//! `Serialize`/`Deserialize` take `&mut self` and `Wire::describe`/`rebuild`
+//! take `&mut S`/`&mut D`, so the visitors' state lives in plain fields.
+//!
+//! The ONE F residue left is recorded in `FRAME_SCOPED_BLOCKED` with its
+//! reason. It is not an oversight: it is the language telling the code what
+//! shape it may have.
 
 use std::path::{Path, PathBuf};
 
 /// `Shared::new(` construction sites per std file, and the class those cells
-/// belong to. The count is of OCCURRENCES, not lines — `binary.vl:26`
-/// constructs two cells on one line.
+/// belong to. The count is of OCCURRENCES, not lines — `reactive.vl` and
+/// `rpc.vl` each construct two cells on one line in places.
 const CENSUS: &[(&str, usize, &str)] = &[
-    (
-        "binary.vl",
-        4,
-        "F (blocked: the Wire visitor's by-value receivers)",
-    ),
     ("browser/router.vl", 1, "R: the module-level `wired` latch"),
     ("browser/ui.vl", 21, "O: per-boundary row/owner bookkeeping"),
-    (
-        "json.vl",
-        6,
-        "F (blocked: the Wire visitor's by-value receivers)",
-    ),
     (
         "memo.vl",
         1,
@@ -87,33 +83,39 @@ const FRAME_SCOPED_RETIRED: &[(&str, &str)] = &[
     ("rpc.vl", "mut fault: Option<str> = None;"),
 ];
 
-/// The F residue, and what blocks each. Recorded rather than asserted away:
-/// the count above already pins the number, and this is why it is not zero.
-const FRAME_SCOPED_BLOCKED: &[(&str, usize, &str)] = &[
-    (
-        "json.vl",
-        6,
-        "`JsonWriter`/`JsonReader` are the visitor's state, and \
-         `Serialize`/`Deserialize` declare every method on a by-value `self`, \
-         so the state cannot live in plain fields behind `&mut self`. Retiring \
-         these six needs the trait receivers to become `&mut self` and \
-         `Wire::describe`/`rebuild` to take `&mut S`/`&mut D` — a breaking \
-         change to a public surface, and its own item.",
-    ),
-    (
-        "binary.vl",
-        4,
-        "`BinaryWriter`/`BinaryReader`, for the same reason as `json.vl`.",
-    ),
-    (
-        "process/fs.vl",
-        1,
-        "`Reader.cursor` is FORCED rather than chosen, and the type's own \
-         doc-comment says so: `Reader::next` awaits the read, and a `&mut` \
-         view may not be held across a suspension (spec §6.3), so a plain \
-         field behind `&mut self` is not a shape this method may have.",
-    ),
+/// The ten cells A108 retired, as the plain FIELD declaration that replaced
+/// each. These were never "shared" with anything: they were a by-value `self`
+/// working around itself, and the fix was the receiver.
+///
+/// The spellings are asserted, so a later edit that re-wraps one of these in a
+/// cell fails here by name rather than only moving the count.
+const VISITOR_STATE_UNBOXED: &[(&str, &str)] = &[
+    ("json.vl", "\tout: str,"),
+    ("json.vl", "\tpending_comma: bool,"),
+    ("json.vl", "\tsaved_commas: List<bool>,"),
+    ("json.vl", "\tvariant_arities: List<i32>,"),
+    ("json.vl", "\tstack: List<JsonValue>,"),
+    ("json.vl", "\terror: Option<str>,"),
+    ("binary.vl", "\tbuffer: Bytes,"),
+    ("binary.vl", "\tused: i32,"),
+    ("binary.vl", "\tcursor: i32,"),
+    ("binary.vl", "\terror: Option<str>,"),
 ];
+
+/// The F residue, and what blocks it. Recorded rather than asserted away: the
+/// count above already pins the number, and this is why it is not zero.
+///
+/// It is ONE file now. `json.vl`'s six and `binary.vl`'s four left with A108;
+/// this one cannot follow them, and the reason is not the receiver.
+const FRAME_SCOPED_BLOCKED: &[(&str, usize, &str)] = &[(
+    "process/fs.vl",
+    1,
+    "`Reader.cursor` is FORCED rather than chosen, and the type's own \
+     doc-comment says so: `Reader::next` awaits the read, and a `&mut` view \
+     may not be held across a suspension (spec §6.3), so a plain field behind \
+     `&mut self` is not a shape this method may have — which is exactly why \
+     A108's receiver change reached the other ten and not this one.",
+)];
 
 fn std_source_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std/src")
@@ -178,9 +180,20 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 131,
+        total, 121,
         "the total number of `Shared` construction sites in std changed"
     );
+
+    // A108's headline, asserted as an absence rather than read off the table:
+    // the two codec files hold no cells at all.
+    for file in ["json.vl", "binary.vl"] {
+        assert!(
+            !read_std(file).contains("Shared::new("),
+            "{file} constructs a `Shared` cell again. Its visitor state is \
+             plain fields behind `&mut self` (A108); a cell here is the \
+             by-value receiver coming back, and the ten cells with it."
+        );
+    }
 }
 
 #[test]
@@ -193,6 +206,19 @@ fn the_frame_scoped_class_stays_retired() {
              closure captures the BINDING (spec §6.9), so these are `mut` \
              locals and not cells; re-wrapping one in `Shared::new` buys an \
              allocation and an indirection for storage the frame already has."
+        );
+    }
+
+    for (file, declaration) in VISITOR_STATE_UNBOXED {
+        let source = read_std(file);
+        assert!(
+            source.contains(declaration),
+            "{file} no longer declares the A108 plain field `{declaration}`. \
+             `Serialize`/`Deserialize` take `&mut self` and \
+             `Wire::describe`/`rebuild` take `&mut S`/`&mut D`, so the \
+             visitor's state is a field and not a cell; re-wrapping one buys \
+             an allocation and an indirection for storage the receiver \
+             already reaches."
         );
     }
 

@@ -105,6 +105,7 @@ guide/routing.md h2 deep-links-and-the-server
 guide/routing.md h2 traps
 guide/services.md h1 services--rpc
 guide/services.md h2 what-can-cross-the-wire-wire
+guide/services.md h3 a-method-with-nothing-to-say-void
 guide/services.md h2 naming-server-entities-handlet
 guide/services.md h2 what-rpc-calls-do
 guide/services.md h2 mirrors
@@ -341,6 +342,7 @@ std/dev.md h2 stash--take
 std/encoding.md h1 encoding-reference
 std/encoding.md h2 json
 std/encoding.md h2 the-wire-layer-stdwire
+std/encoding.md h3 writing-a-wire-impl-by-hand
 std/encoding.md h3 keyed-collections
 std/encoding.md h3 backed-enums-on-the-wire
 std/encoding.md h2 bytes

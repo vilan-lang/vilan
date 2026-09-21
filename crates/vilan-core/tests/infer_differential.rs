@@ -150,7 +150,14 @@ fn compare(program: &str) -> Compared {
 }
 
 /// The corpus programs the inference sweep CHANGES — 29 of them when this gate
-/// was written (const-eval.md §9.1), 33 today.
+/// was written (const-eval.md §9.1), 34 today.
+///
+/// `crypto.vl` joined at A108, and it is the additive direction the headnote
+/// asks to be noticed: the Wire visitor's state moved out of `Shared` cells
+/// into plain fields, so `JsonWriter::new`'s four initializers are literals
+/// (`""`, `false`, `[]`, `[]`) where they were opaque `Shared::new(..)` calls,
+/// and the sweep can fold what it could not see through. `time.vl` was already
+/// here and reaches `std::binary` the same way.
 ///
 /// This is the gate's non-vacuity floor, and it is a list rather than a count
 /// because a count cannot be summed across one process per program. Every
@@ -164,6 +171,7 @@ const FOLDS: &[&str] = &[
     "bool.vl",
     "capture-clones.vl",
     "const.vl",
+    "crypto.vl",
     "default.vl",
     "derive-default.vl",
     "derive-json.vl",

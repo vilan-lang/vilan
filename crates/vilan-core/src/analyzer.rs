@@ -16747,8 +16747,10 @@ impl<'src> Analyzer<'src> {
                 return_type_id,
                 return_type.1,
             )),
-            // A void `[rpc]` method has no reply payload to encode — require a
-            // declared Wire return (fire-and-forget needs its own design).
+            // A void `[rpc]` method has no reply payload, which A107 admits:
+            // the reply is the ack envelope, and `check_rpc_signatures` reads
+            // the `None` here as that shape rather than as a missing
+            // annotation.
             None => members.push(("return type".to_string(), None, None, function.name.1)),
         }
         self.rpc_signatures_to_check.push((
@@ -16795,6 +16797,36 @@ impl<'src> Analyzer<'src> {
                             method_id,
                         );
                     }
+                    continue;
+                }
+                // A107 (R6): a VOID return is admitted, and it is the one
+                // return type that is not Wire and does not have to be. The
+                // method has no reply payload, so the reply is the ack the
+                // protocol already sends (`RpcOutcome::Success` over an empty
+                // body) and the generated stub awaits it and hands back the
+                // failure if there was one. That is a distinct call from a
+                // notification, which has no reply at all (A75, §9.3) — an
+                // awaited void is "it happened", a notification is "it was
+                // sent" — so both spellings exist and neither stands in for
+                // the other.
+                //
+                // Both spellings of void arrive here: the OMITTED return type
+                // (`type_node` is `None`) and an explicit `: void`. They mean
+                // the same thing, as they do on any other function, and the
+                // rule is one test rather than two so they cannot drift. The
+                // test is on the RENDERED spelling because that is what the
+                // `[service]` generator branches on (`method.return_type
+                // .render() == "void"`, rpc.vl) — one string, so the admission
+                // and the code it admits cannot disagree about which methods
+                // are void.
+                //
+                // On a `[client_service]` subject this is unreachable — the
+                // arm above has already answered for every return type there,
+                // including `void`, because that direction has no reply lane
+                // to await on and omission is its only legal spelling.
+                if label == "return type"
+                    && type_node.is_none_or(|node| render_type(node) == "void")
+                {
                     continue;
                 }
                 // A RETURN that is a signal HANDLE is not a Wire type and is

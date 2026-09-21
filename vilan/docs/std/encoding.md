@@ -185,7 +185,9 @@ fun main() {
 The codec-agnostic serialization protocol under `derive(Wire)` and rpc:
 
 - `trait Serialize` / `trait Deserialize`: visitor-style value
-  description (`begin_struct`/`field`/`str_value`/`i53_value`/…). The
+  description (`begin_struct`/`field`/`str_value`/`i53_value`/…), every
+  method on `&mut self` — a visitor is *written to* as a value narrates
+  itself. The
   wire scalars are `str`, `bool` and the whole sized numeric family —
   `i8`, `u8`, `i16`, `u16`, `i32`, `u32`, `i53`, `u53`, `f32`, `f64` —
   plus lists, options, results, maps, structs and enum variants. The
@@ -201,6 +203,59 @@ The codec-agnostic serialization protocol under `derive(Wire)` and rpc:
 `[derive(Wire)]` requires every field to be Wire, recursively, checked at
 the derive site. You implement `Serialize`/`Deserialize` by hand only for
 types with a custom encoding.
+
+### Writing a `Wire` impl by hand
+
+`Wire` is two methods, and the visitor is a `&mut` view in both:
+
+```vilan,fragment
+trait Wire {
+	fun describe<S: Serialize>(self, serializer: &mut S);
+	fun rebuild<D: Deserialize>(deserializer: &mut D): Self;
+}
+```
+
+The VALUE is by-value `self` — describing reads it. The VISITOR is
+`&mut`, because narrating into it is what moves its cursor. Inside the
+body the parameter already *is* the view, so a nested `describe` or
+`rebuild` forwards it **bare**:
+
+```vilan,fragment
+impl Pair with Wire {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
+		serializer.begin_struct(2);
+		serializer.field("left");
+		self.left.describe(serializer);     // bare: already a view
+		serializer.field("right");
+		self.right.describe(serializer);
+		serializer.end_struct();
+	}
+
+	fun rebuild<D: Deserialize>(deserializer: &mut D): Pair {
+		deserializer.begin_struct();
+		deserializer.field("left");
+		let left = i32::rebuild(deserializer);
+		deserializer.field("right");
+		let right = str::rebuild(deserializer);
+		deserializer.end_struct();
+		Pair { left = left, right = right }
+	}
+}
+```
+
+`&mut serializer` appears only where you hold the visitor by VALUE — a
+`Serializer`/`Deserializer` record handed to you by a `Codec`, or one of
+rpc's `|Serializer| void` describer closures. There the record is a bag
+of closures over the codec's own writer, so a `mut` re-binding costs a
+copy of the bag and writes through to the same writer:
+
+```vilan,fragment
+// An rpc describer closure: by value in, `&mut` at the call.
+[|mut serializer: Serializer| id.describe(&mut serializer)]
+```
+
+`encode_json`/`decode_json`/`encode_binary`/`decode_binary` do this for
+you and are the paths to prefer.
 
 It gives you the wire codec and nothing else: a type that also needs
 `to_json`/`from_json` asks for both, `[derive(Json, Wire)]`. The two are
@@ -304,6 +359,9 @@ fun encode_binary<T: Wire>(value: T): Bytes
 fun decode_binary<T: Wire>(bytes: Bytes): Result<T, str>
 struct BinaryWriter { … }   // write_byte / write_i32 / write_str / finish(): Bytes
 ```
+
+Its writers take `&mut self` and keep their state in plain fields, like
+`std::json`'s.
 
 Same model as JSON, compact layout. `i53` values ride as f64 bit patterns,
 exact to 2^53.

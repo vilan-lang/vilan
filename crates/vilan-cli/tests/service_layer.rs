@@ -4385,6 +4385,151 @@ fun run(port: i32) {
     );
 }
 
+/// A107 (R6), end to end over a real socket: an `[rpc]` method that returns
+/// NOTHING and is still awaited. Both spellings — the omitted return type and
+/// an explicit `: void` — and the ordering that is the whole point.
+///
+/// What this pins that no codec test can: the ack is not a shortcut. The
+/// server's handler runs to COMPLETION before the reply is encoded, so the
+/// print inside `remove` lands before the client's `client-acked-remove`, and
+/// a `count` issued after the await sees the removal. That is the difference
+/// between this and a notification (A75 `notify`, `send_notification`), which
+/// returns as soon as the request is sent and can be overtaken by anything.
+///
+/// The stub answers `Option<RpcError>` rather than `Result<void, RpcError>`
+/// because vilan has no unit literal — `Ok(())` does not parse, so a `Result`
+/// whose success arm is `void` has no constructible `Ok`. `None` is the ack.
+/// Measured, not assumed: `call_ack`'s doc-comment says so, and the shape was
+/// probed before the surface was chosen.
+///
+/// The wire does not move for this. The reply is the SAME ack envelope
+/// `notified` already sent for a `[client_service]` notification, so nothing
+/// about `Serialize`'s vocabulary or any existing frame changes; what is new is
+/// a client that waits for it. The contract entry is `remove(i53)->void;`, and
+/// no service that compiled before this had a void method to hash.
+#[test]
+fn an_awaited_void_rpc_acks_after_its_handler_ran() {
+    let dir = temp_project("void_rpc");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::option::Option::{ self, None, Some };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::{ Connection, Service };
+
+[service(StoreClient)]
+struct Store {
+	rows: SignalCell<List<i53>>,
+}
+
+impl Store {
+	// The signature A107 exists for: nothing to report, something to wait for.
+	// kolt's `store.vl` wrote `bool` for exactly this and said so in a FIXME.
+	[rpc]
+	fun remove(self, id: i53) {
+		self.rows.update(|&mut rows| {
+			if rows.index_of(id) is Some(let index) {
+				rows.remove(index);
+			}
+		});
+		print(i"server-removed:{id}");
+	}
+
+	// The explicit spelling of the same declaration.
+	[rpc]
+	fun clear(self): void {
+		self.rows.set([]);
+		print("server-cleared");
+	}
+
+	[rpc]
+	fun count(self): i32 {
+		self.rows.get().len()
+	}
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection: Connection| Store {
+			rows = SignalCell::new([1i53, 2i53, 3i53]),
+		}, json_codec()))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run(server.port()))
+		.build()
+		.start();
+}
+
+fun run(port: i32) {
+	match StoreClient::connect(i"ws://localhost:{port}/", json_codec()) {
+		Ok(let client) => {
+			match client.remove(2i53) {
+				None => print("client-acked-remove"),
+				Some(let error) => print(i"client-remove-failed:{error.debug()}"),
+			}
+			print(i"count-after-remove:{client.count().unwrap_or(0)}");
+			match client.clear() {
+				None => print("client-acked-clear"),
+				Some(let error) => print(i"client-clear-failed:{error.debug()}"),
+			}
+			print(i"count-after-clear:{client.count().unwrap_or(0)}");
+		},
+		Err(let error) => print(i"connect-err:{error.debug()}"),
+	}
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        // The omitted-return spelling crossed and came back acked.
+        "client-acked-remove",
+        // The handler's effect is visible to the NEXT call, which is what the
+        // await bought.
+        "count-after-remove:2",
+        // The explicit `: void` spelling is the same call.
+        "client-acked-clear",
+        "count-after-clear:0",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "`{expected}` is missing from the void service's run:\n{stdout}"
+        );
+    }
+    // The ORDERING, which is the claim: the handler ran before the ack. A
+    // notification could print these two in either order.
+    let handler = stdout
+        .find("server-removed:2")
+        .unwrap_or_else(|| panic!("the void handler never ran:\n{stdout}"));
+    let ack = stdout
+        .find("client-acked-remove")
+        .expect("the ack was asserted above");
+    assert!(
+        handler < ack,
+        "an awaited void must ack AFTER its handler completed — this is the \
+         only thing that distinguishes it from a notification:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("client-remove-failed:") && !stdout.contains("client-clear-failed:"),
+        "an acked void call was reported as a failure:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("connect-err:"),
+        "the void service refused the connection:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// B288, on a GENERATED client: the kolt shape, where the handle's element
 /// type is reachable only through the closure's return (`|T|
 /// Option<RemoteSource<U>>`) and the fallback is an empty `[]`. The wrong
