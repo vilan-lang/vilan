@@ -2842,8 +2842,28 @@ fn the_web_preludes_surface_is_its_members_and_its_ambient_modules() {
     let importables = vilan_core::analyzer::module_importables(&spec.base_root.join("web.vl"));
     let names: Vec<&str> = importables.iter().map(|item| item.name).collect();
     for expected in [
-        "print", "Option", "Some", "None", "Result", "Ok", "Err", "Signal", "view", "View",
-        "style", "ui",
+        "print",
+        "Option",
+        "Some",
+        "None",
+        "Result",
+        "Ok",
+        "Err",
+        "Signal",
+        "view",
+        "View",
+        "style",
+        "ui",
+        // A99's slot values, bare, and A119's `when_some` with them: the
+        // owner's spelling in a hole is `{when_some(selected, ..)}`, so a
+        // conditional form left behind `ui::` would put back the import this
+        // set exists to delete.
+        "when",
+        "when_some",
+        "swap",
+        "each",
+        "each_values",
+        "each_by",
     ] {
         assert!(
             names.contains(&expected),

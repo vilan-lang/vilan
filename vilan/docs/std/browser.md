@@ -284,12 +284,13 @@ Semantics, choosing between `show`/`when`/`swap`, and examples: the
 The conditional, the dynamic subtree and the keyed run are **values**, not
 `View` methods. Each fills a child position, so it sits exactly where it is
 written — between siblings, not after them. They are bare names in the
-`std::web` prelude, and `std::ui::{ when, swap, each, each_values, each_by }`
-otherwise:
+`std::web` prelude, and
+`std::ui::{ when, when_some, swap, each, each_values, each_by }` otherwise:
 
 | function | signature | returns |
 |---|---|---|
 | `when` | `(condition: S, body: (sync \|\| C) context owner_scope)`; `S: Source<bool>, C: Slot` | `Conditional<S, C>` |
+| `when_some` | `(source: S, render: (sync \|SignalCell<T>\| C) context owner_scope)`; `S: Source<Option<T>>, C: Slot` | `WhenSome<T, S, C>` |
 | `swap` | `(source: S, render: (sync \|T\| C) context owner_scope)`; `T: PartialEq, S: Source<T>, C: Slot` | `Swap<T, S, C>` |
 | `each` | `(source: S, key: sync \|T\| K, render: (sync \|T\| C) context owner_scope)`; `T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot` | `Each<T, K, S, C>` |
 | `each_values` | `(source: S, render: (sync \|T\| C) context owner_scope)`; `T: PartialEq, S: Source<List<T>>, C: Slot` | `EachValues<T, S, C>` |
@@ -391,7 +392,7 @@ impl Stored<type T> with Source<T> {
 ```
 
 `Stored<str>` now feeds `bind_text`, `bind_class`, `bind_attr`,
-`bind_styled`, `style_var`, `show`, the five slot values (`when`, `swap`,
+`bind_styled`, `style_var`, `show`, the six slot values (`when`, `when_some`, `swap`,
 `each`, `each_values`, `each_by`) and `chunk_preload` — on both the browser
 layer and the SSR twin.
 

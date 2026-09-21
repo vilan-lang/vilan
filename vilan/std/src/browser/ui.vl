@@ -1788,3 +1788,123 @@ export fun mount_root(id: str, body: (sync || View) context owner_scope): Owner 
 	}
 	root
 }
+
+// === `when_some`: the conditional form that BINDS the value (A119) ==========
+//
+// `when` takes a `Source<bool>` and `swap` rebuilds on every distinct value, so
+// "show this while the source is `Some`, with the payload in hand" had no std
+// spelling and an app wrote its own — kolt's `lib/conditional_value.vl`, a
+// hand-rolled `Slot` impl over `Region`/`Owner`, under three of its own
+// comments.
+//
+// THE ROW SURVIVES A PAYLOAD CHANGE (R6, ruled at Order 39's GO). The body is
+// handed a `SignalCell<T>` rather than a `T`: on `Some -> Some` the cell takes
+// the new value and whatever the body bound to it updates in place, so a
+// changed field does not tear the subtree down and build it again. That is
+// `each_by`'s row cell applied to a single row, and it is why `T` needs no
+// `PartialEq` — there is no value comparison to make. It also answers the
+// FIXME kolt wrote beside its own version ("implement cache or ignore recompute
+// on every change"): the recompute it was trying to avoid is not a cache
+// question, it is the difference between rebuilding a row and writing to it.
+//
+// The PRESENCE is what decides structure: `None -> Some` builds under a fresh
+// `Owner`, `Some -> None` disposes that owner and takes the row out by its
+// span, `Some -> Some` writes. A by-value twin (rebuild on a changed payload,
+// with `T: PartialEq`) can follow if an app asks for one; nothing here needs it.
+// KEEP IN STEP with the process twin's copy (process/ui.vl).
+
+/// Content that exists while `source` is `Some`, with the payload bound — the
+/// `when_some` slot value (A119).
+export struct WhenSome<T, S: Source<Option<T>>, C: Slot> {
+	source: S,
+	render: (|SignalCell<T>| C) context owner_scope,
+}
+
+/// `Some`-conditional CONTENT at THIS position, with the payload in hand:
+/// while `source` holds a value the body's view is mounted under a fresh owner
+/// and the body's cell carries that value; when it turns `None` the owner is
+/// disposed and the content removed.
+///
+/// The body takes a `SignalCell<T>`, not a `T`, so a CHANGED payload updates
+/// the row rather than replacing it (R6) — read it with `.get()` inside a
+/// binding, exactly as an `each_by` row reads its own cell.
+///
+///     <aside>{when_some(selected, |account| account_panel(account))}</aside>
+///
+/// Write it in a child hole where the conditional content belongs, or hand it
+/// to `child` (`parent.child(when_some(..))`) for the parent's current end.
+export fun when_some<T, S: Source<Option<T>>, C: Slot>(
+	source: S,
+	render: (sync |SignalCell<T>| C) context owner_scope,
+): WhenSome<T, S, C> {
+	WhenSome { source, render }
+}
+
+export impl WhenSome<type T, type S: Source<Option<T>>, type C: Slot> with Slot {
+	fun place(self, parent: View) {
+		place_when_some(parent, self.source, self.render);
+	}
+}
+
+/// `when_some`'s body, against a region opened at `parent`'s current end —
+/// `place_swap`'s machinery, with the presence deciding structure and the cell
+/// carrying the value.
+fun place_when_some<T, S: Source<Option<T>>, C: Slot>(
+	parent: View,
+	source: S,
+	render: (sync |SignalCell<T>| C) context owner_scope,
+) {
+	// The content keeps THIS position among the parent's children (A71), so a
+	// panel between a header and a footer stays between them.
+	let region = Region::open(parent);
+	let live_cell: Shared<Option<SignalCell<T>>> = Shared::new(None);
+	let live_row: Shared<Option<Row>> = Shared::new(None);
+	let live_owner: Shared<Option<Owner>> = Shared::new(None);
+	// Live content dies with the enclosing boundary, and the anchor with it.
+	get_owner().defer(|| {
+		live_owner.read()?.dispose();
+		region.close();
+	});
+	source.effect(|value: Option<T>| {
+		match value {
+			Some(let payload) => {
+				match live_cell.read() {
+					// The row stands: its cell takes the new payload and every
+					// binding the body made over it updates in place.
+					Some(let cell) => cell.set(payload),
+					None => {
+						let cell: SignalCell<T> = SignalCell::new(payload);
+						let owner = Owner::new();
+						// The body's own owner is established HERE, at the call
+						// — the clause on the field carries the requirement this
+						// far (B309) — and the PLACE runs under it too, so a
+						// nested region's `defer` dies with the instantiation
+						// rather than with the enclosing boundary (A91).
+						let row = run_with_owner(owner, || region.open_row(render(cell)));
+						region.hold_rows([row]);
+						live_cell.write() = Some(cell);
+						live_row.write() = Some(row);
+						live_owner.write() = Some(owner);
+					},
+				}
+			},
+			None => {
+				match live_row.read() {
+					Some(let row) => {
+						live_owner.read()?.dispose();
+						// The instantiation is a ROW, not an element: its body
+						// may be a fragment, a text node or a value form that
+						// grew after it was placed, so it leaves by its span.
+						let _cut = region.cut_row(row, region.anchor);
+						region.drop_row(row);
+						region.hold_rows([]);
+						live_cell.write() = None;
+						live_row.write() = None;
+						live_owner.write() = None;
+					},
+					None => {},
+				}
+			},
+		}
+	});
+}

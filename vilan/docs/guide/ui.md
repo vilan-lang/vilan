@@ -532,32 +532,48 @@ captured before the first toggle. If you write this element's inline
 `display` yourself after binding `show`, the next toggle takes it: style
 through a `Style` and the two never meet.
 | `when(condition, body)` | unmounted, disposed | dropped | content that shouldn't exist while off (an editor for a missing record) |
+| `when_some(source, render)` | unmounted, disposed | dropped | the same, when the content NEEDS the value — an editor for the selected record |
 | `swap(source, render)` | previous subtree disposed on change | per-value | pages on a route signal, any value-driven subtree |
 
 `show` is a `View` method — it binds a property of the element it is written
-on. `when` and `swap` are **values**: each fills a child position, so it lands
-exactly where it is written.
+on. `when`, `when_some` and `swap` are **values**: each fills a child
+position, so it lands exactly where it is written.
 
 ```vilan,fragment
 .show(open)                            // any Source<bool>
 {when(present, || task_editor(…))}     // any Source<bool> + (sync || C: Slot)
+{when_some(selected, |record|          // any Source<Option<T>>
+	task_editor(record))}              //   + (sync |SignalCell<T>| C: Slot)
 {swap(route, |current| match current { // any Source<T> + (sync |T| C: Slot)
 	Route::Home => home_page(),
 	Route::NotFound => not_found(),
 })}
 ```
 
-`when` and `swap` build their content under a fresh owner each time, so
-everything inside cleans up when the content goes away. `swap` re-renders
-only when the value *changes* (`T: PartialEq`), so navigating
-to the page you're already on does nothing.
+All three build their content under a fresh owner each time, so everything
+inside cleans up when the content goes away. `swap` re-renders only when the
+value *changes* (`T: PartialEq`), so navigating to the page you're already on
+does nothing.
+
+`when_some` is the one that binds the value, and it is the reason to reach for
+it over `when(source.map(|value| value is Some(_)), ..)`: the body gets the
+payload, and it gets it as a `SignalCell<T>` rather than as a `T`. What decides
+structure is the PRESENCE — a `None` → `Some` builds, a `Some` → `None`
+disposes — so a changed payload writes to the cell and the row stands, with
+whatever bound to it updating in place. That is `each_by`'s row cell applied to
+a single row, and it is why `T` needs no `PartialEq`: nothing is compared.
+Read the cell inside a binding, exactly as an `each_by` row does:
+
+```vilan,fragment
+{when_some(selected, |account| <p>{account.map(|current| current.name)}</p>)}
+```
 
 ### Position, and placing one at the end
 
 A value fills a child position, so the conditional or the run sits exactly
-among the siblings it is written between. `std::ui` exports five —
-`when`, `swap`, `each`, `each_values`, `each_by` — and each returns something
-that fills a child slot:
+among the siblings it is written between. `std::ui` exports six —
+`when`, `when_some`, `swap`, `each`, `each_values`, `each_by` — and each
+returns something that fills a child slot:
 
 ```vilan,fragment
 <ul>

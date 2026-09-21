@@ -3174,3 +3174,183 @@ fn a105_the_ssr_twin_renders_a_some_attribute_and_omits_a_none() {
          omit a `None` entirely, and keep `Some(\"\")` as a present empty one"
     );
 }
+
+// --- A119: `when_some` — the conditional form that BINDS the value ----------
+//
+// `when` takes a `Source<bool>` and `swap` rebuilds on every distinct value, so
+// "show this while the source is `Some`, with the payload in hand" had no std
+// spelling and kolt wrote its own (`lib/conditional_value.vl`). R6 at Order
+// 39's GO: the row is KEPT across a payload change and the body is handed a
+// derived cell, which is `each_by`'s row cell applied to one row.
+//
+// The three transitions are one program, because the claim is about the
+// sequence: the identity of the `<p>` across a `Some -> Some` is the whole
+// ruling, and only a run that built it first can say whether it survived.
+
+const WHEN_SOME: &str = r#"import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, mount_root, view, when_some };
+
+struct Account {
+	id: i32,
+	name: str,
+}
+
+fun main() {
+	let selected: SignalCell<Option<Account>> = Signal::new(None);
+	let root = mount_root("app", || {
+		view("div")
+			.child(view("h1").text("head"))
+			.child(when_some(selected, |account| {
+				print("build");
+				view("p").bind_text(account.map(|current| current.name))
+			}))
+			.child(view("footer").text("foot"))
+	});
+	print(i"none={tree()}");
+	selected.set(Some(Account { id = 1, name = "Ada" }));
+	print(i"some={tree()}");
+
+	// `Some -> Some` with a CHANGED payload: the row must be the same node,
+	// carrying the new text. A rebuild would print `build` again and mint a new
+	// identity — which is exactly what `swap` would have done.
+	selected.set(Some(Account { id = 2, name = "Grace" }));
+	print(i"changed={tree()}");
+
+	selected.set(None);
+	print(i"cleared={tree()}");
+
+	// And back again, to prove the removal left the region able to build.
+	selected.set(Some(Account { id = 3, name = "Ida" }));
+	print(i"again={tree()}");
+
+	root.dispose();
+	selected.set(Some(Account { id = 4, name = "Nobody" }));
+	print(i"disposed={tree()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+main();
+"#;
+
+#[test]
+fn a119_when_some_keeps_its_row_across_a_payload_change() {
+    let harness = format!(
+        "{DOM_STUB}\nglobal.__tree = () => flatten(documentRoot);\nrequire(\"./app.js\");\n"
+    );
+    let stdout = build_and_run("when_some", WHEN_SOME, &harness);
+    let line = |prefix: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("the {prefix} line; got:\n{stdout}"))
+            .to_string()
+    };
+    // A `None` builds nothing, and the static siblings keep their places
+    // around the anchor the region planted (A71).
+    let none = line("none=");
+    assert!(
+        !none.contains(" p#"),
+        "a `None` must build no row; got:\n{stdout}"
+    );
+    assert!(
+        none.contains("h1#") && none.contains("footer#"),
+        "the static siblings must be there; got:\n{stdout}"
+    );
+
+    let some = line("some=");
+    let row_identity = some
+        .split_whitespace()
+        .find(|token| token.starts_with("p#"))
+        .unwrap_or_else(|| panic!("a `Some` must build the row; got:\n{stdout}"))
+        .to_string();
+    assert!(
+        row_identity.contains("'Ada'"),
+        "the body must see the payload; got:\n{stdout}"
+    );
+
+    // THE RULING: the row survives, so its identity is unchanged and only the
+    // text moved.
+    let changed = line("changed=");
+    let changed_identity = changed
+        .split_whitespace()
+        .find(|token| token.starts_with("p#"))
+        .unwrap_or_else(|| panic!("the row must still be there; got:\n{stdout}"))
+        .to_string();
+    assert_eq!(
+        changed_identity.split('\'').next(),
+        row_identity.split('\'').next(),
+        "a changed payload must KEEP the row (same node), not rebuild it; \
+         got:\n{stdout}"
+    );
+    assert!(
+        changed_identity.contains("'Grace'"),
+        "and the cell must carry the new value into the binding; got:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("build\n").count(),
+        2,
+        "the body must run once per INSTANTIATION — twice here (the first \
+         `Some` and the one after the `None`), never for a payload change; \
+         got:\n{stdout}"
+    );
+
+    assert!(
+        !line("cleared=").contains(" p#"),
+        "a `None` must remove the row; got:\n{stdout}"
+    );
+    assert!(
+        line("again=").contains("'Ida'"),
+        "and the next `Some` must build a fresh one; got:\n{stdout}"
+    );
+    // Disposal is the enclosing boundary's, and it takes everything the form
+    // registered: the live instantiation's owner, the row, and the region's
+    // anchor — so the static siblings close up around where it stood, exactly
+    // as `when`'s do. The `build` count above is the other half of the claim:
+    // it is still 2 after this write, so the subscription is gone.
+    let disposed = line("disposed=");
+    assert!(
+        !disposed.contains(" p#") && !disposed.contains("#text#"),
+        "disposing the root must take the row AND the region's anchor; \
+         got:\n{stdout}"
+    );
+}
+
+/// The SSR twin: read once. A `Some` renders the body with its cell holding the
+/// current payload; a `None` renders nothing at all.
+const WHEN_SOME_SSR: &str = r#"import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, render, view, when_some };
+
+struct Account {
+	id: i32,
+	name: str,
+}
+
+fun main() {
+	let held: SignalCell<Option<Account>> = Signal::new(Some(Account { id = 1, name = "Ada" }));
+	let absent: SignalCell<Option<Account>> = Signal::new(None);
+	print(render(view("aside").child(when_some(held, |account| {
+		view("p").bind_text(account.map(|current| current.name))
+	}))));
+	print(render(view("aside").child(when_some(absent, |account| {
+		view("p").bind_text(account.map(|current| current.name))
+	}))));
+}
+
+main();
+"#;
+
+#[test]
+fn a119_the_ssr_twin_renders_a_some_body_and_omits_a_none() {
+    let stdout = build_and_run_process("when_some_ssr", WHEN_SOME_SSR);
+    assert_eq!(
+        stdout, "<aside><p>Ada</p></aside>\n<aside></aside>\n",
+        "the server render must carry the `Some` body with its payload and \
+         render nothing for a `None`"
+    );
+}
