@@ -51715,6 +51715,22 @@ pub fn alias_reaching_census() -> usize {
     ALIAS_REACHING_CENSUS.with(std::cell::Cell::get)
 }
 
+// M77's count, and the load-proof half of its pin: how many rows
+// `build_impl_admission` banked in `carried` for the collision refusal to
+// read. It used to be one row per import STATEMENT in the whole program, std's
+// included, the moment any collision was banked; it is now only the statements
+// that carried a COLLIDING block's file, which is what the refusal asks about.
+// A count rather than a clock, because the difference on the M75 fixture sits
+// inside one tick of the `/proc` clock that pin reads.
+thread_local! {
+    static CARRIED_ROWS_CENSUS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[doc(hidden)]
+pub fn carried_rows_census() -> usize {
+    CARRIED_ROWS_CENSUS.with(std::cell::Cell::get)
+}
+
 // M19 T1b's own count, beside T0's census rather than inside it: how many of
 // the reused modules also had their class D TABLES restored. A separate cell
 // because the T1 census is read positionally by three pins and by the phase
@@ -60153,6 +60169,35 @@ pub fn build_impl_admission(program: &mut Program) {
             references.entry((*source, *span)).or_insert(*definition);
         }
     }
+    // M77: and the SECOND product inside the same pass. `statement_sources`
+    // climbs each resolved segment's ancestor modules
+    // (`ancestor_module_sources`, `names.md` §4.1 — "a child pulls its
+    // parent"), and it found each one with
+    // `canonical_sources.iter().position(..)`: a linear scan of every loaded
+    // file, twice per level, per segment, per statement. M75's indexes took
+    // the collision x file x statement product out of the refusal and left
+    // this one — 60 ms of the large leg, following the whole program's
+    // statement count. One map, built once, answers a level in a probe; the
+    // FIRST index wins, which is what `position` answered.
+    let source_of_path: HashMap<&Path, SourceId> = {
+        let mut index: HashMap<&Path, SourceId> = HashMap::default();
+        for (position, path) in program.canonical_sources.iter().enumerate() {
+            index
+                .entry(path.as_path())
+                .or_insert(SourceId(position as u32));
+        }
+        index
+    };
+    // M77: the only sources the collision refusal ever asks `carried` about —
+    // `statement_for` looks up `collision.first_source` and
+    // `collision.second_source` and nothing else. A row carrying neither is a
+    // row nobody reads, and on a program with one collision that is almost
+    // every statement in it.
+    let colliding_sources: HashSet<SourceId> = program
+        .cross_module_collisions
+        .iter()
+        .flat_map(|collision| [collision.first_source, collision.second_source])
+        .collect();
     // Per (importing file, restricted file): the member ids the file's
     // selectors admitted out of that file. An entry's absence is "unrestricted".
     let mut restricted: HashMap<(SourceId, SourceId), HashSet<Id>> = HashMap::default();
@@ -60201,9 +60246,21 @@ pub fn build_impl_admission(program: &mut Program) {
         if !restricting.contains(&row.source) && collisions.is_empty() {
             continue;
         }
-        let sources = statement_sources(program, &references, row);
+        let sources = statement_sources(program, &references, &source_of_path, row);
         if !collisions.is_empty() {
-            carried.push((row.source, row.span, sources.clone()));
+            // M77: only a COLLIDING block's file can be asked for, so only
+            // those are kept — and a statement that carried none of them
+            // contributes no row at all, which is what takes `carried` from
+            // one row per import statement in the whole program down to the
+            // handful the refusal reads.
+            let carried_sources: Vec<SourceId> = sources
+                .iter()
+                .copied()
+                .filter(|source| colliding_sources.contains(source))
+                .collect();
+            if !carried_sources.is_empty() {
+                carried.push((row.source, row.span, carried_sources));
+            }
         }
         if !restricting.contains(&row.source) {
             continue;
@@ -60352,6 +60409,7 @@ pub fn build_impl_admission(program: &mut Program) {
         hidden,
         reached,
     };
+    CARRIED_ROWS_CENSUS.with(|census| census.set(carried.len()));
     if !collisions.is_empty() {
         refuse_imported_member_collisions(program, &collisions, &carried);
     }
@@ -60901,6 +60959,7 @@ pub fn check_call_site_admission(program: &mut Program) {
 fn statement_sources(
     program: &Program,
     references: &HashMap<(SourceId, Span), Id>,
+    source_of_path: &HashMap<&Path, SourceId>,
     restriction: &ImportImplRestriction,
 ) -> Vec<SourceId> {
     let mut sources: Vec<SourceId> = Vec::new();
@@ -60914,7 +60973,9 @@ fn statement_sources(
         if home != restriction.source && !sources.contains(&home) {
             sources.push(home);
         }
-        for ancestor in ancestor_module_sources(program, home, restriction.path_spans.len()) {
+        for ancestor in
+            ancestor_module_sources(program, source_of_path, home, restriction.path_spans.len())
+        {
             if ancestor != restriction.source && !sources.contains(&ancestor) {
                 sources.push(ancestor);
             }
@@ -60941,7 +61002,12 @@ fn statement_sources(
 /// Bounded by the statement's own segment count: a walk that keeps climbing
 /// would eventually reach a package's entry file, which no import of a module
 /// under it loads.
-fn ancestor_module_sources(program: &Program, source: SourceId, bound: usize) -> Vec<SourceId> {
+fn ancestor_module_sources(
+    program: &Program,
+    source_of_path: &HashMap<&Path, SourceId>,
+    source: SourceId,
+    bound: usize,
+) -> Vec<SourceId> {
     let mut found = Vec::new();
     let Some(start) = program.canonical_sources.get(source.0 as usize) else {
         return found;
@@ -60964,16 +61030,17 @@ fn ancestor_module_sources(program: &Program, source: SourceId, bound: usize) ->
             directory.to_path_buf()
         };
         let candidates = [home.with_extension("vl"), home.join("lib.vl")];
+        // M77: a probe per candidate rather than a scan of every loaded file.
+        // The map keeps the FIRST index for a path, which is what `position`
+        // answered when two sources canonicalized the same way.
         let Some((index, hit)) = candidates.iter().find_map(|candidate| {
-            program
-                .canonical_sources
-                .iter()
-                .position(|loaded| loaded == candidate)
-                .map(|index| (index, candidate.clone()))
+            source_of_path
+                .get(candidate.as_path())
+                .map(|source| (*source, candidate.clone()))
         }) else {
             break;
         };
-        found.push(SourceId(index as u32));
+        found.push(index);
         current = hit;
     }
     found

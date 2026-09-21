@@ -7273,7 +7273,12 @@ fn m75_files(colliding: bool, members: usize, statements: usize) -> Vec<(String,
 /// closure's own load is out of the number and what is left is the package and
 /// its checks.
 #[cfg(target_os = "linux")]
-fn m75_cpu_ms(label: &str, colliding: bool, members: usize, statements: usize) -> Option<f64> {
+fn m75_cpu_ms(
+    label: &str,
+    colliding: bool,
+    members: usize,
+    statements: usize,
+) -> Option<(f64, usize)> {
     let directory = scratch::root().join(format!(
         "vilan_m75_{label}_{}_{:?}",
         std::process::id(),
@@ -7312,8 +7317,11 @@ fn m75_cpu_ms(label: &str, colliding: bool, members: usize, statements: usize) -
     let before = process_cpu_ms();
     let _ = analyze();
     let cpu = before.zip(process_cpu_ms()).map(|(a, b)| b - a);
+    // M77: the row count beside the clock. The analysis above ran on THIS
+    // thread, so the thread-local census is this analysis's.
+    let carried = vilan_core::analyzer::carried_rows_census();
     let _ = std::fs::remove_dir_all(&directory);
-    cpu
+    cpu.map(|cpu| (cpu, carried))
 }
 
 /// **M75 — what a two-package collision costs must not follow the importing
@@ -7365,18 +7373,55 @@ fn m75_a_collisions_refusal_does_not_scale_with_the_importers_statement_count() 
              bound would be a wall number wearing a CPU label (M15)"
         );
     };
+    let (small_clean, small_carried_clean) = small_clean;
+    let (small_collide, small_carried) = small_collide;
+    let (large_clean, large_carried_clean) = large_clean;
+    let (large_collide, large_carried) = large_collide;
     let small_delta = small_collide - small_clean;
     let large_delta = large_collide - large_clean;
     println!(
         "M75 profile={} members={MEMBERS} small({SMALL} statements) clean={small_clean:.0} ms \
          collide={small_collide:.0} ms delta={small_delta:.0} ms · large({LARGE} statements) \
          clean={large_clean:.0} ms collide={large_collide:.0} ms delta={large_delta:.0} ms \
-         load={load}",
+         · M77 carried rows small={small_carried} large={large_carried} \
+         (clean legs {small_carried_clean}/{large_carried_clean}) load={load}",
         if cfg!(debug_assertions) {
             "debug"
         } else {
             "release"
         },
+    );
+    // **M77's half of the same shape, as a COUNT.** `carried` held one row per
+    // import STATEMENT in the whole program the moment any collision was
+    // banked — the linear pass M75's indexes left behind — and the refusal
+    // reads it for exactly two sources per collision. So the rows that matter
+    // are bounded by the FILES, and never by the statement count: the large
+    // leg has ten times the small leg's statements and must not have ten times
+    // its rows.
+    //
+    // A count and not a clock, deliberately: measured on this tree at these
+    // sizes the pass is ~10 ms of a ~320 ms analysis, which is one tick of the
+    // `/proc` clock above and cannot be told from noise. On a 3,000-statement
+    // entry the same change is 54.5 -> 34.4 ms of banked-collision CPU, which
+    // is a fixture too slow to keep in the suite.
+    assert!(
+        large_carried <= small_carried * 2 + 8,
+        "the collision refusal banked {large_carried} carried rows with {LARGE} import \
+         statements and {small_carried} with {SMALL} — the rows are following the \
+         statement count, which is the pass M77 narrowed to the colliding files"
+    );
+    // Non-vacuity: a leg with no collision banks no rows at all, and the
+    // colliding legs bank some — so the bound above is over a number the pass
+    // actually produces.
+    assert_eq!(
+        (small_carried_clean, large_carried_clean),
+        (0, 0),
+        "a clean leg banks no carried rows: the whole arm is gated on a collision"
+    );
+    assert!(
+        small_carried > 0 && large_carried > 0,
+        "both colliding legs must bank rows ({small_carried}, {large_carried}), or the \
+         bound above is asserted over two zeroes"
     );
     // `carried` is still BUILT per statement (one `statement_sources` walk each,
     // once, outside the product), so the large leg is allowed to cost more —
