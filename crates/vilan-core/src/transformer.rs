@@ -2218,6 +2218,12 @@ enum Dispatch<'src> {
     Intrinsic(Intrinsic),
     /// An `[extern]`-bound external: the external's id and its host binding.
     Extern(Id, ExternBinding<'src>),
+    /// `List::new()` — an empty JS array. One of the two compiler-lowered
+    /// externals the `intrinsics` table does not carry (B359).
+    ListNew,
+    /// `List::push(self, item)` — the host's `.push` on the receiver. The other
+    /// one (B359).
+    ListPush,
     /// A normal emitted function: its JS name and whether it is async.
     Call(String, bool),
 }
@@ -5453,8 +5459,15 @@ impl<'src> Transformer<'src> {
                     && let Some(receiver_type_id) = receiver_type_id.or(self.current_self_type)
                 {
                     let concrete = self.resolve_type_id(receiver_type_id);
+                    // B359 (R1): an operator inside a trait DEFAULT body names
+                    // the trait's member; dispatch strictly within the trait
+                    // the analyzer resolved it through, exactly as the method
+                    // path does, so an implementor's same-named inherent
+                    // `add`/`eq` cannot win the by-name lookup.
+                    let preferred = self.program.bound_dispatch_traits.get(&id).cloned();
                     if !self.compares_natively(concrete)
-                        && let Some(dispatch) = self.resolve_dispatch(concrete, member_name)
+                        && let Some(dispatch) =
+                            self.resolve_dispatch_with(concrete, member_name, &[], preferred)
                     {
                         let substitution = self
                             .program
@@ -8685,6 +8698,22 @@ impl<'src> Transformer<'src> {
         {
             return Dispatch::Extern(member_id, binding);
         }
+        // B359: `List`'s `new` and `push` are the two compiler-lowered externals
+        // that carry NEITHER an `Intrinsic` row NOR an `[extern]` binding — the
+        // named-callee path recognizes them by function id and lowers them to
+        // `[]` and the host's `.push`. A DISPATCH reaching one had no such arm,
+        // so it fell through to the emitted-function name below and minted a
+        // mangled name for a function nothing ever emits: `impl List<type T>
+        // with Pusher<T>` plus a `self.push(v)` in a trait default compiled
+        // clean and threw `ReferenceError: $b is not defined` at runtime. Every
+        // other external reached here has a lowering keyed by member id; these
+        // two are keyed by their own field, so they are named here too.
+        if Some(member_id) == self.list_new_fn_id {
+            return Dispatch::ListNew;
+        }
+        if Some(member_id) == self.list_push_fn_id {
+            return Dispatch::ListPush;
+        }
         let mut substitution = HashMap::default();
         self.bind_generics(impl_subject, type_id, &mut substitution);
         if !own_generic_values.is_empty()
@@ -8720,15 +8749,78 @@ impl<'src> Transformer<'src> {
         member: &str,
     ) -> Option<(Id, TypeId)> {
         let arguments = self.wanted_trait_arguments(trait_arguments);
-        let selected = self.select_member_here(
+        if let Some(selected) = self.select_member_here(
             type_id,
             member,
             Some(impl_select::WantedTrait {
                 trait_id,
                 arguments: &arguments,
             }),
-        )?;
-        Some((selected.member_id, selected.impl_subject))
+        ) {
+            return Some((selected.member_id, selected.impl_subject));
+        }
+        // B359: the member may be declared by a SUPERTRAIT while the
+        // implementor named only a sub-trait of it — `Source<T>::sub`'s body
+        // calls `self.on_change(..)`, and a type that writes `impl C with
+        // Signal<T>` provides `Source`'s members through that clause and never
+        // names `Source`. The wanted-trait filter is a membership test on the
+        // clause's own traits, so it turns that impl down and the caller falls
+        // to the by-name lookup — which is exactly the lookup an inherent
+        // member of the same name wins. So ask the type's PROVIDED traits
+        // (most specific first) for the ones whose supertrait closure reaches
+        // `trait_id`, and take the member from there.
+        //
+        // The retries go through `impl_select::select_member` rather than
+        // `select_member_here`: a failed scoped lookup RECORDS an admission
+        // miss (E185's plumbing), and a probe that is expected to miss must not
+        // leave one behind.
+        for provided in
+            impl_select::applying_trait_ids(self.program, self.current_admitting_file, type_id)
+        {
+            if provided == trait_id || !self.trait_reaches_supertrait(provided, trait_id) {
+                continue;
+            }
+            if let Some(selected) = impl_select::select_member(
+                self.program,
+                self.current_admitting_file,
+                type_id,
+                member,
+                Some(impl_select::WantedTrait {
+                    trait_id: provided,
+                    arguments: &[],
+                }),
+            ) {
+                return Some((selected.member_id, selected.impl_subject));
+            }
+        }
+        None
+    }
+
+    /// Whether `trait_id`'s supertrait closure contains `supertrait_id` — "is
+    /// an impl of `trait_id` also an impl of `supertrait_id`'s surface"
+    /// (B359's supertrait face).
+    fn trait_reaches_supertrait(&self, trait_id: Id, supertrait_id: Id) -> bool {
+        let mut stack = vec![trait_id];
+        let mut seen = HashSet::default();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if id == supertrait_id {
+                return true;
+            }
+            let Some(trait_) = self.program.traits.get(&id) else {
+                continue;
+            };
+            for supertrait_type_id in &trait_.supertraits {
+                if let Some(Type::Trait(super_id, _)) =
+                    self.program.type_id_to_type_map.get(supertrait_type_id)
+                {
+                    stack.push(*super_id);
+                }
+            }
+        }
+        false
     }
 
     /// Lowers a resolved [`Dispatch`] to its call node with `args` (the receiver
@@ -8744,6 +8836,18 @@ impl<'src> Transformer<'src> {
             Dispatch::Extern(member_id, binding) => {
                 let call = self.emit_extern(member_id, binding, args);
                 self.maybe_await(member_id, call)
+            }
+            // The two id-keyed lowerings, in the forms the named-callee path
+            // emits them in (B359) — byte for byte, so a dispatched `push` and
+            // a written one are the same JS.
+            Dispatch::ListNew => js::Node::Array(Vec::new()),
+            Dispatch::ListPush => {
+                let mut arguments = args.into_iter();
+                let receiver = arguments.next().unwrap_or(js::Node::Void);
+                js::Node::Call(
+                    Box::new(js::Node::Property(Box::new(receiver), "push".to_string())),
+                    arguments.collect(),
+                )
             }
             Dispatch::Call(name, is_async) => {
                 let call = js::Node::Call(Box::new(js::Node::Local(name)), args);

@@ -39923,6 +39923,32 @@ impl<'src> Analyzer<'src> {
                             _ => GenericDispatch::OnType(None, member_name),
                         };
                         self.generic_dispatch.insert(id, dispatch);
+                        // B359 (R1): inside a trait DEFAULT body `self.name(..)`
+                        // means the TRAIT's member, ALWAYS — `Self` is opaque
+                        // there, so an implementor's inherent members are not in
+                        // scope (Rust's rule, and what the generic-bound route
+                        // has always done). Recording the DECLARING trait is
+                        // what says so to codegen: `resolve_dispatch_with`'s
+                        // preferred trait resolves strictly within it (the
+                        // impl's override of the trait member, else the trait's
+                        // own default) instead of falling to the by-name lookup,
+                        // which an implementor's same-named INHERENT member
+                        // wins. Without it a default written against the
+                        // trait's `push` called `Bag`'s inherent `push`, so
+                        // what a default MEANT depended on names its author
+                        // could not know — and where the inherent was
+                        // `external` the specialized default emitted a mangled
+                        // name nothing defined (`ReferenceError`, clean at
+                        // check). The two routes to one default now agree.
+                        //
+                        // Only the default-body dispatch takes it: the B299
+                        // bare-trait-impl body above re-dispatches through the
+                        // CALLER's binding, where the receiver is a concrete
+                        // type and inherent-wins is the ordinary rule.
+                        if matches!(dispatch, GenericDispatch::OnType(None, _)) {
+                            self.bound_dispatch_traits
+                                .insert(id, (*declaring_trait_id, declaring_arguments.clone()));
+                        }
                         // B205: a member reached from a SUPERTRAIT is written in
                         // that trait's terms, `Self` included — and inside this
                         // default body `Self` is the SUB-trait. Record the reach
@@ -47023,13 +47049,21 @@ impl<'src> Analyzer<'src> {
                 // same channel a `self.next()` call in a default uses. Without
                 // this the loop fell through to a native `for...of` over the
                 // struct's flat FIELD array (B56).
-                Type::Trait(trait_id, _) => {
+                Type::Trait(trait_id, trait_arguments) => {
                     let trait_id = *trait_id;
-                    match self.method_member_in_trait(trait_id, next_method) {
-                        Some(next_id) => {
+                    let trait_arguments = trait_arguments.clone();
+                    match self.method_member_in_trait_at(trait_id, &trait_arguments, next_method) {
+                        Some((next_id, declaring_trait_id, declaring_arguments)) => {
                             self.for_each_next.insert(for_each_id, next_id);
                             self.generic_dispatch
                                 .insert(for_each_id, GenericDispatch::OnType(None, next_method));
+                            // B359 (R1): the loop is a call site like any other,
+                            // so `for v in self` in a default body drives the
+                            // TRAIT's protocol member — not an implementor's
+                            // same-named inherent `next`. Same channel as the
+                            // `self.next()` call above.
+                            self.bound_dispatch_traits
+                                .insert(for_each_id, (declaring_trait_id, declaring_arguments));
                         }
                         None => self.report_uniterable_for_each(
                             for_each_id,
@@ -48280,18 +48314,28 @@ impl<'src> Analyzer<'src> {
             // B55, resolved against `current_self_type` at emission. So the
             // explicit spelling now works for the same reason the operator
             // does, and the two halves close together as filed.
-            if let Type::Trait(trait_id, _) = lhs_type
+            if let Type::Trait(trait_id, trait_arguments) = &lhs_type
                 && self.is_in_trait_default(binary_id)
             {
+                let trait_id = *trait_id;
+                let trait_arguments = trait_arguments.clone();
                 // `&&` and `||` are the only prepped operators modelling no
                 // trait, and they `continue`d far above, so every operator
                 // that reaches here has one.
                 let Some((trait_name, method_name)) = operator_trait_method(op) else {
                     continue;
                 };
-                if self.method_member_in_trait(trait_id, method_name).is_some() {
+                if let Some((_, declaring_trait_id, declaring_arguments)) =
+                    self.method_member_in_trait_at(trait_id, &trait_arguments, method_name)
+                {
                     self.generic_dispatch
                         .insert(binary_id, GenericDispatch::OnType(None, method_name));
+                    // B359 (R1): an operator in a default body is a call on the
+                    // TRAIT's member too — `self + self` over a supertrait
+                    // `Add` reaches `Add`'s `add`, never an implementor's
+                    // inherent one.
+                    self.bound_dispatch_traits
+                        .insert(binary_id, (declaring_trait_id, declaring_arguments));
                     continue;
                 }
                 // The default body writes an operator its own trait never

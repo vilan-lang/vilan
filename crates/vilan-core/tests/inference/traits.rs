@@ -6470,3 +6470,344 @@ fn b334_a_bare_value_mention_inside_an_impl_still_takes_the_member() {
         "a method has no value form",
     );
 }
+
+// --- B359: a trait DEFAULT body's `self.member(..)` is the TRAIT's member ---
+//
+// R1, ruled at Order 38's GO: inside a default body `Self` is opaque, so an
+// implementor's INHERENT members are not in scope there (Rust's rule, and what
+// the generic-bound route already did). Outside a default body inherent-wins is
+// unchanged — the last pin of this block is that control.
+//
+// Face 1 was the hijack: a default written against the trait's `push` called
+// `Bag`'s inherent `push`, so what a default MEANT depended on names its author
+// could not know, and an implementor adding an inherent method later silently
+// changed every default that called the same name. Face 2 was the miscompile:
+// where the hijacked member was `external` the specialized default emitted a
+// mangled name nothing defined — clean at check, `ReferenceError` at runtime.
+
+/// Face 1. `Pusher::push_twice`'s body calls the TRAIT's `push` (the default
+/// that prints `trait push`), never `Bag`'s inherent one — so `count` stays 0.
+#[test]
+fn b359_a_default_body_reaches_the_traits_member_not_the_implementors_inherent_one() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Bag { count: i32 }
+
+        impl Bag {
+            fun push(&mut self, value: str) {
+                print("inherent push");
+                self.count += 1;
+            }
+        }
+
+        trait Pusher<T> {
+            fun push(&mut self, value: T) { print("trait push"); }
+            fun push_twice(&mut self, value: T) { self.push(value); self.push(value); }
+        }
+
+        impl Bag with Pusher<str> {}
+
+        fun main() {
+            mut bag = Bag { count = 0 };
+            bag.push_twice("x");
+            print(i"count {bag.count}");
+        }
+        "#,
+        "trait push\ntrait push\ncount 0\n",
+    );
+}
+
+/// The control, and the half of R1 that did NOT move: an ORDINARY call site is
+/// not inside a default body, so `bag.push("y")` still reaches the inherent
+/// member exactly as it always has.
+#[test]
+fn b359_an_ordinary_call_site_still_reaches_the_inherent_member() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Bag { count: i32 }
+
+        impl Bag {
+            fun push(&mut self, value: str) {
+                print("inherent push");
+                self.count += 1;
+            }
+        }
+
+        trait Pusher<T> {
+            fun push(&mut self, value: T) { print("trait push"); }
+            fun push_twice(&mut self, value: T) { self.push(value); self.push(value); }
+        }
+
+        impl Bag with Pusher<str> {}
+
+        fun main() {
+            mut bag = Bag { count = 0 };
+            bag.push("y");
+            print(i"count {bag.count}");
+        }
+        "#,
+        "inherent push\ncount 1\n",
+    );
+}
+
+/// Face 2, the miscompile: `List`'s own `push` is `external`, and the
+/// specialized default emitted it by MANGLED NAME — `function $a(self, value) {
+/// $b(self, value); $b(self, value); }` against a `$b` nothing defined, which
+/// checked clean and threw `ReferenceError: $b is not defined`. The program
+/// runs now, and the length proves `List`'s `push` is NOT what `push_twice`
+/// reaches: the trait's default prints instead, and the list stays empty.
+#[test]
+fn b359_a_default_body_over_an_external_inherent_member_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Pusher<T> {
+            fun push(&mut self, value: T) { print("trait push"); }
+            fun push_twice(&mut self, value: T) { self.push(value); self.push(value); }
+        }
+
+        impl List<type T> with Pusher<T> {}
+
+        fun main() {
+            mut plain: List<str> = [];
+            plain.push_twice("x");
+            print(i"len {plain.len()}");
+        }
+        "#,
+        "trait push\ntrait push\nlen 0\n",
+    );
+}
+
+/// The two ROUTES to one default now agree. Reached through a generic bound
+/// (`fill<S: Pusher<str>>`) the call has always dispatched to the trait's
+/// `push`; reached through the default body it dispatched to the inherent one.
+/// Both print the same thing, and a direct call after them still appends.
+#[test]
+fn b359_the_generic_bound_route_and_the_default_body_route_agree() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Pusher<T> {
+            fun push(&mut self, value: T) { print("trait push"); }
+            fun push_twice(&mut self, value: T) { self.push(value); self.push(value); }
+        }
+
+        impl List<type T> with Pusher<T> {}
+
+        fun fill<S: Pusher<str>>(target: &mut S) { target.push("g"); }
+
+        fun main() {
+            mut plain: List<str> = [];
+            plain.push_twice("x");
+            fill(&mut plain);
+            print(i"len {plain.len()}");
+            plain.push("direct");
+            print(i"len {plain.len()}");
+        }
+        "#,
+        "trait push\ntrait push\ntrait push\nlen 0\nlen 1\n",
+    );
+}
+
+/// An impl's OVERRIDE of the trait member is what a default body reaches — the
+/// trait-scoped lookup takes the impl's declaration first and only then the
+/// trait's own default, so R1 is "the trait's member", not "the trait's body".
+#[test]
+fn b359_an_impl_override_of_the_trait_member_wins_inside_a_default_body() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Bag { count: i32 }
+
+        impl Bag {
+            fun push(&mut self, value: str) { print("inherent push"); }
+        }
+
+        trait Pusher<T> {
+            fun push(&mut self, value: T) { print("trait push"); }
+            fun push_twice(&mut self, value: T) { self.push(value); self.push(value); }
+        }
+
+        impl Bag with Pusher<str> {
+            fun push(&mut self, value: str) {
+                print("impl push");
+                self.count += 1;
+            }
+        }
+
+        fun main() {
+            mut bag = Bag { count = 0 };
+            bag.push_twice("x");
+            print(i"count {bag.count}");
+        }
+        "#,
+        "impl push\nimpl push\ncount 2\n",
+    );
+}
+
+/// The SUPERTRAIT face. The default lives in `Super`, whose `tick` the
+/// implementor provides through `impl Cell with Sub` — a clause that never
+/// names `Super`. The wanted-trait filter is a membership test on the clause's
+/// own traits, so it turned that impl down and the call fell to the by-name
+/// lookup, which the inherent `tick` won. `std`'s own `Source<T>::sub` has
+/// exactly this shape (kolt's `StorageSignalCell` writes `impl .. with
+/// Signal<T>`), which is why the trait-scoped lookup now walks the type's
+/// provided traits for the ones whose supertrait closure reaches the declaring
+/// one.
+#[test]
+fn b359_a_supertrait_default_reaches_the_sub_traits_impl_not_the_inherent_member() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Super {
+            fun tick(self): i32;
+            fun twice(self): i32 { self.tick() + self.tick() }
+        }
+
+        trait Sub with Super {
+            fun label(self): str;
+        }
+
+        struct Cell { n: i32 }
+
+        impl Cell {
+            fun tick(self): i32 { print("inherent tick"); 100 }
+        }
+
+        impl Cell with Sub {
+            fun tick(self): i32 { print("trait tick"); 1 }
+            fun label(self): str { "cell" }
+        }
+
+        fun main() {
+            let c = Cell { n = 0 };
+            print(c.twice());
+        }
+        "#,
+        "trait tick\ntrait tick\n2\n",
+    );
+}
+
+/// An OPERATOR inside a default body is a call on the trait's member too
+/// (B193's channel): `self + self` over the supertrait `Add` reaches `impl
+/// Money with Add`'s `add`, not `Money`'s inherent one. 21 + 21 = 42; the
+/// inherent `add` answers a zero.
+#[test]
+fn b359_an_operator_in_a_default_body_reaches_the_traits_member() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        struct Money { cents: i32 }
+
+        impl Money {
+            fun add(self, other: Money): Money {
+                print("inherent add");
+                Money { cents = 0 }
+            }
+        }
+
+        impl Money with Add {
+            fun add(self, other: Money): Money {
+                Money { cents = self.cents + other.cents }
+            }
+        }
+
+        trait Doubler with Add {
+            fun twice(self): Self { self + self }
+        }
+
+        impl Money with Doubler {}
+
+        fun main() {
+            print(Money { cents = 21 }.twice().cents);
+        }
+        "#,
+        "42\n",
+    );
+}
+
+/// A `for` LOOP inside a default body drives the trait's protocol member on the
+/// same channel (the loop is a call site like any other, B91/B56): `for value
+/// in self` reaches `impl Countdown with Stream`'s `next`, never the inherent
+/// one — which would have printed and yielded nothing.
+#[test]
+fn b359_a_for_loop_in_a_default_body_drives_the_traits_protocol_member() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Countdown { n: i32 }
+
+        impl Countdown {
+            fun next(&mut self): Option<i32> {
+                print("inherent next");
+                None
+            }
+        }
+
+        trait Stream {
+            fun next(&mut self): Option<i32>;
+
+            fun total(&mut self): i32 {
+                mut sum = 0;
+                for value in self {
+                    sum += value;
+                }
+                sum
+            }
+        }
+
+        impl Countdown with Stream {
+            fun next(&mut self): Option<i32> {
+                if self.n > 0 {
+                    self.n -= 1;
+                    Some(self.n + 1)
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            mut c = Countdown { n = 3 };
+            print(c.total());
+        }
+        "#,
+        "6\n",
+    );
+}
+
+/// The one BEHAVIOUR CHANGE R1 carries through std, pinned at its value.
+/// `Ord::clamp`'s default is `self.min(max).max(min)`, and every integer
+/// primitive also declares an INHERENT `min`/`max` over the host's `Math.min`/
+/// `Math.max` — which the default body used to reach. It reaches `Ord`'s own
+/// `min`/`max` defaults now: the same answers through `compare`, which is what
+/// this pin holds (the emitted JS differs, and `number-math.mjs` moved with
+/// it — its runtime output is byte-identical).
+#[test]
+fn b359_ords_clamp_default_still_answers_over_the_integers() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let low: i32 = 2;
+            print(low.clamp(3, 7));
+            print(9.clamp(0, 5));
+            print(4.clamp(0, 5));
+            print(8u32.clamp(0u32, 5u32));
+        }
+        "#,
+        "3\n5\n4\n5\n",
+    );
+}
