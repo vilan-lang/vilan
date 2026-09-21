@@ -806,14 +806,26 @@ export fun when_some<T, S: Source<Option<T>>, C: Slot>(
 
 export impl WhenSome<type T, type S: Source<Option<T>>, type C: Slot> with Slot {
 	fun place(self, parent: View) {
-		match self.source.get() {
-			Some(let payload) => {
-				let region = Region::open(parent);
-				let cell: SignalCell<T> = SignalCell::new(payload);
-				let owner = Owner::new();
-				let _row = run_with_owner(owner, || region.open_row((self.render)(cell)));
-			},
-			None => {},
-		}
+		place_when_some(parent, self.source, self.render);
+	}
+}
+
+/// `when_some`'s body, server side — the body for the CURRENT payload, in
+/// position, or nothing at all. A named helper beside `place_swap`'s and
+/// `place_each`'s, which is also what keeps the two twins' surfaces in parity
+/// (`std_twin_parity`).
+fun place_when_some<T, S: Source<Option<T>>, C: Slot>(
+	parent: View,
+	source: S,
+	render: (sync |SignalCell<T>| C) context owner_scope,
+) {
+	match source.get() {
+		Some(let payload) => {
+			let region = Region::open(parent);
+			let cell: SignalCell<T> = SignalCell::new(payload);
+			let owner = Owner::new();
+			let _row = run_with_owner(owner, || region.open_row(render(cell)));
+		},
+		None => {},
 	}
 }
