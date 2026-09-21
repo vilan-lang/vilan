@@ -3254,8 +3254,8 @@ fn rpc_admits_a_missing_return() {
     // WAS `rpc_rejects_a_missing_return`, and A107 (R6) is why it turned over:
     // a void `[rpc]` method has no reply PAYLOAD, which is not the same as
     // having no reply. The reply is the ack envelope the protocol already
-    // writes, the generated stub awaits it, and `Option<RpcError>` is what it
-    // hands back — so the method a caller must WAIT for but that has nothing to
+    // writes, the generated stub awaits it, and `Result<void, RpcError>` is what
+    // it hands back — so the method a caller must WAIT for but that has nothing to
     // report is finally spellable (kolt's `store.vl` wrote `bool` for it).
     //
     // The old comment's parenthesis — "fire-and-forget needs its own design" —

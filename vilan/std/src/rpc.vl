@@ -1431,11 +1431,11 @@ fun send_notification<Tx: Transport>(
 /// with nothing to SAY and something to WAIT FOR — kolt's `remove_message` —
 /// had neither shape before and wrote `bool` for the wait.
 ///
-/// The answer is `Option<RpcError>` and not `Result<void, RpcError>` because
-/// vilan has no unit literal: `Ok(())` does not parse, so a `Result` whose
-/// success arm is `void` has no constructible `Ok`. `None`-is-fine reads the
-/// same way at a call site that only wants the wait (`client.remove(id);`
-/// awaits and discards) and the same way at one that wants the failure.
+/// The answer is `Result<void, RpcError>`, the shape every other stub has with
+/// nothing in its `Ok`: `void` is vilan's unit value, so `Ok(void)` is the ack.
+/// A call site that only wants the wait writes `client.remove(id)!;` or
+/// discards the result; one that wants the failure matches `Err`, exactly as
+/// it does for a method that answers something.
 ///
 /// The reply's `true` body is `notified`'s ack and is deliberately not read:
 /// what the ENVELOPE was — `Success` or `Failure` — is the whole answer, so
@@ -1445,11 +1445,11 @@ fun call_ack<Tx: Transport>(
 	codec: Codec,
 	method: str,
 	args: List<|Serializer| void>,
-): Option<RpcError> {
+): Result<void, RpcError> {
 	let outcome: Result<bool, RpcError> = call(transport, codec, method, args);
 	match outcome {
-		Ok(let _ran) => None,
-		Err(let error) => Some(error),
+		Ok(let _ran) => Ok(void),
+		Err(let error) => Err(error),
 	}
 }
 
@@ -5546,8 +5546,8 @@ export macro fun service(item: Item): Source {
 		//
 		// On a pure server `[service]` it is an AWAITED VOID (A107, R6): the
 		// stub issues the call, waits for the ack, and answers with the failure
-		// if there was one (`Option<RpcError>`; `call_ack` says why not a
-		// `Result`). A method with nothing to report and something to wait for
+		// if there was one (`Result<void, RpcError>` — every stub's shape, with
+		// the unit value in its `Ok`). A method with nothing to report and something to wait for
 		// is the shape kolt's `remove_message` wrote `bool` for, and A75's
 		// `notify` already covers the fire-and-forget half — so admitting void
 		// as "it happened" adds the call that was missing rather than a second
@@ -5557,7 +5557,7 @@ export macro fun service(item: Item): Source {
 				stub = stub.expr(i"rpc::send_notification(self.transport, self.codec, {label}, [{describer_list}])");
 			} else {
 				stub = stub
-					.returns("Option<RpcError>")
+					.returns("Result<void, RpcError>")
 					.expr(i"rpc::call_ack(self.transport, self.codec, {label}, [{describer_list}])");
 			}
 		} else if kind == "" {

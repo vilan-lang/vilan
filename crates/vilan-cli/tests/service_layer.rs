@@ -4396,11 +4396,10 @@ fun run(port: i32) {
 /// between this and a notification (A75 `notify`, `send_notification`), which
 /// returns as soon as the request is sent and can be overtaken by anything.
 ///
-/// The stub answers `Option<RpcError>` rather than `Result<void, RpcError>`
-/// because vilan has no unit literal — `Ok(())` does not parse, so a `Result`
-/// whose success arm is `void` has no constructible `Ok`. `None` is the ack.
-/// Measured, not assumed: `call_ack`'s doc-comment says so, and the shape was
-/// probed before the surface was chosen.
+/// The stub answers `Result<void, RpcError>` — every other stub's shape with
+/// the unit value in its `Ok` (B363: `void` IS vilan's unit value; the first
+/// surface was `Option<RpcError>`, chosen on a probe that had tried only the
+/// `()` spelling). `Ok(_)` is the ack.
 ///
 /// The wire does not move for this. The reply is the SAME ack envelope
 /// `notified` already sent for a `[client_service]` notification, so nothing
@@ -4474,13 +4473,13 @@ fun run(port: i32) {
 	match StoreClient::connect(i"ws://localhost:{port}/", json_codec()) {
 		Ok(let client) => {
 			match client.remove(2i53) {
-				None => print("client-acked-remove"),
-				Some(let error) => print(i"client-remove-failed:{error.debug()}"),
+				Ok(_) => print("client-acked-remove"),
+				Err(let error) => print(i"client-remove-failed:{error.debug()}"),
 			}
 			print(i"count-after-remove:{client.count().unwrap_or(0)}");
 			match client.clear() {
-				None => print("client-acked-clear"),
-				Some(let error) => print(i"client-clear-failed:{error.debug()}"),
+				Ok(_) => print("client-acked-clear"),
+				Err(let error) => print(i"client-clear-failed:{error.debug()}"),
 			}
 			print(i"count-after-clear:{client.count().unwrap_or(0)}");
 		},

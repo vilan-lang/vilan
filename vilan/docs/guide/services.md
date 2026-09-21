@@ -181,23 +181,20 @@ fun remove_row(self, id: i53) {
 }
 ```
 
-The stub answers `Option<RpcError>`: `None` is the ack, `Some(error)` is
-a call that did not land.
+The stub answers `Result<void, RpcError>` — the shape every other stub
+has, with nothing in its `Ok`: `void` is Vilan's unit value, so the ack
+is `Ok(void)` and a call that did not land is `Err(error)`.
 
 ```vilan,fragment
 // Wait and check.
 match client.remove_row(id) {
-	None => {},
-	Some(let error) => print(i"remove failed: {error.debug()}"),
+	Ok(_) => {},
+	Err(let error) => print(i"remove failed: {error.debug()}"),
 }
 
 // Wait and don't check — still a round trip, the value discarded.
 let _ = client.remove_row(id);
 ```
-
-It is `Option<RpcError>` rather than `Result<void, RpcError>` for a
-plain reason: Vilan has no unit literal, so there is no `Ok(())` to
-write.
 
 **This is not a notification, and the difference is the wait.** A
 notification (`[client_service]`, or the server's
