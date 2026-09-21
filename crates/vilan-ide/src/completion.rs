@@ -731,7 +731,7 @@ fn error_tag_name_range(source: &str, start: usize, end: usize) -> Option<std::o
 /// scope already live. And the property row inserts the `(` with the name,
 /// because a declaration is a call.
 impl Analysis<'_, '_> {
-    fn css_block_completions(&self, position: CssPosition) -> Vec<Completion> {
+    fn css_block_completions(&self, position: CssPosition, offset: usize) -> Vec<Completion> {
         match position {
             CssPosition::Property => {
                 // E153: std's slots FIRST, in canonical order — those are the
@@ -764,7 +764,9 @@ impl Analysis<'_, '_> {
                     })
                     .collect()
             }
-            CssPosition::DottedHead => self.css_dotted_head_completions(),
+            CssPosition::DottedHead => {
+                self.css_dotted_head_completions(self.to_analyzed_offset(offset))
+            }
             // The same rows, as the free CONSTRUCTORS a set is summed from. They
             // are functions here and methods above, which is exactly the
             // difference between `hover()` (the condition) and `.hover { … }`
@@ -804,7 +806,7 @@ impl Analysis<'_, '_> {
     /// Insertion: a nested-rule entry opens a body (`.hover() { }` — the head's
     /// own parens, then the block), a plain method ends its item (`.raw();`),
     /// because those are the two shapes the grammar admits after a dotted head.
-    fn css_dotted_head_completions(&self) -> Vec<Completion> {
+    fn css_dotted_head_completions(&self, analyzed_offset: usize) -> Vec<Completion> {
         let program = self.program;
         let mut items: Vec<Completion> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
@@ -820,7 +822,11 @@ impl Analysis<'_, '_> {
             });
             items.push(completion);
         }
-        let Some(style_id) = self.nominal_id_by_name("Style") else {
+        // `Style` through the SCOPE at the cursor (E195): a `css` block reaches
+        // it by import, so the file's own chain is the right answer — and a
+        // program carrying a second `Style` (a dependency's, kolt's own) must
+        // not have its methods offered here.
+        let Some(style_id) = self.nominal_id_by_name("Style", analyzed_offset) else {
             return items;
         };
         for implementation in &program.implementations {
@@ -1619,7 +1625,9 @@ impl<'a, 'src> Analysis<'a, 'src> {
             CursorContext::ElementHead { chain, tag } => {
                 return self.element_head_completions(chain, tag);
             }
-            CursorContext::CssBlock(position) => return self.css_block_completions(position),
+            CursorContext::CssBlock(position) => {
+                return self.css_block_completions(position, offset);
+            }
             // A field position offers the struct's fields and NOTHING else
             // (E160) — the element head's rule, for the element head's reason:
             // a name in scope is not a field name, and the one thing the author
@@ -1904,18 +1912,26 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// `None` when any step fails, which is a decline and not a guess — the
     /// caller's fallback is what decides whether a guess is better than silence.
     fn path_struct_id(&self, namespace: &[&str], name: &str, analyzed_offset: usize) -> Option<Id> {
+        self.path_entity_id(namespace, name, analyzed_offset)
+            .filter(|id| self.program.structs.contains_key(id))
+    }
+
+    /// The entity a written path names, resolved the way the analyzer resolves
+    /// it (E193): the leading segment out of the SCOPE at the cursor, each
+    /// further segment out of the namespace before it. No filter on what it
+    /// turns out to be — [`Self::path_struct_id`] and
+    /// [`Self::nominal_id_by_name`] each apply their own, which is the only
+    /// thing that differed between the two spellings of this walk (E195).
+    fn path_entity_id(&self, namespace: &[&str], name: &str, analyzed_offset: usize) -> Option<Id> {
         let Some((first, rest)) = namespace.split_first() else {
             // Unqualified: the binding this file's scope chain gives the name.
-            return self
-                .binding_in_scope(name, analyzed_offset)
-                .filter(|id| self.program.structs.contains_key(id));
+            return self.binding_in_scope(name, analyzed_offset);
         };
         let mut current = self.namespace_in_scope(first, analyzed_offset)?;
         for segment in rest {
             current = self.namespace_entry_id(current, segment)?;
         }
         self.namespace_entry_id(current, name)
-            .filter(|id| self.program.structs.contains_key(id))
     }
 
     /// The candidates at a struct-initializer field position (E160): the
@@ -2157,7 +2173,12 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 self.expression_element_nominal_id(receiver).or_else(|| {
                     self.hover_label(receiver)
                         .and_then(|label| first_generic_argument(&label).map(str::to_string))
-                        .and_then(|element| self.nominal_id_by_name(base_type_name(&element)))
+                        .and_then(|element| {
+                            self.nominal_id_by_name(
+                                base_type_name(&element),
+                                self.to_analyzed_offset(receiver_end),
+                            )
+                        })
                 })
             })
             .map(|type_id| self.nominal_member_completions(type_id))
@@ -2205,8 +2226,12 @@ impl<'a, 'src> Analysis<'a, 'src> {
             .and_then(|offset| self.entity_at(offset))
             .and_then(|receiver| {
                 self.expression_nominal_id(receiver).or_else(|| {
-                    self.hover_label(receiver)
-                        .and_then(|label| self.nominal_id_by_name(base_type_name(&label)))
+                    self.hover_label(receiver).and_then(|label| {
+                        self.nominal_id_by_name(
+                            base_type_name(&label),
+                            self.to_analyzed_offset(receiver_end),
+                        )
+                    })
                 })
             })
     }
@@ -3148,19 +3173,46 @@ impl<'a, 'src> Analysis<'a, 'src> {
         }
     }
 
-    /// The struct or enum named `name` (type arguments already stripped).
-    fn nominal_id_by_name(&self, name: &str) -> Option<Id> {
+    /// The struct or enum a written type name refers to AT `analyzed_offset`
+    /// (type arguments already stripped, a `::`-qualified spelling admitted).
+    ///
+    /// E195: this used to be the program-wide FIRST match by name, which is the
+    /// shape E193 fixed for the struct-initializer head — and with two modules
+    /// in one program declaring a `Dot` each, "first" is an answer about entity
+    /// id order and not about this file. The resolution is
+    /// [`Self::path_entity_id`], the analyzer's own: the scope chain at the
+    /// cursor, then each further segment out of the namespace before it.
+    ///
+    /// The program-wide scan STAYS as the fallback, for the same reason
+    /// [`CursorContext::StructInitializer`] keeps one: these callers hand this a
+    /// name read off a RENDERED type label, and a label may name a type no
+    /// scope of this file binds (a type reached only as another type's
+    /// argument). A first match is then still better than silence — it is what
+    /// this answered for every name before — and it can only be reached once
+    /// scope resolution has declined.
+    fn nominal_id_by_name(&self, name: &str, analyzed_offset: usize) -> Option<Id> {
         let program = self.program;
+        let is_nominal =
+            |id: &Id| program.structs.contains_key(id) || program.enums.contains_key(id);
+        let segments: Vec<&str> = name.split("::").map(str::trim).collect();
+        if let Some((last, namespace)) = segments.split_last()
+            && let Some(id) = self
+                .path_entity_id(namespace, last, analyzed_offset)
+                .filter(is_nominal)
+        {
+            return Some(id);
+        }
+        let leaf = segments.last().copied().unwrap_or(name);
         program
             .structs
             .iter()
-            .find(|(_, structure)| structure.name == name)
+            .find(|(_, structure)| structure.name == leaf)
             .map(|(id, _)| *id)
             .or_else(|| {
                 program
                     .enums
                     .iter()
-                    .find(|(_, enumeration)| enumeration.name == name)
+                    .find(|(_, enumeration)| enumeration.name == leaf)
                     .map(|(id, _)| *id)
             })
     }

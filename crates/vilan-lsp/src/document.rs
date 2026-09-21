@@ -14410,6 +14410,131 @@ pub(crate) mod tests {
         }
     }
 
+    // E195: the OTHER two callers of the same by-name lookup — the receiver
+    // typing fallbacks — resolve through the scope chain too.
+    //
+    // `nominal_id_by_name` was the program-wide first match by name, which is
+    // exactly the shape E193 fixed above for the struct-initializer head. It
+    // reached three callers, and the two below can only be seen with two
+    // modules in one program: a sibling's `Dot` is loaded before the entry's
+    // (imports walk first), so "the first struct named `Dot`" is the sibling's
+    // — an answer about entity-id order rather than about this file — and
+    // completion offered the WRONG type's members.
+    //
+    // Both are FALLBACK paths, reached only where the live token walk cannot
+    // type the receiver: the receiver here is a variant CONSTRUCTOR call and a
+    // `?.`-lifted call, which `expr_types` records nothing for, so the typing
+    // goes through the rendered hover label and its name back to a nominal.
+
+    /// The label fallback: `Round(1).|` — a VARIANT constructor, which the live
+    /// token walk cannot type (it is not a function), so the receiver's type
+    /// comes from the rendered hover label, which answers a constructor call
+    /// with the thing being constructed (`enum Dot`). That name must resolve
+    /// through the scope chain: `marks` is imported first, so ITS `Dot` holds
+    /// the lower entity id and is what "the first enum named `Dot`" answered.
+    #[test]
+    fn member_completion_on_a_constructor_receiver_prefers_the_nominal_in_scope() {
+        let labels = workspace_completions_at_cursor(&[
+            (
+                "src/main.vl",
+                "import pkg::marks;\n\
+                 import pkg::shapes::Dot::{ self, Round };\n\
+                 fun main() {\n\tRound(1).|\n\tlet _ = marks::Dot::Square;\n}\n",
+            ),
+            (
+                "src/marks.vl",
+                "export enum Dot { Square }\n\
+                 impl Dot { fun ink(self): str { \"a\" } }\n",
+            ),
+            (
+                "src/shapes.vl",
+                "export enum Dot { Round(i32) }\n\
+                 impl Dot { fun radius(self): i32 { 1 } }\n",
+            ),
+            ("vilan.toml", "[package]\nname = \"probe\"\n"),
+        ]);
+        assert!(
+            labels.contains(&"radius".to_string()),
+            "the `Dot` this file's scope binds: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"ink".to_string()),
+            "not the sibling's `Dot`, whichever the program recorded first: {labels:?}"
+        );
+    }
+
+    /// The lifted arm, as a REGRESSION GUARD rather than a differential: the
+    /// item's third caller is `member_completions_for`'s `Option<…>` first-
+    /// generic-argument fallback, and this fixture does not reach it —
+    /// `expression_element_nominal_id` answers first, so the pin passes with
+    /// the old by-name lookup too (verified by planting it). It is here
+    /// because the arm now threads the cursor offset like its neighbour and a
+    /// wrong offset would show up as the SIBLING's members; a fixture that
+    /// forces the fallback under a `?.` was not found, and the gap is reported
+    /// rather than papered over.
+    #[test]
+    fn lifted_member_completion_prefers_this_files_own_element_nominal() {
+        let labels = workspace_completions_at_cursor(&[
+            (
+                "src/main.vl",
+                "import pkg::marks;\n\
+                 import std::option::Option::{ self, None };\n\
+                 struct Dot { x: i32 }\n\
+                 impl Dot { fun radius(self): i32 { 1 } }\n\
+                 fun find(): Option<Dot> { None }\n\
+                 fun main() {\n\tfind()?.|\n\tlet _ = marks::Dot { ink = \"a\" };\n}\n",
+            ),
+            (
+                "src/marks.vl",
+                "export struct Dot { ink: str }\n\
+                 impl Dot { fun shade(self): str { self.ink } }\n",
+            ),
+            ("vilan.toml", "[package]\nname = \"probe\"\n"),
+        ]);
+        assert!(
+            labels.contains(&"x".to_string()) || labels.contains(&"radius".to_string()),
+            "this file's `Dot`: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"ink".to_string()) && !labels.contains(&"shade".to_string()),
+            "not the sibling's `Dot`: {labels:?}"
+        );
+    }
+
+    /// The `css` dotted-head popup, which asks for `Style` by name: a program
+    /// carrying a second `Style` must not have ITS methods offered.
+    ///
+    /// Also a guard rather than a differential, and for a reason worth
+    /// recording: std walks BEFORE any package module, so std's `Style` always
+    /// held the lower entity id and the program-wide first match already
+    /// answered correctly here. This caller's bug was unreachable in a real
+    /// program; the pin holds the answer now that scope resolution decides it.
+    #[test]
+    fn css_dotted_head_completion_prefers_the_style_this_file_imports() {
+        let labels = workspace_completions_at_cursor(&[
+            (
+                "src/main.vl",
+                "import pkg::marks;\n\
+                 import std::style::{ Style, style };\n\
+                 fun card(): Style {\n\tcss {\n\t\t.|\n\t}\n}\n",
+            ),
+            (
+                "src/marks.vl",
+                "export struct Style { ink: str }\n\
+                 impl Style { fun unrelated_marks_method(self): str { self.ink } }\n",
+            ),
+            ("vilan.toml", "[package]\nname = \"probe\"\n"),
+        ]);
+        assert!(
+            labels.contains(&"hover".to_string()),
+            "the condition combinators: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"unrelated_marks_method".to_string()),
+            "a sibling's same-named `Style` contributes nothing: {labels:?}"
+        );
+    }
+
     // The exhibit's own shape (kolt `store.vl:265`): a multi-line list, one
     // assigned field and three shorthands, the cursor on a fresh line.
     #[test]
