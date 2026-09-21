@@ -67,7 +67,9 @@ function drain(turn) {
 				turn[0].v = [  ];
 				turn[1].v = new Map();
 				for (const subscriber of wave) {
-					subscriber[1]();
+					if (subscriber[2].v) {
+						subscriber[1]();
+					}
 					budget = budget - 1;
 				}
 			}
@@ -80,6 +82,7 @@ function drain(turn) {
 	}
 }
 function dispose(self, $s) {
+	self[2].v = false;
 	const $t = [ 0, self[0] ];
 	let $u = null;
 	if ($t[0] === 0) {
@@ -114,11 +117,11 @@ function dispose(self, $s) {
 		$w = undefined;
 	}
 	$w;
-	const $x = self[2].v;
+	const $x = self[3].v;
 	let $y = null;
 	if ($x[0] === 0) {
 		const release = $x[1];
-		self[2].v = [ 1 ];
+		self[3].v = [ 1 ];
 		releasing_turns.v.push(ambient);
 		__with_finally(release, () => {
 			__list_pop(releasing_turns.v);
@@ -191,18 +194,19 @@ function $a(value) {
 function $d(signal, observer) {
 	const id = fresh_id();
 	const cell = signal[0];
+	const live = __shared_new(true);
 	signal[1].v.push([ id, () => {
 		const $e = [ 0, cell ];
 		let $f = null;
 		if ($e[0] === 0) {
-			const live = $e[1];
-			$f = observer(live.v);
+			const live2 = $e[1];
+			$f = observer(live2.v);
 		} else {
 			$f = undefined;
 		}
 		return $f;
-	} ]);
-	return [ signal[1], id, __shared_new([ 1 ]) ];
+	}, live ]);
+	return [ signal[1], id, live, __shared_new([ 1 ]) ];
 }
 function $g(self) {
 	return __clone(self[0].v);
@@ -235,7 +239,9 @@ function $k(self, $l) {
 			$r = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
-				subscriber[1]();
+				if (subscriber[2].v) {
+					subscriber[1]();
+				}
 			}
 			$r = undefined;
 		}
@@ -295,7 +301,9 @@ function $X(self, $l) {
 			$ab = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
-				subscriber[1]();
+				if (subscriber[2].v) {
+					subscriber[1]();
+				}
 			}
 			$ab = undefined;
 		}
@@ -318,18 +326,19 @@ function $S(self, transform, $T, $U) {
 function $ai(signal, observer) {
 	const id = fresh_id();
 	const cell = signal[0];
+	const live = __shared_new(true);
 	signal[1].v.push([ id, () => {
 		const $aj = [ 0, cell ];
 		let $ak = null;
 		if ($aj[0] === 0) {
-			const live = $aj[1];
-			$ak = observer(live.v);
+			const live2 = $aj[1];
+			$ak = observer(live2.v);
 		} else {
 			$ak = undefined;
 		}
 		return $ak;
-	} ]);
-	return [ signal[1], id, __shared_new([ 1 ]) ];
+	}, live ]);
+	return [ signal[1], id, live, __shared_new([ 1 ]) ];
 }
 function $ah(self, observer) {
 	const subscription = $ai(self, observer);

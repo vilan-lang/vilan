@@ -475,8 +475,13 @@ impl Subscription {
 }
 ```
 
-Disposing a subscription guarantees no *later* deliveries; a delivery already
-queued in the currently-draining turn may still land once.
+Disposing a subscription guarantees no later deliveries — **none**, including
+ones already in flight. A subscriber carries a liveness flag that `dispose`
+lowers before it detaches anything, and both notification loops skip a lowered
+one, so a delivery is stopped whether it sits in a wave the drain has already
+taken out of the queue, in a turn the disposer's own extent cannot reach, or in
+the snapshot an inline notify is walking. (Until A110 a delivery queued in the
+currently-draining turn could still land once. It cannot now.)
 
 `Subscription::teardown` is the registration shape for a source **outside** the
 signal graph: `dispose` runs the hook once and does nothing else. `std::dom`'s

@@ -57,7 +57,14 @@ const CENSUS: &[(&str, usize, &str)] = &[
         "R + O: the registry, the server's stats",
     ),
     ("process/ui.vl", 3, "O: the SSR request's view tree"),
-    ("reactive.vl", 26, "R + O + E: turns, owners, cells, drafts"),
+    (
+        "reactive.vl",
+        29,
+        "R + O + E: turns, owners, cells, drafts, and the subscriber liveness \
+         flag (A110 door 1 — `observe`'s per-subscriber cell, shared with the \
+         `Subscription`; `Subscription::teardown`'s own; the module-level \
+         `always_live` every deferral subscriber shares)",
+    ),
     (
         "rpc.vl",
         52,
@@ -171,7 +178,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 128,
+        total, 131,
         "the total number of `Shared` construction sites in std changed"
     );
 }

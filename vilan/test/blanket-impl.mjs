@@ -59,7 +59,9 @@ function drain(turn) {
 				turn[0].v = [  ];
 				turn[1].v = new Map();
 				for (const subscriber of wave) {
-					subscriber[1]();
+					if (subscriber[2].v) {
+						subscriber[1]();
+					}
 					budget = budget - 1;
 				}
 			}
@@ -89,18 +91,19 @@ function $e(value) {
 function $j(signal, observer) {
 	const id = fresh_id();
 	const cell = signal[0];
+	const live2 = __shared_new(true);
 	signal[1].v.push([ id, () => {
 		const $k = [ 0, cell ];
 		let $l = null;
 		if ($k[0] === 0) {
-			const live2 = $k[1];
-			$l = observer(live2.v);
+			const live3 = $k[1];
+			$l = observer(live3.v);
 		} else {
 			$l = undefined;
 		}
 		return $l;
-	} ]);
-	return [ signal[1], id, __shared_new([ 1 ]) ];
+	}, live2 ]);
+	return [ signal[1], id, live2, __shared_new([ 1 ]) ];
 }
 function $m(self) {
 	return __clone(self[0].v);
@@ -138,7 +141,9 @@ function $p(self, $q) {
 			$w = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
-				subscriber[1]();
+				if (subscriber[2].v) {
+					subscriber[1]();
+				}
 			}
 			$w = undefined;
 		}

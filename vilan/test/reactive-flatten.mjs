@@ -59,7 +59,9 @@ function drain(turn) {
 				turn[0].v = [  ];
 				turn[1].v = new Map();
 				for (const subscriber of wave) {
-					subscriber[1]();
+					if (subscriber[2].v) {
+						subscriber[1]();
+					}
 					budget = budget - 1;
 				}
 			}
@@ -72,6 +74,7 @@ function drain(turn) {
 	}
 }
 function dispose(self, $l) {
+	self[2].v = false;
 	const $m = [ 0, self[0] ];
 	let $n = null;
 	if ($m[0] === 0) {
@@ -106,11 +109,11 @@ function dispose(self, $l) {
 		$p = undefined;
 	}
 	$p;
-	const $q = self[2].v;
+	const $q = self[3].v;
 	let $r = null;
 	if ($q[0] === 0) {
 		const release = $q[1];
-		self[2].v = [ 1 ];
+		self[3].v = [ 1 ];
 		releasing_turns.v.push(ambient);
 		__with_finally(release, () => {
 			__list_pop(releasing_turns.v);
@@ -184,7 +187,9 @@ function $u(self, $v) {
 			$B = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
-				subscriber[1]();
+				if (subscriber[2].v) {
+					subscriber[1]();
+				}
 			}
 			$B = undefined;
 		}
@@ -199,18 +204,19 @@ function $s(self, value, $t) {
 function $D(signal, observer) {
 	const id = fresh_id();
 	const cell = signal[0];
+	const live = __shared_new(true);
 	signal[1].v.push([ id, () => {
 		const $E = [ 0, cell ];
 		let $F = null;
 		if ($E[0] === 0) {
-			const live = $E[1];
-			$F = observer(live.v);
+			const live2 = $E[1];
+			$F = observer(live2.v);
 		} else {
 			$F = undefined;
 		}
 		return $F;
-	} ]);
-	return [ signal[1], id, __shared_new([ 1 ]) ];
+	}, live ]);
+	return [ signal[1], id, live, __shared_new([ 1 ]) ];
 }
 function $C(self, observer) {
 	const subscription = $D(self, observer);
@@ -220,18 +226,19 @@ function $C(self, observer) {
 function $H(signal, observer) {
 	const id = fresh_id();
 	const cell = signal[0];
+	const live = __shared_new(true);
 	signal[1].v.push([ id, () => {
 		const $I = [ 0, cell ];
 		let $J = null;
 		if ($I[0] === 0) {
-			const live = $I[1];
-			$J = observer(live.v);
+			const live2 = $I[1];
+			$J = observer(live2.v);
 		} else {
 			$J = undefined;
 		}
 		return $J;
-	} ]);
-	return [ signal[1], id, __shared_new([ 1 ]) ];
+	}, live ]);
+	return [ signal[1], id, live, __shared_new([ 1 ]) ];
 }
 function $G(self, observer) {
 	const subscription = $H(self, observer);
@@ -295,7 +302,9 @@ function $W(self, $v) {
 			$aa = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
-				subscriber[1]();
+				if (subscriber[2].v) {
+					subscriber[1]();
+				}
 			}
 			$aa = undefined;
 		}
@@ -321,7 +330,9 @@ function $ag(self, $v) {
 			$ak = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
-				subscriber[1]();
+				if (subscriber[2].v) {
+					subscriber[1]();
+				}
 			}
 			$ak = undefined;
 		}

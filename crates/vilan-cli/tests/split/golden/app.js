@@ -147,7 +147,9 @@ function drain(turn) {
 				turn[0].v = [  ];
 				turn[1].v = new Map();
 				for (const subscriber of wave) {
-					subscriber[1]();
+					if (subscriber[2].v) {
+						subscriber[1]();
+					}
 					budget = budget - 1;
 				}
 			}
@@ -160,6 +162,7 @@ function drain(turn) {
 	}
 }
 function dispose(self, $P) {
+	self[2].v = false;
 	const $Q = [ 0, self[0] ];
 	let $R = null;
 	if ($Q[0] === 0) {
@@ -194,11 +197,11 @@ function dispose(self, $P) {
 		$T = undefined;
 	}
 	$T;
-	const $U = self[2].v;
+	const $U = self[3].v;
 	let $V = null;
 	if ($U[0] === 0) {
 		const release = $U[1];
-		self[2].v = [ 1 ];
+		self[3].v = [ 1 ];
 		releasing_turns.v.push(ambient);
 		__with_finally(release, () => {
 			__list_pop(releasing_turns.v);
@@ -636,7 +639,9 @@ function $h(self, $i) {
 			$o = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
-				subscriber[1]();
+				if (subscriber[2].v) {
+					subscriber[1]();
+				}
 			}
 			$o = undefined;
 		}
@@ -672,7 +677,9 @@ function $A(self, $i) {
 			$E = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
-				subscriber[1]();
+				if (subscriber[2].v) {
+					subscriber[1]();
+				}
 			}
 			$E = undefined;
 		}
@@ -687,18 +694,19 @@ function $z(self, value, $g) {
 function $G(signal, observer) {
 	const id = fresh_id();
 	const cell = signal[0];
+	const live = __shared_new(true);
 	signal[1].v.push([ id, () => {
 		const $H = [ 0, cell ];
 		let $I = null;
 		if ($H[0] === 0) {
-			const live = $H[1];
-			$I = observer(live.v);
+			const live2 = $H[1];
+			$I = observer(live2.v);
 		} else {
 			$I = undefined;
 		}
 		return $I;
-	} ]);
-	return [ signal[1], id, __shared_new([ 1 ]) ];
+	}, live ]);
+	return [ signal[1], id, live, __shared_new([ 1 ]) ];
 }
 function $F(self, observer) {
 	return $G(self, observer);
@@ -746,18 +754,19 @@ function $aq(self, content, $ar, $as) {
 function $ax(signal, observer) {
 	const id = fresh_id();
 	const cell = signal[0];
+	const live = __shared_new(true);
 	signal[1].v.push([ id, () => {
 		const $ay = [ 0, cell ];
 		let $az = null;
 		if ($ay[0] === 0) {
-			const live = $ay[1];
-			$az = observer(live.v);
+			const live2 = $ay[1];
+			$az = observer(live2.v);
 		} else {
 			$az = undefined;
 		}
 		return $az;
-	} ]);
-	return [ signal[1], id, __shared_new([ 1 ]) ];
+	}, live ]);
+	return [ signal[1], id, live, __shared_new([ 1 ]) ];
 }
 function $aw(self, observer) {
 	return $ax(self, observer);
@@ -788,18 +797,19 @@ function $aA(self, source, $aB, $aC) {
 function $aQ(signal, observer) {
 	const id = fresh_id();
 	const cell = signal[0];
+	const live = __shared_new(true);
 	signal[1].v.push([ id, () => {
 		const $aR = [ 0, cell ];
 		let $aS = null;
 		if ($aR[0] === 0) {
-			const live = $aR[1];
-			$aS = observer(live.v);
+			const live2 = $aR[1];
+			$aS = observer(live2.v);
 		} else {
 			$aS = undefined;
 		}
 		return $aS;
-	} ]);
-	return [ signal[1], id, __shared_new([ 1 ]) ];
+	}, live ]);
+	return [ signal[1], id, live, __shared_new([ 1 ]) ];
 }
 function $aP(self, observer) {
 	return $aQ(self, observer);
@@ -829,7 +839,9 @@ function $bn(self, $i) {
 			$br = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
-				subscriber[1]();
+				if (subscriber[2].v) {
+					subscriber[1]();
+				}
 			}
 			$br = undefined;
 		}
@@ -855,7 +867,9 @@ function $by(self, $i) {
 			$bC = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
-				subscriber[1]();
+				if (subscriber[2].v) {
+					subscriber[1]();
+				}
 			}
 			$bC = undefined;
 		}
@@ -881,7 +895,9 @@ function $bF(self, $i) {
 			$bJ = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
-				subscriber[1]();
+				if (subscriber[2].v) {
+					subscriber[1]();
+				}
 			}
 			$bJ = undefined;
 		}
@@ -896,18 +912,19 @@ function $bE(self, value, $g) {
 function $bP(signal, observer) {
 	const id = fresh_id();
 	const cell = signal[0];
+	const live = __shared_new(true);
 	signal[1].v.push([ id, () => {
 		const $bQ = [ 0, cell ];
 		let $bR = null;
 		if ($bQ[0] === 0) {
-			const live = $bQ[1];
-			$bR = observer(live.v);
+			const live2 = $bQ[1];
+			$bR = observer(live2.v);
 		} else {
 			$bR = undefined;
 		}
 		return $bR;
-	} ]);
-	return [ signal[1], id, __shared_new([ 1 ]) ];
+	}, live ]);
+	return [ signal[1], id, live, __shared_new([ 1 ]) ];
 }
 function $bO(self, observer) {
 	return $bP(self, observer);

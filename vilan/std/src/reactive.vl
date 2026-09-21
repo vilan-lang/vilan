@@ -19,7 +19,50 @@ export trait Disposable {
 export struct Subscriber {
 	id: i32,
 	notify: || void,
+	/// LIVENESS — `false` once this subscriber's `Subscription` was disposed
+	/// (tracker A110, door 1). Both notification loops read it and skip a
+	/// lowered one: `drain`'s wave loop and `SignalCell::notify`'s inline arm.
+	///
+	/// The flag is what makes "a disposed observer never fires" TRUE rather
+	/// than nearly true. Detaching from the subscriber list and scrubbing the
+	/// ambient turn's pending queue — the two things `Subscription::dispose`
+	/// did — both miss a subscriber that is already IN FLIGHT, and there are
+	/// three ways for that to happen:
+	///
+	///   1. **The inline snapshot.** With no ambient turn `notify` iterates
+	///      `subscribers.read()`, which is a COPY. An earlier observer in that
+	///      copy may cascade depth-first and dispose a later one; the copy
+	///      still holds it, so it was called anyway.
+	///   2. **The wave copy.** `drain` takes a whole wave OUT of `pending`
+	///      before running it, so a dispose from inside the wave scrubs a queue
+	///      the wave is no longer in.
+	///   3. **The scrub's blind spot.** `dispose` scrubs the AMBIENT turn, and
+	///      the ambient turn of a disposer reached through a stored closure is
+	///      the one that closure captured (spec §8.4) — usually none. A cleanup
+	///      running inside a drain therefore scrubbed nothing at all, while the
+	///      subscriber sat in the draining turn's queue waiting for a later
+	///      wave.
+	///
+	/// A cell and not a plain field, deliberately: every reader above holds a
+	/// COPY of the `Subscriber` (a list read, a wave, an enqueued entry), and
+	/// `Shared` is the one thing a copy does not duplicate (spec §6.9), so the
+	/// one flag is visible through every copy that exists. It is the same cell
+	/// the owning `Subscription` holds, so lowering is O(1) and does not depend
+	/// on finding the entry in any list.
+	live: Shared<bool>,
 }
+
+/// The liveness cell every DEFERRAL subscriber shares — `at_settle`'s and
+/// `at_release_settle`'s, the ones `defer_to_turn` mints.
+///
+/// One cell for the program rather than one per deferral, because a deferred
+/// action has no `Subscription`: nothing holds a handle to it, so there is
+/// nothing that could ever lower its flag, and a per-call cell would be an
+/// allocation on `at_settle`'s hot path (a remote mirror defers its
+/// `Unsubscribe` through it on every release) bought for a bit that cannot
+/// change. A future `Subscriber` that something CAN dispose mints its own, as
+/// `observe` does.
+let always_live: Shared<bool> = Shared::new(true);
 
 /// Monotonic ids for subscribers — module-level, one counter for the program.
 let next_subscriber_id: Shared<i32> = Shared::new(0);
@@ -210,7 +253,15 @@ export fun drain(turn: Turn) {
 				// exists for.
 				turn.queued.write() = NativeMap::new();
 				for subscriber in wave {
-					(subscriber.notify)();
+					// A subscriber disposed since this wave was taken OUT of the
+					// queue does not fire (A110 door 1, `Subscriber.live`).
+					// `dispose`'s scrub cannot reach it — the wave is no longer
+					// in `pending` — and neither can a disposer whose own ambient
+					// turn is not this one. The budget is charged either way: it
+					// is a cascade cutoff, not a count of work done.
+					if subscriber.live.read() {
+						(subscriber.notify)();
+					}
 					budget -= 1;
 				}
 			}
@@ -271,7 +322,7 @@ export fun at_release_settle(id: i32, action: || void) {
 /// difference between the two callers above is which turn they resolve, and
 /// that question belongs at the seam, not in here.
 fun defer_to_turn(turn: Option<Turn>, id: i32, action: || void) {
-	let deferred = [Subscriber { id, notify = action }];
+	let deferred = [Subscriber { id, notify = action, live = always_live }];
 	match turn {
 		Some(let ambient) => enqueue(ambient, deferred),
 		None => {
@@ -368,6 +419,17 @@ export struct Subscription {
 	// leak a count cannot collect and the GC only hides.
 	subscribers: Weak<List<Subscriber>>,
 	id: i32,
+	// The subscriber's LIVENESS cell — the same cell the `Subscriber` in the
+	// list carries (A110 door 1, `Subscriber.live`). `dispose` lowers it, and
+	// both notification loops skip a lowered subscriber, which is what makes
+	// "a disposed observer never fires" hold for one already in flight: in an
+	// inline notify's snapshot, in a wave `drain` has already taken out of
+	// `pending`, and in a queue the disposer's own ambient turn cannot reach.
+	//
+	// Held HERE as well as in the list so that lowering never depends on the
+	// weak edge above: a `None` upgrade means there is no list to detach from,
+	// and it must not also mean there is no flag to lower.
+	live: Shared<bool>,
 	// Extra teardown to run on dispose, once. `Signal::sub` leaves it `None`;
 	// a COUNTED subscription — `RemoteSource::sub`, whose lease holds a
 	// network channel open (`proposal/remote-sources.md` §2a) — puts its
@@ -395,6 +457,11 @@ export impl Subscription {
 		Subscription {
 			subscribers = empty.downgrade(),
 			id = fresh_id(),
+			// Its own cell, not the module-level `always_live`: this handle IS
+			// disposable, and lowering a shared flag would retire every deferred
+			// action in the program. Nothing reads it (there is no subscriber to
+			// skip) and it stays for the uniform representation.
+			live = Shared::new(true),
 			release = Shared::new(Some(release)),
 		}
 	}
@@ -402,6 +469,15 @@ export impl Subscription {
 
 export impl Subscription with Disposable {
 	fun dispose(self) {
+		// LIVENESS DOWN FIRST (A110 door 1). Everything below is a REMOVAL — from
+		// the subscriber list, from the ambient turn's pending queue — and a
+		// removal cannot reach a subscriber that is already in flight. The flag
+		// can, because every copy of the `Subscriber` shares this one cell, so
+		// both notification loops see it lowered from this statement on. It goes
+		// down before the release hook runs too: a hook that writes a signal must
+		// not be able to reach the observer it is releasing.
+		self.live.write() = false;
+
 		// The list this subscription aliases, IF it is still there. Under
 		// counting a `None` means the signal outlived nothing and its list is
 		// gone, so there is no subscriber to detach — and the rest of the
@@ -420,12 +496,20 @@ export impl Subscription with Disposable {
 			None => {},
 		}
 
-		// Scrub the AMBIENT turn's pending queue too: a disposed observer
-		// never fires, even if a `set` earlier in the same extent already
-		// enqueued it. (A subscriber queued in ANOTHER extent's turn is out
-		// of this one's reach — the isolation cuts both ways; that stale
-		// notify fires once against current state. Recorded in
-		// `reactive-turns.md`.)
+		// Scrub the AMBIENT turn's pending queue too. Since the liveness flag
+		// above, this is an OPTIMIZATION rather than the guarantee — a lowered
+		// subscriber left in a queue is skipped when the wave runs — and it is
+		// worth keeping: it takes the entry out now, frees its `queued` id so a
+		// re-subscribe in the same extent can enqueue, and keeps the queue the
+		// length of the live graph.
+		//
+		// It is also why the flag is not optional. The scrub reaches this extent's
+		// turn and nothing else: a subscriber queued in ANOTHER extent's turn is
+		// out of reach, and so is the DRAINING turn when the disposer is a stored
+		// closure that captured none (spec §8.4 — an owner's cleanup reached from
+		// inside a drain reads `None` here). Both of those used to fire once
+		// against current state; neither does now. `reactive-turns.md`'s note on
+		// the cross-turn case is superseded by A110 door 1.
 		let ambient = turn_scope.get_safe();
 		match ambient {
 			Some(let turn) => {
@@ -859,8 +943,13 @@ export impl SignalCell<type T> with Source<T> {
 export fun observe<T>(signal: SignalCell<T>, observer: |T| void): Subscription {
 	let id = fresh_id();
 	let cell = signal.value.downgrade();
+	// The liveness cell (A110 door 1). ONE per subscriber, held by the
+	// `Subscriber` the list carries and by the `Subscription` handed back, so
+	// `dispose` lowers it in O(1) without having to find the entry again.
+	let live: Shared<bool> = Shared::new(true);
 	signal.subscribers.write().push(Subscriber {
 		id,
+		live,
 		notify = || {
 			match cell.upgrade() {
 				// `upgrade` rather than `get`: `observer` takes a VALUE, and
@@ -874,7 +963,12 @@ export fun observe<T>(signal: SignalCell<T>, observer: |T| void): Subscription {
 			}
 		},
 	});
-	Subscription { subscribers = signal.subscribers.downgrade(), id, release = Shared::new(None) }
+	Subscription {
+		subscribers = signal.subscribers.downgrade(),
+		id,
+		live,
+		release = Shared::new(None),
+	}
 }
 
 /// The canonical write side. `set_with` is the trait's default, unchanged —
@@ -908,8 +1002,14 @@ export impl SignalCell<type T> with Signal<T> {
 				match draining_turns.read().last() {
 					Some(let draining) => enqueue(draining, self.subscribers.read()),
 					None => {
+						// The loop walks a SNAPSHOT of the list, so an observer
+						// that cascades depth-first and disposes a later one
+						// leaves that later one in the copy. It does not fire
+						// (A110 door 1, `Subscriber.live`).
 						for subscriber in self.subscribers.read() {
-							(subscriber.notify)();
+							if subscriber.live.read() {
+								(subscriber.notify)();
+							}
 						}
 					},
 				}

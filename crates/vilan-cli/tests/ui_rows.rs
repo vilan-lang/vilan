@@ -2726,3 +2726,137 @@ fn a91_the_ssr_twin_renders_what_each_row_shape_renders() {
          value-form row as what they are, in place"
     );
 }
+
+// --- A110 door 1: nested `swap`s on one source ------------------------------
+
+/// The shape the item was filed from (kolt `views.vl:72`), minimized: an OUTER
+/// `swap` keyed on a PROJECTION of the route and an INNER `swap` keyed on the
+/// route itself, so both forms stand on one source and the outer reaches it one
+/// derivation — one wave — later than the inner.
+///
+/// Projecting the outer key is the right way to stop the outer form rebuilding
+/// on every navigation (`place_swap` dedups on `==`), and it is what the guide
+/// teaches. The cost, before door 1, was that the inner form's effect and the
+/// outer's owner disposal raced: the inner rendered under an `Owner` the outer's
+/// `defer` had already run, into a `Region` whose anchor `close()` had already
+/// removed — a subtree nothing would ever dispose, in no document.
+///
+/// Every inner build counts itself and registers a cleanup on its own ambient
+/// owner, so `builds` and `teardowns` are the creation/disposal pair the item
+/// asks to be equal.
+const NESTED_SWAP_ON_ONE_SOURCE: &str = r#"import std::io::print;
+import std::reactive::{ Disposable, FlushPolicy, Signal, SignalCell, Source, get_owner, turn };
+import std::ui::{ View, mount_root, swap, view };
+
+[derive(PartialEq)]
+enum Shell {
+	Login,
+	App,
+}
+
+let route: SignalCell<str> = Signal::new("/app/one");
+let builds: SignalCell<i32> = Signal::new(0);
+let teardowns: SignalCell<i32> = Signal::new(0);
+
+fun shell_of(path: str): Shell {
+	if path.starts_with("/app") { Shell::App } else { Shell::Login }
+}
+
+fun page(path: str): View {
+	builds.set_with(|count| count + 1);
+	get_owner().defer(|| {
+		teardowns.set_with(|count| count + 1);
+	});
+	view("p").text(path)
+}
+
+fun report(label: str) {
+	print(i"{label} builds={builds.get()} teardowns={teardowns.get()} tree={shape()}");
+}
+
+fun main() {
+	let _root = mount_root("app", || view("main").child(swap(route.map(shell_of), |shell: Shell| {
+		match shell {
+			Shell::Login => view("section").text("sign in"),
+			Shell::App => view("div").child(swap(route, |path: str| page(path))),
+		}
+	})));
+	report("mounted");
+
+	// Sign out with NO ambient turn: `SignalCell::notify` takes its inline arm
+	// and walks a snapshot of `route`'s subscriber list. The derivation runs
+	// first, the outer effect disposes the App shell depth-first, and the inner
+	// effect is still in the snapshot.
+	route.set("/login");
+	report("inline-signout");
+
+	// Back in, then out again inside a TURN — the cadence every `View.on`
+	// dispatch and `mount_root` establishes.
+	route.set("/app/two");
+	report("back-in");
+	turn(FlushPolicy::AtSuspension, || {
+		route.set("/login");
+	});
+	report("turn-signout");
+}
+
+/// The document as markup, so "it built into a closed region" is a fact about
+/// the tree rather than a count.
+[extern("__shape")]
+external fun shape(): str;
+
+main();
+"#;
+
+#[test]
+fn a110_nested_swaps_on_one_source_build_no_orphan_subtree_on_sign_out() {
+    let harness = format!(
+        "{DOM_STUB}\nglobal.__shape = () => documentRoot.render();\nrequire(\"./app.js\");\n"
+    );
+    let stdout = build_and_run("a110_nested_swap", NESTED_SWAP_ON_ONE_SOURCE, &harness);
+    let line = |prefix: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("the {prefix} line; got:\n{stdout}"))
+            .trim()
+            .to_string()
+    };
+
+    // The mount builds the App shell and one page under it.
+    assert_eq!(
+        line("mounted "),
+        "builds=1 teardowns=0 tree=<root><main><div><p>/app/one</p></div></main></root>",
+        "the mount must build the App shell and one page; got:\n{stdout}"
+    );
+
+    // The inline sign-out is the face door 1 closes. Before it, `builds` went
+    // to 2 here — a page rendered for `/login` under an owner the outer shell's
+    // disposal had already passed, into a region whose anchor was gone — and
+    // `teardowns` stayed at 1, so the creation/disposal pair did not balance
+    // and the orphan was in no document at all.
+    assert_eq!(
+        line("inline-signout "),
+        "builds=1 teardowns=1 tree=<root><main><section>sign in</section></main></root>",
+        "signing out inline must not build the inner page again, and every page \
+         owner built must have been disposed; got:\n{stdout}"
+    );
+
+    assert_eq!(
+        line("back-in "),
+        "builds=2 teardowns=1 tree=<root><main><div><p>/app/two</p></div></main></root>",
+        "navigating back in must build exactly one page; got:\n{stdout}"
+    );
+
+    // In a TURN the inner page is still built once and then torn down: the
+    // wave order is child-before-parent (A110 face 1), which is DOOR 2's
+    // ordering rule and not this fix. What door 1 guarantees here is the pair —
+    // every owner created was disposed, and the document holds only the Login
+    // shell — so the wasted build is a wasted build and not a leak.
+    assert_eq!(
+        line("turn-signout "),
+        "builds=3 teardowns=3 tree=<root><main><section>sign in</section></main></root>",
+        "signing out in a turn must leave no live page owner and no orphan \
+         subtree; got:\n{stdout}"
+    );
+}
