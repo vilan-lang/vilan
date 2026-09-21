@@ -503,14 +503,34 @@ export impl Subscription with Disposable {
 		// re-subscribe in the same extent can enqueue, and keeps the queue the
 		// length of the live graph.
 		//
-		// It is also why the flag is not optional. The scrub reaches this extent's
-		// turn and nothing else: a subscriber queued in ANOTHER extent's turn is
-		// out of reach, and so is the DRAINING turn when the disposer is a stored
-		// closure that captured none (spec §8.4 — an owner's cleanup reached from
-		// inside a drain reads `None` here). Both of those used to fire once
-		// against current state; neither does now. `reactive-turns.md`'s note on
-		// the cross-turn case is superseded by A110 door 1.
-		let ambient = turn_scope.get_safe();
+		// It is also why the flag is not optional: a subscriber queued in ANOTHER
+		// extent's turn is out of every scrub's reach. That one used to fire once
+		// against current state and no longer does, so `reactive-turns.md`'s note
+		// on the cross-turn case is superseded by the flag.
+		//
+		// THE TURN IS RESOLVED THE WAY `SignalCell::notify` RESOLVES ITS OWN
+		// (FIND-2): the ambient turn, else the currently DRAINING one. `get_safe`
+		// alone was wrong, and wrong in the common case rather than an exotic one.
+		// `turn` calls `drain(fresh)` AFTER `turn_scope.run(fresh, body)` has
+		// returned, so a drain runs OUTSIDE its own turn's context extent — and a
+		// dispose reached from inside a notify is every form's teardown, since a
+		// form's own effect is what disposes the previous instantiation. Those
+		// disposals read `None` here and scrubbed nothing at all, leaving a
+		// disposed subscriber (and its notify closure, and everything that closure
+		// captured — a whole torn-down subtree) reachable from the turn's queue
+		// until the drain ended. `defer_to_turn` and `notify` have always read the
+		// draining turn as the fallback; this is the third reader of the same
+		// question and it now asks it the same way.
+		//
+		// B283 is unaffected. `ambient` is also what `dispose` publishes on
+		// `releasing_turns` for the release hook, and the hook's own
+		// `at_release_settle` already resolved `None` through
+		// `at_settle` → `defer_to_turn` → `draining_turns.last()`, which is the
+		// very turn this match now names — the same answer, one hop earlier.
+		let ambient = match turn_scope.get_safe() {
+			Some(let established) => Some(established),
+			None => draining_turns.read().last(),
+		};
 		match ambient {
 			Some(let turn) => {
 				mut kept_pending: List<Subscriber> = [];
