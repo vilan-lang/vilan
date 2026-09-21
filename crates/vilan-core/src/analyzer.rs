@@ -18939,10 +18939,38 @@ impl<'src> Analyzer<'src> {
     /// nobody can type. The bound is already visible where it was written, on
     /// the parameter.
     fn generic_list_label(&self, constraint_ids: &[TypeId]) -> String {
+        self.generic_list_label_under(constraint_ids, &HashMap::default())
+    }
+
+    /// [`generic_list_label`] with a call's substitution applied (E206): a
+    /// parameter the site bound to a CONCRETE type is no longer a parameter of
+    /// the function the call reached, so it leaves the list — which is what
+    /// makes the owner's second line read `fun get_or(self, key: UserId, …)`
+    /// rather than `fun get_or<K, V>(…)`.
+    ///
+    /// A parameter bound to another still-OPEN parameter has not gone away, it
+    /// has been RENAMED: a generic call inside a generic body passes its
+    /// caller's own binder down, and the type positions print that binder's
+    /// name. So the list keeps it under the name it will print as, and the
+    /// second line stays a signature somebody could write
+    /// (`fun pair<B>(left: i32, right: B): i32`, never a bare `B` with no `<B>`
+    /// declaring it).
+    fn generic_list_label_under(
+        &self,
+        constraint_ids: &[TypeId],
+        substitution: &SubstitutionContext,
+    ) -> String {
         let constraint_ids: Vec<TypeId> = constraint_ids
             .iter()
             .copied()
             .filter(|constraint_id| !self.implicit_generic_scopes.contains_key(constraint_id))
+            .filter_map(|constraint_id| match substitution.get(&constraint_id) {
+                None => Some(constraint_id),
+                Some(bound) => match bound.get_type(self) {
+                    Type::Generic(open) => Some(open),
+                    _ => None,
+                },
+            })
             .collect();
         if constraint_ids.is_empty() {
             return String::new();
@@ -19115,6 +19143,83 @@ impl<'src> Analyzer<'src> {
         function: &Function,
         subject: Option<&SignatureSubject<'_>>,
     ) -> String {
+        self.render_function_signature(function, subject, &HashMap::default())
+    }
+
+    /// [`function_signature_label`] rendered UNDER a call site's substitution
+    /// (E206): every type position printed with the bindings the solver chose
+    /// THERE, so a generic function's hover can show the declaration as written
+    /// and the exact function this call reached. The substitution is the
+    /// analyzer's own record for the site (`method_call_substitution`, the one
+    /// channel an impl's binders, a method's own generics and a free call's
+    /// inferred or written arguments all write into).
+    ///
+    /// Clauses render on this line exactly as they do on the declaration's,
+    /// because they are part of the contract at either reading — and after E207
+    /// they render through the TYPE, which means a substituted closure type
+    /// carries its `context` clause along without a second channel to keep in
+    /// step.
+    fn function_signature_label_under(
+        &self,
+        function: &Function,
+        substitution: &SubstitutionContext,
+    ) -> String {
+        self.render_function_signature(function, None, substitution)
+    }
+
+    /// The FUNCTION a call site's subject names, following the same
+    /// `expr_id_to_expr_map` chain a use site resolves through (a bare name is
+    /// a `Local`; a method call's wired subject is a `Local` pointing at the
+    /// resolved member). A seen-list, because the map is data a lowering can
+    /// rewire into a cycle and E73 proved it does. `None` for anything that is
+    /// not a declared `fun` — a closure value, an external, a constructor.
+    fn signature_site_callee(&self, subject_id: Id) -> Option<Id> {
+        let mut seen: Vec<Id> = Vec::new();
+        let mut current = subject_id;
+        loop {
+            if self.functions.contains_key(&current) {
+                return Some(current);
+            }
+            if seen.contains(&current) {
+                return None;
+            }
+            seen.push(current);
+            match self.expr_id_to_expr_map.get(&current)? {
+                Expr::Local(inner) | Expr::Variable(inner) | Expr::Parameter(inner) => {
+                    current = *inner;
+                }
+                Expr::Function(function_id) => return Some(*function_id),
+                _ => return None,
+            }
+        }
+    }
+
+    /// One type position of a signature label: the trait/impl pair's reading
+    /// where there is a subject (B206, E128), the call site's where there is a
+    /// substitution (E206), the declaration's otherwise. The two are never
+    /// combined — a trait member's declaration renders for its trait, a call
+    /// site renders for its bindings.
+    fn signature_type_label(
+        &self,
+        type_id: TypeId,
+        subject: Option<&SignatureSubject<'_>>,
+        substitution: &SubstitutionContext,
+    ) -> String {
+        if subject.is_some() {
+            return self.declaration_type_label_for(type_id, subject);
+        }
+        if substitution.is_empty() {
+            return self.declaration_type_label(type_id);
+        }
+        self.pretty_print_type(&type_id.get_type(self), substitution)
+    }
+
+    fn render_function_signature(
+        &self,
+        function: &Function,
+        subject: Option<&SignatureSubject<'_>>,
+        substitution: &SubstitutionContext,
+    ) -> String {
         let mut parameters: Vec<String> = Vec::new();
         for parameter_id in &function.parameters {
             let Some(parameter) = self.parameters.get(parameter_id) else {
@@ -19135,7 +19240,7 @@ impl<'src> Analyzer<'src> {
                     if parameter.lazy { "lazy " } else { "" },
                     if parameter.spread { "..." } else { "" },
                     parameter.name,
-                    self.declaration_type_label_for(parameter.type_id, subject)
+                    self.signature_type_label(parameter.type_id, subject, substitution)
                 );
                 // A `context` clause is part of the signature's contract, and
                 // `declaration_type_label_for` has already rendered it: since
@@ -19149,13 +19254,14 @@ impl<'src> Analyzer<'src> {
                 parameters.push(label);
             }
         }
-        let generics = self.generic_list_label(&function.generic_parameter_constraint_ids);
+        let generics =
+            self.generic_list_label_under(&function.generic_parameter_constraint_ids, substitution);
         let return_label = function
             .return_type_id
             .map(|return_type_id| {
                 format!(
                     ": {}",
-                    self.declaration_type_label_for(return_type_id, subject)
+                    self.signature_type_label(return_type_id, subject, substitution)
                 )
             })
             .unwrap_or_default();
@@ -51147,6 +51253,19 @@ pub struct Program<'src> {
     /// Full declaration labels for hover (E9): function signatures,
     /// struct/enum blocks — keyed by declaration id, fenced by the LSP.
     pub declaration_labels: HashMap<Id, String>,
+    /// E206: the signature a GENERIC call site reached, rendered under the
+    /// bindings the solver chose there — `fun get_or(self, key: UserId, make:
+    /// || SignalCell<Option<User>>): SignalCell<Option<User>>` where the
+    /// declaration reads `fun get_or(self, key: K, make: || V): V`. Keyed by
+    /// both entity ids of the site (the call and its subject), so a hover looks
+    /// the id under the cursor up directly.
+    ///
+    /// An entry exists only where the substitution CHANGED the rendering, so a
+    /// reader that finds none shows the declaration alone — which is the answer
+    /// for a non-generic function, for a generic one hovered at its
+    /// declaration, and for a call inside another generic body whose parameters
+    /// are all still open.
+    pub call_signature_labels: HashMap<Id, String>,
     // The resolved type id of every typed expression and binding (same merge as
     // `expr_types`). The transformer reads this to compute a tuple's flat-storage
     // layout — which elements are themselves tuples (and so are spread, not nested)
@@ -59944,6 +60063,42 @@ fn analyze_over_world<'src>(
         };
         declaration_labels.insert(*function_id, label);
     }
+    // E206: the signature each generic call SITE reached, rendered under the
+    // bindings the solver chose there. Keyed by every entity id a cursor can
+    // land on for that site — the call's own id and its source subject (a
+    // method call's wired subject is the resolved member, and which of the two
+    // `entity_at` answers depends on where in the expression the caret sits) —
+    // so a consumer looks the hovered id up directly and needs no reverse
+    // index. An entry exists ONLY where the substitution changed the rendering:
+    // a non-generic callee, and a generic one whose parameters are all still
+    // open (a call inside another generic body), write nothing, which is what
+    // keeps "show one line when nothing is substituted" a property of the map
+    // rather than a rule its readers each have to remember.
+    let mut call_signature_labels: HashMap<Id, String> = HashMap::default();
+    for (call_id, substitution) in &analyzer.method_call_substitution {
+        if substitution.is_empty() {
+            continue;
+        }
+        let Some(call) = analyzer.function_calls.get(call_id) else {
+            continue;
+        };
+        // The call's written subject. The context pass's `context_erased_subjects`
+        // is deliberately not consulted: that pass runs AFTER this label build,
+        // so what is recorded here is the source subject already.
+        let subject_id = call.subject_id;
+        let Some(function_id) = analyzer.signature_site_callee(subject_id) else {
+            continue;
+        };
+        let Some(function) = analyzer.functions.get(&function_id) else {
+            continue;
+        };
+        let computed = analyzer.function_signature_label_under(function, substitution);
+        if declaration_labels.get(&function_id) == Some(&computed) {
+            continue;
+        }
+        call_signature_labels.insert(*call_id, computed.clone());
+        call_signature_labels.insert(subject_id, computed);
+    }
     for (function_id, external) in &analyzer.external_functions {
         let mut parameters: Vec<String> = Vec::new();
         for parameter_id in &external.parameters {
@@ -60367,6 +60522,7 @@ fn analyze_over_world<'src>(
         prelude_bindings: analyzer.prelude_entry_bindings.clone(),
         expr_types,
         declaration_labels,
+        call_signature_labels,
         expr_type_ids,
         inferred_return_types: std::mem::take(&mut analyzer.inferred_return_types),
         tuple_element_types: std::mem::take(&mut analyzer.tuple_element_types),

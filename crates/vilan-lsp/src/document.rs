@@ -2938,11 +2938,22 @@ impl Document {
             return Some(rendered);
         }
         let id = self.entity_at(offset)?;
-        // A function (or requirement-carrying binding): the full signature.
+        // A function (or requirement-carrying binding): the full signature —
+        // and, at a GENERIC call site, the signature that call reached under it
+        // (E206). The site's label is keyed by the id under the cursor, so no
+        // reverse index and no second resolution: the entity that answered
+        // `function_target` is the entity the analyzer keyed.
         if let Some(target) = self.analysis(program).function_target(id) {
             let requirement = self.platform_requirements.get(&target).cloned();
             if let Some(declaration) = program.declaration_labels.get(&target) {
-                return Some(self.compose_hover(program, target, declaration, requirement));
+                let resolved = program.call_signature_labels.get(&id);
+                return Some(self.compose_declaration_hover(
+                    program,
+                    target,
+                    declaration,
+                    requirement,
+                    resolved.map(String::as_str),
+                ));
             }
         }
         // A struct/enum name in value position (a constructor, a variant).
@@ -3173,12 +3184,44 @@ impl Document {
         declaration: &str,
         requirement: Option<String>,
     ) -> String {
-        let declaration = if program.async_functions.contains(&declaration_id)
-            && !declaration.starts_with("async ")
-        {
-            format!("async {declaration}")
-        } else {
-            declaration.to_string()
+        self.compose_declaration_hover(program, declaration_id, declaration, requirement, None)
+    }
+
+    /// [`compose_hover`] with E206's second line: the same signature rendered
+    /// under the SUBSTITUTION this call site solved
+    /// (`Program::call_signature_labels`).
+    ///
+    /// Both lines go in ONE fenced `vilan` block with a blank line between them
+    /// (the owner's own spelling of the ask), rather than two blocks under a
+    /// caption: they are two readings of one signature, and a reader comparing
+    /// them wants them column-aligned in the same monospace run. The declared
+    /// line comes first because it is the thing that exists in the file; the
+    /// computed one answers "and which function did THIS call reach".
+    ///
+    /// `resolved` is `None` wherever the site added nothing — a non-generic
+    /// callee, a hover on the declaration itself, a call inside another generic
+    /// body whose parameters are all still open — and then this is exactly
+    /// [`compose_hover`]. The analyzer decides that, by writing no entry;
+    /// nothing here re-derives it.
+    fn compose_declaration_hover(
+        &self,
+        program: &Program,
+        declaration_id: Id,
+        declaration: &str,
+        requirement: Option<String>,
+        resolved: Option<&str>,
+    ) -> String {
+        let asyncify = |signature: &str| {
+            if program.async_functions.contains(&declaration_id) && !signature.starts_with("async ")
+            {
+                format!("async {signature}")
+            } else {
+                signature.to_string()
+            }
+        };
+        let declaration = match resolved {
+            Some(resolved) => format!("{}\n\n{}", asyncify(declaration), asyncify(resolved)),
+            None => asyncify(declaration),
         };
         let mut out = format!("```vilan\n{declaration}\n```");
         if let Some(docs) = self.analysis(program).doc_comment_of(declaration_id) {
@@ -13826,6 +13869,153 @@ pub(crate) mod tests {
         let text = src.replace(marker, "");
         let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
         document.hover(offset)
+    }
+
+    // --- E206: a generic call site hovers BOTH signatures -------------------
+
+    /// The owner's own exhibit, as a fixture: a generic `Memo` with `get_or`
+    /// declared over the impl's binders, called at `UserId` /
+    /// `SignalCell<Option<User>>`.
+    fn generic_memo_fixture(call: &str) -> String {
+        format!(
+            "import std::reactive::SignalCell;\nimport std::option::Option::{{ self, Some, None }};\n\n\
+             struct UserId {{\n\tvalue: i32,\n}}\n\n\
+             struct User {{\n\tname: str,\n}}\n\n\
+             struct Memo<type K, type V> {{\n\tslot: Option<V>,\n}}\n\n\
+             impl Memo<type K, type V> {{\n\
+             \tfun get_or(self, key: K, make: || V): V {{\n\t\tmake()\n\t}}\n\
+             }}\n\n\
+             fun main() {{\n\
+             \tlet cache: Memo<UserId, SignalCell<Option<User>>> = Memo {{ slot = None }};\n\
+             \t{call}\n\
+             }}\n"
+        )
+    }
+
+    #[test]
+    fn e206_a_generic_call_hovers_the_declaration_and_the_substituted_signature() {
+        let source = generic_memo_fixture(
+            "let _held = cache.get_or¦(UserId { value = 1 }, || SignalCell::new(None));",
+        );
+        let hover = hover_at_marker(&source, '¦').expect("hover on the method call");
+        assert!(
+            hover.contains("fun get_or(self, key: K, make: || V): V"),
+            "the DECLARATION as written is the first line: {hover}"
+        );
+        assert!(
+            hover.contains("key: UserId"),
+            "and the substituted signature is the second: {hover}"
+        );
+        assert!(
+            hover.contains("SignalCell<Option<User>>"),
+            "with the impl's binders carried out: {hover}"
+        );
+        // One fenced block, the two lines separated by a blank one (the owner's
+        // spelling), and no `<K, V>` on the line where nothing is open.
+        assert_eq!(
+            hover.matches("```").count(),
+            2,
+            "exactly one fenced block: {hover}"
+        );
+        assert!(
+            hover.contains(": V\n\nfun get_or("),
+            "a blank line between the two signatures: {hover}"
+        );
+    }
+
+    #[test]
+    fn e206_a_non_generic_call_hovers_one_signature() {
+        let hover = hover_at_cursor(
+            "fun twice(x: i32): i32 {\n\tx + x\n}\n\nfun main() {\n\tlet _n = twi|ce(2);\n}\n",
+        )
+        .expect("hover on the call");
+        assert_eq!(
+            hover.matches("fun twice").count(),
+            1,
+            "nothing is substituted, so there is one line: {hover}"
+        );
+    }
+
+    #[test]
+    fn e206_the_declaration_itself_hovers_one_signature() {
+        // No site, no substitution — a generic function hovered where it is
+        // WRITTEN says what it says.
+        let source = generic_memo_fixture(
+            "let _held = cache.get_or(UserId { value = 1 }, || SignalCell::new(None));",
+        );
+        let source = source.replace("fun get_or(self", "fun get_or¦(self");
+        let hover = hover_at_marker(&source, '¦').expect("hover on the declaration");
+        assert_eq!(hover.matches("fun get_or").count(), 1, "{hover}");
+    }
+
+    #[test]
+    fn e206_a_functions_own_generic_renders_under_the_calls_bindings() {
+        let hover = hover_at_cursor(
+            "fun echo<T>(value: T): T {\n\tvalue\n}\n\nfun main() {\n\tlet _s = ec|ho(\"hi\");\n}\n",
+        )
+        .expect("hover on the call");
+        assert!(
+            hover.contains("fun echo<T>(value: T): T"),
+            "the declaration keeps its list: {hover}"
+        );
+        assert!(
+            hover.contains("fun echo(value: str): str"),
+            "and the bound parameter leaves the substituted line's list: {hover}"
+        );
+    }
+
+    #[test]
+    fn e206_an_open_parameter_stays_as_written_on_the_second_line() {
+        // A PARTIAL substitution: `pair`'s `A` is bound at the site, `B` is the
+        // caller's own still-open parameter, so it renders as written.
+        let hover = hover_at_cursor(
+            "fun pair<A, B>(left: A, right: B): A {\n\tleft\n}\n\nfun wrap<B>(right: B): i32 {\n\tpa|ir(1, right)\n}\n\nfun main() {}\n",
+        )
+        .expect("hover on the call");
+        assert!(
+            hover.contains("fun pair<B>(left: i32, right: B): i32"),
+            "the open parameter stays, the bound one goes: {hover}"
+        );
+    }
+
+    #[test]
+    fn e206_a_trait_default_renders_under_the_receivers_arguments() {
+        // `Source<T>::map` is a trait DEFAULT: the substitution comes from the
+        // receiver's own arguments rather than from the callee's list, which is
+        // the third of the three ways a signature can be generic at a site (the
+        // other two — a function's own `<T>` and an impl's binders — are pinned
+        // above).
+        let hover = hover_at_marker(
+            "import std::reactive::{ SignalCell, Source };\n\nfun main() {\n\tlet cell = SignalCell::new(2);\n\tlet _doubled = cell.map¦(|value: i32| value * 2);\n}\n",
+            '¦',
+        )
+        .expect("hover on the trait default");
+        assert!(hover.contains("fun map"), "{hover}");
+        assert!(
+            hover.matches("fun map").count() == 2,
+            "a generic trait default at a call site shows both readings: {hover}"
+        );
+        assert!(
+            hover.contains("i32"),
+            "the receiver's argument reaches the second line: {hover}"
+        );
+    }
+
+    #[test]
+    fn e206_a_clause_survives_onto_the_substituted_line() {
+        // E207's other half of the reason it had to land first: a clause on the
+        // second line comes from the substituted TYPE, so it neither doubles
+        // nor disappears.
+        let hover = hover_at_marker(
+            "import std::reactive::{ owner_scope, Owner };\n\nfun hold<T>(value: T, body: (|| void) context owner_scope): T {\n\tlet _b = body;\n\tvalue\n}\n\nfun main() {\n\tlet _n = hold¦(1, || {});\n}\n",
+            '¦',
+        )
+        .expect("hover on the call");
+        assert!(
+            hover.contains("fun hold(value: i32, body: (|| void) context owner_scope): i32"),
+            "{hover}"
+        );
+        assert_eq!(occurrences(&hover, "context owner_scope"), 2, "{hover}");
     }
 
     /// How many times `needle` occurs in `haystack` — the assertion E207 owes,
