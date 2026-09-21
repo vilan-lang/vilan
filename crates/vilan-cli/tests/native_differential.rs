@@ -78,6 +78,25 @@ const DEFAULT_SUITE: &[&str] = &[
     "interpolated-multiline-string.vl",
 ];
 
+/// The corpus's ASYNC programs (tracker J6, lane native-b-38).
+///
+/// They are enumerated by name rather than reached through
+/// [`platform_free_programs`] because `std::task` and `std::time` are still
+/// rows of [`PLATFORM_MODULES`] — the executor gives the backend an event loop,
+/// not a `std::time` twin (`now_millis`, `Date`, `sleep_for`'s `Duration` path
+/// still bind the host). So this list is what J6's exit is measured against,
+/// and every program on it lands in one of the same three verdicts the corpus
+/// sweep uses: identical, refused by NAME, or broken.
+const ASYNC_SUITE: &[&str] = &[
+    "async-await.vl",
+    "async-promise-all.vl",
+    "await-postfix.vl",
+    "adapt.vl",
+    "nursery.vl",
+    "reactive-turns.vl",
+    "time.vl",
+];
+
 /// Modules whose presence in an `import` means the program reaches a platform
 /// surface S1a has none of. Written as a support list so Order 38 widens the
 /// corpus by deleting rows rather than by rewriting the walk.
@@ -356,7 +375,7 @@ fn the_probes_board_program_names_its_own_gap() {
         "the probe compiled natively — this pin is now the differential it was written to become"
     );
     assert!(
-        message.contains("a value captured by an `is` test outside an `if` condition"),
+        message.contains("the host type `Hash`"),
         "the probe's wall has moved; the refusal must still name ONE construct, and the pin's \
          own comment must be updated to it. It said:\n{message}"
     );
@@ -364,6 +383,17 @@ fn the_probes_board_program_names_its_own_gap() {
         !message.contains("unbound generic type parameter"),
         "the probe is no longer refused for generics — S1b closed that, and a refusal naming one \
          again is a regression:\n{message}"
+    );
+    // J6 moved the wall one construct further along: the read of a
+    // context-threaded hidden parameter was being refused as an `is`-test
+    // capture, because such a parameter is in neither the `variables` nor the
+    // `parameters` table — deliberately, and for the same reason it has no
+    // type. It is a real parameter of the emitted signature, so a refusal
+    // naming an `is` capture here again is a regression.
+    assert!(
+        !message.contains("a value captured by an `is` test"),
+        "the probe is refused as an `is` capture again, which is the context-threaded \
+         parameter's false positive:\n{message}"
     );
 }
 
@@ -623,6 +653,182 @@ const BOARD_PROBE: &str = concat!(
     "\tcount.set(99);\n",
     "\tprint(seen.len());\n",
     "\tprint(count.get());\n",
+    "}\n",
+);
+
+/// J6's exit: every async corpus program the backend ACCEPTS prints
+/// byte-identically, and the ones it refuses say which construct stopped them.
+///
+/// The census is printed for the same reason the corpus sweep prints its own —
+/// the list of refusals IS the work list, and a reader who runs this wants to
+/// see it shrink.
+#[test]
+fn every_async_corpus_program_is_identical_or_named() {
+    let staged = stage();
+    let mut identical_programs: Vec<String> = Vec::new();
+    let mut refused: Vec<(String, String)> = Vec::new();
+    let mut broken = Vec::new();
+    for program in ASYNC_SUITE {
+        match compare(&staged, program) {
+            Verdict::Identical => identical_programs.push((*program).to_string()),
+            Verdict::Refused(reason) => refused.push(((*program).to_string(), reason)),
+            Verdict::Broken(detail) => broken.push(format!("{program}: {detail}")),
+        }
+    }
+    eprintln!(
+        "async differential: {} enumerated, {} identical, {} refused by name, {} broken",
+        ASYNC_SUITE.len(),
+        identical_programs.len(),
+        refused.len(),
+        broken.len()
+    );
+    for (program, reason) in &refused {
+        eprintln!("  refused  {program}: {reason}");
+    }
+    for program in &identical_programs {
+        eprintln!("  identical  {program}");
+    }
+    assert!(
+        broken.is_empty(),
+        "async programs the native backend ACCEPTED and then got wrong:\n{}",
+        broken.join("\n")
+    );
+    // The two that compile today, and they are the right two.
+    // `await-postfix.vl` was written as a BYTE-level gate on where the
+    // parentheses of an await go, and every helper in it awaits, so every call
+    // to one is awaited on the caller's behalf. `nursery.vl` is structured
+    // concurrency whole: a helper's spawn, a grandchild spawned by a running
+    // child, and a join that must wait for a child list which GREW while it was
+    // draining. If either stops being identical the executor or the emitter's
+    // async arms have moved.
+    for required in ["await-postfix.vl", "nursery.vl"] {
+        assert!(
+            identical_programs.iter().any(|program| program == required),
+            "{required} must be byte-identical on both backends; the census was:\n{}",
+            refused
+                .iter()
+                .map(|(program, reason)| format!("  {program}: {reason}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+}
+
+/// The executor's ORDERING, through an emitted program rather than through a
+/// `vilan-rt` unit test (J6).
+///
+/// `reactive-turns.vl` is the corpus's ordering pin and it is still refused for
+/// its generics, so the ordering the backend must reproduce is pinned here
+/// instead, on the three rules a reader can check by eye: a spawn is EAGER (its
+/// `enter` prints before the line after the spawn expression), the deadline list
+/// is ordered (the 1 ms task finishes before the 12 ms one that was spawned
+/// FIRST), and a join answers the spawned value.
+#[test]
+fn the_spawn_and_sleep_ordering_is_byte_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_spawn.vl"), SPAWN_ORDER_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_spawn.vl"),
+        Verdict::Identical,
+        "the executor's spawn and sleep ordering must match the JS turn model"
+    );
+}
+
+/// `std::time::Timer`'s memoized verdict, through an emitted program: a fired
+/// timer answers `true` twice (from the memo, not from a second timer) and a
+/// cancelled one answers `false`.
+#[test]
+fn a_timers_verdict_is_byte_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_timer.vl"), TIMER_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_timer.vl"),
+        Verdict::Identical,
+        "`Timer`'s verdict must be the same on both backends"
+    );
+}
+
+/// `Task::settle_all` and `Task::race` — the two joins on `Task<T>`, through an
+/// emitted program (J6).
+///
+/// `async-promise-all.vl` is the corpus's own pin on `settle_all` and it is
+/// still refused, for its `[extern("node:timers/promises", "setTimeout")]`
+/// rather than for anything about the join, so the same shape is pinned here
+/// over `std::time::sleep`. `settle_all` preserves ORDER whatever the delays
+/// are, and `race` answers the first task to settle while its loser keeps
+/// running.
+#[test]
+fn the_two_task_joins_are_byte_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_joins.vl"), TASK_JOIN_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_joins.vl"),
+        Verdict::Identical,
+        "`Task::settle_all` and `Task::race` must answer the same on both backends"
+    );
+}
+
+const TASK_JOIN_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::task::Task;\n",
+    "import std::time::sleep;\n",
+    "\n",
+    "fun delayed(label: str, ms: i32): str {\n",
+    "\tsleep(ms);\n",
+    "\tlabel\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut tasks: List<Task<str>> = List::new();\n",
+    "\ttasks.push(async delayed(\"a\", 20));\n",
+    "\ttasks.push(async delayed(\"b\", 10));\n",
+    "\ttasks.push(async delayed(\"c\", 30));\n",
+    "\tlet results: List<str> = Task::settle_all(tasks);\n",
+    "\tfor result in results {\n",
+    "\t\tprint(result);\n",
+    "\t}\n",
+    "\tmut racers: List<Task<str>> = List::new();\n",
+    "\tracers.push(async delayed(\"slow\", 40));\n",
+    "\tracers.push(async delayed(\"quick\", 5));\n",
+    "\tprint(Task::race(racers));\n",
+    "}\n",
+);
+
+const SPAWN_ORDER_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::time::sleep;\n",
+    "\n",
+    "async fun step(label: str, ms: i32): str {\n",
+    "\tprint(i\"enter {label}\");\n",
+    "\tsleep(ms);\n",
+    "\tprint(i\"leave {label}\");\n",
+    "\tlabel\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet late = async step(\"late\", 12);\n",
+    "\tlet early = async step(\"early\", 1);\n",
+    "\tprint(\"spawned\");\n",
+    "\tprint(await early);\n",
+    "\tprint(await late);\n",
+    "}\n",
+);
+
+const TIMER_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::time::Timer;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet fired = Timer::after(1);\n",
+    "\tprint(fired.wait());\n",
+    "\tprint(fired.wait());\n",
+    "\tlet called_off = Timer::after(500);\n",
+    "\tcalled_off.cancel();\n",
+    "\tprint(called_off.wait());\n",
+    "\tprint(\"done\");\n",
     "}\n",
 );
 

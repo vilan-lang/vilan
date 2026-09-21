@@ -52,6 +52,19 @@ type TaskId = usize;
 /// The type-erased driver of one task.
 type Driver = Pin<Box<dyn Future<Output = ()>>>;
 
+/// A future the runtime can HOLD — what the nursery join and
+/// [`with_finally_async`] take where the JS helpers take a closure they invoke.
+///
+/// Named, and paired with [`pin_future`], for §10's rule: emitted Rust says
+/// `vilan_rt::executor::pin_future(async move { .. })` and never `Pin` or
+/// `Box::pin`.
+pub type Boxed<T> = Pin<Box<dyn Future<Output = T>>>;
+
+/// Boxes and pins `body`, so the emitter never has to spell either.
+pub fn pin_future<T>(body: impl Future<Output = T> + 'static) -> Boxed<T> {
+    Box::pin(body)
+}
+
 // -------------------------------------------------------------- failure ---
 
 /// Why a task did not produce a value.
@@ -187,6 +200,15 @@ impl<T> Task<T> {
     }
 }
 
+/// Two handles are equal when they are handles to the SAME task — which is what
+/// `===` on the JS backend's class instance answers, and the only equality a
+/// handle has (a task is not a value).
+impl<T> PartialEq for Task<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.node, &other.node)
+    }
+}
+
 /// The future `task.await` becomes. Holds only `Rc` handles, so it is `Unpin`
 /// and needs no projection.
 pub struct TaskJoin<T> {
@@ -263,12 +285,12 @@ impl Future for NodeJoin {
 /// `Pin<Box<F>>` is itself `Unpin`, so this future reaches its own field with no
 /// `unsafe`.
 struct Catch<T> {
-    inner: Pin<Box<dyn Future<Output = T>>>,
+    inner: Boxed<T>,
     done: bool,
 }
 
 impl<T> Catch<T> {
-    fn new(inner: Pin<Box<dyn Future<Output = T>>>) -> Self {
+    fn new(inner: Boxed<T>) -> Self {
         Catch { inner, done: false }
     }
 }
@@ -473,7 +495,7 @@ pub fn nursery_new_detached() -> Nursery {
 /// aborted the signal, and the drain races every child against the fail-wake. On
 /// failure every remaining child is absorbed, the body's error wins if there is
 /// one, and a latched winner carries its spawn origin into the message.
-pub async fn nursery_run<T>(nursery: Nursery, body: Pin<Box<dyn Future<Output = T>>>) -> T {
+pub async fn nursery_run<T>(nursery: Nursery, body: Boxed<T>) -> T {
     let (result, body_failure) = match Catch::new(body).await {
         Ok(value) => (Some(value), None),
         Err(failure) => (None, Some(failure)),
@@ -688,7 +710,7 @@ impl Future for TimerWait {
 
 /// `__with_finally_async(body, after)` — `after` runs whether or not `body`
 /// failed, and the failure keeps travelling.
-pub async fn with_finally_async(body: Pin<Box<dyn Future<Output = ()>>>, after: impl FnOnce()) {
+pub async fn with_finally_async(body: Boxed<()>, after: impl FnOnce()) {
     let outcome = Catch::new(body).await;
     after();
     if let Err(failure) = outcome {
@@ -799,6 +821,76 @@ impl Future for AnySettled {
             park_on(&node.waiters);
         }
         Poll::Pending
+    }
+}
+
+// ----------------------------------------------------- handles as values ---
+
+/// Every one of the four handles a vilan program can HOLD (`Task`, `Nursery`,
+/// `CancelSignal`, `TimerHandle`) is an `external struct`, which means two
+/// things for the emitter: a vilan struct with a field of that type derives
+/// `PartialEq` and gets an emitted `Js` rendering, so the handle owes both.
+///
+/// Equality is handle identity, as it is on the JS backend (a class instance
+/// compares by reference). `console.log` of a host handle prints the host's own
+/// object inspection — `__Timer { settled: false, … }` under node — and there is
+/// nothing to reproduce there: the shape is the JS runtime's, not the
+/// language's. So `print` of a handle PANICS with that sentence rather than
+/// inventing a rendering the differential would then have to believe. `Js` is
+/// implemented at all because the struct that HOLDS the handle needs it to
+/// compile, and such a struct is printable exactly as long as nothing reaches
+/// the handle's own slot.
+impl PartialEq for Nursery {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl crate::Js for Nursery {
+    fn js(&self) -> String {
+        crate::panic_with(
+            "printing a `Nursery` is a host object's own inspection, which the native backend \
+             does not reproduce",
+        )
+    }
+}
+
+impl PartialEq for TimerHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl crate::Js for TimerHandle {
+    fn js(&self) -> String {
+        crate::panic_with(
+            "printing a `Timer` is a host object's own inspection, which the native backend does \
+             not reproduce",
+        )
+    }
+}
+
+impl PartialEq for CancelSignal {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0.as_ptr(), other.0.as_ptr())
+    }
+}
+
+impl crate::Js for CancelSignal {
+    fn js(&self) -> String {
+        crate::panic_with(
+            "printing a `CancelSignal` is a host object's own inspection, which the native \
+             backend does not reproduce",
+        )
+    }
+}
+
+impl<T> crate::Js for Task<T> {
+    fn js(&self) -> String {
+        crate::panic_with(
+            "printing a `Task` is a host object's own inspection, which the native backend does \
+             not reproduce",
+        )
     }
 }
 

@@ -126,6 +126,29 @@ impl Js for () {
     }
 }
 
+/// A TUPLE renders as the array it is on the JS backend — a vilan tuple and a
+/// vilan struct are both flat arrays there, so `print((a, b))` is `[ a, b ]`
+/// with node's spacing. Written for the arities a program reaches; a wider one
+/// is a refusal in the emitter rather than a silently different rendering.
+macro_rules! js_for_tuple {
+    ($($name:ident),+) => {
+        impl<$($name: Js),+> Js for ($($name,)+) {
+            fn js(&self) -> String {
+                #[allow(non_snake_case, reason = "the binders are the type parameters' own names")]
+                let ($($name,)+) = self;
+                js_tuple(&[$($name.js_nested()),+])
+            }
+        }
+    };
+}
+
+js_for_tuple!(A);
+js_for_tuple!(A, B);
+js_for_tuple!(A, B, C);
+js_for_tuple!(A, B, C, D);
+js_for_tuple!(A, B, C, D, E);
+js_for_tuple!(A, B, C, D, E, F);
+
 impl<T: Js> Js for Vec<T> {
     fn js(&self) -> String {
         if self.is_empty() {
