@@ -1,3 +1,7 @@
+function __at(list, index) {
+	if (index >= 0 && index < list.length) return list[index];
+	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
+}
 function __clone(value) {
 	if (Array.isArray(value)) return value.map(__clone);
 	if (value instanceof Set) return new Set([ ...value ].map(__clone));
@@ -6,6 +10,11 @@ function __clone(value) {
 }
 function __hash(value) {
 	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
+}
+function __insert_at(list, index, value) {
+	if (index >= 0 && index < list.length) return void list.splice(index, 0, value);
+	if (index === list.length) return void list.push(value);
+	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
 }
 function __list_get(list, index) {
 	return index >= 0 && index < list.length ? [ 0, __clone(list[index]) ] : [ 1 ];
@@ -61,38 +70,64 @@ function fresh_id() {
 	return id;
 }
 function new2() {
-	return [ __shared_new([  ]), __shared_new(new Map()), __shared_new(false), __shared_new(false), __shared_new(false) ];
+	return [ __shared_new([  ]), __shared_new([  ]), __shared_new(new Map()), __shared_new(new Map()), __shared_new(false), __shared_new(false), __shared_new(false) ];
+}
+function is_quiescent(self) {
+	return $p(self[0].v) && $p(self[1].v);
 }
 function enqueue(turn, subscribers) {
 	for (const subscriber of subscribers) {
 		const key = hash(subscriber[0]);
-		if (!(turn[1].v.has(key))) {
-			turn[1].v.set(key, true);
-			turn[0].v.push(__clone(subscriber));
+		let $o = null;
+		if (subscriber[3]) {
+			if (!(turn[3].v.has(key))) {
+				turn[3].v.set(key, true);
+				turn[1].v.push(__clone(subscriber));
+			}
+			$o = undefined;
+		} else if (!(turn[2].v.has(key))) {
+			turn[2].v.set(key, true);
+			let index = turn[0].v.length;
+			while (index > 0 && __at(turn[0].v, index - 1)[0] > subscriber[0]) {
+				index = index - 1;
+			}
+			__insert_at(turn[0].v, index, __clone(subscriber));
 		}
+		$o;
 	}
-	if (turn[3].v && !(turn[4].v) && !(turn[2].v)) {
-		turn[4].v = true;
+	if (turn[5].v && !(turn[6].v) && !(turn[4].v)) {
+		turn[6].v = true;
 		queueMicrotask(() => {
-			turn[4].v = false;
+			turn[6].v = false;
 			drain(turn);
 			return;
 		});
 	}
 }
 function drain(turn) {
-	if (!(turn[2].v)) {
-		turn[2].v = true;
+	if (!(turn[4].v)) {
+		turn[4].v = true;
 		draining_turns.v.push(__clone(turn));
 		__with_finally(() => {
 			let budget = 100000;
-			while (!($o(turn[0].v)) && budget > 0) {
+			while (!(is_quiescent(turn)) && budget > 0) {
+				while (!($p(turn[1].v)) && budget > 0) {
+					const derivations = turn[1].v;
+					turn[1].v = [  ];
+					turn[3].v = new Map();
+					for (const subscriber of derivations) {
+						if (subscriber[2].v) {
+							subscriber[1]();
+						}
+						budget = budget - 1;
+					}
+				}
 				const wave = turn[0].v;
 				turn[0].v = [  ];
-				turn[1].v = new Map();
-				for (const subscriber of wave) {
-					if (subscriber[2].v) {
-						subscriber[1]();
+				turn[2].v = new Map();
+				for (const subscriber2 of wave) {
+					if (subscriber2[2].v) {
+						subscriber2[1]();
 					}
 					budget = budget - 1;
 				}
@@ -100,21 +135,21 @@ function drain(turn) {
 			return;
 		}, () => {
 			__list_pop(draining_turns.v);
-			turn[2].v = false;
+			turn[4].v = false;
 			return;
 		});
 	}
 }
-function flush($t) {
-	const $u = $t;
-	let $v = null;
-	if ($u[0] === 0) {
-		const turn = $u[1];
-		$v = drain(turn);
+function flush($u) {
+	const $v = $u;
+	let $w = null;
+	if ($v[0] === 0) {
+		const turn = $v[1];
+		$w = drain(turn);
 	} else {
-		$v = undefined;
+		$w = undefined;
 	}
-	return $v;
+	return $w;
 }
 async function tick() {
 
@@ -130,6 +165,8 @@ function $d(signal, observer) {
 	const id = fresh_id();
 	const cell = signal[0];
 	const live = __shared_new(true);
+	const derived = minting_derivation.v;
+	minting_derivation.v = false;
 	signal[1].v.push([ id, () => {
 		const $e = [ 0, cell ];
 		let $f = null;
@@ -140,7 +177,7 @@ function $d(signal, observer) {
 			$f = undefined;
 		}
 		return $f;
-	}, live ]);
+	}, live, derived ]);
 	return [ signal[1], id, live, __shared_new([ 1 ]) ];
 }
 function $g(self) {
@@ -151,10 +188,10 @@ function $c(self, observer) {
 	observer($g(self));
 	return subscription;
 }
-function $o(self) {
+function $p(self) {
 	return self.length === 0;
 }
-function $p(self) {
+function $q(self) {
 	return __list_get(self, self.length - 1);
 }
 function $k(self, $l) {
@@ -164,20 +201,20 @@ function $k(self, $l) {
 		const turn = $m[1];
 		$n = enqueue(turn, self[1].v);
 	} else {
-		const $q = $p(draining_turns.v);
-		let $r = null;
-		if ($q[0] === 0) {
-			const draining = $q[1];
-			$r = enqueue(draining, self[1].v);
+		const $r = $q(draining_turns.v);
+		let $s = null;
+		if ($r[0] === 0) {
+			const draining = $r[1];
+			$s = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
 				if (subscriber[2].v) {
 					subscriber[1]();
 				}
 			}
-			$r = undefined;
+			$s = undefined;
 		}
-		$n = $r;
+		$n = $s;
 	}
 	return $n;
 }
@@ -185,28 +222,29 @@ function $i(self, value, $j) {
 	self[0].v = __clone(value);
 	$k(self, $j);
 }
-function $y(policy, body) {
+function $z(policy, body) {
 	const fresh = new2();
 	const result = body(fresh);
 	drain(fresh);
-	fresh[3].v = true;
+	fresh[5].v = true;
 	return result;
 }
-function $A(body, $B) {
-	const $C = $B;
-	let $D = null;
-	if ($C[0] === 0) {
-		const current = $C[1];
-		$D = body(current);
+function $B(body, $C) {
+	const $D = $C;
+	let $E = null;
+	if ($D[0] === 0) {
+		const current = $D[1];
+		$E = body(current);
 	} else {
 		const fresh = new2();
 		const result = body(fresh);
 		drain(fresh);
-		fresh[3].v = true;
-		$D = result;
+		fresh[5].v = true;
+		$E = result;
 	}
-	return $D;
+	return $E;
 }
+const minting_derivation = __shared_new(false);
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
 const a = $a(0);
@@ -223,40 +261,40 @@ const turn_b = new2();
 	$i(a, 1, [ 0, $h ]);
 	return;
 })(turn_a);
-(($s) => {
-	$i(b, 1, [ 0, $s ]);
-	flush([ 0, $s ]);
+(($t) => {
+	$i(b, 1, [ 0, $t ]);
+	flush([ 0, $t ]);
 	return;
 })(turn_b);
 console.log("mid");
-(($w) => {
-	return flush([ 0, $w ]);
+(($x) => {
+	return flush([ 0, $x ]);
 })(turn_a);
-$y([ 0 ], ($x) => {
-	$i(a, 2, [ 0, $x ]);
-	$i(b, 2, [ 0, $x ]);
+$z([ 0 ], ($y) => {
+	$i(a, 2, [ 0, $y ]);
+	$i(b, 2, [ 0, $y ]);
 	console.log("inside");
 	return;
 });
-$A(($z) => {
-	$i(a, 3, [ 0, $z ]);
+$B(($A) => {
+	$i(a, 3, [ 0, $A ]);
 	console.log("batched");
 	return;
 }, [ 1 ]);
-$y([ 0 ], ($E) => {
-	$A(($F) => {
-		$i(a, 4, [ 0, $F ]);
+$z([ 0 ], ($F) => {
+	$B(($G) => {
+		$i(a, 4, [ 0, $G ]);
 		return;
-	}, [ 0, $E ]);
+	}, [ 0, $F ]);
 	console.log("joined");
 	return;
 });
 const turn_c = new2();
-(($G) => {
+(($H) => {
 	__task(async () => {
 		await (await (tick()));
-		$i(a, 5, [ 0, $G ]);
-		flush([ 0, $G ]);
+		$i(a, 5, [ 0, $H ]);
+		flush([ 0, $H ]);
 		return;
 	}, "main");
 	return;

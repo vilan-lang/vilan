@@ -244,13 +244,22 @@ fn combine_attaches_to_its_inputs_without_the_first_call() {
         .expect("combine's body is delimited")
         .0;
     assert!(
-        body.contains("source.on_change(|_| {"),
+        body.contains("source.on_change("),
         "combine must attach to each input with on_change; its body is:\n{body}"
     );
     assert!(
         !body.contains("source.sub("),
         "combine must not attach eagerly — each eager attach re-sets the \
          derived signal to the value it was just seeded with; its body is:\n{body}"
+    );
+    // And each attach is a DERIVATION (A110 door 2): it publishes rather than
+    // acts, so it belongs in the wave's first phase. The mark rides the
+    // ELEMENT expression of the mapped tuple, because `observe` spends one mark
+    // per subscriber and the tuple mints one per input.
+    assert!(
+        body.contains("on_change(as_derivation_for("),
+        "combine's per-input attach must be marked as a derivation, inside the \
+         mapped tuple's element expression; its body is:\n{body}"
     );
 }
 

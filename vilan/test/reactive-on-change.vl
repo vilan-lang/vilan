@@ -57,7 +57,10 @@ fun main() {
 	// current value — the eager contract, built by addition. The emitted body
 	// is the whole of it: no wrapper cell, no swallowed call, no branch riding
 	// every later notification.
-	// witness: const subscription = $S(self, observer); observer($T(self)); return subscription;
+	// Re-keyed at A110 door 2: `as_derivation`/`as_derivation_for` are two
+	// more hoisted helpers, so this body's gensyms moved up two letters
+	// ($R/$S/$T -> $S/$T/$U). The CLAIM is unchanged.
+	// witness: const subscription = $T(self, observer); observer($U(self)); return subscription;
 	// witness-absent: seeded
 	let stored = Stored { inner = Signal::new(10) };
 	let eagerly = stored.sub(|value| print(i"eager {value}"));

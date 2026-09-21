@@ -48,7 +48,11 @@ fun main() {
 	print(i"after dispose={selected.cells.read().len()}");
 
 	// `enqueue`'s dedup, keyed: one observer fed twice in one turn fires once.
-	// witness: if (!(turn[1].v.has(key))) { turn[1].v.set(key, true);
+	// Re-keyed at A110 door 2: `Turn` gained `pending_derived` and
+	// `queued_derived`, so the EFFECT dedup map is field 2 where it was
+	// field 1. The CLAIM — a keyed set, not a scan of the queue — is
+	// unchanged, and the bucket this names is the effect one.
+	// witness: if (!(turn[2].v.has(key))) { turn[2].v.set(key, true);
 	let counted: SignalCell<i32> = Signal::new(0);
 	mut hits = 0;
 	let watch = counted.on_change(|_| {

@@ -88,6 +88,8 @@ guide/reactive.md h2 derived-state-map-combine-flatten
 guide/reactive.md h3 selection-over-a-list-selector
 guide/reactive.md h2 reacting-effect-and-sub
 guide/reactive.md h2 ownership-who-cleans-up
+guide/reactive.md h3 who-cleans-up-what
+guide/reactive.md h3 an-owner-per-run-scoped_effect
 guide/reactive.md h2 turns-when-changes-become-visible
 guide/reactive.md h2 optimistic-writes-and-local-first-drafts
 guide/reactive.md h3 one-commit-per-burst-not-per-keystroke
@@ -398,6 +400,7 @@ std/reactive.md h1 stdreactive-reference
 std/reactive.md h2 at-a-glance
 std/reactive.md h2 signal-and-signalcell
 std/reactive.md h2 source
+std/reactive.md h3 scoped_effect--an-owner-per-run
 std/reactive.md h2 selector--per-key-selection
 std/reactive.md h2 writing-a-signal
 std/reactive.md h2 maybesignal
