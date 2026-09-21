@@ -15,7 +15,7 @@ use vilan_core::id::Id;
 use vilan_core::leak_tally::{LeakSite, Leaked};
 use vilan_core::lexing::{AT_IS_NOT_A_TOKEN, tokenize};
 use vilan_core::node::{Convention, CssDeclaration, CssItem, Node};
-use vilan_core::parsing::IMPORTANT_HAS_NO_PLACE;
+use vilan_core::parsing::{A_CSS_DECLARATION_IS_A_CALL, IMPORTANT_HAS_NO_PLACE};
 use vilan_core::{
     Error, LeakedEntryAst, Manifest, OwnedModules, Platform as BuildPlatform, Program, Span,
     Workspace as BuildWorkspace, analyze_source_owning_overlay_modules,
@@ -5766,6 +5766,67 @@ impl Document {
             .map(|(id, _)| id)
     }
 
+    /// E201's bulk fix: every mechanically rewritable `css` declaration in this
+    /// file, as ONE edit.
+    ///
+    /// Offered only when an A101 diagnostic overlaps `range` (the action belongs
+    /// to that refusal, not to the file) and only when there are at least two
+    /// rewrites to make — with one, it would be the same edit as the
+    /// per-declaration fix under a longer name.
+    ///
+    /// `QuickFix` carries a single span and replacement, so the edit spans from
+    /// the first rewrite to the last and splices the text between them through
+    /// verbatim. That is what keeps a DECLINING declaration (a glued value,
+    /// `!important`) exactly as the author wrote it while its neighbours move.
+    fn css_declaration_call_all_fix(&self, range: Span) -> Option<QuickFix> {
+        let mut asked = false;
+        let mut edits: Vec<(Span, String)> = Vec::new();
+        for (index, diagnostic) in self.diagnostics.iter().enumerate() {
+            if self
+                .diagnostic_sources
+                .get(index)
+                .copied()
+                .unwrap_or(SourceId(0))
+                != SourceId(0)
+                || !diagnostic.msg.starts_with(A_CSS_DECLARATION_IS_A_CALL)
+            {
+                continue;
+            }
+            asked |= spans_overlap(diagnostic.span, range);
+            if let Some(edit) = css_declaration_call_edit(&self.text, diagnostic.span.start) {
+                edits.push(edit);
+            }
+        }
+        if !asked || edits.len() < 2 {
+            return None;
+        }
+        edits.sort_by_key(|(span, _)| (span.start, span.end));
+        // One diagnostic per declaration is the parser's own recovery, but a
+        // duplicate here would splice the same bytes twice.
+        edits.dedup_by_key(|(span, _)| span.start);
+        let first = edits.first()?.0.start;
+        let last = edits.last()?.0.end;
+        let mut replacement = String::new();
+        let mut cursor = first;
+        for (span, text) in &edits {
+            // A later edit that OVERLAPS an earlier one cannot be spliced, and
+            // the declarations are disjoint by construction — so this is a
+            // guard against a text scan gone wrong, not an expected shape.
+            if span.start < cursor {
+                return None;
+            }
+            replacement.push_str(self.text.get(cursor..span.start)?);
+            replacement.push_str(text);
+            cursor = span.end;
+        }
+        Some(QuickFix {
+            title: format!("Write all {} `css` declarations as calls", edits.len()),
+            span: Span::from(first..last),
+            replacement,
+            target: None,
+        })
+    }
+
     /// The quickfix menu for the diagnostics overlapping `range` (LIVE
     /// space — safe because the caller gates staleness first, S3: while
     /// non-stale, live spans and this document's own `diagnostics` spans
@@ -5888,6 +5949,23 @@ impl Document {
                     replacement,
                     target: None,
                 });
+            } else if diagnostic.msg.starts_with(A_CSS_DECLARATION_IS_A_CALL)
+                && let Some((span, replacement)) =
+                    css_declaration_call_edit(&self.text, diagnostic.span.start)
+            {
+                // E201. The message every migrating program hits, and the two
+                // mechanical cases are the codemod's own rules — so the fix is
+                // the codemod, one declaration at a time. The title quotes the
+                // REWRITE rather than the property: the point the reader needs
+                // is that a declaration is a call now, and seeing
+                // `padding(px(4))` next to their `padding: 4px;` is the whole
+                // explanation.
+                fixes.push(QuickFix {
+                    title: format!("Write it as a call: `{replacement}`"),
+                    span,
+                    replacement,
+                    target: None,
+                });
             } else if diagnostic.msg.starts_with(IMPORTANT_HAS_NO_PLACE) {
                 // §7.2 fix 3. The parser reads the marker off the declaration's
                 // argument TOKENS (A101 — `red !important` is not an expression)
@@ -5904,6 +5982,20 @@ impl Document {
                     target: None,
                 });
             }
+        }
+        // E201's bulk half. A101's refusal fires PER DECLARATION — the parser
+        // recovers to the next one — so a migrating file carries one diagnostic
+        // and one fix per row, and taking them one at a time is the tedium the
+        // codemod exists to avoid. This action takes every one of them at once.
+        //
+        // The whole FILE rather than the enclosing block, deliberately: the
+        // block's extent would have to be recovered by counting braces through
+        // text the parser has already refused, where a brace inside a string is
+        // enough to find the wrong one, while the declarations themselves are
+        // already located exactly — each by its own diagnostic. The codemod is
+        // file-wide for the same reason.
+        if let Some(fix) = self.css_declaration_call_all_fix(range) {
+            fixes.push(fix);
         }
         // B318 §5: the two reach WARNINGS carry fixes of their own, and a
         // warning is not in `diagnostics` — deliberately, because 62 sites gate
@@ -7421,6 +7513,303 @@ fn media_rule_fix(text: &str, at: usize) -> Option<QuickFix> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// E201 — A101's quick fix: `property: value;` → `property(value);`
+//
+// A101 made a `css` declaration a CALL, and the refusal at the `:` is the
+// message every migrating program hits. The rewrite is the codemod's own
+// (`sweeps/order37/tools/css_call_codemod.py`, R10/R11/R12), reproduced here
+// for the two MECHANICAL cases the item names — a single `{expr}` hole, and a
+// plain text value — plus the whitespace-separated mixed form, which is the
+// same rule applied per piece. Three shapes DECLINE and are left to the
+// author: a glued value (`calc({w} + 2px)`, `{150}ms`), whose faithful rewrite
+// is an i-string with a `piece(..)` per hole and is a judgement about the value
+// rather than a mechanical edit; a value carrying `!important`, which has its
+// own refusal and its own fix once the call form is reached; and anything the
+// scan cannot read off the text.
+//
+// Text, not the AST: the parser REFUSED, so there is no `CssDeclaration` node
+// to read — the diagnostic's span (the `:`) plus the bytes either side of it is
+// all there is, which is also what makes the fix available in a file that does
+// not parse at all.
+// ---------------------------------------------------------------------------
+
+/// One piece of a css declaration's value: a run of literal text, or a
+/// `{expr}` hole.
+#[derive(Debug, PartialEq, Eq)]
+enum CssValuePiece {
+    Text(std::ops::Range<usize>),
+    Hole(std::ops::Range<usize>),
+}
+
+/// The `std::style::prelude` constructor for a whole text value, or `None` when
+/// it has none and the value stays a string literal.
+///
+/// The table is deliberately SMALL, exactly as the codemod's is: the css
+/// lowering makes a typed value and its string spelling byte-identical, so the
+/// choice is readability only, and a rewrite that guessed wrong would be worse
+/// than one that did not guess. Every name is a free function of
+/// `std::style::prelude`, which is ambient inside a `css` block, so a typed
+/// rewrite needs no import.
+fn css_typed_constructor(value: &str) -> Option<String> {
+    let value = value.trim();
+    for (suffix, constructor) in [
+        ("px", "px"),
+        ("rem", "rem"),
+        ("em", "em"),
+        ("vh", "vh"),
+        ("vw", "vw"),
+        ("%", "pct"),
+    ] {
+        let Some(digits) = value.strip_suffix(suffix) else {
+            continue;
+        };
+        // `em` is a suffix of `rem`, so the longer unit must win — the table is
+        // ordered for it, and `rem` is matched before `em` is tried.
+        if digits.is_empty() || !is_css_decimal(digits) {
+            continue;
+        }
+        // The constructors take `f64` and vilan reads a bare `4` as one in that
+        // position, so the digits pass through exactly as written.
+        return Some(format!("{constructor}({digits})"));
+    }
+    None
+}
+
+/// A non-negative decimal with at most one point and digits on both sides of
+/// it — what a unit constructor's argument may be.
+fn is_css_decimal(digits: &str) -> bool {
+    let mut halves = digits.split('.');
+    let whole = halves.next().unwrap_or_default();
+    let fraction = halves.next();
+    halves.next().is_none()
+        && !whole.is_empty()
+        && whole.bytes().all(|byte| byte.is_ascii_digit())
+        && fraction.is_none_or(|fraction| {
+            !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+/// A vilan string literal holding `value` verbatim.
+fn css_string_literal(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Splits a declaration's value text into its pieces. A `{` opens a hole at ANY
+/// depth (`calc({w} + 2px)` is the shape that matters), matched brace-balanced
+/// and string-aware; `None` when a brace does not close.
+fn css_value_pieces(value: &str) -> Option<Vec<CssValuePiece>> {
+    let bytes = value.as_bytes();
+    let mut pieces = Vec::new();
+    let mut text_from = 0usize;
+    let mut at = 0usize;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'"' => at = css_past_string(value, at),
+            b'{' => {
+                if text_from < at {
+                    pieces.push(CssValuePiece::Text(text_from..at));
+                }
+                let end = css_past_braces(value, at)?;
+                pieces.push(CssValuePiece::Hole(at..end));
+                at = end;
+                text_from = end;
+            }
+            // An unbalanced closer means the value is not what this scan
+            // thinks it is.
+            b'}' => return None,
+            _ => at += 1,
+        }
+    }
+    if text_from < bytes.len() {
+        pieces.push(CssValuePiece::Text(text_from..bytes.len()));
+    }
+    Some(pieces)
+}
+
+/// Just past the string literal opening at `at`.
+fn css_past_string(text: &str, at: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut scan = at + 1;
+    while scan < bytes.len() {
+        match bytes[scan] {
+            b'\\' => scan += 2,
+            b'"' => return scan + 1,
+            _ => scan += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// Just past the `}` closing the brace group that opens at `at`, or `None` when
+/// it does not close.
+fn css_past_braces(text: &str, at: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut scan = at;
+    while scan < bytes.len() {
+        match bytes[scan] {
+            b'"' => {
+                scan = css_past_string(text, scan);
+                continue;
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                // Checked: a formatter or a fix that PANICS on odd text is
+                // worse than one that declines, and the language server runs
+                // this behind a fence it should not need.
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(scan + 1);
+                }
+            }
+            _ => {}
+        }
+        scan += 1;
+    }
+    None
+}
+
+/// The argument list `property(..)` takes for this value text, or `None` when
+/// the shape declines.
+fn css_call_arguments(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    // `!important` has its own refusal and its own fix (§10, `IMPORTANT_HAS_NO
+    // PLACE`); rewriting the declaration around it would hand the author a
+    // second diagnostic as the reward for taking a fix.
+    if value.contains("!important") {
+        return None;
+    }
+    let pieces = css_value_pieces(value)?;
+    match pieces.as_slice() {
+        // Exactly one hole: the expression itself, which is what the hole
+        // always was.
+        [CssValuePiece::Hole(range)] => {
+            let inner = value.get(range.start + 1..range.end - 1)?.trim();
+            (!inner.is_empty()).then(|| inner.to_string())
+        }
+        // No holes at all: the typed constructor where the table has one, a
+        // string literal otherwise.
+        [CssValuePiece::Text(_)] => {
+            Some(css_typed_constructor(value).unwrap_or_else(|| css_string_literal(value)))
+        }
+        [] => None,
+        // Mixed. The pieces are N arguments when every boundary between them
+        // is whitespace — the desugar joins N arguments with exactly one
+        // space, so a GLUED boundary would gain a space the value never had.
+        // Those decline: their faithful rewrite is an i-string carrying a
+        // `piece(..)` per hole, which is a decision about the value.
+        pieces => {
+            let mut arguments: Vec<String> = Vec::new();
+            for piece in pieces {
+                match piece {
+                    CssValuePiece::Hole(range) => {
+                        let inner = value.get(range.start + 1..range.end - 1)?.trim();
+                        if inner.is_empty() {
+                            return None;
+                        }
+                        arguments.push(inner.to_string());
+                    }
+                    CssValuePiece::Text(range) => {
+                        let run = value.get(range.clone())?;
+                        // The boundary test: a text run adjacent to a hole must
+                        // be separated from it by whitespace on that side.
+                        let leading = range.start == 0 || run.starts_with([' ', '\t']);
+                        let trailing = range.end == value.len() || run.ends_with([' ', '\t']);
+                        if !leading || !trailing {
+                            return None;
+                        }
+                        let run = run.trim();
+                        if !run.is_empty() {
+                            arguments.push(
+                                css_typed_constructor(run)
+                                    .unwrap_or_else(|| css_string_literal(run)),
+                            );
+                        }
+                    }
+                }
+            }
+            (!arguments.is_empty()).then(|| arguments.join(", "))
+        }
+    }
+}
+
+/// The whole rewrite of the declaration whose `:` the A101 diagnostic spans:
+/// the span to replace and its replacement text.
+///
+/// `colon` is `diagnostic.span.start` — the parser reports at exactly the token
+/// where a `(` belongs. The property is read BACKWARDS from it (the property
+/// production is `-*[A-Za-z_][A-Za-z0-9_]*(-[A-Za-z0-9_]+)*`, so a custom
+/// property's leading dashes ride along, R12) and the value forwards to the
+/// `;`.
+fn css_declaration_call_edit(text: &str, colon: usize) -> Option<(Span, String)> {
+    text.get(colon..)?.strip_prefix(':')?;
+    let before = text.get(..colon)?;
+    let name_end = before.trim_end_matches([' ', '\t']).len();
+    let name_start = before
+        .get(..name_end)?
+        .char_indices()
+        .rev()
+        .take_while(|(_, character)| {
+            character.is_ascii_alphanumeric() || *character == '_' || *character == '-'
+        })
+        .map(|(at, _)| at)
+        .last()
+        .unwrap_or(name_end);
+    let name = before.get(name_start..name_end)?;
+    if name.is_empty() || !css_property_is_well_formed(name) {
+        return None;
+    }
+    // The value ends at the `;`, which A101's own production requires. A hole
+    // may hold one (`{ if a { 1; } else { 2 } }`), so the search skips holes
+    // and strings rather than taking the first `;` it meets.
+    let after = text.get(colon + 1..)?;
+    let terminator = css_value_terminator(after)?;
+    let arguments = css_call_arguments(after.get(..terminator)?)?;
+    Some((
+        Span::from(name_start..colon + 1 + terminator + 1),
+        format!("{name}({arguments});"),
+    ))
+}
+
+/// The offset of the `;` ending a declaration's value, skipping holes and
+/// strings. `None` when the value does not terminate (the file is mid-edit) or
+/// runs into the block's own `}`.
+fn css_value_terminator(after: &str) -> Option<usize> {
+    let bytes = after.as_bytes();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'"' => at = css_past_string(after, at),
+            b'{' => at = css_past_braces(after, at)?,
+            b';' => return Some(at),
+            // The declaration is unterminated and the block has closed.
+            b'}' => return None,
+            _ => at += 1,
+        }
+    }
+    None
+}
+
+/// Whether `name` is the css property production: optional leading dashes, then
+/// hyphen-joined identifier segments.
+fn css_property_is_well_formed(name: &str) -> bool {
+    let body = name.trim_start_matches('-');
+    if body.is_empty() {
+        return false;
+    }
+    body.split('-').all(|segment| {
+        !segment.is_empty()
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            && !segment.as_bytes()[0].is_ascii_digit()
+    })
+}
+
 /// S2's parse-error message (`parsing.rs::render`, `ParseErrorReason::
 /// MissingTerminator`) — matched by PREFIX since a curated parse error can
 /// carry a trailing `" in <context>"` label (`render`'s own context loop),
@@ -8571,6 +8960,226 @@ pub(crate) mod tests {
             .collect();
         let _ = std::fs::remove_dir_all(&directory);
         fixes
+    }
+
+    // E201. A101's refusal at the `:` is the message every migrating program
+    // hits, and the rewrite is mechanical for the two cases the item names —
+    // one `{expr}` hole, and a plain text value (typed where the codemod's
+    // small table types it, a string otherwise). One pin per shape, not one
+    // representative: a value rule table is exactly what regresses in five of
+    // six and passes.
+
+    /// The plain-text case, both halves of it: a value the table types becomes
+    /// the typed constructor, and one it does not becomes a string literal —
+    /// the css lowering makes the two byte-identical, so the choice is
+    /// readability and the table stays small deliberately.
+    #[test]
+    fn quickfix_rewrites_a_text_css_declaration_as_a_call() {
+        let typed = css_block_fixes("\tcss {\n\t\tpadding: 4px;\n\t}\n");
+        assert!(
+            typed.contains(&(
+                "Write it as a call: `padding(px(4));`".to_string(),
+                "padding: 4px;".to_string(),
+                "padding(px(4));".to_string(),
+            )),
+            "{typed:?}"
+        );
+        // `%` is the one unit whose constructor is not its own spelling.
+        let percent = css_block_fixes("\tcss {\n\t\twidth: 100%;\n\t}\n");
+        assert!(
+            percent.contains(&(
+                "Write it as a call: `width(pct(100));`".to_string(),
+                "width: 100%;".to_string(),
+                "width(pct(100));".to_string(),
+            )),
+            "{percent:?}"
+        );
+        // A fraction rides through as written — the constructors take `f64`.
+        let fractional = css_block_fixes("\tcss {\n\t\tmargin: 1.5rem;\n\t}\n");
+        assert!(
+            fractional.contains(&(
+                "Write it as a call: `margin(rem(1.5));`".to_string(),
+                "margin: 1.5rem;".to_string(),
+                "margin(rem(1.5));".to_string(),
+            )),
+            "{fractional:?}"
+        );
+        // And a value with no unit at all is a string. `flex` is not a number,
+        // and guessing a constructor for it would be the fix inventing
+        // semantics.
+        let word = css_block_fixes("\tcss {\n\t\tdisplay: flex;\n\t}\n");
+        assert!(
+            word.contains(&(
+                "Write it as a call: `display(\"flex\");`".to_string(),
+                "display: flex;".to_string(),
+                "display(\"flex\");".to_string(),
+            )),
+            "{word:?}"
+        );
+    }
+
+    /// The hole case: `{expr}` was always the expression, so the rewrite is the
+    /// expression with the braces gone.
+    #[test]
+    fn quickfix_rewrites_a_hole_valued_css_declaration_as_a_call() {
+        let fixes = css_block_fixes("\tcss {\n\t\tcolor: {Color::gray(500)};\n\t}\n");
+        assert!(
+            fixes.contains(&(
+                "Write it as a call: `color(Color::gray(500));`".to_string(),
+                "color: {Color::gray(500)};".to_string(),
+                "color(Color::gray(500));".to_string(),
+            )),
+            "{fixes:?}"
+        );
+    }
+
+    /// A whitespace-separated mixed value is N arguments — the desugar joins
+    /// them with exactly one space, which is what the value had.
+    ///
+    /// One argument per PIECE, not per word: a run of literal text stays one
+    /// string (`"1px solid"`), which is the codemod's own rule and the reason
+    /// the rewrite cannot change what reaches the sheet — splitting the run
+    /// would be the fix re-deciding where a value's parts are.
+    #[test]
+    fn quickfix_rewrites_a_space_separated_css_value_as_several_arguments() {
+        let fixes = css_block_fixes("\tcss {\n\t\tborder: 1px solid {Color::gray(200)};\n\t}\n");
+        assert!(
+            fixes.contains(&(
+                "Write it as a call: `border(\"1px solid\", Color::gray(200));`".to_string(),
+                "border: 1px solid {Color::gray(200)};".to_string(),
+                "border(\"1px solid\", Color::gray(200));".to_string(),
+            )),
+            "{fixes:?}"
+        );
+        // A text run the table DOES type on its own is typed: the hole first,
+        // then a bare unit value, is the common `margin: {gap} 4px;` shape.
+        let typed_tail = css_block_fixes("\tcss {\n\t\tmargin: {gap} 4px;\n\t}\n");
+        assert!(
+            typed_tail.contains(&(
+                "Write it as a call: `margin(gap, px(4));`".to_string(),
+                "margin: {gap} 4px;".to_string(),
+                "margin(gap, px(4));".to_string(),
+            )),
+            "{typed_tail:?}"
+        );
+    }
+
+    /// A custom property keeps its leading dashes (R12): the property
+    /// production admits them, so the call does too.
+    #[test]
+    fn quickfix_rewrites_a_custom_property_declaration() {
+        let fixes = css_block_fixes("\tcss {\n\t\t--card-gap: 8px;\n\t}\n");
+        assert!(
+            fixes.contains(&(
+                "Write it as a call: `--card-gap(px(8));`".to_string(),
+                "--card-gap: 8px;".to_string(),
+                "--card-gap(px(8));".to_string(),
+            )),
+            "{fixes:?}"
+        );
+    }
+
+    /// The shapes that DECLINE. Each is a value the rewrite cannot make
+    /// without deciding something, so the refusal's own sentence stays the
+    /// whole answer and the author edits by hand.
+    #[test]
+    fn quickfix_declines_the_glued_and_important_css_values() {
+        // A GLUED boundary: `{150}ms` joined by N arguments would gain a space
+        // it never had, and its faithful rewrite is an i-string carrying a
+        // `piece(..)` per hole — a judgement about the value.
+        let glued = css_block_fixes("\tcss {\n\t\ttransition-duration: {150}ms;\n\t}\n");
+        assert!(
+            !glued
+                .iter()
+                .any(|(title, _, _)| title.starts_with("Write it as a call")),
+            "{glued:?}"
+        );
+        // `calc({w} + 2px)` is the same class with the glue at the front.
+        let calc = css_block_fixes("\tcss {\n\t\twidth: calc({gap} + 2px);\n\t}\n");
+        assert!(
+            !calc
+                .iter()
+                .any(|(title, _, _)| title.starts_with("Write it as a call")),
+            "{calc:?}"
+        );
+        // `!important` has its own refusal and its own fix once the call form
+        // is reached; rewriting around it would hand the author a second
+        // diagnostic as the reward for taking a fix.
+        let important = css_block_fixes("\tcss {\n\t\tdisplay: flex !important;\n\t}\n");
+        assert!(
+            !important
+                .iter()
+                .any(|(title, _, _)| title.starts_with("Write it as a call")),
+            "{important:?}"
+        );
+    }
+
+    /// The bulk half: A101 fires per declaration, so a migrating file offers
+    /// one fix per row — and one action that takes them all. The spliced edit
+    /// leaves a DECLINING neighbour exactly as written.
+    #[test]
+    fn quickfix_rewrites_every_css_declaration_in_one_action() {
+        let fixes = css_block_fixes(
+            "\tcss {\n\t\tpadding: 4px;\n\t\twidth: calc({gap} + 2px);\n\t\tdisplay: flex;\n\t}\n",
+        );
+        let (title, replaced, replacement) = fixes
+            .iter()
+            .find(|(title, _, _)| title.starts_with("Write all "))
+            .unwrap_or_else(|| panic!("the bulk action must be offered: {fixes:?}"));
+        assert_eq!(title, "Write all 2 `css` declarations as calls");
+        assert_eq!(
+            replaced,
+            "padding: 4px;\n\t\twidth: calc({gap} + 2px);\n\t\tdisplay: flex;"
+        );
+        assert_eq!(
+            replacement, "padding(px(4));\n\t\twidth: calc({gap} + 2px);\n\t\tdisplay(\"flex\");",
+            "the glued declaration between them travels through verbatim"
+        );
+        // With ONE rewrite there is nothing to bulk: the action would be the
+        // per-declaration fix under a longer name.
+        let single = css_block_fixes("\tcss {\n\t\tpadding: 4px;\n\t}\n");
+        assert!(
+            !single
+                .iter()
+                .any(|(title, _, _)| title.starts_with("Write all ")),
+            "{single:?}"
+        );
+    }
+
+    /// Applied, the fix leaves the file clean — the contract the add-import pin
+    /// holds for its own edit, and the only proof that the rewrite is the one
+    /// the parser wanted.
+    #[test]
+    fn the_applied_css_call_fix_leaves_the_file_analyzing() {
+        let source = "import std::style::{ Style, style };\n\nfun card(): Style {\n\tcss {\n\t\tpadding: 4px;\n\t\tdisplay: flex;\n\t}\n}\n";
+        let (directory, document) = analyze_workspace(&[("main.vl", source)]);
+        let program = document.program.as_ref().expect("a css fixture analyzes");
+        let text = document.line_index.text().to_string();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
+        let bulk = fixes
+            .iter()
+            .find(|fix| fix.title.starts_with("Write all "))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{:?}",
+                    fixes.iter().map(|fix| &fix.title).collect::<Vec<_>>()
+                )
+            });
+        let mut applied = text.clone();
+        applied.replace_range(bulk.span.into_range(), &bulk.replacement);
+        let entry = directory.join("main.vl");
+        std::fs::write(&entry, &applied).unwrap();
+        let reanalyzed = Document::analyze(&applied, &std_root(), &entry);
+        assert!(
+            reanalyzed.diagnostics.is_empty(),
+            "applying the rewrite must leave the file clean: {:#?}\n{applied}",
+            reanalyzed.diagnostics
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     // B318 §5: the two reach warnings carry one-character fixes, and a WARNING

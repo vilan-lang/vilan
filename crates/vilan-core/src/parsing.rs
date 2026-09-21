@@ -323,7 +323,10 @@ const CSS_PSEUDO_CLASS_IS_DOTTED: &str = "a `css` block writes a pseudo-class as
 /// property is the name, the value is its ordinary vilan expression arguments,
 /// and the `{ }` hole is gone because there is no token span left for one to
 /// interrupt.
-const A_CSS_DECLARATION_IS_A_CALL: &str = "a `css` declaration is a CALL: write `padding(space(4));`, not `padding: space(4);`. The \
+/// Public for the same reason [`IMPORTANT_HAS_NO_PLACE`] is: the language
+/// server's quick fix keys on it (E201) — one constant rather than a second
+/// copy to drift from.
+pub const A_CSS_DECLARATION_IS_A_CALL: &str = "a `css` declaration is a CALL: write `padding(space(4));`, not `padding: space(4);`. The \
      property is the name and its value is ordinary vilan expressions, so a typed value needs \
      no `{ }` hole — and several arguments join with one space, as CSS's own value lists do \
      (`margin(px(4), px(8))`)";
