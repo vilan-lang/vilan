@@ -2141,7 +2141,20 @@ fn fmt(paths: &[PathBuf], check: bool) -> ExitCode {
     // the FORMATTER's, and a run reporting the second as the first is how a
     // printer gap stays invisible.
     let mut declined = 0;
+    // E205: `[fmt] wrap_comments` is a PACKAGE's opinion, so it is resolved per
+    // file — and cached per DIRECTORY for `exclude_generated`'s reason: every
+    // file in one directory has the same ancestors, so one manifest climb per
+    // directory rather than one per file.
+    let mut wrap_comments: HashMap<PathBuf, bool> = HashMap::new();
     for file in &files {
+        let directory = file.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let options = vilan_core::formatter::FormatOptions {
+            wrap_comments: *wrap_comments
+                .entry(directory)
+                .or_insert_with_key(|directory| {
+                    vilan_core::manifest::wrap_comments_covering(directory)
+                }),
+        };
         let source = match fs::read_to_string(file) {
             Ok(source) => source,
             Err(error) => {
@@ -2160,7 +2173,7 @@ fn fmt(paths: &[PathBuf], check: bool) -> ExitCode {
         // `fmt --check vilan/std` green over it, and an idempotency pin on one
         // file is what caught it. `reprint` says which happened, and a decline
         // is reported by name here instead of being counted as clean.
-        let formatted = match vilan_core::formatter::reprint(&source) {
+        let formatted = match vilan_core::formatter::reprint_with(&source, options) {
             Ok(formatted) => formatted,
             Err(decline) => {
                 report_decline(file, &decline);

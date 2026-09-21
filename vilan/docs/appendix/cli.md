@@ -355,6 +355,36 @@ is the current directory. Formatting is conservative and a fixed point:
 `--check` reports the files that would change and exits 1 if any (the
 CI spelling). Nothing is rewritten.
 
+**Comments are left exactly as you typed them, unless you ask.** The formatter
+lays code out to a width and leaves prose alone, so a `//` line runs as far as
+its author took it and a paragraph edited in the middle keeps its ragged
+lines. A package can opt into re-filling them:
+
+```toml
+[fmt]
+wrap_comments = true
+```
+
+It re-fills a *paragraph* — a run of `//` (or `///`) lines with nothing but a
+newline between them — to the same width the code is laid out to, at that
+comment's own indentation. A blank `//` line is a paragraph break and stays
+one. The key is read from the nearest `vilan.toml` above the file, so a
+workspace can set it once and a member override it; unset means off, and with
+it off `vilan fmt` is byte-for-byte what it was.
+
+What it never touches, because re-wrapping these destroys something: fenced
+code blocks; list items (an item is a line, and joining two makes
+one); tables; headings; block quotes; a line with an interior run of two or
+more spaces (aligned columns, an ASCII drawing); section banners and
+horizontal rules (`// --- Placement ---`); toolchain directives such as
+`// witness:`; commented-out code; license headers; and a trailing comment
+after code. A URL or a `` `code span` `` longer than the width is never
+*broken* — it takes a line of its own and runs over, the way any unbreakable
+word does. No character is ever substituted: the fill moves whitespace between
+words and does nothing else, and it checks that afterwards. If a re-fill ever
+came out with different words, `vilan fmt` declines the file (exit 2) and
+names the comment rather than writing it.
+
 **Three outcomes, three exit codes.** `0` is clean. `1` is "this tree is not
 formatted" — `--check` found files that would change, or a write failed. `2` is
 "the formatter could not format a file", the `declined` lines above it saying

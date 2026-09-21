@@ -31,6 +31,8 @@ pub struct Manifest {
     pub library: Option<Library>,
     pub project: Option<Project>,
     pub build: Option<Build>,
+    /// `[fmt]` — `vilan fmt`'s per-package knobs (E205).
+    pub fmt: Option<Fmt>,
     /// `[macro]` — expansion budgets (macro-engine.md §5): `fuel` (interpreter
     /// steps per macro run, default 1_000_000) and `depth` (expansion fixpoint
     /// rounds, default 16).
@@ -53,8 +55,25 @@ pub struct Manifest {
 /// pinned against. `server` / `client` are here only so [`Manifest::validate`]
 /// can point their users at the replacement; they are not valid content.
 pub const KNOWN_SECTIONS: &[&str] = &[
-    "package", "library", "project", "build", "macro", "entry", "server", "client",
+    "package", "library", "project", "build", "fmt", "macro", "entry", "server", "client",
 ];
+
+/// The `[fmt]` section: `vilan fmt`'s per-package knobs (E205).
+///
+/// Deliberately not a WIDTH. The formatter has one canonical layout for code
+/// and a width knob would fork the shape of every file in every project; what
+/// belongs here is the one thing that cannot be settled globally, which is
+/// whether the formatter may rewrite the author's own prose.
+#[derive(Debug, Default, Deserialize)]
+pub struct Fmt {
+    /// Re-fill a paragraph of `//` / `///` lines to the line width, the way
+    /// the printer already lays out code. Default OFF for one release (E205's
+    /// R8): rewrapping somebody's comments is the one thing the formatter does
+    /// that no token comparison can check, so it is asked for rather than
+    /// arriving with an upgrade.
+    #[serde(rename = "wrap_comments")]
+    pub wrap_comments: Option<bool>,
+}
 
 /// The `[macro]` section: per-package expansion budgets.
 #[derive(Debug, Default, Deserialize)]
@@ -850,6 +869,42 @@ pub fn generated_root_in(directory: &Path) -> Option<PathBuf> {
 /// link. Resolving the deepest ancestor that does exist puts both sides in the
 /// same spelling; where nothing exists at all, both degrade lexically together,
 /// which is the spelled ladder and not a mixed comparison.
+/// Whether `[fmt] wrap_comments` is on for the package covering `path` (a
+/// file or a directory) — E205's opt-in, and the ONE predicate behind it.
+///
+/// It lives here, over a path, for exactly [`generated_root_covering`]'s
+/// reason: the CLI walks directories while an editor is handed one buffer by
+/// its exact path, and the two must answer identically or a file would be
+/// wrapped by `vilan fmt` and unwrapped by format-on-save. The search climbs
+/// to the filesystem root and takes the NEAREST manifest that declares the
+/// key, so a workspace can set it once and a member override it; a manifest
+/// that declares nothing is climbed past rather than read as `false`.
+///
+/// Every failure answers `false`: no manifest, a manifest that does not parse,
+/// a manifest declaring nothing. That is the safe direction and the only one
+/// available here — an unreadable tree gets today's formatter, never a
+/// silently different one.
+pub fn wrap_comments_covering(path: &Path) -> bool {
+    let mut current = Some(crate::util::spelled_path(path));
+    while let Some(directory) = current {
+        if let Some(declared) = wrap_comments_in(&directory) {
+            return declared;
+        }
+        current = directory.parent().map(Path::to_path_buf);
+    }
+    false
+}
+
+/// The `[fmt] wrap_comments` `directory`'s own `vilan.toml` declares, or
+/// `None` when there is no manifest, it does not parse, or it is silent —
+/// which is what makes the climb in [`wrap_comments_covering`] pass through a
+/// manifest that has no opinion.
+fn wrap_comments_in(directory: &Path) -> Option<bool> {
+    let text = std::fs::read_to_string(directory.join("vilan.toml")).ok()?;
+    let (manifest, _warnings) = Manifest::parse(&text).ok()?;
+    manifest.fmt?.wrap_comments
+}
+
 pub fn generated_root_covering(path: &Path) -> Option<PathBuf> {
     let resolved = crate::util::canonical_path_of_unwritten(path);
     let spelled = crate::util::spelled_path(path);

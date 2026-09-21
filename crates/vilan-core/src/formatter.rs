@@ -20,6 +20,13 @@ use crate::node::{
 use crate::span::{Span, Spanned};
 use crate::token::Token;
 
+mod comment_reflow;
+
+/// The comment markers a paragraph may be written with — the reflow module's
+/// list, re-exported here because the paragraph GROUPING needs it too (a bare
+/// `//` is a paragraph break).
+use comment_reflow::MARKERS as MARKER_SPELLINGS;
+
 thread_local! {
     /// How many whole-buffer parses ([`parse`]) this thread has paid so far —
     /// the formatter's unit of real work, and what made a bare scope
@@ -2571,17 +2578,9 @@ pub fn organize_import_runs(
     keep_module: &dyn Fn(Span) -> ModuleRescue,
 ) -> Option<Vec<ImportRunEdit>> {
     let items = parse(source)?;
-    let mut printer = Printer {
-        out: String::new(),
-        indent: 0,
-        comments: extract_comments(source),
-        cursor: 0,
-        source,
-        declined: None,
-        split: Split::Off,
-        probing: false,
-        atomic_elements: false,
-    };
+    // The organizer rewrites import STATEMENTS, never the comments around them,
+    // so the comment width knob cannot reach its output.
+    let mut printer = Printer::new(source, FormatOptions::default());
     Some(printer.organize_runs(&items, keep, keep_module))
 }
 
@@ -2935,6 +2934,12 @@ pub enum DeclineReason {
     /// one the token-stream net cannot see; see [`verify_reprint`] for why the
     /// two checks are independent.
     ReprintDoesNotParse,
+    /// `[fmt] wrap_comments` re-filled a comment paragraph and the words came
+    /// out different (E205). Not a printer gap in the code — the CODE is
+    /// fine — but the one defect a token stream cannot see, since a comment is
+    /// trivia the lexer drops: so the reflow carries its own net, and a
+    /// failure declines the file rather than rewrite somebody's prose wrongly.
+    ReflowChangedTheWords,
 }
 
 /// What [`reprint`] declined on: the reason, and — for a printer gap — the
@@ -2964,6 +2969,12 @@ impl Decline {
                  reprint was thrown away (the formatter's own safety net): `{}`",
                 self.construct
             ),
+            DeclineReason::ReflowChangedTheWords => format!(
+                "re-filling this comment to the line width would have changed its \
+                 WORDS, so nothing was rewritten (`[fmt] wrap_comments`, and the \
+                 formatter's own safety net): `{}`",
+                self.construct
+            ),
             DeclineReason::ReprintDoesNotParse => format!(
                 "reprinting it produced text that is not a Vilan file, so the \
                  reprint was thrown away (the formatter's own safety net): the \
@@ -2974,11 +2985,35 @@ impl Decline {
     }
 }
 
-/// What the printer declined on, recorded at the fallback that declined.
+/// What the printer declined on, recorded at the site that declined.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DeclinedAt {
-    /// The span of the node the printer had no rule for.
+    /// Which of the printer's OWN two declines this is:
+    /// [`DeclineReason::NoRule`] (a construct it cannot render) or
+    /// [`DeclineReason::ReflowChangedTheWords`] (E205's net).
+    reason: DeclineReason,
+    /// The span of the construct — the node the printer had no rule for, or
+    /// the first line of the comment the reflow would have rewritten.
     span: Option<Span>,
+}
+
+/// The per-package knobs `vilan fmt` reads from a manifest's `[fmt]` section.
+///
+/// Deliberately tiny, and deliberately not a width: the formatter has ONE
+/// canonical layout for code (see [`LINE_BUDGET`]), and a width knob would
+/// fork the shape of every file in every project. What is here is the one
+/// thing that cannot be settled globally — whether the formatter is allowed to
+/// rewrite the author's prose.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FormatOptions {
+    /// `[fmt] wrap_comments` (E205): re-fill a paragraph of `//` / `///` lines
+    /// to the line width, the way the printer already lays out code.
+    ///
+    /// **Default OFF, for one release** (R8 at Order 39's GO). Rewrapping
+    /// somebody's comments is the one thing the formatter does that no token
+    /// comparison can check, so it earns its default by being asked for first.
+    /// With the key off, `vilan fmt` is byte-for-byte what it was.
+    pub wrap_comments: bool,
 }
 
 /// Formats `original`, returning the reprinted text — or the [`Decline`] that
@@ -2999,6 +3034,16 @@ struct DeclinedAt {
 /// fully understand is not one to rewrite, not even its line endings. The line
 /// a `Decline` reports is the same in both, since normalizing removes no lines.
 pub fn reprint(original: &str) -> Result<String, Decline> {
+    reprint_with(original, FormatOptions::default())
+}
+
+/// [`reprint`] under a package's own `[fmt]` options (E205).
+///
+/// The knobs are a SEPARATE entry point rather than a parameter on `reprint`,
+/// so that every existing caller — the language server, the playground, the
+/// tests — keeps the canonical output it had, and a tool that has read a
+/// manifest opts in explicitly.
+pub fn reprint_with(original: &str, options: FormatOptions) -> Result<String, Decline> {
     let normalized = crate::util::normalize_newlines(crate::util::strip_bom(original));
     let source: &str = &normalized;
     let Some(original_tokens) = code_tokens_spanned(source) else {
@@ -3007,23 +3052,13 @@ pub fn reprint(original: &str) -> Result<String, Decline> {
     let Some(items) = parse(source) else {
         return Err(decline(source, DeclineReason::DoesNotParse, None));
     };
-    let mut printer = Printer {
-        out: String::new(),
-        indent: 0,
-        comments: extract_comments(source),
-        cursor: 0,
-        source,
-        declined: None,
-        split: Split::Off,
-        probing: false,
-        atomic_elements: false,
-    };
+    let mut printer = Printer::new(source, options);
     let prev_end = printer.print_items(&items, 0, true);
     // Comments after the last item (trailing end-of-file comments).
     printer.flush_comments_before(source.len(), prev_end);
     printer.out.push('\n');
     if let Some(declined) = printer.declined {
-        return Err(decline(source, DeclineReason::NoRule, declined.span));
+        return Err(decline(source, declined.reason, declined.span));
     }
     verify_reprint(source, &original_tokens, &printer.out)?;
     Ok(printer.out)
@@ -3384,16 +3419,42 @@ struct Printer<'src> {
     /// its items — breaks in the probe too, because that break is not a width
     /// decision and flattening it would be a lie.
     atomic_elements: bool,
+    /// The package's `[fmt]` knobs (E205).
+    options: FormatOptions,
 }
 
 impl<'src> Printer<'src> {
+    /// A printer over `source` under `options`, at column zero with nothing
+    /// declined and no split armed — the state every entry point starts from,
+    /// in one place so a new field cannot be initialized two ways.
+    fn new(source: &'src str, options: FormatOptions) -> Self {
+        Printer {
+            out: String::new(),
+            indent: 0,
+            comments: extract_comments(source),
+            cursor: 0,
+            source,
+            declined: None,
+            split: Split::Off,
+            probing: false,
+            atomic_elements: false,
+            options,
+        }
+    }
+
     /// Records that the printer has no rule for the construct at `span`, which
     /// makes [`reprint`] hand the original bytes back with a [`Decline`] naming
     /// it (N90). The FIRST decline is kept: it is the one nearest the gap, and
     /// a later one is usually the same construct met again on the way out.
     fn decline(&mut self, span: Option<Span>) {
+        self.decline_with(DeclineReason::NoRule, span);
+    }
+
+    /// [`Self::decline`] for a reason other than a missing rule — E205's
+    /// words-in-order net. The FIRST decline is kept, whichever it is.
+    fn decline_with(&mut self, reason: DeclineReason, span: Option<Span>) {
         if self.declined.is_none() {
-            self.declined = Some(DeclinedAt { span });
+            self.declined = Some(DeclinedAt { reason, span });
         }
     }
 
@@ -3453,6 +3514,11 @@ impl<'src> Printer<'src> {
     /// line, preserving a blank line before a comment that the source had one
     /// before. Returns the source offset just past the last comment emitted (or
     /// `start_from` if none), so the caller can judge the gap before the item.
+    ///
+    /// This is the ONE place a standalone comment is written, which is what
+    /// makes E205's reflow a local change: with `[fmt] wrap_comments` off the
+    /// loop is exactly what it always was, and with it on the run is taken a
+    /// PARAGRAPH at a time instead of a line at a time.
     fn flush_comments_before(&mut self, pos: usize, start_from: usize) -> usize {
         let mut at = start_from;
         while self.cursor < self.comments.len() {
@@ -3464,12 +3530,100 @@ impl<'src> Printer<'src> {
             if self.has_blank_between(at, range.start) {
                 self.blank_line();
             }
-            self.line();
-            self.out.push_str(text);
-            at = range.end;
-            self.cursor += 1;
+            if !self.options.wrap_comments {
+                self.line();
+                self.out.push_str(text);
+                at = range.end;
+                self.cursor += 1;
+                continue;
+            }
+            at = self.flush_comment_paragraph(pos);
         }
         at
+    }
+
+    /// Emits the paragraph beginning at the comment cursor, re-filled to the
+    /// line width when E205's rules allow it, and advances the cursor past it.
+    /// Returns the source offset just past the paragraph's last line.
+    ///
+    /// A paragraph is at least one line, so this always makes progress.
+    fn flush_comment_paragraph(&mut self, pos: usize) -> usize {
+        let length = self.comment_paragraph_length(pos);
+        let paragraph = &self.comments[self.cursor..self.cursor + length];
+        let first = paragraph[0].0;
+        let end = paragraph[length - 1].0.into_range().end;
+        let lines: Vec<&'src str> = paragraph.iter().map(|(_, text)| *text).collect();
+        self.emit_comment_paragraph(&lines, Some(first));
+        self.cursor += length;
+        end
+    }
+
+    /// Emits one paragraph of comment lines, each on its own line, re-filled
+    /// to the width when `[fmt] wrap_comments` is on and E205's rules allow
+    /// it. `at` is the span a decline would name.
+    ///
+    /// Shared by the two places a standalone comment reaches the output: the
+    /// comment stream, and E181's comments riding with an `export *;` marker.
+    fn emit_comment_paragraph(&mut self, lines: &[&'src str], at: Option<Span>) {
+        // The budget is the line's, at the indentation this paragraph is being
+        // printed at — not the one it was written at, since the printer may
+        // have re-indented the block around it.
+        let budget = LINE_BUDGET.saturating_sub(self.indent * TAB_COLUMNS);
+        let filled = match self.options.wrap_comments {
+            true => comment_reflow::reflow(lines, budget),
+            false => comment_reflow::Reflow::AsWritten,
+        };
+        if let comment_reflow::Reflow::Filled(filled) = filled {
+            for line in filled {
+                self.line();
+                self.out.push_str(&line);
+            }
+            return;
+        }
+        // The net caught a bug in the filler. The reprint still prints what
+        // was WRITTEN — so the output stays a faithful reprint and the token
+        // net has nothing to report — and the decline is what stops
+        // `vilan fmt` writing the file at all (N90's exit 2).
+        if filled == comment_reflow::Reflow::WordsChanged {
+            self.decline_with(DeclineReason::ReflowChangedTheWords, at);
+        }
+        for line in lines {
+            self.line();
+            self.out.push_str(line);
+        }
+    }
+
+    /// How many comments from the cursor form ONE paragraph: consecutive lines
+    /// before `pos`, separated by nothing but a single newline and whitespace,
+    /// and none of them an empty `//`.
+    ///
+    /// The three ways a paragraph ends are the three a reader sees: a blank
+    /// line, a blank `//` line (a paragraph break written INSIDE a comment
+    /// block, which is why it is a boundary here and never a line to re-fill),
+    /// and anything at all between the two lines that is not whitespace — code
+    /// the printer has yet to reach.
+    fn comment_paragraph_length(&self, pos: usize) -> usize {
+        let is_blank_marker = |text: &str| {
+            MARKER_SPELLINGS
+                .iter()
+                .any(|marker| text.trim_end() == *marker)
+        };
+        if is_blank_marker(self.comments[self.cursor].1) {
+            return 1;
+        }
+        let mut length = 1;
+        while let Some((span, text)) = self.comments.get(self.cursor + length) {
+            let range = span.into_range();
+            let previous_end = self.comments[self.cursor + length - 1].0.into_range().end;
+            let gap = self.source.get(previous_end..range.start).unwrap_or("x");
+            let contiguous = gap.chars().all(char::is_whitespace)
+                && gap.bytes().filter(|byte| *byte == b'\n').count() == 1;
+            if range.start >= pos || !contiguous || is_blank_marker(text) {
+                break;
+            }
+            length += 1;
+        }
+        length
     }
 
     /// Emits a trailing (same-line) comment if the next pending comment starts on
@@ -3679,7 +3833,7 @@ impl<'src> Printer<'src> {
         marker: usize,
         slot: usize,
         prev_end: usize,
-        comments: &[&'src str],
+        comments: &[Spanned<&'src str>],
     ) -> usize {
         let mut prev_end = prev_end;
         // No leading import at all: the marker is the file's first statement,
@@ -3689,10 +3843,12 @@ impl<'src> Printer<'src> {
             prev_end = self.flush_comments_before(until, prev_end);
         }
         self.blank_line();
-        for text in comments {
-            self.line();
-            self.out.push_str(text);
-        }
+        // E181's comments travel with the marker, and they are a paragraph
+        // like any other: the same reflow rules reach them, so a long module
+        // comment above `export *;` is not a hole in the knob.
+        let lines: Vec<&'src str> = comments.iter().map(|(text, _)| *text).collect();
+        let first = comments.first().map(|(_, span)| *span);
+        self.emit_comment_paragraph(&lines, first);
         self.line();
         self.out.push_str("export *;");
         prev_end
@@ -3752,7 +3908,7 @@ impl<'src> Printer<'src> {
         &mut self,
         items: &[Spanned<Node<'src>>],
         marker: usize,
-    ) -> Vec<&'src str> {
+    ) -> Vec<Spanned<&'src str>> {
         let marker_start = items[marker].1.into_range().start;
         let floor = match marker {
             0 => 0,
@@ -3789,7 +3945,13 @@ impl<'src> Printer<'src> {
             attached -= 1;
         }
         let taken = &candidates[attached..];
-        let texts: Vec<&'src str> = taken.iter().map(|index| self.comments[*index].1).collect();
+        let texts: Vec<Spanned<&'src str>> = taken
+            .iter()
+            .map(|index| {
+                let (span, text) = self.comments[*index];
+                (text, span)
+            })
+            .collect();
         for index in taken.iter().rev() {
             self.comments.remove(*index);
         }
@@ -15000,8 +15162,8 @@ mod declines {
     //! [`reprint`] is the honest half, and these pin what it says.
 
     use super::{
-        Decline, DeclineReason, DeclinedAt, Printer, Split, decline, extract_comments,
-        first_line_at, format, line_of, reprint,
+        Decline, DeclineReason, DeclinedAt, FormatOptions, Printer, decline, first_line_at, format,
+        line_of, reprint,
     };
     use crate::node::Node;
 
@@ -15041,23 +15203,19 @@ mod declines {
         // construct is missing — it is that the printer RECORDS one, with the
         // span a tool needs to name it. A bare `bailed: bool` could not.
         let source = "fun main() {\n\tlet x = 1;\n}\n";
-        let mut printer = Printer {
-            out: String::new(),
-            indent: 0,
-            comments: extract_comments(source),
-            cursor: 0,
-            source,
-            declined: None,
-            split: Split::Off,
-            probing: false,
-            atomic_elements: false,
-        };
+        let mut printer = Printer::new(source, FormatOptions::default());
         // The span of `let x = 1;` on line 2, so the recorded construct is one
         // a reader can go and look at.
         let start = source.find("let x").expect("the fixture's second line");
         let span = (start..start + "let x = 1;".len()).into();
         printer.print_expr(&(Node::Error, span));
-        assert_eq!(printer.declined, Some(DeclinedAt { span: Some(span) }));
+        assert_eq!(
+            printer.declined,
+            Some(DeclinedAt {
+                reason: DeclineReason::NoRule,
+                span: Some(span)
+            })
+        );
 
         let declined = decline(source, DeclineReason::NoRule, Some(span));
         assert_eq!(
@@ -15080,17 +15238,7 @@ mod declines {
         // flag went with it. It still does, now that the flag carries a span:
         // a probe that met a gap must not make the whole file decline.
         let source = "fun main() {\n\tlet x = 1;\n}\n";
-        let mut printer = Printer {
-            out: String::new(),
-            indent: 0,
-            comments: extract_comments(source),
-            cursor: 0,
-            source,
-            declined: None,
-            split: Split::Off,
-            probing: false,
-            atomic_elements: false,
-        };
+        let mut printer = Printer::new(source, FormatOptions::default());
         let start = source.find("let x").expect("the fixture's second line");
         let span = (start..start + "let x = 1;".len()).into();
         assert!(!printer.expr_spans_lines(&(Node::Error, span)));
@@ -15310,5 +15458,273 @@ mod divergence_location {
         let span = diverging_span(&written, &canonical_source, &canonical_reprint)
             .expect("a divergence has a span");
         assert_eq!(&source[span.into_range()], "2");
+    }
+}
+
+#[cfg(test)]
+mod comment_wrapping {
+    //! E205 end to end: `[fmt] wrap_comments` through [`reprint_with`].
+    //!
+    //! The unit rules live beside the filler in
+    //! [`super::comment_reflow`]; what these pin is the printer's half — that
+    //! the knob reaches the output, that the paragraph GROUPING is the one a
+    //! reader sees, and above all that every kind of comment on the
+    //! never-reflow list comes out BYTE-IDENTICAL with the knob on.
+    //!
+    //! Every fixture asserts its own canonicality first (`reprint` answers the
+    //! source unchanged), so "byte-identical under the knob" cannot be
+    //! satisfied by a fixture that was going to be rewritten anyway.
+
+    use super::{Decline, DeclineReason, FormatOptions, decline, reprint, reprint_with};
+
+    /// The knob on.
+    const ON: FormatOptions = FormatOptions {
+        wrap_comments: true,
+    };
+
+    /// Formats `source` with the knob on, asserting first that the fixture is
+    /// already canonical — so a byte-identity claim is about the REFLOW and
+    /// not about the rest of the printer.
+    fn wrapped(source: &str) -> String {
+        assert_eq!(
+            reprint(source).as_deref(),
+            Ok(source),
+            "the fixture must be canonical already"
+        );
+        reprint_with(source, ON).expect("the fixture reprints")
+    }
+
+    /// The whole never-reflow list, each entry a canonical file whose comment
+    /// must survive the knob byte for byte.
+    fn survives_byte_identical(source: &str) {
+        assert_eq!(wrapped(source), source);
+        // And idempotent: a second pass over the answer changes nothing.
+        assert_eq!(reprint_with(source, ON).as_deref(), Ok(source));
+    }
+
+    #[test]
+    fn with_the_key_off_the_formatter_is_byte_for_byte_what_it_was() {
+        // The first thing to pin, and the promise the default rests on: with
+        // `wrap_comments` unset, a comment far past the budget is left exactly
+        // where its author left it, and the answer is `reprint`'s own.
+        let source = "// this comment runs a very long way past the hundred-column budget the printer lays code out to, and it stays exactly as written\nfun main() {}\n";
+        assert_eq!(reprint(source).as_deref(), Ok(source));
+        assert_eq!(
+            reprint_with(source, FormatOptions::default()),
+            reprint(source)
+        );
+    }
+
+    #[test]
+    fn a_prose_paragraph_is_filled_and_the_fill_is_idempotent() {
+        let source = "// the formatter has laid code out to a width since the day it existed and left every comment exactly as typed\n// which is\n// the asymmetry this closes\nfun main() {}\n";
+        let once = wrapped(source);
+        assert_eq!(
+            once,
+            "// the formatter has laid code out to a width since the day it existed and left every comment\n// exactly as typed which is the asymmetry this closes\nfun main() {}\n"
+        );
+        assert_eq!(
+            reprint_with(&once, ON).as_deref(),
+            Ok(once.as_str()),
+            "the fill must be idempotent"
+        );
+    }
+
+    #[test]
+    fn a_doc_comment_paragraph_is_filled_at_its_own_marker() {
+        let source = "/// what this function does, said at enough length that it runs past the budget the printer lays code out to, and then some\nfun main() {}\n";
+        let filled = wrapped(source);
+        assert!(
+            filled
+                .lines()
+                .filter(|line| line.starts_with("///"))
+                .count()
+                == 2,
+            "{filled}"
+        );
+        assert!(filled.lines().all(|line| line.chars().count() <= 100));
+    }
+
+    #[test]
+    fn a_comment_inside_a_block_fills_to_the_narrower_budget() {
+        // One tab of indentation is four columns off the budget, and the fill
+        // has to measure the line it is actually printing.
+        let source = "fun main() {\n\t// a comment inside a block has four fewer columns to work with than one at the top level, and the fill has to know that\n\tlet x = 1;\n}\n";
+        let filled = wrapped(source);
+        assert!(
+            filled.lines().all(|line| line.chars().count()
+                + 3 * line.chars().take_while(|c| *c == '\t').count()
+                <= 100),
+            "{filled}"
+        );
+    }
+
+    #[test]
+    fn a_fence_survives_byte_identical() {
+        survives_byte_identical(
+            "// an example, and the fence is verbatim by definition:\n// ```\n// let x = 1;\n// ```\nfun main() {}\n",
+        );
+    }
+
+    #[test]
+    fn a_list_survives_byte_identical() {
+        // Each item is a line; joining two of them would make one item.
+        survives_byte_identical(
+            "// the three reasons, and not one of them may be joined to the next:\n// - the first, which is long enough on its own to tempt a filler into it\n// - the second\n// - the third\nfun main() {}\n",
+        );
+    }
+
+    #[test]
+    fn an_ordered_list_and_a_hanging_indent_survive_byte_identical() {
+        survives_byte_identical(
+            "// 1. the first item, written long enough that a filler would want to pull the\n//    continuation up into it\n// 2. the second\nfun main() {}\n",
+        );
+    }
+
+    #[test]
+    fn a_table_survives_byte_identical() {
+        survives_byte_identical(
+            "// | name | what it does |\n// | ---- | ------------ |\n// | fmt | lays the code out to a width, and now the comments too when asked |\nfun main() {}\n",
+        );
+    }
+
+    #[test]
+    fn a_heading_survives_byte_identical() {
+        survives_byte_identical(
+            "// # The section this file is about\n// and the prose under it, which is long enough that a filler would pull the heading into it given the chance\nfun main() {}\n",
+        );
+    }
+
+    #[test]
+    fn a_block_quote_survives_byte_identical() {
+        survives_byte_identical(
+            "// > the owner's words, quoted, and the line breaks in a quotation belong to whoever wrote it\n// > and not to this formatter\nfun main() {}\n",
+        );
+    }
+
+    #[test]
+    fn an_aligned_column_run_survives_byte_identical() {
+        // Two or more interior spaces is the rule that catches aligned
+        // columns, hand-laid tables and ASCII drawings in one.
+        survives_byte_identical(
+            "// node     the default host, and the one every example is written against\n// deno     the second\n// browser  the third\nfun main() {}\n",
+        );
+    }
+
+    #[test]
+    fn a_toolchain_directive_survives_byte_identical() {
+        // A directive is READ by a tool, so its line structure is a contract.
+        survives_byte_identical(
+            "// witness: the emitted bytes that carry this program's claim, at enough length to be past the budget\nfun main() {}\n",
+        );
+        survives_byte_identical(
+            "// witness-absent: the bytes this program's claim says are not in the golden at all, which is a long sentence\nfun main() {}\n",
+        );
+        survives_byte_identical(
+            "// GENERATED(mime-table): from crates/vilan-core/tests/mime-table.tsv, itself derived from the mime-db registry\nfun main() {}\n",
+        );
+    }
+
+    #[test]
+    fn commented_out_code_survives_byte_identical() {
+        survives_byte_identical(
+            "// let total = rows.iter().filter(|row| row.enabled).map(|row| row.weight).sum();\n// print(total);\nfun main() {}\n",
+        );
+        survives_byte_identical("// match value {\n// \tSome(let x) => x,\n// }\nfun main() {}\n");
+    }
+
+    #[test]
+    fn a_trailing_comment_is_never_reflowed() {
+        // A different emission path entirely — a trailing comment rides on the
+        // statement's own line — and the knob must not reach it.
+        survives_byte_identical(
+            "fun main() {\n\tlet x = 1; // what this binding is for, said at enough length to run well past the budget the printer keeps\n}\n",
+        );
+    }
+
+    #[test]
+    fn a_license_header_survives_byte_identical() {
+        survives_byte_identical(
+            "// Copyright (c) 2026 the vilan authors. All rights reserved, and a legal notice's line breaks are the licence's\n// SPDX-License-Identifier: MIT OR Apache-2.0\nfun main() {}\n",
+        );
+    }
+
+    #[test]
+    fn a_blank_comment_line_breaks_the_paragraph_and_survives() {
+        // A bare `//` is a paragraph break written INSIDE a comment block: it
+        // is never a line to re-fill, and the halves fill independently.
+        let source = "// the first paragraph, which is long enough that the filler will take it and re-lay it across two lines of its own\n//\n// the second\nfun main() {}\n";
+        let filled = wrapped(source);
+        assert!(filled.contains("\n//\n"), "the break survives: {filled}");
+        assert!(filled.contains("// the second\n"), "{filled}");
+        assert_eq!(
+            reprint_with(&filled, ON).as_deref(),
+            Ok(filled.as_str()),
+            "idempotent"
+        );
+    }
+
+    #[test]
+    fn a_long_url_and_a_long_code_span_are_never_broken() {
+        let source = "// the reference is https://example.com/a/path/long/enough/that/it/alone/exceeds/the/whole/budget/on/its/own and the rest follows\nfun main() {}\n";
+        let filled = wrapped(source);
+        assert!(
+            filled.contains(
+                "https://example.com/a/path/long/enough/that/it/alone/exceeds/the/whole/budget/on/its/own"
+            ),
+            "{filled}"
+        );
+        let span = "// the name is `a code span written long enough that the whole of it will not fit inside one line's budget` and then some more words\nfun main() {}\n";
+        let filled = wrapped(span);
+        assert!(
+            filled.contains(
+                "`a code span written long enough that the whole of it will not fit inside one line's budget`"
+            ),
+            "{filled}"
+        );
+    }
+
+    #[test]
+    fn the_comments_riding_with_an_export_marker_are_filled_too() {
+        // E181 takes these out of the comment stream so they travel to the
+        // marker's slot; they are a paragraph like any other and the knob must
+        // not have a hole there.
+        let source = "// the module comment for this file, written long enough that the filler has something to do with it here\nexport *;\n\nfun main() {}\n";
+        let filled = wrapped(source);
+        assert!(
+            filled.lines().filter(|line| line.starts_with("//")).count() == 2,
+            "{filled}"
+        );
+        assert_eq!(
+            reprint_with(&filled, ON).as_deref(),
+            Ok(filled.as_str()),
+            "idempotent"
+        );
+    }
+
+    #[test]
+    fn the_words_in_order_net_declines_by_name() {
+        // The net's own decline, shaped as N90's pins shape one: the filler
+        // cannot be made to fail from a source (the words-in-order property
+        // holds by construction — `comment_reflow::safety_net` plants a broken
+        // filler to prove the net catches one), so what is pinned here is what
+        // a tool is told when it does.
+        let source = "// the comment this would have rewritten\nfun main() {}\n";
+        let span = (0..source.find('\n').expect("the first line")).into();
+        let declined = decline(source, DeclineReason::ReflowChangedTheWords, Some(span));
+        assert_eq!(
+            declined,
+            Decline {
+                reason: DeclineReason::ReflowChangedTheWords,
+                construct: "// the comment this would have rewritten".to_string(),
+                line: Some(1),
+            }
+        );
+        assert_eq!(
+            declined.sentence(),
+            "re-filling this comment to the line width would have changed its WORDS, \
+             so nothing was rewritten (`[fmt] wrap_comments`, and the formatter's own \
+             safety net): `// the comment this would have rewritten`"
+        );
     }
 }
