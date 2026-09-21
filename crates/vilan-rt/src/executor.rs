@@ -1059,9 +1059,14 @@ fn poll_task(id: TaskId) {
     };
     let previous = RUNTIME.with(|runtime| runtime.current.replace(Some(id)));
     let mut context = Context::from_waker(Waker::noop());
+    // F25: a panic caught HERE is a task's failure latching, not the program
+    // failing, so the process hook stays quiet for it — `report_unobserved`
+    // and the raise out of `block_on` are what say something.
+    crate::enter_caught();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         driver.as_mut().poll(&mut context)
     }));
+    crate::leave_caught();
     RUNTIME.with(|runtime| runtime.current.set(previous));
     match outcome {
         Ok(Poll::Pending) => {
@@ -1385,6 +1390,11 @@ pub fn run_pending() {
 /// that point rather than running the timers that were still outstanding.
 pub fn block_on<T: Clone + 'static>(body: impl Future<Output = T> + 'static) -> T {
     let root = spawn(body, "top level");
+    // The root is OBSERVED by definition: the loop below reads its failure and
+    // raises it. Without this it also took the unobserved-report path, so a
+    // failing `async fun main` printed `unhandled task error (spawned in top
+    // level)` and then the message — two lines where node prints one (F25).
+    root.node.observed.set(true);
     loop {
         drain_microtasks();
         report_unobserved_failures();

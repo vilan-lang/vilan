@@ -491,6 +491,48 @@ impl<'a, 'src> Emitter<'a, 'src> {
         })
     }
 
+    /// F25: `print` of a HOST HANDLE or of a value holding a function is
+    /// refused where it is written, not where it runs.
+    ///
+    /// What node prints for either is its own object inspection —
+    /// `Promise { <pending> }`, `[Function (anonymous)]`, `[Function: name]`
+    /// depending on how the function was WRITTEN — and none of it is anything
+    /// the language defines. Order 38 answered it with a runtime panic carrying
+    /// the reason, which is honest and one release too late: the program that
+    /// does it cannot work, so it is a compile-time refusal (the standing
+    /// preference, F25's own recommendation).
+    ///
+    /// The test is the RENDERED type, which is where the two facts already
+    /// live: every closure type is `Rc<dyn Fn(..) -> ..>` (F16) and every host
+    /// handle is a `vilan_rt::executor::` or `vilan_rt::http::` path. A value
+    /// that holds one NESTED — a `List` of structs each holding a closure —
+    /// renders as neither, and the runtime panic in the generated `impl Js`
+    /// stays as the backstop for it rather than being replaced by a walk that
+    /// would have to chase every type this emitter can mint.
+    fn refuse_unprintable(&mut self, argument_ids: &[Id], span: Span) -> Result<(), Error> {
+        let Some(&argument) = argument_ids.first() else {
+            return Ok(());
+        };
+        let Some(type_id) = self.type_of(argument) else {
+            return Ok(());
+        };
+        // A type this emitter cannot render is refused by the render itself,
+        // where the diagnosis is better; nothing to add here.
+        let Ok(rendered) = self.rust_type(type_id, span) else {
+            return Ok(());
+        };
+        if is_closure_type(&rendered) {
+            return Err(unsupported("`print` of a value holding a function", span));
+        }
+        if let Some(handle) = host_handle_name(&rendered) {
+            return Err(unsupported(
+                &format!("`print` of the host handle `{handle}`"),
+                span,
+            ));
+        }
+        Ok(())
+    }
+
     /// A closure's body, with the destructures a TUPLE PARAMETER owes in front
     /// of it (F18).
     ///
@@ -2035,6 +2077,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
         walked?;
 
         let mut out = String::new();
+        // F25: whether `main`'s body was opened inside a `main_guard` closure
+        // that has to be closed after it.
+        let mut closes_a_guard = false;
         if is_main {
             if is_async {
                 // `async fun main` — `main` itself cannot be async, so the real
@@ -2042,15 +2087,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // executor. `block_on` drives the loop until both the microtask
                 // queue and the deadline list are empty, which is where node
                 // exits too.
+                // F25: `main_guard` is what makes an uncaught failure answer
+                // node's shape — the message alone on stderr, exit code 1 —
+                // rather than Rust's panic banner and 101.
                 let _ = writeln!(out, "fn main() {{");
                 let _ = writeln!(
                     out,
-                    "    vilan_rt::executor::block_on({ASYNC_MAIN_BODY}());"
+                    "    vilan_rt::main_guard(|| vilan_rt::executor::block_on({ASYNC_MAIN_BODY}()));"
                 );
                 let _ = writeln!(out, "}}");
                 let _ = writeln!(out, "async fn {ASYNC_MAIN_BODY}() {{");
             } else {
                 let _ = writeln!(out, "fn main() {{");
+                let _ = writeln!(out, "    vilan_rt::main_guard(|| {{");
+                closes_a_guard = true;
             }
         } else {
             let _ = writeln!(
@@ -2066,8 +2116,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // `std::reactive`'s late-write path does — must still let it run. The
         // async `main` above reaches the same loop through `block_on`, and a
         // program that queued nothing pays one empty loop turn.
+        //
+        // It runs INSIDE F25's `main_guard`, and that is the point of the
+        // order: a panic raised by a microtask this turn is the program
+        // failing, and it owes node's exit code and node's stderr like any
+        // other.
         if is_main && !is_async {
             let _ = writeln!(out, "    vilan_rt::executor::run_pending();");
+        }
+        if closes_a_guard {
+            let _ = writeln!(out, "    }});");
         }
         let _ = writeln!(out, "}}");
         Ok(out)
@@ -5003,6 +5061,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
 
         if Some(target) == self.program.print_fn_id {
+            self.refuse_unprintable(&function_call.argument_ids, span)?;
             let value = self.place_argument(&function_call.argument_ids, 0, depth)?;
             return Ok(format!("vilan_rt::print(&({value}))"));
         }
@@ -5809,6 +5868,30 @@ fn mentions_a_closure(rendered: &str) -> bool {
 /// byte-identical.
 fn compares_by_cell_identity(rendered: &str) -> bool {
     rendered.starts_with("vilan_rt::Shared<") || rendered.starts_with("vilan_rt::Weak<")
+}
+
+/// The host handle a rendered type IS, if it is one — F25's other unprintable.
+///
+/// A host handle has no rendering the language defines (what node prints is its
+/// own object inspection), and every one of them is a path into this runtime's
+/// two host modules, so the rendered type is where the fact already lives.
+fn host_handle_name(rendered: &str) -> Option<&'static str> {
+    const HANDLES: &[(&str, &str)] = &[
+        ("vilan_rt::executor::Task", "Task"),
+        ("vilan_rt::executor::Nursery", "Nursery"),
+        ("vilan_rt::executor::CancelSignal", "CancelSignal"),
+        ("vilan_rt::executor::TimerHandle", "TimerHandle"),
+        ("vilan_rt::http::Server", "NodeServer"),
+        ("vilan_rt::http::Address", "NodeAddress"),
+        ("vilan_rt::http::Request", "NodeRequest"),
+        ("vilan_rt::http::Response", "NodeResponse"),
+        ("vilan_rt::http::Socket", "NodeSocket"),
+        ("vilan_rt::http::Bytes", "Bytes"),
+    ];
+    HANDLES
+        .iter()
+        .find(|(path, _)| rendered.starts_with(path))
+        .map(|(_, name)| *name)
 }
 
 fn is_integer_type(rendered: &str) -> bool {

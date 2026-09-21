@@ -837,6 +837,180 @@ const HTTP_PROBE: &str = concat!(
     "}\n",
 );
 
+/// F25: a program that FAILS answers the same exit code on both backends, and
+/// the native binary does not print Rust's panic banner.
+///
+/// Node prints the error and exits 1; Rust prints
+/// `thread 'main' panicked at src/main.rs:N:M:`, a `note: run with
+/// RUST_BACKTRACE=1` line, and exits 101. stdout is what the differential
+/// compares and it was already identical, so this is about what a SHELL sees —
+/// and a shell reading 101 where the JS build gave it 1 is one program
+/// answering two different things.
+///
+/// Both the synchronous and the `async fun main` paths, because they are two
+/// different emitted shapes: one wraps the body, the other wraps the
+/// `block_on`.
+#[test]
+fn a_failing_program_exits_one_on_both_backends_without_rusts_banner() {
+    let staged = stage();
+    for (file, source, expected_stdout) in [
+        ("native_probe_panic.vl", PANIC_PROBE, "before the panic\n"),
+        (
+            "native_probe_panic_async.vl",
+            ASYNC_PANIC_PROBE,
+            "before the async panic\n",
+        ),
+    ] {
+        std::fs::write(staged.join(file), source).expect("write the probe program");
+        let native = vilan(&staged)
+            .args(["run", "--backend", "rust", file])
+            .output()
+            .expect("run the failing probe natively");
+        let javascript = vilan(&staged)
+            .args(["run", file])
+            .output()
+            .expect("run the failing probe on the JS backend");
+        assert_eq!(
+            native.status.code(),
+            Some(1),
+            "{file}: the native binary must exit 1, not Rust's 101:\n{}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        assert_eq!(
+            javascript.status.code(),
+            Some(1),
+            "{file}: the JS leg is the oracle and it exits 1"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&native.stdout),
+            String::from_utf8_lossy(&javascript.stdout),
+            "{file}: stdout up to the failure must still be identical"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&native.stdout),
+            expected_stdout,
+            "{file}: the probe must get as far as its own output, or this pin is \
+             asserting nothing about the failure"
+        );
+        let stderr = String::from_utf8_lossy(&native.stderr);
+        assert!(
+            !stderr.contains("panicked at"),
+            "{file}: Rust's panic banner must not reach stderr: {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("RUST_BACKTRACE"),
+            "{file}: Rust's backtrace note must not reach stderr: {stderr:?}"
+        );
+        // ONE line about the failure, and it is the program's own message —
+        // node prints one too. Two was the shape before the executor stopped
+        // reporting the root task as an unobserved failure.
+        let said: Vec<&str> = stderr.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(
+            said.len(),
+            1,
+            "{file}: one line about one failure: {said:?}"
+        );
+        assert!(
+            said[0].contains("boom"),
+            "{file}: and it is the program's own message: {said:?}"
+        );
+    }
+}
+
+const PANIC_PROBE: &str = concat!(
+    "import std::io::{ print, panic };\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(\"before the panic\");\n",
+    "\tpanic(\"boom\");\n",
+    "}\n",
+);
+
+const ASYNC_PANIC_PROBE: &str = concat!(
+    "import std::io::{ print, panic };\n",
+    "import std::time::sleep;\n",
+    "\n",
+    "async fun main() {\n",
+    "\tprint(\"before the async panic\");\n",
+    "\tsleep(1);\n",
+    "\tpanic(\"boom\");\n",
+    "}\n",
+);
+
+/// F25: printing a host handle or a value holding a function is refused where
+/// it is WRITTEN.
+///
+/// Order 38 answered both with a runtime panic carrying the reason, which is
+/// honest and one release too late — what node prints there is its own object
+/// inspection (`Promise { <pending> }`, `[Function (anonymous)]`), so the
+/// program cannot work and nothing is gained by letting it build.
+#[test]
+fn printing_a_host_handle_or_a_function_is_refused_at_compile_time() {
+    let staged = stage();
+    for (file, source, needle) in [
+        (
+            "native_probe_print_task.vl",
+            PRINT_HANDLE_PROBE,
+            "`print` of the host handle `Task`",
+        ),
+        (
+            "native_probe_print_fn.vl",
+            PRINT_FUNCTION_PROBE,
+            "`print` of a value holding a function",
+        ),
+    ] {
+        std::fs::write(staged.join(file), source).expect("write the probe program");
+        let output = vilan(&staged)
+            .args(["build", "--backend", "rust", "--stdout", file])
+            .output()
+            .expect("build the probe");
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{file} must be refused rather than built"
+        );
+        assert!(
+            message.contains(needle),
+            "{file} must be refused by name (`{needle}`); it said:\n{message}"
+        );
+        // Non-vacuous: the JS backend BUILDS the same program, so the refusal
+        // is the native backend's answer and not a defect in the probe.
+        let javascript = vilan(&staged)
+            .args(["build", file])
+            .output()
+            .expect("build the probe on the JS backend");
+        assert!(
+            javascript.status.success(),
+            "{file} must be a program the JS backend accepts:\n{}",
+            String::from_utf8_lossy(&javascript.stderr)
+        );
+    }
+}
+
+const PRINT_HANDLE_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::time::sleep;\n",
+    "\n",
+    "async fun work(): i32 {\n",
+    "\tsleep(1);\n",
+    "\t7\n",
+    "}\n",
+    "\n",
+    "async fun main() {\n",
+    "\tlet task = async work();\n",
+    "\tprint(task);\n",
+    "}\n",
+);
+
+const PRINT_FUNCTION_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet f = |x: i32| x + 1;\n",
+    "\tprint(f);\n",
+    "}\n",
+);
+
 /// S1b's monomorphisation, held to the shape rather than to one program: a
 /// generic function, a generic struct and a generic enum each emit ONE Rust
 /// item per instantiation, and two instantiations of one declaration are two

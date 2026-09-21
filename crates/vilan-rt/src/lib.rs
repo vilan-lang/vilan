@@ -280,6 +280,74 @@ pub fn panic_with(message: &str) -> ! {
     std::panic::panic_any(message.to_string())
 }
 
+/// The whole of an emitted program's `main` (tracker F25).
+///
+/// Node and Rust disagree about what an uncaught error LOOKS like and what it
+/// exits with. Node prints the error and exits **1**; Rust prints
+/// `thread 'main' panicked at src/main.rs:12:5:`, then the message, then a
+/// `note: run with RUST_BACKTRACE=1` line, and exits **101**. A vilan program's
+/// failure is the language's, not the backend's, so the native binary answers
+/// node's shape: the message on stderr, alone, and exit code 1.
+///
+/// stdout is untouched either way — which is what the differential compares —
+/// so this is about what a SHELL sees, and a shell reading 101 where the JS
+/// build gave it 1 is the same program answering two different things.
+///
+/// The hook is installed for the body's duration rather than for the process,
+/// because [`guarded`] installs its own around a `guarded` region and a
+/// process-wide hook here would fight it.
+pub fn main_guard(body: impl FnOnce()) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|info| {
+        // A panic somebody is going to CATCH is not a failure yet: the
+        // executor catches one at every poll boundary (it is how a task's
+        // failure latches) and `guarded` catches one by definition. Printing
+        // there would put two or three lines on stderr for one failure where
+        // node prints one.
+        if is_caught() {
+            return;
+        }
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("the program failed");
+        eprintln!("{message}");
+    }));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+    std::panic::set_hook(previous);
+    if outcome.is_err() {
+        // The hook above has already said what happened. `exit` rather than a
+        // re-raise, because a re-raise is how 101 comes back.
+        std::process::exit(1);
+    }
+}
+
+// How many CATCHING regions the current thread is inside (F25). A counter
+// rather than a hook swap per region, because the executor enters one at every
+// task poll and `set_hook` allocates.
+thread_local! {
+    static CAUGHT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether a panic raised right now is going to be caught — read by
+/// [`main_guard`]'s hook.
+pub fn is_caught() -> bool {
+    CAUGHT_DEPTH.with(|depth| depth.get() > 0)
+}
+
+/// Marks the current thread as inside a catching region; [`leave_caught`] ends
+/// it. Public because [`executor`] is a sibling module, not because a program
+/// ever calls it.
+pub fn enter_caught() {
+    CAUGHT_DEPTH.with(|depth| depth.set(depth.get() + 1));
+}
+
+pub fn leave_caught() {
+    CAUGHT_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+}
+
 /// `__guarded` — run `body`, answering `Err(message)` if it panicked.
 ///
 /// `native-apps.md` §2.3 (5): the JS helper is a `try`/`catch` returning
