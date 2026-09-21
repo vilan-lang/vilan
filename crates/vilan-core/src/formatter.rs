@@ -72,10 +72,20 @@ pub fn extract_comments(source: &str) -> Vec<(Span, &str)> {
 /// The lexer's token stream with spans stripped — the formatter's notion of "the
 /// same code", used to check a reprint didn't change anything but trivia.
 fn code_tokens(source: &str) -> Option<Vec<Token<'_>>> {
+    Some(
+        code_tokens_spanned(source)?
+            .into_iter()
+            .map(|(token, _)| token)
+            .collect(),
+    )
+}
+
+/// [`code_tokens`] with the spans kept — the source side of the net, where a
+/// decline has to say WHERE (E210). The reprint side never needs them: its
+/// spans point into a text the reader cannot see.
+fn code_tokens_spanned(source: &str) -> Option<Vec<Spanned<Token<'_>>>> {
     let (tokens, lex_errors) = crate::lexing::tokenize(source);
-    lex_errors
-        .is_empty()
-        .then(|| tokens.into_iter().map(|(token, _)| token).collect())
+    lex_errors.is_empty().then_some(tokens)
 }
 
 /// The formatter's token-level canonicalization, used to check a reprint changed
@@ -2950,8 +2960,8 @@ impl Decline {
                 self.construct
             ),
             DeclineReason::WouldChangeTheCode => format!(
-                "reprinting it would have changed the code, so the reprint was \
-                 thrown away (the formatter's own safety net): `{}`",
+                "reprinting it would have changed the code at this line, so the \
+                 reprint was thrown away (the formatter's own safety net): `{}`",
                 self.construct
             ),
             DeclineReason::ReprintDoesNotParse => format!(
@@ -2991,7 +3001,7 @@ struct DeclinedAt {
 pub fn reprint(original: &str) -> Result<String, Decline> {
     let normalized = crate::util::normalize_newlines(crate::util::strip_bom(original));
     let source: &str = &normalized;
-    let Some(original_tokens) = code_tokens(source) else {
+    let Some(original_tokens) = code_tokens_spanned(source) else {
         return Err(decline(source, DeclineReason::DoesNotLex, None));
     };
     let Some(items) = parse(source) else {
@@ -3015,7 +3025,7 @@ pub fn reprint(original: &str) -> Result<String, Decline> {
     if let Some(declined) = printer.declined {
         return Err(decline(source, DeclineReason::NoRule, declined.span));
     }
-    verify_reprint(source, original_tokens, &items, &printer.out)?;
+    verify_reprint(source, &original_tokens, &printer.out)?;
     Ok(printer.out)
 }
 
@@ -3041,19 +3051,24 @@ pub fn reprint(original: &str) -> Result<String, Decline> {
 /// and it is paid only on (a)'s success path.
 fn verify_reprint(
     source: &str,
-    original_tokens: Vec<Token<'_>>,
-    items: &NodeList<'_>,
+    original_tokens: &[Spanned<Token<'_>>],
     reprinted: &str,
 ) -> Result<(), Decline> {
-    let canonical_source = normalize(original_tokens);
+    let canonical_source = normalize(
+        original_tokens
+            .iter()
+            .map(|(token, _)| token.clone())
+            .collect(),
+    );
     match code_tokens(reprinted).map(normalize) {
         Some(canonical_reprint) if canonical_reprint == canonical_source => {}
-        Some(_) => {
-            // The safety net has no span to offer — it compares two whole
-            // token streams — so it names the file's first item, which is as
-            // close as the net can get to "where to start looking".
-            let first = items.first().map(|(_, span)| *span);
-            return Err(decline(source, DeclineReason::WouldChangeTheCode, first));
+        Some(canonical_reprint) => {
+            let at = diverging_span(original_tokens, &canonical_source, &canonical_reprint);
+            return Err(decline_at_line(
+                source,
+                DeclineReason::WouldChangeTheCode,
+                at,
+            ));
         }
         // A reprint that does not even lex cannot be compared, and it is
         // exactly (b)'s class — so it takes (b)'s answer rather than being
@@ -3064,6 +3079,99 @@ fn verify_reprint(
         return Err(reprint_is_not_a_vilan_file(reprinted));
     }
     Ok(())
+}
+
+/// The position at which two streams stop agreeing — the length of their
+/// common prefix, which for streams of different length is where the shorter
+/// one ran out. Called only after the comparison FAILED, so the answer is
+/// always a real divergence.
+fn first_divergence(source: &[Token<'_>], reprint: &[Token<'_>]) -> usize {
+    source
+        .iter()
+        .zip(reprint)
+        .position(|(written, printed)| written != printed)
+        .unwrap_or_else(|| source.len().min(reprint.len()))
+}
+
+/// Where in the SOURCE the reprint stopped agreeing with it — E210's answer,
+/// in place of the file's first item.
+///
+/// The bisect runs over the two NORMALIZED streams, because those are what the
+/// net compares: bisecting the raw streams would report the first of the six
+/// canonical REORDERINGS the net deliberately accepts, which for a typical
+/// file is its import run — and "the file's first import" is exactly the
+/// wrong-place answer E210 exists to remove (it sent N108's investigation
+/// thirty lines off, into the wrong grammar).
+///
+/// Mapping a normalized position back to a written one needs the
+/// canonicalization's own alignment, and the alignment is read off rather than
+/// tracked: [`normalize`] both permutes and DELETES, so a normalized index is
+/// a written index only where the two streams still agree position for
+/// position. Both ends are tried, and each is exact where it applies.
+///
+/// * The common PREFIX covers every file whose canonicalization happens after
+///   the divergence — which is every already-canonical file, so the whole
+///   steady state of `vilan fmt --check`, and N108's repro among them.
+/// * The common SUFFIX covers the opposite and more interesting case: a file
+///   whose imports (at the top) reorder and whose printer bug is further down.
+///   Counting from the end walks past the canonicalization entirely.
+/// * Where neither reaches — a divergence *inside* a canonicalized region —
+///   the answer is the first token the canonicalization itself moved. That is
+///   honest ("the reprint and the file part company at or after here") and it
+///   is still a token rather than an item, so it never degrades to naming the
+///   file's first declaration.
+///
+/// A reprint that runs LONGER than the source has no diverging source token at
+/// all; it is named at the file's last one, which is where the extra output
+/// begins.
+fn diverging_span(
+    original: &[Spanned<Token<'_>>],
+    canonical_source: &[Token<'_>],
+    canonical_reprint: &[Token<'_>],
+) -> Option<Span> {
+    let at = first_divergence(canonical_source, canonical_reprint);
+    let span_of = |index: usize| original.get(index).map(|(_, span)| *span);
+    // How far the canonicalized stream is still the file's own stream, from
+    // each end. `position` over the zip stops at the shorter of the two, which
+    // is the bound either way.
+    let aligned_prefix = canonical_source
+        .iter()
+        .zip(original)
+        .position(|(canonical, (written, _))| canonical != written)
+        .unwrap_or_else(|| canonical_source.len().min(original.len()));
+    if at < aligned_prefix {
+        return span_of(at);
+    }
+    let aligned_suffix = canonical_source
+        .iter()
+        .rev()
+        .zip(original.iter().rev())
+        .position(|(canonical, (written, _))| canonical != written)
+        .unwrap_or_else(|| canonical_source.len().min(original.len()));
+    let from_the_end = canonical_source.len() - at.min(canonical_source.len());
+    if from_the_end > 0
+        && from_the_end <= aligned_suffix
+        && let Some(index) = original.len().checked_sub(from_the_end)
+    {
+        return span_of(index);
+    }
+    span_of(aligned_prefix).or_else(|| original.last().map(|(_, span)| *span))
+}
+
+/// The [`Decline`] for a net anchored at a TOKEN rather than at a node: the
+/// reason, the SOURCE LINE that token sits on, and that line's 1-based number.
+///
+/// The line rather than the token, because a token's own text names nothing —
+/// N108's lost terminator is a bare `;`, where the line it sits on is `};`,
+/// which is the construct to go and look at.
+fn decline_at_line(source: &str, reason: DeclineReason, span: Option<Span>) -> Decline {
+    Decline {
+        reason,
+        construct: span
+            .map(|span| line_text_at(source, span))
+            .unwrap_or_default(),
+        line: span.map(|span| line_of(source, span)),
+    }
 }
 
 /// The [`DeclineReason::ReprintDoesNotParse`] decline, naming the line of the
@@ -15017,20 +15125,17 @@ mod reprint_safety_net {
     //! cannot see and hold the decline it now produces.
 
     use super::{
-        Decline, DeclineReason, Token, code_tokens, normalize, parse, reprint, verify_reprint,
+        Decline, DeclineReason, code_tokens, code_tokens_spanned, normalize, reprint,
+        verify_reprint,
     };
 
     /// The planted printer bug: what the printer WOULD have written, handed to
     /// the safety net in place of its own output. The bug is planted rather
     /// than found because the printer has no such gap today — and a pin that
     /// waits for one to appear pins nothing.
-    fn net(source: &str, planted: &str) -> Result<(), Decline> {
-        let tokens: Vec<Token<'_>> = code_tokens(source)
-            .expect("the fixture lexes")
-            .into_iter()
-            .collect();
-        let items = parse(source).expect("the fixture parses");
-        verify_reprint(source, tokens, &items, planted)
+    pub(super) fn net(source: &str, planted: &str) -> Result<(), Decline> {
+        let tokens = code_tokens_spanned(source).expect("the fixture lexes");
+        verify_reprint(source, &tokens, planted)
     }
 
     #[test]
@@ -15106,5 +15211,104 @@ mod reprint_safety_net {
         assert_eq!(reprint(source), Ok(source.to_string()));
         let formatted = reprint("fun  main( ) {\n let x=1;\n}\n").expect("reprints");
         assert_eq!(formatted, "fun main() {\n\tlet x = 1;\n}\n");
+    }
+}
+
+#[cfg(test)]
+mod divergence_location {
+    //! E210: the net's decline named the WRONG construct.
+    //!
+    //! `WouldChangeTheCode` had no span — it compares two whole token streams —
+    //! so it reported the file's FIRST ITEM. On kolt's `client.vl` that was
+    //! line 7, an ordinary `import`, thirty lines and one whole grammar away
+    //! from the `const { … };` whose terminator the printer had lost; the
+    //! investigation it sent off was N108's.
+    //!
+    //! The two streams are bisected instead, and the decline names the line
+    //! the reprint stops agreeing with the file on.
+
+    use super::super::formatter::reprint_safety_net::net;
+    use super::{DeclineReason, code_tokens, code_tokens_spanned, diverging_span, normalize};
+
+    /// N108's repro, and the output the printer produced before the fix: the
+    /// `const { … }` expression statement printed with no terminator.
+    const N108_SOURCE: &str = "const {\n\tlet _unused = 1;\n};\n\nfun main() {}\n";
+    const N108_PRINTED: &str = "const {\n\tlet _unused = 1;\n}\n\nfun main() {}\n";
+
+    #[test]
+    fn n108s_lost_terminator_is_named_at_the_line_that_lost_it() {
+        let declined = net(N108_SOURCE, N108_PRINTED).expect_err("the loss is a token drift");
+        assert_eq!(declined.reason, DeclineReason::WouldChangeTheCode);
+        // The `};` on line 3 — the construct, not the bare `;` the diverging
+        // token is, and not the `const {` on line 1 that opens the file's
+        // first item.
+        assert_eq!(declined.construct, "};");
+        assert_eq!(declined.line, Some(3));
+        assert_eq!(
+            declined.sentence(),
+            "reprinting it would have changed the code at this line, so the reprint \
+             was thrown away (the formatter's own safety net): `};`"
+        );
+    }
+
+    #[test]
+    fn the_first_item_is_no_longer_the_answer() {
+        // The regression guard for what E210 removed. A file whose first item
+        // is an import — kolt's shape — with the loss far below it: the old
+        // net reported the import's line, which is what sent the reader into
+        // the wrong grammar.
+        let source = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\n\nconst {\n\tlet _unused = 1;\n};\n";
+        let printed = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\n\nconst {\n\tlet _unused = 1;\n}\n";
+        let declined = net(source, printed).expect_err("the loss is a token drift");
+        assert_eq!(declined.line, Some(9));
+        assert_eq!(declined.construct, "};");
+    }
+
+    #[test]
+    fn a_divergence_below_an_accepted_reordering_is_located_past_it() {
+        // The case the RAW streams cannot answer. The net deliberately accepts
+        // the printer sorting a top-level import run, so the raw streams part
+        // company at line 1 — legitimately. The bug is on line 7, and counting
+        // from the END of the stream walks past the reordering to reach it.
+        let source = "import std::json;\nimport std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\n\nconst {\n\tlet _unused = 1;\n};\n";
+        let printed = "import std::io::print;\nimport std::json;\n\nfun main() {\n\tprint(\"hi\");\n}\n\nconst {\n\tlet _unused = 1;\n}\n";
+        // The reordering really is one the net accepts on its own: the same
+        // reprint with the terminator kept verifies clean.
+        let sorted_only = "import std::io::print;\nimport std::json;\n\nfun main() {\n\tprint(\"hi\");\n}\n\nconst {\n\tlet _unused = 1;\n};\n";
+        assert_eq!(
+            net(source, sorted_only),
+            Ok(()),
+            "the import reordering alone must pass the net, or this pin measures the wrong thing"
+        );
+        let declined = net(source, printed).expect_err("the loss is a token drift");
+        assert_eq!(declined.line, Some(10));
+        assert_eq!(declined.construct, "};");
+    }
+
+    #[test]
+    fn a_reprint_with_an_extra_token_is_named_at_the_files_last_line() {
+        // Nothing in the source diverges — the reprint simply runs on past its
+        // end — so the answer is where the extra output begins.
+        let source = "fun main() {}\n";
+        let printed = "fun main() {}\nfun extra() {}\n";
+        let declined = net(source, printed).expect_err("an extra item is a token drift");
+        assert_eq!(declined.reason, DeclineReason::WouldChangeTheCode);
+        assert_eq!(declined.construct, "fun main() {}");
+        assert_eq!(declined.line, Some(1));
+    }
+
+    #[test]
+    fn the_bisect_is_over_the_normalized_streams() {
+        // Directly: an insignificant trailing comma the file wrote and the
+        // reprint dropped is NOT a divergence, so the bisect must not see one
+        // there. The streams differ only at the `2`.
+        let source = "fun main() {\n\tlet x = [1,];\n\tlet y = 2;\n}\n";
+        let printed = "fun main() {\n\tlet x = [1];\n\tlet y = 3;\n}\n";
+        let written = code_tokens_spanned(source).expect("the fixture lexes");
+        let canonical_source = normalize(written.iter().map(|(token, _)| token.clone()).collect());
+        let canonical_reprint = normalize(code_tokens(printed).expect("the planted output lexes"));
+        let span = diverging_span(&written, &canonical_source, &canonical_reprint)
+            .expect("a divergence has a span");
+        assert_eq!(&source[span.into_range()], "2");
     }
 }

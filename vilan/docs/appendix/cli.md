@@ -347,7 +347,10 @@ is the current directory. Formatting is conservative and a fixed point:
   parses its own output before it writes anything. The second check is not
   implied by the first, because the token comparison deliberately ignores an
   insignificant trailing comma, so a printer that wrote one in the wrong place
-  would satisfy it with output nothing can parse.
+  would satisfy it with output nothing can parse. When the token check is the
+  one that fails, the line it names is where the reprint and your file stop
+  agreeing — found by bisecting the two token streams, not by naming the file's
+  first declaration.
 
 `--check` reports the files that would change and exits 1 if any (the
 CI spelling). Nothing is rewritten.
