@@ -163,9 +163,40 @@ let chip = css {
 
 Your own names always win: a `let rem = …` or an `import` in scope is
 what the name means, and the module is only asked when nothing else
-answers. Outside a block these are ordinary imports —
-`import std::style::prelude::{ rem, gray };` binds them bare, and
-`import std::style::prelude;` qualifies through the name.
+answers.
+
+**Outside a block, import the vocabulary once at the top of the file.**
+`std::style::prelude` is an ordinary module there, so
+`import std::style::prelude::{ s, space, gray, hover, Cursor };` binds
+exactly what the file uses — bare, for the whole file — and
+`import std::style::prelude as tokens;` qualifies them through a name of
+your choosing instead. That is the form to reach for in a file whose
+`fun` bodies build chains, because a chain written outside a hole gets no
+ambient scope: one import list at the top beats an import block inside
+each function, which is what the shape without it turns into.
+
+The keyword-property TYPES are in that module too — `Length`, `Cursor`,
+`TextAlign` and `AlignItems` — so one import answers both halves of a
+chain, the tokens and the keywords:
+
+```vilan,fragment
+import std::style::prelude::{ s, space, gray, px, hover, active, Cursor, TextAlign };
+
+fun button(): Style {
+	s()
+		.padding(space(2))
+		.color(gray(700))
+		.cursor(Cursor::Pointer)
+		.text_align(TextAlign::Center)
+		.width(px(120))
+		.on(hover() + active().not(), s().color(gray(900)))
+}
+```
+
+The other keyword enums — `Display`, `Position`, `FlexDirection`,
+`JustifyContent`, `Overflow`, `WhiteSpace`, `UserSelect` — stay in
+`std::style` and are imported from there when a file wants them. The
+prelude is a vocabulary, not a second spelling of the whole module.
 
 **A dotted item ending in `;` is a chain link** — a `Style` method call,
 spliced exactly where you wrote it. That is how your own helpers reach a
