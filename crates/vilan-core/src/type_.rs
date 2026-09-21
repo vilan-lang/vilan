@@ -14,6 +14,15 @@ pub const SCALAR_PRIMITIVE_NAMES: &[&str] = &[
     "str", "i32", "u32", "f64", "BigInt", "null", "i8", "u8", "i16", "u16", "i53", "u53", "f32",
 ];
 
+/// The numeric PRIMITIVE type names — the scalar primitives minus the three
+/// that are not numbers. The emission verdicts an arithmetic expression carries
+/// (truncating division, unsigned bitwise) are a property of one of these and
+/// of nothing else, so B370's context record is filtered by this list; beside
+/// `SCALAR_PRIMITIVE_NAMES` so the two cannot drift apart unnoticed.
+pub const NUMERIC_PRIMITIVE_NAMES: &[&str] = &[
+    "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64", "BigInt",
+];
+
 /// The numeric-literal type suffixes the analyzer accepts (`42u32`, `1.5f`,
 /// `0n`); any other suffix is a hard error (numeric-types.md §3 — `5i64` names
 /// the rename to `i53`). One source of truth: the book's highlight.js theme

@@ -10991,3 +10991,165 @@ fn b357_a_payload_less_variant_with_no_constraint_still_lands() {
         "bare\nf\nd\n",
     );
 }
+
+// --- B370: an arithmetic expression's EMISSION VERDICT is a property of the
+// type its CONTEXT settled, not of the default its left operand falls back to --
+//
+// An unsuffixed literal has no type of its own; `i32` is the default for a
+// context that states nothing. The checker knew that — `rem(4 / 16)` for `fun
+// rem(value: f64)` was ACCEPTED as `f64` — but the truncating-division verdict
+// was recorded in `finalize_build` from the left operand re-read at `Unknown`,
+// which answers the DEFAULT. So a program the checker had typed as float
+// division emitted `Math.trunc(4 / 16)` and printed 0, with no diagnostic
+// anywhere. The owner found it in kolt (`Length::rem(4 / 16)`), which is why
+// kolt writes `4f / 16` in seventy-seven places.
+
+/// The five positions the item reproduces, in one program: an argument, an
+/// annotated `let`, a return, a method argument, a struct field.
+#[test]
+fn b370_a_literal_division_takes_its_contexts_float_type_in_every_position() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Holder { value: f64 }
+
+        fun rem(value: f64): f64 { value }
+
+        fun half(): f64 { 4 / 16 }
+
+        fun main() {
+        	print(rem(4 / 16));
+        	let annotated: f64 = 4 / 16;
+        	print(annotated);
+        	print(half());
+        	mut values = List<f64>::new();
+        	values.push(1 / 4);
+        	print(values.get(0).unwrap_or(9f));
+        	let held = Holder { value = 1 / 4 };
+        	print(held.value);
+        }
+        "#,
+        "0.25\n0.25\n0.25\n0.25\n0.25\n",
+    );
+}
+
+/// NESTED: the inner expression is itself literal-only, so the context has to
+/// reach through it.
+#[test]
+fn b370_a_nested_literal_expression_takes_the_contexts_type_too() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun rem(value: f64): f64 { value }
+
+        fun main() {
+        	print(rem((1 + 3) / 16));
+        }
+        "#,
+        "0.25\n",
+    );
+}
+
+/// The division that actually has a fractional answer, so the pin cannot pass
+/// on integer and float agreeing.
+#[test]
+fn b370_an_annotated_float_division_is_not_truncated() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let half: f64 = 7 / 2;
+        	print(half);
+        }
+        "#,
+        "3.5\n",
+    );
+}
+
+/// The CONTROLS, both directions: an integer context still truncates, and a
+/// context that states nothing still defaults to `i32`. The law is that a
+/// literal takes its type from context — not that it stops being an integer.
+#[test]
+fn b370_an_integer_context_and_no_context_at_all_still_truncate() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let integral: i32 = 7 / 2;
+        	print(integral);
+        	let defaulted = 4 / 16;
+        	print(defaulted);
+        	let truncated = 7 / 2;
+        	print(truncated);
+        }
+        "#,
+        "3\n0\n3\n",
+    );
+}
+
+/// A VARIABLE in the same position stays refused: a literal has no type of its
+/// own and an `i32` binding has one, and this fix does not make the second into
+/// the first.
+#[test]
+fn b370_an_i32_variable_in_a_float_position_is_still_refused() {
+    assert_fails_with(
+        r#"
+        fun rem(value: f64): f64 { value }
+
+        fun main() {
+        	let count: i32 = 4;
+        	print(rem(count / 16));
+        }
+        "#,
+        "Expected f64, but got i32 instead.",
+    );
+}
+
+/// The emission itself, which is where the wrong value came from: no
+/// `Math.trunc` for the float context, and one for the integer context in the
+/// same program (so the pin cannot pass by the helper vanishing entirely).
+#[test]
+fn b370_the_emitted_float_division_carries_no_truncation() {
+    let source = r#"
+        import std::io::print;
+
+        fun main() {
+        	let floating: f64 = 4 / 16;
+        	let integral: i32 = 7 / 2;
+        	print(floating);
+        	print(integral);
+        }
+        "#;
+    assert_eq!(
+        emitted_occurrences(source, "Math.trunc"),
+        1,
+        "exactly one of the two divisions truncates — the `i32` one"
+    );
+    assert_emits_containing(source, "4 / 16");
+}
+
+/// The same ordering bug in the OTHER verdict the same loop records: the
+/// unsigned-emission decision for a bitwise operator. `let mask: u32 = 1 << 31`
+/// printed -2147483648 on c3f7d1a38 — the left literal had defaulted to `i32`,
+/// so the shift emitted signed — and the context says `u32`.
+#[test]
+fn b370_a_literal_shift_in_an_unsigned_context_emits_unsigned() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let unsigned: u32 = 1 << 31;
+        	print(unsigned);
+        	let signed: i32 = 1 << 31;
+        	print(signed);
+        }
+        "#,
+        "2147483648\n-2147483648\n",
+    );
+}
+

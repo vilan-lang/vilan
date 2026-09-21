@@ -3870,6 +3870,24 @@ pub struct Analyzer<'src> {
     // resolved after typing to decide native JS arithmetic vs an operator-trait
     // method call (`Add::add`, ...).
     prepped_binary_ops: Vec<(Id, BinaryOp, Id)>,
+    // B370: the CONCRETE numeric type an arithmetic expression's own context
+    // asked of it, recorded where the constraint flows into the expression
+    // (`infer_type_path`'s arithmetic `Expr::Binary` arm) — the first concrete
+    // one, `or_insert`, exactly as `expected_types` behaves and for the same
+    // reason (a nearer landing wins).
+    //
+    // The expression's SETTLED type, in other words, for every position that
+    // states one: there are no implicit conversions, so an accepted arithmetic
+    // expression's type IS what its context asked of it. That is the type the
+    // emission verdicts below (`integer_division`, `bitwise_u32`) are a
+    // property of, and re-inferring the LEFT operand at `Unknown` in
+    // `finalize_build` answers the DEFAULT instead: an unsuffixed literal has
+    // no type of its own, so `rem(4 / 16)` for `fun rem(value: f64)` read
+    // `i32 / i32`, recorded truncating division, and emitted
+    // `Math.trunc(4 / 16)` — zero, from a program the checker accepted as
+    // `f64`. Only numeric primitives are recorded: nothing else can change a
+    // verdict, and a narrow record cannot perturb a program that has none.
+    binary_context_types: HashMap<Id, TypeId>,
     // Unary expressions (`-x`, `!x`), as (unary id, operator, operand id),
     // awaiting the post-solve operand check (B200). A unary takes its type
     // from its OPERAND, so an unchecked one is the binary family's miscompile
@@ -5816,6 +5834,7 @@ impl<'src> Analyzer<'src> {
             for_each_views: HashMap::default(),
             wrapped_view_captures: HashMap::default(),
             prepped_binary_ops: Vec::new(),
+            binary_context_types: HashMap::default(),
             prepped_unary_ops: Vec::new(),
             prepped_conditions: Vec::new(),
             std_module_files: Vec::new(),
@@ -34932,8 +34951,14 @@ impl<'src> Analyzer<'src> {
                 _,
             ) => self.bool_type(),
             Expr::Binary(_, lhs_id, _rhs_id) => {
+                let lhs_id = *lhs_id;
+                // B370: this is the ONE place a context's type flows into an
+                // arithmetic expression, so it is where the expression's
+                // settled type is recorded for the emission verdicts
+                // `finalize_build` computes. See `binary_context_types`.
+                self.note_binary_context(expr_id, &constraint);
                 let lhs =
-                    self.infer_type_inner(*lhs_id, &constraint, substitution_context, exprs_seen);
+                    self.infer_type_inner(lhs_id, &constraint, substitution_context, exprs_seen);
                 match lhs {
                     Type::Unresolved => Type::Unresolved,
                     _ => lhs,
@@ -41325,6 +41350,29 @@ impl<'src> Analyzer<'src> {
         for tail_id in tails {
             self.seed_tail_expectations(tail_id, type_id);
         }
+    }
+
+    /// B370 — record the CONCRETE NUMERIC type an arithmetic expression's
+    /// context asked of it (see `binary_context_types`). Skips everything that
+    /// is not a numeric primitive: an `Unknown` expectation is the absence of a
+    /// context, a `Generic` one belongs to the monomorphization channel the
+    /// verdicts already have, and a nominal one cannot change a verdict.
+    /// `or_insert`, so the nearest landing that states a type wins.
+    fn note_binary_context(&mut self, expr: Id, constraint: &Type) {
+        let Type::Struct(struct_id, arguments) = constraint else {
+            return;
+        };
+        if !arguments.is_empty() {
+            return;
+        }
+        let numeric = crate::type_::NUMERIC_PRIMITIVE_NAMES
+            .iter()
+            .any(|name| self.primitive_struct_ids.get(*name) == Some(struct_id));
+        if !numeric {
+            return;
+        }
+        let type_id = constraint.clone().get_type_id(self);
+        self.binary_context_types.entry(expr).or_insert(type_id);
     }
 
     fn seed_expectation(&mut self, expr: Id, constraint: &Type) {
@@ -47938,6 +47986,23 @@ impl<'src> Analyzer<'src> {
 
         for (binary_id, op, lhs_id) in std::mem::take(&mut self.prepped_binary_ops) {
             let lhs_type = self.infer_type(lhs_id, &Type::Unknown, &HashMap::default());
+            // B370: the emission verdicts below are a property of the
+            // expression's SETTLED type, and the left operand re-read at
+            // `Unknown` answers the DEFAULT — which for an unsuffixed literal
+            // is not its type at all. Where the expression's own context stated
+            // a numeric type, that is the settled one: `rem(4 / 16)` for `fun
+            // rem(value: f64)` is `f64 / f64`, and recording truncating
+            // division for it emitted `Math.trunc(4 / 16)` — zero, silently,
+            // out of a program the checker accepted. A GENERIC left operand
+            // still takes the monomorphization channel: the context cannot have
+            // stated a numeric primitive for it (`note_binary_context` skips
+            // everything else), so the two never contend.
+            let settled_type = self
+                .binary_context_types
+                .get(&binary_id)
+                .copied()
+                .map(|type_id| self.get_type_by_type_id(type_id))
+                .unwrap_or_else(|| lhs_type.clone());
             // Record the unsigned-emission verdict for bitwise/shift binaries
             // while the operand's type is in hand: concrete `u32` settles here;
             // a generic operand records its constraint for the transformer to
@@ -47950,12 +48015,12 @@ impl<'src> Analyzer<'src> {
                     | BinaryOp::BitXor
                     | BinaryOp::BitOr
             ) {
-                match &lhs_type {
-                    Type::Struct(id, _) if *id == self.primitive_struct_ids["u32"] => {
-                        self.bitwise_u32.insert(binary_id);
-                    }
-                    Type::Generic(constraint_id) => {
+                match (&lhs_type, &settled_type) {
+                    (Type::Generic(constraint_id), _) => {
                         self.bitwise_generic_lhs.insert(binary_id, *constraint_id);
+                    }
+                    (_, Type::Struct(id, _)) if *id == self.primitive_struct_ids["u32"] => {
+                        self.bitwise_u32.insert(binary_id);
                     }
                     _ => {}
                 }
@@ -47964,16 +48029,16 @@ impl<'src> Analyzer<'src> {
             // the same way: integer operands settle here; a generic operand
             // resolves under each monomorphization.
             if matches!(op, BinaryOp::Div) {
-                match &lhs_type {
-                    Type::Struct(id, _)
+                match (&lhs_type, &settled_type) {
+                    (Type::Generic(constraint_id), _) => {
+                        self.division_generic_lhs.insert(binary_id, *constraint_id);
+                    }
+                    (_, Type::Struct(id, _))
                         if ["i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53"]
                             .iter()
                             .any(|name| self.primitive_struct_ids.get(*name) == Some(id)) =>
                     {
                         self.integer_division.insert(binary_id);
-                    }
-                    Type::Generic(constraint_id) => {
-                        self.division_generic_lhs.insert(binary_id, *constraint_id);
                     }
                     _ => {}
                 }
