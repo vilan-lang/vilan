@@ -124,7 +124,9 @@ function = [ "[" "deprecated" "(" STRING ")" "]" ]
 
 parameter  = [ "mut" | convention ] [ "..." ] binder [ ":" type ] ;
 convention = "own" | "&" [ "mut" ] ;
-binder     = IDENT | "(" binder "," binder { "," binder } [ "," ] ")" ;
+binder     = IDENT
+           | "(" binder "," binder { "," binder } [ "," ] ")"
+           | "[" binder { "," binder } [ "," ] "]" ;
 
 extern-attr = "[" "extern" "(" extern-args [ "," "retains" ] [ "," ] ")" "]" ;
 extern-args = STRING [ "," STRING ]              (* global, or module and symbol *)
@@ -359,7 +361,7 @@ innermost enclosing loop.
 ```text
 block      = "{" { statement } [ expression ] "}" ;
 if-expr    = "if" condition-expr block [ "else" ( block | if-expr ) ] ;
-for-expr   = "for" IDENT "in" condition-expr block   (* iteration *)
+for-expr   = "for" binder "in" condition-expr block  (* iteration *)
            | "for" condition-expr block              (* while *)
            | "for" block ;                           (* infinite *)
 match-expr = "match" condition-expr "{" { match-leg [ "," ] } "}" ;
@@ -373,17 +375,23 @@ unambiguous. A match leg's comma-separated patterns form an or-pattern;
 the optional `if` guard applies to the whole leg; the trailing comma
 after a leg is optional.
 
-A `for IDENT in` subject must have **one element type**, which the binder
-takes: a `List<T>`, a `Set<T>`, a `[T; n]`, a `str` (yielding characters),
-or any type providing the iterator protocol `next(&mut self): Option<T>`
+A `for <binder> in` subject must have **one element type**, which the
+binder takes: a `List<T>`, a `Set<T>`, a `[T; n]`, a `str` (yielding
+characters), or any type providing the iterator protocol
+`next(&mut self): Option<T>`
 (§5.7 dispatches it; `for e in &mut c` drives `next_mut` and binds each
 element as a view, §6). A **tuple is not iterable**, and the loop over one
 is refused: a tuple is a fixed sequence of independently typed elements
 rather than a container of one element type, so there is no single type
 for the binder to take and one body cannot be checked for every element.
 Read the elements positionally (`t.0`, `t.1`) or destructure the tuple
-(§5.9). The same holds for a **mapped tuple** `(U in T: F<U>)`, whose
-elements have no positions to read while `T` is abstract: its element-wise
+(§5.9). The header's binder is `let`'s (`binder`, §3.3), so a tuple or
+array binder destructures each ELEMENT — `for (index, item) in
+list.iter().enumerate()` — with exactly the rules a destructuring `let`
+takes; any other pattern is refused by name, and the element is bound and
+destructured in the body instead. The same holds for a **mapped tuple**
+`(U in T: F<U>)`, whose elements have no positions to read while `T` is
+abstract: its element-wise
 form is the tuple comprehension. *Whether such a loop should instead be
 UNROLLED — the body checked and emitted once per element, at that element's
 own type — is recorded future work; the refusal is forward-compatible with

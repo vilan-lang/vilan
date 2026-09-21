@@ -3283,11 +3283,40 @@ impl<'a, 'src> Parser<'a, 'src> {
             if !parser.peek_is_op("::") {
                 return None;
             }
+            parser.refuse_generic_self(name, start);
             Some((
                 Node::AccessorWithGenerics(name, generic_arguments),
                 parser.span_from(start),
             ))
         })
+    }
+
+    /// B361 (R4) — `Self<..>`, refused with the steer.
+    ///
+    /// `Self` names the impl's SUBJECT, which is already the whole applied type:
+    /// inside `impl Cell<type T>`, `Self` IS `Cell<T>`, so writing arguments on
+    /// it names a second application of a type that has one. It parsed in a
+    /// type position, in a `::`-path head and at a struct literal, and nothing
+    /// in std, the corpus, the examples, the docs, the templates, the website,
+    /// the playground or kolt ever wrote it — and where it was written it did
+    /// not work: `fun same(self): Self<i32>` with a matching body was refused
+    /// `Expected i32, but got i32 instead`, and `Self<i32> { .. }` with
+    /// `cannot initialize a non-struct: Self`. A spelling with no use and no
+    /// coherent meaning is one refusal, at the spelling, naming the fix.
+    fn refuse_generic_self(&mut self, name: &'src str, start: usize) {
+        if name != "Self" {
+            return;
+        }
+        self.errors.push(ParseError {
+            span: self.span_from(start),
+            reason: ParseErrorReason::Rule(
+                "`Self` already names the impl's subject WITH its arguments — inside \
+                 `impl Cell<type T>` it is `Cell<T>` — so it takes none of its own: write \
+                 the type's name (`Cell<i32>`)",
+            ),
+            context: self.context_stack.clone(),
+            hint: None,
+        });
     }
 
     /// The chain head: in expression mode a `css { … }` block, then a struct
@@ -3358,6 +3387,12 @@ impl<'a, 'src> Parser<'a, 'src> {
             let generic_arguments = parser.parse_generic_arguments();
             if !parser.peek_is_ctrl('{') {
                 return None;
+            }
+            // B361's third position: `Self<i32> { .. }`. Refused only once the
+            // `{` has been seen, so a declining attempt never pushes it — the
+            // attempt's own truncation covers the rest.
+            if generic_arguments.is_some() && namespace.is_empty() {
+                parser.refuse_generic_self(name, name_start);
             }
             // The `{ field, ... }` list, clean or recovered to empty fields on a
             // garbled body (chumsky's `nested_delimiters` on the struct-initializer
@@ -4524,14 +4559,58 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_for(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         self.expect(&Token::For)?;
-        // `for IDENT in …` — a bare identifier immediately followed by `in`.
-        if matches!(self.peek(), Some(Token::Ident(_))) && self.peek_at(1) == Some(&Token::In) {
-            let variable = self.eat_ident()?;
-            self.expect(&Token::In)?;
+        // `for <binder> in …`. The binder production is `let`'s (B368/R5), so a
+        // tuple binder destructures the element in the header — `for (index,
+        // item) in list.iter().enumerate()` — exactly as `let (index, item) =
+        // pair;` does one line lower. Read as an ATTEMPT rather than by peeking
+        // for `IDENT` + `in`, because the binder is now arbitrarily wide: what
+        // decides the form is that the binder is followed by `in`, and a
+        // `for a == b { .. }` while-loop backtracks out of it with its errors
+        // truncated.
+        if let Some(binder) = self.attempt(|parser| {
+            let binder = parser.parse_binder()?;
+            parser.expect(&Token::In)?;
+            Some(binder)
+        }) {
             let iterable = self.parse_condition()?;
             let body = self.parse_block()?;
             return Some((
-                Node::ForIn(variable, Box::new(iterable), body),
+                Node::ForIn(Box::new(binder), Box::new(iterable), body),
+                self.span_from(start),
+            ));
+        }
+        // A header that SAYS `in` but whose binder is not one the binding
+        // grammar takes — `for Some(x) in xs`, `for 3 in xs`, `for (only) in
+        // xs` — is refused BY NAME, naming the sanctioned spelling (R5). Before
+        // this the attempt above fell through to the while-loop branch, the
+        // condition parse died on the `in`, and the author read `found 'for'
+        // expected a statement or '}'` anchored on the `for` keyword, with no
+        // mention of the binder at all (B368's second half). The rest of the
+        // header is consumed so the file keeps parsing.
+        if let Some(offset) = self.for_header_binder_width() {
+            // Consumed FIRST, so the span the refusal carries is the binder the
+            // author wrote and not the `for` keyword (E190's rule: the
+            // diagnostic anchors where the fix goes).
+            let binder_start = self.position;
+            for _ in 0..offset {
+                self.bump();
+            }
+            self.errors.push(ParseError {
+                span: self.span_from(binder_start),
+                reason: ParseErrorReason::Rule(
+                    "a `for … in` header binds the element with `let`'s binder — a name, or a \
+                     tuple or array of names (`for (index, item) in …`); bind the element and \
+                     destructure in the body for anything else",
+                ),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+            self.expect(&Token::In)?;
+            let iterable = self.parse_condition()?;
+            let body = self.parse_block()?;
+            let binder = Box::new((Pattern::Wildcard, self.span_from(start)));
+            return Some((
+                Node::ForIn(binder, Box::new(iterable), body),
                 self.span_from(start),
             ));
         }
@@ -4548,6 +4627,33 @@ impl<'a, 'src> Parser<'a, 'src> {
             Node::For(Some(Box::new(condition)), body),
             self.span_from(start),
         ))
+    }
+
+    /// Is this `for` header an `in` form, and if so how many tokens is its
+    /// binder? Read by scanning from just past the keyword to the `in` that
+    /// would separate binder from iterable — stopping at the header's own block
+    /// brace, and never counting an `in` inside a nested delimited region, so a
+    /// `for probe(pick(x)) { .. }` while-loop is not mistaken for one.
+    /// Consulted only once [`Parser::parse_binder`] has already declined, i.e.
+    /// only to choose between "an unreadable binder" and "a condition".
+    fn for_header_binder_width(&self) -> Option<usize> {
+        let mut depth = 0usize;
+        let mut offset = 0usize;
+        while let Some(token) = self.peek_at(offset) {
+            match token {
+                Token::Ctrl('(' | '[') => depth += 1,
+                Token::Ctrl(')' | ']') => depth = depth.saturating_sub(1),
+                // The header's own `{` ends it: past there is the body, and an
+                // `in` inside the body is some inner loop's.
+                Token::Ctrl('{') if depth == 0 => return None,
+                // A binder of nothing is not a binder — `for in xs` is a
+                // condition parse's problem, not this refusal's.
+                Token::In if depth == 0 => return (offset > 0).then_some(offset),
+                _ => {}
+            }
+            offset += 1;
+        }
+        None
     }
 
     /// `match subject { leg, … }`.
@@ -5305,6 +5411,9 @@ impl<'a, 'src> Parser<'a, 'src> {
             name = self.eat_ident().expect("peeked as an identifier");
         }
         let generic_arguments = self.attempt(Self::parse_generic_arguments);
+        if generic_arguments.is_some() && namespace.is_none() {
+            self.refuse_generic_self(name, start);
+        }
         let node = match namespace {
             Some(namespace) => Node::StaticAccessor(Box::new(namespace), name, generic_arguments),
             None => match generic_arguments {

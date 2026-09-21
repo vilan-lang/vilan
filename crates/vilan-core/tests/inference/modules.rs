@@ -199,7 +199,10 @@ fn bumps_propagates_through_a_forwarding_call() {
 fn bumps_extern_off_table_defaults_to_bumping() {
     // A bodyless extern with a `&mut` parameter may do anything — the safe
     // default — and the verdict propagates to its caller.
-    let source = "external fun grow(xs: &mut List<i32>);\nfun call_it(xs: &mut List<i32>) { grow(xs); }\nfun main() { mut xs = [ 1 ]; call_it(&mut xs); }\n";
+    // B360: the extern carries a host binding, because a bodiless one with
+    // none names nothing at all. The verdict under test is unchanged — an
+    // OFF-TABLE extern still defaults to bumping.
+    let source = "[extern(\"globalThis.grow\")]\nexternal fun grow(xs: &mut List<i32>);\nfun call_it(xs: &mut List<i32>) { grow(xs); }\nfun main() { mut xs = [ 1 ]; call_it(&mut xs); }\n";
     assert_bumps(source, "grow", &[0]);
     assert_bumps(source, "call_it", &[0]);
 }
@@ -6900,5 +6903,123 @@ fn a_use_takes_no_only() {
     assert_fails_with(
         "use pkg::a::b only;\n\nfun main() {}\n",
         "`only` belongs to `import`",
+    );
+}
+
+// --- B360 (R4): an `external fun` that names no body at all -------------------
+//
+// `external` says the body lives where the compiler does not look, and there
+// are exactly two such places: an `[extern(..)]` binding naming the host form,
+// or a lowering the compiler carries itself (`str`'s methods, `List::new` /
+// `push`, `panic`, `print`, `drop`, `Context`'s four, the nursery pair — every
+// one of them a bodiless std declaration on purpose). A declaration with
+// NEITHER named nothing: emission fell through to "a normal function" and
+// emitted a call to a mangled name no declaration defines — clean through
+// `vilan check`, a `TypeError` at the first line that reached it. B359 closed
+// the DISPATCHED half; this is the ordinary call site, refused where the fix
+// goes.
+
+#[test]
+fn b360_an_external_method_with_no_binding_is_refused_at_its_declaration() {
+    assert_fails_spanning(
+        r#"
+        external struct Thing;
+
+        impl Thing {
+        	external fun poke(&mut self, v: str);
+        }
+
+        [extern("globalThis.thing")]
+        external fun make(): Thing;
+
+        fun main() {
+        	mut t = make();
+        	t.poke("x");
+        }
+        "#,
+        "poke",
+        "`external fun poke` names no body",
+    );
+}
+
+/// A FREE external function with no binding, which has no receiver and so
+/// reaches the emitter by a different arm — refused at the same place.
+#[test]
+fn b360_a_free_external_function_with_no_binding_is_refused() {
+    assert_fails_with(
+        r#"
+        external fun compute(value: i32): i32;
+
+        fun main() {
+        	print(compute(1));
+        }
+        "#,
+        "`external fun compute` names no body",
+    );
+}
+
+/// The refusal is at the DECLARATION, so it fires even where nothing calls it:
+/// the dangling name is a property of the declaration, and waiting for a call
+/// means an unreached branch ships it.
+#[test]
+fn b360_an_uncalled_external_with_no_binding_is_still_refused() {
+    assert_fails_with(
+        r#"
+        external fun unused(value: i32): i32;
+
+        fun main() {
+        	print("ok");
+        }
+        "#,
+        "`external fun unused` names no body",
+    );
+}
+
+/// The CONTROLS: a bound external compiles, and so does std's own bodiless set
+/// — every one of those is a compiler lowering, which is the whole reason the
+/// check asks the finished program rather than the declaration's own syntax.
+#[test]
+fn b360_a_bound_external_and_stds_own_lowerings_still_compile() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        [extern("Math.max")]
+        external fun largest(a: f64, b: f64): f64;
+
+        fun main() {
+        	print(largest(2f, 5f));
+        	// std's compiler-lowered bodiless externals, one of each family:
+        	print("  hi  ".trim());
+        	mut items = List<i32>::new();
+        	items.push(7);
+        	print(items.len());
+        }
+        "#,
+        "5\nhi\n1\n",
+    );
+}
+
+/// Every extern FORM counts as a binding, not just the two-string one — a
+/// method binding, a property read and a property write each name a host form.
+#[test]
+fn b360_every_extern_form_counts_as_a_binding() {
+    assert_compiles(
+        r#"
+        external struct Node;
+
+        impl Node {
+        	[extern("method")]
+        	external fun click(self): void;
+
+        	[extern("get", "id")]
+        	external fun id(self): str;
+
+        	[extern("set", "id")]
+        	external fun set_id(&mut self, value: str): void;
+        }
+
+        fun main() { print("ok"); }
+        "#,
     );
 }

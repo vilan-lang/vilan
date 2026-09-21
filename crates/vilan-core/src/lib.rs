@@ -792,6 +792,11 @@ pub fn post_analysis_passes(
     // the subtree test the analyzer's own walk cannot make. Returns immediately
     // for a program that wrote no general narrowing, which is the whole estate.
     analyzer::check_scoped_exports(program);
+    // B360 (R4): an `external fun` with neither an `[extern]` binding nor a
+    // compiler lowering names no body at all, and a call to one emitted a
+    // dangling name. Refused at the declaration, which needs the FINISHED
+    // program: the compiler's own lowerings are resolved by name in `build`.
+    analyzer::check_unlowered_externals(program);
     // M26's POST-PASS boundary, the outermost of the three the phase line names
     // (`contexts+graph`, `const-pass`, `dispatch-refine`; the last is a slice
     // through the first two, so cancelling either cancels it). The passes are

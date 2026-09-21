@@ -10800,6 +10800,7 @@ fn b353_an_agreeing_closure_body_still_compiles() {
 //   static fn, enum subject       `Holder<i32>::wrap("x")`      checked
 //   trait static                  `Signal<i32>::new("x")`       checked (B352)
 //   `Self<..>::member`            `Self<i32>::make("x")`        checked
+//                                 (RETIRED by B361: `Self<..>` is refused)
 //   VARIANT constructor           `Holder<i32>::Full("x")`      INERT
 //
 // and the seventh shape the sweep named — a qualified `pkg::mod::T<..>::f` —
@@ -10890,9 +10891,11 @@ fn b356_the_already_checked_path_shapes_stay_checked() {
         "let _a = Boxy<i32> { value = \"x\" };",
         // A static function on an enum subject.
         "let _h = Holder<i32>::wrap(\"x\");",
-        // `Self<..>::member` inside the impl (the impl's own binder is NOT what
-        // the path wrote).
-        "let _a = Boxy<i32>::relay();",
+        // B361 retired the `Self<..>::member` row: `Self<i32>::make("x")` is
+        // refused at the spelling now (`Self` already carries the impl's
+        // arguments), so the shape this row covered no longer exists. Its
+        // NAMED twin — the same path written `Boxy<i32>::make("x")` — is the
+        // first row above, and B361's own pins hold the refusal.
     ];
     for body in shapes {
         let source = format!(
@@ -10901,7 +10904,6 @@ fn b356_the_already_checked_path_shapes_stay_checked() {
 
             impl Boxy<type T> {{
                 fun make(value: T): Boxy<T> {{ Boxy {{ value }} }}
-                fun relay(): Boxy<i32> {{ Self<i32>::make("x") }}
             }}
 
             enum Holder<T> {{ Full(T), Empty }}
@@ -10989,5 +10991,384 @@ fn b357_a_payload_less_variant_with_no_constraint_still_lands() {
         }
         "#,
         "bare\nf\nd\n",
+    );
+}
+
+// --- B370: an arithmetic expression's EMISSION VERDICT is a property of the
+// type its CONTEXT settled, not of the default its left operand falls back to --
+//
+// An unsuffixed literal has no type of its own; `i32` is the default for a
+// context that states nothing. The checker knew that — `rem(4 / 16)` for `fun
+// rem(value: f64)` was ACCEPTED as `f64` — but the truncating-division verdict
+// was recorded in `finalize_build` from the left operand re-read at `Unknown`,
+// which answers the DEFAULT. So a program the checker had typed as float
+// division emitted `Math.trunc(4 / 16)` and printed 0, with no diagnostic
+// anywhere. The owner found it in kolt (`Length::rem(4 / 16)`), which is why
+// kolt writes `4f / 16` in seventy-seven places.
+
+/// The five positions the item reproduces, in one program: an argument, an
+/// annotated `let`, a return, a method argument, a struct field.
+#[test]
+fn b370_a_literal_division_takes_its_contexts_float_type_in_every_position() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Holder { value: f64 }
+
+        fun rem(value: f64): f64 { value }
+
+        fun half(): f64 { 4 / 16 }
+
+        fun main() {
+        	print(rem(4 / 16));
+        	let annotated: f64 = 4 / 16;
+        	print(annotated);
+        	print(half());
+        	mut values = List<f64>::new();
+        	values.push(1 / 4);
+        	print(values.get(0).unwrap_or(9f));
+        	let held = Holder { value = 1 / 4 };
+        	print(held.value);
+        }
+        "#,
+        "0.25\n0.25\n0.25\n0.25\n0.25\n",
+    );
+}
+
+/// NESTED: the inner expression is itself literal-only, so the context has to
+/// reach through it.
+#[test]
+fn b370_a_nested_literal_expression_takes_the_contexts_type_too() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun rem(value: f64): f64 { value }
+
+        fun main() {
+        	print(rem((1 + 3) / 16));
+        }
+        "#,
+        "0.25\n",
+    );
+}
+
+/// The division that actually has a fractional answer, so the pin cannot pass
+/// on integer and float agreeing.
+#[test]
+fn b370_an_annotated_float_division_is_not_truncated() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let half: f64 = 7 / 2;
+        	print(half);
+        }
+        "#,
+        "3.5\n",
+    );
+}
+
+/// The CONTROLS, both directions: an integer context still truncates, and a
+/// context that states nothing still defaults to `i32`. The law is that a
+/// literal takes its type from context — not that it stops being an integer.
+#[test]
+fn b370_an_integer_context_and_no_context_at_all_still_truncate() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let integral: i32 = 7 / 2;
+        	print(integral);
+        	let defaulted = 4 / 16;
+        	print(defaulted);
+        	let truncated = 7 / 2;
+        	print(truncated);
+        }
+        "#,
+        "3\n0\n3\n",
+    );
+}
+
+/// A VARIABLE in the same position stays refused: a literal has no type of its
+/// own and an `i32` binding has one, and this fix does not make the second into
+/// the first.
+#[test]
+fn b370_an_i32_variable_in_a_float_position_is_still_refused() {
+    assert_fails_with(
+        r#"
+        fun rem(value: f64): f64 { value }
+
+        fun main() {
+        	let count: i32 = 4;
+        	print(rem(count / 16));
+        }
+        "#,
+        "Expected f64, but got i32 instead.",
+    );
+}
+
+/// The emission itself, which is where the wrong value came from: no
+/// `Math.trunc` for the float context, and one for the integer context in the
+/// same program (so the pin cannot pass by the helper vanishing entirely).
+#[test]
+fn b370_the_emitted_float_division_carries_no_truncation() {
+    let source = r#"
+        import std::io::print;
+
+        fun main() {
+        	let floating: f64 = 4 / 16;
+        	let integral: i32 = 7 / 2;
+        	print(floating);
+        	print(integral);
+        }
+        "#;
+    assert_eq!(
+        emitted_occurrences(source, "Math.trunc"),
+        1,
+        "exactly one of the two divisions truncates — the `i32` one"
+    );
+    assert_emits_containing(source, "4 / 16");
+}
+
+/// The same ordering bug in the OTHER verdict the same loop records: the
+/// unsigned-emission decision for a bitwise operator. `let mask: u32 = 1 << 31`
+/// printed -2147483648 on c3f7d1a38 — the left literal had defaulted to `i32`,
+/// so the shift emitted signed — and the context says `u32`.
+#[test]
+fn b370_a_literal_shift_in_an_unsigned_context_emits_unsigned() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let unsigned: u32 = 1 << 31;
+        	print(unsigned);
+        	let signed: i32 = 1 << 31;
+        	print(signed);
+        }
+        "#,
+        "2147483648\n-2147483648\n",
+    );
+}
+
+// --- B361 (R4): `Self<..>` is refused -----------------------------------------
+//
+// `Self` names the impl's SUBJECT, which already carries its arguments —
+// inside `impl Cell<type T>` it IS `Cell<T>` — so arguments written on it name
+// a second application of a type that has one. It parsed in three positions
+// (a type, a `::`-path head, a struct literal), and the census found it
+// nowhere: not in std, `vilan/test`, `vilan/examples`, the docs fences,
+// `vilan/benchmarks`, the `vilan init` templates, `vilan-website`,
+// `vilan-playground` or kolt — ONE site in the whole estate, a `.vl` program
+// const in this file (`b356_the_already_checked_path_shapes_stay_checked`,
+// rewritten below to name the type).
+//
+// Its premise wanted correcting: the spelling was NOT coherent. `fun same(self):
+// Self<i32>` with a matching body was refused `Expected i32, but got i32
+// instead.`, and `Self<i32> { .. }` with `cannot initialize a non-struct:
+// Self`. It was a spelling with no use AND no meaning.
+
+#[test]
+fn b361_self_with_arguments_is_refused_in_a_type_position() {
+    assert_fails_with(
+        r#"
+        struct Cell<T> { value: T }
+
+        impl Cell<type T> {
+        	fun make(value: T): Cell<T> { Cell { value } }
+        	fun same(self): Self<i32> { Cell<i32>::make(1) }
+        }
+
+        fun main() { print(Cell<i32>::make(5).value); }
+        "#,
+        "write the type's name (`Cell<i32>`)",
+    );
+}
+
+#[test]
+fn b361_self_with_arguments_is_refused_as_a_path_head() {
+    assert_fails_with(
+        r#"
+        struct Cell<T> { value: T }
+
+        impl Cell<type T> {
+        	fun make(value: T): Cell<T> { Cell { value } }
+        	fun relay(self): Cell<i32> { Self<i32>::make(2) }
+        }
+
+        fun main() { print(Cell<i32>::make(5).value); }
+        "#,
+        "`Self` already names the impl's subject WITH its arguments",
+    );
+}
+
+#[test]
+fn b361_self_with_arguments_is_refused_at_a_struct_literal() {
+    assert_fails_with(
+        r#"
+        struct Cell<T> { value: T }
+
+        impl Cell<type T> {
+        	fun make(value: T): Cell<T> { Cell { value } }
+        	fun build(self): Cell<i32> { Self<i32> { value = 3 } }
+        }
+
+        fun main() { print(Cell<i32>::make(5).value); }
+        "#,
+        "so it takes none of its own",
+    );
+}
+
+/// The CONTROLS: a bare `Self` is untouched in every position, and a generic
+/// literal of the type's own name still works — the refusal is about the
+/// ARGUMENTS on `Self`, not about either half on its own.
+#[test]
+fn b361_a_bare_self_and_a_named_generic_application_still_compile() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Cell<T> { value: T }
+
+        impl Cell<type T> {
+        	fun make(value: T): Cell<T> { Cell { value } }
+        	fun same(self): Self { Cell { value = self.value } }
+        	fun relay(self): Cell<T> { Self::make(self.value) }
+        }
+
+        fun main() {
+        	print(Cell<i32> { value = 5 }.same().value);
+        	print(Cell<i32>::make(6).relay().value);
+        }
+        "#,
+        "5\n6\n",
+    );
+}
+
+// --- E208: a written type argument SETTLES the expression, so one refusal ------
+//
+// B356 made a variant constructor's written arguments fix the enum's parameters
+// for the PAYLOAD check, and stopped there: the expression itself still settled
+// from the payload. So `Option<i32>::Some("y")` refused at the payload (the
+// right line) and then typed as `Option<str>`, and `unwrap_or(3)` refused too —
+// a second message about a type the author never wrote, which E189's narrow
+// rule cannot suppress because both are type errors.
+//
+// The same gap had a SECOND, worse face, which the integrator's papers lane
+// found: where the payload decided nothing either, the constructor came out as
+// the ERASED `Result` with no arguments at all, so a generic BOUND on it could
+// not be checked — and `Ok<void, str>(void).to_json()` walked past the missing
+// `Json` impl into emission and died there as `internal: a call resolved to
+// `Json`'s requirement `to_json`, which has no body … please report this
+// program`. The ANNOTATED spelling of the same expression refused cleanly,
+// which is what said it was the written-arguments path and not `void`.
+//
+// The written arguments are the author's stated intent; they settle the type,
+// and the payload disagreeing with them is the one refusal B356 already makes.
+
+#[test]
+fn e208_a_refused_written_type_argument_reports_exactly_once() {
+    assert_fails_once_with(
+        r#"
+        fun main() {
+        	let o = Option<i32>::Some("y");
+        	print(o.unwrap_or(3));
+        }
+        "#,
+        "Expected i32, but got str instead.",
+    );
+}
+
+#[test]
+fn e208_a_written_type_argument_settles_the_expressions_type() {
+    assert_fails_with(
+        r#"
+        fun main() {
+        	let held = Option<i32>::Some(1);
+        	let flag: bool = held;
+        	print(flag);
+        }
+        "#,
+        "but got Option<i32>",
+    );
+}
+
+/// The BARE variant spelling writes the enum's arguments on the VARIANT name,
+/// where there is no enum path to bank them from — and that is the spelling
+/// the prelude gives every program.
+#[test]
+fn e208_a_bare_variant_path_with_written_arguments_settles_too() {
+    assert_fails_with(
+        r#"
+        fun main() {
+        	let outcome = Ok<i32, str>(1);
+        	let flag: bool = outcome;
+        	print(flag);
+        }
+        "#,
+        "but got Result<i32, str>",
+    );
+}
+
+/// The internal error: a bound that cannot be checked because the receiver had
+/// no arguments to check it on. Both payload shapes, because the first report
+/// of this blamed `void`.
+#[test]
+fn e208_an_unsatisfied_bound_on_a_written_argument_constructor_refuses_cleanly() {
+    for source in [
+        r#"
+        import std::json::Json;
+
+        fun main() {
+        	print(Ok<void, str>(void).to_json());
+        }
+        "#,
+        r#"
+        import std::json::Json;
+
+        struct Opaque { seed: i32 }
+
+        fun main() {
+        	print(Ok<Opaque, str>(Opaque { seed = 1 }).to_json());
+        }
+        "#,
+    ] {
+        assert_fails_with(source, "does not implement trait 'Json'");
+        assert_fails_without(source, "internal:");
+    }
+}
+
+/// The CONTROLS: the annotated spellings still refuse the same way (they always
+/// did), and a written argument the payload AGREES with still compiles and
+/// still carries its arguments.
+#[test]
+fn e208_the_annotated_spellings_and_the_agreeing_case_are_unchanged() {
+    assert_fails_with(
+        r#"
+        import std::json::Json;
+
+        fun main() {
+        	let outcome: Result<void, str> = Ok(void);
+        	print(outcome.to_json());
+        }
+        "#,
+        "does not implement trait 'Json'",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let outcome = Ok<i32, str>(1);
+        	print(outcome.unwrap_or(0));
+        	let held = Option<i32>::Some(2);
+        	print(held.unwrap_or(3));
+        }
+        "#,
+        "1\n2\n",
     );
 }

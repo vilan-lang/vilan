@@ -3870,6 +3870,24 @@ pub struct Analyzer<'src> {
     // resolved after typing to decide native JS arithmetic vs an operator-trait
     // method call (`Add::add`, ...).
     prepped_binary_ops: Vec<(Id, BinaryOp, Id)>,
+    // B370: the CONCRETE numeric type an arithmetic expression's own context
+    // asked of it, recorded where the constraint flows into the expression
+    // (`infer_type_path`'s arithmetic `Expr::Binary` arm) — the first concrete
+    // one, `or_insert`, exactly as `expected_types` behaves and for the same
+    // reason (a nearer landing wins).
+    //
+    // The expression's SETTLED type, in other words, for every position that
+    // states one: there are no implicit conversions, so an accepted arithmetic
+    // expression's type IS what its context asked of it. That is the type the
+    // emission verdicts below (`integer_division`, `bitwise_u32`) are a
+    // property of, and re-inferring the LEFT operand at `Unknown` in
+    // `finalize_build` answers the DEFAULT instead: an unsuffixed literal has
+    // no type of its own, so `rem(4 / 16)` for `fun rem(value: f64)` read
+    // `i32 / i32`, recorded truncating division, and emitted
+    // `Math.trunc(4 / 16)` — zero, from a program the checker accepted as
+    // `f64`. Only numeric primitives are recorded: nothing else can change a
+    // verdict, and a narrow record cannot perturb a program that has none.
+    binary_context_types: HashMap<Id, TypeId>,
     // Unary expressions (`-x`, `!x`), as (unary id, operator, operand id),
     // awaiting the post-solve operand check (B200). A unary takes its type
     // from its OPERAND, so an unchecked one is the binary family's miscompile
@@ -5821,6 +5839,7 @@ impl<'src> Analyzer<'src> {
             for_each_views: HashMap::default(),
             wrapped_view_captures: HashMap::default(),
             prepped_binary_ops: Vec::new(),
+            binary_context_types: HashMap::default(),
             prepped_unary_ops: Vec::new(),
             prepped_conditions: Vec::new(),
             std_module_files: Vec::new(),
@@ -11827,6 +11846,7 @@ impl<'src> Analyzer<'src> {
         }
         let skip = |analyzer: &Self, id: Id| restored_enrolment && analyzer.table_entity(id);
         let mut asked = 0usize;
+        crate::drop_plan_stats::reset_literal_evidence();
         let mut memo: HashMap<TypeId, bool> = HashMap::default();
         for function in self.functions.values() {
             if !function.has_body {
@@ -11994,7 +12014,24 @@ impl<'src> Analyzer<'src> {
             Some(Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding)) => {
                 self.binding_reaches_resource(*binding, nominals, memo)
             }
-            Some(Expr::StructInitializer(struct_id, _)) => nominals.contains(struct_id),
+            // B365: the payload here is the LITERAL's own expression id, not
+            // the struct's declaration — `Expr::StructInitializer(initializer_id,
+            // fields)`, as `resolve_struct_initializer` builds it — so testing
+            // it against the set of struct DEFINITION ids answered `false` for
+            // every program there has ever been. `struct_initializer_to_def` is
+            // the map from the one to the other, written at the same place;
+            // the `EnumVariant` arm beside this one already carries its
+            // declaration's id, which is why only this arm was dead.
+            Some(Expr::StructInitializer(initializer_id, _)) => self
+                .struct_initializer_to_def
+                .get(initializer_id)
+                .is_some_and(|struct_id| {
+                    let reaches = nominals.contains(struct_id);
+                    if reaches {
+                        crate::drop_plan_stats::note_literal_evidence();
+                    }
+                    reaches
+                }),
             Some(Expr::EnumVariant(enum_id, _)) => nominals.contains(enum_id),
             Some(Expr::Call(call_id)) => self.call_reaches_resource(*call_id, nominals, memo),
             _ => false,
@@ -20086,6 +20123,30 @@ impl<'src> Analyzer<'src> {
     /// `Option<str>` from the PAYLOAD with the written `i32` silently
     /// discarded — B323's family, "an annotation-only generic argument is
     /// silently inert".
+    /// E208: the enum arguments a variant constructor path WROTE, positionally,
+    /// or `None` when it wrote none (or wrote a partial set).
+    ///
+    /// `seed_variant_subject_bindings` banks those arguments as a substitution
+    /// keyed by the enum's own parameters — what the payload check reads. This
+    /// reads the same record back as an argument LIST, which is what the
+    /// expression's type needs. Every parameter must be fixed: a partial
+    /// application would put a hole beside a written argument and the payload
+    /// pass is the one entitled to fill it.
+    fn written_variant_arguments(&self, subject_id: Id, enum_id: Id) -> Option<Vec<TypeId>> {
+        let bindings = self.static_subject_bindings.get(&subject_id)?;
+        let parameters = self
+            .enums
+            .get(&enum_id)
+            .map(|enum_| enum_.generic_parameter_constraint_ids.clone())?;
+        if parameters.is_empty() {
+            return None;
+        }
+        parameters
+            .iter()
+            .map(|constraint_id| bindings.get(constraint_id).copied())
+            .collect()
+    }
+
     fn seed_variant_subject_bindings(&mut self, id: Id, subject_type: &Type) {
         let Type::Enum(enum_id, arguments) = subject_type else {
             return;
@@ -29182,28 +29243,35 @@ impl<'src> Analyzer<'src> {
             // `Expr::ForEach`); it iterates a JS-iterable (e.g. a `List`, which is
             // an array). Iterating a custom `Iterator` (the trait protocol) is not
             // supported yet — that needs trait dispatch.
-            Node::ForIn(variable, iterable, body) => {
+            Node::ForIn(binder, iterable, body) => {
                 let iterable_id = self.walk_expr_node(iterable, scope_id);
                 let body_scope_id = self.create_owned_scope(Some(scope_id)).id;
+                // A bare name is the element binding itself; a tuple or array
+                // binder (B368) binds a hidden element and DESTRUCTURES it in a
+                // prelude statement of the body, exactly as a tuple-bound
+                // parameter does (`walk_parameter`'s destructure). `_` and a
+                // binder the parser refused introduce nothing at all.
+                let (name, name_span) = match &binder.0 {
+                    Pattern::Binding(name, _, name_span) => (*name, *name_span),
+                    Pattern::Wildcard => ("_", binder.1),
+                    _ => ("_", binder.1),
+                };
+                let destructured = !matches!(binder.0, Pattern::Binding(..) | Pattern::Wildcard);
                 // The element binding's type is the iterable's element type when
                 // recoverable, else unknown (a `List` value erases its element
                 // type). `_` introduces no binding.
-                let item_id = (*variable != "_").then(|| {
+                let item_id = (name != "_" || destructured).then(|| {
                     let variable_id = self.new_entity_id();
                     // The binding starts `Unknown` (so a method call on it defers
                     // rather than erroring) and is resolved to the iterable's
                     // element type in the constraint loop, falling back to `any`
                     // for an iterable whose element type can't be recovered.
                     let element_type_id = Type::Unknown.get_type_id(self);
-                    // The binding name follows `for ` in the loop header.
-                    let header = node.1.into_range();
-                    let name_span: Span =
-                        (header.start + 4..header.start + 4 + variable.len()).into();
                     self.variables.insert(
                         variable_id,
                         Variable {
                             id: variable_id,
-                            name: variable,
+                            name,
                             name_span,
                             initial: None,
                             type_id: element_type_id,
@@ -29218,8 +29286,13 @@ impl<'src> Analyzer<'src> {
                     self.span_map.insert(variable_id, &node.1);
                     self.reference_count.entry(variable_id).or_insert(0);
                     // Visible from its name in the header on — i.e. throughout
-                    // the body, and shadowable by a `let` inside it.
-                    self.declare_scope_value(body_scope_id, variable, variable_id, name_span.end);
+                    // the body, and shadowable by a `let` inside it. A
+                    // destructuring binder's hidden element has no name to
+                    // declare: the names in scope are the pattern's, bound by
+                    // the prelude below.
+                    if !destructured {
+                        self.declare_scope_value(body_scope_id, name, variable_id, name_span.end);
+                    }
                     // `for e in &mut list` / `&list` — the iterable is a view, so
                     // each binding is a view of the element (write-through), not a
                     // copy. The element type still resolves below (a view is
@@ -29235,7 +29308,40 @@ impl<'src> Analyzer<'src> {
                     });
                     variable_id
                 });
-                let ids = self.walk_expr_nodes(&body.0.0, body_scope_id);
+                // The destructure prelude: one statement, ahead of the body's
+                // own, reading a REFERENCE to the hidden element (the variable
+                // entity is a declaration that emits no value) and binding the
+                // pattern's names for the rest of the iteration.
+                let mut ids = Vec::new();
+                if destructured && let Some(item_id) = item_id {
+                    let walked =
+                        self.walk_pattern(&binder.0, &binder.1, body_scope_id, binder.1.end);
+                    let reference_id = self.new_entity_id();
+                    self.expr_id_to_expr_map
+                        .insert(reference_id, Expr::Local(item_id));
+                    self.expr_id_to_scope_id_map
+                        .insert(reference_id, body_scope_id);
+                    self.span_map.insert(reference_id, &binder.1);
+                    let destructure_id = self.new_entity_id();
+                    self.span_map.insert(destructure_id, &binder.1);
+                    self.expr_id_to_scope_id_map
+                        .insert(destructure_id, body_scope_id);
+                    self.constraints
+                        .push(Constraint::Destructure(DestructureConstraint {
+                            id: destructure_id,
+                            value_id: reference_id,
+                            type_id: None,
+                            scope_id: body_scope_id,
+                            pattern: walked,
+                            // The element's type is `Unknown` until
+                            // `ForEachItem` resolves it from the iterable, so
+                            // the destructure waits for it exactly as a tuple
+                            // parameter waits for its argument.
+                            defer_until_known: true,
+                        }));
+                    ids.push(destructure_id);
+                }
+                ids.extend(self.walk_expr_nodes(&body.0.0, body_scope_id));
                 let expr_id = self.walk_expr_node(&body.0.1, body_scope_id);
                 // Decide native `for...of` vs the Iterator-protocol loop once the
                 // iterable's type is known (in `build`).
@@ -34584,6 +34690,50 @@ impl<'src> Analyzer<'src> {
                     // from the constructor arguments (`Some(3)` -> `Option<i32>`).
                     Type::Enum(enum_id, arguments) => {
                         if arguments.is_empty() {
+                            // E208: the author WROTE the arguments —
+                            // `Option<i32>::Some("y")`, `Ok<void, str>(void)` —
+                            // and B356 made them fix the enum's parameters for
+                            // the payload CHECK without ever putting them on
+                            // the expression. So the expression still settled
+                            // from the payload (`Option<str>`, and a bare
+                            // `Result` with NO arguments when the payload
+                            // decided nothing), and everything downstream was
+                            // checked against a type the author never wrote: a
+                            // second refusal at `unwrap_or(3)` for wanting a
+                            // `str` (E208), and — where the erased form came
+                            // out — a generic BOUND that could not be checked
+                            // at all, so `Ok<void, str>(void).to_json()`
+                            // reached emission and died as `internal: a call
+                            // resolved to `Json`'s requirement `to_json`,
+                            // which has no body`. The written arguments are the
+                            // author's stated intent and they settle the type;
+                            // the payload disagreeing with them is the ONE
+                            // refusal, at the payload, which B356 already
+                            // reports.
+                            let written = self
+                                .written_variant_arguments(subject_id, enum_id)
+                                .or_else(|| {
+                                    // The BARE variant spelling — `Ok<void,
+                                    // str>(void)`, the prelude's own — writes
+                                    // the enum's arguments on the VARIANT
+                                    // name, so there is no enum path for
+                                    // `seed_variant_subject_bindings` to have
+                                    // banked them from. They are the call's
+                                    // own written arguments, and they mean the
+                                    // enum's parameters positionally: a
+                                    // variant constructor has no generics of
+                                    // its own.
+                                    let parameters = self
+                                        .enums
+                                        .get(&enum_id)?
+                                        .generic_parameter_constraint_ids
+                                        .len();
+                                    (parameters > 0 && generic_argument_ids.len() == parameters)
+                                        .then(|| generic_argument_ids.clone())
+                                });
+                            if let Some(written) = written {
+                                return Type::Enum(enum_id, written);
+                            }
                             let inferred = self.infer_enum_constructor_arguments(
                                 subject_id,
                                 enum_id,
@@ -34694,21 +34844,36 @@ impl<'src> Analyzer<'src> {
                                 substitution_context.insert(*constraint_id, *argument_id);
                             }
                         }
-                        // Keep the DECLARED return type too: the return-type-only
-                        // inference below must filter bindings to the callee's own
-                        // generics, and after substitution the return type's
-                        // generics can be the CALLER's (an abstract argument bound
-                        // the callee's `T` to the caller's `T`) — those must not
-                        // be re-bound against the expectation.
+                        // Keep the CALLEE's OWN return type too: the
+                        // return-type-only inference below must filter bindings to
+                        // the callee's own generics, and after substitution the
+                        // return type's generics can be the CALLER's (an abstract
+                        // argument bound the callee's `T` to the caller's `T`) —
+                        // those must not be re-bound against the expectation.
                         let declared_return_type = return_type_id.map(|id| id.get_type(self));
-                        let return_type = match &declared_return_type {
-                            Some(declared) => self.substitute_type(declared, &substitution_context),
+                        // B369: an INFERRED return type is written in the callee's
+                        // own binders exactly as a declared one is — `fun
+                        // hold<C: Show>(body: C) { Holder { body } }` infers
+                        // `Holder<C>` — and the substitution has to be applied to
+                        // it HERE, because the tail's type comes back out of the
+                        // solver's cache verbatim: `infer_type_path` answers from
+                        // `resolved_types` before any substitution runs, so
+                        // threading the context down through `inferred_return_type`
+                        // reaches nothing. Without this `hold("x")` typed as
+                        // `Holder<C>`, and the first dispatch on that value
+                        // resolved to the trait's BODYLESS requirement — an
+                        // internal error anchored wherever the generic std
+                        // function that received it lives, over a correct program.
+                        let callee_return_type = match declared_return_type {
+                            Some(declared) => declared,
                             None => self.inferred_return_type(
                                 function_id,
                                 &substitution_context,
                                 exprs_seen,
                             ),
                         };
+                        let return_type =
+                            self.substitute_type(&callee_return_type, &substitution_context);
                         // A generic parameter fixed only by the return type — no
                         // argument binds it — is inferred by unifying the return
                         // type against the call's expected type, and recorded so
@@ -34719,16 +34884,13 @@ impl<'src> Analyzer<'src> {
                         // (Argument-bound generics are recorded during call-subject
                         // resolution; this fills the return-type-only gap.)
                         if !matches!(constraint.as_ref(), Type::Unknown | Type::Unresolved) {
-                            // The callee's own return-type generics — from the
-                            // DECLARED type where there is one, so a caller
-                            // generic introduced by substitution never counts as
-                            // "the callee's, still to infer".
+                            // The callee's own return-type generics — read off the
+                            // callee's OWN return type (declared or inferred),
+                            // never the substituted one, so a caller generic
+                            // introduced by substitution never counts as "the
+                            // callee's, still to infer".
                             let mut return_generics = Vec::new();
-                            self.collect_generics(
-                                declared_return_type.as_ref().unwrap_or(&return_type),
-                                0,
-                                &mut return_generics,
-                            );
+                            self.collect_generics(&callee_return_type, 0, &mut return_generics);
                             if !return_generics.is_empty()
                                 && let Some((_, bindings)) = self.reconcile_type(
                                     &return_type,
@@ -34997,8 +35159,14 @@ impl<'src> Analyzer<'src> {
                 _,
             ) => self.bool_type(),
             Expr::Binary(_, lhs_id, _rhs_id) => {
+                let lhs_id = *lhs_id;
+                // B370: this is the ONE place a context's type flows into an
+                // arithmetic expression, so it is where the expression's
+                // settled type is recorded for the emission verdicts
+                // `finalize_build` computes. See `binary_context_types`.
+                self.note_binary_context(expr_id, &constraint);
                 let lhs =
-                    self.infer_type_inner(*lhs_id, &constraint, substitution_context, exprs_seen);
+                    self.infer_type_inner(lhs_id, &constraint, substitution_context, exprs_seen);
                 match lhs {
                     Type::Unresolved => Type::Unresolved,
                     _ => lhs,
@@ -35707,6 +35875,25 @@ impl<'src> Analyzer<'src> {
         for parameter_id in &function.parameters {
             let parameter = self.parameters.get(parameter_id)?;
             if parameter.name == "self" {
+                return None;
+            }
+            // B362 (R4), UNSOUND before this: a `lazy` parameter is a promise
+            // about the CALL — the argument is wrapped in a thunk at every call
+            // site and the body forces it — and only a DIRECT call can keep it,
+            // because only a direct call is rewritten. `record_lazy_arguments`
+            // skips a dispatched or indirect callee, so a function reached
+            // through a closure slot was handed a plain value and forced it:
+            // `__force(7)` → `cell.state = 1` on a number, a `TypeError` out of
+            // a program that checked clean. M81 made the case with NO direct
+            // call correct (the parameter becomes eager); the MIXED case — one
+            // direct call keeping the thunk, one indirect call not — was left,
+            // and cannot be fixed at the call site, because the value that
+            // escapes into the slot is the function itself. So a function with
+            // a `lazy` parameter is not a closure VALUE, and the coercion is
+            // refused where it is attempted. The refusal is the house type
+            // mismatch, which now NAMES the difference: `lazy` prints as part
+            // of the function type (see `pretty_print_type_inner`).
+            if parameter.lazy {
                 return None;
             }
             parameter_type_ids.push(parameter.type_id);
@@ -41390,6 +41577,29 @@ impl<'src> Analyzer<'src> {
         for tail_id in tails {
             self.seed_tail_expectations(tail_id, type_id);
         }
+    }
+
+    /// B370 — record the CONCRETE NUMERIC type an arithmetic expression's
+    /// context asked of it (see `binary_context_types`). Skips everything that
+    /// is not a numeric primitive: an `Unknown` expectation is the absence of a
+    /// context, a `Generic` one belongs to the monomorphization channel the
+    /// verdicts already have, and a nominal one cannot change a verdict.
+    /// `or_insert`, so the nearest landing that states a type wins.
+    fn note_binary_context(&mut self, expr: Id, constraint: &Type) {
+        let Type::Struct(struct_id, arguments) = constraint else {
+            return;
+        };
+        if !arguments.is_empty() {
+            return;
+        }
+        let numeric = crate::type_::NUMERIC_PRIMITIVE_NAMES
+            .iter()
+            .any(|name| self.primitive_struct_ids.get(*name) == Some(struct_id));
+        if !numeric {
+            return;
+        }
+        let type_id = constraint.clone().get_type_id(self);
+        self.binary_context_types.entry(expr).or_insert(type_id);
     }
 
     fn seed_expectation(&mut self, expr: Id, constraint: &Type) {
@@ -48003,6 +48213,23 @@ impl<'src> Analyzer<'src> {
 
         for (binary_id, op, lhs_id) in std::mem::take(&mut self.prepped_binary_ops) {
             let lhs_type = self.infer_type(lhs_id, &Type::Unknown, &HashMap::default());
+            // B370: the emission verdicts below are a property of the
+            // expression's SETTLED type, and the left operand re-read at
+            // `Unknown` answers the DEFAULT — which for an unsuffixed literal
+            // is not its type at all. Where the expression's own context stated
+            // a numeric type, that is the settled one: `rem(4 / 16)` for `fun
+            // rem(value: f64)` is `f64 / f64`, and recording truncating
+            // division for it emitted `Math.trunc(4 / 16)` — zero, silently,
+            // out of a program the checker accepted. A GENERIC left operand
+            // still takes the monomorphization channel: the context cannot have
+            // stated a numeric primitive for it (`note_binary_context` skips
+            // everything else), so the two never contend.
+            let settled_type = self
+                .binary_context_types
+                .get(&binary_id)
+                .copied()
+                .map(|type_id| self.get_type_by_type_id(type_id))
+                .unwrap_or_else(|| lhs_type.clone());
             // Record the unsigned-emission verdict for bitwise/shift binaries
             // while the operand's type is in hand: concrete `u32` settles here;
             // a generic operand records its constraint for the transformer to
@@ -48015,12 +48242,12 @@ impl<'src> Analyzer<'src> {
                     | BinaryOp::BitXor
                     | BinaryOp::BitOr
             ) {
-                match &lhs_type {
-                    Type::Struct(id, _) if *id == self.primitive_struct_ids["u32"] => {
-                        self.bitwise_u32.insert(binary_id);
-                    }
-                    Type::Generic(constraint_id) => {
+                match (&lhs_type, &settled_type) {
+                    (Type::Generic(constraint_id), _) => {
                         self.bitwise_generic_lhs.insert(binary_id, *constraint_id);
+                    }
+                    (_, Type::Struct(id, _)) if *id == self.primitive_struct_ids["u32"] => {
+                        self.bitwise_u32.insert(binary_id);
                     }
                     _ => {}
                 }
@@ -48029,16 +48256,16 @@ impl<'src> Analyzer<'src> {
             // the same way: integer operands settle here; a generic operand
             // resolves under each monomorphization.
             if matches!(op, BinaryOp::Div) {
-                match &lhs_type {
-                    Type::Struct(id, _)
+                match (&lhs_type, &settled_type) {
+                    (Type::Generic(constraint_id), _) => {
+                        self.division_generic_lhs.insert(binary_id, *constraint_id);
+                    }
+                    (_, Type::Struct(id, _))
                         if ["i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53"]
                             .iter()
                             .any(|name| self.primitive_struct_ids.get(*name) == Some(id)) =>
                     {
                         self.integer_division.insert(binary_id);
-                    }
-                    Type::Generic(constraint_id) => {
-                        self.division_generic_lhs.insert(binary_id, *constraint_id);
                     }
                     _ => {}
                 }
@@ -49833,15 +50060,24 @@ impl<'src> Analyzer<'src> {
                 // (marked `?`, addressable by name). Each carries its bound when it
                 // isn't the open `any`. Generics bound to a concrete type by the
                 // `substitution` are omitted (they render concretely below).
-                let parameter_types: Vec<Type> = parameter_ids
+                // B362: `lazy` is part of what the signature PROMISES — the
+                // argument is carried by a thunk the callee forces — so it is
+                // printed. Without it the coercion refusal reads
+                // "Expected |bool, i32| i32, but got fn choose(bool, i32): i32",
+                // two types that look identical.
+                let parameter_types: Vec<(Type, bool)> = parameter_ids
                     .iter()
                     .filter_map(|parameter_id| self.parameters.get(parameter_id))
-                    .map(|parameter| parameter.type_id.get_type(self))
+                    .map(|parameter| (parameter.type_id.get_type(self), parameter.lazy))
                     .collect();
                 let return_type = return_type_id.map(|type_id| type_id.get_type(self));
+                let plain_parameter_types: Vec<Type> = parameter_types
+                    .iter()
+                    .map(|(parameter_type, _)| parameter_type.clone())
+                    .collect();
                 let generics = self.signature_generics(
                     own_generics,
-                    &parameter_types,
+                    &plain_parameter_types,
                     return_type.as_ref(),
                     substitution,
                 );
@@ -49876,9 +50112,12 @@ impl<'src> Analyzer<'src> {
                 }
 
                 buf.push('(');
-                for (index, parameter_type) in parameter_types.iter().enumerate() {
+                for (index, (parameter_type, lazy)) in parameter_types.iter().enumerate() {
                     if index > 0 {
                         buf.push_str(", ");
+                    }
+                    if *lazy {
+                        buf.push_str("lazy ");
                     }
                     self.pretty_print_type_inner(
                         parameter_type,
@@ -62338,5 +62577,85 @@ mod rigidity_agreement_tests {
                 "the two predicates disagree on {shape} — §1.4 says they agree exactly"
             );
         }
+    }
+}
+
+/// B360 — an `external fun` with NO `[extern]` binding and no compiler
+/// lowering, refused where it is DECLARED (R4).
+///
+/// An `external fun` says "the body lives somewhere the compiler does not look
+/// at", and there are exactly two somewheres: a host binding written on the
+/// declaration (`[extern("Math", "max")]`, `[extern("method")]`, …), or a
+/// lowering the compiler itself carries — `str`'s methods, `List::new`/`push`,
+/// `panic`, `print`, `drop`, `Context`'s four, the nursery pair, and the rest
+/// of the `intrinsics` table, all of which std declares as bodyless externals
+/// deliberately. A declaration with NEITHER names nothing: emission fell
+/// through every arm above to "a normal emitted function", and emitted a CALL
+/// to a mangled name no declaration in the program ever defines — `$b(t, "x")`
+/// with `$b` undefined, clean through `vilan check` and a `TypeError` on the
+/// first line that reaches it.
+///
+/// B359 closed the DISPATCHED half of this (a trait default reaching
+/// `List::new`/`push` through a requirement); the ordinary call site was left,
+/// and an ordinary call site cannot be fixed by emission — there is nothing to
+/// emit. So the declaration is refused, which is also where the fix goes: add
+/// the binding, or give the function a body.
+///
+/// A post-pass rather than a walk-time check because the compiler's own
+/// lowerings are resolved BY NAME against the finished program (see `build`'s
+/// `intrinsics` assembly): at the walk there is no table to ask.
+pub fn check_unlowered_externals(program: &mut Program) {
+    // The compiler's own external lowerings that are recorded as single ids
+    // rather than in `intrinsics`. Every one of them is a std declaration the
+    // emitter has an arm for.
+    let lowered_by_id: Vec<Option<Id>> = vec![
+        program.list_new_fn_id,
+        program.list_push_fn_id,
+        program.panic_fn_id,
+        program.print_fn_id,
+        program.drop_fn_id,
+        program.context_new_fn_id,
+        program.context_run_fn_id,
+        program.context_get_fn_id,
+        program.context_get_safe_fn_id,
+        program.nursery_fn_id,
+        program.owned_nursery_enter_fn_id,
+    ];
+    let mut sites: Vec<(Span, SourceId, String)> = Vec::new();
+    for external in program.external_functions.values() {
+        if external.extern_binding.is_some() {
+            continue;
+        }
+        if program.intrinsics.contains_key(&external.id) {
+            continue;
+        }
+        if lowered_by_id.contains(&Some(external.id)) {
+            continue;
+        }
+        let Some(source) = program.source_of(external.id) else {
+            continue;
+        };
+        sites.push((
+            external.name_span,
+            source,
+            format!(
+                "`external fun {}` names no body: an external needs an `[extern(..)]` binding \
+                 saying what the host calls it, or it is not external — give it a body. \
+                 Without one, a call to it emits a name nothing in the program defines",
+                external.name
+            ),
+        ));
+    }
+    sites.sort_by_key(|(span, source, _)| (source.0, span.start, span.end));
+    for (span, source, msg) in sites {
+        program.push_diagnostic(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg,
+            },
+            source,
+        );
     }
 }

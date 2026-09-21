@@ -67,9 +67,14 @@ The suffix names the literal's type: `i8 i16 i32 u8 u16 u32` (that
 two's-complement width), `i53`/`u53` (the wide integers; see below),
 `f` (`f64`), `f32`, `f64`, `n` (`BigInt`). An **unknown suffix is a
 compile error** (the retired `i64`/`u64` suffixes get a rename hint). An
-unsuffixed integer literal is `i32`; an unsuffixed fractional literal is
-`f64`. Every integer literal is **range-checked** against its type at
-compile time.
+unsuffixed literal takes its type from its CONTEXT — the annotation, the
+parameter, the field, the return type it lands at — and `i32` for an
+integer literal, `f64` for a fractional one, is the DEFAULT where the
+context states nothing. That holds for an expression of unsuffixed
+literals as well as for a lone one, including the operator it is
+computed with: `let ratio: f64 = 7 / 2;` is float division and `3.5`,
+where the same expression with no annotation truncates to `3`. Every
+integer literal is **range-checked** against its type at compile time.
 
 `i53` spans the symmetric range ±2^53 and `u53` spans [0, 2^53]: the
 window in which every integer is exactly representable in an IEEE-754

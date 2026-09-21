@@ -78,7 +78,11 @@ fun main() {
 Two rules that differ from JS:
 
 - **Integer division truncates toward zero.** `7 / 2` is `3`, and
-  `-7 / 2` is `-3`. Float division works the way you expect.
+  `-7 / 2` is `-3`. Float division works the way you expect — and which
+  one you get is decided by the CONTEXT, because an unsuffixed literal
+  has no type of its own: `let ratio: f64 = 7 / 2;` is `3.5`, while the
+  same expression with nothing to take a type from defaults to `i32` and
+  truncates.
 - **There are no implicit conversions between numeric types.** Mixing an
   `i53` and an `i32` in one expression is a compile error. Convert
   explicitly with the `as_*` methods, or suffix the literal.

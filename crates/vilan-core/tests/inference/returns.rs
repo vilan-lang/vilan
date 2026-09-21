@@ -5368,3 +5368,179 @@ fn b221_a_closure_body_that_leaves_early_owes_no_tail() {
         "3\n",
     );
 }
+
+// --- B369: an inferred return type takes the call's substitution --------------
+//
+// A function with no declared return type infers one written in ITS OWN binders
+// — `fun hold<C: Show>(body: C) { Holder { body } }` infers `Holder<C>`, and the
+// struct literal's own inference is what puts `C` there (correctly: the item's
+// "the inferred return type loses `C`" premise was wrong). What was missing is
+// the caller's half: the tail's type comes back out of the solver's cache
+// verbatim, so the call site had to apply the substitution to the inferred
+// answer exactly as it already did to a declared one. Without it `hold("x")`
+// typed as `Holder<C>` and the first trait dispatch on that value resolved to
+// the trait's BODYLESS requirement — an `internal:` error anchored wherever the
+// generic function that received the value lives (in kolt's case, in std).
+
+/// The class, with no `Slot` and no UI in sight: a generic struct with a trait
+/// impl, built by an un-annotated generic function, dispatched through a
+/// generic function. Ran red as `internal: a call resolved to `Show`'s
+/// requirement `show`, which has no body` before the fix.
+#[test]
+fn b369_an_un_annotated_generic_constructor_types_its_call_under_the_substitution() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Show {
+        	fun show(self): str;
+        }
+
+        struct Holder<C: Show> {
+        	body: C,
+        }
+
+        impl Holder<type C: Show> with Show {
+        	fun show(self): str {
+        		self.body.show()
+        	}
+        }
+
+        impl str with Show {
+        	fun show(self): str { self }
+        }
+
+        fun hold<C: Show>(body: C) {
+        	Holder { body }
+        }
+
+        fun render<S: Show>(value: S): str { value.show() }
+
+        fun main() { print(render(hold("x"))); }
+        "#,
+        "x\n",
+    );
+}
+
+/// The type itself, read off a refusal so the pin is about the substitution and
+/// not about a downstream symptom: `Holder<str>`, not `Holder<C>`.
+#[test]
+fn b369_the_inferred_return_type_names_the_arguments_type_not_the_callees_binder() {
+    assert_fails_with(
+        r#"
+        struct Holder<C> {
+        	body: C,
+        }
+
+        fun hold<C>(body: C) {
+        	Holder { body }
+        }
+
+        fun main() {
+        	let held = hold("x");
+        	let n: i32 = held;
+        	print(n);
+        }
+        "#,
+        "but got Holder<str>",
+    );
+}
+
+/// TWO generic parameters, bound from two different arguments, so a fix that
+/// substituted only the first (or only the last) reds here.
+#[test]
+fn b369_an_inferred_generic_return_type_carries_both_parameters() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Pair<A, B> {
+        	left: A,
+        	right: B,
+        }
+
+        fun pair<A, B>(left: A, right: B) {
+        	Pair { left, right }
+        }
+
+        fun main() {
+        	let both = pair("x", 2);
+        	print(both.left);
+        	print(both.right + 1);
+        }
+        "#,
+        "x\n3\n",
+    );
+}
+
+/// A parameter reachable only through ANOTHER parameter's bound (B251's shape)
+/// under an inferred return: `T` is named by no field, so it is derived from
+/// `S`'s `Signal` impl — and that derivation has to survive the substitution
+/// too.
+#[test]
+fn b369_a_bound_reachable_parameter_survives_an_inferred_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Source, SignalCell };
+
+        struct Held<T, S: Source<T>> {
+        	cell: S,
+        }
+
+        fun hold<T, S: Source<T>>(cell: S) {
+        	Held { cell }
+        }
+
+        fun main() {
+        	let held = hold(SignalCell::new(41));
+        	print(held.cell.get() + 1);
+        }
+        "#,
+        "42\n",
+    );
+}
+
+/// Kolt's exact shape (`lib/conditional_value.vl`'s `when_value`), which is
+/// where B369 was found: THREE parameters, one of them bound only through
+/// another's bound, and a closure-typed parameter carrying a `context` clause —
+/// placed through std's own generic `Slot` machinery. The `open_row_before`
+/// internal error was anchored in std here.
+#[test]
+fn b369_the_kolt_shape_a_context_carrying_closure_parameter_and_a_slot_impl() {
+    assert_compiles_browser(
+        r#"
+        import std::reactive::{ Source, SignalCell, owner_scope };
+        import std::ui::{ Region, Slot, View };
+        import std::ui;
+
+        struct Conditional<T, S: Source<Option<T>>, C: Slot> {
+        	condition: S,
+        	body: (|T| C) context owner_scope,
+        }
+
+        impl Conditional<type T, type S: Source<Option<T>>, type C: Slot> with Slot {
+        	fun place(self, parent: View) {
+        		let region = Region::open(parent);
+        		self.condition.effect(|on| {
+        			if on is Some(let value) {
+        				let _row = region.open_row((self.body)(value));
+        			}
+        		});
+        	}
+        }
+
+        fun when_value<T, S: Source<Option<T>>, C: Slot>(
+        	condition: S,
+        	body: (|T| C) context owner_scope,
+        ) {
+        	Conditional { condition, body }
+        }
+
+        fun main() {
+        	let name: SignalCell<Option<str>> = SignalCell::new(Some("x"));
+        	let _root = ui::mount_root("app", || <div>{when_value(name, |value| <span>{value}</span>)}</div>);
+        }
+        "#,
+    );
+}

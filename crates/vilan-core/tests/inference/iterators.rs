@@ -4456,3 +4456,200 @@ fn b102_the_unconditional_hoist_keeps_both_argument_orders_running() {
         "42\n42\n",
     );
 }
+
+// --- B368: a binder pattern in a `for` header ---------------------------------
+//
+// R5: the header's binder is `let`'s own production, so a tuple (or array)
+// binder destructures the element in the header; anything else the binding
+// grammar does not take is refused BY NAME. Before this the header took a bare
+// IDENT followed by `in` and nothing else, and `for (i, item) in ..` fell
+// through to the WHILE branch — whose condition parse died on the `in` and
+// reported `found 'for' expected a statement or '}'` anchored on the keyword,
+// with no mention of the pattern (kolt's `lib/search.vl:26` wrote a manual
+// counter around it).
+
+#[test]
+fn b368_a_tuple_binder_in_a_for_header_destructures_the_element() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	for (index, item) in ["a", "b", "c"].iter().enumerate() {
+        		print(i"{index}:{item}");
+        	}
+        }
+        "#,
+        "0:a\n1:b\n2:c\n",
+    );
+}
+
+/// A list of tuples, so the element is a real tuple rather than one the
+/// iterator adapter builds — the plain shape, and the one whose element type
+/// the `ForEachItem` constraint has to resolve before the destructure can run.
+#[test]
+fn b368_a_tuple_binder_over_a_list_of_tuples() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let pairs = [(1, "x"), (2, "y")];
+        	for (number, label) in pairs {
+        		print(i"{number}-{label}");
+        	}
+        }
+        "#,
+        "1-x\n2-y\n",
+    );
+}
+
+/// NESTED, which is the whole point of sharing `let`'s production rather than
+/// writing a one-level tuple arm.
+#[test]
+fn b368_a_nested_binder_in_a_for_header() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let rows = [((1, 2), "x"), ((3, 4), "y")];
+        	for ((left, right), label) in rows {
+        		print(i"{left},{right},{label}");
+        	}
+        }
+        "#,
+        "1,2,x\n3,4,y\n",
+    );
+}
+
+/// The ARRAY binder comes along with the production, and takes exactly the
+/// rules `let [a, b] = ..` takes — including the fixed-array requirement.
+#[test]
+fn b368_an_array_binder_in_a_for_header_binds_a_fixed_array_element() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let grid: [[i32; 2]; 2] = [[1, 2], [3, 4]];
+        	for [left, right] in grid {
+        		print(i"{left}/{right}");
+        	}
+        }
+        "#,
+        "1/2\n3/4\n",
+    );
+}
+
+#[test]
+fn b368_an_array_binder_over_a_list_element_is_refused_as_a_let_would_be() {
+    assert_fails_with(
+        r#"
+        fun main() {
+        	for [left, right] in [[1, 2], [3, 4]] {
+        		print(left + right);
+        	}
+        }
+        "#,
+        "cannot destructure List<i32> as a fixed array",
+    );
+}
+
+/// The binder's names are the loop's, so they shadow and go out of scope with
+/// it exactly as a plain one does.
+#[test]
+fn b368_a_binders_names_do_not_escape_the_loop() {
+    assert_fails_with(
+        r#"
+        fun main() {
+        	for (index, item) in ["a"].iter().enumerate() {
+        		print(i"{index}{item}");
+        	}
+        	print(item);
+        }
+        "#,
+        "item",
+    );
+}
+
+/// A binder the binding grammar does NOT take is refused by name, anchored on
+/// the binder the author wrote rather than on the `for` keyword.
+#[test]
+fn b368_a_variant_pattern_in_a_for_header_is_refused_by_name() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+        	for Some(let value) in [1, 2] {
+        		print(value);
+        	}
+        }
+        "#,
+        "Some(let value)",
+        "a `for … in` header binds the element with `let`'s binder",
+    );
+}
+
+#[test]
+fn b368_a_literal_in_a_for_header_is_refused_by_name() {
+    assert_fails_with(
+        r#"
+        fun main() {
+        	for 3 in [1, 2] {
+        		print("x");
+        	}
+        }
+        "#,
+        "bind the element and destructure in the body",
+    );
+}
+
+/// A ONE-element paren is not a tuple binder (`let (only) = ..` is not either),
+/// so it takes the same refusal rather than silently meaning `for only in ..`.
+#[test]
+fn b368_a_single_element_paren_binder_is_refused_by_name() {
+    assert_fails_with(
+        r#"
+        fun main() {
+        	for (only) in [1, 2] {
+        		print(only);
+        	}
+        }
+        "#,
+        "a `for … in` header binds the element with `let`'s binder",
+    );
+}
+
+/// The three OTHER `for` forms still read as themselves — the binder attempt
+/// backtracks with its errors truncated, and a while condition that happens to
+/// contain a call is not mistaken for an unreadable binder.
+#[test]
+fn b368_the_while_and_infinite_forms_are_untouched() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun ready(count: i32): bool { count >= 2 }
+
+        fun main() {
+        	mut count = 0;
+        	for !ready(count) {
+        		count += 1;
+        	}
+        	print(count);
+        	mut spins = 0;
+        	for {
+        		spins += 1;
+        		if spins == 3 {
+        			jump break;
+        		}
+        	}
+        	print(spins);
+        	for _ in ["a", "b"] {
+        		print("tick");
+        	}
+        }
+        "#,
+        "2\n3\ntick\ntick\n",
+    );
+}
