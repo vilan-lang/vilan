@@ -4058,6 +4058,21 @@ fn git_deps_cached() -> vilan_core::git_dep::GitDeps {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CompileGoal {
     Emit,
+    /// `vilan run` of a lone package or a bare file: the emission walk's TEXT
+    /// is wanted, and nothing is written into `dist/` (tracker N103).
+    ///
+    /// `Emit` in every respect but that one, and that one is the whole reason
+    /// the variant exists. `run_single` hands Node a temp script and keeps the
+    /// canonical `<entry>.<ext>` sidecars beside the source, so it has no
+    /// build directory — yet it compiled under `Emit`, which put its macro
+    /// expansion table in `dist/.cache/`. N92 moved `vilan check`'s table out
+    /// of the package for exactly this reason and stopped one command short:
+    /// after `vilan run <package>` the tree held a `dist/` containing
+    /// `.cache/macro-expansions` and NOTHING else — a build directory in a
+    /// tree nobody asked to build, with no build in it. Milder than the check
+    /// case, because `rm -rf dist` still means what it says; misleading all
+    /// the same, and it is the same root.
+    Run,
     Check,
     CheckModule,
 }
@@ -4069,9 +4084,11 @@ impl CompileGoal {
         matches!(self, CompileGoal::Check | CompileGoal::CheckModule)
     }
 
-    /// Whether this goal writes ARTIFACTS — which is what decides where its
-    /// macro expansion table lives (N92): `dist/` belongs to a build, and a
-    /// command that emits nothing has no business creating one.
+    /// Whether this goal writes artifacts INTO `dist/` — which is what decides
+    /// where its macro expansion table lives (N92, N103): `dist/` belongs to a
+    /// build, and a command that puts nothing there has no business creating
+    /// one. `Run` emits text and writes none, so it answers `false` with the
+    /// two checking goals.
     fn emits_artifacts(self) -> bool {
         matches!(self, CompileGoal::Emit)
     }
@@ -4089,7 +4106,7 @@ impl CompileGoal {
     /// 6.3% of a cold check's instructions spent producing names and text that
     /// this goal drops on the floor.
     fn emits_text(self) -> bool {
-        matches!(self, CompileGoal::Emit)
+        matches!(self, CompileGoal::Emit | CompileGoal::Run)
     }
 }
 
@@ -4208,15 +4225,20 @@ fn compile_unit(
 
 /// Where THIS compile keeps its cross-process macro expansion table (M33, N92).
 ///
-/// Two roots, chosen by what the compile writes. A goal that EMITS uses the
-/// package's own `dist/`, which is where its artifacts go and what `rm -rf
-/// dist` is about: one gesture, "recompile everything, macro worlds included".
-/// A CHECKING goal emits nothing, so it has no build directory of its own to
-/// put memory in — and creating one made `vilan check` mutate the package it
-/// was pointed at, which is the whole of N92. Its table lives under
-/// `~/.vilan/check-cache/<hash>` instead, keyed by the package's canonical
-/// path so two packages never share a table and one package's two spellings
-/// do.
+/// Two roots, chosen by what the compile writes INTO `dist/`. A goal that puts
+/// artifacts there uses the package's own `dist/`, which is what `rm -rf dist`
+/// is about: one gesture, "recompile everything, macro worlds included". A goal
+/// that puts nothing there has no build directory of its own to keep memory in
+/// — and creating one made `vilan check` mutate the package it was pointed at,
+/// which is the whole of N92. Its table lives under
+/// `~/.vilan/check-cache/<hash>` instead, keyed by the package's canonical path
+/// so two packages never share a table and one package's two spellings do.
+///
+/// N103: `vilan run` of a lone package or a bare file is on that side too. It
+/// hands Node a temp script and keeps its sidecars beside the source, so it
+/// writes nothing into `dist/` — but it compiled under `Emit` and so left a
+/// `dist/` holding `.cache/macro-expansions` and nothing else. See
+/// [`CompileGoal::Run`].
 ///
 /// The hash and not the path itself: a directory name has to be one path
 /// segment on every platform, and a project path is neither (it carries
@@ -4398,7 +4420,7 @@ fn run_single(unit: &Unit, args: &[String], backend: Backend) -> ExitCode {
         unit,
         platform,
         Backend::Js,
-        CompileGoal::Emit,
+        CompileGoal::Run,
         false,
         false,
         None,
