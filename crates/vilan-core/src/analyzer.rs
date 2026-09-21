@@ -28558,14 +28558,21 @@ impl<'src> Analyzer<'src> {
     /// The walk's depth bound (B138): the walk recurses once per level of
     /// syntactic nesting carrying the largest frame in the analyzer — the
     /// union of [`Self::walk_expr_node_inner`]'s ~90 arms, measured by
-    /// `VILAN_DEPTH_STATS` at ~36 KiB per level unoptimized, ~4.5 KiB
-    /// optimized — so nesting depth, not node count, is what outgrows a
-    /// stack (the v0.36.0 incident, commit 0fb5e5f0: a modest server
-    /// program's walk closed a CI worker's ~2 MiB margin). Every realistic
-    /// fixture peaks at 20 levels (both walkthrough entries, the std
-    /// twin-parity and release-emission corpora); 500 is 25x that, and caps
-    /// the bounded worst case near 18 MiB unoptimized — deeper nesting gets
-    /// a clean diagnostic instead of a stack overflow.
+    /// `VILAN_DEPTH_STATS` (and by gdb, to the byte) at 42,464 B (41.5 KiB)
+    /// per level unoptimized, ~4,650 B (4.5 KiB) optimized — so nesting
+    /// depth, not node count, is what outgrows a stack (the v0.36.0
+    /// incident, commit 0fb5e5f0: a modest server program's walk closed a CI
+    /// worker's ~2 MiB margin). Every realistic fixture peaks at 20 levels
+    /// (both walkthrough entries, the std twin-parity and release-emission
+    /// corpora); 500 is 25x that, and caps the bounded worst case near
+    /// 20.3 MiB unoptimized — deeper nesting gets a clean diagnostic instead
+    /// of a stack overflow.
+    ///
+    /// The per-level figure is N97's re-measurement, and
+    /// `tests/deep_nesting.rs` is where it is held: the record read ~36 KiB
+    /// per level and ~18 MiB at the bound until Order 36's lazy, const,
+    /// callable and visibility arms landed IN this frame, and three comments
+    /// went on quoting the old numbers (N111).
     const WALK_DEPTH_LIMIT: usize = 500;
 
     fn walk_expr_node(&mut self, node: &'src Spanned<Node<'src>>, scope_id: Id) -> Id {

@@ -22,7 +22,9 @@
 //! worker below spawns with 64 MiB ON PURPOSE — not the harness convention's
 //! 256 MiB: the plant's 5000 levels cost the UNBOUNDED walk ~180 MiB
 //! unoptimized and overflowed exactly this spawn before the bound existed,
-//! while the bounded walk stops near 18 MiB. Growing this spawn to make a
+//! while the bounded walk stops near 20.3 MiB (500 levels at the 42,464 bytes
+//! this header measures; "near 18 MiB" was the pre-N97 frame's figure and
+//! three comments went on quoting it — N111). Growing this spawn to make a
 //! failure pass again would make the pin vacuous.
 //!
 //! The file grew past that one bound, because the recursive families that can

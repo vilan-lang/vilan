@@ -973,6 +973,24 @@ pub fn begin_depth_stats() {
     }
 }
 
+/// Release the `VILAN_DEPTH_STATS` instrument for a front end that anchored
+/// with [`begin_depth_stats`] and will NOT reach `post_analysis_passes`.
+///
+/// The report normally rides the end of the analysis, which is the only place
+/// that knows every recursive family has unwound. A front end can anchor and
+/// then decline to analyse, though, and `vilan build` does exactly that on a
+/// parse error: the tree is dropped and the parse diagnostics are reported, so
+/// the depth line went missing for precisely the analyses the PARSER's own
+/// bound exists for (B142's 500-level refusal, N111). Calling this on that
+/// path prints the line the anchored parse measured; calling it on a path that
+/// did analyse would print a second one, so it belongs only where no
+/// `post_analysis_passes` follows.
+pub fn report_depth_stats() {
+    if !macros::in_macro_world() {
+        depth_stats::report();
+    }
+}
+
 /// Whether `VILAN_LEAK_REPORT` asks for the per-analysis leak line (any value
 /// but empty or `0`). Read once and cached: an env var does not change under a
 /// live process, and the LSP asks on every keystroke.

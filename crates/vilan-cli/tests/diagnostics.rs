@@ -826,6 +826,91 @@ fn depth_stats_env_var_prints_the_depth_line() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// N111: the depth line survives a build that never ANALYSES.
+///
+/// The report rides the end of `post_analysis_passes`, and `vilan build` drops
+/// the tree of a file that did not parse cleanly — so the one case the
+/// instrument exists for was the one case it said nothing about. The parser's
+/// own bound (B142, `NESTING_DEPTH_LIMIT` = 500) is that case by construction:
+/// the refusal comes from the family with the deepest measured recursion, and
+/// before this the run printed the refusal and no numbers.
+///
+/// Both halves are pinned. On the refusal the line is printed ONCE and its
+/// `parse` family carries a depth past the bound; and a build that DOES
+/// analyse still prints exactly one line, because the release is on the
+/// no-tree path only — a second call would double the line.
+#[test]
+fn n111_a_parse_bound_refusal_still_prints_the_depth_line() {
+    // 600 nested parentheses: past the parser's 500-level bound, and flat to
+    // everything downstream of it (nothing is analysed at all).
+    let deep = format!(
+        "import std::io::print;\nfun main() {{ print({}1{}); }}\n",
+        "(".repeat(600),
+        ")".repeat(600)
+    );
+    let dir = temp_package("depthbound", &deep);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
+    command
+        .current_dir(&dir)
+        .args(["build"])
+        .env("VILAN_DEPTH_STATS", "1");
+    let output = command.output().expect("run vilan");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "the 600-level program must be refused; stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("nests more than 500 levels deep, which parsing refuses"),
+        "the refusal must be the PARSER's bound; stderr was: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches("[vilan depth]").count(),
+        1,
+        "the depth line must be printed exactly once for a refused parse; \
+         stderr was: {stderr}"
+    );
+    // The line is the anchored parse's own measurement, not an empty frame:
+    // the peak sits one past the bound, which is where the refusal fires.
+    let line = stderr
+        .lines()
+        .find(|line| line.contains("[vilan depth]"))
+        .expect("the depth line");
+    let parse_depth: usize = line
+        .split_whitespace()
+        .skip_while(|word| *word != "parse")
+        .nth(1)
+        .expect("the `parse` family's depth")
+        .parse()
+        .expect("the depth is a number");
+    assert!(
+        parse_depth > 500,
+        "the `parse` peak must show the bound being reached, not 0; the line \
+         was: {line}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The other half: a build that reaches analysis still prints ONE line.
+    let clean = temp_package(
+        "depthclean",
+        "import std::io::print;\nfun main() { print(7); }\n",
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
+    command
+        .current_dir(&clean)
+        .args(["build"])
+        .env("VILAN_DEPTH_STATS", "1");
+    let output = command.output().expect("run vilan");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("[vilan depth]").count(),
+        1,
+        "an analysed build must print the line once, not twice; stderr was: \
+         {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&clean);
+}
+
 /// The batch half of the blackout (`editing-dx.md` S6/§13.1, the P29 shape).
 ///
 /// `check`'s whole job is to answer questions about a file the user is still

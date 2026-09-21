@@ -36,7 +36,8 @@ fn compiler() -> MutexGuard<'static, ()> {
 ///
 /// Measured since (B138, `VILAN_DEPTH_STATS`): the analyses these tests run
 /// peak under 1 MiB of stack unoptimized — what closed the CI margin was the
-/// expression walk's ~36 KiB-per-nesting-level frames, depth-bounded at 500
+/// expression walk's 42,464-bytes-per-nesting-level frames (41.5 KiB, N97's
+/// re-measurement — the record read ~36 KiB), depth-bounded at 500
 /// levels now, as are the return-inference chain (B139) and the parser itself
 /// (B142). The 256 MiB here matches the vilan-core harness convention, not a
 /// measured need of these fixtures — the SHIPPED margins are sized from the
