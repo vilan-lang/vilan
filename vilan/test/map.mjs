@@ -100,17 +100,6 @@ function $q(self, key2) {
 	}
 	return $s;
 }
-function $t(self, fallback) {
-	const $u = self;
-	let $v = null;
-	if ($u[0] === 0) {
-		const x = __clone($u[1]);
-		$v = x;
-	} else {
-		$v = __clone(__force(fallback));
-	}
-	return $v;
-}
 function $w(self) {
 	let result = [  ];
 	for (const entry2 of __map_values(self[0])) {
@@ -166,10 +155,10 @@ console.log($d(copy, "dave"));
 let names = $a();
 $p(names, 1, "one");
 $p(names, 2, "two");
-console.log($t($q(names, 1), __lazy("fallback", () => {
+console.log($h($q(names, 1), __lazy("fallback", () => {
 	return "?";
 })));
-console.log($t($q(names, 9), __lazy("fallback", () => {
+console.log($h($q(names, 9), __lazy("fallback", () => {
 	return "?";
 })));
 let letters = $a();

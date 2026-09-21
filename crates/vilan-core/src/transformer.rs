@@ -2516,24 +2516,86 @@ struct SharedBody {
     emission: Option<EmissionId>,
 }
 
-/// One emitted instance body as text, with the instance's OWN name normalized
-/// away — the key [`Transformer::push_or_share`] compares bodies by.
+/// One emitted instance body as text, with the instance's OWN name and every
+/// generated name the body BINDS normalized away — the key
+/// [`Transformer::push_or_share`] compares bodies by.
 ///
-/// The name is removed through the same [`rename_node`] walk the release
+/// The names are removed through the same [`rename_node`] walk the release
 /// rename uses, not by substituting text: a string LITERAL that happened to
 /// contain another instance's name would make two different bodies look alike
 /// to a textual swap, and that would be a miscompile rather than a missed
-/// optimization. `@` is not an identifier character, so the placeholder cannot
-/// collide with a real name.
-fn canonical_instance_body(node: &js::Node, name: &str) -> String {
+/// optimization. `@` is not an identifier character, so the placeholders
+/// cannot collide with a real name.
+///
+/// **The local gensyms are normalized too (backlog M80), and that is what
+/// makes the key about the CODE rather than about the counter.** The
+/// generator's anonymous temporaries are minted from one monotonic counter, so
+/// two monomorphizations of one function get different ones — and then their
+/// bodies, identical in every other character, stopped sharing. C14 S3 gave
+/// `std::reactive`'s `observe` two compiler-minted temporaries and the
+/// function was emitted TWICE in `reactive-flatten.mjs` and
+/// `reactive-on-change.mjs` where it had been emitted once, `$D`/`$H`
+/// identical modulo `$E$F` against `$I$J`.
+///
+/// Two conditions keep the wider equivalence exact rather than merely
+/// plausible, and both are needed:
+///
+///  - only names in the generator's `minted` set are renamed. One generated
+///    name is one binding program-wide — `allocate_scope`'s `debug_assert` is
+///    that invariant — so a minted name the body binds cannot ALSO be a free
+///    reference to something else in the same body, which is the one way a
+///    scope-blind rename could make two different bodies look alike. A source
+///    name is left alone precisely because it can shadow;
+///  - only names the body itself BINDS are renamed, collected through the same
+///    hand-written walk the release rename uses. That walk may be incomplete
+///    (`rename_for_scopes` reserves the complement for exactly that reason),
+///    and an incomplete answer here costs a missed share and nothing else: an
+///    unnormalized name simply makes two bodies compare unequal.
+///
+/// Numbered in walk order, which is deterministic for a given body, so two
+/// bodies that differ only in their temporaries' numbering render the same
+/// text.
+fn canonical_instance_body(node: &js::Node, name: &str, minted: &HashSet<String>) -> String {
     let mut probe = node.clone();
     let mut rename: HashMap<String, String> = HashMap::default();
     rename.insert(name.to_string(), "@".to_string());
+    let mut declarations = Vec::new();
+    let mut children = Vec::new();
+    collect_declarations(
+        std::slice::from_ref(node),
+        minted,
+        &mut declarations,
+        &mut children,
+    );
+    let scope = JsScope {
+        declarations,
+        children,
+    };
+    let mut bound = Vec::new();
+    collect_bound_names_in_order(&scope, &mut bound);
+    for (position, name) in bound.into_iter().enumerate() {
+        rename.entry(name).or_insert_with(|| format!("@{position}"));
+    }
     rename_node(&mut probe, &rename);
     // The tightest rendering: whitespace options are a fact about the output
     // file, and two bodies are the same body or not regardless of how they
     // will be printed.
     Formatter::from_options(false, false).node(&probe, "", 0)
+}
+
+/// Every binding name a scope tree accounts for, in WALK order and without
+/// repeats — [`canonical_instance_body`]'s numbering. [`collect_reached_names`]
+/// answers the same question as a set, which is the right shape for reserving
+/// the complement and the wrong one for numbering.
+fn collect_bound_names_in_order(scope: &JsScope, into: &mut Vec<String>) {
+    for name in &scope.declarations {
+        if !into.contains(name) {
+            into.push(name.clone());
+        }
+    }
+    for child in &scope.children {
+        collect_bound_names_in_order(child, into);
+    }
 }
 
 /// What one emission contributed DIRECTLY, recorded the first — and, in the
@@ -8467,7 +8529,7 @@ impl<'src> Transformer<'src> {
         landed_before: usize,
     ) -> Option<SharedBody> {
         if self.monomorphized.len() == landed_before {
-            let body = canonical_instance_body(&js_function, name);
+            let body = canonical_instance_body(&js_function, name, &self.ng.minted);
             if let Some(shared) = self.shared_bodies.get(&(subject, body.clone())) {
                 return Some(shared.clone());
             }
@@ -12327,7 +12389,93 @@ fn bodyless_refusal_frame(requester: Option<(&str, Option<&str>)>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Formatter, bodyless_refusal_frame, unescape_string};
+    use super::{
+        Formatter, HashSet, bodyless_refusal_frame, canonical_instance_body, js, unescape_string,
+    };
+
+    /// One emitted instance: `function <name>(self) { const <temp> = self;
+    /// return <temp>; }` — the smallest body that BINDS a generated
+    /// temporary, which is what M80 is about.
+    fn instance(name: &str, temporary: &str) -> js::Node<'static> {
+        js::Node::Function(js::Function {
+            name: name.to_string(),
+            parameters: vec![js::Parameter {
+                name: "self".to_string(),
+            }],
+            body: vec![
+                js::Node::ConstVariable(js::Variable {
+                    name: temporary.to_string(),
+                    value: Box::new(js::Node::Local("self".to_string())),
+                }),
+                js::Node::Return(Box::new(js::Node::Local(temporary.to_string()))),
+            ],
+            is_async: false,
+        })
+    }
+
+    /// **M80** — two monomorphizations whose bodies differ only in the NUMBER
+    /// the generator gave a local temporary share one body.
+    ///
+    /// `canonical_instance_body` normalized the instance's own name and
+    /// nothing else, so two instances of one generic function stopped sharing
+    /// the moment their bodies bound a compiler-minted local: the names come
+    /// out of one monotonic counter, so the second instance's are simply
+    /// later. C14 S3 gave `std::reactive`'s `observe` two temporaries and it
+    /// was emitted TWICE in `reactive-flatten.mjs` and
+    /// `reactive-on-change.mjs` where it had been emitted once.
+    #[test]
+    fn two_bodies_differing_only_in_a_generated_temporary_share_one_key() {
+        let minted: HashSet<String> = ["$D", "$H", "$E", "$I"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let first = canonical_instance_body(&instance("$D", "$E"), "$D", &minted);
+        let second = canonical_instance_body(&instance("$H", "$I"), "$H", &minted);
+        assert_eq!(
+            first, second,
+            "the key must be about the CODE, not about the counter"
+        );
+    }
+
+    /// The controls, and they are what keep the wider equivalence exact.
+    ///
+    /// A name the generator did NOT mint is left alone: a source name can
+    /// shadow, so renaming it through a scope-blind walk could make two
+    /// different bodies look alike. And a body that calls a DIFFERENT function
+    /// is a different body — the call target is a free reference, not a
+    /// binding, so nothing normalizes it.
+    #[test]
+    fn a_source_name_and_a_different_call_target_keep_two_bodies_apart() {
+        let minted: HashSet<String> = ["$D", "$H"].into_iter().map(str::to_string).collect();
+        // `total` and `spent` are not in `minted`, so they are not normalized.
+        let first = canonical_instance_body(&instance("$D", "total"), "$D", &minted);
+        let second = canonical_instance_body(&instance("$H", "spent"), "$H", &minted);
+        assert_ne!(
+            first, second,
+            "a name the generator did not mint must not be normalized: it can \
+             shadow, and one generated name is one binding program-wide only \
+             for the minted ones"
+        );
+
+        let calling = |target: &str| {
+            js::Node::Function(js::Function {
+                name: "$D".to_string(),
+                parameters: Vec::new(),
+                body: vec![js::Node::Return(Box::new(js::Node::Call(
+                    Box::new(js::Node::Local(target.to_string())),
+                    Vec::new(),
+                )))],
+                is_async: false,
+            })
+        };
+        let minted: HashSet<String> = ["$D", "$E", "$F"].into_iter().map(str::to_string).collect();
+        assert_ne!(
+            canonical_instance_body(&calling("$E"), "$D", &minted),
+            canonical_instance_body(&calling("$F"), "$D", &minted),
+            "a body calling a different function is a different body — the \
+             target is a free reference and the body binds nothing"
+        );
+    }
 
     /// E190 — the body-less refusal names the frame that asked and its file.
     /// kolt's report was one bare `Error:` line with no file, no line and no

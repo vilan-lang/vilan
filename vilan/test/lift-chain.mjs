@@ -83,17 +83,6 @@ function $d(self, fallback) {
 	}
 	return $f;
 }
-function $i(self, fallback) {
-	const $j = self;
-	let $k = null;
-	if ($j[0] === 0) {
-		const x = __clone($j[1]);
-		$k = x;
-	} else {
-		$k = __clone(__force(fallback));
-	}
-	return $k;
-}
 const $b = find("hit");
 let $c = null;
 if ($b[0] === 1) {
@@ -111,7 +100,7 @@ if ($g[0] === 1) {
 } else {
 	$h = [ 0, $g[1][1].length ];
 }
-console.log($i($h, __lazy("fallback", () => {
+console.log($d($h, __lazy("fallback", () => {
 	return 0 - 1;
 })));
 const $l = find("miss");

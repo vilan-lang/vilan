@@ -38,7 +38,7 @@ function from_json_value2(value) {
 	return $f;
 }
 function to_json(self) {
-	return "{\"name\":" + JSON.stringify(self[0]) + "," + "\"members\":" + $i(self[1]) + "," + "\"captain\":" + $N(self[2]) + "}";
+	return "{\"name\":" + JSON.stringify(self[0]) + "," + "\"members\":" + $i(self[1]) + "," + "\"captain\":" + $q(self[2]) + "}";
 }
 function from_json(text) {
 	const $x = $u(__try_parse_json(text), "not valid JSON");
@@ -190,17 +190,6 @@ function $H(value) {
 		$I = [ 0, [ 0, $J[1] ] ];
 	}
 	return $I;
-}
-function $N(self) {
-	const $O = self;
-	let $P = null;
-	if ($O[0] === 0) {
-		const value = $O[1];
-		$P = JSON.stringify(value);
-	} else {
-		$P = "null";
-	}
-	return $P;
 }
 function $T(value) {
 	let $U = null;

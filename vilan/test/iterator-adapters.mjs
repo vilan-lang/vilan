@@ -184,22 +184,11 @@ function $A(self, predicate) {
 function $E(self, other) {
 	return [ self, __clone(other) ];
 }
-function $I(self) {
-	let $J = null;
-	if (self[1] < self[0].length) {
-		const value = __clone(__at(self[0], self[1]));
-		self[1] = self[1] + 1;
-		$J = [ 0, value ];
-	} else {
-		$J = [ 1 ];
-	}
-	return $J;
-}
 function $F(self) {
 	const $H = next(self[0]);
 	let $L = null;
 	if ($H[0] === 0) {
-		const $K = $I(self[1]);
+		const $K = $k(self[1]);
 		if ($K[0] === 0) {
 			return [ 0, [ $H[1], $K[1] ] ];
 		}
@@ -238,7 +227,7 @@ function $U(self) {
 	return [ self, 0 ];
 }
 function $V(self) {
-	const $W = $I(self[0]);
+	const $W = $k(self[0]);
 	if ($W[0] === 0) {
 		const index = self[1];
 		self[1] = index + 1;
@@ -340,7 +329,7 @@ function $at(self) {
 	return self[0].size;
 }
 function $aw(self) {
-	const $ax = $I(self[0]);
+	const $ax = $k(self[0]);
 	if ($ax[0] === 0) {
 		return [ 0, self[1]($ax[1]) ];
 	}

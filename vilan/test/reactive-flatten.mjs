@@ -217,24 +217,8 @@ function $C(self, observer) {
 	observer($h(self));
 	return subscription;
 }
-function $H(signal, observer) {
-	const id = fresh_id();
-	const cell = signal[0];
-	signal[1].v.push([ id, () => {
-		const $I = [ 0, cell ];
-		let $J = null;
-		if ($I[0] === 0) {
-			const live = $I[1];
-			$J = observer(live.v);
-		} else {
-			$J = undefined;
-		}
-		return $J;
-	} ]);
-	return [ signal[1], id, __shared_new([ 1 ]) ];
-}
 function $G(self, observer) {
-	const subscription = $H(self, observer);
+	const subscription = $D(self, observer);
 	observer($h(self));
 	return subscription;
 }
@@ -307,31 +291,9 @@ function $V(self, value, $t) {
 	self[0].v = __clone(value);
 	$W(self, $t);
 }
-function $ag(self, $v) {
-	const $ah = $v;
-	let $ai = null;
-	if ($ah[0] === 0) {
-		const turn = $ah[1];
-		$ai = enqueue(turn, self[1].v);
-	} else {
-		const $aj = $z(draining_turns.v);
-		let $ak = null;
-		if ($aj[0] === 0) {
-			const draining = $aj[1];
-			$ak = enqueue(draining, self[1].v);
-		} else {
-			for (const subscriber of self[1].v) {
-				subscriber[1]();
-			}
-			$ak = undefined;
-		}
-		$ai = $ak;
-	}
-	return $ai;
-}
 function $af(self, value, $t) {
 	self[0].v = __clone(value);
-	$ag(self, $t);
+	$W(self, $t);
 }
 function $al(self, observer) {
 	return $D(self, observer);

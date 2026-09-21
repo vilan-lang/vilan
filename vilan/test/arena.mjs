@@ -114,20 +114,6 @@ function $p(self) {
 	const $q = self;
 	return $q[0] === 0;
 }
-function $s(self, value) {
-	const $t = __list_pop(self[1]);
-	let $u = null;
-	if ($t[0] === 0) {
-		const index = $t[1];
-		__at(self[0], index)[1] = __clone(value);
-		$u = [ index, __at(self[0], index)[0] ];
-	} else {
-		const index2 = self[0].length;
-		self[0].push([ self[2], __clone(value) ]);
-		$u = [ index2, self[2] ];
-	}
-	return $u;
-}
 function $v(self, handle) {
 	let $x = null;
 	if ($g(self, handle)) {
@@ -161,10 +147,10 @@ console.log($i($f(numbers, a), __lazy("fallback", () => {
 	return -(1);
 })));
 let graph = $a();
-const leaf1 = $s(graph, [ 2, [  ] ]);
-const leaf2 = $s(graph, [ 3, [  ] ]);
+const leaf1 = $b(graph, [ 2, [  ] ]);
+const leaf2 = $b(graph, [ 3, [  ] ]);
 let root_edges = [  ];
 root_edges.push(leaf1);
 root_edges.push(leaf2);
-const root = $s(graph, [ 1, root_edges ]);
+const root = $b(graph, [ 1, root_edges ]);
 console.log(sum_from(graph, root));
