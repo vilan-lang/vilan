@@ -212,6 +212,20 @@ breaks out of never finishes, so the code after it is unreachable and a
 function that ends in one owes no return value. Iterating with `for _ in …`
 skips the binding.
 
+The header's binder is the same one `let` takes, so an element that is a
+tuple can be destructured right there:
+
+```vilan
+fun main() {
+	for (index, item) in ["a", "b"].iter().enumerate() {
+		print(i"{index}: {item}");
+	}
+}
+```
+
+Any other pattern in the header — a variant, a literal — is refused by
+name: bind the element and destructure it in the body.
+
 One more form matters once you care about performance:
 `for e in &mut list` iterates *views* of the elements so you can mutate
 them in place. That's a [memory model](memory-model.md) topic.

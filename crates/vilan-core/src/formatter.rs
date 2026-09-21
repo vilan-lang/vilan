@@ -7029,13 +7029,17 @@ impl<'src> Printer<'src> {
                 self.out.push(' ');
                 self.print_block(body);
             }
-            Node::ForIn(variable, iterable, body) => {
+            Node::ForIn(binder, iterable, body) => {
                 self.out.push_str("for ");
-                self.out.push_str(variable);
+                // The binder is `let`'s (B368), so it prints through the same
+                // `print_binder` a destructuring `let` uses: a name, or a
+                // tuple/array of them.
+                self.print_binder(&binder.0);
                 self.out.push_str(" in ");
-                // `for <name> in <iterable> {` is one measured line, and the
+                // `for <binder> in <iterable> {` is one measured line, and the
                 // ITERABLE is the only thing on it with a layout of its own —
-                // the binder is a name — so it takes the split permission the
+                // the binder is a name or a flat binder — so it takes the split
+                // permission the
                 // `for` condition and the `match` subject take (E147, E150
                 // rule B, E154). E150 rule B reached the two block-bearing
                 // heads it was written for and left the third sibling alone,
@@ -14258,6 +14262,25 @@ mod loop_and_match_head_layout {
              }\n",
             source,
         );
+    }
+
+    /// B368 — a binder pattern in the header reprints as written, through the
+    /// same `print_binder` a destructuring `let` uses. (The header's LAYOUT is
+    /// unchanged: the binder is still not a split site, the iterable is.)
+    #[test]
+    fn a_for_in_binder_pattern_reprints_as_written() {
+        let source = "fun demo(pairs: List<(i32, str)>) {\n\
+                      \tfor (number, label) in pairs {\n\
+                      \t\tlog(label);\n\
+                      \t}\n\
+                      \tfor ((left, right), label) in pairs {\n\
+                      \t\tlog(label);\n\
+                      \t}\n\
+                      \tfor [left, right] in pairs {\n\
+                      \t\tlog(\"x\");\n\
+                      \t}\n\
+                      }\n";
+        assert_construct(source, source);
     }
 
     /// A bare `for {` — the unconditional loop — has no condition to hand the

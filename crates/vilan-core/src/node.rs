@@ -676,9 +676,20 @@ pub enum Node<'src> {
         Option<Box<Spanned<Self>>>,
         Spanned<(NodeList<'src>, Box<Spanned<Self>>)>,
     ),
-    // `for item in iterable { .. }` — the binding name, the iterable, the body.
+    // `for item in iterable { .. }` — the element BINDER, the iterable, the
+    // body. The binder is `let`'s (B368/R5, spec §3.3's `binder`): a bare name,
+    // or a tuple/array pattern that destructures the element in the header.
+    // Anything else the binding grammar does not take is refused by name in
+    // `parse_for`, so only `Pattern::Binding`, `Pattern::Tuple` and
+    // `Pattern::Array` ever reach here.
+    //
+    // BOXED, for M53's reason and by its rule: a `Spanned<Pattern>` inline put
+    // this variant at 104 bytes and `Node` over the 96-byte ceiling
+    // `node_size.rs` pins — paid on every expression the parser returns. A
+    // `for` header is one per LOOP, so the allocation is in the same class as
+    // the item declarations M53 boxed by field.
     ForIn(
-        &'src str,
+        Box<Spanned<Pattern<'src>>>,
         Box<Spanned<Self>>,
         Spanned<(NodeList<'src>, Box<Spanned<Self>>)>,
     ),
@@ -1166,7 +1177,8 @@ impl<'src> Node<'src> {
                 }
                 visit_body(&body.0, visit);
             }
-            Node::ForIn(_, iterable, body) => {
+            Node::ForIn(binder, iterable, body) => {
+                visit_pattern(&binder.0, visit);
                 visit(iterable);
                 visit_body(&body.0, visit);
             }

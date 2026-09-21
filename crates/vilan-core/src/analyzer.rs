@@ -29060,28 +29060,35 @@ impl<'src> Analyzer<'src> {
             // `Expr::ForEach`); it iterates a JS-iterable (e.g. a `List`, which is
             // an array). Iterating a custom `Iterator` (the trait protocol) is not
             // supported yet — that needs trait dispatch.
-            Node::ForIn(variable, iterable, body) => {
+            Node::ForIn(binder, iterable, body) => {
                 let iterable_id = self.walk_expr_node(iterable, scope_id);
                 let body_scope_id = self.create_owned_scope(Some(scope_id)).id;
+                // A bare name is the element binding itself; a tuple or array
+                // binder (B368) binds a hidden element and DESTRUCTURES it in a
+                // prelude statement of the body, exactly as a tuple-bound
+                // parameter does (`walk_parameter`'s destructure). `_` and a
+                // binder the parser refused introduce nothing at all.
+                let (name, name_span) = match &binder.0 {
+                    Pattern::Binding(name, _, name_span) => (*name, *name_span),
+                    Pattern::Wildcard => ("_", binder.1),
+                    _ => ("_", binder.1),
+                };
+                let destructured = !matches!(binder.0, Pattern::Binding(..) | Pattern::Wildcard);
                 // The element binding's type is the iterable's element type when
                 // recoverable, else unknown (a `List` value erases its element
                 // type). `_` introduces no binding.
-                let item_id = (*variable != "_").then(|| {
+                let item_id = (name != "_" || destructured).then(|| {
                     let variable_id = self.new_entity_id();
                     // The binding starts `Unknown` (so a method call on it defers
                     // rather than erroring) and is resolved to the iterable's
                     // element type in the constraint loop, falling back to `any`
                     // for an iterable whose element type can't be recovered.
                     let element_type_id = Type::Unknown.get_type_id(self);
-                    // The binding name follows `for ` in the loop header.
-                    let header = node.1.into_range();
-                    let name_span: Span =
-                        (header.start + 4..header.start + 4 + variable.len()).into();
                     self.variables.insert(
                         variable_id,
                         Variable {
                             id: variable_id,
-                            name: variable,
+                            name,
                             name_span,
                             initial: None,
                             type_id: element_type_id,
@@ -29096,8 +29103,13 @@ impl<'src> Analyzer<'src> {
                     self.span_map.insert(variable_id, &node.1);
                     self.reference_count.entry(variable_id).or_insert(0);
                     // Visible from its name in the header on — i.e. throughout
-                    // the body, and shadowable by a `let` inside it.
-                    self.declare_scope_value(body_scope_id, variable, variable_id, name_span.end);
+                    // the body, and shadowable by a `let` inside it. A
+                    // destructuring binder's hidden element has no name to
+                    // declare: the names in scope are the pattern's, bound by
+                    // the prelude below.
+                    if !destructured {
+                        self.declare_scope_value(body_scope_id, name, variable_id, name_span.end);
+                    }
                     // `for e in &mut list` / `&list` — the iterable is a view, so
                     // each binding is a view of the element (write-through), not a
                     // copy. The element type still resolves below (a view is
@@ -29113,7 +29125,40 @@ impl<'src> Analyzer<'src> {
                     });
                     variable_id
                 });
-                let ids = self.walk_expr_nodes(&body.0.0, body_scope_id);
+                // The destructure prelude: one statement, ahead of the body's
+                // own, reading a REFERENCE to the hidden element (the variable
+                // entity is a declaration that emits no value) and binding the
+                // pattern's names for the rest of the iteration.
+                let mut ids = Vec::new();
+                if destructured && let Some(item_id) = item_id {
+                    let walked =
+                        self.walk_pattern(&binder.0, &binder.1, body_scope_id, binder.1.end);
+                    let reference_id = self.new_entity_id();
+                    self.expr_id_to_expr_map
+                        .insert(reference_id, Expr::Local(item_id));
+                    self.expr_id_to_scope_id_map
+                        .insert(reference_id, body_scope_id);
+                    self.span_map.insert(reference_id, &binder.1);
+                    let destructure_id = self.new_entity_id();
+                    self.span_map.insert(destructure_id, &binder.1);
+                    self.expr_id_to_scope_id_map
+                        .insert(destructure_id, body_scope_id);
+                    self.constraints
+                        .push(Constraint::Destructure(DestructureConstraint {
+                            id: destructure_id,
+                            value_id: reference_id,
+                            type_id: None,
+                            scope_id: body_scope_id,
+                            pattern: walked,
+                            // The element's type is `Unknown` until
+                            // `ForEachItem` resolves it from the iterable, so
+                            // the destructure waits for it exactly as a tuple
+                            // parameter waits for its argument.
+                            defer_until_known: true,
+                        }));
+                    ids.push(destructure_id);
+                }
+                ids.extend(self.walk_expr_nodes(&body.0.0, body_scope_id));
                 let expr_id = self.walk_expr_node(&body.0.1, body_scope_id);
                 // Decide native `for...of` vs the Iterator-protocol loop once the
                 // iterable's type is known (in `build`).
