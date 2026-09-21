@@ -105,6 +105,7 @@ guide/routing.md h2 deep-links-and-the-server
 guide/routing.md h2 traps
 guide/services.md h1 services--rpc
 guide/services.md h2 what-can-cross-the-wire-wire
+guide/services.md h3 a-method-with-nothing-to-say-void
 guide/services.md h2 naming-server-entities-handlet
 guide/services.md h2 what-rpc-calls-do
 guide/services.md h2 mirrors

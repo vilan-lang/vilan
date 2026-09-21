@@ -167,6 +167,47 @@ The codec is chosen at connect time: `json_codec()` for a readable wire,
 `binary_codec()` for a compact one. Client and server must use the same
 one.
 
+### A method with nothing to say: `void`
+
+One return type is not Wire and does not have to be. An `[rpc]` method
+that returns *nothing* — write no return type, or write `: void`, they
+mean the same thing — has no reply payload to encode, so its reply is
+just the acknowledgement, and the generated stub **waits for it**:
+
+```vilan,fragment
+[rpc]
+fun remove_row(self, id: i53) {
+	self.rows.update(|&mut rows| { … });
+}
+```
+
+The stub answers `Option<RpcError>`: `None` is the ack, `Some(error)` is
+a call that did not land.
+
+```vilan,fragment
+// Wait and check.
+match client.remove_row(id) {
+	None => {},
+	Some(let error) => print(i"remove failed: {error.debug()}"),
+}
+
+// Wait and don't check — still a round trip, the value discarded.
+let _ = client.remove_row(id);
+```
+
+It is `Option<RpcError>` rather than `Result<void, RpcError>` for a
+plain reason: Vilan has no unit literal, so there is no `Ok(())` to
+write.
+
+**This is not a notification, and the difference is the wait.** A
+notification (`[client_service]`, or the server's
+`connection.client().…`) returns as soon as the request is sent: no
+wait, no failure, nothing that orders it against what comes next. An
+awaited `void` means *it happened* — the handler ran to completion on
+the server before the stub returned, so the next call sees its effect.
+Reach for `void` when you need the ordering and have nothing to report,
+and for a notification when you need neither.
+
 ## Naming server entities: `Handle<T>`
 
 Payloads carry *data*. When a client needs to talk about a thing the
@@ -1188,11 +1229,15 @@ let client = KoltClient::connect(url, json_codec())!.with_handlers(handlers);
 ```
 
 **Notifications only, in this version.** A `[client_service]` method
-declares no return type and is refused if it does. A server→client
+declares no return type and is refused if it does — `: void` included,
+which is the one place that spelling is not interchangeable with
+omission. A server→client
 notification has no reply lane to settle on and no pending table to
-correlate with, so there is nothing for a value to come back through —
-`self.client.session_revoked(reason)` is synchronous, returns nothing,
-and cannot fail visibly. If the client must answer, have its handler call
+correlate with, so there is nothing for a value to come back through,
+and nothing to *wait* for either: `self.client.session_revoked(reason)`
+is synchronous, returns nothing,
+and cannot fail visibly. That is why the awaited `void` above is a
+server-side shape only. If the client must answer, have its handler call
 back on the connection it already holds.
 
 Both attributes on one struct is peer-to-peer, and needs no new spelling:

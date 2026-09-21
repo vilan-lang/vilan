@@ -3250,10 +3250,25 @@ fn a_hand_written_async_route_dispatches_through_respond() {
 }
 
 #[test]
-fn rpc_rejects_a_missing_return() {
-    // A void `[rpc]` method has no reply payload to encode — the return must be a
-    // declared Wire type (fire-and-forget needs its own design).
-    assert_fails(
+fn rpc_admits_a_missing_return() {
+    // WAS `rpc_rejects_a_missing_return`, and A107 (R6) is why it turned over:
+    // a void `[rpc]` method has no reply PAYLOAD, which is not the same as
+    // having no reply. The reply is the ack envelope the protocol already
+    // writes, the generated stub awaits it, and `Option<RpcError>` is what it
+    // hands back — so the method a caller must WAIT for but that has nothing to
+    // report is finally spellable (kolt's `store.vl` wrote `bool` for it).
+    //
+    // The old comment's parenthesis — "fire-and-forget needs its own design" —
+    // is answered too, and answered separately: A75's `notify` is
+    // fire-and-forget, this is not, and `rpc.vl`'s `send_notification` and
+    // `call_ack` are the two calls side by side.
+    //
+    // What this pins HERE is the narrowest thing: the signature check admits
+    // it. The rule's other three faces are in `traits.rs` (both spellings, the
+    // non-Wire control, the `[client_service]` control) and its behaviour —
+    // the ack arriving only after the handler ran — is
+    // `service_layer.rs::an_awaited_void_rpc_acks_after_its_handler_ran`.
+    assert_compiles(
         r#"
         struct Service {}
         impl Service {

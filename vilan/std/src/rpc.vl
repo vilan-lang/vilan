@@ -1379,15 +1379,23 @@ export fun reply<T: Wire>(value: T): RpcOutcome {
 	RpcOutcome::Success(|mut serializer: Serializer| value.describe(&mut serializer))
 }
 
-/// A NOTIFICATION route's outcome (`transport-rpc.md` §9.3, R4): run the
-/// handler, then answer with the ack envelope its `void` return has no payload
-/// for.
+/// A VOID route's outcome: run the handler to completion, then answer with the
+/// ack envelope its `void` return has no payload for.
 ///
-/// The protocol always replies (`RpcProtocol::respond`), so a notification needs
-/// SOMETHING to encode; `true` is the smallest honest thing — "it ran". Nothing
-/// reads it on the `s:` lane, which has no reverse reply lane at all; the
-/// forward lane's `send_notification` drops it too, and it exists so that a
-/// method's route shape does not depend on which direction called it.
+/// One route shape serves both void calls, and that is the point (§9.3 R4,
+/// A107): a notification (`[client_service]`, or a peer's reverse direction)
+/// and an AWAITED void differ only in whether the CALLER waits for this reply,
+/// never in what the server does with the request. The handler is awaited here
+/// either way — an awaited void means "it happened", and it would mean nothing
+/// if the ack could overtake the handler.
+///
+/// The protocol always replies (`RpcProtocol::respond`), so a void route needs
+/// SOMETHING to encode; `true` is the smallest honest thing — "it ran", the
+/// empty `Ok` of the body A107 asks for, and it costs the envelope one byte of
+/// JSON rather than putting a payload-less value into `Serialize`'s vocabulary.
+/// A notification's caller drops it (`send_notification`); an awaited void's
+/// caller reads the ENVELOPE and not the value (`call_ack`), so neither side
+/// depends on the `true` being a `true`.
 fun notified(run: async || void): RpcOutcome {
 	run();
 	RpcOutcome::Success(|mut serializer: Serializer| true.describe(&mut serializer))
@@ -1410,6 +1418,39 @@ fun send_notification<Tx: Transport>(
 	let _sent = async {
 		let _outcome: Result<bool, RpcError> = call(transport, codec, method, args);
 	};
+}
+
+/// An AWAITED VOID call (A107, R6): issue the request, wait for the ack, and
+/// answer `None` — or `Some(error)` when the call did not land.
+///
+/// This is `send_notification`'s opposite number, and the difference is the
+/// whole of why `void` is admitted as an rpc return at all. A notification is
+/// "it was sent": no wait, no failure. An awaited void is "it happened": the
+/// handler ran to completion on the server before this returns, and a dropped
+/// connection or a decode failure comes back rather than vanishing. A method
+/// with nothing to SAY and something to WAIT FOR — kolt's `remove_message` —
+/// had neither shape before and wrote `bool` for the wait.
+///
+/// The answer is `Option<RpcError>` and not `Result<void, RpcError>` because
+/// vilan has no unit literal: `Ok(())` does not parse, so a `Result` whose
+/// success arm is `void` has no constructible `Ok`. `None`-is-fine reads the
+/// same way at a call site that only wants the wait (`client.remove(id);`
+/// awaits and discards) and the same way at one that wants the failure.
+///
+/// The reply's `true` body is `notified`'s ack and is deliberately not read:
+/// what the ENVELOPE was — `Success` or `Failure` — is the whole answer, so
+/// the body could be anything and this would still be right.
+fun call_ack<Tx: Transport>(
+	transport: Tx,
+	codec: Codec,
+	method: str,
+	args: List<|Serializer| void>,
+): Option<RpcError> {
+	let outcome: Result<bool, RpcError> = call(transport, codec, method, args);
+	match outcome {
+		Ok(let _ran) => None,
+		Err(let error) => Some(error),
+	}
 }
 
 /// Reply with a HANDLE: export `source` on the connection this request arrived
@@ -5491,13 +5532,34 @@ export macro fun service(item: Item): Source {
 			None => method.return_type.render(),
 		};
 		stub_index = stub_index + 1;
-		// A `void` [rpc] method is a NOTIFICATION in both directions (R4): the
-		// forward stub starts the request and drops the reply, so it is sync and
-		// void exactly like the reverse proxy's method for the same declaration.
-		// This is what lets a peer-to-peer struct — both attributes, one method
-		// set — be called from either end without a second spelling.
+		// A `void` [rpc] method's forward stub, and which of the two void calls
+		// it is depends on WHOSE method it is.
+		//
+		// On a struct carrying `[client_service]` it is a NOTIFICATION in both
+		// directions (R4): the forward stub starts the request and drops the
+		// reply, so it is sync and void exactly like the reverse proxy's method
+		// for the same declaration. This is what lets a peer-to-peer struct —
+		// both attributes, one method set — be called from either end without a
+		// second spelling, and it is forced rather than chosen: the `s:` lane
+		// has no reverse reply lane, so there is no ack for that direction's
+		// caller to await.
+		//
+		// On a pure server `[service]` it is an AWAITED VOID (A107, R6): the
+		// stub issues the call, waits for the ack, and answers with the failure
+		// if there was one (`Option<RpcError>`; `call_ack` says why not a
+		// `Result`). A method with nothing to report and something to wait for
+		// is the shape kolt's `remove_message` wrote `bool` for, and A75's
+		// `notify` already covers the fire-and-forget half — so admitting void
+		// as "it happened" adds the call that was missing rather than a second
+		// spelling of one that was not.
 		if method.return_type.render() == "void" {
-			stub = stub.expr(i"rpc::send_notification(self.transport, self.codec, {label}, [{describer_list}])");
+			if target.client_side {
+				stub = stub.expr(i"rpc::send_notification(self.transport, self.codec, {label}, [{describer_list}])");
+			} else {
+				stub = stub
+					.returns("Option<RpcError>")
+					.expr(i"rpc::call_ack(self.transport, self.codec, {label}, [{describer_list}])");
+			}
 		} else if kind == "" {
 			stub = stub
 				.returns(i"Result<{mapped}, RpcError>")

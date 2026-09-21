@@ -1123,3 +1123,109 @@ fun run_client(url: str) {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A107's other leg: an awaited `void` `[rpc]` method over the CONNECTIONLESS
+/// `{mount}rpc` POST route, where a handle-returning method cannot be served
+/// at all.
+///
+/// This is the pair worth having beside `a_handle_method_over_the_connectionless
+/// _post_leg_fails_naming_the_method`. A handle's reply is a channel id minted
+/// in a connection's capability table and the POST leg holds no connection, so
+/// that method fails by construction. A void method needs NOTHING from the
+/// connection: its reply is the ack envelope, so it is served over the POST leg
+/// exactly as a plain method is, and the client waits for the ack over one
+/// request/response pair with no socket anywhere.
+///
+/// Which also says what the ack IS: not a socket-level acknowledgement, but the
+/// reply frame the protocol always writes (`RpcProtocol::respond`). Whatever
+/// carries a reply carries this one.
+#[test]
+fn an_awaited_void_rpc_is_served_over_the_connectionless_post_leg() {
+    let dir = temp_project("void_over_post");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Ok, Err };
+import std::option::Option::{ self, None, Some };
+import std::json::json_codec;
+import std::rpc::HttpTransport;
+import std::http::Server;
+import std::rpc_server::Service;
+
+[service(LedgerClient)]
+struct Ledger {
+	rows: SignalCell<List<i53>>,
+}
+
+impl Ledger {
+	[rpc]
+	fun drop_row(self, id: i53) {
+		self.rows.update(|&mut rows| {
+			if rows.index_of(id) is Some(let index) {
+				rows.remove(index);
+			}
+		});
+	}
+
+	[rpc]
+	fun count(self): i32 {
+		self.rows.get().len()
+	}
+}
+
+fun main() {
+	let ledger = Ledger { rows = Signal::new([1i53, 2i53, 3i53]) };
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(ledger.dispatcher().into_protocol(json_codec())))
+		.on_start(|server| run_client(i"{server.url()}rpc"))
+		.build()
+		.start();
+}
+
+fun run_client(url: str) {
+	// No `reactive` field: this service exposes nothing and returns no handle,
+	// so its generated client is the transport and the codec — which is the
+	// whole surface an awaited void needs.
+	let client = LedgerClient {
+		transport = HttpTransport { url = url },
+		codec = json_codec(),
+	};
+	print(i"before {client.count().unwrap_or(0)}");
+	match client.drop_row(2i53) {
+		None => print("acked"),
+		Some(let error) => print(i"failed {error.to_json()}"),
+	}
+	print(i"after {client.count().unwrap_or(0)}");
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("before 3"),
+        "the POST leg must answer the plain method first:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("acked"),
+        "an awaited void must be served over the connectionless POST leg — its \
+         reply is the ack envelope and needs no connection:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("after 2"),
+        "the void handler must have run before the ack the client waited for:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("failed "),
+        "the void call over the POST leg reported a failure:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

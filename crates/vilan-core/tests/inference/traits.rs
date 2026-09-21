@@ -4022,6 +4022,129 @@ fn b284_a_client_service_only_struct_without_an_expose_still_compiles() {
     );
 }
 
+// --- A107 (R6): a `void` `[rpc]` return -------------------------------------
+
+/// A107: a `[rpc]` method that returns NOTHING is admitted, in both of void's
+/// spellings — the omitted return type and an explicit `: void`.
+///
+/// It is the one return type that is not Wire and does not have to be: there
+/// is no reply PAYLOAD, so the reply is the ack envelope the protocol already
+/// writes and the generated stub awaits it (`rpc::call_ack`, answering
+/// `Option<RpcError>`). Before this, both spellings were refused — the omitted
+/// one as "must declare a Wire type", the written one as "`void`, which is not
+/// Wire" — and kolt's `store.vl` wrote `bool` for a method with nothing to
+/// report, with a FIXME naming this item.
+///
+/// The end-to-end behaviour, including the ordering that distinguishes this
+/// from a notification, is `service_layer.rs`'s
+/// `an_awaited_void_rpc_acks_after_its_handler_ran`; this is the admission.
+#[test]
+fn a107_a_void_rpc_return_is_admitted_in_both_spellings() {
+    for source in [
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        [service(StoreClient)]
+        struct Store { rows: SignalCell<i32> }
+        impl Store {
+            [rpc]
+            fun bump(self, by: i32) { self.rows.set(self.rows.get() + by); }
+        }
+        fun main() { print(Store { rows = Signal::new(0) }.contract_hash()); }
+        main();
+        "#,
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+        [service(StoreClient)]
+        struct Store { rows: SignalCell<i32> }
+        impl Store {
+            [rpc]
+            fun bump(self, by: i32): void { self.rows.set(self.rows.get() + by); }
+        }
+        fun main() { print(Store { rows = Signal::new(0) }.contract_hash()); }
+        main();
+        "#,
+    ] {
+        assert_compiles(source);
+    }
+}
+
+/// The first control: admitting `void` widened NOTHING else. A return type
+/// that is a real type and is not Wire is refused exactly as before, in the
+/// same words.
+#[test]
+fn a107_a_non_wire_rpc_return_is_still_refused() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        struct Opaque { body: || void }
+        [service(StoreClient)]
+        struct Store { name: str }
+        impl Store {
+            [rpc]
+            fun look(self): Opaque { Opaque { body = || {} } }
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "of `[rpc]` method `look` is `Opaque`, which is not Wire",
+    );
+}
+
+/// The second control, and the one that says where the two void calls part: on
+/// a `[client_service]` subject a DECLARED return type is still refused,
+/// `void` included, because omission is that direction's only legal spelling.
+///
+/// This is not an oversight and it is not a narrower rule than the server's.
+/// The `s:` lane has no reverse reply lane at all (§9.3, R4), so there is no
+/// ack for that direction's caller to await — a client-side `[rpc]` method is
+/// a notification, and the refusal's own steer ("Drop the return type") is
+/// exactly right for someone who wrote `: void` there.
+#[test]
+fn a107_a_void_return_on_a_client_service_is_still_the_notification_refusal() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        [client_service]
+        struct Handlers { tag: str }
+        impl Handlers {
+            [rpc]
+            fun revoked(self, reason: str): void { print(reason); }
+        }
+        fun main() { print(Handlers { tag = "h" }.contract_hash()); }
+        main();
+        "#,
+        "but a `[client_service]` method is a NOTIFICATION",
+    );
+}
+
+/// Ledger row 5 (`{label} of \x60[rpc]\x60 method \x60{method_name}\x60 must declare a
+/// Wire type`) is still REACHABLE after A107 took the return type off it: an
+/// unannotated PARAMETER is what it now speaks about, and that is a shape a
+/// person writes.
+///
+/// Pinned because the widening could have retired a message silently, and a
+/// ledger row whose text lives in the tree but whose firing does not is the
+/// defect N98's family exists to find.
+#[test]
+fn a107_the_declare_a_wire_type_refusal_still_reaches_an_unannotated_parameter() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        [service(StoreClient)]
+        struct Store { name: str }
+        impl Store {
+            [rpc]
+            fun keep(self, row) { print("kept"); }
+        }
+        fun main() { print("store"); }
+        main();
+        "#,
+        "must declare a Wire type",
+    );
+}
+
 // --- B285: `[expose(keyed = K)]` over a `KeyedCell<K2, T>` ------------------
 
 /// B285: the `KeyedCell<K, T>` twin of A56/R6 — the field names its key twice
