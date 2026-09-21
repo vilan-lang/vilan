@@ -191,7 +191,9 @@ pub fn plan(program: &Program<'_>) -> ChunkPlan {
             .is_none_or(|source| program.std_sources.contains(&source))
         {
             // Std is never chunked — it is the shared runtime, eager by
-            // residence (and mostly tree-shaken anyway). App code is
+            // residence (and mostly tree-shaken anyway; `std_sources` is the
+            // residence set, E198, so an overlaid std copy is still std here).
+            // App code is
             // chunkable wherever it lives: entry-only would plan ZERO chunks
             // for the common real shape (pages in a `views` module — the
             // walkthrough example), which S1's sweep caught.

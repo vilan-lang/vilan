@@ -1109,9 +1109,13 @@ fn analyze(
     // user territory and anchors at itself). The anchoring walk (A2/E74) and
     // hop labeling (E78) both go through this one predicate, so std and
     // dependencies demote and trace identically.
+    //
+    // E198: `frozen_sources`, not `std_sources` — the disk-only half is the one
+    // that carries the overlay rule this comment states, and it is exactly the
+    // rule `dependency_sources` beside it already follows.
     let library_spanned = |id: Id| -> bool {
         program.source_of(id).is_some_and(|source| {
-            program.std_sources.contains(&source) || program.dependency_sources.contains(&source)
+            program.frozen_sources.contains(&source) || program.dependency_sources.contains(&source)
         })
     };
     // Whether a dispatch site can actually select `candidate` — the

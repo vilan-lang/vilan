@@ -164,15 +164,19 @@ fn a_splittable_route_match_still_compiles_to_one_playground_bundle() {
 /// The stance above, guarded at its cause rather than at its symptom: the
 /// playground's compile path must never reach the split emitter.
 ///
-/// The output pin alone cannot see this. `chunks::plan` recognizes nothing in
-/// the playground anyway — `embedded_std_spec` hand-builds its package spec and
-/// leaves `Program::std_sources` EMPTY, so `View` does not read as std-resident
-/// and the `swap` recognizer finds no site — which means swapping `transform`
-/// for `transform_split` here would today produce the same single string and
-/// pass unnoticed. It would also be a trap: the residence rules in `chunks.rs`
-/// ("std is never chunked") all read the other way under an empty
-/// `std_sources`, so the day that spec learns to mark std, a playground wired
-/// to the split emitter would start chunking the standard library.
+/// The output pin alone cannot see this. Until E198 `chunks::plan` recognized
+/// nothing in the playground at all: `Program::std_sources` was the S1 FROZEN
+/// set, the embedded toolchain lives in the document overlay and an overlaid
+/// source is never frozen, so `View` did not read as std-resident and the
+/// `swap` recognizer found no site. Swapping `transform` for `transform_split`
+/// here would have produced the same single string and passed unnoticed.
+///
+/// E198 split residence from freezing, so the playground now DOES record its
+/// std sources and `chunks.rs`'s residence rules ("std is never chunked") read
+/// the right way there — which is what this pin was written against. The
+/// stance is unchanged and the guard stays at the cause: `split` is a
+/// `vilan build` decision and the playground's compile path must not reach the
+/// split emitter at all.
 #[test]
 fn the_playground_compile_path_never_calls_the_split_emitter() {
     let source = include_str!("../src/lib.rs");
@@ -181,6 +185,51 @@ fn the_playground_compile_path_never_calls_the_split_emitter() {
         "`split` is a `vilan build` decision: the playground has no manifest to \
          declare it in, a single-string `CompileResult` to carry it, and an \
          opaque-origin srcdoc frame that cannot resolve a chunk's relative import"
+    );
+}
+
+/// E198: a diagnostic whose steer is keyed on STD RESIDENCE fires in the
+/// playground too.
+///
+/// The A99 steer is the reader: it names the free slot value that replaced a
+/// retired `View` method, and it only fires on std's OWN `View` (a user type
+/// with a `bind_each` of its own must not be told it retired one). The
+/// residence test used to read `Program::std_sources`, which was the S1 FROZEN
+/// set — and the playground's whole toolchain lives in the document overlay,
+/// where nothing is ever frozen. So the playground answered the bare
+/// `View has no method 'swap'` and swallowed the one sentence that says what to
+/// write instead, for every visitor migrating an Order-36-era snippet.
+#[test]
+fn a_retired_view_method_carries_the_a99_steer_in_the_playground() {
+    let output = compile(
+        "import std::reactive::{ Signal, SignalCell };\n\
+         import std::ui::{ View, mount_root, view };\n\
+         \n\
+         fun main() {\n\
+         \tlet tab: SignalCell<i32> = Signal::new(1);\n\
+         \tlet _root = mount_root(\"app\", || view(\"div\")\n\
+         \t\t.swap(tab, |value: i32| view(\"section\").text(i\"p{value}\")));\n\
+         }\n",
+    );
+    let steered = output
+        .diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("is no longer a `View` method (A99)")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the playground must carry the A99 steer, got: {:#?}",
+                output.diagnostics
+            )
+        });
+    assert!(
+        steered.message.contains("write `child(swap(..))`")
+            && steered.message.contains("`{swap(..)}` in a child hole"),
+        "the steer spells BOTH replacements: {}",
+        steered.message
     );
 }
 
