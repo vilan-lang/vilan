@@ -3726,7 +3726,7 @@ fn hand_written_wire_impls_round_trip_through_json() {
         }
 
         impl Status with Wire {
-            fun describe<S: Serialize>(self, serializer: S) {
+            fun describe<S: Serialize>(self, serializer: &mut S) {
                 match self {
                     Status::Offline => {
                         serializer.begin_variant("Offline", 0);
@@ -3746,7 +3746,7 @@ fn hand_written_wire_impls_round_trip_through_json() {
                 }
             }
 
-            fun rebuild<D: Deserialize>(deserializer: D): Status {
+            fun rebuild<D: Deserialize>(deserializer: &mut D): Status {
                 let tag = deserializer.variant_tag();
                 match tag {
                     "Offline" => {
@@ -3784,7 +3784,7 @@ fn hand_written_wire_impls_round_trip_through_json() {
         }
 
         impl Profile with Wire {
-            fun describe<S: Serialize>(self, serializer: S) {
+            fun describe<S: Serialize>(self, serializer: &mut S) {
                 serializer.begin_struct(5);
                 serializer.field("id");
                 self.id.describe(serializer);
@@ -3799,7 +3799,7 @@ fn hand_written_wire_impls_round_trip_through_json() {
                 serializer.end_struct();
             }
 
-            fun rebuild<D: Deserialize>(deserializer: D): Profile {
+            fun rebuild<D: Deserialize>(deserializer: &mut D): Profile {
                 deserializer.begin_struct();
                 deserializer.field("id");
                 let id = i32::rebuild(deserializer);
@@ -7102,8 +7102,8 @@ fn b244_a_conditional_impl_through_two_generic_parameters_reaches_its_member() {
         import std::wire::{ Wire, Delta, Serializer, Frame };
         import std::json::json_codec;
 
-        fun narrate<K: Wire, T: Wire>(ops: List<Delta<K, T>>, serializer: Serializer) {
-            ops.describe(serializer);
+        fun narrate<K: Wire, T: Wire>(ops: List<Delta<K, T>>, mut serializer: Serializer) {
+            ops.describe(&mut serializer);
         }
 
         fun main() {
@@ -7134,8 +7134,8 @@ fn b244_maps_conditional_wire_impl_takes_the_same_path() {
         import std::map::Map;
         import std::hash::Hashable;
 
-        fun narrate<K: Hashable + Wire, V: Wire>(rows: List<Map<K, V>>, serializer: Serializer) {
-            rows.describe(serializer);
+        fun narrate<K: Hashable + Wire, V: Wire>(rows: List<Map<K, V>>, mut serializer: Serializer) {
+            rows.describe(&mut serializer);
         }
 
         fun main() {
@@ -7168,8 +7168,8 @@ fn b244_two_instantiations_of_the_same_nested_conditional_impl_stay_apart() {
         import std::wire::{ Wire, Delta, Serializer, Frame };
         import std::json::json_codec;
 
-        fun narrate<K: Wire, T: Wire>(ops: List<Delta<K, T>>, serializer: Serializer) {
-            ops.describe(serializer);
+        fun narrate<K: Wire, T: Wire>(ops: List<Delta<K, T>>, mut serializer: Serializer) {
+            ops.describe(&mut serializer);
         }
 
         fun main() {
@@ -7203,8 +7203,8 @@ fn b244_one_generic_parameter_nested_in_a_constructor_is_the_same_hole() {
         import std::wire::{ Wire, Serializer, Frame };
         import std::json::json_codec;
 
-        fun narrate<T: Wire>(ops: List<Option<T>>, serializer: Serializer) {
-            ops.describe(serializer);
+        fun narrate<T: Wire>(ops: List<Option<T>>, mut serializer: Serializer) {
+            ops.describe(&mut serializer);
         }
 
         fun main() {
@@ -7234,8 +7234,8 @@ fn b244_a_bare_generic_receiver_still_grounds() {
         import std::wire::{ Wire, Serializer, Frame };
         import std::json::json_codec;
 
-        fun narrate<T: Wire>(items: List<T>, serializer: Serializer) {
-            items.describe(serializer);
+        fun narrate<T: Wire>(items: List<T>, mut serializer: Serializer) {
+            items.describe(&mut serializer);
         }
 
         fun main() {

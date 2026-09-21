@@ -503,7 +503,7 @@ fun main() {{
 	let reactive = ReactiveClient::new(bridge(split), json_codec());
 	let transport = HttpTransport {{ url = i"{{base}}/rpc" }};
 	let connection = split.connection;
-	let attached: Result<i32, RpcError> = call(transport, json_codec(), "attach", [|s: Serializer| connection.describe(s)]);
+	let attached: Result<i32, RpcError> = call(transport, json_codec(), "attach", [|mut s: Serializer| connection.describe(&mut s)]);
 	match attached {{
 		Ok(let channel) => {{
 			let mirror: RemoteSource<i32> = reactive.source(channel);
@@ -540,7 +540,7 @@ fun main() {{
         "src/main.vl",
         &watcher(
             "survivor",
-            "\tlet by = 5;\n\tlet added: Result<i32, RpcError> = call(transport, json_codec(), \"add\", [|s: Serializer| by.describe(s)]);\n\tmatch added {\n\t\tOk(let n) => print(i\"add -> {n}\"),\n\t\tErr(let error) => print(i\"add err {error.to_json()}\"),\n\t}\n\tsleep(300);\n",
+            "\tlet by = 5;\n\tlet added: Result<i32, RpcError> = call(transport, json_codec(), \"add\", [|mut s: Serializer| by.describe(&mut s)]);\n\tmatch added {\n\t\tOk(let n) => print(i\"add -> {n}\"),\n\t\tErr(let error) => print(i\"add err {error.to_json()}\"),\n\t}\n\tsleep(300);\n",
         ),
     );
 

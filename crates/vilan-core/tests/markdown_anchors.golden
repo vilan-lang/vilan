@@ -341,6 +341,7 @@ std/dev.md h2 stash--take
 std/encoding.md h1 encoding-reference
 std/encoding.md h2 json
 std/encoding.md h2 the-wire-layer-stdwire
+std/encoding.md h3 writing-a-wire-impl-by-hand
 std/encoding.md h3 keyed-collections
 std/encoding.md h3 backed-enums-on-the-wire
 std/encoding.md h2 bytes

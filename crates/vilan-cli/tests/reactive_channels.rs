@@ -354,7 +354,7 @@ fun main() {
 	let (client_end, server_end) = logged_pair("gen");
 	register_session(1, server_end, json_codec());
 	let transport = local_rpc(cell_store.dispatcher().into_protocol(json_codec()));
-	let attached: Result<List<i32>, RpcError> = call(transport, json_codec(), "__attach", [|serializer: Serializer| 1.describe(serializer)]);
+	let attached: Result<List<i32>, RpcError> = call(transport, json_codec(), "__attach", [|mut serializer: Serializer| 1.describe(&mut serializer)]);
 	let channels = attached.unwrap_or([]);
 	print(i"gen-channel:{channels[0]}");
 	let client = ReactiveClient::new(client_end, json_codec());
@@ -1134,10 +1134,10 @@ fun main() {
 	// error: the op is not applied, and the mirror says so once.
 	let codec = json_codec();
 	let stray: List<Delta<str, Row>> = [Delta::Update("zzz", Row { id = "zzz", value = 9 })];
-	wire_end.send(encode_patch(codec, channel, |serializer: Serializer| {
+	wire_end.send(encode_patch(codec, channel, |mut serializer: Serializer| {
 		serializer.begin_list(stray.len());
 		for op in stray {
-			op.describe(serializer);
+			op.describe(&mut serializer);
 		}
 		serializer.end_list();
 	}));
@@ -1146,10 +1146,10 @@ fun main() {
 
 	// Sticky: the first fault is the one kept.
 	let second: List<Delta<str, Row>> = [Delta::Remove("yyy")];
-	wire_end.send(encode_patch(codec, channel, |serializer: Serializer| {
+	wire_end.send(encode_patch(codec, channel, |mut serializer: Serializer| {
 		serializer.begin_list(second.len());
 		for op in second {
-			op.describe(serializer);
+			op.describe(&mut serializer);
 		}
 		serializer.end_list();
 	}));
@@ -1597,7 +1597,7 @@ fun main() {
 	let (gen_client_end, gen_server_end) = logged_pair("gen");
 	register_session(1, gen_server_end, json_codec());
 	let transport = local_rpc(store.dispatcher().into_protocol(json_codec()));
-	let attached: Result<List<i32>, RpcError> = call(transport, json_codec(), "__attach", [|serializer: Serializer| 1.describe(serializer)]);
+	let attached: Result<List<i32>, RpcError> = call(transport, json_codec(), "__attach", [|mut serializer: Serializer| 1.describe(&mut serializer)]);
 	let channels = attached.unwrap_or([]);
 	print(i"gen-channel:{channels[0]}");
 	let gen_client = ReactiveClient::new(gen_client_end, json_codec());

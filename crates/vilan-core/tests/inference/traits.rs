@@ -36,7 +36,7 @@ const OUTCOME_WIRE_IMPL: &str = r#"
         }
 
         impl Outcome<type T: Wire, type E: Wire> with Wire {
-            fun describe<S: Serialize>(self, serializer: S) {
+            fun describe<S: Serialize>(self, serializer: &mut S) {
                 match self {
                     Outcome::Good(let value) => {
                         serializer.begin_variant("Good", 1);
@@ -51,7 +51,7 @@ const OUTCOME_WIRE_IMPL: &str = r#"
                 }
             }
 
-            fun rebuild<D: Deserialize>(deserializer: D): Outcome<T, E> {
+            fun rebuild<D: Deserialize>(deserializer: &mut D): Outcome<T, E> {
                 let tag = deserializer.variant_tag();
                 match tag {
                     "Good" => {
@@ -4651,11 +4651,11 @@ fn wire_impl_service() -> String {
         struct Opaque {{ body: || void }}
         struct Phantom<T> {{ count: i53 }}
         impl Phantom<type T> with Wire {{
-            fun describe<S: Serialize>(self, serializer: S) {{
+            fun describe<S: Serialize>(self, serializer: &mut S) {{
                 self.count.describe(serializer);
             }}
 
-            fun rebuild<D: Deserialize>(deserializer: D): Phantom<T> {{
+            fun rebuild<D: Deserialize>(deserializer: &mut D): Phantom<T> {{
                 Phantom {{ count = i53::rebuild(deserializer) }}
             }}
         }}

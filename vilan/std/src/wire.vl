@@ -12,6 +12,16 @@
 // the traits by delegating to their fields, so the RPC seam rides them
 // unchanged while direct entry points (`encode_json`, `encode_binary`) skip
 // them entirely.
+//
+// A visitor is MUTATED as a value narrates itself to it, and the receivers say
+// so: every `Serialize`/`Deserialize` method takes `&mut self`, and
+// `Wire::describe`/`rebuild` take the visitor as `&mut S`/`&mut D` (A108).
+// That is what lets a codec's writer keep its state in PLAIN FIELDS — a
+// by-value `self` forced `JsonWriter`/`BinaryWriter` to hold every field in a
+// `Shared` cell just so a method could write one (signal-cell-representation.md
+// §2.4's frame-scoped class, ten cells of it). Forwarding is bare: inside a
+// `describe` body the parameter already IS the view, so `element.describe(
+// serializer)` passes it along rather than re-taking it.
 
 import pkg::bytes::Bytes;
 import pkg::hash::Hashable;
@@ -24,43 +34,43 @@ export *;
 /// The write half of the visitor: what a codec's writer implements. See
 /// `Serializer` (the record) for the call-by-call protocol notes.
 trait Serialize {
-	fun begin_struct(self, fields: i32);
-	fun field(self, name: str);
-	fun end_struct(self);
-	fun begin_list(self, length: i32);
-	fun end_list(self);
-	fun begin_variant(self, name: str, arity: i32);
-	fun end_variant(self);
-	fun null_value(self);
-	fun some_value(self);
-	fun str_value(self, value: str);
-	fun i32_value(self, value: i32);
-	fun u32_value(self, value: u32);
-	fun i53_value(self, value: i53);
-	fun f64_value(self, value: f64);
-	fun bool_value(self, value: bool);
+	fun begin_struct(&mut self, fields: i32);
+	fun field(&mut self, name: str);
+	fun end_struct(&mut self);
+	fun begin_list(&mut self, length: i32);
+	fun end_list(&mut self);
+	fun begin_variant(&mut self, name: str, arity: i32);
+	fun end_variant(&mut self);
+	fun null_value(&mut self);
+	fun some_value(&mut self);
+	fun str_value(&mut self, value: str);
+	fun i32_value(&mut self, value: i32);
+	fun u32_value(&mut self, value: u32);
+	fun i53_value(&mut self, value: i53);
+	fun f64_value(&mut self, value: f64);
+	fun bool_value(&mut self, value: bool);
 }
 
 /// The read half: pull-based, sticky-erroring (see `Deserializer`).
 trait Deserialize {
-	fun begin_struct(self);
-	fun field(self, name: str);
-	fun end_struct(self);
-	fun begin_list(self): i32;
-	fun end_list(self);
-	fun variant_tag(self): str;
-	fun begin_variant(self, name: str, arity: i32);
-	fun end_variant(self);
-	fun is_null(self): bool;
-	fun null_value(self);
-	fun str_value(self): str;
-	fun i32_value(self): i32;
-	fun u32_value(self): u32;
-	fun i53_value(self): i53;
-	fun f64_value(self): f64;
-	fun bool_value(self): bool;
-	fun fail(self, reason: str);
-	fun failed(self): Option<str>;
+	fun begin_struct(&mut self);
+	fun field(&mut self, name: str);
+	fun end_struct(&mut self);
+	fun begin_list(&mut self): i32;
+	fun end_list(&mut self);
+	fun variant_tag(&mut self): str;
+	fun begin_variant(&mut self, name: str, arity: i32);
+	fun end_variant(&mut self);
+	fun is_null(&mut self): bool;
+	fun null_value(&mut self);
+	fun str_value(&mut self): str;
+	fun i32_value(&mut self): i32;
+	fun u32_value(&mut self): u32;
+	fun i53_value(&mut self): i53;
+	fun f64_value(&mut self): f64;
+	fun bool_value(&mut self): bool;
+	fun fail(&mut self, reason: str);
+	fun failed(&mut self): Option<str>;
 }
 
 /// The self-description contract. `describe` narrates the value's structure to
@@ -68,9 +78,14 @@ trait Deserialize {
 /// deserializer — both generic over the codec's own writer/reader, so the
 /// calls monomorphize with no indirection. The two must mirror each other
 /// exactly: the derive guarantees it; hand-written impls promise it.
+///
+/// The visitor arrives as a `&mut` view, and a nested `describe`/`rebuild`
+/// forwards the parameter BARE (`self.field.describe(serializer)`) — it is
+/// already a view, so `&mut serializer` would be re-taking one. The VALUE
+/// being narrated is still by-value `self`: describing reads it.
 trait Wire {
-	fun describe<S: Serialize>(self, serializer: S);
-	fun rebuild<D: Deserialize>(deserializer: D): Self;
+	fun describe<S: Serialize>(self, serializer: &mut S);
+	fun rebuild<D: Deserialize>(deserializer: &mut D): Self;
 }
 
 /// The write side. Aggregates narrate as: a struct is `begin_struct(n)`, then
@@ -139,137 +154,137 @@ struct Deserializer {
 // generic `describe`/`rebuild` as a direct writer (one extra call per
 // operation — the price of the erasure, paid only on the codec path).
 impl Serializer with Serialize {
-	fun begin_struct(self, fields: i32) {
+	fun begin_struct(&mut self, fields: i32) {
 		(self.begin_struct)(fields);
 	}
 
-	fun field(self, name: str) {
+	fun field(&mut self, name: str) {
 		(self.field)(name);
 	}
 
-	fun end_struct(self) {
+	fun end_struct(&mut self) {
 		(self.end_struct)();
 	}
 
-	fun begin_list(self, length: i32) {
+	fun begin_list(&mut self, length: i32) {
 		(self.begin_list)(length);
 	}
 
-	fun end_list(self) {
+	fun end_list(&mut self) {
 		(self.end_list)();
 	}
 
-	fun begin_variant(self, name: str, arity: i32) {
+	fun begin_variant(&mut self, name: str, arity: i32) {
 		(self.begin_variant)(name, arity);
 	}
 
-	fun end_variant(self) {
+	fun end_variant(&mut self) {
 		(self.end_variant)();
 	}
 
-	fun null_value(self) {
+	fun null_value(&mut self) {
 		(self.null_value)();
 	}
 
-	fun some_value(self) {
+	fun some_value(&mut self) {
 		(self.some_value)();
 	}
 
-	fun str_value(self, value: str) {
+	fun str_value(&mut self, value: str) {
 		(self.str_value)(value);
 	}
 
-	fun i32_value(self, value: i32) {
+	fun i32_value(&mut self, value: i32) {
 		(self.i32_value)(value);
 	}
 
-	fun u32_value(self, value: u32) {
+	fun u32_value(&mut self, value: u32) {
 		(self.u32_value)(value);
 	}
 
-	fun i53_value(self, value: i53) {
+	fun i53_value(&mut self, value: i53) {
 		(self.i53_value)(value);
 	}
 
-	fun f64_value(self, value: f64) {
+	fun f64_value(&mut self, value: f64) {
 		(self.f64_value)(value);
 	}
 
-	fun bool_value(self, value: bool) {
+	fun bool_value(&mut self, value: bool) {
 		(self.bool_value)(value);
 	}
 }
 
 impl Deserializer with Deserialize {
-	fun begin_struct(self) {
+	fun begin_struct(&mut self) {
 		(self.begin_struct)();
 	}
 
-	fun field(self, name: str) {
+	fun field(&mut self, name: str) {
 		(self.field)(name);
 	}
 
-	fun end_struct(self) {
+	fun end_struct(&mut self) {
 		(self.end_struct)();
 	}
 
-	fun begin_list(self): i32 {
+	fun begin_list(&mut self): i32 {
 		(self.begin_list)()
 	}
 
-	fun end_list(self) {
+	fun end_list(&mut self) {
 		(self.end_list)();
 	}
 
-	fun variant_tag(self): str {
+	fun variant_tag(&mut self): str {
 		(self.variant_tag)()
 	}
 
-	fun begin_variant(self, name: str, arity: i32) {
+	fun begin_variant(&mut self, name: str, arity: i32) {
 		(self.begin_variant)(name, arity);
 	}
 
-	fun end_variant(self) {
+	fun end_variant(&mut self) {
 		(self.end_variant)();
 	}
 
-	fun is_null(self): bool {
+	fun is_null(&mut self): bool {
 		(self.is_null)()
 	}
 
-	fun null_value(self) {
+	fun null_value(&mut self) {
 		(self.null_value)();
 	}
 
-	fun str_value(self): str {
+	fun str_value(&mut self): str {
 		(self.str_value)()
 	}
 
-	fun i32_value(self): i32 {
+	fun i32_value(&mut self): i32 {
 		(self.i32_value)()
 	}
 
-	fun u32_value(self): u32 {
+	fun u32_value(&mut self): u32 {
 		(self.u32_value)()
 	}
 
-	fun i53_value(self): i53 {
+	fun i53_value(&mut self): i53 {
 		(self.i53_value)()
 	}
 
-	fun f64_value(self): f64 {
+	fun f64_value(&mut self): f64 {
 		(self.f64_value)()
 	}
 
-	fun bool_value(self): bool {
+	fun bool_value(&mut self): bool {
 		(self.bool_value)()
 	}
 
-	fun fail(self, reason: str) {
+	fun fail(&mut self, reason: str) {
 		(self.fail)(reason);
 	}
 
-	fun failed(self): Option<str> {
+	fun failed(&mut self): Option<str> {
 		(self.failed)()
 	}
 }
@@ -277,61 +292,61 @@ impl Deserializer with Deserialize {
 // --- The leaves -------------------------------------------------------------
 
 impl str with Wire {
-	fun describe<S: Serialize>(self, serializer: S) {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
 		serializer.str_value(self);
 	}
 
-	fun rebuild<D: Deserialize>(deserializer: D): str {
+	fun rebuild<D: Deserialize>(deserializer: &mut D): str {
 		deserializer.str_value()
 	}
 }
 
 impl i32 with Wire {
-	fun describe<S: Serialize>(self, serializer: S) {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
 		serializer.i32_value(self);
 	}
 
-	fun rebuild<D: Deserialize>(deserializer: D): i32 {
+	fun rebuild<D: Deserialize>(deserializer: &mut D): i32 {
 		deserializer.i32_value()
 	}
 }
 
 impl u32 with Wire {
-	fun describe<S: Serialize>(self, serializer: S) {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
 		serializer.u32_value(self);
 	}
 
-	fun rebuild<D: Deserialize>(deserializer: D): u32 {
+	fun rebuild<D: Deserialize>(deserializer: &mut D): u32 {
 		deserializer.u32_value()
 	}
 }
 
 impl i53 with Wire {
-	fun describe<S: Serialize>(self, serializer: S) {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
 		serializer.i53_value(self);
 	}
 
-	fun rebuild<D: Deserialize>(deserializer: D): i53 {
+	fun rebuild<D: Deserialize>(deserializer: &mut D): i53 {
 		deserializer.i53_value()
 	}
 }
 
 impl f64 with Wire {
-	fun describe<S: Serialize>(self, serializer: S) {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
 		serializer.f64_value(self);
 	}
 
-	fun rebuild<D: Deserialize>(deserializer: D): f64 {
+	fun rebuild<D: Deserialize>(deserializer: &mut D): f64 {
 		deserializer.f64_value()
 	}
 }
 
 impl bool with Wire {
-	fun describe<S: Serialize>(self, serializer: S) {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
 		serializer.bool_value(self);
 	}
 
-	fun rebuild<D: Deserialize>(deserializer: D): bool {
+	fun rebuild<D: Deserialize>(deserializer: &mut D): bool {
 		deserializer.bool_value()
 	}
 }
@@ -359,68 +374,68 @@ impl bool with Wire {
 // it then calls.
 
 impl i8 with Wire {
-	fun describe<S: Serialize>(self, serializer: S) {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
 		serializer.i32_value(self.as_i32());
 	}
 
-	fun rebuild<D: Deserialize>(deserializer: D): i8 {
+	fun rebuild<D: Deserialize>(deserializer: &mut D): i8 {
 		deserializer.i32_value().as_i8()
 	}
 }
 
 impl u8 with Wire {
-	fun describe<S: Serialize>(self, serializer: S) {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
 		serializer.u32_value(self.as_u32());
 	}
 
-	fun rebuild<D: Deserialize>(deserializer: D): u8 {
+	fun rebuild<D: Deserialize>(deserializer: &mut D): u8 {
 		deserializer.u32_value().as_u8()
 	}
 }
 
 impl i16 with Wire {
-	fun describe<S: Serialize>(self, serializer: S) {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
 		serializer.i32_value(self.as_i32());
 	}
 
-	fun rebuild<D: Deserialize>(deserializer: D): i16 {
+	fun rebuild<D: Deserialize>(deserializer: &mut D): i16 {
 		deserializer.i32_value().as_i16()
 	}
 }
 
 impl u16 with Wire {
-	fun describe<S: Serialize>(self, serializer: S) {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
 		serializer.u32_value(self.as_u32());
 	}
 
-	fun rebuild<D: Deserialize>(deserializer: D): u16 {
+	fun rebuild<D: Deserialize>(deserializer: &mut D): u16 {
 		deserializer.u32_value().as_u16()
 	}
 }
 
 impl u53 with Wire {
-	fun describe<S: Serialize>(self, serializer: S) {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
 		serializer.i53_value(self.as_i53());
 	}
 
-	fun rebuild<D: Deserialize>(deserializer: D): u53 {
+	fun rebuild<D: Deserialize>(deserializer: &mut D): u53 {
 		deserializer.i53_value().as_u53()
 	}
 }
 
 impl f32 with Wire {
-	fun describe<S: Serialize>(self, serializer: S) {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
 		serializer.f64_value(self.as_f64());
 	}
 
-	fun rebuild<D: Deserialize>(deserializer: D): f32 {
+	fun rebuild<D: Deserialize>(deserializer: &mut D): f32 {
 		deserializer.f64_value().as_f32()
 	}
 }
 
 // A list narrates element by element; rebuild trusts `begin_list`'s count.
 impl List<type T: Wire> with Wire {
-	fun describe<S: Serialize>(self, serializer: S) {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
 		serializer.begin_list(self.len());
 		for element in self {
 			element.describe(serializer);
@@ -428,7 +443,7 @@ impl List<type T: Wire> with Wire {
 		serializer.end_list();
 	}
 
-	fun rebuild<D: Deserialize>(deserializer: D): List<T> {
+	fun rebuild<D: Deserialize>(deserializer: &mut D): List<T> {
 		let length = deserializer.begin_list();
 		mut result: List<T> = [];
 		mut index = 0;
@@ -444,7 +459,7 @@ impl List<type T: Wire> with Wire {
 // An absent option is a null; a present one announces itself (`some_value` —
 // a no-op in JSON, a marker byte in binary) and describes its value.
 impl Option<type T: Wire> with Wire {
-	fun describe<S: Serialize>(self, serializer: S) {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
 		match self {
 			Some(let value) => {
 				serializer.some_value();
@@ -454,7 +469,7 @@ impl Option<type T: Wire> with Wire {
 		}
 	}
 
-	fun rebuild<D: Deserialize>(deserializer: D): Option<T> {
+	fun rebuild<D: Deserialize>(deserializer: &mut D): Option<T> {
 		if deserializer.is_null() {
 			deserializer.null_value();
 			None
@@ -481,7 +496,7 @@ impl Option<type T: Wire> with Wire {
 // `Deserializer` promises. (`Delta`'s `_` arm answers with `Reset([])`;
 // `Result` has no empty value to hand back, so it hands back a poisoned one.)
 impl Result<type T: Wire, type E: Wire> with Wire {
-	fun describe<S: Serialize>(self, serializer: S) {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
 		match self {
 			Ok(let value) => {
 				serializer.begin_variant("Ok", 1);
@@ -496,7 +511,7 @@ impl Result<type T: Wire, type E: Wire> with Wire {
 		}
 	}
 
-	fun rebuild<D: Deserialize>(deserializer: D): Result<T, E> {
+	fun rebuild<D: Deserialize>(deserializer: &mut D): Result<T, E> {
 		let tag = deserializer.variant_tag();
 		match tag {
 			"Ok" => {
@@ -563,7 +578,7 @@ enum Delta<K, T> {
 }
 
 impl Delta<type K: Wire, type T: Wire> with Wire {
-	fun describe<S: Serialize>(self, serializer: S) {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
 		match self {
 			Delta::Reset(let items) => {
 				serializer.begin_variant("Reset", 1);
@@ -591,7 +606,7 @@ impl Delta<type K: Wire, type T: Wire> with Wire {
 		}
 	}
 
-	fun rebuild<D: Deserialize>(deserializer: D): Delta<K, T> {
+	fun rebuild<D: Deserialize>(deserializer: &mut D): Delta<K, T> {
 		let tag = deserializer.variant_tag();
 		match tag {
 			"Reset" => {
@@ -638,7 +653,7 @@ impl Delta<type K: Wire, type T: Wire> with Wire {
 // round trip preserves it. A duplicate key on the wire keeps the LAST pair,
 // matching `Map::insert`.
 impl Map<type K: Hashable + Wire, type V: Wire> with Wire {
-	fun describe<S: Serialize>(self, serializer: S) {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
 		let entries = self.entries();
 		serializer.begin_list(entries.len());
 		for entry in entries {
@@ -652,7 +667,7 @@ impl Map<type K: Hashable + Wire, type V: Wire> with Wire {
 		serializer.end_list();
 	}
 
-	fun rebuild<D: Deserialize>(deserializer: D): Map<K, V> {
+	fun rebuild<D: Deserialize>(deserializer: &mut D): Map<K, V> {
 		let length = deserializer.begin_list();
 		mut result: Map<K, V> = Map::new();
 		mut index = 0;
@@ -690,17 +705,21 @@ struct Codec {
 	reader: |Frame| Deserializer,
 }
 
-/// One value to one frame.
+/// One value to one frame. The record is re-bound `mut` so `describe` can take
+/// the `&mut` view its signature asks for: the record itself holds no state
+/// (its closures do), so the re-binding costs a copy of a closure bag and the
+/// writer behind it is the one the codec minted.
 fun encode<T: Wire>(codec: Codec, value: T): Frame {
 	let (serializer, finish) = (codec.writer)();
-	value.describe(serializer);
+	mut sink = serializer;
+	value.describe(&mut sink);
 	finish()
 }
 
 /// One frame back to a value; `Err(reason)` names the first structural failure.
 fun decode<T: Wire>(codec: Codec, frame: Frame): Result<T, str> {
-	let deserializer = (codec.reader)(frame);
-	let value = T::rebuild(deserializer);
+	mut deserializer = (codec.reader)(frame);
+	let value = T::rebuild(&mut deserializer);
 	match (deserializer.failed)() {
 		None => Ok(value),
 		Some(let reason) => Err(reason),

@@ -161,7 +161,7 @@ impl AccountsClient<type T> {
 		// into the envelope's serializer — §4.1), awaits the round-trip, and
 		// decodes the reply as `Option<WireUser>` — inferred from this return
 		// type; infra failures become `Err`.
-		call(self.transport, self.codec, "get_user", [|s: Serializer| id.describe(s)])
+		call(self.transport, self.codec, "get_user", [|mut s: Serializer| id.describe(&mut s)])
 	}
 }
 
@@ -336,7 +336,7 @@ fun reactive_demo() {
 	let rpc_transport = local_rpc(dispatcher.into_protocol(json_codec()));
 	let amount = 3;
 	let added: Result<i32, RpcError> = call(rpc_transport, json_codec(), "add", [
-		|s: Serializer| amount.describe(s),
+		|mut s: Serializer| amount.describe(&mut s),
 	]);
 	match added {
 		Ok(let n) => print(i"rpc add -> {n}"),

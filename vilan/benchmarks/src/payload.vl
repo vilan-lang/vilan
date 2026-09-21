@@ -52,10 +52,10 @@ fun measure(label: str, count: i32) {
 	// The request envelope carrying the list as its one argument, and the
 	// success reply carrying it as the result — single-pass, both codecs.
 	let request_json = frame_bytes(encode_request(json_codec(), "sync", [
-		|s: Serializer| todos.describe(s),
+		|mut s: Serializer| todos.describe(&mut s),
 	]));
 	let request_binary = frame_bytes(encode_request(binary_codec(), "sync", [
-		|s: Serializer| todos.describe(s),
+		|mut s: Serializer| todos.describe(&mut s),
 	]));
 	let reply_json = frame_bytes(encode_reply(json_codec(), reply(todos)));
 	let reply_binary = frame_bytes(encode_reply(binary_codec(), reply(todos)));

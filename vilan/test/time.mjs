@@ -14,9 +14,6 @@ function __json_tag(value) {
 function __list_pop(list) {
 	return list.length === 0 ? [ 1 ] : [ 0, list.pop() ];
 }
-function __shared_new(value) {
-	return { v: value };
-}
 function __sleep(ms, signal) {
 	const sig = signal && signal[0] === 0 ? signal[1] : undefined;
 	return new Promise((resolve, reject) => {
@@ -39,24 +36,24 @@ function __try_parse_json(text) {
 	}
 }
 function new2() {
-	return [ __shared_new(new Uint8Array(64)), __shared_new(0) ];
+	return [ new Uint8Array(64), 0 ];
 }
 function ensure(self, extra) {
-	const needed = self[1].v + extra;
-	let capacity = self[0].v.length;
+	const needed = self[1] + extra;
+	let capacity = self[0].length;
 	if (needed > capacity) {
 		while (needed > capacity) {
 			capacity = capacity * 2;
 		}
 		const grown = new Uint8Array(capacity);
-		grown.set(self[0].v, 0);
-		self[0].v = grown;
+		grown.set(self[0], 0);
+		self[0] = grown;
 	}
 }
 function write_byte(self, value2) {
 	ensure(self, 1);
-	set(self[0].v, self[1].v, value2);
-	self[1].v = self[1].v + 1;
+	set(self[0], self[1], value2);
+	self[1] = self[1] + 1;
 }
 function write_i32(self, value2) {
 	write_byte(self, value2);
@@ -66,8 +63,8 @@ function write_i32(self, value2) {
 }
 function write_byte_u32(self, value2) {
 	ensure(self, 1);
-	set_u32(self[0].v, self[1].v, value2);
-	self[1].v = self[1].v + 1;
+	set_u32(self[0], self[1], value2);
+	self[1] = self[1] + 1;
 }
 function write_u32(self, value2) {
 	write_byte_u32(self, (value2 & 0xFF) >>> 0);
@@ -79,51 +76,18 @@ function write_f64(self, value2) {
 	const scratch = new Uint8Array(8);
 	new DataView(scratch.buffer).setFloat64(0, value2, true);
 	ensure(self, 8);
-	self[0].v.set(scratch, self[1].v);
-	self[1].v = self[1].v + 8;
+	self[0].set(scratch, self[1]);
+	self[1] = self[1] + 8;
 }
 function write_str(self, value2) {
 	const encoded = encode_utf8(value2);
 	write_i32(self, encoded.length);
 	ensure(self, encoded.length);
-	self[0].v.set(encoded, self[1].v);
-	self[1].v = self[1].v + encoded.length;
+	self[0].set(encoded, self[1]);
+	self[1] = self[1] + encoded.length;
 }
 function finish(self) {
-	return self[0].v.slice(0, self[1].v);
-}
-function serializer(self) {
-	return [ (fields) => {
-		return begin_struct(self, fields);
-	}, (name) => {
-		return field(self, name);
-	}, () => {
-		return end_struct(self);
-	}, (length) => {
-		return begin_list(self, length);
-	}, () => {
-		return end_list(self);
-	}, (name, arity) => {
-		return begin_variant(self, name, arity);
-	}, () => {
-		return end_variant(self);
-	}, () => {
-		return null_value(self);
-	}, () => {
-		return some_value(self);
-	}, (value2) => {
-		return str_value(self, value2);
-	}, (value2) => {
-		return i32_value(self, value2);
-	}, (value2) => {
-		return u32_value(self, value2);
-	}, (value2) => {
-		return i53_value(self, value2);
-	}, (value2) => {
-		return f64_value(self, value2);
-	}, (value2) => {
-		return bool_value(self, value2);
-	} ];
+	return self[0].slice(0, self[1]);
 }
 function begin_struct(self, fields) {
 
@@ -177,36 +141,36 @@ function bool_value(self, value2) {
 	write_byte(self, $ac);
 }
 function new3(bytes) {
-	return [ __clone(bytes), __shared_new(0), __shared_new([ 1 ]) ];
+	return [ __clone(bytes), 0, [ 1 ] ];
 }
 function ok(self) {
-	const $af = self[2].v;
-	let $ag = null;
-	if ($af[0] === 0) {
-		const _reason = $af[1];
-		$ag = false;
-	} else {
-		$ag = true;
-	}
-	return $ag;
-}
-function report(self, reason) {
-	const $ah = self[2].v;
+	const $ah = self[2];
 	let $ai = null;
 	if ($ah[0] === 0) {
-		const _first = $ah[1];
-		$ai = undefined;
+		const _reason = $ah[1];
+		$ai = false;
 	} else {
-		self[2].v = [ 0, reason ];
-		$ai = undefined;
+		$ai = true;
 	}
 	return $ai;
+}
+function report(self, reason) {
+	const $af = self[2];
+	let $ag = null;
+	if ($af[0] === 0) {
+		const _first = $af[1];
+		$ag = undefined;
+	} else {
+		self[2] = [ 0, reason ];
+		$ag = undefined;
+	}
+	return $ag;
 }
 function expect(self, count) {
 	if (!(ok(self))) {
 		return false;
 	}
-	if (self[1].v + count > self[0].length) {
+	if (self[1] + count > self[0].length) {
 		report(self, "unexpected end of frame");
 		return false;
 	}
@@ -216,40 +180,40 @@ function read_byte(self) {
 	if (!(expect(self, 1))) {
 		return 0;
 	}
-	const value2 = self[0].at(self[1].v);
-	self[1].v = self[1].v + 1;
+	const value2 = self[0].at(self[1]);
+	self[1] = self[1] + 1;
 	return value2;
 }
 function read_i32(self) {
 	if (!(expect(self, 4))) {
 		return 0;
 	}
-	const at = self[1].v;
+	const at = self[1];
 	const value2 = self[0].at(at) | self[0].at(at + 1) << 8 | self[0].at(at + 2) << 16 | self[0].at(at + 3) << 24;
-	self[1].v = at + 4;
+	self[1] = at + 4;
 	return value2;
 }
 function read_u32(self) {
 	if (!(expect(self, 4))) {
 		return 0;
 	}
-	const at = self[1].v;
+	const at = self[1];
 	const value2 = (((self[0].at(at) | self[0].at(at + 1) << 8 >>> 0) >>> 0 | self[0].at(at + 2) << 16 >>> 0) >>> 0 | self[0].at(at + 3) << 24 >>> 0) >>> 0;
-	self[1].v = at + 4;
+	self[1] = at + 4;
 	return value2;
 }
 function read_f64(self) {
 	if (!(expect(self, 8))) {
 		return 0.0;
 	}
-	const at = self[1].v;
+	const at = self[1];
 	const scratch = self[0].slice(at, at + 8);
-	self[1].v = at + 8;
+	self[1] = at + 8;
 	return new DataView(scratch.buffer).getFloat64(0, true);
 }
 function read_length(self) {
 	const length = read_i32(self);
-	if (length < 0 || self[1].v + length > self[0].length) {
+	if (length < 0 || self[1] + length > self[0].length) {
 		report(self, "length prefix exceeds frame");
 		return 0;
 	}
@@ -260,49 +224,10 @@ function read_str(self) {
 	if (!(expect(self, length))) {
 		return "";
 	}
-	const at = self[1].v;
+	const at = self[1];
 	const piece = self[0].slice(at, at + length);
-	self[1].v = at + length;
+	self[1] = at + length;
 	return decode_utf8(piece);
-}
-function deserializer(self) {
-	return [ () => {
-		return begin_struct2(self);
-	}, (name) => {
-		return field2(self, name);
-	}, () => {
-		return end_struct2(self);
-	}, () => {
-		return begin_list2(self);
-	}, () => {
-		return end_list2(self);
-	}, () => {
-		return variant_tag(self);
-	}, (name, arity) => {
-		return begin_variant2(self, name, arity);
-	}, () => {
-		return end_variant2(self);
-	}, () => {
-		return is_null(self);
-	}, () => {
-		return null_value2(self);
-	}, () => {
-		return str_value2(self);
-	}, () => {
-		return i32_value2(self);
-	}, () => {
-		return u32_value2(self);
-	}, () => {
-		return i53_value2(self);
-	}, () => {
-		return f64_value2(self);
-	}, () => {
-		return bool_value2(self);
-	}, (reason) => {
-		return fail(self, reason);
-	}, () => {
-		return failed(self);
-	} ];
 }
 function begin_struct2(self) {
 
@@ -333,10 +258,10 @@ function is_null(self) {
 		return false;
 	}
 	let $aj = null;
-	if (self[0].at(self[1].v) === 0) {
+	if (self[0].at(self[1]) === 0) {
 		$aj = true;
 	} else {
-		self[1].v = self[1].v + 1;
+		self[1] = self[1] + 1;
 		$aj = false;
 	}
 	return $aj;
@@ -366,12 +291,43 @@ function fail(self, reason) {
 	report(self, reason);
 }
 function failed(self) {
-	return self[2].v;
+	return self[2];
 }
 function binary_codec() {
 	return [ () => {
-		const writer = new2();
-		return [ serializer(writer), () => {
+		let writer = new2();
+		const record = [ (fields) => {
+			return begin_struct(writer, fields);
+		}, (name) => {
+			return field(writer, name);
+		}, () => {
+			return end_struct(writer);
+		}, (length) => {
+			return begin_list(writer, length);
+		}, () => {
+			return end_list(writer);
+		}, (name, arity) => {
+			return begin_variant(writer, name, arity);
+		}, () => {
+			return end_variant(writer);
+		}, () => {
+			return null_value(writer);
+		}, () => {
+			return some_value(writer);
+		}, (value2) => {
+			return str_value(writer, value2);
+		}, (value2) => {
+			return i32_value(writer, value2);
+		}, (value2) => {
+			return u32_value(writer, value2);
+		}, (value2) => {
+			return i53_value(writer, value2);
+		}, (value2) => {
+			return f64_value(writer, value2);
+		}, (value2) => {
+			return bool_value(writer, value2);
+		} ];
+		return [ record, () => {
 			return [ 1, finish(writer) ];
 		} ];
 	}, (frame) => {
@@ -379,14 +335,51 @@ function binary_codec() {
 		let $ae = null;
 		if ($ad[0] === 1) {
 			const bytes = $ad[1];
-			$ae = deserializer(new3(bytes));
+			$ae = new3(bytes);
 		} else {
 			const text = $ad[1];
-			const reader = new3(new Uint8Array(0));
-			report(reader, "binary codec: received a text frame");
-			$ae = deserializer(reader);
+			let poisoned = new3(new Uint8Array(0));
+			report(poisoned, "binary codec: received a text frame");
+			$ae = poisoned;
 		}
-		return $ae;
+		let reader = $ae;
+		return [ () => {
+			return begin_struct2(reader);
+		}, (name) => {
+			return field2(reader, name);
+		}, () => {
+			return end_struct2(reader);
+		}, () => {
+			return begin_list2(reader);
+		}, () => {
+			return end_list2(reader);
+		}, () => {
+			return variant_tag(reader);
+		}, (name, arity) => {
+			return begin_variant2(reader, name, arity);
+		}, () => {
+			return end_variant2(reader);
+		}, () => {
+			return is_null(reader);
+		}, () => {
+			return null_value2(reader);
+		}, () => {
+			return str_value2(reader);
+		}, () => {
+			return i32_value2(reader);
+		}, () => {
+			return u32_value2(reader);
+		}, () => {
+			return i53_value2(reader);
+		}, () => {
+			return f64_value2(reader);
+		}, () => {
+			return bool_value2(reader);
+		}, (reason) => {
+			return fail(reader, reason);
+		}, () => {
+			return failed(reader);
+		} ];
 	} ];
 }
 function set(self, index, value2) {
@@ -402,23 +395,23 @@ function decode_utf8(bytes) {
 	return new TextDecoder().decode(bytes);
 }
 function new4() {
-	return [ __shared_new(""), __shared_new(false), __shared_new([  ]), __shared_new([  ]) ];
+	return [ "", false, [  ], [  ] ];
 }
 function value(self, text) {
-	if (self[1].v) {
-		self[0].v = self[0].v + ",";
+	if (self[1]) {
+		self[0] = self[0] + ",";
 	}
-	self[0].v = self[0].v + text;
-	self[1].v = true;
+	self[0] = self[0] + text;
+	self[1] = true;
 }
 function open(self, opener) {
 	value(self, opener);
-	self[2].v.push(true);
-	self[1].v = false;
+	self[2].push(true);
+	self[1] = false;
 }
 function close(self, closer) {
-	self[0].v = self[0].v + closer;
-	const $m = __list_pop(self[2].v);
+	self[0] = self[0] + closer;
+	const $m = __list_pop(self[2]);
 	let $n = null;
 	if ($m[0] === 0) {
 		const saved = $m[1];
@@ -426,53 +419,20 @@ function close(self, closer) {
 	} else {
 		$n = false;
 	}
-	self[1].v = $n;
+	self[1] = $n;
 }
 function result(self) {
-	return self[0].v;
-}
-function serializer2(self) {
-	return [ (fields) => {
-		return begin_struct3(self, fields);
-	}, (name) => {
-		return field3(self, name);
-	}, () => {
-		return end_struct3(self);
-	}, (length) => {
-		return begin_list3(self, length);
-	}, () => {
-		return end_list3(self);
-	}, (name, arity) => {
-		return begin_variant3(self, name, arity);
-	}, () => {
-		return end_variant3(self);
-	}, () => {
-		return null_value3(self);
-	}, () => {
-		return some_value2(self);
-	}, (value2) => {
-		return str_value3(self, value2);
-	}, (value2) => {
-		return i32_value3(self, value2);
-	}, (value2) => {
-		return u32_value3(self, value2);
-	}, (value2) => {
-		return i53_value3(self, value2);
-	}, (value2) => {
-		return f64_value3(self, value2);
-	}, (value2) => {
-		return bool_value3(self, value2);
-	} ];
+	return self[0];
 }
 function begin_struct3(self, fields) {
 	open(self, "{");
 }
 function field3(self, name) {
-	if (self[1].v) {
-		self[0].v = self[0].v + ",";
+	if (self[1]) {
+		self[0] = self[0] + ",";
 	}
-	self[0].v = self[0].v + JSON.stringify(name) + ":";
-	self[1].v = false;
+	self[0] = self[0] + JSON.stringify(name) + ":";
+	self[1] = false;
 }
 function end_struct3(self) {
 	close(self, "}");
@@ -484,23 +444,23 @@ function end_list3(self) {
 	close(self, "]");
 }
 function begin_variant3(self, name, arity) {
-	self[3].v.push(arity);
+	self[3].push(arity);
 	let $o = null;
 	if (arity === 0) {
 		value(self, JSON.stringify(name));
 	} else {
 		open(self, "{");
-		self[0].v = self[0].v + JSON.stringify(name) + ":";
-		self[1].v = false;
+		self[0] = self[0] + JSON.stringify(name) + ":";
+		self[1] = false;
 		if (arity > 1) {
-			self[0].v = self[0].v + "[";
+			self[0] = self[0] + "[";
 		}
 		$o = undefined;
 	}
 	return $o;
 }
 function end_variant3(self) {
-	const $p = __list_pop(self[3].v);
+	const $p = __list_pop(self[3]);
 	let $q = null;
 	if ($p[0] === 0) {
 		const opened = $p[1];
@@ -510,7 +470,7 @@ function end_variant3(self) {
 	}
 	const arity = $q;
 	if (arity > 1) {
-		self[0].v = self[0].v + "]";
+		self[0] = self[0] + "]";
 	}
 	if (arity > 0) {
 		close(self, "}");
@@ -541,12 +501,12 @@ function bool_value3(self, value2) {
 	value(self, "" + value2);
 }
 function new5(root) {
-	const stack = __shared_new([  ]);
-	stack.v.push(__clone(root));
-	return [ stack, __shared_new([ 1 ]) ];
+	let stack = [  ];
+	stack.push(__clone(root));
+	return [ stack, [ 1 ] ];
 }
 function ok2(self) {
-	const $x = self[1].v;
+	const $x = self[1];
 	let $y = null;
 	if ($x[0] === 0) {
 		const _reason = $x[1];
@@ -557,24 +517,23 @@ function ok2(self) {
 	return $y;
 }
 function report2(self, reason) {
-	const $v = self[1].v;
+	const $v = self[1];
 	let $w = null;
 	if ($v[0] === 0) {
 		const _first = $v[1];
 		$w = undefined;
 	} else {
-		self[1].v = [ 0, reason ];
+		self[1] = [ 0, reason ];
 		$w = undefined;
 	}
 	return $w;
 }
 function top(self) {
 	let $A = null;
-	if (!(ok2(self)) || $z(self[0].v)) {
+	if (!(ok2(self)) || $z(self[0])) {
 		$A = JSON.parse("null");
 	} else {
-		const values = __clone(self[0].v);
-		$A = __at(values, values.length - 1);
+		$A = __clone(__at(self[0], self[0].length - 1));
 	}
 	return $A;
 }
@@ -582,7 +541,7 @@ function take(self) {
 	if (!(ok2(self))) {
 		return JSON.parse("null");
 	}
-	const $C = __list_pop(self[0].v);
+	const $C = __list_pop(self[0]);
 	let $D = null;
 	if ($C[0] === 0) {
 		const value2 = $C[1];
@@ -593,45 +552,6 @@ function take(self) {
 	}
 	return $D;
 }
-function deserializer2(self) {
-	return [ () => {
-		return begin_struct4(self);
-	}, (name) => {
-		return field4(self, name);
-	}, () => {
-		return end_struct4(self);
-	}, () => {
-		return begin_list4(self);
-	}, () => {
-		return end_list4(self);
-	}, () => {
-		return variant_tag2(self);
-	}, (name, arity) => {
-		return begin_variant4(self, name, arity);
-	}, () => {
-		return end_variant4(self);
-	}, () => {
-		return is_null2(self);
-	}, () => {
-		return null_value4(self);
-	}, () => {
-		return str_value4(self);
-	}, () => {
-		return i32_value4(self);
-	}, () => {
-		return u32_value4(self);
-	}, () => {
-		return i53_value4(self);
-	}, () => {
-		return f64_value4(self);
-	}, () => {
-		return bool_value4(self);
-	}, (reason) => {
-		return fail2(self, reason);
-	}, () => {
-		return failed2(self);
-	} ];
-}
 function begin_struct4(self) {
 
 }
@@ -640,7 +560,7 @@ function field4(self, name) {
 	let $B = null;
 	if (ok2(self)) {
 		if (Object.hasOwn(subject, name)) {
-			self[0].v.push(subject[name]);
+			self[0].push(subject[name]);
 		} else {
 			report2(self, "missing field \'" + name + "\'");
 		}
@@ -658,7 +578,7 @@ function begin_list4(self) {
 		const elements = subject;
 		let index = elements.length - 1;
 		while (index >= 0) {
-			self[0].v.push(__clone(__at(elements, index)));
+			self[0].push(__clone(__at(elements, index)));
 			index = index - 1;
 		}
 		$E = elements.length;
@@ -688,12 +608,12 @@ function begin_variant4(self, name, arity) {
 			const payload = subject[name];
 			let $G = null;
 			if (arity === 1) {
-				self[0].v.push(payload);
+				self[0].push(payload);
 			} else {
 				const elements = payload;
 				let index = elements.length - 1;
 				while (index >= 0) {
-					self[0].v.push(__clone(__at(elements, index)));
+					self[0].push(__clone(__at(elements, index)));
 					index = index - 1;
 				}
 				$G = undefined;
@@ -779,7 +699,7 @@ function fail2(self, reason) {
 	report2(self, reason);
 }
 function failed2(self) {
-	return self[1].v;
+	return self[1];
 }
 function opened_reader(text) {
 	const $t = __try_parse_json(text);
@@ -788,7 +708,7 @@ function opened_reader(text) {
 		const root = $t[1];
 		$u = new5(root);
 	} else {
-		const reader = new5(JSON.parse("null"));
+		let reader = new5(JSON.parse("null"));
 		report2(reader, "malformed JSON");
 		$u = reader;
 	}
@@ -796,8 +716,39 @@ function opened_reader(text) {
 }
 function json_codec() {
 	return [ () => {
-		const writer = new4();
-		return [ serializer2(writer), () => {
+		let writer = new4();
+		const record = [ (fields) => {
+			return begin_struct3(writer, fields);
+		}, (name) => {
+			return field3(writer, name);
+		}, () => {
+			return end_struct3(writer);
+		}, (length) => {
+			return begin_list3(writer, length);
+		}, () => {
+			return end_list3(writer);
+		}, (name, arity) => {
+			return begin_variant3(writer, name, arity);
+		}, () => {
+			return end_variant3(writer);
+		}, () => {
+			return null_value3(writer);
+		}, () => {
+			return some_value2(writer);
+		}, (value2) => {
+			return str_value3(writer, value2);
+		}, (value2) => {
+			return i32_value3(writer, value2);
+		}, (value2) => {
+			return u32_value3(writer, value2);
+		}, (value2) => {
+			return i53_value3(writer, value2);
+		}, (value2) => {
+			return f64_value3(writer, value2);
+		}, (value2) => {
+			return bool_value3(writer, value2);
+		} ];
+		return [ record, () => {
 			return [ 0, result(writer) ];
 		} ];
 	}, (frame) => {
@@ -805,12 +756,49 @@ function json_codec() {
 		let $s = null;
 		if ($r[0] === 0) {
 			const text = $r[1];
-			$s = deserializer2(opened_reader(text));
+			$s = opened_reader(text);
 		} else {
 			const bytes = $r[1];
-			$s = deserializer2(opened_reader(decode_utf8(bytes)));
+			$s = opened_reader(decode_utf8(bytes));
 		}
-		return $s;
+		let reader = $s;
+		return [ () => {
+			return begin_struct4(reader);
+		}, (name) => {
+			return field4(reader, name);
+		}, () => {
+			return end_struct4(reader);
+		}, () => {
+			return begin_list4(reader);
+		}, () => {
+			return end_list4(reader);
+		}, () => {
+			return variant_tag2(reader);
+		}, (name, arity) => {
+			return begin_variant4(reader, name, arity);
+		}, () => {
+			return end_variant4(reader);
+		}, () => {
+			return is_null2(reader);
+		}, () => {
+			return null_value4(reader);
+		}, () => {
+			return str_value4(reader);
+		}, () => {
+			return i32_value4(reader);
+		}, () => {
+			return u32_value4(reader);
+		}, () => {
+			return i53_value4(reader);
+		}, () => {
+			return f64_value4(reader);
+		}, () => {
+			return bool_value4(reader);
+		}, (reason) => {
+			return fail2(reader, reason);
+		}, () => {
+			return failed2(reader);
+		} ];
 	} ];
 }
 function partial_compare(self, b) {
@@ -1022,46 +1010,47 @@ function $k(self, b) {
 function $z(self) {
 	return self.length === 0;
 }
-function $S(self, serializer3) {
-	i53_value5(serializer3, self);
+function $S(self, serializer) {
+	i53_value5(serializer, self);
 }
-function $T(self, serializer3) {
-	str_value5(serializer3, self);
+function $T(self, serializer) {
+	str_value5(serializer, self);
 }
-function $R(self, serializer3) {
-	begin_struct5(serializer3, 2);
-	field5(serializer3, "at");
-	$S(self[0], serializer3);
-	field5(serializer3, "label");
-	$T(self[1], serializer3);
-	end_struct5(serializer3);
+function $R(self, serializer) {
+	begin_struct5(serializer, 2);
+	field5(serializer, "at");
+	$S(self[0], serializer);
+	field5(serializer, "label");
+	$T(self[1], serializer);
+	end_struct5(serializer);
 }
 function $P(codec, value2) {
 	const $Q = codec[0]();
-	const serializer3 = $Q[0];
+	const serializer = $Q[0];
 	const finish2 = $Q[1];
-	$R(value2, serializer3);
+	let sink = serializer;
+	$R(value2, sink);
 	return finish2();
 }
-function $W(deserializer3) {
-	return i53_value6(deserializer3);
+function $W(deserializer) {
+	return i53_value6(deserializer);
 }
-function $X(deserializer3) {
-	return str_value6(deserializer3);
+function $X(deserializer) {
+	return str_value6(deserializer);
 }
-function $V(deserializer3) {
-	begin_struct6(deserializer3);
-	field6(deserializer3, "at");
-	const at = $W(deserializer3);
-	field6(deserializer3, "label");
-	const label = $X(deserializer3);
-	end_struct6(deserializer3);
+function $V(deserializer) {
+	begin_struct6(deserializer);
+	field6(deserializer, "at");
+	const at = $W(deserializer);
+	field6(deserializer, "label");
+	const label = $X(deserializer);
+	end_struct6(deserializer);
 	return [ at, label ];
 }
 function $U(codec, frame) {
-	const deserializer3 = codec[1](frame);
-	const value2 = $V(deserializer3);
-	const $Y = deserializer3[17]();
+	let deserializer = codec[1](frame);
+	const value2 = $V(deserializer);
+	const $Y = deserializer[17]();
 	let $Z = null;
 	if ($Y[0] === 1) {
 		$Z = [ 0, value2 ];
@@ -1071,30 +1060,31 @@ function $U(codec, frame) {
 	}
 	return $Z;
 }
-function $ao(self, serializer3) {
-	begin_struct5(serializer3, 1);
-	field5(serializer3, "millis");
-	$S(self[0], serializer3);
-	end_struct5(serializer3);
+function $ao(self, serializer) {
+	begin_struct5(serializer, 1);
+	field5(serializer, "millis");
+	$S(self[0], serializer);
+	end_struct5(serializer);
 }
 function $am(codec, value2) {
 	const $an = codec[0]();
-	const serializer3 = $an[0];
+	const serializer = $an[0];
 	const finish2 = $an[1];
-	$ao(value2, serializer3);
+	let sink = serializer;
+	$ao(value2, sink);
 	return finish2();
 }
-function $aq(deserializer3) {
-	begin_struct6(deserializer3);
-	field6(deserializer3, "millis");
-	const millis2 = $W(deserializer3);
-	end_struct6(deserializer3);
+function $aq(deserializer) {
+	begin_struct6(deserializer);
+	field6(deserializer, "millis");
+	const millis2 = $W(deserializer);
+	end_struct6(deserializer);
 	return [ millis2 ];
 }
 function $ap(codec, frame) {
-	const deserializer3 = codec[1](frame);
-	const value2 = $aq(deserializer3);
-	const $ar = deserializer3[17]();
+	let deserializer = codec[1](frame);
+	const value2 = $aq(deserializer);
+	const $ar = deserializer[17]();
 	let $as = null;
 	if ($ar[0] === 1) {
 		$as = [ 0, value2 ];

@@ -1185,7 +1185,8 @@ export fun open_request(codec: Codec, frame: Frame): RpcRequest {
 /// One reply envelope: an externally-tagged `Success` carrying the described
 /// result, or `Failure` carrying the `RpcError`.
 export fun encode_reply(codec: Codec, outcome: RpcOutcome): Frame {
-	let (serializer, finish) = (codec.writer)();
+	let (record, finish) = (codec.writer)();
+	mut serializer = record;
 	match outcome {
 		RpcOutcome::Success(let describe) => {
 			(serializer.begin_variant)("Success", 1);
@@ -1194,7 +1195,7 @@ export fun encode_reply(codec: Codec, outcome: RpcOutcome): Frame {
 		},
 		RpcOutcome::Failure(let error) => {
 			(serializer.begin_variant)("Failure", 1);
-			error.describe(serializer);
+			error.describe(&mut serializer);
 			(serializer.end_variant)();
 		},
 	}
@@ -1329,12 +1330,12 @@ export fun call<T: Wire, Tx: Transport>(
 		// host, a call issued while disconnected.
 		Err(let reason) => Err(RpcError::Transport(reason)),
 		Ok(let reply_frame) => {
-			let deserializer = (codec.reader)(reply_frame);
+			mut deserializer = (codec.reader)(reply_frame);
 			let tag = (deserializer.variant_tag)();
 			match tag {
 				"Success" => {
 					(deserializer.begin_variant)("Success", 1);
-					let value: T = T::rebuild(deserializer);
+					let value: T = T::rebuild(&mut deserializer);
 					match (deserializer.failed)() {
 						None => Ok(value),
 						Some(let reason) => Err(RpcError::Decode(reason)),
@@ -1342,7 +1343,7 @@ export fun call<T: Wire, Tx: Transport>(
 				},
 				"Failure" => {
 					(deserializer.begin_variant)("Failure", 1);
-					let error: RpcError = RpcError::rebuild(deserializer);
+					let error: RpcError = RpcError::rebuild(&mut deserializer);
 					(deserializer.end_variant)();
 					Err(error)
 				},
@@ -1357,7 +1358,12 @@ export fun call<T: Wire, Tx: Transport>(
 /// `RpcRequest`). A missing/garbled argument poisons the request's
 /// deserializer; check `decode_failed` before running the impl.
 export fun arg<T: Wire>(request: RpcRequest, index: i32): T {
-	T::rebuild(request.deserializer)
+	// The record is a bag of closures over the request's own reader, so the
+	// `mut` copy that `rebuild`'s `&mut D` asks for costs a copy of the bag
+	// and pulls from the same cursor — successive `arg` calls stay positional
+	// and once-each (A108).
+	mut deserializer = request.deserializer;
+	T::rebuild(&mut deserializer)
 }
 
 /// Whether decoding this request has failed so far — the gate between the
@@ -1370,7 +1376,7 @@ export fun decode_failed(request: RpcRequest): Option<str> {
 /// Capture a procedure's result as a success outcome — described into the
 /// reply envelope when the protocol encodes it.
 export fun reply<T: Wire>(value: T): RpcOutcome {
-	RpcOutcome::Success(|serializer: Serializer| value.describe(serializer))
+	RpcOutcome::Success(|mut serializer: Serializer| value.describe(&mut serializer))
 }
 
 /// A NOTIFICATION route's outcome (`transport-rpc.md` §9.3, R4): run the
@@ -1384,7 +1390,7 @@ export fun reply<T: Wire>(value: T): RpcOutcome {
 /// method's route shape does not depend on which direction called it.
 fun notified(run: async || void): RpcOutcome {
 	run();
-	RpcOutcome::Success(|serializer: Serializer| true.describe(serializer))
+	RpcOutcome::Success(|mut serializer: Serializer| true.describe(&mut serializer))
 }
 
 /// A forward-direction NOTIFICATION: the request `call` would send, started and
@@ -1912,8 +1918,8 @@ export impl ReactiveServer {
 		let transport = self.transport;
 		let codec = self.codec;
 		let starter = || source.sub(|value| {
-			transport.send(encode_update(codec, channel, |serializer: Serializer| {
-				value.describe(serializer);
+			transport.send(encode_update(codec, channel, |mut serializer: Serializer| {
+				value.describe(&mut serializer);
 			}));
 		});
 		self.sources
@@ -1962,8 +1968,8 @@ export impl ReactiveServer {
 				let transport = self.transport;
 				let codec = self.codec;
 				let starter = || source.sub(|value| {
-					transport.send(encode_update(codec, channel, |serializer: Serializer| {
-						value.describe(serializer);
+					transport.send(encode_update(codec, channel, |mut serializer: Serializer| {
+						value.describe(&mut serializer);
 					}));
 				});
 				self.sources
@@ -2051,8 +2057,8 @@ export impl ReactiveServer {
 		let transport = self.transport;
 		let codec = self.codec;
 		let start = || keyed_forward(transport, codec, channel, source, elements, key_of);
-		let resolve = |deserializer: Deserializer| {
-			let key: K = K::rebuild(deserializer);
+		let resolve = |mut deserializer: Deserializer| {
+			let key: K = K::rebuild(&mut deserializer);
 			KeySubscription {
 				key = key.hash(),
 				start = || keyed_key_forward(transport, codec, channel, source, elements, key_of, key),
@@ -2087,8 +2093,8 @@ export impl ReactiveServer {
 		let transport = self.transport;
 		let codec = self.codec;
 		let start = || keyed_cell_forward(transport, codec, channel, cell);
-		let resolve = |deserializer: Deserializer| {
-			let key: K = K::rebuild(deserializer);
+		let resolve = |mut deserializer: Deserializer| {
+			let key: K = K::rebuild(&mut deserializer);
 			KeySubscription {
 				key = key.hash(),
 				start = || keyed_cell_key_forward(transport, codec, channel, cell, key),
@@ -2121,8 +2127,8 @@ export impl ReactiveServer {
 				let transport = self.transport;
 				let codec = self.codec;
 				let start = || keyed_cell_forward(transport, codec, channel, cell);
-				let resolve = |deserializer: Deserializer| {
-					let key: K = K::rebuild(deserializer);
+				let resolve = |mut deserializer: Deserializer| {
+					let key: K = K::rebuild(&mut deserializer);
 					KeySubscription {
 						key = key.hash(),
 						start = || keyed_cell_key_forward(transport, codec, channel, cell, key),
@@ -2384,8 +2390,8 @@ fun send_patch<K: Wire, T: Wire>(
 	channel: i32,
 	ops: List<Delta<K, T>>,
 ) {
-	transport.send(encode_patch(codec, channel, |serializer: Serializer| {
-		ops.describe(serializer);
+	transport.send(encode_patch(codec, channel, |mut serializer: Serializer| {
+		ops.describe(&mut serializer);
 	}));
 }
 
@@ -2891,11 +2897,11 @@ export impl ReactiveClient {
 		// routed, not consumed) and rebuild the payload at this channel's type.
 		// A malformed update is dropped — the mirror keeps its last good value.
 		let deliver = |frame: Frame| {
-			let deserializer = (codec.reader)(frame);
+			mut deserializer = (codec.reader)(frame);
 			let tag = (deserializer.variant_tag)();
 			(deserializer.begin_variant)(tag, 2);
 			let _channel = (deserializer.i32_value)();
-			let value: T = T::rebuild(deserializer);
+			let value: T = T::rebuild(&mut deserializer);
 			match (deserializer.failed)() {
 				Some(let _reason) => {},
 				None => cache.set(Some(value)),
@@ -2964,7 +2970,7 @@ export impl ReactiveClient {
 		// element types. A malformed patch is dropped whole — a half-applied
 		// one would desync the mirror for good.
 		let deliver = |frame: Frame| {
-			let deserializer = (codec.reader)(frame);
+			mut deserializer = (codec.reader)(frame);
 			let tag = (deserializer.variant_tag)();
 			(deserializer.begin_variant)(tag, 2);
 			let _channel = (deserializer.i32_value)();
@@ -2972,7 +2978,7 @@ export impl ReactiveClient {
 			mut ops: List<Delta<K, T>> = [];
 			mut index = 0;
 			for index < length {
-				ops.push(Delta<K, T>::rebuild(deserializer));
+				ops.push(Delta<K, T>::rebuild(&mut deserializer));
 				index += 1;
 			}
 			(deserializer.end_list)();
@@ -4271,7 +4277,7 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 		}
 		let fresh = KeyLease {
 			key = wanted,
-			describe = |serializer: Serializer| key.describe(serializer),
+			describe = |mut serializer: Serializer| key.describe(&mut serializer),
 			count = Shared::new(0),
 			closing = Shared::new(false),
 			settle_id = fresh_id(),
@@ -4687,7 +4693,7 @@ fun reattach_mirrors(
 			if hash == expected_contract {
 				let connection = socket.connection.read();
 				let attached: Result<List<i32>, RpcError> = call(transport, codec, "__attach", [
-					|serializer: Serializer| connection.describe(serializer),
+					|mut serializer: Serializer| connection.describe(&mut serializer),
 				]);
 				match attached {
 					// No fresh channel ids, so there is nothing to rebind to:
@@ -5464,7 +5470,7 @@ export macro fun service(item: Item): Source {
 				jump continue;
 			}
 			stub = stub.parameter(i"{parameter.name}: {parameter.type_.render()}");
-			describers.push(i"|serializer: Serializer| {parameter.name}.describe(serializer)");
+			describers.push(i"|mut serializer: Serializer| {parameter.name}.describe(&mut serializer)");
 		}
 		let label = quote(method.name);
 		let describer_list = join(describers, ", ");
@@ -5582,7 +5588,7 @@ export macro fun service(item: Item): Source {
 	body.push("let connection = socket.connection.read();");
 	body.push("let attached: Result<List<i32>, RpcError> = rpc::call(transport, codec, "
 		+ quote("__attach")
-		+ ", [|serializer: Serializer| connection.describe(serializer)]);");
+		+ ", [|mut serializer: Serializer| connection.describe(&mut serializer)]);");
 	body.push("let channels = attached!;");
 	body.push("let reactive = ReactiveClient::new(rpc::bridge(socket), codec);");
 	// Registered where the client is born, so no terminal arm has to carry
@@ -5701,7 +5707,7 @@ export macro fun service(item: Item): Source {
 					jump continue;
 				}
 				stub = stub.parameter(i"{parameter.name}: {parameter.type_.render()}");
-				describers.push(i"|serializer: Serializer| {parameter.name}.describe(serializer)");
+				describers.push(i"|mut serializer: Serializer| {parameter.name}.describe(&mut serializer)");
 			}
 			let label = quote(method.name);
 			let describer_list = join(describers, ", ");

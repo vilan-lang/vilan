@@ -10,7 +10,6 @@
 import pkg::bytes::decode_utf8;
 import pkg::option::Option::{ self, None, Some };
 import pkg::result::Result::{ self, Err, Ok };
-import pkg::shared::Shared;
 import pkg::wire::{ Codec, Deserialize, Deserializer, Frame, Serialize, Serializer, Wire };
 
 // --- Serialization (`to_json`) ------------------------------------------------
@@ -311,165 +310,146 @@ external fun has_json_field(value: JsonValue, name: str): bool;
 /// saves the parent's flag and starts fresh, closing restores it. A `field`
 /// writes its own separator and glues its value (no comma between `"name":` and
 /// the value). Variant arities are tracked so `end_variant` knows what to close.
+///
+/// PLAIN FIELDS behind `&mut self` (A108). Until the visitor's receivers moved,
+/// every one of these four was a `Shared` cell — not because the state is
+/// shared with anything, but because `Serialize` declared `begin_struct(self)`
+/// and a by-value receiver cannot write a field. The cells were the language
+/// telling the code what shape it may have
+/// (`signal-cell-representation.md` §2.4's frame-scoped class); the receiver
+/// was the thing to fix.
 struct JsonWriter {
-	out: Shared<str>,
-	pending_comma: Shared<bool>,
-	saved_commas: Shared<List<bool>>,
-	variant_arities: Shared<List<i32>>,
+	out: str,
+	pending_comma: bool,
+	saved_commas: List<bool>,
+	variant_arities: List<i32>,
 }
 
 export impl JsonWriter {
 	fun new(): JsonWriter {
-		JsonWriter {
-			out = Shared::new(""),
-			pending_comma = Shared::new(false),
-			saved_commas = Shared::new([]),
-			variant_arities = Shared::new([]),
-		}
+		JsonWriter { out = "", pending_comma = false, saved_commas = [], variant_arities = [] }
 	}
 
 	/// Appends `text` as one value at the current level: separator first, and
 	/// the NEXT value here will need one too.
-	fun value(self, text: str) {
-		if self.pending_comma.read() {
-			self.out.write() = self.out.read() + ",";
+	fun value(&mut self, text: str) {
+		if self.pending_comma {
+			self.out = self.out + ",";
 		}
-		self.out.write() = self.out.read() + text;
-		self.pending_comma.write() = true;
+		self.out = self.out + text;
+		self.pending_comma = true;
 	}
 
 	/// Opens an aggregate: the opener is a value at the parent level; inside,
 	/// the first item needs no separator.
-	fun open(self, opener: str) {
+	fun open(&mut self, opener: str) {
 		self.value(opener);
-		self.saved_commas.write().push(true);
-		self.pending_comma.write() = false;
+		self.saved_commas.push(true);
+		self.pending_comma = false;
 	}
 
 	/// Closes an aggregate and restores the parent level's separator state.
-	fun close(self, closer: str) {
-		self.out.write() = self.out.read() + closer;
-		self.pending_comma.write() = match self.saved_commas.write().pop() {
+	fun close(&mut self, closer: str) {
+		self.out = self.out + closer;
+		self.pending_comma = match self.saved_commas.pop() {
 			Some(let saved) => saved,
 			None => false,
 		};
 	}
 
 	/// The finished document.
-	fun result(self): str {
-		self.out.read()
-	}
-
-	/// The closure record a `Codec` hands out — thin delegates to the trait
-	/// methods below (the codec-as-a-value erasure; direct `encode_json` skips it).
-	fun serializer(self): Serializer {
-		Serializer {
-			begin_struct = |fields| self.begin_struct(fields),
-			field = |name| self.field(name),
-			end_struct = || self.end_struct(),
-			begin_list = |length| self.begin_list(length),
-			end_list = || self.end_list(),
-			begin_variant = |name, arity| self.begin_variant(name, arity),
-			end_variant = || self.end_variant(),
-			null_value = || self.null_value(),
-			some_value = || self.some_value(),
-			str_value = |value| self.str_value(value),
-			i32_value = |value| self.i32_value(value),
-			u32_value = |value| self.u32_value(value),
-			i53_value = |value| self.i53_value(value),
-			f64_value = |value| self.f64_value(value),
-			bool_value = |value| self.bool_value(value),
-		}
+	fun result(&self): str {
+		self.out
 	}
 }
 
 // The visitor's write half, natively — `describe` monomorphizes straight onto
 // these methods on the direct path.
 export impl JsonWriter with Serialize {
-	fun begin_struct(self, fields: i32) {
+	fun begin_struct(&mut self, fields: i32) {
 		self.open("{");
 	}
 
-	fun field(self, name: str) {
-		if self.pending_comma.read() {
-			self.out.write() = self.out.read() + ",";
+	fun field(&mut self, name: str) {
+		if self.pending_comma {
+			self.out = self.out + ",";
 		}
-		self.out.write() = self.out.read() + name.to_json() + ":";
-		self.pending_comma.write() = false;
+		self.out = self.out + name.to_json() + ":";
+		self.pending_comma = false;
 	}
 
-	fun end_struct(self) {
+	fun end_struct(&mut self) {
 		self.close("}");
 	}
 
-	fun begin_list(self, length: i32) {
+	fun begin_list(&mut self, length: i32) {
 		self.open("[");
 	}
 
-	fun end_list(self) {
+	fun end_list(&mut self) {
 		self.close("]");
 	}
 
-	fun begin_variant(self, name: str, arity: i32) {
-		self.variant_arities.write().push(arity);
+	fun begin_variant(&mut self, name: str, arity: i32) {
+		self.variant_arities.push(arity);
 		if arity == 0 {
 			// A payload-less variant is its bare name: `"Ready"`.
 			self.value(name.to_json());
 		} else {
 			self.open("{");
-			self.out.write() = self.out.read() + name.to_json() + ":";
-			self.pending_comma.write() = false;
+			self.out = self.out + name.to_json() + ":";
+			self.pending_comma = false;
 			if arity > 1 {
 				// Several payloads ride in an array: `{"Pair":[1,2]}`.
-				self.out.write() = self.out.read() + "[";
+				self.out = self.out + "[";
 			}
 		}
 	}
 
-	fun end_variant(self) {
-		let arity = match self.variant_arities.write().pop() {
+	fun end_variant(&mut self) {
+		let arity = match self.variant_arities.pop() {
 			Some(let opened) => opened,
 			None => 0,
 		};
 		if arity > 1 {
-			self.out.write() = self.out.read() + "]";
+			self.out = self.out + "]";
 		}
 		if arity > 0 {
 			self.close("}");
 		}
 	}
 
-	fun null_value(self) {
+	fun null_value(&mut self) {
 		self.value("null");
 	}
 
 	/// JSON has no Some marker — a present Option is its bare value (which
 	/// keeps the format's Some(None) ≡ None collapse).
-	fun some_value(self) {}
+	fun some_value(&mut self) {}
 
-	fun str_value(self, value: str) {
+	fun str_value(&mut self, value: str) {
 		self.value(value.to_json());
 	}
 
-	fun i32_value(self, value: i32) {
+	fun i32_value(&mut self, value: i32) {
 		self.value(i"{value}");
 	}
 
-	fun u32_value(self, value: u32) {
+	fun u32_value(&mut self, value: u32) {
 		self.value(i"{value}");
 	}
 
 	/// A JSON number; exact for the runtime's whole i53 range (integers to
 	/// 2^53 — the f64 representation).
-	fun i53_value(self, value: i53) {
+	fun i53_value(&mut self, value: i53) {
 		self.value(i"{value}");
 	}
 
-	fun f64_value(self, value: f64) {
+	fun f64_value(&mut self, value: f64) {
 		self.value(i"{value}");
 	}
 
-	fun bool_value(self, value: bool) {
+	fun bool_value(&mut self, value: bool) {
 		self.value(i"{value}");
 	}
 }
@@ -480,50 +460,51 @@ export impl JsonWriter with Serialize {
 /// (reversed, so pops come off in order). Errors are sticky: after `fail`, every
 /// operation is a no-op returning a zero value, and `decode_json` reports the
 /// first reason.
+/// Plain fields behind `&mut self`, for the reason `JsonWriter`'s headnote
+/// gives (A108).
 struct JsonReader {
-	stack: Shared<List<JsonValue>>,
-	error: Shared<Option<str>>,
+	stack: List<JsonValue>,
+	error: Option<str>,
 }
 
 export impl JsonReader {
 	fun new(root: JsonValue): JsonReader {
-		let stack: Shared<List<JsonValue>> = Shared::new([]);
-		stack.write().push(root);
-		JsonReader { stack, error = Shared::new(None) }
+		mut stack: List<JsonValue> = [];
+		stack.push(root);
+		JsonReader { stack, error = None }
 	}
 
-	fun ok(self): bool {
-		match self.error.read() {
+	fun ok(&self): bool {
+		match self.error {
 			Some(let _reason) => false,
 			None => true,
 		}
 	}
 
-	fun report(self, reason: str) {
-		match self.error.read() {
+	fun report(&mut self, reason: str) {
+		match self.error {
 			Some(let _first) => {},
 			None => {
-				self.error.write() = Some(reason);
+				self.error = Some(reason);
 			},
 		}
 	}
 
 	/// The current value without consuming it (a null sentinel when poisoned
 	/// or unbalanced — reads stay crash-free either way).
-	fun top(self): JsonValue {
-		if !self.ok() || self.stack.read().is_empty() {
+	fun top(&self): JsonValue {
+		if !self.ok() || self.stack.is_empty() {
 			parse_json_value("null")
 		} else {
-			let values = self.stack.read();
-			values[values.len() - 1]
+			self.stack[self.stack.len() - 1]
 		}
 	}
 
-	fun take(self): JsonValue {
+	fun take(&mut self): JsonValue {
 		if !self.ok() {
 			ret parse_json_value("null");
 		}
-		match self.stack.write().pop() {
+		match self.stack.pop() {
 			Some(let value) => value,
 			None => {
 				// A balanced rebuild never underflows — reading past the
@@ -533,59 +514,34 @@ export impl JsonReader {
 			},
 		}
 	}
-
-	/// The closure record a `Codec` hands out — thin delegates to the trait
-	/// methods below (direct `decode_json` skips it).
-	fun deserializer(self): Deserializer {
-		Deserializer {
-			begin_struct = || self.begin_struct(),
-			field = |name| self.field(name),
-			end_struct = || self.end_struct(),
-			begin_list = || self.begin_list(),
-			end_list = || self.end_list(),
-			variant_tag = || self.variant_tag(),
-			begin_variant = |name, arity| self.begin_variant(name, arity),
-			end_variant = || self.end_variant(),
-			is_null = || self.is_null(),
-			null_value = || self.null_value(),
-			str_value = || self.str_value(),
-			i32_value = || self.i32_value(),
-			u32_value = || self.u32_value(),
-			i53_value = || self.i53_value(),
-			f64_value = || self.f64_value(),
-			bool_value = || self.bool_value(),
-			fail = |reason| self.fail(reason),
-			failed = || self.failed(),
-		}
-	}
 }
 
 // The visitor's read half, natively.
 export impl JsonReader with Deserialize {
-	fun begin_struct(self) {}
+	fun begin_struct(&mut self) {}
 
-	fun field(self, name: str) {
+	fun field(&mut self, name: str) {
 		let subject = self.top();
 		if self.ok() {
 			if has_json_field(subject, name) {
-				self.stack.write().push(subject.field(name));
+				self.stack.push(subject.field(name));
 			} else {
 				self.report(i"missing field '{name}'");
 			}
 		}
 	}
 
-	fun end_struct(self) {
+	fun end_struct(&mut self) {
 		let _ = self.take();
 	}
 
-	fun begin_list(self): i32 {
+	fun begin_list(&mut self): i32 {
 		let subject = self.take();
 		if self.ok() {
 			let elements = subject.elements();
 			mut index = elements.len() - 1;
 			for index >= 0 {
-				self.stack.write().push(elements[index]);
+				self.stack.push(elements[index]);
 				index -= 1;
 			}
 			elements.len()
@@ -594,9 +550,9 @@ export impl JsonReader with Deserialize {
 		}
 	}
 
-	fun end_list(self) {}
+	fun end_list(&mut self) {}
 
-	fun variant_tag(self): str {
+	fun variant_tag(&mut self): str {
 		if self.ok() {
 			self.top().tag()
 		} else {
@@ -604,18 +560,18 @@ export impl JsonReader with Deserialize {
 		}
 	}
 
-	fun begin_variant(self, name: str, arity: i32) {
+	fun begin_variant(&mut self, name: str, arity: i32) {
 		let subject = self.take();
 		if self.ok() && arity > 0 {
 			if has_json_field(subject, name) {
 				let payload = subject.field(name);
 				if arity == 1 {
-					self.stack.write().push(payload);
+					self.stack.push(payload);
 				} else {
 					let elements = payload.elements();
 					mut index = elements.len() - 1;
 					for index >= 0 {
-						self.stack.write().push(elements[index]);
+						self.stack.push(elements[index]);
 						index -= 1;
 					}
 				}
@@ -625,13 +581,13 @@ export impl JsonReader with Deserialize {
 		}
 	}
 
-	fun end_variant(self) {}
+	fun end_variant(&mut self) {}
 
-	fun is_null(self): bool {
+	fun is_null(&mut self): bool {
 		self.ok() && self.top().is_null()
 	}
 
-	fun null_value(self) {
+	fun null_value(&mut self) {
 		let _ = self.take();
 	}
 
@@ -639,7 +595,7 @@ export impl JsonReader with Deserialize {
 	/// scalar through the raw coercion rather than the validating `from_json_value`
 	/// (which now returns a `Result`) — the leaf is already inside the reader's
 	/// error discipline.
-	fun str_value(self): str {
+	fun str_value(&mut self): str {
 		let value = self.take();
 		if self.ok() {
 			coerce_str(value)
@@ -648,7 +604,7 @@ export impl JsonReader with Deserialize {
 		}
 	}
 
-	fun i32_value(self): i32 {
+	fun i32_value(&mut self): i32 {
 		let value = self.take();
 		if self.ok() {
 			coerce_i32(value)
@@ -657,7 +613,7 @@ export impl JsonReader with Deserialize {
 		}
 	}
 
-	fun u32_value(self): u32 {
+	fun u32_value(&mut self): u32 {
 		let value = self.take();
 		if self.ok() {
 			coerce_u32(value)
@@ -666,7 +622,7 @@ export impl JsonReader with Deserialize {
 		}
 	}
 
-	fun i53_value(self): i53 {
+	fun i53_value(&mut self): i53 {
 		let value = self.take();
 		if self.ok() {
 			coerce_i53(value)
@@ -675,7 +631,7 @@ export impl JsonReader with Deserialize {
 		}
 	}
 
-	fun f64_value(self): f64 {
+	fun f64_value(&mut self): f64 {
 		let value = self.take();
 		if self.ok() {
 			coerce_f64(value)
@@ -684,7 +640,7 @@ export impl JsonReader with Deserialize {
 		}
 	}
 
-	fun bool_value(self): bool {
+	fun bool_value(&mut self): bool {
 		let value = self.take();
 		if self.ok() {
 			coerce_bool(value)
@@ -693,20 +649,20 @@ export impl JsonReader with Deserialize {
 		}
 	}
 
-	fun fail(self, reason: str) {
+	fun fail(&mut self, reason: str) {
 		self.report(reason);
 	}
 
-	fun failed(self): Option<str> {
-		self.error.read()
+	fun failed(&mut self): Option<str> {
+		self.error
 	}
 }
 
 /// Encode a `Wire` value as JSON text — the direct path: `describe`
 /// monomorphizes straight onto `JsonWriter`, no record in between.
 export fun encode_json<T: Wire>(value: T): str {
-	let writer = JsonWriter::new();
-	value.describe(writer);
+	mut writer = JsonWriter::new();
+	value.describe(&mut writer);
 	writer.result()
 }
 
@@ -715,9 +671,9 @@ export fun encode_json<T: Wire>(value: T): str {
 /// (Malformed JSON *syntax* still throws at `parse_json_value` — the guarded
 /// parse is Q10/`?` territory.)
 export fun decode_json<T: Wire>(text: str): Result<T, str> {
-	let reader = opened_reader(text);
-	let value: T = T::rebuild(reader);
-	match reader.error.read() {
+	mut reader = opened_reader(text);
+	let value: T = T::rebuild(&mut reader);
+	match reader.error {
 		None => Ok(value),
 		Some(let reason) => Err(reason),
 	}
@@ -731,7 +687,7 @@ fun opened_reader(text: str): JsonReader {
 	match text.try_parse_json() {
 		Some(let root) => JsonReader::new(root),
 		None => {
-			let reader = JsonReader::new(parse_json_value("null"));
+			mut reader = JsonReader::new(parse_json_value("null"));
 			reader.report("malformed JSON");
 			reader
 		},
@@ -740,18 +696,65 @@ fun opened_reader(text: str): JsonReader {
 
 /// The JSON codec (§6.2): text frames over the writer/reader pair. A binary
 /// frame poisons the reader — a sticky decode error, never a crash.
+///
+/// The closure records are built HERE rather than by a `serializer()` method on
+/// the writer, and A108 is why: the visitor's state lives in plain fields now,
+/// so a record whose closures captured a by-value copy of the writer would
+/// narrate into a copy and finish an empty document, and a record whose
+/// closures captured a `&mut self` view is refused outright (a view may not
+/// escape its scope). What both closures may capture is the `mut` LOCAL of the
+/// frame that mints them — a closure captures the BINDING (spec §6.9) — so the
+/// writer and the finisher share one writer, which is exactly the relation the
+/// `Shared` cells used to buy.
 export fun json_codec(): Codec {
 	Codec {
 		writer = || {
-			let writer = JsonWriter::new();
-			(writer.serializer(), || Frame::Text(writer.result()))
+			mut writer = JsonWriter::new();
+			let record = Serializer {
+				begin_struct = |fields| writer.begin_struct(fields),
+				field = |name| writer.field(name),
+				end_struct = || writer.end_struct(),
+				begin_list = |length| writer.begin_list(length),
+				end_list = || writer.end_list(),
+				begin_variant = |name, arity| writer.begin_variant(name, arity),
+				end_variant = || writer.end_variant(),
+				null_value = || writer.null_value(),
+				some_value = || writer.some_value(),
+				str_value = |value| writer.str_value(value),
+				i32_value = |value| writer.i32_value(value),
+				u32_value = |value| writer.u32_value(value),
+				i53_value = |value| writer.i53_value(value),
+				f64_value = |value| writer.f64_value(value),
+				bool_value = |value| writer.bool_value(value),
+			};
+			(record, || Frame::Text(writer.result()))
 		},
 		reader = |frame| {
 			// Liberal in what it accepts: a binary frame is read as UTF-8 JSON
 			// (server mounts read request bodies as bytes without sniffing).
-			match frame {
-				Frame::Text(let text) => opened_reader(text).deserializer(),
-				Frame::Binary(let bytes) => opened_reader(decode_utf8(bytes)).deserializer(),
+			mut reader = match frame {
+				Frame::Text(let text) => opened_reader(text),
+				Frame::Binary(let bytes) => opened_reader(decode_utf8(bytes)),
+			};
+			Deserializer {
+				begin_struct = || reader.begin_struct(),
+				field = |name| reader.field(name),
+				end_struct = || reader.end_struct(),
+				begin_list = || reader.begin_list(),
+				end_list = || reader.end_list(),
+				variant_tag = || reader.variant_tag(),
+				begin_variant = |name, arity| reader.begin_variant(name, arity),
+				end_variant = || reader.end_variant(),
+				is_null = || reader.is_null(),
+				null_value = || reader.null_value(),
+				str_value = || reader.str_value(),
+				i32_value = || reader.i32_value(),
+				u32_value = || reader.u32_value(),
+				i53_value = || reader.i53_value(),
+				f64_value = || reader.f64_value(),
+				bool_value = || reader.bool_value(),
+				fail = |reason| reader.fail(reason),
+				failed = || reader.failed(),
 			}
 		},
 	}
@@ -831,7 +834,7 @@ export macro fun struct_wire_impls(target: StructItem): str {
 	mut describe = fun_of("describe")
 		.generics("<S: Serialize>")
 		.parameter("self")
-		.parameter("serializer: S")
+		.parameter("serializer: &mut S")
 		.line(i"serializer.begin_struct({target.fields.len()});");
 	for field in target.fields {
 		let label = quote(field.name);
@@ -841,7 +844,7 @@ export macro fun struct_wire_impls(target: StructItem): str {
 	describe = describe.line("serializer.end_struct();");
 	mut rebuild = fun_of("rebuild")
 		.generics("<D: Deserialize>")
-		.parameter("deserializer: D")
+		.parameter("deserializer: &mut D")
 		.returns(target.subject())
 		.line("deserializer.begin_struct();");
 	mut literal = init_of(target.name);
@@ -1023,11 +1026,11 @@ export macro fun enum_wire_impls(target: EnumItem): str {
 		let backed_describe = fun_of("describe")
 			.generics("<S: Serialize>")
 			.parameter("self")
-			.parameter("serializer: S")
+			.parameter("serializer: &mut S")
 			.expr("self.value().describe(serializer)");
 		mut backed_rebuild = fun_of("rebuild")
 			.generics("<D: Deserialize>")
-			.parameter("deserializer: D")
+			.parameter("deserializer: &mut D")
 			.returns(subject);
 		for line in rebuild_body {
 			backed_rebuild = backed_rebuild.line(line);
@@ -1110,11 +1113,11 @@ export macro fun enum_wire_impls(target: EnumItem): str {
 	let describe = fun_of("describe")
 		.generics("<S: Serialize>")
 		.parameter("self")
-		.parameter("serializer: S")
+		.parameter("serializer: &mut S")
 		.expr(describe_arms.render());
 	let rebuild = fun_of("rebuild")
 		.generics("<D: Deserialize>")
-		.parameter("deserializer: D")
+		.parameter("deserializer: &mut D")
 		.returns(subject)
 		.line("let tag = deserializer.variant_tag();")
 		.expr(rebuild_arms.render());

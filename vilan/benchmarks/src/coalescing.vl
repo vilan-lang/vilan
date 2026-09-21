@@ -100,7 +100,7 @@ fun run() {
 	let transport = local_rpc(dispatcher.into_protocol(json_codec()));
 	let amount = 1;
 	let outcome: Result<i32, RpcError> = call(transport, json_codec(), "bump", [
-		|s: Serializer| amount.describe(s),
+		|mut s: Serializer| amount.describe(&mut s),
 	]);
 	match outcome {
 		Ok(let value) => {},
