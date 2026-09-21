@@ -60095,9 +60095,20 @@ fn analyze_over_world<'src>(
     // open (a call inside another generic body), write nothing, which is what
     // keeps "show one line when nothing is substituted" a property of the map
     // rather than a rule its readers each have to remember.
+    //
+    // ENTRY-FILE sites only, which is not a shortcut but the reach of the one
+    // question this answers: a hover resolves through `entity_at`, whose table
+    // is the entry's id range and nothing else (M27), so a label for a call
+    // inside std could never be looked up — and std is where the generic call
+    // sites are. This is the compiler's largest per-process retention's
+    // neighbourhood (M11), and a String per generic call in the whole world is
+    // what the unfiltered loop would have kept.
     let mut call_signature_labels: HashMap<Id, String> = HashMap::default();
     for (call_id, substitution) in &analyzer.method_call_substitution {
         if substitution.is_empty() {
+            continue;
+        }
+        if analyzer.source_of_id(*call_id) != Some(SourceId(0)) {
             continue;
         }
         let Some(call) = analyzer.function_calls.get(call_id) else {
