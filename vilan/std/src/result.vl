@@ -113,7 +113,13 @@ impl Result<type T, type E> {
 		}
 	}
 
-	fun expect_err(self, message: str): E {
+	/// `message` is `lazy` (proposal/lazy.md §6b), the same position and the
+	/// same argument shape `expect` carries — here the text is BUILT on the
+	/// `Ok` path only, because that is the path that panics. The asymmetry this
+	/// closes was a trap: `expect`, `unwrap_or` and both of `Option`'s twins
+	/// were retrofitted and this one was not, so the cost of the message
+	/// depended on which of two neighbouring methods you reached for (A109).
+	fun expect_err(self, lazy message: str): E {
 		match self {
 			Err(let e) => e,
 			_ => panic(message),

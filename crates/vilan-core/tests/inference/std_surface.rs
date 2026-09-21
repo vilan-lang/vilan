@@ -5522,6 +5522,121 @@ fn an_unknown_result_tag_is_a_sticky_decode_failure_not_a_panic() {
     );
 }
 
+/// A104 — the DIRECT `Json`/`FromJson` pair for `Result<T, E>`, which the
+/// module carried for `Option` from the start and for `Result` not at all. It
+/// is deliberately not a third encoding: the text is externally tagged by
+/// VARIANT NAME, which is both what `[derive(Json)]` gives a one-payload
+/// variant and what the wire codec's `Result` impl writes, so `to_json` and
+/// `encode_json` are byte-identical and either side reads the other's document.
+/// (kolt's `shared.vl:65/80` hand-wrote the pair as a `[kind, value]` array
+/// with integer kinds — the exhibit, and an encoding nothing else spoke.)
+#[test]
+fn a104_result_carries_the_direct_json_pair_in_the_codecs_own_spelling() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::{ decode_json, encode_json, FromJson, Json };
+        import std::result::Result::{ self, Err, Ok };
+        fun show(outcome: Result<Result<i53, str>, str>): str {
+            match outcome {
+                Ok(let inner) => match inner {
+                    Ok(let value) => i"ok:{value}",
+                    Err(let reason) => i"err:{reason}",
+                },
+                Err(let reason) => i"failed:{reason}",
+            }
+        }
+        fun main() {
+            let good: Result<i53, str> = Ok(7i53);
+            let bad: Result<i53, str> = Err("nope");
+            print(good.to_json());                 // {"Ok":7}
+            print(bad.to_json());                  // {"Err":"nope"}
+            // The visitor writes the same bytes the direct impl does.
+            print(i"same:{encode_json(good) == good.to_json()}");
+            print(i"same:{encode_json(bad) == bad.to_json()}");
+            // Both directions of the direct pair.
+            print(show(Result::from_json(good.to_json())));
+            print(show(Result::from_json(bad.to_json())));
+            // And across the two: the visitor reads what the direct impl wrote.
+            print(show(decode_json<Result<i53, str>>(good.to_json())));
+            print(show(Result::from_json(encode_json(bad))));
+        }
+        "#,
+        "{\"Ok\":7}\n{\"Err\":\"nope\"}\nsame:true\nsame:true\nok:7\nerr:nope\nok:7\nerr:nope\n",
+    );
+}
+
+/// A104 — the pair nests, because each side delegates to its payload's own
+/// impl: a container, an `Option` (whose `None` is a bare `null` inside the
+/// tag) and a `[derive(Json)]` struct all cross on either leg.
+#[test]
+fn a104_the_result_json_pair_nests_through_containers_and_a_derive() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::{ FromJson, Json };
+        import std::result::Result::{ self, Err, Ok };
+        [derive(Json)]
+        struct Row {
+            id: i32,
+            name: str,
+        }
+        fun main() {
+            let list: Result<List<i32>, str> = Ok([1, 2]);
+            print(list.to_json());
+            let absent: Result<Option<i32>, str> = Ok(None);
+            print(absent.to_json());
+            let row: Result<Row, str> = Ok(Row { id = 1, name = "Ada" });
+            print(row.to_json());
+            let read: Result<Result<Row, str>, str> = Result::from_json(row.to_json());
+            match read {
+                Ok(let inner) => match inner {
+                    Ok(let value) => print(i"row {value.id} {value.name}"),
+                    Err(let reason) => print(i"inner-err {reason}"),
+                },
+                Err(let reason) => print(i"failed {reason}"),
+            }
+            // The Err leg carries its own payload type just as well.
+            let failed: Result<i32, Row> = Err(Row { id = 9, name = "boom" });
+            print(failed.to_json());
+        }
+        "#,
+        "{\"Ok\":[1,2]}\n{\"Ok\":null}\n{\"Ok\":{\"id\":1,\"name\":\"Ada\"}}\nrow 1 Ada\n\
+         {\"Err\":{\"id\":9,\"name\":\"boom\"}}\n",
+    );
+}
+
+/// A104 — decoding is fallible and NEVER crashes (the rule `FromJson`'s own
+/// doc states). The SHAPE is checked before the tag is read, deliberately: a
+/// tag read is `Object.keys` over the value, and a JSON `null` has no keys, so
+/// reading the tag first would throw rather than report. A wrong shape, an
+/// unknown tag, and text that is not JSON at all are three decode errors.
+#[test]
+fn a104_a_malformed_result_document_is_a_decode_error_and_never_a_crash() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::FromJson;
+        import std::result::Result::{ self, Err, Ok };
+        fun show(outcome: Result<Result<i53, str>, str>): str {
+            match outcome {
+                Ok(let _decoded) => "decoded-garbage",
+                Err(let reason) => i"refused:{reason}",
+            }
+        }
+        fun main() {
+            print(show(Result::from_json("null")));          // no keys to read
+            print(show(Result::from_json("7")));             // a number is not a variant
+            print(show(Result::from_json("[0,7]")));         // kolt's old array shape
+            print(show(Result::from_json("{\"Nope\":1}")));  // a tag nothing declares
+            print(show(Result::from_json("not json")));      // not a document at all
+        }
+        "#,
+        "refused:expected an object\nrefused:expected an object\nrefused:expected an object\n\
+         refused:unknown variant in JSON for enum Result\nrefused:not valid JSON\n",
+    );
+}
+
 /// The sized numeric family (numeric-types.md §5) is Wire, each width riding
 /// the visitor lane that holds it exactly — `i8`/`i16` on `i32`, `u8`/`u16` on
 /// `u32`, `u53` on `i53`, `f32` on `f64` — so the round trip is exact at both
@@ -5768,5 +5883,125 @@ fn a_signal_cells_identity_is_its_value_cells_and_survives_a_copy() {
         main();
         "#,
         "held:true\ntwin:false\n",
+    );
+}
+
+// --- I4: `Default` reaches the containers -----------------------------------
+//
+// `Default`'s implementors were the numeric family (`number.vl`), `str` and
+// `bool` (`default.vl`) and `Option<T>` (`option.vl`) — no container at all, so
+// a `T: Default` bound could not be met by a `List`, a `Map` or a `Set` and a
+// `[derive(Default)]` over a struct holding one had nothing to call. kolt wrote
+// `impl Map<type K, type V> with Default` itself (`prefs.vl:100`, under a
+// `// FIXME: Implement with std.`). Each impl lives in its own type's module,
+// which is the rule `default.vl`'s own comment states and the placement
+// `Option`'s follows.
+
+/// The three empty containers answer `default()`, and the value is a real fresh
+/// container rather than a shared one: inserting into the map does not change
+/// what the next `default()` hands back.
+#[test]
+fn i4_the_containers_have_a_default_and_it_is_the_empty_one() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::default::Default;
+        import std::map::Map;
+        import std::set::Set;
+        fun make<T: Default>(): T {
+            T::default()
+        }
+        fun main() {
+            let list: List<i32> = make();
+            mut map: Map<str, i32> = make();
+            mut set: Set<i32> = make();
+            print(i"{list.len()} {map.len()} {set.len()}");
+            map.insert("a", 1);
+            set.insert(3);
+            print(i"{map.len()} {set.len()}");
+            let fresh_map: Map<str, i32> = make();
+            let fresh_set: Set<i32> = make();
+            print(i"{fresh_map.len()} {fresh_set.len()}");
+        }
+        "#,
+        "0 0 0\n1 1\n0 0\n",
+    );
+}
+
+/// The other three the item asked to verify were already there, and the pin
+/// says so rather than leaving it to a reader: `str` is `""`, `bool` is
+/// `false`, `Option<T>` is `None`, and the numeric family is zero.
+#[test]
+fn i4_the_scalars_and_option_already_had_one() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::default::Default;
+        fun make<T: Default>(): T {
+            T::default()
+        }
+        fun main() {
+            let text: str = make();
+            let flag: bool = make();
+            let slot: Option<i32> = make();
+            let whole: i32 = make();
+            let real: f64 = make();
+            print(i"'{text}' {flag} {slot.is_none()} {whole} {real}");
+        }
+        "#,
+        "'' false true 0 0\n",
+    );
+}
+
+/// The point of the batch: `[derive(Default)]` builds its literal out of
+/// `Field::default()` per field, so a struct holding a container was refused at
+/// the DERIVE before this — the shape kolt's `prefs.vl` is.
+#[test]
+fn i4_a_derived_default_admits_a_struct_holding_containers() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::map::Map;
+        import std::set::Set;
+        [derive(Default)]
+        struct Prefs {
+            names: List<str>,
+            seen: Set<i32>,
+            widths: Map<str, i32>,
+            label: str,
+            collapsed: bool,
+            width: i32,
+            last: Option<i32>,
+        }
+        fun main() {
+            let prefs = Prefs::default();
+            print(i"{prefs.names.len()} {prefs.seen.len()} {prefs.widths.len()}");
+            print(i"'{prefs.label}' {prefs.collapsed} {prefs.width} {prefs.last.is_none()}");
+        }
+        "#,
+        "0 0 0\n'' false 0 true\n",
+    );
+}
+
+/// A `Map`'s and a `Set`'s binder carries the `Hashable` its TYPE declares, so
+/// the impls do not widen what either container admits: a key that is not
+/// hashable is refused exactly where it was before, at the type.
+#[test]
+fn i4_the_container_defaults_do_not_widen_what_a_map_key_may_be() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::default::Default;
+        import std::map::Map;
+        struct Key { id: i32 }
+        fun make<T: Default>(): T {
+            T::default()
+        }
+        fun main() {
+            let map: Map<Key, i32> = make();
+            print(map.len());
+        }
+        "#,
+        "Hashable",
     );
 }

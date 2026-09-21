@@ -129,6 +129,18 @@ impl List<type T: Add + Default> {
 	}
 }
 
+/// The empty list is a `List`'s default (I4). It is here rather than in
+/// `default.vl` for the reason that module's own comment gives: a type with a
+/// module of its own declares its default there, the way `Option` does. Without
+/// it a `T: Default` bound could not be met by a container at all, so a derived
+/// `Default` over a struct holding a `List` had nothing to call and every app
+/// wrote the impl itself (kolt's `prefs.vl:100`, for `Map`).
+impl List<type T> with Default {
+	fun default(): List<T> {
+		[]
+	}
+}
+
 impl List<type T: Mul + Default> {
 	fun product(self): T {
 		mut total = T::default();

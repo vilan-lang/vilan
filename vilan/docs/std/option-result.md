@@ -151,7 +151,7 @@ impl Result<type T, type E> {
 	fun unwrap_or(self, lazy fallback: T): T
 	fun unwrap_or_else(self, fn: |E| T): T
 	fun expect(self, lazy message: str): T   // panic with your message
-	fun expect_err(self, message: str): E
+	fun expect_err(self, lazy message: str): E
 
 	// transformation
 	fun map<U>(self, fn: |T| U): Result<U, E>
@@ -206,12 +206,13 @@ fun main() {
   invariants, and it panics.
 - `unwrap_or`'s fallback and `expect`'s message are
   [**`lazy`**](../tour/functions-and-closures.md#lazy-parameters) on all
-  four of `Option::expect`, `Option::unwrap_or`, `Result::expect` and
-  `Result::unwrap_or`: the expression you write in that position is
-  evaluated only on the path that needs it, at most once. So
-  `opt.unwrap_or(expensive())` does not run `expensive()` when `opt` is
-  `Some`, and `res.expect(i"no row for {key}")` builds no message when the
-  row is there. `unwrap_or_else` remains the explicit spelling — a
+  five of `Option::expect`, `Option::unwrap_or`, `Result::expect`,
+  `Result::unwrap_or` and `Result::expect_err`: the expression you write
+  in that position is evaluated only on the path that needs it, at most
+  once. So `opt.unwrap_or(expensive())` does not run `expensive()` when
+  `opt` is `Some`, and `res.expect(i"no row for {key}")` builds no message
+  when the row is there — nor does `res.expect_err(..)` on the `Err` path,
+  which is the one it does not panic on. `unwrap_or_else` remains the explicit spelling — a
   closure, and on a `Result` the one that sees the error — and it is still
   the resource-clean one, because it PRODUCES the fallback instead of
   discarding it.

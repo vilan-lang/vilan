@@ -14,17 +14,34 @@
 // bare names against the site's scope FIRST and against this module only if
 // nothing there answers, so an explicit local binding always wins and no file
 // can be broken by a name added here. Outside a block it is an ordinary
-// module — `import std::style::prelude::{ rem, gray };` binds what it names.
+// module — `import std::style::prelude::{ rem, gray };` binds what it names,
+// and `import std::style::prelude::*;` at the top of a file is the IDIOM for a
+// file whose `fun` bodies build chains: a chain written outside a hole gets no
+// ambient scope, so before this the file imported one name per token it used
+// (kolt's `styles.vl:54/103` imported nine, per function).
+//
+// The keyword-property TYPES ride along for that reason (A106): a chain reads
+// `.cursor(Cursor::Pointer)` whether it is inside a hole or not, so `Cursor`,
+// `TextAlign` and `AlignItems` belong to the same vocabulary as `rem` and
+// `hover` (`Length` was already here, as `piece`'s and the constructors'
+// currency). The set is deliberately the FOUR the vocabulary needs and not
+// every keyword enum in `std::style`: `Display`, `Position`, `FlexDirection`,
+// `JustifyContent`, `Overflow`, `WhiteSpace` and `UserSelect` stay qualified
+// until a file asks for them, because a prelude is a vocabulary rather than a
+// re-export of a module.
 //
 // `s()` is `style()` under the one-letter name a chain written inside a
 // `const { … }` wants; the builder itself is untouched.
 
 import pkg::style::{
+	AlignItems,
 	Color,
 	Condition,
 	CssPiece,
+	Cursor,
 	Length,
 	Style,
+	TextAlign,
 	active as active_condition,
 	attribute as attribute_condition,
 	children as children_condition,

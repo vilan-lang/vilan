@@ -6295,6 +6295,134 @@ fn the_style_prelude_is_not_ambient_outside_a_block() {
     );
 }
 
+// --- A106: the vocabulary reaches a chain written OUTSIDE a hole -------------
+//
+// A70 made the prelude ambient inside a css HOLE, which is one syntactic
+// position. A `fun` body that builds a chain is not that position, so before
+// A106 such a file imported one name per token it used — and from `std::style`
+// rather than the prelude, because the prelude carried the free functions and
+// the conditions but NOT the keyword-property types, and because the builder
+// there is named `style` and wants aliasing. kolt's `styles.vl:54/103` is the
+// exhibit: nine names, imported twice, once inside each of two functions,
+// under a `// FIXME: Add a prelude to std.`.
+//
+// Door 1 (R7 at Order 38's GO): the four TYPES the vocabulary needs join the
+// module, and one file-level import list is the idiom. Door 2 — the `std::web`
+// prelude re-exporting this module, ambient in every web file — is gated on a
+// zero-collision census, and the census this lane ran is NOT zero, so it is
+// not taken.
+
+/// The four keyword-property types resolve through `std::style::prelude`, so
+/// ONE import list answers both halves of a chain — the tokens and the
+/// keywords. This is kolt's `button_style` shape, with the nine-name block
+/// replaced by one statement at the top.
+#[test]
+fn a106_one_prelude_import_answers_a_whole_chain_outside_a_hole() {
+    let css = style_css(
+        r#"
+        import std::style::prelude::{
+            AlignItems,
+            Cursor,
+            Length,
+            TextAlign,
+            active,
+            attribute,
+            gray,
+            hover,
+            pseudo,
+            px,
+            s,
+            space,
+        };
+        import std::style::Style;
+        fun button(): Style {
+            s()
+                .padding(space(2))
+                .color(gray(700))
+                .cursor(Cursor::Pointer)
+                .text_align(TextAlign::Center)
+                .align_items(AlignItems::Center)
+                .width(px(120))
+                .raw("outline-offset", Length::zero())
+                .on(hover() + active().not(), s().color(gray(900)))
+                .on(attribute("data-open"), s().color(gray(500)))
+                .on(pseudo("focus-visible"), s().color(gray(100)))
+        }
+        fun main() { let _built = const button(); }
+        main();
+        "#,
+    );
+    assert!(css.contains("{cursor:pointer"), "{css}");
+    assert!(css.contains("text-align:center"), "{css}");
+    assert!(css.contains("align-items:center"), "{css}");
+    assert!(css.contains("width:120px"), "{css}");
+    assert!(css.contains(":hover"), "{css}");
+    assert!(css.contains("[data-open]"), "{css}");
+    assert!(css.contains(":focus-visible"), "{css}");
+}
+
+/// The module name qualifies them too, which is the form for a file that would
+/// rather not bind a dozen bare names.
+#[test]
+fn a106_the_four_types_qualify_through_the_module_name() {
+    assert_compiles(
+        r#"
+        import std::style::prelude as tokens;
+        import std::style::Style;
+        fun button(): Style {
+            tokens::s()
+                .cursor(tokens::Cursor::Pointer)
+                .text_align(tokens::TextAlign::Left)
+                .align_items(tokens::AlignItems::Stretch)
+                .raw("outline-offset", tokens::Length::zero())
+        }
+        fun main() { let _built = const button(); }
+        main();
+        "#,
+    );
+}
+
+/// The set is the FOUR the vocabulary needs, not every keyword enum in
+/// `std::style`. A prelude is a vocabulary rather than a second spelling of a
+/// module, so the rest stay where they are and the refusal says so.
+#[test]
+fn a106_the_other_keyword_enums_stay_out_of_the_prelude() {
+    for absent in ["Display", "Position", "FlexDirection", "JustifyContent"] {
+        let source = format!(
+            r#"
+            import std::style::prelude::{{ {absent} }};
+            fun main() {{}}
+            main();
+            "#
+        );
+        assert_fails_with(&source, "in the imported path");
+    }
+}
+
+/// The widening cannot break a file, and this is the rule that guarantees it:
+/// the site's own scope is asked FIRST, always. A file declaring its own
+/// `Cursor` keeps it, and a hole in the same file still reaches the prelude for
+/// everything else. Neither case is hypothetical — the book's own iteration
+/// example declares `struct Cursor`, and kolt's icon library declares
+/// `fun space()`, `fun focus()` and `fun divide()`; they are three of the six
+/// file-level shadows door 2's census found.
+#[test]
+fn a106_a_local_declaration_still_beats_a_newly_added_prelude_name() {
+    let css = style_css(
+        r#"
+        struct Cursor { index: i32 }
+        fun space(): i32 { 7 }
+        let card = css { padding(rem(1)); };
+        fun main() {
+            let walked = Cursor { index = space() };
+            print(walked.index);
+        }
+        main();
+        "#,
+    );
+    assert!(css.contains("{padding:1rem}"), "{css}");
+}
+
 // --- A68: a block is `const` BY CONSTRUCTION ---------------------------------
 //
 // `Style::raw` calls `emit`, the compile-time channel, so a chain only means

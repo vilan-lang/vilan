@@ -1322,3 +1322,50 @@ export impl f32 with FromJson {
 		}
 	}
 }
+
+// --- `Result` (A104) ----------------------------------------------------------
+//
+// `Option` has carried both directions since this module existed (`:23` and
+// `:264`); `Result` carried neither, so every app wanting a fallible value in
+// JSON wrote the pair itself and chose its own encoding (kolt's
+// `shared.vl:65/80` is a `[kind, value]` array with 0 = Ok and 1 = Err).
+//
+// The spelling here is not a third one. It is EXTERNALLY TAGGED BY VARIANT
+// NAME — `Ok(7)` is `{"Ok":7}`, `Err("nope")` is `{"Err":"nope"}` — which is
+// at once what `[derive(Json)]` gives a one-payload variant and what the wire
+// codec's `Result` impl writes through `begin_variant` (wire.vl's A82 block).
+// One value therefore crosses both codecs under one spelling, and the tags are
+// names rather than discriminants, so neither side depends on declaration
+// order.
+export impl Result<type T: Json, type E: Json> with Json {
+	fun to_json(self): str {
+		match self {
+			Ok(let value) => "{\"Ok\":" + value.to_json() + "}",
+			Err(let error) => "{\"Err\":" + error.to_json() + "}",
+		}
+	}
+}
+
+// Decoding is fallible and never crashes (the rule this module's `FromJson`
+// doc states): the SHAPE is checked before the tag is read, because a tag read
+// is `Object.keys` over the value and a JSON `null` or number has no keys. A
+// wrong shape and an unrecognized tag are both decode errors, and each payload
+// leaf threads its own failure with `!`.
+export impl Result<type T: FromJson, type E: FromJson> with FromJson {
+	fun from_json(text: str): Result<Result<T, E>, str> {
+		match text.try_parse_json() {
+			Some(let value) => Result::from_json_value(value),
+			None => Err("not valid JSON"),
+		}
+	}
+	fun from_json_value(value: JsonValue): Result<Result<T, E>, str> {
+		if value.kind() != JsonKind::Object {
+			ret Err("expected an object");
+		}
+		match value.tag() {
+			"Ok" => Ok(Ok(T::from_json_value(value.field("Ok"))!)),
+			"Err" => Ok(Err(E::from_json_value(value.field("Err"))!)),
+			_ => Err("unknown variant in JSON for enum Result"),
+		}
+	}
+}

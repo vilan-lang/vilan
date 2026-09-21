@@ -23,6 +23,7 @@ impl List<type T> {
 	fun last(self): Option<T>
 	fun map<U>(self, fn: |T| U): List<U>
 	fun filter(self, predicate: |T| bool): List<T>
+	fun filter_map<U>(self, fn: |T| Option<U>): List<U>   // both, one pass
 	fun find(self, predicate: |T| bool): Option<T>
 	fun fold<B>(self, init: B, fn: |B, T| B): B
 	fun for_each(self, fn: |T| void)
@@ -40,6 +41,7 @@ impl List<type T: PartialEq> with PartialEq {
 	fun eq(self, b: List<T>): bool           // element-wise, length first
 }
 impl List<type T: Display> { fun join(self, separator: str): str }
+impl List<type T> with Default { fun default(): List<T> }       // []
 ```
 
 Indexing is `list[i]`; iterate with `for item in list` (copies) or
@@ -174,6 +176,9 @@ impl Map<type K: Hashable, type V: PartialEq> {
 	fun contains_value(self, value: V): bool
 }
 impl List<(type K: Hashable, type V)> { fun to_map(self): Map<K, V> }
+impl Map<type K: Hashable, type V> with Default {
+	fun default(): Map<K, V>                 // the empty map
+}
 ```
 
 Keys compare **by value**. Scalars work directly, and so does a **backed enum**
@@ -260,6 +265,7 @@ impl Set<type T: Hashable> {
 	fun difference(self, other: Set<T>): Set<T>
 }
 impl List<type T: Hashable> { fun to_set(self): Set<T> }
+impl Set<type T: Hashable> with Default { fun default(): Set<T> }  // the empty set
 ```
 
 Value-keyed like `Map` (element `T` must be `Hashable`); `for x in set`
@@ -533,12 +539,18 @@ all of them:
 ```vilan,fragment
 fun map<U>(self, fn: |T| U): Mapped<Self, T, U>
 fun filter(self, predicate: |T| bool): Filtered<Self, T>
+fun filter_map<U>(self, fn: |T| Option<U>): FilterMapped<Self, T, U>   // both, one pass
 fun take(self, count: i32): Taken<Self, T>
 fun skip(self, count: i32): Skipped<Self, T>
 fun enumerate(self): Enumerated<Self, T>                       // (0, a), (1, b), …
 fun zip<U, J: Iterator<U>>(self, other: J): Zipped<Self, J, T, U>
 fun chain<J: Iterator<T>>(self, other: J): Chained<Self, J, T>
 ```
+
+`filter_map` is `map` and `filter` at once: the projection answers
+`Some(value)` to keep that value and `None` to drop the element, so a partial
+or fallible projection needs neither a two-stage chain nor an `Option` to
+unwrap afterwards. `List` carries the eager twin under the same name.
 
 They are **lazy**: each returns a small struct holding its upstream, and nothing
 runs until something pulls. So a chain makes one pass over the source and builds

@@ -241,7 +241,10 @@ fun on<C: IntoConditions>(self, conditions: C, inner: Style): Style
 
 Free functions in `std::style` (and in `std::style::prelude`, which is ambient
 inside a `css` block, along with `var`, `piece`, the `Length`/`Color`
-constructors and `s()`):
+constructors, `s()`, and the keyword-property types `Length`, `Cursor`,
+`TextAlign` and `AlignItems` — so one file-level
+`import std::style::prelude::{ … };` answers a whole chain built outside a
+hole):
 
 ```vilan,fragment
 fun hover(): Condition          // :hover

@@ -4,6 +4,7 @@
 // (I1). Each element is turned into a canonical `Hash` via `value.hash()`, which
 // keys the underlying native map; the original value is stored alongside so
 // `for x in set` yields real `T`s in insertion order.
+import pkg::default::Default;
 import pkg::hash::{ Hash, Hashable };
 import pkg::native_map::NativeMap;
 
@@ -110,5 +111,14 @@ impl List<type T: Hashable> {
 			result.insert(value);
 		}
 		result
+	}
+}
+
+/// The empty set is a `Set`'s default (I4), beside `List`'s and `Map`'s. The
+/// binder carries `Hashable` for the same reason `Map`'s key does — the type's
+/// own bound.
+impl Set<type T: Hashable> with Default {
+	fun default(): Set<T> {
+		Set::new()
 	}
 }
