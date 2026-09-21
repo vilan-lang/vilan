@@ -625,3 +625,119 @@ fn b293_the_anchor_link_builds_is_not_drag_armed() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- A72: replace-state navigation ------------------------------------------
+//
+// `navigate` pushes a history entry, which is wrong for every navigation the
+// user did not ask for — a redirect off a bare path onto its canonical form, a
+// sign-in bounce, a filter written into the URL. Pushing there makes Back walk
+// through the redirect and arrive where it started, so an app wrote the other
+// half itself: kolt's `client.vl:39/44` is a hand-declared
+// `[extern("history.replaceState")]` plus a `navigate_in_place` that reaches
+// `std::router`'s own unexported `ensure_wired` and `path_signal`, under
+// `// FIXME: Implement with std (A72)`.
+//
+// The pin's instrument is the history STACK, because the difference between the
+// two calls is invisible in `location.pathname`: both advance it, and only the
+// depth says which one ran.
+
+const REPLACE_APP: &str = r#"import std::io::print;
+import std::reactive::SignalCell;
+import std::router::{ current_path, navigate, navigate_replace };
+import std::ui::{ View, mount_root, view };
+
+fun main() {
+	let path: SignalCell<str> = current_path();
+	let _root = mount_root("app", || {
+		view("main")
+			.child(view("button").attr("id", "push").on("click", || navigate("/pushed")))
+			.child(view("button")
+				.attr("id", "replace")
+				.on("click", || navigate_replace("/replaced")))
+			.child(view("p").attr("id", "here").bind_text(path))
+	});
+}
+
+main();
+"#;
+
+const REPLACE_HARNESS: &str = concat!(
+    include_str!("support/dom/stub.js"),
+    include_str!("support/dom/router.js"),
+    r##"require("./app.js");
+
+let failures = 0;
+const assert = (cond, msg) => {
+    if (!cond) { failures += 1; console.error("FAIL - " + msg); }
+    else console.log("ok   - " + msg);
+};
+
+const main = root.children[0];
+const button = (id) => main.find(e => e.attributes.id === id);
+const here = () => main.find(e => e.attributes.id === "here").textContent;
+
+assert(global.historyEntries.length === 1, "one entry to start with");
+assert(here() === "/", "the path signal starts at the current location");
+
+button("push").click();
+assert(global.location.pathname === "/pushed", "navigate() moved the location");
+assert(global.historyEntries.length === 2, "navigate() PUSHED an entry");
+assert(here() === "/pushed", "and the path signal advanced");
+
+button("replace").click();
+assert(global.location.pathname === "/replaced", "navigate_replace() moved the location too");
+assert(global.historyEntries.length === 2,
+    "navigate_replace() did NOT push — the stack is the same depth");
+assert(global.historyEntries[1] === "/replaced",
+    "it rewrote the entry that was on top, so Back goes where it went before");
+assert(here() === "/replaced",
+    "and the path signal advanced exactly as it does for navigate()");
+
+// The wiring is the singleton's, so a replace before any push works too — the
+// shape a redirect at boot actually takes. `popstate` still drives the signal.
+global.location.pathname = "/pushed";
+global.window.fire("popstate", {});
+assert(here() === "/pushed", "back/forward still drives the same path signal");
+
+process.exit(failures === 0 ? 0 : 1);
+"##,
+);
+
+/// A72: `navigate_replace` advances the URL and the path signal exactly as
+/// `navigate` does, and leaves the history stack the depth it was.
+#[test]
+fn a72_navigate_replace_rewrites_the_current_entry_instead_of_pushing_one() {
+    let dir = temp_project("replace");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"router_replace\"\nroot = \".\"\nentry = \"app.vl\"\ntarget = \"browser\"\n",
+    );
+    write(&dir, "app.vl", REPLACE_APP);
+    write(&dir, "harness.js", REPLACE_HARNESS);
+
+    let build = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", dir.to_str().unwrap()])
+        .output()
+        .expect("run vilan build");
+    assert!(
+        build.status.success(),
+        "vilan build failed:\n{}\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new("node")
+        .arg("harness.js")
+        .current_dir(&dir)
+        .output()
+        .expect("run node harness");
+    assert!(
+        run.status.success(),
+        "replace-navigation harness failed:\n{}\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

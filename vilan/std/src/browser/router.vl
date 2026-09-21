@@ -23,6 +23,10 @@ import pkg::ui::{ View, chunk_failure, chunk_pending, view };
 [extern("history.pushState")]
 external fun history_push(state: str, title: str, path: str): void;
 
+/// `history.replaceState(state, title, path)` — state and title are unused ("").
+[extern("history.replaceState")]
+external fun history_replace(state: str, title: str, path: str): void;
+
 /// `location.pathname` (via a helper — a global property has no function form).
 [extern("__router_path")]
 external fun location_path(): str;
@@ -83,6 +87,28 @@ export fun current_path(): SignalCell<str> {
 export fun navigate(path: str) {
 	ensure_wired();
 	history_push("", "", path);
+	path_signal.set(path);
+}
+
+/// Navigation that REPLACES the current history entry instead of pushing one
+/// (A72): the URL and the path signal advance exactly as `navigate`'s do, and
+/// the back button goes wherever it went before this call.
+///
+/// Reach for it where the entry that would be pushed is not a place a user
+/// meant to go back to: a redirect off a bare path onto its canonical form
+/// (`/` → `/inbox`), a sign-in bounce landing on the page the user actually
+/// asked for, a filter or a tab written into the URL so a reload restores it.
+/// Pushing in those places is what makes Back walk through a redirect and
+/// arrive where it started.
+///
+/// A SECOND FUNCTION rather than `navigate(path, replace)`: vilan has neither
+/// overloading nor default arguments, so a parameter would be a breaking change
+/// to every existing call — and `navigate_replace(path)` reads as what it does
+/// at the call site, which a bare `true` does not. Joins the caller's ambient
+/// turn, exactly as `navigate` does.
+export fun navigate_replace(path: str) {
+	ensure_wired();
+	history_replace("", "", path);
 	path_signal.set(path);
 }
 

@@ -412,6 +412,7 @@ Two things deliberately still ask for the concrete type:
 ```vilan,fragment
 fun current_path(): SignalCell<str>       // location.pathname, live (navigate + back/forward)
 fun navigate(path: str)               // pushState + update current_path
+fun navigate_replace(path: str)       // replaceState — same, WITHOUT a new history entry
 fun location_url(): str               // pathname + search + hash — the whole relative URL
 fun segments(path: str): List<str>    // "/w/3/task/7" → ["w", "3", "task", "7"], RAW
 fun percent_decode(text: str): str    // decodeURIComponent, total (a bad escape decodes to itself)
@@ -433,6 +434,17 @@ impl View {
 fun pending(): SignalCell<bool>                 // a route chunk is in flight
 fun chunk_error(): SignalCell<Option<str>>      // the last fetch failed, with the reason
 ```
+
+`navigate` pushes a history entry; `navigate_replace` rewrites the one that
+is there. Reach for the replacing form wherever the entry would not be a
+place a user meant to go back to — a redirect off a bare path onto its
+canonical form, a sign-in bounce landing on the page they asked for, a filter
+or tab written into the URL so a reload restores it. Pushing there is what
+makes Back walk through the redirect and arrive where it started. Both
+advance `current_path()` identically and both join the caller's ambient turn;
+there is no `navigate(path, replace)` because vilan has neither overloading
+nor default arguments, and a bare `true` at the call site says less than the
+name does.
 
 `current_path()` is a singleton signal: every caller gets the same one, and
 the `popstate` listener is wired on first use. `link` renders a real anchor
