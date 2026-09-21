@@ -19850,6 +19850,37 @@ impl<'src> Analyzer<'src> {
             .collect()
     }
 
+    /// B356: the substitution a VARIANT constructor path's written arguments
+    /// fix (`Holder<i32>::Full` -> `{ Holder::T: i32 }`) — the enum's own
+    /// parameters zipped with what the path wrote, exactly as
+    /// [`Self::trait_parameter_substitution`] zips a trait's.
+    ///
+    /// A variant has no impl to reconcile the subject against (the static
+    /// path's own channel), so its written arguments reached nothing:
+    /// `Holder<i32>::Full("x")` compiled, and `Option<i32>::Some("y")` typed as
+    /// `Option<str>` from the PAYLOAD with the written `i32` silently
+    /// discarded — B323's family, "an annotation-only generic argument is
+    /// silently inert".
+    fn seed_variant_subject_bindings(&mut self, id: Id, subject_type: &Type) {
+        let Type::Enum(enum_id, arguments) = subject_type else {
+            return;
+        };
+        if arguments.is_empty() {
+            return;
+        }
+        let bindings: SubstitutionContext = self
+            .enums
+            .get(enum_id)
+            .map(|enum_| enum_.generic_parameter_constraint_ids.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .zip(arguments.iter().copied())
+            .collect();
+        if !bindings.is_empty() {
+            self.static_subject_bindings.insert(id, bindings);
+        }
+    }
+
     /// [`trait_with_supertraits`] with each trait paired with the type
     /// arguments it is reached WITH: the sub-trait's arguments substituted
     /// into the supertrait's WRITTEN ones, so `trait Sig<T> with Src<T>`
@@ -34112,6 +34143,7 @@ impl<'src> Analyzer<'src> {
             // A bare variant reference is a value of the enum (e.g. `None`); a
             // variant with data acts as a constructor whose call also yields
             // the enum.
+            //
             Expr::EnumVariant(enum_id, _) => Type::Enum(*enum_id, Vec::new()),
             Expr::Trait(trait_id) => Type::Trait(*trait_id, Vec::new()),
             Expr::Module(module_id) => Type::Module(*module_id),
@@ -39034,15 +39066,30 @@ impl<'src> Analyzer<'src> {
                         });
                         return Resolution::Failed;
                     }
-                    let substitution_context = HashMap::default();
+                    // B356: a written path argument (`Holder<i32>::Full(..)`,
+                    // `Option<str>::Some(..)`) FIXES the enum's parameter for
+                    // this call. Without it the arguments were inert — the
+                    // payload typed the enum and the written argument reached
+                    // nothing, so `Option<i32>::Some("y")` was an `Option<str>`
+                    // and `o.unwrap_or(3)` then wanted a `str`.
+                    let substitution_context: SubstitutionContext = self
+                        .static_subject_bindings
+                        .get(&subject_id)
+                        .cloned()
+                        .unwrap_or_default();
                     // A constructor call INSTANTIATES the enum's parameters, so
                     // they are open here even inside an `impl Option<type T>`
-                    // that holds the same ids rigid (B211).
-                    let enum_generics = self
+                    // that holds the same ids rigid (B211) — except the ones the
+                    // path just fixed, which are no longer open to inference or
+                    // the written argument would lose to the payload again.
+                    let enum_generics: Vec<TypeId> = self
                         .enums
                         .get(&enum_id)
                         .map(|enum_| enum_.generic_parameter_constraint_ids.clone())
-                        .unwrap_or_default();
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|constraint_id| !substitution_context.contains_key(constraint_id))
+                        .collect();
                     for (index, data_type_id) in data_type_ids.iter().enumerate() {
                         let data_type = data_type_id.get_type(self);
                         let argument_id = *argument_ids.get(index).unwrap();
@@ -45903,6 +45950,12 @@ impl<'src> Analyzer<'src> {
                             // reconciled impl-first so the bindings key on the
                             // impl's generics.
                             self.seed_trait_static_subject_bindings(id, &subject_type);
+                            // B356: and a VARIANT's, which has no impl for the
+                            // reconcile below to match against — the enum's own
+                            // parameters are the channel.
+                            if variant_id == Some(member_id) {
+                                self.seed_variant_subject_bindings(id, &subject_type);
+                            }
                             let has_concrete_args = matches!(
                                 &subject_type,
                                 Type::Struct(_, args) | Type::Enum(_, args) if !args.is_empty()

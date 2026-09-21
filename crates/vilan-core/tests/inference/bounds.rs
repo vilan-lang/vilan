@@ -10786,3 +10786,149 @@ fn b353_an_agreeing_closure_body_still_compiles() {
         "#,
     );
 }
+
+// --- B356/B357: every path shape that carries WRITTEN type arguments checks
+// them, and a payload-less variant of a generic enum carries a real hole -----
+//
+// B323's family is "an annotation-only generic argument is silently inert", and
+// B352 closed the trait-static shape. B356 asked for the sweep: enumerate the
+// path shapes that can carry written type arguments and pin each against an
+// argument that CONTRADICTS them. The table, measured at 0fa109eb:
+//
+//   static call, struct subject   `Boxy<i32>::make("x")`        checked
+//   struct literal                `Boxy<i32> { value = "x" }`   checked
+//   static fn, enum subject       `Holder<i32>::wrap("x")`      checked
+//   trait static                  `Signal<i32>::new("x")`       checked (B352)
+//   `Self<..>::member`            `Self<i32>::make("x")`        checked
+//   VARIANT constructor           `Holder<i32>::Full("x")`      INERT
+//
+// and the seventh shape the sweep named — a qualified `pkg::mod::T<..>::f` —
+// does not exist: the expression grammar refuses `<` after a multi-segment
+// path, so there is nothing there to check (pinned below, so the day it parses
+// this block reds).
+//
+// The variant constructor was inert for the reason B352's trait subject was: a
+// variant has no impl for the static path's reconcile to match the subject
+// against, so nothing zipped the enum's own parameters with what the path
+// wrote — and the constructor call then built its substitution from an EMPTY
+// map, so the payload typed the enum and the written argument reached nothing.
+
+/// The INERT shape, closed: a variant constructor's written argument is checked
+/// against its payload.
+#[test]
+fn b356_a_written_type_argument_on_a_variant_constructor_is_checked() {
+    assert_fails_with(
+        r#"
+        enum Holder<T> { Full(T), Empty }
+
+        fun main() {
+            let _h = Holder<i32>::Full("x");
+        }
+        "#,
+        "Expected i32, but got str instead.",
+    );
+}
+
+/// The same shape on std's own `Option`, which is where a reader meets it:
+/// `Option<i32>::Some("y")` was an `Option<str>` — the written `i32`
+/// discarded, and `unwrap_or(3)` then refused for wanting a `str`, which is a
+/// message about the wrong line.
+#[test]
+fn b356_a_written_type_argument_on_a_std_variant_is_checked() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let _o = Option<i32>::Some("y");
+        }
+        "#,
+        "Expected i32, but got str instead.",
+    );
+}
+
+/// The controls, in one program: a written argument the payload AGREES with, a
+/// nullary variant at a written argument, and a BARE variant path (no written
+/// arguments at all), which must keep taking its type from the payload.
+#[test]
+fn b356_a_variant_constructor_that_agrees_with_its_written_argument_compiles() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        enum Holder<T> { Full(T), Empty }
+
+        fun main() {
+            let h = Holder<i32>::Full(7);
+            match h {
+                Holder::Full(let v) => { print(v + 1); },
+                Holder::Empty => { print("empty"); },
+            }
+            let e = Holder<str>::Empty;
+            print(e is Holder::Empty);
+            let bare = Holder::Full("a");
+            match bare {
+                Holder::Full(let v) => { print(v); },
+                Holder::Empty => { print("-"); },
+            }
+            let o = Option<i32>::Some(4);
+            print(o.unwrap_or(3));
+        }
+        "#,
+        "8\ntrue\na\n4\n",
+    );
+}
+
+/// The four shapes the sweep found ALREADY checked, each against a
+/// contradicting argument, so the table above is a pin rather than a note. The
+/// fifth (the trait static) is `b352_an_explicit_type_argument_still_refuses_a_
+/// contradicting_argument` and is not duplicated here.
+#[test]
+fn b356_the_already_checked_path_shapes_stay_checked() {
+    let shapes = [
+        // A static call on a struct subject.
+        "let _a = Boxy<i32>::make(\"x\");",
+        // A struct literal.
+        "let _a = Boxy<i32> { value = \"x\" };",
+        // A static function on an enum subject.
+        "let _h = Holder<i32>::wrap(\"x\");",
+        // `Self<..>::member` inside the impl (the impl's own binder is NOT what
+        // the path wrote).
+        "let _a = Boxy<i32>::relay();",
+    ];
+    for body in shapes {
+        let source = format!(
+            r#"
+            struct Boxy<T> {{ value: T }}
+
+            impl Boxy<type T> {{
+                fun make(value: T): Boxy<T> {{ Boxy {{ value }} }}
+                fun relay(): Boxy<i32> {{ Self<i32>::make("x") }}
+            }}
+
+            enum Holder<T> {{ Full(T), Empty }}
+
+            impl Holder<type T> {{
+                fun wrap(value: T): Holder<T> {{ Holder::Full(value) }}
+            }}
+
+            fun main() {{
+                {body}
+            }}
+            "#
+        );
+        assert_fails_with(&source, "Expected i32, but got str instead.");
+    }
+}
+
+/// The shape that does NOT exist, pinned so it cannot quietly start parsing
+/// into an inert argument list: a multi-segment path takes no type arguments.
+#[test]
+fn b356_a_qualified_path_carries_no_written_type_arguments() {
+    assert_fails_with(
+        r#"
+        fun main() {
+            let _a = std::option::Option<i32>::Some("y");
+        }
+        "#,
+        "expected an expression",
+    );
+}
