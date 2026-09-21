@@ -1598,8 +1598,11 @@ fn a_vilan_struct_is_a_positional_array_at_runtime() {
     //
     // If vilan ever gives structs a named-field representation, this goes red —
     // and several TODO rows become real mappings.
+    // B360: the extern carries a host binding — a bodiless one with none is
+    // refused at its declaration now, and this fixture is about the STRUCT's
+    // runtime shape.
     let source = "struct Point { x: f64 }\nfun main() { let p = Point { x = 1.0 }; print_f(p.x); }\n\
-                  external fun print_f(value: f64): void;\n";
+                  [extern(\"globalThis.printF\")]\nexternal fun print_f(value: f64): void;\n";
     let leaked: &'static str = Box::leak(source.to_string().into_boxed_str());
     let (program, errors) = analyze_source(
         leaked,

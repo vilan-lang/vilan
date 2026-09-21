@@ -797,10 +797,6 @@ pub fn post_analysis_passes(
     // dangling name. Refused at the declaration, which needs the FINISHED
     // program: the compiler's own lowerings are resolved by name in `build`.
     analyzer::check_unlowered_externals(program);
-    // B362's dispatched face (R4): a `lazy` parameter on a trait member is a
-    // convention only a DIRECT call can keep, and a dispatched call has no
-    // callee to rewrite — refused at the declaration.
-    analyzer::check_lazy_trait_members(program);
     // M26's POST-PASS boundary, the outermost of the three the phase line names
     // (`contexts+graph`, `const-pass`, `dispatch-refine`; the last is a slice
     // through the first two, so cancelling either cancels it). The passes are

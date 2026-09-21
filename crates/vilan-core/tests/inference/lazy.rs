@@ -1983,16 +1983,28 @@ fn b362_stds_lazy_members_are_untouched() {
     );
 }
 
-/// B362's DISPATCHED face — the one the coercion refusal above does not
-/// reach. A call through a generic bound has no callee to rewrite, so
-/// `record_lazy_arguments` never sees it and the argument arrives as a plain
-/// value: `value.pick(false, 7)` reached the implementor's body and forced a
-/// `7`. The convention is declared once for every implementor and reached
-/// through both doors, so it is refused at the trait member.
+/// B362's DISPATCHED face, STILL OPEN and pinned red. A call through a generic
+/// BOUND has no callee to rewrite, so `record_lazy_arguments` never sees it and
+/// the argument arrives as a plain value: the body's `__force(7)` writes
+/// `.state` on a number and the program dies with a `TypeError` it checked
+/// clean. The coercion refusal above does not reach this door.
+///
+/// It is NOT closed by refusing `lazy` on a trait member: that was tried and
+/// backed out, because a trait member reached by a DIRECT call on a concrete
+/// receiver keeps its laziness and the language ships that deliberately —
+/// `an_impl_that_agrees_keeps_the_laziness_through_dispatch` and
+/// `lazy_is_accepted_in_all_three_grammar_homes` are both pins on it. The fix
+/// belongs at the dispatched CALL, either as a refusal there or by thunking
+/// through the callee's recorded convention (the item's own alternative).
 #[test]
-fn b362_a_lazy_parameter_on_a_trait_member_is_refused() {
-    assert_fails_spanning(
+#[ignore = "B362: a `lazy` parameter reached through a generic BOUND is still \
+            handed a plain value and forced; the fix belongs at the dispatched \
+            call, not at the declaration (see the comment above)"]
+fn b362_a_lazy_parameter_reached_through_a_bound_is_still_unsound() {
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
+
         trait Fallback {
         	fun pick(self, flag: bool, lazy other: i32): i32;
         }
@@ -2011,30 +2023,7 @@ fn b362_a_lazy_parameter_on_a_trait_member_is_refused() {
         	print(through(Picker { base = 1 }));
         }
         "#,
-        "pick",
-        "cannot take a `lazy` parameter",
-    );
-}
-
-/// A trait DEFAULT body is the same declaration reached the same two ways, so
-/// it takes the same refusal.
-#[test]
-fn b362_a_lazy_parameter_on_a_trait_default_is_refused_too() {
-    assert_fails_with(
-        r#"
-        trait Fallback {
-        	fun pick(self, flag: bool, lazy other: i32): i32 {
-        		if flag { 1 } else { other }
-        	}
-        }
-
-        struct Picker { base: i32 }
-
-        impl Picker with Fallback {}
-
-        fun main() { print(Picker { base = 1 }.pick(true, 2)); }
-        "#,
-        "cannot take a `lazy` parameter",
+        "7\n",
     );
 }
 

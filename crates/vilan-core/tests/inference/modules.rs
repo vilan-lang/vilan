@@ -199,7 +199,10 @@ fn bumps_propagates_through_a_forwarding_call() {
 fn bumps_extern_off_table_defaults_to_bumping() {
     // A bodyless extern with a `&mut` parameter may do anything — the safe
     // default — and the verdict propagates to its caller.
-    let source = "external fun grow(xs: &mut List<i32>);\nfun call_it(xs: &mut List<i32>) { grow(xs); }\nfun main() { mut xs = [ 1 ]; call_it(&mut xs); }\n";
+    // B360: the extern carries a host binding, because a bodiless one with
+    // none names nothing at all. The verdict under test is unchanged — an
+    // OFF-TABLE extern still defaults to bumping.
+    let source = "[extern(\"globalThis.grow\")]\nexternal fun grow(xs: &mut List<i32>);\nfun call_it(xs: &mut List<i32>) { grow(xs); }\nfun main() { mut xs = [ 1 ]; call_it(&mut xs); }\n";
     assert_bumps(source, "grow", &[0]);
     assert_bumps(source, "call_it", &[0]);
 }

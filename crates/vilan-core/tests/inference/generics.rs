@@ -7853,7 +7853,12 @@ fn b280_a_user_external_methods_list_return_keeps_the_callers_rigid_element() {
         external struct Bag<T>;
 
         impl Bag<type T> {
+            // B360: a bodiless external needs a host binding, and these two are
+            // here for their TYPES — the pin never runs the program.
+            [extern("method")]
             external fun items(self): List<T>;
+
+            [extern("globalThis.makeBag")]
             external fun make(): Bag<T>;
         }
 
@@ -7890,6 +7895,9 @@ fn b280_an_external_list_return_through_a_bounded_receiver_keeps_its_element() {
         }
 
         impl Bag<type T> {
+            // B360: a bodiless external needs a host binding; the pin is about
+            // the RETURN's element type, not about emission.
+            [extern("method")]
             external fun items(self): List<T>;
         }
 
