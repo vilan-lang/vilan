@@ -6,6 +6,18 @@
 //! error rendering, and the todo app's persistence. Each file's count is
 //! pinned; a new or moved use must update this table deliberately, with the
 //! doc's audit section.
+//!
+//! **This is a CENSUS, not a behaviour harness** (N111). It greps `.vl` source
+//! for the two spellings and counts non-comment lines; it compiles nothing,
+//! runs nothing, and can tell you nothing about what a codec ANSWERS. Two
+//! lanes have reached for it as the place a `std::json` pin goes and found no
+//! harness here. The behaviour of the codecs is pinned in
+//! `crates/vilan-core/tests/inference/std_surface.rs` (the round trips and the
+//! malformed-document sets, `assert_compiles_and_runs`), in
+//! `inference/generics.rs` (the derive and the hand-written `Wire` impls
+//! crossing JSON), and over the wire in vilan-cli's `service_layer.rs` /
+//! `rpc_http.rs`. A change to what a document DECODES TO belongs in those; a
+//! change to WHERE the two spellings may appear belongs here.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

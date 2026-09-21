@@ -66,6 +66,20 @@ pub enum Type {
     // parameters with them.
     Enum(Id, Vec<TypeId>),
     Function(Id),
+    // A mention of a generic parameter, by the CONSTRAINT's type id — the id
+    // whose own `Type` is the parameter's bound (`Trait(Greet, [])` for
+    // `<type T: Greet>`, `Any` for an unbounded one).
+    //
+    // **`Generic(constraint)` is the ONE spelling of a parameter in a nominal
+    // declaration's body** (B366): a struct field, an enum variant's payload,
+    // a nested nominal's or tuple's argument, and an impl SUBJECT's argument
+    // all carry it, for user, std, `external`, bounded, multi-parameter,
+    // recursive and `[derive]`-generated declarations alike. The bare
+    // constraint id is never a body type. That is what lets one walk bind a
+    // declaration's parameters —
+    // [`crate::impl_select::bind_subject`](crate::impl_select::bind_subject)
+    // is that walk, and it matches this node and nothing else — and the
+    // emitters may rely on it. `tests/nominal_generic_spelling.rs` is the gate.
     Generic(TypeId),
     Module(Id),
     Struct(Id, Vec<TypeId>),

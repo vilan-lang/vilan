@@ -372,6 +372,121 @@ fn witnesses(source: &str) -> Vec<(usize, bool, String)> {
         .collect()
 }
 
+/// One piece of a parsed witness: either bytes that must appear verbatim, or a
+/// GENERATED name, which is a hole (N110).
+#[derive(Debug, PartialEq, Eq)]
+enum WitnessPiece {
+    Literal(String),
+    /// The generated name as the witness SPELLS it — the spelling is the hole's
+    /// identity, not a byte to match: two occurrences of one spelling must bind
+    /// to one name in the golden, and two spellings must bind to two.
+    Generated(String),
+}
+
+/// A generated name at the start of `text`: `$` and the identifier run after
+/// it. `None` if `text` does not start one.
+///
+/// Every `$`-prefixed identifier in emitted JavaScript is the name generator's
+/// — the runtime helpers are `__`-prefixed and source names are the author's —
+/// so the test needs no table of which names are generated.
+fn generated_name_at(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('$')?;
+    let length = rest
+        .find(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .unwrap_or(rest.len());
+    (length > 0).then(|| &text[..length + 1])
+}
+
+/// Splits a normalized witness into literal bytes and generated-name holes.
+fn parse_witness(witness: &str) -> Vec<WitnessPiece> {
+    let mut pieces = Vec::new();
+    let mut literal = String::new();
+    let mut rest = witness;
+    while !rest.is_empty() {
+        if let Some(name) = generated_name_at(rest) {
+            if !literal.is_empty() {
+                pieces.push(WitnessPiece::Literal(std::mem::take(&mut literal)));
+            }
+            pieces.push(WitnessPiece::Generated(name.to_string()));
+            rest = &rest[name.len()..];
+            continue;
+        }
+        let mut characters = rest.chars();
+        let character = characters.next().expect("the loop guard");
+        literal.push(character);
+        rest = characters.as_str();
+    }
+    if !literal.is_empty() {
+        pieces.push(WitnessPiece::Literal(literal));
+    }
+    pieces
+}
+
+/// Whether the normalized `golden` carries the bytes `witness` names, reading
+/// every generated name in the witness as a HOLE (N110).
+///
+/// **Why a hole and not a byte.** A generated name is minted from one monotonic
+/// counter, so a temporary added anywhere upstream shifts every name after it
+/// and nothing about the program changes. The byte gate is judged against that
+/// — the integrator's diff is gensym-normalized — but this gate was literal
+/// substring containment, so a pure shift reddened it with a message that tells
+/// the reader the CLAIM is unwitnessed and forbids relaxing the witness.
+/// `reactive-on-change.vl:60` was re-keyed once in Order 38 and survived the
+/// merged-tree regeneration by luck. A gate whose failure means "the counter
+/// moved" and whose text means "your claim is false" is worse than no gate.
+///
+/// **What the hole still pins.** The shape, and the IDENTITY relation: the
+/// binding map is one-to-one both ways, so `$a = 7; process.exit($a);` still
+/// says "the same generated name is assigned and then read", and `function
+/// $j($k) { $b($k[0]); }` still says the parameter is what the third name is
+/// called with — three distinct names, in those positions. What it drops is
+/// exactly what the counter decides. A witness that names no generated name is
+/// matched byte for byte as before.
+fn witness_is_in(golden: &str, witness: &str) -> bool {
+    let pieces = parse_witness(witness);
+    // No hole: the old path, and the common one.
+    if pieces
+        .iter()
+        .all(|piece| matches!(piece, WitnessPiece::Literal(_)))
+    {
+        return golden.contains(witness);
+    }
+    // A hole cannot be the anchor, so every start offset is tried. The witness
+    // is one comment line and the golden one file, so this is cheap.
+    (0..=golden.len()).any(|start| {
+        golden.is_char_boundary(start) && witness_matches_at(&golden[start..], &pieces)
+    })
+}
+
+/// One attempt: the pieces in order from the head of `text`, holes binding to
+/// generated names one-to-one.
+fn witness_matches_at(text: &str, pieces: &[WitnessPiece]) -> bool {
+    let mut rest = text;
+    let mut by_witness: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut by_golden: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for piece in pieces {
+        match piece {
+            WitnessPiece::Literal(bytes) => match rest.strip_prefix(bytes.as_str()) {
+                Some(tail) => rest = tail,
+                None => return false,
+            },
+            WitnessPiece::Generated(spelling) => {
+                let Some(found) = generated_name_at(rest) else {
+                    return false;
+                };
+                if *by_witness.entry(spelling.as_str()).or_insert(found) != found {
+                    return false; // one spelling, two names
+                }
+                if *by_golden.entry(found).or_insert(spelling.as_str()) != spelling.as_str() {
+                    return false; // two spellings, one name
+                }
+                rest = &rest[found.len()..];
+            }
+        }
+    }
+    true
+}
+
 /// Audit run 7's F7/F8 rule, mechanized: a corpus program's prose claim is
 /// checked against the bytes it claims.
 ///
@@ -397,7 +512,9 @@ fn witnesses(source: &str) -> Vec<(usize, bool, String)> {
 /// Matching is whitespace-normalized on both sides, so a witness fits on one
 /// comment line and still spans the emitter's indented multi-line shapes. It is
 /// substring containment rather than a regex: a witness should be readable as
-/// the JS it names.
+/// the JS it names. The one exception is a GENERATED name (`$a`, `$S`), which
+/// is a hole — see [`witness_is_in`] for why the counter is not part of any
+/// claim, and what the hole still pins.
 ///
 /// The rejected weaker design, recorded because it looks adequate: "every corpus
 /// program's leading comment mentions a token the emitted JS contains". It is
@@ -455,7 +572,7 @@ fn every_declared_witness_is_in_its_golden() {
                 failures.push(format!("{name}:{line}: the witness is empty"));
                 continue;
             }
-            if normalized_golden.contains(&witness) != present {
+            if witness_is_in(&normalized_golden, &witness) != present {
                 let complaint = if present {
                     "is not in"
                 } else {
@@ -508,6 +625,92 @@ fn witness_directives_parse() {
         "try { $a(r);",
         "whitespace normalization must let a one-line witness span emitted lines"
     );
+}
+
+/// N110, the mechanism: a generated name in a witness is a hole, and the hole
+/// is exactly as wide as the counter.
+///
+/// Both directions are pinned, because the fix's failure mode is a gate that
+/// has stopped saying anything. A pure counter SHIFT must pass; a changed
+/// SHAPE, a changed identity relation, and a witness that names no generated
+/// name at all must all still fail.
+#[test]
+fn n110_a_generated_name_in_a_witness_is_a_hole_and_nothing_wider() {
+    // The parse, first: a witness is literal bytes around `$`-prefixed holes,
+    // and the hole carries its own spelling.
+    assert_eq!(
+        parse_witness("$a = 7; process.exit($a);"),
+        vec![
+            WitnessPiece::Generated("$a".to_string()),
+            WitnessPiece::Literal(" = 7; process.exit(".to_string()),
+            WitnessPiece::Generated("$a".to_string()),
+            WitnessPiece::Literal(");".to_string()),
+        ],
+        "a witness must split into literals and generated-name holes"
+    );
+    assert_eq!(
+        parse_witness("console.log(a[0]);"),
+        vec![WitnessPiece::Literal("console.log(a[0]);".to_string())],
+        "a witness with no generated name is one literal"
+    );
+
+    // THE DEFECT. `reactive-on-change.vl:60`'s witness, against a golden whose
+    // counter has moved — a temporary minted anywhere upstream does this, and
+    // nothing about the program has changed.
+    let witness =
+        "const subscription = $S(self, observer); observer($T(self)); return subscription;";
+    let shifted =
+        "const subscription = $W(self, observer); observer($X(self)); return subscription; }";
+    assert!(
+        witness_is_in(shifted, witness),
+        "a pure counter shift must not red the witness gate"
+    );
+    assert!(
+        witness_is_in(
+            "const subscription = $S(self, observer); observer($T(self)); return subscription;",
+            witness
+        ),
+        "the unshifted golden must still match"
+    );
+
+    // And nothing wider. The SHAPE:
+    assert!(
+        !witness_is_in(
+            "const subscription = $W(self); observer($X(self)); return subscription;",
+            witness
+        ),
+        "a dropped argument must still fail"
+    );
+    // The IDENTITY relation, both ways round. One spelling, two names:
+    assert!(
+        !witness_is_in("$b = 7; process.exit($c);", "$a = 7; process.exit($a);"),
+        "one witness spelling must bind to one generated name"
+    );
+    assert!(
+        witness_is_in("$c = 7; process.exit($c);", "$a = 7; process.exit($a);"),
+        "the same name twice is what the witness says"
+    );
+    // Two spellings, one name:
+    assert!(
+        !witness_is_in("function $q($q) { }", "function $j($k) { }"),
+        "two witness spellings must bind to two generated names"
+    );
+    assert!(
+        witness_is_in("function $q($r) { }", "function $j($k) { }"),
+        "two distinct names in those positions is what the witness says"
+    );
+    // A hole is ONE name, never a wildcard over arbitrary bytes:
+    assert!(
+        !witness_is_in("drop2(payload); ", "drop2($d); "),
+        "a hole must not match a source name"
+    );
+    assert!(
+        !witness_is_in("drop2($d, $e); ", "drop2($d); "),
+        "a hole must not swallow the bytes after the name"
+    );
+    // And the literal path is untouched, in both directions.
+    assert!(witness_is_in("a } finally { b", "} finally {"));
+    assert!(!witness_is_in("a } catch { b", "} finally {"));
 }
 
 /// The equivalence-gate rationale for HMR (A13, `hmr.md` §5): the `build` path

@@ -8,6 +8,26 @@ use crate::span::Span;
 /// an ariadne sub-label whose `file:line:col` sub-header and label derive
 /// from one converted position (`char_range` in the CLI — E76), the
 /// language server as related information.
+///
+/// **"One, not a list" was re-examined against a real second note and KEPT**
+/// (N112, decided 2026-09-21). E189's broad gate (B355) is the first place a
+/// second footnote looked wanted: when a program already carries an error the
+/// context family stands down whole, and the count of checks that did not run
+/// has to reach the reader somehow. Beside the primary error it would be a
+/// footnote about a DIFFERENT subject — the primary error is one wrong
+/// expression, the deferral is a statement about the pass — and it would have
+/// to be attached to whichever diagnostic happened to be last, which is not a
+/// relation the reader can read. It ships as its own WARNING instead, and that
+/// is the general answer: a second fact that is not a second LOCATION for THIS
+/// error is its own diagnostic, not another line under this one.
+///
+/// Growing the field to `footnotes: Vec<Note>` is cheap here and expensive
+/// everywhere it is read — the terminal renderer, the HMR overlay, the
+/// language server's related information and the playground each gain a list
+/// to order and to truncate, and the C3 terseness rule stops being enforced by
+/// the type. [`Error::trace`] is the escape hatch that already exists for the
+/// one shape that genuinely is a chain (E78's requirement trace), and it is
+/// deliberately NOT this field.
 #[derive(Debug, Clone)]
 pub struct Note {
     pub span: Span,

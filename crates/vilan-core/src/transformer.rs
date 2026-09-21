@@ -2213,17 +2213,18 @@ fn binary<'src>(op: BinaryOp, lhs: js::Node<'src>, rhs: js::Node<'src>) -> js::N
 /// member. The member may be an intrinsic or an `[extern]` external (a host form),
 /// not just a normal emitted function — so resolution is split from emission, and
 /// `args` is consumed only once the form is known (see `resolve_dispatch`).
+///
+/// It had two more variants until N109 — `ListNew` and `ListPush`, for the only
+/// two compiler-lowered externals the `intrinsics` table did not carry. They
+/// were B359's fix rather than its cause: a dispatch resolving to one had no
+/// arm at all and minted a mangled name for a function nothing emits. Both are
+/// `Intrinsic` rows now, so the class is closed at the table instead of
+/// patched at each reader.
 enum Dispatch<'src> {
     /// A built-in lowering (`str.len()` → `.length`, etc.).
     Intrinsic(Intrinsic),
     /// An `[extern]`-bound external: the external's id and its host binding.
     Extern(Id, ExternBinding<'src>),
-    /// `List::new()` — an empty JS array. One of the two compiler-lowered
-    /// externals the `intrinsics` table does not carry (B359).
-    ListNew,
-    /// `List::push(self, item)` — the host's `.push` on the receiver. The other
-    /// one (B359).
-    ListPush,
     /// A normal emitted function: its JS name and whether it is async.
     Call(String, bool),
 }
@@ -2292,8 +2293,6 @@ struct Transformer<'src> {
     formatter: Formatter,
     ng: NameGenerator,
     print_fn_id: Id,
-    list_new_fn_id: Option<Id>,
-    list_push_fn_id: Option<Id>,
     panic_fn_id: Option<Id>,
     drop_fn_id: Option<Id>,
     program: &'src Program<'src>,
@@ -2842,8 +2841,6 @@ impl<'src> Transformer<'src> {
             formatter: Formatter::from_options(options.indent, options.spaces),
             ng: NameGenerator::new(names),
             print_fn_id,
-            list_new_fn_id: program.list_new_fn_id,
-            list_push_fn_id: program.list_push_fn_id,
             panic_fn_id: program.panic_fn_id,
             drop_fn_id: program.drop_fn_id,
             program,
@@ -4930,23 +4927,6 @@ impl<'src> Transformer<'src> {
                                     "log".to_string(),
                                 )),
                                 args,
-                            ));
-                        }
-                        // `List::new()` builds an empty JS array.
-                        if Some(target_id) == self.list_new_fn_id {
-                            return Some(js::Node::Array(Vec::new()));
-                        }
-                        // `list.push(x)` lowers to the native array method; the
-                        // receiver is the method call's first (`self`) argument.
-                        if Some(target_id) == self.list_push_fn_id {
-                            let mut arguments = args.into_iter();
-                            let receiver = arguments.next().unwrap_or(js::Node::Void);
-                            return Some(js::Node::Call(
-                                Box::new(js::Node::Property(
-                                    Box::new(receiver),
-                                    "push".to_string(),
-                                )),
-                                arguments.collect(),
                             ));
                         }
                         // `panic(msg)` lowers to a thrown error. It's wrapped in
@@ -7771,6 +7751,16 @@ impl<'src> Transformer<'src> {
                     args.collect(),
                 )
             }
+            // `List::new()` builds an empty JS array literal. Receiverless,
+            // like `Set::new` and `Map::new` beside it.
+            Intrinsic::ListNew => js::Node::Array(Vec::new()),
+            // `list.push(x)` is the native array method — the receiver is the
+            // method call's first (`self`) argument, which is what
+            // `native_method` does, so this rides it rather than repeating the
+            // shape (N109: the id-keyed arm it replaces was written out twice,
+            // once for a named call and once for a dispatch, and keeping those
+            // two byte-identical was a standing obligation).
+            Intrinsic::ListPush => native_method(&mut args, "push"),
             Intrinsic::StrLen | Intrinsic::ListLen => js::Node::Property(
                 Box::new(args.next().unwrap_or(js::Node::Void)),
                 "length".to_string(),
@@ -8764,22 +8754,17 @@ impl<'src> Transformer<'src> {
         {
             return Dispatch::Extern(member_id, binding);
         }
-        // B359: `List`'s `new` and `push` are the two compiler-lowered externals
-        // that carry NEITHER an `Intrinsic` row NOR an `[extern]` binding — the
-        // named-callee path recognizes them by function id and lowers them to
-        // `[]` and the host's `.push`. A DISPATCH reaching one had no such arm,
-        // so it fell through to the emitted-function name below and minted a
-        // mangled name for a function nothing ever emits: `impl List<type T>
-        // with Pusher<T>` plus a `self.push(v)` in a trait default compiled
-        // clean and threw `ReferenceError: $b is not defined` at runtime. Every
-        // other external reached here has a lowering keyed by member id; these
-        // two are keyed by their own field, so they are named here too.
-        if Some(member_id) == self.list_new_fn_id {
-            return Dispatch::ListNew;
-        }
-        if Some(member_id) == self.list_push_fn_id {
-            return Dispatch::ListPush;
-        }
+        // The two arms above are the WHOLE external surface, and that is N109's
+        // point. `List`'s `new` and `push` used to carry neither an `Intrinsic`
+        // row nor an `[extern]` binding — the named-callee path recognized them
+        // by function id — so a DISPATCH reaching one had no arm here, fell
+        // through to the emitted-function name below, and minted a mangled name
+        // for a function nothing ever emits: `impl List<type T> with Pusher<T>`
+        // plus a `self.push(v)` in a trait default compiled clean and threw
+        // `ReferenceError: $b is not defined` at runtime (B359). They are rows
+        // in `intrinsics` now, so every external a dispatch can land on has a
+        // lowering keyed by member id and this function cannot be incomplete
+        // again for the same reason.
         let mut substitution = HashMap::default();
         self.bind_generics(impl_subject, type_id, &mut substitution);
         if !own_generic_values.is_empty()
@@ -8902,18 +8887,6 @@ impl<'src> Transformer<'src> {
             Dispatch::Extern(member_id, binding) => {
                 let call = self.emit_extern(member_id, binding, args);
                 self.maybe_await(member_id, call)
-            }
-            // The two id-keyed lowerings, in the forms the named-callee path
-            // emits them in (B359) — byte for byte, so a dispatched `push` and
-            // a written one are the same JS.
-            Dispatch::ListNew => js::Node::Array(Vec::new()),
-            Dispatch::ListPush => {
-                let mut arguments = args.into_iter();
-                let receiver = arguments.next().unwrap_or(js::Node::Void);
-                js::Node::Call(
-                    Box::new(js::Node::Property(Box::new(receiver), "push".to_string())),
-                    arguments.collect(),
-                )
             }
             Dispatch::Call(name, is_async) => {
                 let call = js::Node::Call(Box::new(js::Node::Local(name)), args);

@@ -340,6 +340,14 @@ pub fn subject_outranks(program: &Program, subject: TypeId, other: TypeId) -> bo
 /// concrete `type_id` (`List<i32>`), accumulating `{T -> i32}`. Recurses
 /// through nominal arguments, tuples, arrays, and closures so a nested
 /// parameter (`List<List<T>>` -> `T = i32`) is reached.
+///
+/// It matches [`Type::Generic`] and nothing else, and that is COMPLETE rather
+/// than a happy path: `Generic(constraint)` is the one spelling a parameter has
+/// in a nominal declaration's body (B366, the invariant is written at
+/// [`Type::Generic`] and gated by `tests/nominal_generic_spelling.rs`). A walk
+/// that also accepted a bare constraint id would be defending against a
+/// spelling the analyzer does not mint — which is what the emit-Rust backend's
+/// own copy of this walk did, and what the gate lets it stop doing.
 pub fn bind_subject(
     program: &Program,
     pattern: TypeId,

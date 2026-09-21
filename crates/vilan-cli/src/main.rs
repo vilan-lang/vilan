@@ -1952,7 +1952,7 @@ fn build_and_spawn_run(
             )
             .ok()?;
             let script = watch_script_path();
-            if let Err(error) = fs::write(&script, compiled.javascript) {
+            if let Err(error) = write_run_script(&script, &compiled.javascript) {
                 eprintln!(
                     "{} cannot write {}: {error}",
                     paint::error_prefix(),
@@ -5550,7 +5550,7 @@ fn run_test(file: &Path) -> Result<(), String> {
     )
     .map_err(|_| String::new())?;
     let script = env::temp_dir().join(format!("vilan-test-{}.mjs", std::process::id()));
-    if let Err(error) = fs::write(&script, compiled.javascript) {
+    if let Err(error) = write_run_script(&script, &compiled.javascript) {
         return Err(format!("cannot write {}: {error}", script.display()));
     }
     let output = std::process::Command::new("node").arg(&script).output();
@@ -6946,6 +6946,15 @@ fn compile_to_js(
                 }
             }
         }
+    } else {
+        // No tree to analyse — `build`'s parse failed and its diagnostics are
+        // reported below. The depth instrument was anchored before that parse
+        // and its report rides the end of `post_analysis_passes`, which this
+        // path never reaches, so the `VILAN_DEPTH_STATS` line was missing for
+        // exactly the analyses the PARSER's bound exists for (B142's 500-level
+        // refusal, N111). Released here instead, with the parse family's peak
+        // in it.
+        vilan_core::report_depth_stats();
     }
 
     let clean = analyzer_errors.is_empty()
@@ -7003,6 +7012,35 @@ fn compile_to_js(
     }
 }
 
+/// Writes one of the CLI's three temp scripts — `vilan-run-<pid>.mjs`,
+/// `vilan-watch-<pid>.mjs`, `vilan-test-<pid>.mjs` — and hands back the write's
+/// own error for the caller to report against its own path.
+///
+/// **Why not `fs::write`** (N111). The system temp directory is the right home
+/// for a file its writer deletes again — it is not the package tree, which is
+/// N103's concern — but it is SHARED, and every one of these names is
+/// predictable from a process id. `fs::write` FOLLOWS a symlink, so a
+/// `vilan-run-<pid>.mjs` planted there by anyone else on the machine had this
+/// process truncate whatever it pointed at and then execute it. The path is
+/// unlinked first (which takes the LINK, never its target) and then created
+/// with `create_new`, so the file handed to `node` is a file this process made;
+/// the remaining race can only make the create FAIL, which is reported.
+///
+/// The unlink is also what keeps a script leaked by an abnormal exit — the one
+/// case the callers' own removal cannot cover — from wedging a later run whose
+/// pid happens to match. `run --watch` rewrites its script once per round, and
+/// that is safe for the reason `remove_watch_script`'s comment already gives:
+/// the round deletes it after the child is killed AND reaped, so nothing holds
+/// it when the next round creates it.
+fn write_run_script(script: &Path, javascript: &str) -> std::io::Result<()> {
+    let _ = fs::remove_file(script);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(script)?;
+    std::io::Write::write_all(&mut file, javascript.as_bytes())
+}
+
 /// Writes `javascript` to a temp file and executes it with Node.js, propagating
 /// its exit code, with stdin/stdout/stderr connected to the terminal. `args` are
 /// forwarded to the program, reachable through `process::args()`. (A temp file
@@ -7010,7 +7048,7 @@ fn compile_to_js(
 /// script would consume it, breaking `scan()`.)
 fn run_node_script(javascript: &str, args: &[String]) -> ExitCode {
     let script = env::temp_dir().join(format!("vilan-run-{}.mjs", std::process::id()));
-    if let Err(error) = fs::write(&script, javascript) {
+    if let Err(error) = write_run_script(&script, javascript) {
         eprintln!(
             "{} cannot write {}: {error}",
             paint::error_prefix(),
@@ -8397,5 +8435,86 @@ mod tests {
         assert_eq!(char_range(multibyte, &(5..7)), 5..7); // mid-codepoint
         assert_eq!(char_range(multibyte, &(400..420)), 400..420); // past the end
         assert_eq!(char_range("", &(5..7)), 5..7); // and against empty text
+    }
+}
+
+#[cfg(test)]
+mod write_run_script_tests {
+    use super::write_run_script;
+    use std::path::PathBuf;
+
+    /// A directory nothing else writes into, inside the worktree's own
+    /// `target/` — NOT `std::env::temp_dir()`, which is the shared tmpfs N86
+    /// swept the suites off. `CARGO_TARGET_TMPDIR` is not defined for a binary
+    /// crate's unit tests, so the same location is named from the manifest.
+    fn scratch(tag: &str) -> PathBuf {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp")
+            .join(format!("vilan-cli-write-run-script-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("the unit scratch root");
+        root.join(tag)
+    }
+
+    /// The ordinary case: the script is written, and its bytes are the
+    /// program's.
+    #[test]
+    fn n111_a_script_is_written_with_its_own_bytes() {
+        let script = scratch("plain.mjs");
+        let _ = std::fs::remove_file(&script);
+        write_run_script(&script, "console.log(7);\n").expect("the write succeeds");
+        assert_eq!(
+            std::fs::read_to_string(&script).expect("read it back"),
+            "console.log(7);\n"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// A leaked script from an earlier run with the same pid does not wedge
+    /// this one: the path is unlinked before it is created.
+    #[test]
+    fn n111_a_leaked_script_at_the_path_is_replaced() {
+        let script = scratch("leaked.mjs");
+        std::fs::write(&script, "// the previous run's program\n").expect("plant a leak");
+        write_run_script(&script, "console.log(8);\n").expect("the write succeeds");
+        assert_eq!(
+            std::fs::read_to_string(&script).expect("read it back"),
+            "console.log(8);\n"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// The reason the unlink-then-`create_new` pair exists: a SYMLINK planted
+    /// at the predictable path is removed rather than followed, so the file
+    /// `node` is handed is this process's and the link's target is untouched.
+    /// `fs::write` wrote straight through it.
+    #[cfg(unix)]
+    #[test]
+    fn n111_a_planted_symlink_is_not_written_through() {
+        let victim = scratch("victim.txt");
+        let script = scratch("planted.mjs");
+        std::fs::write(&victim, "the victim's contents\n").expect("plant the victim");
+        let _ = std::fs::remove_file(&script);
+        std::os::unix::fs::symlink(&victim, &script).expect("plant the symlink");
+
+        write_run_script(&script, "console.log(9);\n").expect("the write succeeds");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("the victim is still there"),
+            "the victim's contents\n",
+            "the symlink's target was written through"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&script).expect("the script is a real file"),
+            "console.log(9);\n"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&script)
+                .expect("stat the script")
+                .file_type()
+                .is_symlink(),
+            "the path is still a symlink"
+        );
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&victim);
     }
 }

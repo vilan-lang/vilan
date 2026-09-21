@@ -28558,14 +28558,21 @@ impl<'src> Analyzer<'src> {
     /// The walk's depth bound (B138): the walk recurses once per level of
     /// syntactic nesting carrying the largest frame in the analyzer — the
     /// union of [`Self::walk_expr_node_inner`]'s ~90 arms, measured by
-    /// `VILAN_DEPTH_STATS` at ~36 KiB per level unoptimized, ~4.5 KiB
-    /// optimized — so nesting depth, not node count, is what outgrows a
-    /// stack (the v0.36.0 incident, commit 0fb5e5f0: a modest server
-    /// program's walk closed a CI worker's ~2 MiB margin). Every realistic
-    /// fixture peaks at 20 levels (both walkthrough entries, the std
-    /// twin-parity and release-emission corpora); 500 is 25x that, and caps
-    /// the bounded worst case near 18 MiB unoptimized — deeper nesting gets
-    /// a clean diagnostic instead of a stack overflow.
+    /// `VILAN_DEPTH_STATS` (and by gdb, to the byte) at 42,464 B (41.5 KiB)
+    /// per level unoptimized, ~4,650 B (4.5 KiB) optimized — so nesting
+    /// depth, not node count, is what outgrows a stack (the v0.36.0
+    /// incident, commit 0fb5e5f0: a modest server program's walk closed a CI
+    /// worker's ~2 MiB margin). Every realistic fixture peaks at 20 levels
+    /// (both walkthrough entries, the std twin-parity and release-emission
+    /// corpora); 500 is 25x that, and caps the bounded worst case near
+    /// 20.3 MiB unoptimized — deeper nesting gets a clean diagnostic instead
+    /// of a stack overflow.
+    ///
+    /// The per-level figure is N97's re-measurement, and
+    /// `tests/deep_nesting.rs` is where it is held: the record read ~36 KiB
+    /// per level and ~18 MiB at the bound until Order 36's lazy, const,
+    /// callable and visibility arms landed IN this frame, and three comments
+    /// went on quoting the old numbers (N111).
     const WALK_DEPTH_LIMIT: usize = 500;
 
     fn walk_expr_node(&mut self, node: &'src Spanned<Node<'src>>, scope_id: Id) -> Id {
@@ -50001,6 +50008,19 @@ pub enum Intrinsic {
     Args,
     // `process::env(key): Option<str>` -> a runtime helper returning the enum form.
     Env,
+    // `List::new(): List<T>` -> an empty JS array literal, `[]`.
+    ListNew,
+    // `List.push(&mut self, value)` -> native `.push(value)`.
+    //
+    // These two were the only compiler-lowered externals OUTSIDE this table
+    // until N109: two `Program` fields keyed by function id, recognized by
+    // their own `if Some(target) == self.list_new_fn_id` arms. That is why
+    // B359's emit hole existed — a DISPATCH resolving to one had no arm and
+    // fell through to the emitted-function name, minting a mangled name for a
+    // function nothing emits — and why its fix had to add a pair of `Dispatch`
+    // variants beside them. As rows here they ride every path that already
+    // knows how to lower an intrinsic, and there is nothing left to forget.
+    ListPush,
     // `List.len(): i32` -> native `.length` (property read).
     ListLen,
     // `List.get(i): Option<T>` -> a bounds-checked runtime helper (Option form).
@@ -50792,9 +50812,17 @@ pub struct Program<'src> {
     /// sound because a SECOND `value` on a backed enum is B57's
     /// duplicate-inherent error: whatever survives here is the synthesized one.
     pub backed_value_members: HashSet<Id>,
-    // The source `List` intrinsics (`list.vl`), special-cased in codegen
-    // (`new` -> `[]`, `push` -> `subject.push(..)`). `None` only if `list.vl`
-    // failed to load.
+    /// The source `List` constructor and `push` (`list.vl`), by function id.
+    /// `None` only if `list.vl` failed to load.
+    ///
+    /// **Both are `Intrinsic` rows now** ([`Intrinsic::ListNew`],
+    /// [`Intrinsic::ListPush`]) and the JS emitter reads them out of
+    /// [`Self::intrinsics`] like every other built-in lowering — N109, which is
+    /// what closed the class B359 was one instance of. These two fields survive
+    /// only because `vilan-rust` still recognizes the pair by id, ahead of its
+    /// own intrinsic table; they are deleted together with those two arms once
+    /// that emitter carries `Intrinsic::ListNew` / `Intrinsic::ListPush`.
+    /// Nothing new may be keyed this way: a compiler-lowered external is a row.
     pub list_new_fn_id: Option<Id>,
     pub list_push_fn_id: Option<Id>,
     // The `std` `panic` intrinsic (if loaded); its calls lower to a `throw`.
@@ -56322,9 +56350,13 @@ struct World<'src> {
     generated_by_source: HashMap<SourceId, Vec<crate::macros::GeneratedItems>>,
     // The std intrinsics the tail keys passes off (resolved from the loaded
     // world's scopes; `None` when the module never loaded).
-    list_struct_id: Option<Id>,
-    list_new_fn_id: Option<Id>,
-    list_push_fn_id: Option<Id>,
+    //
+    // `List` is NOT among them: its struct id lands in
+    // `analyzer.primitive_struct_ids`, which rides the world already, and
+    // `new`/`push` are `Intrinsic` rows the tail reads off that (N109). The
+    // three fields they had here carried `None` into every stored world and
+    // were filled after the unpack, which is a thread through a cache that
+    // never held anything.
     context_struct_id: Option<Id>,
     nursery_ambient_id: Option<Id>,
     nursery_fn_id: Option<Id>,
@@ -56824,10 +56856,9 @@ fn analyze_inner<'src>(
 
     // `List` is the built-in growable array. It is migrated to source
     // (`list.vl`, an `external struct` with `external fun new`/`push`); the
-    // struct id and the `new`/`push` intrinsic ids are captured below after the
-    // module loads, and the transformer lowers them to `[]` / `.push`.
-    let list_new_fn_id: Option<Id> = None;
-    let list_push_fn_id: Option<Id> = None;
+    // struct id is captured below after the module loads, and `new`/`push` are
+    // `Intrinsic` rows the tail reads off `primitive_struct_ids` (N109), which
+    // lowers them to `[]` / `.push` like every other built-in.
 
     // --- Load the `std` package from source ---
     // `pkg` aliases this package's sibling modules so `pkg::<module>::item`
@@ -58530,11 +58561,11 @@ fn analyze_inner<'src>(
     // Bind the source `List` struct into the global scope (so bare `List`
     // resolves in user code). Its `new`/`push` intrinsic ids are captured after
     // `build()`, once impl subjects resolve.
-    let list_struct_id = module_scopes
+    if let Some(list_struct_id) = module_scopes
         .get("list")
         .and_then(|scope_id| analyzer.scopes.get(scope_id))
-        .and_then(|scope| scope.name_to_id_map.get("List").copied());
-    if let Some(list_struct_id) = list_struct_id {
+        .and_then(|scope| scope.name_to_id_map.get("List").copied())
+    {
         analyzer.primitive_struct_ids.insert("List", list_struct_id);
         analyzer
             .mut_scope_for_scope_id(global_scope_id)
@@ -58765,9 +58796,6 @@ fn analyze_inner<'src>(
         module_scopes,
         pkg_module_names,
         generated_by_source,
-        list_struct_id,
-        list_new_fn_id,
-        list_push_fn_id,
         context_struct_id,
         nursery_ambient_id,
         nursery_fn_id,
@@ -58897,9 +58925,6 @@ fn analyze_over_world<'src>(
         module_scopes,
         pkg_module_names: _,
         generated_by_source,
-        list_struct_id,
-        mut list_new_fn_id,
-        mut list_push_fn_id,
         context_struct_id,
         nursery_ambient_id,
         nursery_fn_id,
@@ -59095,8 +59120,9 @@ fn analyze_over_world<'src>(
     // whose module is not loaded resolve to `None` and drop out — the table is
     // inert until a container is actually used (the `try_trait_id` precedent).
     let bumps_rows: [(Option<Id>, bool); 11] = {
-        // Resolve a method id inside the impl of a resolved container struct (the
-        // `list_push_fn_id` pattern), matching the impl subject by nominal id.
+        // Resolve a method id inside the impl of a resolved container struct
+        // (the `intrinsics` table's own pattern), matching the impl subject by
+        // nominal id.
         let container_method = |struct_id: Option<Id>, name: &str| -> Option<Id> {
             let struct_id = struct_id?;
             analyzer.implementations.iter().find_map(|implementation| {
@@ -59450,27 +59476,6 @@ fn analyze_over_world<'src>(
         })
     });
 
-    // Find `List`'s `new`/`push` (special-cased by the transformer to `[]` /
-    // `.push`) now that impl subjects have resolved.
-    if let Some(list_struct_id) = list_struct_id {
-        for implementation in &analyzer.implementations {
-            // Match the `List` impl by nominal id, ignoring the subject's type
-            // arguments (`impl List<type T>` has subject `List<Generic>`).
-            let subject_is_list = matches!(
-                analyzer.type_id_to_type_map.get(&implementation.subject),
-                Some(Type::Struct(id, _)) if *id == list_struct_id
-            );
-            if subject_is_list {
-                // Both take B265's rule with the intrinsic table below: an
-                // `external fun` declaration and nothing else.
-                list_new_fn_id = external_intrinsic_declaration(&analyzer, implementation, "new")
-                    .or(list_new_fn_id);
-                list_push_fn_id = external_intrinsic_declaration(&analyzer, implementation, "push")
-                    .or(list_push_fn_id);
-            }
-        }
-    }
-
     // Capture the external std functions with built-in JS lowerings: `str`'s
     // methods (across every `impl str` block), and the module-level `scan` /
     // `random::range_{i32,u32,f64}` (the `Random` trait impls forward to these).
@@ -59507,6 +59512,16 @@ fn analyze_over_world<'src>(
             }
         }
     }
+    // N109's remaining half. `new` and `push` are rows here like the rest of
+    // `List`'s methods, and the JS emitter reaches them through the table — but
+    // `vilan-rust` still recognizes them by function ID, so the two `Program`
+    // fields are filled from THIS loop rather than by the second walk of
+    // `List`'s impls they used to have. First declaration wins, in
+    // `implementations` order, which is what the `.or(..)` pair before it did.
+    // Both fields, and these two assignments, go when that emitter takes its
+    // `Intrinsic::ListNew` / `Intrinsic::ListPush` arms.
+    let mut list_new_fn_id: Option<Id> = None;
+    let mut list_push_fn_id: Option<Id> = None;
     if let Some(list_struct_id) = analyzer.primitive_struct_ids.get("List").copied() {
         for implementation in &analyzer.implementations {
             let subject_is_list = matches!(
@@ -59515,6 +59530,8 @@ fn analyze_over_world<'src>(
             );
             if subject_is_list {
                 for (name, intrinsic) in [
+                    ("new", Intrinsic::ListNew),
+                    ("push", Intrinsic::ListPush),
                     ("len", Intrinsic::ListLen),
                     ("get", Intrinsic::ListGet),
                     ("pop", Intrinsic::ListPop),
@@ -59526,6 +59543,15 @@ fn analyze_over_world<'src>(
                         external_intrinsic_declaration(&analyzer, implementation, name)
                     {
                         intrinsics.insert(id, intrinsic);
+                        match intrinsic {
+                            Intrinsic::ListNew => {
+                                list_new_fn_id = list_new_fn_id.or(Some(id));
+                            }
+                            Intrinsic::ListPush => {
+                                list_push_fn_id = list_push_fn_id.or(Some(id));
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }

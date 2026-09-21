@@ -17,6 +17,8 @@
 
 use std::path::{Path, PathBuf};
 
+use vilan_core::analyzer::Intrinsic;
+use vilan_core::id::Id;
 use vilan_core::{BuildOptions, PackageSpec, Platform, Workspace, analyze_source, transform};
 
 mod scratch;
@@ -200,4 +202,135 @@ fn b265_a_bodied_remove_on_another_type_is_untouched() {
         .expect("the compile worker finished")
         .expect("the user program compiles");
     assert_eq!(run(&js, "bag"), "bag\n1\n3\n");
+}
+
+/// N109: the same table is what binds `List::new` and `List::push`.
+///
+/// Until N109 these two were the compiler's only lowered externals OUTSIDE
+/// `Program::intrinsics` — two `Program` fields keyed by function id, with a
+/// dedicated `if Some(target) == self.list_new_fn_id` arm in the JS emitter's
+/// named-callee path and, since B359, a second pair of arms for the dispatch
+/// path beside it. B359 is what that costs: a DISPATCH resolving to one had no
+/// arm at all, fell through to the emitted-function name and minted a mangled
+/// name for a function nothing emits, so a trait default's `self.push(v)` over
+/// a `List` compiled clean and threw `ReferenceError` at runtime.
+///
+/// So the invariant is the pin: a compiler-lowered external is a ROW. Both are
+/// rows now, the rows are unique, and the two surviving `Program` fields —
+/// which exist only because `vilan-rust` still recognizes the pair by id —
+/// name exactly the ids those rows are filed under, so the field cannot drift
+/// from the table it is read out of.
+struct ListRows {
+    new_rows: Vec<Id>,
+    push_rows: Vec<Id>,
+    new_field: Option<Id>,
+    push_field: Option<Id>,
+    javascript: String,
+}
+
+fn list_rows(source: &'static str) -> ListRows {
+    let spec = vilan_core::manifest::resolve_std(&toolchain().join("std"));
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let (program, errors) = analyze_source(
+                source,
+                &spec,
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let program = program.expect("the probe program analyzes");
+            assert!(
+                errors.is_empty(),
+                "the probe program must be clean: {:?}",
+                errors
+                    .into_iter()
+                    .map(|error| error.msg)
+                    .collect::<Vec<_>>()
+            );
+            let rows = |wanted: &dyn Fn(&Intrinsic) -> bool| -> Vec<Id> {
+                let mut found: Vec<Id> = program
+                    .intrinsics
+                    .iter()
+                    .filter(|(_, intrinsic)| wanted(intrinsic))
+                    .map(|(id, _)| *id)
+                    .collect();
+                found.sort_by_key(|id| id.0);
+                found
+            };
+            ListRows {
+                new_rows: rows(&|intrinsic| matches!(intrinsic, Intrinsic::ListNew)),
+                push_rows: rows(&|intrinsic| matches!(intrinsic, Intrinsic::ListPush)),
+                new_field: program.list_new_fn_id,
+                push_field: program.list_push_fn_id,
+                javascript: transform(&program, &BuildOptions::default())
+                    .expect("the probe program emits"),
+            }
+        })
+        .expect("spawn the compile worker")
+        .join()
+        .expect("the compile worker finished")
+}
+
+#[test]
+fn n109_list_new_and_push_are_intrinsic_rows_like_every_other_lowering() {
+    // Every spelling of the pair in one program: the named constructor, the
+    // literal (which is the same lowering arrived at through the elements
+    // path), and a `push` on each.
+    let rows = list_rows(
+        r#"
+        import std::io::print;
+        fun main() {
+            mut named: List<i32> = List::new();
+            named.push(1);
+            mut literal: List<i32> = [];
+            literal.push(2);
+            print(named.len() + literal.len());
+        }
+        "#,
+    );
+
+    assert_eq!(
+        rows.new_rows.len(),
+        1,
+        "`List::new` must be exactly one `Intrinsic::ListNew` row, not a \
+         `Program` field the emitters have to remember: {:?}",
+        rows.new_rows
+    );
+    assert_eq!(
+        rows.push_rows.len(),
+        1,
+        "`List::push` must be exactly one `Intrinsic::ListPush` row: {:?}",
+        rows.push_rows
+    );
+    assert_eq!(
+        rows.new_field,
+        Some(rows.new_rows[0]),
+        "`Program::list_new_fn_id` must name the id its row is filed under — \
+         `vilan-rust` reads the field and the JS emitter reads the row, and \
+         the two answering differently is the whole defect class"
+    );
+    assert_eq!(
+        rows.push_field,
+        Some(rows.push_rows[0]),
+        "`Program::list_push_fn_id` must name the id its row is filed under"
+    );
+
+    // And the lowering is unchanged: the array literal and the host method,
+    // with no emitted function standing in for either.
+    assert!(
+        rows.javascript.contains(".push(1)") && rows.javascript.contains(".push(2)"),
+        "`push` must lower to the host method:\n{}",
+        rows.javascript
+    );
+    assert_eq!(
+        rows.javascript.matches("= [  ];").count(),
+        2,
+        "both constructors must lower to an empty array literal (the printer \
+         spaces an empty one as `[  ]`):\n{}",
+        rows.javascript
+    );
+    assert_eq!(run(&rows.javascript, "n109"), "2\n");
 }
