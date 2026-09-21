@@ -180,7 +180,7 @@ struct BinaryReader {
 	error: Shared<Option<str>>,
 }
 
-export impl BinaryReader {
+impl BinaryReader {
 	fun new(bytes: Bytes): BinaryReader {
 		BinaryReader { bytes, cursor = Shared::new(0), error = Shared::new(None) }
 	}
@@ -310,6 +310,12 @@ export impl BinaryReader {
 // `begin_variant` is a no-op — the mirror of the write side, where
 // `begin_variant` writes it); `is_null` peeks the Option marker and consumes
 // it only for `Some`, leaving `None`'s `0x00` for `null_value`.
+// EXPORTED deliberately, and B354 is the reason: a `[derive(Wire)]` visitor is
+// generated code, and its admitting file is the file the ATTRIBUTE was written
+// in - a USER's file, which cannot reach a private std block and cannot be asked
+// to write `#(impl BinaryReader)` for one. The Order 36 sweep exported these under
+// the sentinel rule; they stay exported under the right one. The plain blocks
+// above/below need no export: a derived body only ever calls the VISITOR methods.
 export impl BinaryReader with Deserialize {
 	fun begin_struct(self) {}
 

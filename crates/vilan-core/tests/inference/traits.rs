@@ -6242,21 +6242,131 @@ fn b316_an_unrelated_trait_pair_is_still_refused() {
     );
 }
 
+/// The fence's NON-DIAGNOSTIC face (B355, R3), and the helper both B279 pins
+/// are written against since the broad gate landed.
+///
+/// Analyzes `source` on a large-stack worker with the fallback recorder zeroed
+/// THERE (the isolation `dispatch_selections` documents: an analysis is
+/// single-threaded, the suite is not), enumerates the coverage pass's dispatch
+/// sites exactly as it does, runs the refinement, and hands back — per site
+/// whose dispatched member is `member` — the candidate list each fallback
+/// widened to, rendered as the impl-subject names the candidates belong to.
+///
+/// Diagnostics are TOLERATED: the programs below carry one by construction (a
+/// generic taken as a value is what makes the level unresolvable in the first
+/// place), and under E189's broad gate the coverage refusal that used to be
+/// the only observation of this property is no longer emitted at all.
+fn dispatch_fallback_subjects(source: &str, member: &str) -> Vec<Vec<String>> {
+    use vilan_core::call_graph::{CallGraph, CallTarget, IndirectReason};
+    use vilan_core::dispatch_refine::{
+        self, DispatchSite, RefinedCaller, candidates_of, member_name_at,
+    };
+    use vilan_core::id::Id;
+    use vilan_core::type_::Type;
+
+    let source = source.to_string();
+    let member = member.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, _errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let program = program.expect("analysis should produce a program");
+            let graph = CallGraph::build(&program);
+            let mut sites: Vec<DispatchSite> = Vec::new();
+            for node in graph.nodes() {
+                for call in graph.calls_of(node.id()) {
+                    if !matches!(
+                        call.target,
+                        CallTarget::Indirect(
+                            IndirectReason::TraitDispatch | IndirectReason::GenericMember
+                        )
+                    ) {
+                        continue;
+                    }
+                    let Some(name) = member_name_at(&program, call.call_id) else {
+                        continue;
+                    };
+                    sites.push(DispatchSite {
+                        owner: RefinedCaller::Node(node.id()),
+                        call: call.call_id,
+                        candidates: candidates_of(
+                            &program,
+                            program.admitting_file(call.call_id),
+                            name,
+                        ),
+                    });
+                }
+            }
+            let wanted: Vec<Id> = sites
+                .iter()
+                .filter(|site| member_name_at(&program, site.call) == Some(member.as_str()))
+                .map(|site| site.call)
+                .collect();
+            dispatch_refine::reset_dispatch_fallbacks();
+            let _edges = dispatch_refine::refined_edges(&program, &graph, &sites);
+            // The impl subject each candidate belongs to, by name — what the
+            // claim is about ("`Wall::paint` is in the set").
+            let subject_of = |candidate: Id| -> String {
+                for implementation in &program.implementations {
+                    if implementation
+                        .declarations
+                        .values()
+                        .any(|declared| *declared == candidate)
+                    {
+                        return match program.type_id_to_type_map.get(&implementation.subject) {
+                            Some(Type::Struct(struct_id, _)) => program
+                                .structs
+                                .get(struct_id)
+                                .map(|declared| declared.name.to_string())
+                                .unwrap_or_else(|| "?".to_string()),
+                            _ => "?".to_string(),
+                        };
+                    }
+                }
+                "?".to_string()
+            };
+            dispatch_refine::dispatch_fallbacks()
+                .into_iter()
+                .filter(|(call, _)| wanted.contains(call))
+                .map(|(_, candidates)| {
+                    let mut names: Vec<String> = candidates.into_iter().map(subject_of).collect();
+                    names.sort();
+                    names.dedup();
+                    names
+                })
+                .collect()
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
 /// B279's invariant, held where a guard can be held: the coverage walk's
 /// dead-code exemption is read off the REFINED dispatch edges, and it is sound
 /// only because every fallback in `refined_edges` widens to the WHOLE candidate
 /// list. Here the dispatching level is taken as a value, so its entries cannot
 /// be enumerated and the site resolves to nothing — the fallback must therefore
-/// draw an edge to every candidate, `Wall::paint` among them, and `Wall::paint`
-/// must be FENCED for coverage rather than exempted as dead. The moment a
-/// fallback narrows instead of widening, this program compiles and prints
-/// `undefined`, which is B258's silence from the other direction.
+/// widen to every candidate, `Wall::paint` among them. The moment a fallback
+/// narrows instead of widening, `Wall::paint` is exempted as dead, no caller of
+/// it is checked for having a context to hand, and this program compiles and
+/// prints `undefined` — which is B258's silence from the other direction.
 ///
-/// (The two extra diagnostics the program carries — a generic taken as a value
-/// — are what makes the level unresolvable and are not the claim.)
+/// **Re-pinned on the fence itself (B355, R3).** It used to observe this
+/// THROUGH the coverage refusal, which E189's broad gate no longer emits for a
+/// program carrying another diagnostic — and this program carries two by
+/// construction. The property was always about the candidate SET, not about a
+/// message; it is read off the set now.
 #[test]
 fn b279_an_unresolvable_dispatch_site_still_fences_its_candidates() {
-    assert_fails_with(
+    let widened = dispatch_fallback_subjects(
         r#"
         import std::io::print;
         import std::context::Context;
@@ -6285,16 +6395,28 @@ fn b279_an_unresolvable_dispatch_site_still_fences_its_candidates() {
         }
         main();
         "#,
-        "context `scope` is read here, but this code can be reached without an enclosing `run`",
+        "paint",
     );
+    assert!(
+        !widened.is_empty(),
+        "the site must FALL BACK — its level is taken as a value"
+    );
+    for candidates in &widened {
+        assert!(
+            candidates.iter().any(|subject| subject == "Wall")
+                && candidates.iter().any(|subject| subject == "Board"),
+            "a fallback must widen to EVERY candidate, `Wall::paint` among them: {candidates:?}"
+        );
+    }
 }
 
 /// The same shape one level deeper — the unresolvable level FORWARDS into the
 /// dispatching one — so the widening has to survive the recursion into the
-/// entry's own enclosing function.
+/// entry's own enclosing function. Re-pinned on the fence for B279's own
+/// reason (B355).
 #[test]
 fn b279_an_unresolvable_level_above_the_dispatch_still_fences() {
-    assert_fails_with(
+    let widened = dispatch_fallback_subjects(
         r#"
         import std::io::print;
         import std::context::Context;
@@ -6325,8 +6447,19 @@ fn b279_an_unresolvable_level_above_the_dispatch_still_fences() {
         }
         main();
         "#,
-        "context `scope` is read here, but this code can be reached without an enclosing `run`",
+        "paint",
     );
+    assert!(
+        !widened.is_empty(),
+        "the site must FALL BACK — the level above it is taken as a value"
+    );
+    for candidates in &widened {
+        assert!(
+            candidates.iter().any(|subject| subject == "Wall")
+                && candidates.iter().any(|subject| subject == "Board"),
+            "a fallback must widen to EVERY candidate, `Wall::paint` among them: {candidates:?}"
+        );
+    }
 }
 
 // --- B334 (R4): a receiverless call means the FREE function ------------------
@@ -6468,5 +6601,346 @@ fn b334_a_bare_value_mention_inside_an_impl_still_takes_the_member() {
         }
         "#,
         "a method has no value form",
+    );
+}
+
+// --- B359: a trait DEFAULT body's `self.member(..)` is the TRAIT's member ---
+//
+// R1, ruled at Order 38's GO: inside a default body `Self` is opaque, so an
+// implementor's INHERENT members are not in scope there (Rust's rule, and what
+// the generic-bound route already did). Outside a default body inherent-wins is
+// unchanged — the last pin of this block is that control.
+//
+// Face 1 was the hijack: a default written against the trait's `push` called
+// `Bag`'s inherent `push`, so what a default MEANT depended on names its author
+// could not know, and an implementor adding an inherent method later silently
+// changed every default that called the same name. Face 2 was the miscompile:
+// where the hijacked member was `external` the specialized default emitted a
+// mangled name nothing defined — clean at check, `ReferenceError` at runtime.
+
+/// Face 1. `Pusher::push_twice`'s body calls the TRAIT's `push` (the default
+/// that prints `trait push`), never `Bag`'s inherent one — so `count` stays 0.
+#[test]
+fn b359_a_default_body_reaches_the_traits_member_not_the_implementors_inherent_one() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Bag { count: i32 }
+
+        impl Bag {
+            fun push(&mut self, value: str) {
+                print("inherent push");
+                self.count += 1;
+            }
+        }
+
+        trait Pusher<T> {
+            fun push(&mut self, value: T) { print("trait push"); }
+            fun push_twice(&mut self, value: T) { self.push(value); self.push(value); }
+        }
+
+        impl Bag with Pusher<str> {}
+
+        fun main() {
+            mut bag = Bag { count = 0 };
+            bag.push_twice("x");
+            print(i"count {bag.count}");
+        }
+        "#,
+        "trait push\ntrait push\ncount 0\n",
+    );
+}
+
+/// The control, and the half of R1 that did NOT move: an ORDINARY call site is
+/// not inside a default body, so `bag.push("y")` still reaches the inherent
+/// member exactly as it always has.
+#[test]
+fn b359_an_ordinary_call_site_still_reaches_the_inherent_member() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Bag { count: i32 }
+
+        impl Bag {
+            fun push(&mut self, value: str) {
+                print("inherent push");
+                self.count += 1;
+            }
+        }
+
+        trait Pusher<T> {
+            fun push(&mut self, value: T) { print("trait push"); }
+            fun push_twice(&mut self, value: T) { self.push(value); self.push(value); }
+        }
+
+        impl Bag with Pusher<str> {}
+
+        fun main() {
+            mut bag = Bag { count = 0 };
+            bag.push("y");
+            print(i"count {bag.count}");
+        }
+        "#,
+        "inherent push\ncount 1\n",
+    );
+}
+
+/// Face 2, the miscompile: `List`'s own `push` is `external`, and the
+/// specialized default emitted it by MANGLED NAME — `function $a(self, value) {
+/// $b(self, value); $b(self, value); }` against a `$b` nothing defined, which
+/// checked clean and threw `ReferenceError: $b is not defined`. The program
+/// runs now, and the length proves `List`'s `push` is NOT what `push_twice`
+/// reaches: the trait's default prints instead, and the list stays empty.
+#[test]
+fn b359_a_default_body_over_an_external_inherent_member_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Pusher<T> {
+            fun push(&mut self, value: T) { print("trait push"); }
+            fun push_twice(&mut self, value: T) { self.push(value); self.push(value); }
+        }
+
+        impl List<type T> with Pusher<T> {}
+
+        fun main() {
+            mut plain: List<str> = [];
+            plain.push_twice("x");
+            print(i"len {plain.len()}");
+        }
+        "#,
+        "trait push\ntrait push\nlen 0\n",
+    );
+}
+
+/// The two ROUTES to one default now agree. Reached through a generic bound
+/// (`fill<S: Pusher<str>>`) the call has always dispatched to the trait's
+/// `push`; reached through the default body it dispatched to the inherent one.
+/// Both print the same thing, and a direct call after them still appends.
+#[test]
+fn b359_the_generic_bound_route_and_the_default_body_route_agree() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Pusher<T> {
+            fun push(&mut self, value: T) { print("trait push"); }
+            fun push_twice(&mut self, value: T) { self.push(value); self.push(value); }
+        }
+
+        impl List<type T> with Pusher<T> {}
+
+        fun fill<S: Pusher<str>>(target: &mut S) { target.push("g"); }
+
+        fun main() {
+            mut plain: List<str> = [];
+            plain.push_twice("x");
+            fill(&mut plain);
+            print(i"len {plain.len()}");
+            plain.push("direct");
+            print(i"len {plain.len()}");
+        }
+        "#,
+        "trait push\ntrait push\ntrait push\nlen 0\nlen 1\n",
+    );
+}
+
+/// An impl's OVERRIDE of the trait member is what a default body reaches — the
+/// trait-scoped lookup takes the impl's declaration first and only then the
+/// trait's own default, so R1 is "the trait's member", not "the trait's body".
+#[test]
+fn b359_an_impl_override_of_the_trait_member_wins_inside_a_default_body() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Bag { count: i32 }
+
+        impl Bag {
+            fun push(&mut self, value: str) { print("inherent push"); }
+        }
+
+        trait Pusher<T> {
+            fun push(&mut self, value: T) { print("trait push"); }
+            fun push_twice(&mut self, value: T) { self.push(value); self.push(value); }
+        }
+
+        impl Bag with Pusher<str> {
+            fun push(&mut self, value: str) {
+                print("impl push");
+                self.count += 1;
+            }
+        }
+
+        fun main() {
+            mut bag = Bag { count = 0 };
+            bag.push_twice("x");
+            print(i"count {bag.count}");
+        }
+        "#,
+        "impl push\nimpl push\ncount 2\n",
+    );
+}
+
+/// The SUPERTRAIT face. The default lives in `Super`, whose `tick` the
+/// implementor provides through `impl Cell with Sub` — a clause that never
+/// names `Super`. The wanted-trait filter is a membership test on the clause's
+/// own traits, so it turned that impl down and the call fell to the by-name
+/// lookup, which the inherent `tick` won. `std`'s own `Source<T>::sub` has
+/// exactly this shape (kolt's `StorageSignalCell` writes `impl .. with
+/// Signal<T>`), which is why the trait-scoped lookup now walks the type's
+/// provided traits for the ones whose supertrait closure reaches the declaring
+/// one.
+#[test]
+fn b359_a_supertrait_default_reaches_the_sub_traits_impl_not_the_inherent_member() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Super {
+            fun tick(self): i32;
+            fun twice(self): i32 { self.tick() + self.tick() }
+        }
+
+        trait Sub with Super {
+            fun label(self): str;
+        }
+
+        struct Cell { n: i32 }
+
+        impl Cell {
+            fun tick(self): i32 { print("inherent tick"); 100 }
+        }
+
+        impl Cell with Sub {
+            fun tick(self): i32 { print("trait tick"); 1 }
+            fun label(self): str { "cell" }
+        }
+
+        fun main() {
+            let c = Cell { n = 0 };
+            print(c.twice());
+        }
+        "#,
+        "trait tick\ntrait tick\n2\n",
+    );
+}
+
+/// An OPERATOR inside a default body is a call on the trait's member too
+/// (B193's channel): `self + self` over the supertrait `Add` reaches `impl
+/// Money with Add`'s `add`, not `Money`'s inherent one. 21 + 21 = 42; the
+/// inherent `add` answers a zero.
+#[test]
+fn b359_an_operator_in_a_default_body_reaches_the_traits_member() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+
+        struct Money { cents: i32 }
+
+        impl Money {
+            fun add(self, other: Money): Money {
+                print("inherent add");
+                Money { cents = 0 }
+            }
+        }
+
+        impl Money with Add {
+            fun add(self, other: Money): Money {
+                Money { cents = self.cents + other.cents }
+            }
+        }
+
+        trait Doubler with Add {
+            fun twice(self): Self { self + self }
+        }
+
+        impl Money with Doubler {}
+
+        fun main() {
+            print(Money { cents = 21 }.twice().cents);
+        }
+        "#,
+        "42\n",
+    );
+}
+
+/// A `for` LOOP inside a default body drives the trait's protocol member on the
+/// same channel (the loop is a call site like any other, B91/B56): `for value
+/// in self` reaches `impl Countdown with Stream`'s `next`, never the inherent
+/// one — which would have printed and yielded nothing.
+#[test]
+fn b359_a_for_loop_in_a_default_body_drives_the_traits_protocol_member() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Countdown { n: i32 }
+
+        impl Countdown {
+            fun next(&mut self): Option<i32> {
+                print("inherent next");
+                None
+            }
+        }
+
+        trait Stream {
+            fun next(&mut self): Option<i32>;
+
+            fun total(&mut self): i32 {
+                mut sum = 0;
+                for value in self {
+                    sum += value;
+                }
+                sum
+            }
+        }
+
+        impl Countdown with Stream {
+            fun next(&mut self): Option<i32> {
+                if self.n > 0 {
+                    self.n -= 1;
+                    Some(self.n + 1)
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            mut c = Countdown { n = 3 };
+            print(c.total());
+        }
+        "#,
+        "6\n",
+    );
+}
+
+/// The one BEHAVIOUR CHANGE R1 carries through std, pinned at its value.
+/// `Ord::clamp`'s default is `self.min(max).max(min)`, and every integer
+/// primitive also declares an INHERENT `min`/`max` over the host's `Math.min`/
+/// `Math.max` — which the default body used to reach. It reaches `Ord`'s own
+/// `min`/`max` defaults now: the same answers through `compare`, which is what
+/// this pin holds (the emitted JS differs, and `number-math.mjs` moved with
+/// it — its runtime output is byte-identical).
+#[test]
+fn b359_ords_clamp_default_still_answers_over_the_integers() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let low: i32 = 2;
+            print(low.clamp(3, 7));
+            print(9.clamp(0, 5));
+            print(4.clamp(0, 5));
+            print(8u32.clamp(0u32, 5u32));
+        }
+        "#,
+        "3\n5\n4\n5\n",
     );
 }

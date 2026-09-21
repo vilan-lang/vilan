@@ -100,6 +100,23 @@ thread_local! {
     /// clock reads per call are noise next to a program-wide scan.
     static REFINE_TIME: std::cell::Cell<crate::PhaseSpan> =
         const { std::cell::Cell::new(crate::PhaseSpan::ZERO) };
+    /// Every site [`refined_edges`] could not resolve, with the candidate list
+    /// it widened to — B279's fence, given a face that is not a diagnostic
+    /// (B355).
+    ///
+    /// The fence's soundness property is "every fallback widens to the WHOLE
+    /// candidate list" (stated in this module's own documentation and
+    /// load-bearing in `context.rs`'s dead-code exemption), and until now the
+    /// only thing that could OBSERVE it was a coverage refusal — in a program
+    /// that carries another diagnostic by construction, because a generic
+    /// taken as a value is what makes the level unresolvable in the first
+    /// place. That is why E189's broad gate could not be built: under it the
+    /// property had no observable face at all. It has one here, on the same
+    /// terms as [`SELECTION_COUNT`] — a thread-local the analysis fills and a
+    /// pin reads, because the property is not a fact about any one `Program`
+    /// field and an analysis is single-threaded while the suite is not.
+    static FALLBACK_SITES: std::cell::RefCell<Vec<(Id, Vec<Id>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The number of impl selections [`refined_edges`] has evaluated on this
@@ -111,6 +128,21 @@ pub fn selection_count() -> usize {
 /// Zeroes this thread's [`selection_count`].
 pub fn reset_selection_count() {
     SELECTION_COUNT.with(|count| count.set(0));
+}
+
+/// The dispatch sites [`refined_edges`] could not resolve on this thread since
+/// the last [`reset_dispatch_fallbacks`], each with the candidate list it
+/// widened to: B279's fence, observable without a diagnostic (B355). One entry
+/// per fallback, so a site that falls back at several levels appears several
+/// times — the property being observed is "this site widened to all of these",
+/// not how many times it did.
+pub fn dispatch_fallbacks() -> Vec<(Id, Vec<Id>)> {
+    FALLBACK_SITES.with(|sites| sites.borrow().clone())
+}
+
+/// Empties this thread's [`dispatch_fallbacks`].
+pub fn reset_dispatch_fallbacks() {
+    FALLBACK_SITES.with(|sites| sites.borrow_mut().clear());
 }
 
 /// How long this thread has spent inside [`refined_edges`] since the last
@@ -536,7 +568,23 @@ fn refined_edges_timed(
 
     let mut edges: Vec<RefinedEdge> = Vec::new();
     for site in sites {
+        // B355: the fence's non-diagnostic face. Every path below that hands
+        // back `site.candidates` INSTEAD of a resolution is a fallback, and
+        // each records itself here — so the widening is observable without a
+        // coverage refusal to read it through.
+        let record_fallback = || {
+            FALLBACK_SITES.with(|recorded| {
+                recorded
+                    .borrow_mut()
+                    .push((site.call, site.candidates.clone()));
+            });
+        };
+        let widened = || {
+            record_fallback();
+            site.candidates.clone()
+        };
         let union_fallback = |edges: &mut Vec<RefinedEdge>| {
+            record_fallback();
             for &candidate in &site.candidates {
                 edges.push(RefinedEdge {
                     caller: site.owner,
@@ -606,7 +654,7 @@ fn refined_edges_timed(
             // An id with no resolved type selects nothing and falls back, the
             // same answer `impl_members_for_bound`'s own guard gives.
             let Some(key) = program.type_id_to_type_map.get(&resolved) else {
-                return site.candidates.clone();
+                return widened();
             };
             if let Some(selected) = selection_memo.get(key) {
                 return selected.clone();
@@ -620,7 +668,7 @@ fn refined_edges_timed(
                 &constraint_traits,
             );
             let selected = if selected.is_empty() {
-                site.candidates.clone()
+                widened()
             } else {
                 selected
             };
@@ -659,9 +707,9 @@ fn refined_edges_timed(
                             walk.push((outer, parameter));
                             continue;
                         }
-                        None => site.candidates.clone(),
+                        None => widened(),
                     },
-                    Resolution::Opaque => site.candidates.clone(),
+                    Resolution::Opaque => widened(),
                 };
                 for candidate in selected {
                     edges.push(RefinedEdge {
@@ -677,7 +725,7 @@ fn refined_edges_timed(
                     Resolution::Concrete(resolved) => selected_for(resolved),
                     // Top-level code has no generic parameters to recurse
                     // into — an unresolved binding marks every candidate.
-                    _ => site.candidates.clone(),
+                    _ => widened(),
                 };
                 for candidate in selected {
                     edges.push(RefinedEdge {

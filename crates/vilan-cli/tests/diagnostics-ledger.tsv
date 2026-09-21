@@ -569,3 +569,4 @@ row	flagship	key
 545	flagship	a `css` declaration is a CALL: write `padding(space(4));`, not `padding: space(4);`. The property is the name and its value is ordinary vilan expressions, so a typed value needs no `{ }` hole — and several arguments join with one space, as CSS's own value lists do (`margin(px(4), px(8))`)
 546	-	`asset::staged` reads the registry AFTER evaluation has finished, and this build is still evaluating — until the last `const` expression has run, a token it stages may still be about to be named. Read it from a function passed to `asset::schedule_at_end`, which is where the build runs it.
 547	-	`[derive({name})]` expanded before std's `{module}` declared its `{name}` macro: a compiler load-ordering bug (B21's class); please report how this module is reached
+548	-	{count} `context` {checks} did not run: this program does not type, so the call graph it would be checked over has holes in it — fix the errors above and check again

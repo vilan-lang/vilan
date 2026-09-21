@@ -19928,6 +19928,37 @@ impl<'src> Analyzer<'src> {
             .collect()
     }
 
+    /// B356: the substitution a VARIANT constructor path's written arguments
+    /// fix (`Holder<i32>::Full` -> `{ Holder::T: i32 }`) — the enum's own
+    /// parameters zipped with what the path wrote, exactly as
+    /// [`Self::trait_parameter_substitution`] zips a trait's.
+    ///
+    /// A variant has no impl to reconcile the subject against (the static
+    /// path's own channel), so its written arguments reached nothing:
+    /// `Holder<i32>::Full("x")` compiled, and `Option<i32>::Some("y")` typed as
+    /// `Option<str>` from the PAYLOAD with the written `i32` silently
+    /// discarded — B323's family, "an annotation-only generic argument is
+    /// silently inert".
+    fn seed_variant_subject_bindings(&mut self, id: Id, subject_type: &Type) {
+        let Type::Enum(enum_id, arguments) = subject_type else {
+            return;
+        };
+        if arguments.is_empty() {
+            return;
+        }
+        let bindings: SubstitutionContext = self
+            .enums
+            .get(enum_id)
+            .map(|enum_| enum_.generic_parameter_constraint_ids.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .zip(arguments.iter().copied())
+            .collect();
+        if !bindings.is_empty() {
+            self.static_subject_bindings.insert(id, bindings);
+        }
+    }
+
     /// [`trait_with_supertraits`] with each trait paired with the type
     /// arguments it is reached WITH: the sub-trait's arguments substituted
     /// into the supertrait's WRITTEN ones, so `trait Sig<T> with Src<T>`
@@ -32830,27 +32861,24 @@ impl<'src> Analyzer<'src> {
     /// Whether `candidate` says strictly LESS about a generic than `held` does
     /// — the test [`Self::record_generic_binding`] declines on.
     ///
-    /// Two shapes, and both are "the same answer with something rubbed out":
-    /// a HOLE where the held binding has none (`Option<unknown>` against
-    /// `Option<str>`), and the same nominal head with its arguments ERASED.
-    /// The second is the one `None` produces: a payload-less variant types as
-    /// the bare enum, `Option` with an empty argument list, which carries no
-    /// hole to test for and unifies with every `Option<_>` there is.
+    /// ONE shape: "the same answer with something rubbed out" — a HOLE where
+    /// the held binding has none (`Option<unknown>` against `Option<str>`).
+    ///
+    /// B352 shipped a SECOND arm for the same nominal head with its arguments
+    /// ERASED, because that is what `None` produced: a payload-less variant
+    /// typed as the bare enum, `Option` with an empty argument list, which
+    /// carries no hole to test for and unifies with every `Option<_>` there is.
+    /// B357 fixed that at its seed — such a variant takes the landing
+    /// constraint's arguments, or a real `Unknown` per parameter — so the
+    /// erased shape no longer reaches here and the special case is RETIRED.
+    /// B352's three pins stay green without it, which is the condition the item
+    /// set for retiring it.
     ///
     /// Anything else replaces: a different type is a contradiction the
     /// reconcile that produced it has already judged, and a better-resolved
     /// answer arriving late is the ordinary way a generic lands.
     fn binding_is_weaker(&self, candidate: TypeId, held: TypeId) -> bool {
-        if self.type_has_hole(candidate) && !self.type_has_hole(held) {
-            return true;
-        }
-        match (candidate.get_type(self), held.get_type(self)) {
-            (Type::Enum(candidate_id, candidate_args), Type::Enum(held_id, held_args))
-            | (Type::Struct(candidate_id, candidate_args), Type::Struct(held_id, held_args)) => {
-                candidate_id == held_id && candidate_args.is_empty() && !held_args.is_empty()
-            }
-            _ => false,
-        }
+        self.type_has_hole(candidate) && !self.type_has_hole(held)
     }
 
     fn bind_callee_own_generics(
@@ -34330,7 +34358,44 @@ impl<'src> Analyzer<'src> {
             // A bare variant reference is a value of the enum (e.g. `None`); a
             // variant with data acts as a constructor whose call also yields
             // the enum.
-            Expr::EnumVariant(enum_id, _) => Type::Enum(*enum_id, Vec::new()),
+            //
+            // B357: a PAYLOAD-LESS variant of a GENERIC enum used to type as
+            // the bare enum with an EMPTY argument list — `None` was `Option`
+            // with no arguments, which carries no hole to test for and unifies
+            // with every instantiation there is while saying nothing. That is
+            // what made `Box<Option<str>>::new(None)` a `Box<Option>` until
+            // B352 special-cased the erased shape in `binding_is_weaker`. It
+            // takes the LANDING CONSTRAINT when the constraint names this very
+            // enum at arguments, exactly as a constructor call would, and a
+            // HOLE per parameter otherwise — a real `Unknown`, which the
+            // ordinary weaker-binding test already declines against a resolved
+            // answer, so the erased-arguments special case has nothing left to
+            // catch.
+            Expr::EnumVariant(enum_id, variant_index) => {
+                let enum_id = *enum_id;
+                let payload_less = self
+                    .enums
+                    .get(&enum_id)
+                    .and_then(|enum_| enum_.variants.get(*variant_index))
+                    .is_some_and(|variant| variant.data_type_ids.is_empty());
+                let parameters = self
+                    .enums
+                    .get(&enum_id)
+                    .map(|enum_| enum_.generic_parameter_constraint_ids.len())
+                    .unwrap_or(0);
+                match (payload_less && parameters > 0, constraint.as_ref()) {
+                    (false, _) => Type::Enum(enum_id, Vec::new()),
+                    (true, Type::Enum(wanted_id, wanted_arguments))
+                        if *wanted_id == enum_id && wanted_arguments.len() == parameters =>
+                    {
+                        Type::Enum(enum_id, wanted_arguments.clone())
+                    }
+                    (true, _) => {
+                        let hole = Type::Unknown.get_type_id(self);
+                        Type::Enum(enum_id, vec![hole; parameters])
+                    }
+                }
+            }
             Expr::Trait(trait_id) => Type::Trait(*trait_id, Vec::new()),
             Expr::Module(module_id) => Type::Module(*module_id),
             Expr::Call(id) => {
@@ -39319,15 +39384,30 @@ impl<'src> Analyzer<'src> {
                         });
                         return Resolution::Failed;
                     }
-                    let substitution_context = HashMap::default();
+                    // B356: a written path argument (`Holder<i32>::Full(..)`,
+                    // `Option<str>::Some(..)`) FIXES the enum's parameter for
+                    // this call. Without it the arguments were inert — the
+                    // payload typed the enum and the written argument reached
+                    // nothing, so `Option<i32>::Some("y")` was an `Option<str>`
+                    // and `o.unwrap_or(3)` then wanted a `str`.
+                    let substitution_context: SubstitutionContext = self
+                        .static_subject_bindings
+                        .get(&subject_id)
+                        .cloned()
+                        .unwrap_or_default();
                     // A constructor call INSTANTIATES the enum's parameters, so
                     // they are open here even inside an `impl Option<type T>`
-                    // that holds the same ids rigid (B211).
-                    let enum_generics = self
+                    // that holds the same ids rigid (B211) — except the ones the
+                    // path just fixed, which are no longer open to inference or
+                    // the written argument would lose to the payload again.
+                    let enum_generics: Vec<TypeId> = self
                         .enums
                         .get(&enum_id)
                         .map(|enum_| enum_.generic_parameter_constraint_ids.clone())
-                        .unwrap_or_default();
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|constraint_id| !substitution_context.contains_key(constraint_id))
+                        .collect();
                     for (index, data_type_id) in data_type_ids.iter().enumerate() {
                         let data_type = data_type_id.get_type(self);
                         let argument_id = *argument_ids.get(index).unwrap();
@@ -40208,6 +40288,32 @@ impl<'src> Analyzer<'src> {
                             _ => GenericDispatch::OnType(None, member_name),
                         };
                         self.generic_dispatch.insert(id, dispatch);
+                        // B359 (R1): inside a trait DEFAULT body `self.name(..)`
+                        // means the TRAIT's member, ALWAYS — `Self` is opaque
+                        // there, so an implementor's inherent members are not in
+                        // scope (Rust's rule, and what the generic-bound route
+                        // has always done). Recording the DECLARING trait is
+                        // what says so to codegen: `resolve_dispatch_with`'s
+                        // preferred trait resolves strictly within it (the
+                        // impl's override of the trait member, else the trait's
+                        // own default) instead of falling to the by-name lookup,
+                        // which an implementor's same-named INHERENT member
+                        // wins. Without it a default written against the
+                        // trait's `push` called `Bag`'s inherent `push`, so
+                        // what a default MEANT depended on names its author
+                        // could not know — and where the inherent was
+                        // `external` the specialized default emitted a mangled
+                        // name nothing defined (`ReferenceError`, clean at
+                        // check). The two routes to one default now agree.
+                        //
+                        // Only the default-body dispatch takes it: the B299
+                        // bare-trait-impl body above re-dispatches through the
+                        // CALLER's binding, where the receiver is a concrete
+                        // type and inherent-wins is the ordinary rule.
+                        if matches!(dispatch, GenericDispatch::OnType(None, _)) {
+                            self.bound_dispatch_traits
+                                .insert(id, (*declaring_trait_id, declaring_arguments.clone()));
+                        }
                         // B205: a member reached from a SUPERTRAIT is written in
                         // that trait's terms, `Self` included — and inside this
                         // default body `Self` is the SUB-trait. Record the reach
@@ -46165,6 +46271,12 @@ impl<'src> Analyzer<'src> {
                             // reconciled impl-first so the bindings key on the
                             // impl's generics.
                             self.seed_trait_static_subject_bindings(id, &subject_type);
+                            // B356: and a VARIANT's, which has no impl for the
+                            // reconcile below to match against — the enum's own
+                            // parameters are the channel.
+                            if variant_id == Some(member_id) {
+                                self.seed_variant_subject_bindings(id, &subject_type);
+                            }
                             let has_concrete_args = matches!(
                                 &subject_type,
                                 Type::Struct(_, args) | Type::Enum(_, args) if !args.is_empty()
@@ -47311,13 +47423,21 @@ impl<'src> Analyzer<'src> {
                 // same channel a `self.next()` call in a default uses. Without
                 // this the loop fell through to a native `for...of` over the
                 // struct's flat FIELD array (B56).
-                Type::Trait(trait_id, _) => {
+                Type::Trait(trait_id, trait_arguments) => {
                     let trait_id = *trait_id;
-                    match self.method_member_in_trait(trait_id, next_method) {
-                        Some(next_id) => {
+                    let trait_arguments = trait_arguments.clone();
+                    match self.method_member_in_trait_at(trait_id, &trait_arguments, next_method) {
+                        Some((next_id, declaring_trait_id, declaring_arguments)) => {
                             self.for_each_next.insert(for_each_id, next_id);
                             self.generic_dispatch
                                 .insert(for_each_id, GenericDispatch::OnType(None, next_method));
+                            // B359 (R1): the loop is a call site like any other,
+                            // so `for v in self` in a default body drives the
+                            // TRAIT's protocol member — not an implementor's
+                            // same-named inherent `next`. Same channel as the
+                            // `self.next()` call above.
+                            self.bound_dispatch_traits
+                                .insert(for_each_id, (declaring_trait_id, declaring_arguments));
                         }
                         None => self.report_uniterable_for_each(
                             for_each_id,
@@ -48568,18 +48688,28 @@ impl<'src> Analyzer<'src> {
             // B55, resolved against `current_self_type` at emission. So the
             // explicit spelling now works for the same reason the operator
             // does, and the two halves close together as filed.
-            if let Type::Trait(trait_id, _) = lhs_type
+            if let Type::Trait(trait_id, trait_arguments) = &lhs_type
                 && self.is_in_trait_default(binary_id)
             {
+                let trait_id = *trait_id;
+                let trait_arguments = trait_arguments.clone();
                 // `&&` and `||` are the only prepped operators modelling no
                 // trait, and they `continue`d far above, so every operator
                 // that reaches here has one.
                 let Some((trait_name, method_name)) = operator_trait_method(op) else {
                     continue;
                 };
-                if self.method_member_in_trait(trait_id, method_name).is_some() {
+                if let Some((_, declaring_trait_id, declaring_arguments)) =
+                    self.method_member_in_trait_at(trait_id, &trait_arguments, method_name)
+                {
                     self.generic_dispatch
                         .insert(binary_id, GenericDispatch::OnType(None, method_name));
+                    // B359 (R1): an operator in a default body is a call on the
+                    // TRAIT's member too — `self + self` over a supertrait
+                    // `Add` reaches `Add`'s `add`, never an implementor's
+                    // inherent one.
+                    self.bound_dispatch_traits
+                        .insert(binary_id, (declaring_trait_id, declaring_arguments));
                     continue;
                 }
                 // The default body writes an operator its own trait never
@@ -51289,11 +51419,23 @@ impl<'src> Program<'src> {
     /// neither `only` nor a selector. `source_of` is a linear scan of
     /// `source_ranges` (M27's whole-program-loop hazard) and the dispatch
     /// consumers ask it once per SITE, so the guard has to come first.
+    /// B354: a `[derive(..)]`-SYNTHESIZED body's admitting file is the file the
+    /// ATTRIBUTE was written in, which is what [`Self::note_source_of`]
+    /// resolves. `source_of` answers the sentinel [`DERIVED_SOURCE`] for
+    /// generated code, and the sentinel is not a file any import can reach: it
+    /// declares nothing of its own and it has reached nothing with `#`, so the
+    /// export gate turned down every non-exported `impl` in the program for
+    /// every derived visitor. That is WHY E185's placeholder fired sixteen
+    /// times at Order 36's sweep merge and why std had to export the codec
+    /// blocks it had kept private — and the refusal's own advice ("widen
+    /// `thing`'s own import of `w`") could not be taken, because `thing.vl`'s
+    /// set was not the set being consulted. The generated code belongs to the
+    /// module that asked for it; it resolves under that module's imports.
     pub fn admitting_file(&self, id: Id) -> Option<SourceId> {
         if self.impl_admission.is_empty() {
             return None;
         }
-        self.source_of(id)
+        self.note_source_of(id)
     }
 
     pub fn source_of(&self, id: Id) -> Option<SourceId> {

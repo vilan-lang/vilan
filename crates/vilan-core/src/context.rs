@@ -93,6 +93,59 @@ pub fn thread_contexts(program: &mut Program) -> Option<CallGraph> {
     let plan = match outcome {
         Ok(plan) => plan,
         Err(errors) => {
+            // --- E189's BROAD GATE (B355, R3). ---
+            //
+            // This pass's verdicts are computed over the CALL GRAPH, and a
+            // program that does not type has holes in its call graph by
+            // construction: a call the solver could not wire is recorded
+            // nowhere, so who owns the calls written inside it, and what the
+            // closures handed to it will be run under, are questions with no
+            // answers yet. E189 closed the worst of that (the collector
+            // descends into an unwired call's operands, so kolt's 184 errors
+            // became 9) — but the residue is not a bug to fix one shape at a
+            // time, it is the pass answering a question the program has not
+            // finished asking. One wrong `href(href())` in an element head
+            // still cost 138 coverage refusals entering at a component whose
+            // RETURN TYPE the failed attribute poisoned, none of which trace
+            // through the head and none of which a reader can act on.
+            //
+            // So: when the program ALREADY carries an error, the context
+            // family stands down whole and says so once, as a warning. The
+            // warning and not a diagnostic, deliberately — the compile is
+            // already failing, and E191's claim is that the arity error
+            // reports ALONE.
+            //
+            // What made this unbuildable until now was not the pins it turns
+            // off — three restate as deferrals — but
+            // `b279_an_unresolvable_dispatch_site_still_fences_its_candidates`,
+            // which observed a SOUNDNESS property (the refined-dispatch
+            // fallback widening to the whole candidate list) only THROUGH a
+            // coverage refusal, in a program carrying another diagnostic by
+            // construction. The fence has its own face now
+            // (`dispatch_refine::dispatch_fallbacks`) and that pin reads it,
+            // so nothing is left observable only through this list.
+            if !program.diagnostics.is_empty() {
+                let deferred = errors.len();
+                let anchor = program.diagnostics.len().saturating_sub(1);
+                let source = program.diagnostic_source(anchor);
+                let msg = format!(
+                    "{deferred} `context` {} did not run: this program does not type, so \
+                     the call graph it would be checked over has holes in it — fix the \
+                     errors above and check again",
+                    crate::util::plural(deferred, "check", "checks"),
+                );
+                program
+                    .warning_sources
+                    .resize(program.warnings.len(), source);
+                program.warnings.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: crate::span::Span::default(),
+                    msg,
+                });
+                program.warning_sources.push(source);
+                return Some(graph);
+            }
             for (error, source) in errors {
                 program.push_diagnostic(error, source);
             }
