@@ -62253,3 +62253,83 @@ mod rigidity_agreement_tests {
         }
     }
 }
+
+/// B360 — an `external fun` with NO `[extern]` binding and no compiler
+/// lowering, refused where it is DECLARED (R4).
+///
+/// An `external fun` says "the body lives somewhere the compiler does not look
+/// at", and there are exactly two somewheres: a host binding written on the
+/// declaration (`[extern("Math", "max")]`, `[extern("method")]`, …), or a
+/// lowering the compiler itself carries — `str`'s methods, `List::new`/`push`,
+/// `panic`, `print`, `drop`, `Context`'s four, the nursery pair, and the rest
+/// of the `intrinsics` table, all of which std declares as bodyless externals
+/// deliberately. A declaration with NEITHER names nothing: emission fell
+/// through every arm above to "a normal emitted function", and emitted a CALL
+/// to a mangled name no declaration in the program ever defines — `$b(t, "x")`
+/// with `$b` undefined, clean through `vilan check` and a `TypeError` on the
+/// first line that reaches it.
+///
+/// B359 closed the DISPATCHED half of this (a trait default reaching
+/// `List::new`/`push` through a requirement); the ordinary call site was left,
+/// and an ordinary call site cannot be fixed by emission — there is nothing to
+/// emit. So the declaration is refused, which is also where the fix goes: add
+/// the binding, or give the function a body.
+///
+/// A post-pass rather than a walk-time check because the compiler's own
+/// lowerings are resolved BY NAME against the finished program (see `build`'s
+/// `intrinsics` assembly): at the walk there is no table to ask.
+pub fn check_unlowered_externals(program: &mut Program) {
+    // The compiler's own external lowerings that are recorded as single ids
+    // rather than in `intrinsics`. Every one of them is a std declaration the
+    // emitter has an arm for.
+    let lowered_by_id: Vec<Option<Id>> = vec![
+        program.list_new_fn_id,
+        program.list_push_fn_id,
+        program.panic_fn_id,
+        program.print_fn_id,
+        program.drop_fn_id,
+        program.context_new_fn_id,
+        program.context_run_fn_id,
+        program.context_get_fn_id,
+        program.context_get_safe_fn_id,
+        program.nursery_fn_id,
+        program.owned_nursery_enter_fn_id,
+    ];
+    let mut sites: Vec<(Span, SourceId, String)> = Vec::new();
+    for external in program.external_functions.values() {
+        if external.extern_binding.is_some() {
+            continue;
+        }
+        if program.intrinsics.contains_key(&external.id) {
+            continue;
+        }
+        if lowered_by_id.contains(&Some(external.id)) {
+            continue;
+        }
+        let Some(source) = program.source_of(external.id) else {
+            continue;
+        };
+        sites.push((
+            external.name_span,
+            source,
+            format!(
+                "`external fun {}` names no body: an external needs an `[extern(..)]` binding \
+                 saying what the host calls it, or it is not external — give it a body. \
+                 Without one, a call to it emits a name nothing in the program defines",
+                external.name
+            ),
+        ));
+    }
+    sites.sort_by_key(|(span, source, _)| (source.0, span.start, span.end));
+    for (span, source, msg) in sites {
+        program.push_diagnostic(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg,
+            },
+            source,
+        );
+    }
+}

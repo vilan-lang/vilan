@@ -570,3 +570,4 @@ row	flagship	key
 546	-	`asset::staged` reads the registry AFTER evaluation has finished, and this build is still evaluating — until the last `const` expression has run, a token it stages may still be about to be named. Read it from a function passed to `asset::schedule_at_end`, which is where the build runs it.
 547	-	`[derive({name})]` expanded before std's `{module}` declared its `{name}` macro: a compiler load-ordering bug (B21's class); please report how this module is reached
 548	-	{count} `context` {checks} did not run: this program does not type, so the call graph it would be checked over has holes in it — fix the errors above and check again
+NEW	-	`external fun {name}` names no body: an external needs an `[extern(..)]` binding saying what the host calls it, or it is not external — give it a body. Without one, a call to it emits a name nothing in the program defines
