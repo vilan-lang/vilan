@@ -34572,21 +34572,36 @@ impl<'src> Analyzer<'src> {
                                 substitution_context.insert(*constraint_id, *argument_id);
                             }
                         }
-                        // Keep the DECLARED return type too: the return-type-only
-                        // inference below must filter bindings to the callee's own
-                        // generics, and after substitution the return type's
-                        // generics can be the CALLER's (an abstract argument bound
-                        // the callee's `T` to the caller's `T`) — those must not
-                        // be re-bound against the expectation.
+                        // Keep the CALLEE's OWN return type too: the
+                        // return-type-only inference below must filter bindings to
+                        // the callee's own generics, and after substitution the
+                        // return type's generics can be the CALLER's (an abstract
+                        // argument bound the callee's `T` to the caller's `T`) —
+                        // those must not be re-bound against the expectation.
                         let declared_return_type = return_type_id.map(|id| id.get_type(self));
-                        let return_type = match &declared_return_type {
-                            Some(declared) => self.substitute_type(declared, &substitution_context),
+                        // B369: an INFERRED return type is written in the callee's
+                        // own binders exactly as a declared one is — `fun
+                        // hold<C: Show>(body: C) { Holder { body } }` infers
+                        // `Holder<C>` — and the substitution has to be applied to
+                        // it HERE, because the tail's type comes back out of the
+                        // solver's cache verbatim: `infer_type_path` answers from
+                        // `resolved_types` before any substitution runs, so
+                        // threading the context down through `inferred_return_type`
+                        // reaches nothing. Without this `hold("x")` typed as
+                        // `Holder<C>`, and the first dispatch on that value
+                        // resolved to the trait's BODYLESS requirement — an
+                        // internal error anchored wherever the generic std
+                        // function that received it lives, over a correct program.
+                        let callee_return_type = match declared_return_type {
+                            Some(declared) => declared,
                             None => self.inferred_return_type(
                                 function_id,
                                 &substitution_context,
                                 exprs_seen,
                             ),
                         };
+                        let return_type =
+                            self.substitute_type(&callee_return_type, &substitution_context);
                         // A generic parameter fixed only by the return type — no
                         // argument binds it — is inferred by unifying the return
                         // type against the call's expected type, and recorded so
@@ -34597,16 +34612,13 @@ impl<'src> Analyzer<'src> {
                         // (Argument-bound generics are recorded during call-subject
                         // resolution; this fills the return-type-only gap.)
                         if !matches!(constraint.as_ref(), Type::Unknown | Type::Unresolved) {
-                            // The callee's own return-type generics — from the
-                            // DECLARED type where there is one, so a caller
-                            // generic introduced by substitution never counts as
-                            // "the callee's, still to infer".
+                            // The callee's own return-type generics — read off the
+                            // callee's OWN return type (declared or inferred),
+                            // never the substituted one, so a caller generic
+                            // introduced by substitution never counts as "the
+                            // callee's, still to infer".
                             let mut return_generics = Vec::new();
-                            self.collect_generics(
-                                declared_return_type.as_ref().unwrap_or(&return_type),
-                                0,
-                                &mut return_generics,
-                            );
+                            self.collect_generics(&callee_return_type, 0, &mut return_generics);
                             if !return_generics.is_empty()
                                 && let Some((_, bindings)) = self.reconcile_type(
                                     &return_type,

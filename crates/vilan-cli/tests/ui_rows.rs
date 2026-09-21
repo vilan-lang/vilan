@@ -3010,3 +3010,69 @@ fn a105_the_ssr_twin_renders_a_some_attribute_and_omits_a_none() {
          omit a `None` entirely, and keep `Some(\"\")` as a present empty one"
     );
 }
+
+/// B369: a user-written generic `Slot` impl built by a generic function with
+/// NO declared return type. The claim is about a live tree, which is why it is
+/// here and not an inference pin: before the fix the call typed as `Holder<C>`,
+/// `place` resolved to `Slot`'s bodyless requirement, and the build died with
+/// an `internal:` error anchored in std's `open_row_before`. The pin is that
+/// the `<span>` the body builds is actually PLACED, between its two static
+/// siblings.
+const B369_INFERRED_CONSTRUCTOR: &str = r#"import std::io::print;
+import std::ui::{ Region, Slot, View, mount_root, view };
+
+struct Holder<C: Slot> {
+	body: || C,
+}
+
+impl Holder<type C: Slot> with Slot {
+	fun place(self, parent: View) {
+		let region = Region::open(parent);
+		let _row = region.open_row((self.body)());
+	}
+}
+
+fun hold<C: Slot>(body: || C) {
+	Holder { body }
+}
+
+fun main() {
+	let _root = mount_root("app", || {
+		view("main")
+			.child(view("header").text("H"))
+			.child(hold(|| view("span").text("x")))
+			.child(view("footer").text("F"))
+	});
+	print(i"placed={tree()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+main();
+"#;
+
+#[test]
+fn b369_an_inferred_generic_constructor_places_its_slot_in_the_live_tree() {
+    let harness = format!("{DOM_STUB}{POSITION_HARNESS_TAIL}");
+    let stdout = build_and_run(
+        "b369_inferred_constructor",
+        B369_INFERRED_CONSTRUCTOR,
+        &harness,
+    );
+    assert_eq!(
+        readouts(&stdout),
+        vec![(
+            "placed".to_string(),
+            vec![
+                "root".to_string(),
+                "main".to_string(),
+                "header'H'".to_string(),
+                "span'x'".to_string(),
+                "footer'F'".to_string(),
+            ],
+        )],
+        "the body the un-annotated generic constructor holds must be placed at \
+         its own hole, between the two static siblings; got:\n{stdout}"
+    );
+}
