@@ -208,7 +208,16 @@ struct Emitter<'a, 'src> {
     /// can narrow an answer and never change one.
     expected_type: Option<TypeId>,
     /// R3: the bindings boxed into a counted cell, and why they had to be.
+    /// Computed over EVERY closure the program loaded, std's unreached ones
+    /// included — it is a lookup the walk consults, not a measurement.
     boxed: HashSet<Id>,
+    /// The subset of [`Emitter::boxed`] whose declaration this walk actually
+    /// EMITTED as a `vilan_rt::Captured` — R3's measurement. The two differ by
+    /// every mutably-captured binding in a function the program never reaches:
+    /// A108 gave `json_codec` and `binary_codec` one each, and a program that
+    /// merely loads `std::json` would otherwise report two boxes its binary
+    /// does not contain.
+    boxed_emitted: HashSet<Id>,
     /// Every module-level binding in the world, lowered to a `thread_local!`.
     module_bindings: HashSet<Id>,
     /// The module-level bindings this program actually READ, in reach order,
@@ -270,6 +279,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             current_returns_view: false,
             expected_type: None,
             boxed: HashSet::new(),
+            boxed_emitted: HashSet::new(),
             module_bindings: HashSet::new(),
             module_binding_cells: BTreeMap::new(),
             module_bindings_started: HashSet::new(),
@@ -331,7 +341,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Ok(Emitted {
             source,
             host_gaps: self.host_gaps.iter().cloned().collect(),
-            boxed_bindings: self.boxed.len(),
+            boxed_bindings: self.boxed_emitted.len(),
         })
     }
 
@@ -2756,6 +2766,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     // R3: a mutably-captured binding is a counted cell, so the
                     // declaration builds one and every read and write below goes
                     // through it.
+                    self.boxed_emitted.insert(binding);
                     return Ok(format!("let {name} = vilan_rt::Captured::new({value})"));
                 }
                 Ok(format!("let {mutable}{name}{annotation} = {value}"))
