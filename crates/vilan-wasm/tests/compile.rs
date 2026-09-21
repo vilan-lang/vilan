@@ -828,6 +828,26 @@ fn element_head_completion_offers_the_attribute_table() {
     assert!(attribute.is_snippet);
 }
 
+/// E194's server half: the candidate list at `<svg stroke-w|` DOES carry
+/// `stroke-width`. The bug was never here — VS Code filtered the list against
+/// the word under the cursor, and with no `wordPattern` declared its default
+/// excludes `-`, so the word was `w` and the one candidate the author was
+/// typing towards was the one that disappeared. The client half is pinned in
+/// `vilan-cli::vscode_extension` (`the_word_pattern_reads_a_hyphenated_
+/// attribute_prefix_whole`); this is the half that says the server was right.
+#[test]
+fn element_head_completion_offers_a_hyphenated_attribute_under_its_own_prefix() {
+    let compiled =
+        "import std::ui::view;\n\nfun main() {\n\tlet icon = <svg/>;\n\tlet _ = icon;\n}\n";
+    let live = "import std::ui::view;\n\nfun main() {\n\tlet icon = <svg stroke-w/>;\n\tlet _ = icon;\n}\n";
+    let items = complete_after(compiled, live, 3, 25);
+    let offered = labels(&items);
+    assert!(
+        offered.contains(&"stroke-width"),
+        "the SVG-wide vocabulary is offered at a hyphenated prefix: {offered:?}"
+    );
+}
+
 /// Import-path completion with no filesystem: `import std::` enumerates the
 /// embedded toolchain's modules out of the document overlay (the
 /// `modules_in_root` overlay listing, pinned in core), plus the names std's
