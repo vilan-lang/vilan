@@ -407,11 +407,17 @@ fn a_module_warning_renders_in_the_module_file() {
 }
 
 #[test]
-fn a_macro_registration_diagnostic_renders_in_the_file_that_defines_the_macro() {
+fn a_macro_registration_diagnostic_renders_once_at_the_entry_and_leads() {
     // E16's original repro (`macros.rs`): a std file that defines a macro, with
-    // no `macro_std` beside `std`. The error's span belongs to the STD file, and
-    // before this it was rendered against the entry — whose text is far shorter,
-    // so the label silently vanished and the message printed location-less.
+    // no `macro_std` beside `std`. E16 made the error render in the STD file that
+    // holds the span (before it, the label vanished against the entry's shorter
+    // text). E212 (Order 39) then found that refusal firing ONCE PER
+    // MACRO-DEFINING STD FILE, each anchored inside std, after a first diagnostic
+    // blaming the user's own code — so the split-toolchain refusal is now asked
+    // once, before any registration, attributed to the ENTRY at offset 0 so it
+    // leads, and de-duplicated. What this pins is E212's contract: one sentence,
+    // first, naming both paths, rendered in the entry — and no rendering inside
+    // the std file, which is not the user's to fix.
     let dir = temp_files(
         "macro_std_missing",
         &[
@@ -449,9 +455,22 @@ fn a_macro_registration_diagnostic_renders_in_the_file_that_defines_the_macro() 
         stderr.contains("`macro_std` package was not found"),
         "the macro-registration error is reported: {stderr}"
     );
+    // The renderer prints a diagnostic's message twice (the headline and the
+    // label), so the count that says "once" is the count of headlines.
+    assert_eq!(
+        stderr
+            .matches("Error: the `macro_std` package was not found")
+            .count(),
+        1,
+        "and it is reported exactly once, not once per macro-defining std file: {stderr}"
+    );
     assert!(
-        renders_in(&stderr, "mine.vl", "macro fun Marker(item: Item): Source {"),
-        "and renders in the file that defines the macro: {stderr}"
+        renders_in(&stderr, "main.vl", "import std::mine::Marker;"),
+        "and it renders at the entry, leading, where the user can act on it: {stderr}"
+    );
+    assert!(
+        !renders_in(&stderr, "mine.vl", "macro fun Marker(item: Item): Source {"),
+        "and not inside the std file, which is not the user's to fix: {stderr}"
     );
 }
 
