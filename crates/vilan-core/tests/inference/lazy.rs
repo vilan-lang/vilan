@@ -1849,3 +1849,223 @@ fn a_view_inside_a_nested_call_subject_in_a_lazy_argument_is_a_view_capture() {
         "a closure cannot capture the view 'seen'",
     );
 }
+
+// --- B362 (R4): a function with a `lazy` parameter is not a closure VALUE -----
+//
+// `lazy` is a promise about the CALL: the argument is wrapped in a thunk at the
+// call site and the body forces it. Only a DIRECT call can keep that promise,
+// because only a direct call is rewritten — `record_lazy_arguments` skips a
+// dispatched or indirect callee. So a function reached through a closure slot
+// was handed a plain value and forced it: `__force(7)` reaching `cell.state`
+// on a number, a `TypeError` out of a program `vilan check` passed. M81 made
+// the case with NO direct call correct (the parameter becomes eager) and left
+// the MIXED one, which cannot be fixed at the call site: what escapes into the
+// slot is the function itself. Refused at the coercion.
+
+#[test]
+fn b362_a_lazy_parameter_function_does_not_coerce_to_a_closure() {
+    assert_fails_with(
+        r#"
+        fun expensive(): i32 {
+        	print("computing");
+        	42
+        }
+
+        fun choose(flag: bool, lazy fallback: i32): i32 {
+        	if flag { 1 } else { fallback }
+        }
+
+        fun apply(f: |bool, i32| i32): i32 { f(false, 7) }
+
+        fun main() {
+        	print(choose(true, expensive()));
+        	print(apply(choose));
+        }
+        "#,
+        "but got fn choose(bool, lazy i32): i32",
+    );
+}
+
+/// The refusal fires with NO direct call beside it too — M81's eager rewrite
+/// made that case produce a right ANSWER, but the promise is still one the
+/// closure slot cannot carry, and a later direct call would silently change
+/// what the slot holds.
+#[test]
+fn b362_the_coercion_is_refused_even_with_no_direct_call() {
+    assert_fails_with(
+        r#"
+        fun choose(flag: bool, lazy fallback: i32): i32 {
+        	if flag { 1 } else { fallback }
+        }
+
+        fun apply(f: |bool, i32| i32): i32 { f(false, 7) }
+
+        fun main() { print(apply(choose)); }
+        "#,
+        "but got fn choose(bool, lazy i32): i32",
+    );
+}
+
+/// The refusal NAMES the difference, which is the whole of why `lazy` is
+/// printed as part of a function type: without it the two sides of the message
+/// read identically.
+#[test]
+fn b362_a_function_types_printed_form_carries_lazy() {
+    assert_fails_with(
+        r#"
+        fun hold(lazy message: str): str { message }
+
+        fun main() {
+        	let slot: |str| str = hold;
+        	print(slot("x"));
+        }
+        "#,
+        "fn hold(lazy str): str",
+    );
+}
+
+/// The CONTROLS: a direct call keeps its thunk and the laziness still works,
+/// and the SAME function without `lazy` still coerces.
+#[test]
+fn b362_a_direct_call_still_defers_and_a_plain_function_still_coerces() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun expensive(): i32 {
+        	print("computing");
+        	42
+        }
+
+        fun choose(flag: bool, lazy fallback: i32): i32 {
+        	if flag { 1 } else { fallback }
+        }
+
+        fun eager(flag: bool, fallback: i32): i32 {
+        	if flag { 1 } else { fallback }
+        }
+
+        fun apply(f: |bool, i32| i32): i32 { f(false, 7) }
+
+        fun main() {
+        	print(choose(true, expensive()));
+        	print(choose(false, expensive()));
+        	print(apply(eager));
+        }
+        "#,
+        "1\ncomputing\n42\n7\n",
+    );
+}
+
+/// std's own `lazy`-parameter members all take `self`, which the coercion
+/// already declined — so the refusal changes nothing about them, and they go
+/// on deferring at a direct call.
+#[test]
+fn b362_stds_lazy_members_are_untouched() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+
+        fun loud(): i32 {
+        	print("built");
+        	9
+        }
+
+        fun main() {
+        	let present: Option<i32> = Some(1);
+        	print(present.unwrap_or(loud()));
+        	let absent: Option<i32> = None;
+        	print(absent.unwrap_or(loud()));
+        }
+        "#,
+        "1\nbuilt\n9\n",
+    );
+}
+
+/// B362's DISPATCHED face — the one the coercion refusal above does not
+/// reach. A call through a generic bound has no callee to rewrite, so
+/// `record_lazy_arguments` never sees it and the argument arrives as a plain
+/// value: `value.pick(false, 7)` reached the implementor's body and forced a
+/// `7`. The convention is declared once for every implementor and reached
+/// through both doors, so it is refused at the trait member.
+#[test]
+fn b362_a_lazy_parameter_on_a_trait_member_is_refused() {
+    assert_fails_spanning(
+        r#"
+        trait Fallback {
+        	fun pick(self, flag: bool, lazy other: i32): i32;
+        }
+
+        struct Picker { base: i32 }
+
+        impl Picker with Fallback {
+        	fun pick(self, flag: bool, lazy other: i32): i32 {
+        		if flag { self.base } else { other }
+        	}
+        }
+
+        fun through<T: Fallback>(value: T): i32 { value.pick(false, 7) }
+
+        fun main() {
+        	print(through(Picker { base = 1 }));
+        }
+        "#,
+        "pick",
+        "cannot take a `lazy` parameter",
+    );
+}
+
+/// A trait DEFAULT body is the same declaration reached the same two ways, so
+/// it takes the same refusal.
+#[test]
+fn b362_a_lazy_parameter_on_a_trait_default_is_refused_too() {
+    assert_fails_with(
+        r#"
+        trait Fallback {
+        	fun pick(self, flag: bool, lazy other: i32): i32 {
+        		if flag { 1 } else { other }
+        	}
+        }
+
+        struct Picker { base: i32 }
+
+        impl Picker with Fallback {}
+
+        fun main() { print(Picker { base = 1 }.pick(true, 2)); }
+        "#,
+        "cannot take a `lazy` parameter",
+    );
+}
+
+/// The CONTROL: an INHERENT member keeps `lazy` — it is reached only by a
+/// direct call, which is the door the rewrite sees. std's five
+/// `expect`/`unwrap_or` members are exactly this shape.
+#[test]
+fn b362_an_inherent_member_still_takes_a_lazy_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Picker { base: i32 }
+
+        impl Picker {
+        	fun pick(self, flag: bool, lazy other: i32): i32 {
+        		if flag { self.base } else { other }
+        	}
+        }
+
+        fun expensive(): i32 {
+        	print("computing");
+        	42
+        }
+
+        fun main() {
+        	let p = Picker { base = 1 };
+        	print(p.pick(true, expensive()));
+        	print(p.pick(false, expensive()));
+        }
+        "#,
+        "1\ncomputing\n42\n",
+    );
+}

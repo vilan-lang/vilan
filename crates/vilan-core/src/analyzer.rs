@@ -35687,6 +35687,25 @@ impl<'src> Analyzer<'src> {
             if parameter.name == "self" {
                 return None;
             }
+            // B362 (R4), UNSOUND before this: a `lazy` parameter is a promise
+            // about the CALL — the argument is wrapped in a thunk at every call
+            // site and the body forces it — and only a DIRECT call can keep it,
+            // because only a direct call is rewritten. `record_lazy_arguments`
+            // skips a dispatched or indirect callee, so a function reached
+            // through a closure slot was handed a plain value and forced it:
+            // `__force(7)` → `cell.state = 1` on a number, a `TypeError` out of
+            // a program that checked clean. M81 made the case with NO direct
+            // call correct (the parameter becomes eager); the MIXED case — one
+            // direct call keeping the thunk, one indirect call not — was left,
+            // and cannot be fixed at the call site, because the value that
+            // escapes into the slot is the function itself. So a function with
+            // a `lazy` parameter is not a closure VALUE, and the coercion is
+            // refused where it is attempted. The refusal is the house type
+            // mismatch, which now NAMES the difference: `lazy` prints as part
+            // of the function type (see `pretty_print_type_inner`).
+            if parameter.lazy {
+                return None;
+            }
             parameter_type_ids.push(parameter.type_id);
         }
         Some((parameter_type_ids, function.return_type_id))
@@ -49851,15 +49870,24 @@ impl<'src> Analyzer<'src> {
                 // (marked `?`, addressable by name). Each carries its bound when it
                 // isn't the open `any`. Generics bound to a concrete type by the
                 // `substitution` are omitted (they render concretely below).
-                let parameter_types: Vec<Type> = parameter_ids
+                // B362: `lazy` is part of what the signature PROMISES — the
+                // argument is carried by a thunk the callee forces — so it is
+                // printed. Without it the coercion refusal reads
+                // "Expected |bool, i32| i32, but got fn choose(bool, i32): i32",
+                // two types that look identical.
+                let parameter_types: Vec<(Type, bool)> = parameter_ids
                     .iter()
                     .filter_map(|parameter_id| self.parameters.get(parameter_id))
-                    .map(|parameter| parameter.type_id.get_type(self))
+                    .map(|parameter| (parameter.type_id.get_type(self), parameter.lazy))
                     .collect();
                 let return_type = return_type_id.map(|type_id| type_id.get_type(self));
+                let plain_parameter_types: Vec<Type> = parameter_types
+                    .iter()
+                    .map(|(parameter_type, _)| parameter_type.clone())
+                    .collect();
                 let generics = self.signature_generics(
                     own_generics,
-                    &parameter_types,
+                    &plain_parameter_types,
                     return_type.as_ref(),
                     substitution,
                 );
@@ -49894,9 +49922,12 @@ impl<'src> Analyzer<'src> {
                 }
 
                 buf.push('(');
-                for (index, parameter_type) in parameter_types.iter().enumerate() {
+                for (index, (parameter_type, lazy)) in parameter_types.iter().enumerate() {
                     if index > 0 {
                         buf.push_str(", ");
+                    }
+                    if *lazy {
+                        buf.push_str("lazy ");
                     }
                     self.pretty_print_type_inner(
                         parameter_type,
@@ -62278,6 +62309,76 @@ mod rigidity_agreement_tests {
 /// A post-pass rather than a walk-time check because the compiler's own
 /// lowerings are resolved BY NAME against the finished program (see `build`'s
 /// `intrinsics` assembly): at the walk there is no table to ask.
+/// B362's second face (R4's ruling reaches the first): a `lazy` parameter on a
+/// TRAIT member, refused where it is declared.
+///
+/// `lazy` is a promise about the CALL — the argument is wrapped in a thunk at
+/// the call site and the body forces it — and the rewrite that keeps that
+/// promise (`record_lazy_arguments`) only sees calls whose callee is named
+/// directly. A DISPATCHED call has no such callee: `fun through<T: Fallback>(v:
+/// T) { v.pick(false, 7) }` reaches the implementor's body through the
+/// requirement, so the argument arrives as a plain `7` and the body's
+/// `__force(7)` writes `.state` on a number — a `TypeError` out of a program
+/// that checked clean, the same shape the closure coercion produced.
+///
+/// A trait member cannot be exempted per call: it is declared once for every
+/// implementor and reached through both doors, so a convention only the direct
+/// door carries is not one the declaration may promise. An INHERENT member
+/// keeps it (std's five `expect`/`unwrap_or` members are inherent, and the
+/// census found no trait member with a `lazy` parameter anywhere in the
+/// estate), and the sanctioned spelling for the dispatched shape is the one
+/// `unwrap_or_else` already uses: a closure parameter.
+pub fn check_lazy_trait_members(program: &mut Program) {
+    if program.traits.is_empty() {
+        return;
+    }
+    let mut sites: Vec<(Span, SourceId, String)> = Vec::new();
+    for trait_ in program.traits.values() {
+        for (member_name, member_id) in &trait_.declared_members {
+            let Some(function) = program.functions.get(member_id) else {
+                continue;
+            };
+            for parameter_id in &function.parameters {
+                let Some(parameter) = program.parameters.get(parameter_id) else {
+                    continue;
+                };
+                if !parameter.lazy {
+                    continue;
+                }
+                let Some(source) = program.source_of(*member_id) else {
+                    continue;
+                };
+                sites.push((
+                    function.name_span,
+                    source,
+                    format!(
+                        "`{}` is a member of trait `{}`, so it cannot take a `lazy` parameter: \
+                         `lazy` is kept by the CALL, and a call dispatched through the trait \
+                         has no callee to rewrite — `{}` would reach the body as a plain \
+                         value and be forced as a memo cell. Take a closure instead \
+                         (`{}: || T`, the spelling `unwrap_or_else` uses), or declare the \
+                         member on the type itself",
+                        member_name, trait_.name, parameter.name, parameter.name
+                    ),
+                ));
+            }
+        }
+    }
+    sites.sort_by_key(|(span, source, _)| (source.0, span.start, span.end));
+    sites.dedup();
+    for (span, source, msg) in sites {
+        program.push_diagnostic(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg,
+            },
+            source,
+        );
+    }
+}
+
 pub fn check_unlowered_externals(program: &mut Program) {
     // The compiler's own external lowerings that are recorded as single ids
     // rather than in `intrinsics`. Every one of them is a std declaration the
