@@ -1293,3 +1293,191 @@ fn a114_a_throwing_scoped_effect_body_does_not_leak_the_run_it_started() {
          got:\n{stdout}"
     );
 }
+
+// --- A113: who cleans up what, one pin per row ------------------------------
+
+/// A113's question (the owner, 2026-09-21) — **do signal effects clean up their
+/// observers?** — answered by COUNTING subscribers on the source rather than by
+/// reading doc comments, which is where the answer lived until now. The rows are
+/// the item's own table and the guide's "Who cleans up what" carries the same
+/// five.
+///
+/// **Row 1 — `effect` / `effect_on_change`.** The ambient owner's, and the
+/// requirement is static (no owner, no compile). One subscriber each while the
+/// boundary lives, none after it goes.
+///
+/// **Row 3 — the derivation combinators.** `map`, `combine`, `selector` and
+/// `flatten` all route their subscription through `register_with_owner`, so
+/// inside a boundary all four detach with it — A28's measured leak, closed. And
+/// OUTSIDE every boundary the derivation lives as long as its source, which is
+/// **deliberate and RULED (R3 at Order 39's GO: KEEP)**: refusing the ownerless
+/// case is the stronger law and a breaking change to a documented idiom
+/// (`current_path().map(parse)` at the top of `main`), so it stays
+/// leak-as-today and it is pinned as the contract rather than left to a reader.
+/// `RemoteSource::map` is the one combinator that DOES refuse it, because its
+/// subscription costs a network frame.
+const A113_OWNED_FORMS: &str = r#"import std::io::print;
+import std::reactive::{
+	Disposable, Owner, Signal, SignalCell, Source, combine, run_with_owner, selector,
+};
+
+fun counts(label: str, mapped: SignalCell<i32>, left: SignalCell<i32>, right: SignalCell<i32>,
+	picked: SignalCell<i32>, outer: SignalCell<SignalCell<i32>>, inner: SignalCell<i32>) {
+	print(i"row3: {label} map={mapped.subscribers.read().len()} combine={left.subscribers.read().len()}+{right.subscribers.read().len()} selector={picked.subscribers.read().len()} flatten={outer.subscribers.read().len()}+{inner.subscribers.read().len()}");
+}
+
+fun main() {
+	let eager: SignalCell<i32> = Signal::new(0);
+	let quiet: SignalCell<i32> = Signal::new(0);
+	let boundary = Owner::new();
+	run_with_owner(boundary, || {
+		eager.effect(|_value: i32| {});
+		quiet.effect_on_change(|_value: i32| {});
+	});
+	print(i"row1: live eager={eager.subscribers.read().len()} quiet={quiet.subscribers.read().len()}");
+	boundary.dispose();
+	print(i"row1: disposed eager={eager.subscribers.read().len()} quiet={quiet.subscribers.read().len()}");
+
+	let mapped: SignalCell<i32> = Signal::new(0);
+	let left: SignalCell<i32> = Signal::new(0);
+	let right: SignalCell<i32> = Signal::new(0);
+	let picked: SignalCell<i32> = Signal::new(0);
+	let inner: SignalCell<i32> = Signal::new(0);
+	let outer: SignalCell<SignalCell<i32>> = Signal::new(inner);
+	let derivations = Owner::new();
+	run_with_owner(derivations, || {
+		let _m = mapped.map(|value| value + 1);
+		let _c = combine((left, right));
+		let _s = selector(picked);
+		let _f = outer.flatten();
+	});
+	counts("inside-live", mapped, left, right, picked, outer, inner);
+	derivations.dispose();
+	counts("inside-disposed", mapped, left, right, picked, outer, inner);
+
+	let module_level: SignalCell<i32> = Signal::new(0);
+	let _ownerless = module_level.map(|value| value + 1);
+	print(i"row3: ownerless map={module_level.subscribers.read().len()}");
+}
+"#;
+
+#[test]
+fn a113_the_owned_forms_and_every_derivation_detach_with_their_boundary() {
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("a113_owned", A113_OWNED_FORMS, &harness, &[]);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "row1: live eager=1 quiet=1",
+            "row1: disposed eager=0 quiet=0",
+            // All four combinators, one subscription each into their inputs —
+            // `combine` one per input, `flatten` one outer and one inner.
+            "row3: inside-live map=1 combine=1+1 selector=1 flatten=1+1",
+            "row3: inside-disposed map=0 combine=0+0 selector=0 flatten=0+0",
+            // The ownerless derivation KEEPS its subscription (R3). This line
+            // reading 0 would mean the idiom stopped working; reading 1 is the
+            // documented answer.
+            "row3: ownerless map=1",
+        ],
+        "the owned forms and the derivation combinators must release their \
+         observers with their boundary, and an ownerless derivation must keep \
+         its own; got:\n{stdout}"
+    );
+}
+
+/// The other two rows, and both are pins over what does NOT happen.
+///
+/// **Row 2 — `sub` / `on_change` / `observe`.** They hand back a `Subscription`
+/// and nothing cleans it up. DROPPING the value does not unsubscribe: there are
+/// no destructors on this backend, and C14 S3's weak edges help collect a dead
+/// CELL, not a live cell's forgotten observer. So `after-drop=1` is the
+/// contract, not a bug — the caller holds the handle and disposes it, or hands
+/// it to an owner.
+///
+/// **Row 4 — a plain effect's body has no per-run cleanup.** Two `set`s later
+/// the body's nested subscription has been made three times and all three are
+/// live, because `Owner::defer` runs at DISPOSAL only. That is the row A114
+/// answers: `scoped_effect` in the same shape holds exactly one.
+const A113_MANUAL_FORMS: &str = r#"import std::io::print;
+import std::reactive::{ Disposable, Owner, Signal, SignalCell, Source, run_with_owner };
+
+fun subscribe_and_drop(source: SignalCell<i32>) {
+	let _dropped = source.on_change(|_value: i32| {});
+}
+
+fun main() {
+	let source: SignalCell<i32> = Signal::new(0);
+	subscribe_and_drop(source);
+	print(i"row2: after-drop={source.subscribers.read().len()}");
+	let held = source.on_change(|_value: i32| {});
+	print(i"row2: held={source.subscribers.read().len()}");
+	held.dispose();
+	print(i"row2: after-dispose={source.subscribers.read().len()}");
+	let bag = Owner::new();
+	let _taken = bag.take(source.on_change(|_value: i32| {}));
+	print(i"row2: taken={source.subscribers.read().len()}");
+	bag.dispose();
+	print(i"row2: bag-disposed={source.subscribers.read().len()}");
+
+	let key: SignalCell<i32> = Signal::new(0);
+	let watched: SignalCell<i32> = Signal::new(0);
+	let page = Owner::new();
+	run_with_owner(page, || {
+		key.effect(|_value: i32| {
+			watched.effect(|_seen: i32| {});
+		});
+	});
+	key.set(1);
+	key.set(2);
+	print(i"row4: plain watchers={watched.subscribers.read().len()}");
+	page.dispose();
+	print(i"row4: plain-disposed watchers={watched.subscribers.read().len()}");
+	let scoped_page = Owner::new();
+	run_with_owner(scoped_page, || {
+		key.scoped_effect(|_value: i32| {
+			watched.effect(|_seen: i32| {});
+		});
+	});
+	key.set(3);
+	key.set(4);
+	print(i"row4: scoped watchers={watched.subscribers.read().len()}");
+	scoped_page.dispose();
+	print(i"row4: scoped-disposed watchers={watched.subscribers.read().len()}");
+}
+"#;
+
+#[test]
+fn a113_the_manual_forms_release_nothing_and_a_plain_effects_body_accumulates() {
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("a113_manual", A113_MANUAL_FORMS, &harness, &[]);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            // The dropped handle is still subscribed, and stays so for the rest
+            // of the program — every later count includes it.
+            "row2: after-drop=1",
+            "row2: held=2",
+            "row2: after-dispose=1",
+            "row2: taken=2",
+            "row2: bag-disposed=1",
+            // Three runs of a plain effect body, three live nested
+            // subscriptions.
+            "row4: plain watchers=3",
+            "row4: plain-disposed watchers=0",
+            // The same body under `scoped_effect`: one.
+            "row4: scoped watchers=1",
+            "row4: scoped-disposed watchers=0",
+        ],
+        "a dropped subscription must stay subscribed and a plain effect's body \
+         must accumulate, both as documented; got:\n{stdout}"
+    );
+}
+
+// Row 5 of A113's table — a disposed `Owner` is single-use, so a late `take` or
+// `defer` releases ON THE SPOT rather than parking a cleanup nothing will run —
+// is B291's and is already pinned above, by
+// `b291_an_effect_registered_after_its_owner_was_disposed_never_fires_again`
+// and `b291_a_disposed_owner_is_idempotent_and_releases_what_it_is_given_at_once`.
+// It gets no third pin here.

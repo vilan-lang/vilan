@@ -250,6 +250,39 @@ fun main() {
 }
 ```
 
+### Who cleans up what
+
+Five rules, and they are the whole answer:
+
+| What you wrote | Who releases the observer | When |
+|---|---|---|
+| `signal.effect(..)` / `effect_on_change(..)` | the ambient owner (required, *statically*) | the boundary is disposed |
+| `signal.sub(..)` / `on_change(..)` / `observe(..)` | **nobody** — you hold the `Subscription` | you call `dispose()`, or the owner you gave it to is disposed |
+| `map` / `combine` / `flatten` / `selector` **inside** a boundary | the ambient owner | the boundary is disposed |
+| `map` / `combine` / `flatten` / `selector` **outside** every boundary | nobody — it lives as long as its source | never (deliberate: see below) |
+| `signal.scoped_effect(..)`, and anything its body registers | that **run's** owner | before the next run, and with the boundary |
+
+Two of those rows are worth a sentence.
+
+**Dropping a `Subscription` does not unsubscribe it.** There are no
+destructors here, so a handle you forget about keeps firing. Hold it and
+`dispose()` it, hand it to an owner (`owner.take(..)`), or use `effect`,
+which does that for you — and `effect` is the one to reach for.
+
+**A derivation made outside every boundary lives as long as its
+source, on purpose.** `current_path().map(parse)` at the top of `main`
+is a documented idiom, and the derivation is meant to last as long as
+the program. Refusing it would be the stricter rule and would break
+that idiom, so vilan does not. Inside a boundary the derivation dies
+with the boundary, which is what a component wants. The one exception
+is a *mirror*: `RemoteSource::map` requires an owner, because its
+subscription costs a network frame.
+
+A disposed owner is **single-use**: a `take` or `defer` that arrives
+after it was disposed runs the cleanup on the spot rather than parking
+it on a list nothing will read again. That is what makes ownership hold
+across `await`.
+
 ### An owner per run: `scoped_effect`
 
 An effect's body normally runs under the *boundary's* owner, so whatever
