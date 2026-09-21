@@ -755,12 +755,41 @@ pub fn complete_program(source: &str, line: u32, character: u32) -> Vec<Completi
     })
 }
 
+/// What the Format button learns (E197): the text to put in the editor, and
+/// the reason there is no new text when there is none.
+///
+/// `text` is the ORIGINAL bytes on a decline, so a caller that wants text and
+/// nothing else reads this field alone and behaves exactly as the old
+/// `String`-returning `format_program` did — a file the formatter does not
+/// fully understand is not one to rewrite.
+pub struct FormatOutcome {
+    pub text: String,
+    /// The decline's own sentence (`formatter::Decline::sentence`, the CLI's
+    /// and the language server's words for the same event), or `None` when the
+    /// reprint stands.
+    pub declined: Option<String>,
+}
+
 /// Formats one Vilan source string — the CLI's `vilan fmt` rule exactly
-/// (`formatter::format`): canonical layout when the reprint round-trips, the
-/// ORIGINAL bytes when it does not (the source does not parse, or the printer
-/// bails). Pure text work: no boot, no overlay, no platform.
-pub fn format_program(source: &str) -> String {
-    vilan_core::formatter::format(source)
+/// (`formatter::reprint`): canonical layout when the reprint round-trips, and
+/// otherwise the ORIGINAL bytes plus the reason. Pure text work: no boot, no
+/// overlay, no platform.
+///
+/// E197 moved this off `formatter::format`, which answers the original bytes on
+/// every way out: the page could not tell an already-canonical file from one
+/// the printer cannot render, so pressing Format on a construct with no rule
+/// looked exactly like pressing it on a clean file.
+pub fn format_program(source: &str) -> FormatOutcome {
+    match vilan_core::formatter::reprint(source) {
+        Ok(text) => FormatOutcome {
+            text,
+            declined: None,
+        },
+        Err(decline) => FormatOutcome {
+            text: source.to_string(),
+            declined: Some(decline.sentence()),
+        },
+    }
 }
 
 /// The toolchain version this module was built from, for the page's badge.
@@ -927,9 +956,37 @@ mod bindings {
     /// Formats Vilan source; the input comes back unchanged when it cannot be
     /// safely reformatted. The page feature-detects this export, so a glue
     /// built before it existed simply hides its Format button.
+    ///
+    /// Kept `String`-shaped deliberately (E197): the deployed glue feature-
+    /// detects the export by NAME and would insert whatever it is handed, so
+    /// widening the return here would put an object into the editor of every
+    /// page served before the next build. A page that wants the reason calls
+    /// [`format_checked`] instead.
     #[wasm_bindgen]
     pub fn format(source: String) -> String {
-        crate::format_program(&source)
+        crate::format_program(&source).text
+    }
+
+    /// One formatting verdict, as the page consumes it (E197).
+    #[wasm_bindgen(getter_with_clone)]
+    pub struct FormatResult {
+        /// The canonical text, or the original bytes when `declined` is set.
+        pub text: String,
+        /// Why there is no new text — the formatter's own sentence, the same
+        /// one `vilan fmt` prints and the language server toasts — or `null`.
+        pub declined: Option<String>,
+    }
+
+    /// Formats Vilan source and says whether it could. The honest half of
+    /// [`format`]: a page showing a status note reads `declined`, which is
+    /// `null` on success and a sentence naming the construct otherwise.
+    #[wasm_bindgen]
+    pub fn format_checked(source: String) -> FormatResult {
+        let outcome = crate::format_program(&source);
+        FormatResult {
+            text: outcome.text,
+            declined: outcome.declined,
+        }
     }
 
     /// The toolchain version, for the page's badge.

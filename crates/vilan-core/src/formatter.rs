@@ -3931,14 +3931,34 @@ impl<'src> Printer<'src> {
     /// as already-formatted). S6's curation is what made it reachable: five of
     /// std's module-level `let`s carry the marker.
     fn needs_semicolon(node: &Node<'src>) -> bool {
-        // `const` ASKS THE DECLARATION UNDER IT for the same reason (N89, G24):
+        if let Node::Export(_, inner) = node {
+            return Self::needs_semicolon(&inner.0);
+        }
+        // `const` asks the DECLARATION under it for the same reason (N89, G24):
         // `const fun f()` takes no `;` and `const let x = 1;` takes one. Without
         // this the printer wrote `const fun f() { .. };`, which does not
         // re-parse — so the verification bailed and the whole FILE came back
         // unformatted, exactly as `export let` did before B318 S6, and just as
         // silently.
-        if let Node::Export(_, inner) | Node::Const(inner) = node {
-            return Self::needs_semicolon(&inner.0);
+        //
+        // ONLY the declaration forms, though (N108). `Node::Const` is two
+        // grammars under one variant: `parse_const_declaration`'s `const let` /
+        // `const fun`, which the statement funnel reads ahead of everything, and
+        // `parse_expression`'s weak-precedence `const` PREFIX, which wraps any
+        // expression at all. Forwarding for the prefix asks the wrong question —
+        // `const { .. }` is an expression statement whose expression happens to
+        // be block-shaped, and an expression statement takes its terminator
+        // however it is shaped — so the printer wrote a `const { .. }` block
+        // with no `;` after it. That does not re-parse either (kolt's
+        // `client.vl` has one at module level, and the whole file came back
+        // unformatted for it), and the two forwarding cases are exactly `Let`
+        // and `Func`: the funnel's declaration fork runs first, so no other
+        // inner node can have come from `const let` or `const fun`.
+        if let Node::Const(inner) = node {
+            return match &inner.0 {
+                Node::Let(..) | Node::Func(..) => Self::needs_semicolon(&inner.0),
+                _ => true,
+            };
         }
         !matches!(
             node,
@@ -8788,6 +8808,50 @@ mod const_declaration_printing {
         assert_construct(
             "export const let    value: i32 = 1;\n",
             "export const let value: i32 = 1;\n",
+        );
+    }
+
+    /// N108: the other half of `Node::Const` — the weak-precedence EXPRESSION
+    /// prefix, whose statement form takes its `;` like any other expression
+    /// statement.
+    ///
+    /// `needs_semicolon` forwarded through `Const` unconditionally, so a
+    /// `const { .. }` statement asked `Node::Block`'s question and got "no
+    /// terminator". It does not re-parse: a module-level `const { .. }` with no
+    /// `;` is a parse error, and so is a non-tail one inside a block. The
+    /// printer's own safety net caught it, which is why the failure looked like
+    /// an unrelated DECLINE naming the file's first item rather than a wrong
+    /// reprint — kolt's `client.vl` carries such a block (its asset bundle plus
+    /// the preflight styles) and the whole file was undeformattable on that
+    /// account, which is how the bug was found.
+    #[test]
+    fn a_const_expression_statement_keeps_its_terminator() {
+        // Module level, the kolt shape: a `const` block of build-time calls.
+        assert_construct(
+            "const {\n  bundle(\"static/robots.txt\");\n};\n",
+            "const {\n\tbundle(\"static/robots.txt\");\n};\n",
+        );
+        // Inside a block, NOT the tail — the position where the missing `;`
+        // stops the file parsing rather than quietly changing its meaning.
+        assert_construct(
+            "fun f() {\n  const { 1 };\n  let value = 2;\n}\n",
+            "fun f() {\n\tconst {\n\t\t1\n\t};\n\tlet value = 2;\n}\n",
+        );
+        // The block-bearing expressions under the prefix answer the same way:
+        // `const` makes them operands, and an operand statement is terminated.
+        assert_construct(
+            "fun f() {\n  const if true { 1 } else { 2 };\n  let value = 2;\n}\n",
+            "fun f() {\n\tconst if true { 1 } else { 2 };\n\tlet value = 2;\n}\n",
+        );
+        assert_construct(
+            "fun f() {\n  const match 1 { _ => 1, };\n  let value = 2;\n}\n",
+            "fun f() {\n\tconst match 1 {\n\t\t_ => 1,\n\t};\n\tlet value = 2;\n}\n",
+        );
+        // And a non-block `const` operand, which was already terminated — it is
+        // in the pin so the two halves of the variant cannot drift apart.
+        assert_construct(
+            "fun f() {\n  const 1 + 2;\n}\n",
+            "fun f() {\n\tconst 1 + 2;\n}\n",
         );
     }
 }

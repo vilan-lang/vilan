@@ -3373,13 +3373,26 @@ pub struct Analyzer<'src> {
     // `analyze`) so constraint resolution can attribute its diagnostics via
     // `source_of_id`. Moved into `Program.source_ranges` at the end.
     source_ranges: Vec<SourceRange>,
-    // The sources whose definition-site diagnostics are frozen (S1,
-    // analysis-reuse.md §6): std modules loaded from DISK. Never the entry
-    // (even when the entry IS a std file) and never an LSP-overlaid buffer —
-    // both keep full checking. Definition-site checks skip entities from
-    // these sources via `frozen_entity`; the std-clean invariant that makes
-    // that sound is pinned in `check_scope_differential.rs`.
+    // The sources that ARE std: every module loaded with `Origin::Std`,
+    // whether it came off disk or out of the document overlay. Never the entry
+    // (even when the entry IS a std file), which is what keeps "std" a
+    // statement about a LIBRARY and not about what is being compiled.
+    //
+    // E198 split this from `frozen_sources` below. The two used to be one set
+    // and the conflation was a bug: the wasm playground registers the whole
+    // embedded toolchain through the document overlay, so its std was
+    // overlay-excluded and therefore invisible to everything keyed on
+    // residence — the A99 steer never fired there, and `chunks.rs`'s "std is
+    // never chunked" rules all read the other way. Residence questions ask
+    // this set; the S1 freezing asks the one below.
     std_sources: HashSet<SourceId>,
+    // The subset of `std_sources` whose definition-site diagnostics are frozen
+    // (S1, analysis-reuse.md §6): std modules loaded from DISK. An
+    // LSP-overlaid buffer (open in the editor, possibly dirty) is NOT here —
+    // it keeps full checking. Definition-site checks skip entities from these
+    // sources via `frozen_entity`; the std-clean invariant that makes that
+    // sound is pinned in `check_scope_differential.rs`.
+    frozen_sources: HashSet<SourceId>,
     /// E119: the std sources that live in a platform LAYER root rather than in
     /// the base root, with that layer's name (`process`, `browser`). These are
     /// the OVERLAID files — the ones whose `View`, `Element` and friends are one
@@ -3388,6 +3401,20 @@ pub struct Analyzer<'src> {
     /// module in the BASE root is not here: it is the same type under every
     /// platform and has no twin to name.
     std_layer_sources: HashMap<SourceId, String>,
+    // E200: the lazy ARGUMENTS `check_lazy_arguments` refused in its own words
+    // (ledger row 475, "this argument is the resource `T` …"). Recorded so R9's
+    // thunk arm can stand down on exactly those — one diagnostic per root cause
+    // (B5).
+    //
+    // A recorded SET rather than a shared predicate, because the two checks sit
+    // on opposite sides of `&mut self`: the refusal needs the resource
+    // classification memo, the capture scan runs over `&self`. It is sound in
+    // one direction only, and that is the direction the pass order already
+    // gives — `check_lazy_arguments` is a Class A check and
+    // `check_resource_moves` runs after every one of them. Both skip a REUSED
+    // argument by the same `reusable_entity` test, so a replayed diagnostic is
+    // not doubled either.
+    lazy_argument_resource_refusals: HashSet<Id>,
     // The dependency packages' sources loaded from DISK (E84,
     // diagnostics-standard.md C3a): code the user did not write, whether
     // fetched (git) or path-linked. The context-coverage pass demotes and
@@ -5686,9 +5713,11 @@ impl<'src> Analyzer<'src> {
             diagnostic_source_marks: Vec::new(),
             source_ranges: Vec::new(),
             std_sources: HashSet::default(),
+            frozen_sources: HashSet::default(),
             std_layer_sources: HashMap::default(),
             platform: Platform::default(),
             platform_reason: None,
+            lazy_argument_resource_refusals: HashSet::default(),
             dependency_sources: HashSet::default(),
             type_map_writes: 0,
             frozen_ranges: Vec::new(),
@@ -14774,6 +14803,15 @@ impl<'src> Analyzer<'src> {
             if self.reusable_entity(*argument_id) {
                 continue;
             }
+            // E200: `check_lazy_arguments` has already refused this argument in
+            // words that name the type and the position, so R9 stands down —
+            // one diagnostic per root cause (B5). It speaks for the shapes R9
+            // cannot describe (a field of a resource binding, a call returning
+            // a resource) and declines the bare resource BINDING, which is
+            // R9's own case and is reported below.
+            if self.lazy_argument_resource_refusals.contains(argument_id) {
+                continue;
+            }
             let mut declared_inside: HashSet<Id> = HashSet::default();
             let mut captured: Vec<Id> = Vec::new();
             let mut visited: HashSet<Id> = HashSet::default();
@@ -18642,7 +18680,11 @@ impl<'src> Analyzer<'src> {
     /// around it and not about the call.
     ///
     /// Keyed on std's OWN `View`: a user type free to declare a `bind_each` of
-    /// its own must not be told it has retired one. `retired_slot_value_name`
+    /// its own must not be told it has retired one. Residence, so
+    /// `std_sources` and not `frozen_sources` (E198): the wasm playground's std
+    /// arrives through the document overlay and is unfrozen, and its users
+    /// need this steer exactly as much as the CLI's do.
+    /// `retired_slot_value_name`
     /// is the whole table, and it is the same mapping the editor's quick fix
     /// applies (`vilan-lsp::document::retired_slot_method_fix`), so the two
     /// cannot drift.
@@ -24870,6 +24912,17 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             let rendered = self.pretty_print_type(&type_id.get_type(self), &HashMap::default());
+            // E200: this refusal OWNS the shape, so R9's thunk arm stands down
+            // on it. `hold(flag, holder.conn)` reached a resource through a
+            // FIELD of a resource binding and got both messages — R9's capture
+            // words naming the binding, and this one naming the field's type —
+            // two diagnostics for one mistake, which is the class B5 forbids.
+            // This one owns it because it names the TYPE and the POSITION,
+            // which together are what the author has to change; R9's words are
+            // right only where the thunk names a resource BINDING bare, and
+            // that case is exactly the one the `Expr::Local` test above hands
+            // back to it.
+            self.lazy_argument_resource_refusals.insert(argument_id);
             self.push_anchored(
                 Error {
                     trace: Vec::new(),
@@ -37616,7 +37669,7 @@ impl<'src> Analyzer<'src> {
             .map(|range| range.source)
     }
 
-    /// Projects `std_sources` onto entity-id space for `frozen_entity`'s
+    /// Projects `frozen_sources` onto entity-id space for `frozen_entity`'s
     /// binary search. Called once, after `build()` and before the checks —
     /// every `source_ranges` push (module ids, body walks, derived runs, the
     /// entry) has happened by then, and the ranges are disjoint by
@@ -37635,13 +37688,13 @@ impl<'src> Analyzer<'src> {
             .collect();
         self.sorted_source_ranges.sort_unstable();
         self.frozen_ranges.clear();
-        if self.std_sources.is_empty() || full_scan_checks_forced() {
+        if self.frozen_sources.is_empty() || full_scan_checks_forced() {
             return;
         }
         self.frozen_ranges = self
             .source_ranges
             .iter()
-            .filter(|range| self.std_sources.contains(&range.source))
+            .filter(|range| self.frozen_sources.contains(&range.source))
             .map(|range| (range.start, range.end))
             .collect();
         self.frozen_ranges.sort_unstable();
@@ -37653,7 +37706,7 @@ impl<'src> Analyzer<'src> {
     /// pinned clean by the differential gate's invariant test. Use-site and
     /// instantiation-driven checks must never consult this. Anything the
     /// ranges do not cover — entities minted during constraint resolution,
-    /// derived entities (`DERIVED_SOURCE` is never in `std_sources`) — stays
+    /// derived entities (`DERIVED_SOURCE` is never in `frozen_sources`) — stays
     /// checked: the conservative default for an unattributed id is "not
     /// frozen".
     fn frozen_entity(&self, id: Id) -> bool {
@@ -50533,11 +50586,26 @@ pub struct Program<'src> {
     // Computed once here because the coloring walk asks per reachable node.
     pub canonical_sources: Vec<PathBuf>,
     pub source_ranges: Vec<SourceRange>,
-    /// The sources whose definition-site diagnostics are frozen (S1,
-    /// analysis-reuse.md §6): std modules loaded from disk — never the entry,
-    /// never an LSP-overlaid buffer. Post-passes consult this the way the
-    /// in-analyze checks consult `Analyzer::frozen_entity`.
+    /// The sources that ARE std: every module loaded with `Origin::Std`,
+    /// overlaid or off disk — never the entry. This is the RESIDENCE question,
+    /// the one "is this the standard library's own declaration?" means, and it
+    /// is what `chunks.rs` ("std is never chunked", the std-free-function
+    /// recognizers), the A99 steer and the LSP's rename refusal read.
+    ///
+    /// E198 split it from [`Self::frozen_sources`]. Before the split this set
+    /// was the frozen one, so the wasm playground — whose whole embedded
+    /// toolchain is registered in the document overlay — recorded NO std
+    /// sources at all, and every residence answer there was silently "no".
     pub std_sources: HashSet<SourceId>,
+    /// The subset of [`Self::std_sources`] whose definition-site diagnostics
+    /// are frozen (S1, analysis-reuse.md §6): std modules loaded from DISK —
+    /// never the entry, never an LSP-overlaid buffer, never the playground's
+    /// embedded copy. Post-passes consult this the way the in-analyze checks
+    /// consult `Analyzer::frozen_entity`. It is also the "disk-loaded library
+    /// code" half of C3a's demotion domain (`context.rs`'s `library_spanned`),
+    /// which pairs it with [`Self::dependency_sources`] under the same
+    /// overlay rule.
+    pub frozen_sources: HashSet<SourceId>,
     /// The EXTERNAL dependency packages' sources loaded from disk (E84,
     /// diagnostics-standard.md C3a): code the user did not write, whether
     /// fetched (git) or path-linked. The context-coverage pass demotes and
@@ -57222,11 +57290,20 @@ fn analyze_inner<'src>(
                         diagnostics_before,
                         SourceId(sources.len() as u32),
                     );
-                    // A std module loaded from DISK carries frozen
-                    // definition-site diagnostics (S1) — an overlaid buffer
-                    // (open in the editor, possibly dirty) does not.
-                    if matches!(origin, Origin::Std) && !document_overlay_contains(&module_path) {
+                    // E198: residence and freezing are two facts, recorded
+                    // separately. EVERY std module is std — that is where the
+                    // A99 steer, `chunks.rs`'s "std is never chunked" and the
+                    // std-free-function recognizers key. Only a std module
+                    // loaded from DISK carries frozen definition-site
+                    // diagnostics (S1); an overlaid buffer (open in the editor,
+                    // or the playground's embedded toolchain) does not.
+                    if matches!(origin, Origin::Std) {
                         analyzer.std_sources.insert(SourceId(sources.len() as u32));
+                        if !document_overlay_contains(&module_path) {
+                            analyzer
+                                .frozen_sources
+                                .insert(SourceId(sources.len() as u32));
+                        }
                     }
                     // E119: a std module under a platform LAYER root is an
                     // OVERLAID file — its types are this platform's twin of a
@@ -59805,6 +59882,7 @@ fn analyze_over_world<'src>(
         source_hashes,
         source_ranges: std::mem::take(&mut analyzer.source_ranges),
         std_sources: std::mem::take(&mut analyzer.std_sources),
+        frozen_sources: std::mem::take(&mut analyzer.frozen_sources),
         dependency_sources: std::mem::take(&mut analyzer.dependency_sources),
         derived_origins: std::mem::take(&mut analyzer.derived_origins),
         layer_platforms,

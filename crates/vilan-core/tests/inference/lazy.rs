@@ -1396,6 +1396,86 @@ fn a_resource_local_in_a_lazy_position_is_still_only_the_r9_capture() {
     assert_fails_without(source, "this argument is the resource");
 }
 
+/// E200: a lazy argument reaching a resource through a FIELD of a resource
+/// binding is ONE diagnostic, the argument check's.
+///
+/// It used to be two. R9's thunk capture scan sees the thunk name `holder` —
+/// a resource binding from the enclosing body — and says a closure cannot
+/// capture it; the argument check sees the argument's own type is `Conn` and
+/// says so at the same span. Two diagnostics for one mistake, which is the
+/// class B5 forbids, and neither was wrong: the shape really is both. The
+/// argument check owns it because it names the TYPE and the POSITION, which
+/// together are what the author has to change — "a closure cannot capture
+/// `holder`" is about a closure the author never wrote.
+#[test]
+fn a_lazy_argument_through_a_resource_field_is_one_diagnostic() {
+    let source = r#"
+        import std::drop::{ Drop, drop };
+        import std::io::print;
+
+        resource struct Conn { tag: str }
+        impl Conn with Drop {
+            fun drop(&mut self) {
+                print(i"drop {self.tag}");
+            }
+        }
+
+        resource struct Holder { conn: Conn }
+
+        fun hold<T>(flag: bool, lazy fallback: T): bool {
+            flag
+        }
+
+        fun main() {
+            let holder = Holder { conn = Conn { tag = "field" } };
+            print(i"{hold(true, holder.conn)}");
+        }
+        "#;
+    assert_fails_with(
+        source,
+        "this argument is the resource `Conn`, and it stands in the `lazy` parameter `fallback`",
+    );
+    assert_fails_without(source, "a closure cannot capture");
+}
+
+/// The same shape reached through a LOAN of the owner (`&Holder`), which is the
+/// item's second form: the thunk names the loan parameter rather than an owned
+/// binding, and the answer is the same one diagnostic.
+#[test]
+fn a_lazy_argument_through_a_loaned_resource_field_is_one_diagnostic() {
+    let source = r#"
+        import std::drop::{ Drop, drop };
+        import std::io::print;
+
+        resource struct Conn { tag: str }
+        impl Conn with Drop {
+            fun drop(&mut self) {
+                print(i"drop {self.tag}");
+            }
+        }
+
+        resource struct Holder { conn: Conn }
+
+        fun hold<T>(flag: bool, lazy fallback: T): bool {
+            flag
+        }
+
+        fun peek(holder: &Holder): bool {
+            hold(true, holder.conn)
+        }
+
+        fun main() {
+            let owner = Holder { conn = Conn { tag = "loan" } };
+            print(i"{peek(&owner)}");
+        }
+        "#;
+    assert_fails_with(
+        source,
+        "this argument is the resource `Conn`, and it stands in the `lazy` parameter `fallback`",
+    );
+    assert_fails_without(source, "a closure cannot capture");
+}
+
 /// A lazy parameter instantiated at DATA is untouched — the check is the delta
 /// of the instantiation, so nothing about an ordinary generic changes.
 #[test]

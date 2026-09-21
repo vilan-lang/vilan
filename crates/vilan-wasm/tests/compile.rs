@@ -164,15 +164,19 @@ fn a_splittable_route_match_still_compiles_to_one_playground_bundle() {
 /// The stance above, guarded at its cause rather than at its symptom: the
 /// playground's compile path must never reach the split emitter.
 ///
-/// The output pin alone cannot see this. `chunks::plan` recognizes nothing in
-/// the playground anyway — `embedded_std_spec` hand-builds its package spec and
-/// leaves `Program::std_sources` EMPTY, so `View` does not read as std-resident
-/// and the `swap` recognizer finds no site — which means swapping `transform`
-/// for `transform_split` here would today produce the same single string and
-/// pass unnoticed. It would also be a trap: the residence rules in `chunks.rs`
-/// ("std is never chunked") all read the other way under an empty
-/// `std_sources`, so the day that spec learns to mark std, a playground wired
-/// to the split emitter would start chunking the standard library.
+/// The output pin alone cannot see this. Until E198 `chunks::plan` recognized
+/// nothing in the playground at all: `Program::std_sources` was the S1 FROZEN
+/// set, the embedded toolchain lives in the document overlay and an overlaid
+/// source is never frozen, so `View` did not read as std-resident and the
+/// `swap` recognizer found no site. Swapping `transform` for `transform_split`
+/// here would have produced the same single string and passed unnoticed.
+///
+/// E198 split residence from freezing, so the playground now DOES record its
+/// std sources and `chunks.rs`'s residence rules ("std is never chunked") read
+/// the right way there — which is what this pin was written against. The
+/// stance is unchanged and the guard stays at the cause: `split` is a
+/// `vilan build` decision and the playground's compile path must not reach the
+/// split emitter at all.
 #[test]
 fn the_playground_compile_path_never_calls_the_split_emitter() {
     let source = include_str!("../src/lib.rs");
@@ -181,6 +185,51 @@ fn the_playground_compile_path_never_calls_the_split_emitter() {
         "`split` is a `vilan build` decision: the playground has no manifest to \
          declare it in, a single-string `CompileResult` to carry it, and an \
          opaque-origin srcdoc frame that cannot resolve a chunk's relative import"
+    );
+}
+
+/// E198: a diagnostic whose steer is keyed on STD RESIDENCE fires in the
+/// playground too.
+///
+/// The A99 steer is the reader: it names the free slot value that replaced a
+/// retired `View` method, and it only fires on std's OWN `View` (a user type
+/// with a `bind_each` of its own must not be told it retired one). The
+/// residence test used to read `Program::std_sources`, which was the S1 FROZEN
+/// set — and the playground's whole toolchain lives in the document overlay,
+/// where nothing is ever frozen. So the playground answered the bare
+/// `View has no method 'swap'` and swallowed the one sentence that says what to
+/// write instead, for every visitor migrating an Order-36-era snippet.
+#[test]
+fn a_retired_view_method_carries_the_a99_steer_in_the_playground() {
+    let output = compile(
+        "import std::reactive::{ Signal, SignalCell };\n\
+         import std::ui::{ View, mount_root, view };\n\
+         \n\
+         fun main() {\n\
+         \tlet tab: SignalCell<i32> = Signal::new(1);\n\
+         \tlet _root = mount_root(\"app\", || view(\"div\")\n\
+         \t\t.swap(tab, |value: i32| view(\"section\").text(i\"p{value}\")));\n\
+         }\n",
+    );
+    let steered = output
+        .diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("is no longer a `View` method (A99)")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the playground must carry the A99 steer, got: {:#?}",
+                output.diagnostics
+            )
+        });
+    assert!(
+        steered.message.contains("write `child(swap(..))`")
+            && steered.message.contains("`{swap(..)}` in a child hole"),
+        "the steer spells BOTH replacements: {}",
+        steered.message
     );
 }
 
@@ -469,27 +518,56 @@ fn recompiling_identical_source_interns_the_entry_text() {
 
 #[test]
 fn a_misindented_program_formats_to_the_canonical_layout() {
-    let formatted = vilan_wasm::format_program("fun main() {\n      let a = 1;\n\tprint(a);\n}\n");
+    let outcome = vilan_wasm::format_program("fun main() {\n      let a = 1;\n\tprint(a);\n}\n");
     assert_eq!(
-        formatted, "fun main() {\n\tlet a = 1;\n\tprint(a);\n}\n",
+        outcome.text, "fun main() {\n\tlet a = 1;\n\tprint(a);\n}\n",
         "format must canonicalize indentation the way `vilan fmt` does"
     );
     assert_eq!(
-        vilan_wasm::format_program(&formatted),
-        formatted,
-        "formatting must be idempotent"
+        outcome.declined, None,
+        "a reprint that stands declines nothing"
     );
+    let again = vilan_wasm::format_program(&outcome.text);
+    assert_eq!(again.text, outcome.text, "formatting must be idempotent");
+    assert_eq!(again.declined, None);
 }
 
+/// E197: the page can tell "already canonical" from "the printer could not
+/// render this", which `formatter::format` made indistinguishable — it answers
+/// the original bytes on every way out, so the Format button did nothing and
+/// said nothing on a file it could not print.
 #[test]
-fn a_program_that_does_not_parse_formats_to_itself() {
+fn a_program_that_does_not_parse_formats_to_itself_and_says_so() {
     let broken = "fun main( {\n   let a = ;\n";
+    let outcome = vilan_wasm::format_program(broken);
     assert_eq!(
-        vilan_wasm::format_program(broken),
-        broken,
-        "a bail must return the original bytes untouched — a file the \
+        outcome.text, broken,
+        "a decline must return the original bytes untouched — a file the \
          formatter does not understand is not one to rewrite"
     );
+    assert_eq!(
+        outcome.declined.as_deref(),
+        Some("it does not parse"),
+        "and it must say which of the four ways out it took"
+    );
+    // The already-canonical file is the other side of the same question: same
+    // text back, and NOTHING said — which is what makes the sentence above
+    // information rather than noise.
+    let canonical = "fun main() {\n\tlet a = 1;\n}\n";
+    let clean = vilan_wasm::format_program(canonical);
+    assert_eq!(clean.text, canonical);
+    assert_eq!(clean.declined, None);
+}
+
+/// The printer-gap face, which is the one the item is about: a construct the
+/// safety net throws away reports the construct, not just "no".
+#[test]
+fn a_construct_the_printer_cannot_render_names_itself() {
+    // An unterminated string reaches the LEXER's refusal, the one decline that
+    // carries no construct — pinned so the page's note is never an empty
+    // sentence.
+    let outcome = vilan_wasm::format_program("fun main() {\n\tlet a = \"open;\n}\n");
+    assert_eq!(outcome.declined.as_deref(), Some("it does not lex"));
 }
 
 // --- compile_for: the server check mode's contract ---------------------------
@@ -748,6 +826,26 @@ fn element_head_completion_offers_the_attribute_table() {
     assert_eq!(attribute.kind, "field");
     assert_eq!(attribute.insert, "type(${1:value})$0");
     assert!(attribute.is_snippet);
+}
+
+/// E194's server half: the candidate list at `<svg stroke-w|` DOES carry
+/// `stroke-width`. The bug was never here — VS Code filtered the list against
+/// the word under the cursor, and with no `wordPattern` declared its default
+/// excludes `-`, so the word was `w` and the one candidate the author was
+/// typing towards was the one that disappeared. The client half is pinned in
+/// `vilan-cli::vscode_extension` (`the_word_pattern_reads_a_hyphenated_
+/// attribute_prefix_whole`); this is the half that says the server was right.
+#[test]
+fn element_head_completion_offers_a_hyphenated_attribute_under_its_own_prefix() {
+    let compiled =
+        "import std::ui::view;\n\nfun main() {\n\tlet icon = <svg/>;\n\tlet _ = icon;\n}\n";
+    let live = "import std::ui::view;\n\nfun main() {\n\tlet icon = <svg stroke-w/>;\n\tlet _ = icon;\n}\n";
+    let items = complete_after(compiled, live, 3, 25);
+    let offered = labels(&items);
+    assert!(
+        offered.contains(&"stroke-width"),
+        "the SVG-wide vocabulary is offered at a hyphenated prefix: {offered:?}"
+    );
 }
 
 /// Import-path completion with no filesystem: `import std::` enumerates the

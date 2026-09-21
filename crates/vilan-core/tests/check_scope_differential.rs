@@ -126,6 +126,11 @@ fn every_std_module_is_clean_under_full_scan() {
 
 /// The recording that the skip keys on: a plain analysis marks the loaded
 /// std modules as frozen sources, and never the entry.
+///
+/// E198 split residence (`std_sources`) from freezing (`frozen_sources`). On a
+/// DISK analysis — this one, and every `vilan build` — the two coincide
+/// exactly, which is why the split moved nothing outside the overlay-served
+/// front-ends; the pin below is where they come apart.
 #[test]
 fn std_sources_are_recorded_and_the_entry_is_not() {
     let _guard = OVERRIDE_LOCK
@@ -161,6 +166,83 @@ fn std_sources_are_recorded_and_the_entry_is_not() {
             .std_sources
             .contains(&vilan_core::analyzer::SourceId(0)),
         "the entry must never be a frozen source"
+    );
+    let mut residence: Vec<u32> = program.std_sources.iter().map(|source| source.0).collect();
+    let mut frozen: Vec<u32> = program
+        .frozen_sources
+        .iter()
+        .map(|source| source.0)
+        .collect();
+    residence.sort_unstable();
+    frozen.sort_unstable();
+    assert_eq!(
+        residence, frozen,
+        "off disk every std source is also frozen — the sets only part under an overlay"
+    );
+}
+
+/// E198's split, at the seam where the two facts come apart: a std module
+/// served from the DOCUMENT OVERLAY is still std (residence) but is no longer
+/// frozen (its definition-site diagnostics are live again).
+///
+/// This is the wasm playground's whole situation — `boot()` registers every
+/// embedded toolchain file in the overlay — and the LSP's whenever a user opens
+/// a std file. Under the old single set the playground recorded no std sources
+/// at all, so everything keyed on residence (the A99 steer, `chunks.rs`'s "std
+/// is never chunked" and its std-free-function recognizers) silently answered
+/// "not std" for the entire standard library.
+#[test]
+fn an_overlaid_std_module_stays_std_but_stops_being_frozen() {
+    let _guard = OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The module's own bytes, so the overlay changes WHERE the text came from
+    // and nothing else: any content edit would move diagnostics too and the
+    // pin would stop being about the overlay.
+    let overlaid = std_root().join("src").join("option.vl");
+    let contents = std::fs::read_to_string(&overlaid).expect("read std's option.vl");
+    vilan_core::analyzer::set_document_overlay(&overlaid, Some(contents));
+    let (program, errors) = {
+        let source: &'static str = "fun main() {}";
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                analyze_source(
+                    source,
+                    &std_spec(),
+                    Path::new("."),
+                    Path::new("probe.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                )
+            })
+            .expect("spawn worker")
+            .join()
+            .expect("worker panicked")
+    };
+    vilan_core::analyzer::set_document_overlay(&overlaid, None);
+    assert!(errors.is_empty(), "{errors:?}");
+    let program = program.expect("program");
+    let canonical = vilan_core::util::canonical_path(&overlaid);
+    let source = program
+        .canonical_sources
+        .iter()
+        .position(|candidate| *candidate == canonical)
+        .map(|index| vilan_core::analyzer::SourceId(index as u32))
+        .expect("the overlaid std module is among the loaded sources");
+    assert!(
+        program.std_sources.contains(&source),
+        "an overlaid std module is still std: residence does not depend on where the bytes came from"
+    );
+    assert!(
+        !program.frozen_sources.contains(&source),
+        "an overlaid std module is NOT frozen: it is possibly dirty and keeps full checking"
+    );
+    assert!(
+        program.std_sources.len() > program.frozen_sources.len(),
+        "exactly one source parted: {} std, {} frozen",
+        program.std_sources.len(),
+        program.frozen_sources.len()
     );
 }
 

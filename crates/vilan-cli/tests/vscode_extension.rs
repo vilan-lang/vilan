@@ -239,3 +239,114 @@ fn the_listing_page_has_no_relative_links() {
         broken.join("\n")
     );
 }
+
+// --- E194: the client's word pattern ----------------------------------------
+
+/// The word at the END of `text`, as the CLIENT would compute it: the
+/// language configuration's own `wordPattern`, run by node's RegExp (the same
+/// engine VS Code uses), asked for the match that touches the cursor.
+///
+/// This is the whole of the bug E194 closed, and it can only be seen from the
+/// client's side: the server's candidate list is right — `stroke-width` is in
+/// it, and `crates/vilan-ide`'s pins assert so — but VS Code filters that list
+/// against the word under the cursor, and with no `wordPattern` declared its
+/// DEFAULT excludes `-`. At `<svg stroke-w|` the word was `w`, which
+/// `stroke-width` does not match, so the one candidate the author was typing
+/// towards was the one that disappeared. The `Completion` type carries no
+/// `filter_text` and the server sends no edit range, so nothing server-side
+/// could override it.
+fn word_at_end(text: &str) -> Option<String> {
+    let script = "const fs = require('fs');\n\
+         const config = JSON.parse(fs.readFileSync(process.env.VILAN_JSON, 'utf8'));\n\
+         if (!config.wordPattern) { console.log('NO-WORD-PATTERN'); process.exit(0); }\n\
+         const text = process.env.VILAN_TEXT;\n\
+         const pattern = new RegExp(config.wordPattern, 'g');\n\
+         let answer = '';\n\
+         let match;\n\
+         while ((match = pattern.exec(text)) !== null) {\n\
+         \x20   if (match.index + match[0].length === text.length) answer = match[0];\n\
+         \x20   if (match[0].length === 0) break;\n\
+         }\n\
+         console.log(answer);";
+    let output = Command::new("node")
+        .args(["-e", script])
+        .env(
+            "VILAN_JSON",
+            extension_dir().join("language-configuration.json"),
+        )
+        .env("VILAN_TEXT", text)
+        .output()
+        .expect("run node");
+    assert!(
+        output.status.success(),
+        "the word pattern must be a valid RegExp: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let answer = String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string();
+    assert_ne!(
+        answer, "NO-WORD-PATTERN",
+        "the language configuration must declare a `wordPattern` — without one \
+         the client's default excludes `-`, and every hyphenated attribute and \
+         css property is filtered out of its own completion list (E194)"
+    );
+    (!answer.is_empty()).then_some(answer)
+}
+
+/// The item's own position: `<svg stroke-w|`. The word must be `stroke-w`, so
+/// the client keeps `stroke-width` in the list and replaces the whole prefix
+/// when it is accepted.
+#[test]
+fn the_word_pattern_reads_a_hyphenated_attribute_prefix_whole() {
+    assert_eq!(
+        word_at_end("\t\tview(\"svg\") <svg stroke-w").as_deref(),
+        Some("stroke-w"),
+        "an attribute prefix in element-head position is ONE word"
+    );
+    // A css property is the same shape one syntax over (E153's vocabulary),
+    // and a CUSTOM property keeps its leading dashes (A101 R12).
+    assert_eq!(
+        word_at_end("\tcss {\n\t\tfont-fam").as_deref(),
+        Some("font-fam")
+    );
+    assert_eq!(word_at_end("\t\t--card-ga").as_deref(), Some("--card-ga"));
+}
+
+/// The pattern WIDENS the default and narrows nothing: every word the default
+/// reads whole is still one word. A word pattern is not only completion — it
+/// is double-click, `Ctrl+D` and word-wise motion — so a regression here is
+/// felt on every keystroke in the editor, which is why the pin is a table
+/// rather than the one case the item names.
+#[test]
+fn the_word_pattern_keeps_every_word_the_default_read() {
+    for (text, expected) in [
+        // Ordinary identifiers and paths: `.` and `::` still break a word.
+        ("foo.bar", Some("bar")),
+        ("Route::Home", Some("Home")),
+        ("view(\"svg\").stroke_width", Some("stroke_width")),
+        // Numbers, suffixed numbers, and decimals.
+        ("let a = 1.5", Some("1.5")),
+        ("padding(px(4", Some("4")),
+        ("let width = 4px", Some("4px")),
+        ("let n: i53", Some("i53")),
+        // NON-ASCII, the case a hand-written ASCII identifier class breaks:
+        // a comment or a string in any language must still have words.
+        ("// le café", Some("café")),
+        // A SPACED binary minus — what the formatter writes — is untouched.
+        ("let d = x - 1", Some("1")),
+        // And a position that is not in a word has none.
+        ("let a = ", None),
+    ] {
+        assert_eq!(
+            word_at_end(text).as_deref(),
+            expected,
+            "word at the end of {text:?}"
+        );
+    }
+    // The one deliberate widening beyond attribute position: an UNSPACED
+    // binary minus reads as one word. Canonical vilan spaces it (`vilan fmt`
+    // is authoritative), so this is reachable only in text the formatter has
+    // not seen — and it is the price of the hyphen, named rather than hidden.
+    assert_eq!(word_at_end("let d = a-b").as_deref(), Some("a-b"));
+}
