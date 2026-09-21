@@ -3455,6 +3455,14 @@ pub struct Analyzer<'src> {
     // key: a module in here is not reusable for THIS analysis, because a slot
     // it reads was ground by the buffer being edited.
     entry_dirty_sources: HashSet<SourceId>,
+    // M76: every (importing file, resolved target) pair an import or `use`
+    // statement bound in this program. The input to the ALIAS-REACH closure an
+    // entry-shaped world's checks-reuse record needs — see
+    // [`alias_reaching_sources`]. Recorded as an ENTITY rather than a source
+    // because `source_of_id` is only answerable once the source ranges are
+    // sealed, which is after `build()`; recorded unconditionally, beside
+    // `import_reaches`, which pays the same push for the same kind of reason.
+    import_targets: Vec<(SourceId, Id)>,
     // M19 T0: whether the entry tail has begun — set once, after
     // `resolve_world` on a miss and after the base-cache lookup on a hit. The
     // world's OWN resolution writes slots constantly and dirties nothing; only
@@ -5685,6 +5693,7 @@ impl<'src> Analyzer<'src> {
             reuse_derived: HashMap::default(),
             reuse_unrecordable: HashSet::default(),
             entry_dirty_sources: HashSet::default(),
+            import_targets: Vec::new(),
             entry_phase: false,
             source_texts: Vec::new(),
             type_references: Vec::new(),
@@ -37351,6 +37360,13 @@ impl<'src> Analyzer<'src> {
             }
             return false;
         }
+        // M76: the edge, recorded where the PATH resolved rather than where a
+        // name binds — a selector-only statement (the `!bind` return just
+        // below) resolves against the target's file exactly as a binding
+        // import does, and the reach closure must not mistake it for no
+        // dependency at all. A `self` leaf is covered here too, which the
+        // `import_reaches` record below deliberately is not.
+        self.import_targets.push((source_id, target_id));
         // A `self` leaf's own span points at the namespace it re-binds.
         if name == "self" {
             self.record_reference(source_id, leaf_span, target_id);
@@ -37758,6 +37774,66 @@ impl<'src> Analyzer<'src> {
             .world_table_ranges
             .partition_point(|(start, _)| *start <= id.0);
         index > 0 && id.0 < self.world_table_ranges[index - 1].1
+    }
+
+    /// M76 — the files an ENTRY-SHAPED world's checks-reuse record must hold
+    /// back: those whose own resolution can be answered by the OPEN FILE's
+    /// declarations, because they reach it through `pkg::`.
+    ///
+    /// M19 T1's record is of checks that ran over a world resolved BEFORE the
+    /// store. An open module's world resolves inside the post-entry `build()`
+    /// instead — every analysis of it, hit or miss — so the record was
+    /// withheld outright (M70's as-built: "a claim the seam has not been
+    /// proved to support"), and `[vilan phase] reused 0/69` on every one of
+    /// M70's six kolt files is the cost of withholding it. Two guards replace
+    /// the blanket refusal, and a module needs BOTH:
+    ///
+    ///  - T0's dirty bit, unchanged, which certifies that the post-store
+    ///    phase moved none of the module's TYPE slots;
+    ///  - this set, which certifies that the module's NAME resolution cannot
+    ///    have consulted the entry — the half a type-slot watch cannot see.
+    ///
+    /// The rule is M79's deferral rule, applied to a different question: seed
+    /// with the files that import something the entry file declares (the
+    /// alias's own source is `SourceId(0)`, which is how the `pkg::<entry>`
+    /// re-entry is bound), then close under "imports from a deferred file" —
+    /// a file whose import resolves into a deferred file inherits the
+    /// dependency. A target whose source cannot be resolved at all defers its
+    /// importer: an unattributed id is a fact this cannot check, and the
+    /// conservative answer is the same one `frozen_entity` gives.
+    ///
+    /// Linear in the edges per closure round, and the rounds are bounded by
+    /// the package's import depth (three on kolt).
+    fn alias_reaching_sources(&self) -> HashSet<SourceId> {
+        let mut deferred: HashSet<SourceId> = HashSet::default();
+        // The edge list, resolved to (importer, target file) once: the closure
+        // below re-reads it per round and `source_of_id` is a binary search.
+        let edges: Vec<(SourceId, Option<SourceId>)> = self
+            .import_targets
+            .iter()
+            .filter(|(importer, _)| importer.0 != 0)
+            .map(|(importer, target)| (*importer, self.source_of_id(*target)))
+            .collect();
+        loop {
+            let before = deferred.len();
+            for (importer, target) in &edges {
+                if deferred.contains(importer) {
+                    continue;
+                }
+                let reaches = match target {
+                    // The entry file itself — the alias, or any declaration of
+                    // the open module reached through it.
+                    Some(source) => source.0 == 0 || deferred.contains(source),
+                    None => true,
+                };
+                if reaches {
+                    deferred.insert(*importer);
+                }
+            }
+            if deferred.len() == before {
+                return deferred;
+            }
+        }
     }
 
     /// The predicate the **Class A** checks ask (§3.3): module-local given the
@@ -44880,6 +44956,9 @@ impl<'src> Analyzer<'src> {
                     }
                     None => name,
                 };
+                // M76: a `use` binds out of a namespace exactly as an import
+                // binds out of a module, so it is the same edge.
+                self.import_targets.push((source_id, current));
                 let scope = self.mut_scope_for_scope_id(scope_id);
                 scope.name_to_id_map.insert(bind_name, current);
             }
@@ -51620,6 +51699,22 @@ pub fn reuse_census() -> (usize, usize, usize) {
     REUSE_CENSUS.with(std::cell::Cell::get)
 }
 
+// M76's count, in the same family: how many sources this analysis held back
+// from the checks-reuse record because they reach the OPEN FILE through
+// `pkg::`. Zero on every shape but an entry-shaped world, where it is the
+// second of the two guards (T0's dirty bit is the other) and the one no clock
+// or diagnostic can otherwise observe — a closure that stopped at its seed
+// would agree with every differential and still be wrong, which is what this
+// pins.
+thread_local! {
+    static ALIAS_REACHING_CENSUS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[doc(hidden)]
+pub fn alias_reaching_census() -> usize {
+    ALIAS_REACHING_CENSUS.with(std::cell::Cell::get)
+}
+
 // M19 T1b's own count, beside T0's census rather than inside it: how many of
 // the reused modules also had their class D TABLES restored. A separate cell
 // because the T1 census is read positionally by three pins and by the phase
@@ -56242,11 +56337,14 @@ fn analyze_inner<'src>(
         // hands back a byte-identical module prefix — so it is the only shape
         // the widened seam activates on.
         //
-        // M70: except for an entry-shaped world, which now hits too. Its
-        // modules resolve in the post-entry `build()` rather than before the
-        // store, so there is no record filed under this key and none to file —
-        // the store path withholds the key for the same reason.
-        let checks_key = (!world.entry_is_open_module).then(|| base_cache_key.clone());
+        // M70 left an entry-shaped world out of it: its modules resolve in the
+        // post-entry `build()` rather than before the store, so the record
+        // would be of checks the seam had not been proved to cover. M76 proves
+        // the covered part instead of withholding all of it — the reuse set
+        // for such a world is additionally narrowed by
+        // `Analyzer::alias_reaching_sources`, which is where that argument is
+        // written — so the key rides on both shapes now.
+        let checks_key = Some(base_cache_key.clone());
         return analyze_over_world(
             world, nodes, std, pkg_root, platform, workspace, checks_key, true,
         );
@@ -58289,14 +58387,13 @@ fn analyze_inner<'src>(
         pkg_root,
         platform,
         workspace,
-        // No key for an entry-shaped world, even though M70 now STORES one:
-        // M19's per-module records are of checks that ran over a RESOLVED
-        // world, and an open module's world resolves inside the post-entry
-        // `build()` — every analysis of it, hit or miss. Recording those as
-        // this key's is a claim the seam has not been proved to support, and a
-        // saving on top of a saving is the wrong place to take that risk
-        // (recorded as a follow-up on M70).
-        (base_cacheable && !entry_is_module && !entry_is_open_module).then_some(base_cache_key),
+        // M76: an entry-shaped world files its record too. M70 withheld the
+        // key because M19's records are of checks that ran over a RESOLVED
+        // world and an open module's resolves post-store; the narrowing in
+        // `Analyzer::alias_reaching_sources` is what closes that gap, and it
+        // narrows the READING side, so the record itself is filed the same way
+        // on both shapes.
+        (base_cacheable && !entry_is_module).then_some(base_cache_key),
         false,
     )
 }
@@ -58495,10 +58592,27 @@ fn analyze_over_world<'src>(
     // module's record for that world. No dependency graph, and sound in the
     // presence of §4's whole-program impl visibility, which an import-closure
     // key could not be.
+    //
+    // M76 adds a FOURTH term, and only for an entry-shaped world: the module
+    // must not reach the open file through `pkg::`. Such a world resolves
+    // post-store, so T0's dirty bit — which watches type slots — is no longer
+    // the whole guard; `alias_reaching_sources` is the other half, and
+    // together they are what let the record be filed for this shape at all
+    // (see that function).
+    let alias_reaching: HashSet<SourceId> = if entry_is_open_module && from_base_cache {
+        analyzer.alias_reaching_sources()
+    } else {
+        HashSet::default()
+    };
+    if !crate::macros::in_macro_world() {
+        ALIAS_REACHING_CENSUS.with(|census| census.set(alias_reaching.len()));
+    }
     let reuse_candidates: HashSet<SourceId> = if from_base_cache && !entry_is_module {
         (1..sources.len() as u32)
             .map(SourceId)
-            .filter(|source| !analyzer.entry_dirty_sources.contains(source))
+            .filter(|source| {
+                !analyzer.entry_dirty_sources.contains(source) && !alias_reaching.contains(source)
+            })
             .collect()
     } else {
         HashSet::default()
@@ -59596,8 +59710,12 @@ fn analyze_over_world<'src>(
         // resolution moved a type slot in, which is the number T0 exists to
         // measure and the one that decides whether any of this pays.
         eprintln!(
-            "[vilan phase] reused {}/{} entry-dirty {} tables {}",
-            reuse_census.0, reuse_census.2, reuse_census.1, table_census,
+            "[vilan phase] reused {}/{} entry-dirty {} alias-reaching {} tables {}",
+            reuse_census.0,
+            reuse_census.2,
+            reuse_census.1,
+            alias_reaching_census(),
+            table_census,
         );
     }
 

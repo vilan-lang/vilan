@@ -465,6 +465,234 @@ fn a_reused_module_replays_its_own_diagnostic() {
     vilan_core::analyzer::base_cache_clear();
 }
 
+// --- M76: the ENTRY-SHAPED world's record --------------------------------
+
+/// An entry-shaped package with a CHAIN, so the alias-reach closure has a
+/// transitive step to find: `opened` (the entry) -> `ring` -> `probe`, plus
+/// `chain`, which imports `ring` and so inherits its dependency on the entry
+/// without naming it.
+///
+/// Its own helper rather than the harness's, because the harness's three-file
+/// fixture is what the corpus differential wants and this fourth file exists
+/// only to make the closure's second round observable.
+fn write_chained_open_package(name: &str) -> (PathBuf, PathBuf) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let directory = scratch::root().join(format!(
+        "vilan_m76_chain_{name}_{}_{unique}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("create the package directory");
+    // Class A, inside the module's own body: `let` is immutable, so the write
+    // is refused at the assignment site by `check_readonly_mutation`.
+    std::fs::write(
+        directory.join("probe.vl"),
+        "fun probe_broken(): i32 {\n\tlet total = 1;\n\ttotal = 2;\n\ttotal\n}\n",
+    )
+    .expect("write the probe module");
+    std::fs::write(
+        directory.join("ring.vl"),
+        "import pkg::opened;\nimport pkg::probe;\n\n\
+         fun ring_broken(): i32 {\n\tlet spent = 1;\n\tspent = 2;\n\tspent\n}\n",
+    )
+    .expect("write the ring module");
+    std::fs::write(
+        directory.join("chain.vl"),
+        "import pkg::ring;\n\nfun chain_probe(): i32 {\n\t0\n}\n",
+    )
+    .expect("write the chain module");
+    let opened = directory.join("opened.vl");
+    std::fs::write(&opened, chained_open_entry(0)).expect("write the opened module");
+    (directory, opened)
+}
+
+/// The opened file's text for the chained fixture — it has to import `chain`
+/// as well, or nothing loads it.
+fn chained_open_entry(revision: u32) -> String {
+    format!(
+        "import pkg::ring;\nimport pkg::chain;\n\n\
+         fun opened_probe(): i32 {{\n\t{revision}\n}}\n"
+    )
+}
+
+/// **M76's replay pin.** A module of an ENTRY-SHAPED world — one whose
+/// `pkg::<entry>` aliases the open file's own scope, so the world is stored
+/// UNRESOLVED — publishes its remembered diagnostic on the second analysis,
+/// byte for byte, without re-deriving it.
+///
+/// M70 stored that world and withheld its checks record, which is why
+/// `[vilan phase] reused 0/69` read on every one of the six kolt files it
+/// names: the whole widened seam stood down there. This is the pin that says
+/// the record is filed for the shape at all.
+#[test]
+fn an_entry_shaped_world_files_and_replays_its_modules_checks() {
+    let _guard = OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::set_world_reuse(true);
+    vilan_core::analyzer::base_cache_clear();
+
+    let (directory, opened) = replay_harness::write_open_module_package(
+        "replay",
+        "fun probe_broken(): i32 {\n\tlet total = 1;\n\ttotal = 2;\n\ttotal\n}\n",
+    );
+
+    let first = replay_harness::observe_open_module(
+        &directory,
+        &opened,
+        replay_harness::open_module_entry(1),
+    );
+    assert!(
+        first.0.contains("total"),
+        "the fixture must produce a MODULE diagnostic to replay, got: {}",
+        first.0
+    );
+    assert_eq!(
+        first.3.0, 0,
+        "the first analysis of an entry-shaped world is a base-cache MISS: it \
+         derives and records, it does not reuse"
+    );
+
+    let second = replay_harness::observe_open_module(
+        &directory,
+        &opened,
+        replay_harness::open_module_entry(2),
+    );
+    assert!(
+        second.3.0 > 0,
+        "the second analysis must hit the entry-shaped world and reuse its \
+         modules; census (reused, dirty, sources) = {:?}",
+        second.3
+    );
+    assert_eq!(
+        first.0, second.0,
+        "the replayed diagnostic must be byte-identical to the derived one"
+    );
+    assert_eq!(
+        first.1, second.1,
+        "and must publish to the same FILE — a replayed `Note.source` is an \
+         index into the world's `sources` vector (§3.2)"
+    );
+
+    let _ = std::fs::remove_dir_all(&directory);
+    vilan_core::analyzer::base_cache_clear();
+}
+
+/// **M76's narrowing pin**, and the one thing no differential can see: the
+/// files that reach the OPEN FILE through `pkg::` are held back from the
+/// record, and the set is CLOSED — a file that imports a file that imports the
+/// entry is held back too.
+///
+/// A closure that stopped at its seed would agree with every differential in
+/// the tree and still be wrong, because agreement is what a wrongly-reused
+/// module produces until the day the entry's edit is the one that matters. So
+/// the count is asserted directly: two of the four package modules are held
+/// back (`ring`, which imports `pkg::opened`, and `chain`, which imports
+/// `ring`), and `probe` — which imports nothing — is not.
+#[test]
+fn the_alias_reach_closure_holds_back_a_transitive_importer_of_the_open_file() {
+    let _guard = OVERRIDE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    vilan_core::analyzer::set_world_reuse(true);
+    vilan_core::analyzer::base_cache_clear();
+
+    let (directory, opened) = write_chained_open_package("closure");
+    // The census is read INSIDE the worker: it is a thread-local and the
+    // analysis runs on its own 256 MiB thread, so reading it back here would
+    // answer 0 whatever the analysis found.
+    let observe =
+        |revision: u32| observe_open_module_here(&directory, &opened, chained_open_entry(revision));
+    // The miss fills the world and files the record; the census is zero there
+    // because the narrowing is on the READING side.
+    let (first, first_reaching) = observe(1);
+    assert_eq!(
+        first_reaching, 0,
+        "a base-cache MISS reads no record, so it narrows nothing"
+    );
+    let (second, second_reaching) = observe(2);
+    assert_eq!(
+        second_reaching, 2,
+        "`ring` imports `pkg::opened` and `chain` imports `ring`, so BOTH are \
+         held back — a census of 1 means the closure never ran its second \
+         round, and a census of 3 means it swallowed `probe`, which imports \
+         nothing"
+    );
+    assert!(
+        second.3.0 > 0,
+        "and something must still be reusable, or the narrowing has simply \
+         turned the seam off; census = {:?}",
+        second.3
+    );
+    assert_eq!(
+        (first.0.clone(), first.1.clone()),
+        (second.0.clone(), second.1.clone()),
+        "both modules' diagnostics must publish identically whichever side of \
+         the narrowing they fell on"
+    );
+
+    let _ = std::fs::remove_dir_all(&directory);
+    vilan_core::analyzer::base_cache_clear();
+}
+
+/// This binary's own twin of `replay_harness::observe_open_module`, for the
+/// same reason `observe_in_package` above is one: the T1b table census and
+/// M76's alias-reach census both ride in the observation here and not in the
+/// harness's four-field tuple.
+fn observe_open_module_here(
+    pkg_root: &Path,
+    entry_path: &Path,
+    entry_source: String,
+) -> (ReuseObservation, usize) {
+    refuse_a_manifest_directory(pkg_root);
+    let pkg_root = pkg_root.to_path_buf();
+    let entry_path = entry_path.to_path_buf();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(entry_source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                &pkg_root,
+                &entry_path,
+                Some(Platform::default()),
+                &replay_harness::open_file_workspace(),
+            );
+            let diagnostics = format!("{errors:?}");
+            let warnings = program
+                .as_ref()
+                .map(|program| {
+                    format!(
+                        "{:?}#{:?}#{:?}",
+                        program.warnings, program.warning_sources, program.diagnostic_sources
+                    )
+                })
+                .unwrap_or_default();
+            let javascript = match program {
+                Some(program) if errors.is_empty() => {
+                    transform(&program, &BuildOptions::default()).ok()
+                }
+                _ => None,
+            };
+            (
+                (
+                    diagnostics,
+                    warnings,
+                    javascript,
+                    vilan_core::analyzer::reuse_census(),
+                    vilan_core::analyzer::table_reuse_census(),
+                ),
+                vilan_core::analyzer::alias_reaching_census(),
+            )
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
 /// **The red-first pin** (§5, T1's third gate). The planted disable switch
 /// must move the WORK and must not move the ANSWER: with reuse off the same
 /// warm analysis reuses nothing, and publishes exactly what it published with

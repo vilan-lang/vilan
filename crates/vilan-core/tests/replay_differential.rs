@@ -19,7 +19,9 @@ mod scratch;
 
 use std::path::PathBuf;
 
-use replay_harness::{ReuseObservation, warm_pair, write_module_package};
+use replay_harness::{
+    ReuseObservation, warm_open_pair, warm_pair, write_module_package, write_open_module_package,
+};
 
 /// The Class A WARNING probe appended to every corpus module: a deprecated
 /// function and a local call to it. A warning rather than a refusal, so the
@@ -241,5 +243,142 @@ fn corpus_agrees_between_replayed_and_rederived_module_checks() {
     assert!(
         resourced >= 5,
         "only {resourced} modules produced the resource-move refusal — `check_resource_moves`, the largest check the seam skips, is INERT in a program that declares no resource, so without the probe this leg says nothing about it"
+    );
+}
+
+/// **The differential over an ENTRY-SHAPED world** (M76) — the same claim as
+/// the sweep above, for the second shape the base cache holds.
+///
+/// M70 stored a world for a module a front end opened AS the entry, and left
+/// its checks record withheld: such a world resolves inside the post-entry
+/// `build()`, so a record of checks that ran over it was "a claim the seam has
+/// not been proved to support". M76 files it, narrowing the READING side by
+/// the alias-reach closure instead — and this is the proof, built exactly like
+/// the sweep above so the two are read together: every corpus program becomes
+/// the OPENED file of a three-file package, analyzed warm twice, and a leg
+/// that replays its modules' remembered checks is compared against one that
+/// re-derives them.
+///
+/// The probes are in `probe.vl`, the one module the record is read for: the
+/// opened file is `SourceId(0)` and never reusable, and `ring.vl` reaches the
+/// alias and is held back by construction. Its own test rather than a second
+/// leg inside the sweep above, because nextest runs the two in parallel and a
+/// sequential leg would have doubled the binary's wall.
+#[test]
+fn an_entry_shaped_world_agrees_between_replayed_and_rederived_module_checks() {
+    let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/test");
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&corpus)
+        .expect("corpus directory")
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension()? == "vl").then_some(path)
+        })
+        .collect();
+    paths.sort();
+    assert!(paths.len() > 60, "suspiciously few corpus programs");
+
+    // The corpus program rides in `probe.vl` — the module whose remembered
+    // checks the second analysis replays — with the same alternating probes
+    // the sweep above appends, and for the same reason: sixty clean modules
+    // agree whether the replay works or not.
+    let packages: Vec<(PathBuf, PathBuf)> = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let mut source = std::fs::read_to_string(path).expect("read corpus file");
+            source.push_str(PROBE_WARNING);
+            if index % 2 == 1 {
+                source.push_str(PROBE_REFUSAL);
+            }
+            if index % 3 == 0 {
+                source.insert_str(0, "import std::drop::{ Drop, drop };\n");
+                source.push_str(PROBE_RESOURCE);
+            }
+            let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+            write_open_module_package(&name, &source)
+        })
+        .collect();
+
+    let observe_all = || -> Vec<ReuseObservation> {
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = packages
+                .chunks(packages.len().div_ceil(16).max(1))
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|(directory, opened)| warm_open_pair(directory, opened))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().expect("worker panicked"))
+                .collect()
+        })
+    };
+
+    vilan_core::analyzer::set_world_reuse(false);
+    vilan_core::analyzer::base_cache_clear();
+    let derived = observe_all();
+    vilan_core::analyzer::set_world_reuse(true);
+    vilan_core::analyzer::base_cache_clear();
+    let replayed = observe_all();
+    vilan_core::analyzer::base_cache_clear();
+
+    for (directory, _) in &packages {
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    let mut divergences = Vec::new();
+    for ((path, replayed), derived) in paths.iter().zip(&replayed).zip(&derived) {
+        let name = path.file_name().unwrap().to_string_lossy();
+        if replayed.0 != derived.0 {
+            divergences.push(format!(
+                "{name}: diagnostics differ\n  replayed: {}\n  derived:  {}",
+                replayed.0, derived.0
+            ));
+        }
+        if replayed.1 != derived.1 {
+            divergences.push(format!(
+                "{name}: warnings or per-file attribution differ\n  replayed: {}\n  derived:  {}",
+                replayed.1, derived.1
+            ));
+        }
+        if replayed.2 != derived.2 {
+            divergences.push(format!("{name}: emitted JS differs"));
+        }
+    }
+    assert!(
+        divergences.is_empty(),
+        "{} corpus programs observe the entry-shaped check scope:\n{}",
+        divergences.len(),
+        divergences.join("\n")
+    );
+
+    // Non-vacuity, in both directions and with the PACKAGE module named: an
+    // entry-shaped world whose only reused sources were std's would prove
+    // nothing about M76, because std's Class A diagnostics are known absent
+    // through S1's freeze whatever this seam does.
+    let reused: usize = replayed
+        .iter()
+        .filter(|observation| observation.3.0 > 0)
+        .count();
+    assert_eq!(
+        reused,
+        packages.len(),
+        "every entry-shaped warm pair must reuse on the replaying leg; {} of {} did",
+        reused,
+        packages.len()
+    );
+    let rederived: usize = derived
+        .iter()
+        .filter(|observation| observation.3.0 > 0)
+        .count();
+    assert_eq!(
+        rederived, 0,
+        "the re-deriving leg must reuse nothing — {rederived} pairs did, so the \
+         two legs were not compared against different work"
     );
 }
