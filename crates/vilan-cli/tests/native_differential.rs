@@ -755,9 +755,11 @@ const DESTRUCTURE_PROBE: &str = concat!(
 /// the lane's report and none of them about HTTP (an `async` closure TYPE at a
 /// struct field, a derived `PartialEq` over an `Option` of a closure, an enum
 /// payload holding a closure, and a non-`Copy` field read off a loaned
-/// receiver). So this pin holds what DOES stand: every one of the seventeen
-/// `node:http` bindings on this program's path is answered by
-/// `vilan_rt::http` and none is refused.
+/// receiver). So this pin holds what DOES stand: twenty-three of `std::http`'s
+/// twenty-five raw `node:http` bindings are answered by `vilan_rt::http` — the
+/// two that are not are `NodeRequest::headers` and `NodeSocket::remoteAddress`,
+/// which answer a `JsonValue` and are Order 40's — and this program reaches
+/// neither, so none of its bindings is refused.
 ///
 /// It asserts the CALLS and not merely that the emit succeeded, because an
 /// emitter that refused every binding under the census's `unimplemented!()`
