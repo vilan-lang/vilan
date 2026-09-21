@@ -28,7 +28,11 @@
 //! agrees — this exemplar mounted holds V4 plus two live-session loops (a
 //! `ReactiveServer`/`ReactiveClient` and its transport handler, a
 //! `RemoteSource` lease and its cache), all of which are exactly as long-lived
-//! as the thing they belong to. What must be ZERO is what survives the
+//! as the thing they belong to. The walk reports them as TWO strongly connected
+//! components, not three cycles — loops that share a node are one component —
+//! so the mounted line reads `cycles=2` (measured at Order 38: a component of
+//! 64 around the element tree, V4's, and one of 30 around the session's
+//! closures), and that figure is this paragraph, not a disagreement with it. What must be ZERO is what survives the
 //! teardown, and that is what this asserts.
 //!
 //! Every one of V1, V3 and V5 was proven to redden it by planting the bug back:
@@ -39,9 +43,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 /// A fresh temp directory for one test's project tree.
 fn temp_project(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = support::scratch_root().join(format!(
         "vilan_reactive_lifetimes_{tag}_{}",
         std::process::id()
     ));

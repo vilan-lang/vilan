@@ -26,7 +26,12 @@ use std::path::{Path, PathBuf};
 /// The `vilan-cli` suites still writing to the shared tmpfs, by file (N86's
 /// tail, swept by N102).
 ///
-/// **Thirty-eight at Order 37, three now.** The tail was listed rather than
+/// **Thirty-eight at Order 37, NONE now** (the last three — `reactive_lifetimes`,
+/// `ssr_differential`, `ui_rows` — joined `support` at Order 38's integration,
+/// once reactive-38's pins had landed). The list stays as the gate's shape: a
+/// suite that cannot move yet is named here, never silently exempt.
+///
+/// How it got here: The tail was listed rather than
 /// ported because porting looked like a structural edit to forty files that
 /// five lanes were adding tests to. It was not: each one builds its scratch
 /// path inline from `std::env::temp_dir()` in ONE helper, so a suite costs one
@@ -36,12 +41,6 @@ use std::path::{Path, PathBuf};
 /// nothing else writes into, which is what the old inline paths were faking
 /// with a process id.
 ///
-/// The three that stay are the three another lane is adding pins to this order
-/// (reactive-38's `bind_attr` and disposal pins): a structural edit to a file
-/// head is a merge cost, and paying it for a file somebody else is editing
-/// buys nothing this sweep needs. They are one line each when that lane's
-/// work has landed.
-///
 /// Listed by FILE and not by COUNT, deliberately: a suite here may grow
 /// another scratch path without reding this gate, because reding it would
 /// punish the lane that added a test rather than the one that owns the sweep.
@@ -49,11 +48,7 @@ use std::path::{Path, PathBuf};
 /// after this rule exists has no excuse — and a listed file that stopped
 /// naming it, which must be delisted so the list cannot outlive the work
 /// (N42's rule for an exemption that only ever subtracts).
-const BINARIES_STILL_ON_THE_SHARED_TMPFS: &[&str] = &[
-    "vilan-cli/tests/reactive_lifetimes.rs",
-    "vilan-cli/tests/ssr_differential.rs",
-    "vilan-cli/tests/ui_rows.rs",
-];
+const BINARIES_STILL_ON_THE_SHARED_TMPFS: &[&str] = &[];
 
 /// Files that name the call because the scratch root CANNOT serve them — with
 /// the reason.
