@@ -20008,6 +20008,30 @@ impl<'src> Analyzer<'src> {
     /// `Option<str>` from the PAYLOAD with the written `i32` silently
     /// discarded — B323's family, "an annotation-only generic argument is
     /// silently inert".
+    /// E208: the enum arguments a variant constructor path WROTE, positionally,
+    /// or `None` when it wrote none (or wrote a partial set).
+    ///
+    /// `seed_variant_subject_bindings` banks those arguments as a substitution
+    /// keyed by the enum's own parameters — what the payload check reads. This
+    /// reads the same record back as an argument LIST, which is what the
+    /// expression's type needs. Every parameter must be fixed: a partial
+    /// application would put a hole beside a written argument and the payload
+    /// pass is the one entitled to fill it.
+    fn written_variant_arguments(&self, subject_id: Id, enum_id: Id) -> Option<Vec<TypeId>> {
+        let bindings = self.static_subject_bindings.get(&subject_id)?;
+        let parameters = self
+            .enums
+            .get(&enum_id)
+            .map(|enum_| enum_.generic_parameter_constraint_ids.clone())?;
+        if parameters.is_empty() {
+            return None;
+        }
+        parameters
+            .iter()
+            .map(|constraint_id| bindings.get(constraint_id).copied())
+            .collect()
+    }
+
     fn seed_variant_subject_bindings(&mut self, id: Id, subject_type: &Type) {
         let Type::Enum(enum_id, arguments) = subject_type else {
             return;
@@ -34544,6 +34568,50 @@ impl<'src> Analyzer<'src> {
                     // from the constructor arguments (`Some(3)` -> `Option<i32>`).
                     Type::Enum(enum_id, arguments) => {
                         if arguments.is_empty() {
+                            // E208: the author WROTE the arguments —
+                            // `Option<i32>::Some("y")`, `Ok<void, str>(void)` —
+                            // and B356 made them fix the enum's parameters for
+                            // the payload CHECK without ever putting them on
+                            // the expression. So the expression still settled
+                            // from the payload (`Option<str>`, and a bare
+                            // `Result` with NO arguments when the payload
+                            // decided nothing), and everything downstream was
+                            // checked against a type the author never wrote: a
+                            // second refusal at `unwrap_or(3)` for wanting a
+                            // `str` (E208), and — where the erased form came
+                            // out — a generic BOUND that could not be checked
+                            // at all, so `Ok<void, str>(void).to_json()`
+                            // reached emission and died as `internal: a call
+                            // resolved to `Json`'s requirement `to_json`,
+                            // which has no body`. The written arguments are the
+                            // author's stated intent and they settle the type;
+                            // the payload disagreeing with them is the ONE
+                            // refusal, at the payload, which B356 already
+                            // reports.
+                            let written = self
+                                .written_variant_arguments(subject_id, enum_id)
+                                .or_else(|| {
+                                    // The BARE variant spelling — `Ok<void,
+                                    // str>(void)`, the prelude's own — writes
+                                    // the enum's arguments on the VARIANT
+                                    // name, so there is no enum path for
+                                    // `seed_variant_subject_bindings` to have
+                                    // banked them from. They are the call's
+                                    // own written arguments, and they mean the
+                                    // enum's parameters positionally: a
+                                    // variant constructor has no generics of
+                                    // its own.
+                                    let parameters = self
+                                        .enums
+                                        .get(&enum_id)?
+                                        .generic_parameter_constraint_ids
+                                        .len();
+                                    (parameters > 0 && generic_argument_ids.len() == parameters)
+                                        .then(|| generic_argument_ids.clone())
+                                });
+                            if let Some(written) = written {
+                                return Type::Enum(enum_id, written);
+                            }
                             let inferred = self.infer_enum_constructor_arguments(
                                 subject_id,
                                 enum_id,

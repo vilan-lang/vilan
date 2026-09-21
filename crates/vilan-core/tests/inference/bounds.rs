@@ -11249,3 +11249,126 @@ fn b361_a_bare_self_and_a_named_generic_application_still_compile() {
     );
 }
 
+// --- E208: a written type argument SETTLES the expression, so one refusal ------
+//
+// B356 made a variant constructor's written arguments fix the enum's parameters
+// for the PAYLOAD check, and stopped there: the expression itself still settled
+// from the payload. So `Option<i32>::Some("y")` refused at the payload (the
+// right line) and then typed as `Option<str>`, and `unwrap_or(3)` refused too —
+// a second message about a type the author never wrote, which E189's narrow
+// rule cannot suppress because both are type errors.
+//
+// The same gap had a SECOND, worse face, which the integrator's papers lane
+// found: where the payload decided nothing either, the constructor came out as
+// the ERASED `Result` with no arguments at all, so a generic BOUND on it could
+// not be checked — and `Ok<void, str>(void).to_json()` walked past the missing
+// `Json` impl into emission and died there as `internal: a call resolved to
+// `Json`'s requirement `to_json`, which has no body … please report this
+// program`. The ANNOTATED spelling of the same expression refused cleanly,
+// which is what said it was the written-arguments path and not `void`.
+//
+// The written arguments are the author's stated intent; they settle the type,
+// and the payload disagreeing with them is the one refusal B356 already makes.
+
+#[test]
+fn e208_a_refused_written_type_argument_reports_exactly_once() {
+    assert_fails_once_with(
+        r#"
+        fun main() {
+        	let o = Option<i32>::Some("y");
+        	print(o.unwrap_or(3));
+        }
+        "#,
+        "Expected i32, but got str instead.",
+    );
+}
+
+#[test]
+fn e208_a_written_type_argument_settles_the_expressions_type() {
+    assert_fails_with(
+        r#"
+        fun main() {
+        	let held = Option<i32>::Some(1);
+        	let flag: bool = held;
+        	print(flag);
+        }
+        "#,
+        "but got Option<i32>",
+    );
+}
+
+/// The BARE variant spelling writes the enum's arguments on the VARIANT name,
+/// where there is no enum path to bank them from — and that is the spelling
+/// the prelude gives every program.
+#[test]
+fn e208_a_bare_variant_path_with_written_arguments_settles_too() {
+    assert_fails_with(
+        r#"
+        fun main() {
+        	let outcome = Ok<i32, str>(1);
+        	let flag: bool = outcome;
+        	print(flag);
+        }
+        "#,
+        "but got Result<i32, str>",
+    );
+}
+
+/// The internal error: a bound that cannot be checked because the receiver had
+/// no arguments to check it on. Both payload shapes, because the first report
+/// of this blamed `void`.
+#[test]
+fn e208_an_unsatisfied_bound_on_a_written_argument_constructor_refuses_cleanly() {
+    for source in [
+        r#"
+        import std::json::Json;
+
+        fun main() {
+        	print(Ok<void, str>(void).to_json());
+        }
+        "#,
+        r#"
+        import std::json::Json;
+
+        struct Opaque { seed: i32 }
+
+        fun main() {
+        	print(Ok<Opaque, str>(Opaque { seed = 1 }).to_json());
+        }
+        "#,
+    ] {
+        assert_fails_with(source, "does not implement trait 'Json'");
+        assert_fails_without(source, "internal:");
+    }
+}
+
+/// The CONTROLS: the annotated spellings still refuse the same way (they always
+/// did), and a written argument the payload AGREES with still compiles and
+/// still carries its arguments.
+#[test]
+fn e208_the_annotated_spellings_and_the_agreeing_case_are_unchanged() {
+    assert_fails_with(
+        r#"
+        import std::json::Json;
+
+        fun main() {
+        	let outcome: Result<void, str> = Ok(void);
+        	print(outcome.to_json());
+        }
+        "#,
+        "does not implement trait 'Json'",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+        	let outcome = Ok<i32, str>(1);
+        	print(outcome.unwrap_or(0));
+        	let held = Option<i32>::Some(2);
+        	print(held.unwrap_or(3));
+        }
+        "#,
+        "1\n2\n",
+    );
+}
