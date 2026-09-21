@@ -2290,16 +2290,21 @@ impl<'a> Interpreter<'a> {
                     .collect();
                 Ok(Value::Array(Rc::new(RefCell::new(values))))
             }
+            // The externally-tagged enum discriminator (mirrors the
+            // `__json_tag` codegen helper). A116: everything that is neither a
+            // string nor a non-empty object answers `""` — a tag no variant can
+            // be spelled with — so the derived decoder's `_` arm reports
+            // "unknown variant" rather than this evaluator reporting an
+            // internal error over a document the caller did not choose. The
+            // codegen twin threw a `TypeError` out of `Object.keys(null)` for
+            // the same inputs.
             "__json_tag" => match take(0) {
-                Value::Str(s) => Ok(Value::Str(s)),
-                Value::Object(object) => match object.borrow().keys().next() {
-                    Some(key) => Ok(Value::Str(key.clone())),
-                    None => Ok(Value::Undefined),
-                },
-                other => Err(Failure::internal(format!(
-                    "__json_tag on {}",
-                    type_name(&other)
-                ))),
+                Value::Str(text) => Ok(Value::Str(text)),
+                Value::Object(object) => Ok(Value::Str(match object.borrow().keys().next() {
+                    Some(key) => key.clone(),
+                    None => Rc::from(""),
+                })),
+                _ => Ok(Value::Str(Rc::from(""))),
             },
             // The normalized JSON kind: `typeof`, with arrays and null named
             // (mirrors the `__json_kind` codegen helper). Basis for the decode

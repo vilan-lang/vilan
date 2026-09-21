@@ -1900,8 +1900,25 @@ fn helper_source(name: &str) -> &'static str {
         }
         // The externally-tagged enum discriminator: a bare `"Variant"` is its own
         // tag, a `{"Variant":..}` object's tag is its single key.
+        //
+        // A116: everything ELSE answers `""` — a tag no variant can be spelled
+        // with, so the derived decoder's `_` arm reports "unknown variant"
+        // instead of the helper throwing. `Object.keys(null)` is a `TypeError`,
+        // which took `FromJson`'s never-crash contract (json.vl §"Decoding is
+        // fallible and NEVER crashes") down over a document the caller did not
+        // choose — a frame off a socket could abort the process. `null`, a
+        // number, a boolean and an array are all "not a tagged enum", and so is
+        // `{}`, whose first key is `undefined`: none of them names a variant,
+        // and the decode error is the honest answer for all five. An object
+        // with SEVERAL keys still tags by its first, exactly as before — a
+        // document carrying extra keys beside the tag is not this item's
+        // question.
         "__json_tag" => {
-            "function __json_tag(value) {\n\treturn typeof value === \"string\" ? value : Object.keys(value)[0];\n}"
+            "function __json_tag(value) {\n\
+             \tif (typeof value === \"string\") return value;\n\
+             \tif (value === null || typeof value !== \"object\" || Array.isArray(value)) return \"\";\n\
+             \treturn Object.keys(value)[0] ?? \"\";\n\
+             }"
         }
         // The normalized JSON type of a parsed value: `typeof` buckets arrays and
         // `null` as `"object"`, so name them explicitly. Basis for the decode

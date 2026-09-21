@@ -5637,6 +5637,93 @@ fn a104_a_malformed_result_document_is_a_decode_error_and_never_a_crash() {
     );
 }
 
+// --- A116: `[derive(Json)]` on an ENUM never crashes on a non-object ---------
+//
+// A104 gave `std::result::Result` a hand-written shape guard AHEAD of the tag
+// read; a DERIVED enum has no such guard and read the tag first, so
+// `__json_tag` reached `Object.keys(null)` and threw a `TypeError` out of a
+// decode that `FromJson`'s own doc promises can only return `Err` (json.vl,
+// "Decoding is fallible and NEVER crashes"). The fix is in the helper rather
+// than in the derive: `__json_tag` answers `""` for everything that is not a
+// tagged enum, which no variant can be spelled with, so the generated `_` arm
+// reports the decode error it was always there to report.
+//
+// One pin per document shape, because each reaches the helper differently:
+// `null` threw, a number reached `Object.keys(3)` (empty) and answered
+// `undefined`, an array answered its first INDEX (`"0"`, a tag by accident),
+// and `{}` answered `undefined` too. The control below proves the two real
+// spellings still decode, so a helper that answered `""` unconditionally would
+// not pass this set.
+
+/// The shared fixture: a plain two-variant derived enum and a reporter that
+/// prints the decode outcome. `Shape` carries a payload on one variant so the
+/// object form is a real `{"Square":…}` document and not only a bare tag.
+const A116_DERIVED_ENUM: &str = r#"
+        import std::io::print;
+        import std::json::{ FromJson, Json };
+        [derive(Json)]
+        enum Shape {
+            Circle,
+            Square(i32),
+        }
+        fun show(text: str): str {
+            match Shape::from_json(text) {
+                Ok(let shape) => i"decoded:{shape.to_json()}",
+                Err(let reason) => i"refused:{reason}",
+            }
+        }
+    "#;
+
+/// A116 — JSON `null` is the crashing case the item was filed for.
+#[test]
+fn a116_a_derived_enum_refuses_a_null_document_instead_of_throwing() {
+    assert_compiles_and_runs(
+        &format!("{A116_DERIVED_ENUM}\nfun main() {{ print(show(\"null\")); }}\n"),
+        "refused:unknown variant in JSON for enum Shape\n",
+    );
+}
+
+/// A116 — a NUMBER has no keys at all, so the tag read answered `undefined`.
+#[test]
+fn a116_a_derived_enum_refuses_a_number_document() {
+    assert_compiles_and_runs(
+        &format!("{A116_DERIVED_ENUM}\nfun main() {{ print(show(\"7\")); }}\n"),
+        "refused:unknown variant in JSON for enum Shape\n",
+    );
+}
+
+/// A116 — an ARRAY answered its first INDEX as the tag, which is a tag by
+/// accident: `["Circle"]` would have decoded through a key that is not a name.
+#[test]
+fn a116_a_derived_enum_refuses_an_array_document() {
+    assert_compiles_and_runs(
+        &format!("{A116_DERIVED_ENUM}\nfun main() {{ print(show(\"[\\\"Circle\\\"]\")); }}\n"),
+        "refused:unknown variant in JSON for enum Shape\n",
+    );
+}
+
+/// A116 — an EMPTY object is an object with no tag in it.
+#[test]
+fn a116_a_derived_enum_refuses_an_empty_object_document() {
+    assert_compiles_and_runs(
+        &format!("{A116_DERIVED_ENUM}\nfun main() {{ print(show(\"{{}}\")); }}\n"),
+        "refused:unknown variant in JSON for enum Shape\n",
+    );
+}
+
+/// A116's control — both tagged spellings still decode, so the four refusals
+/// above are about the shapes and not about the helper having stopped working.
+#[test]
+fn a116_a_derived_enum_still_decodes_a_bare_tag_and_a_single_key_object() {
+    assert_compiles_and_runs(
+        &format!(
+            "{A116_DERIVED_ENUM}\nfun main() {{ print(show(\"\\\"Circle\\\"\")); \
+             print(show(\"{{\\\"Square\\\":3}}\")); }}\n"
+        ),
+        "decoded:\"Circle\"\ndecoded:{\"Square\":3}\n",
+    );
+}
+
 /// The sized numeric family (numeric-types.md §5) is Wire, each width riding
 /// the visitor lane that holds it exactly — `i8`/`i16` on `i32`, `u8`/`u16` on
 /// `u32`, `u53` on `i53`, `f32` on `f64` — so the round trip is exact at both

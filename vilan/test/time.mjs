@@ -9,7 +9,9 @@ function __clone(value) {
 	return value;
 }
 function __json_tag(value) {
-	return typeof value === "string" ? value : Object.keys(value)[0];
+	if (typeof value === "string") return value;
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return "";
+	return Object.keys(value)[0] ?? "";
 }
 function __list_pop(list) {
 	return list.length === 0 ? [ 1 ] : [ 0, list.pop() ];
