@@ -102,7 +102,9 @@
 //!   message))` — a variable, not a literal, so the walk reads nothing there,
 //!   exactly as it reads nothing at a helper-built `msg:`. The largest of those
 //!   is `asset::staged`'s "reads the registry AFTER evaluation has finished",
-//!   which is unrowed at this sha and is filed.
+//!   and N99 rowed it by hand through [`ROWS_THE_ENUMERATION_CANNOT_REACH`] —
+//!   with the one unrowed corner of the `[derive]` family, whose other five
+//!   corners had rows.
 //! - **The `unsupported` family is rowed on its SUBJECT, not on its sentence.**
 //!   `Failure::unsupported` composes `"{what} is not available at expansion
 //!   time"`, and the two halves live apart, so the envelope has a row of its
@@ -302,6 +304,37 @@ const ROWS_THE_ENUMERATION_CANNOT_REACH: &[(&str, &str)] = &[
     (
         "`-` negates a number, and `{label}` is a trait: no trait names",
         "`-`'s trait-typed arm",
+    ),
+    // N99's two, and they are the two OTHER shapes this walk cannot read —
+    // neither is a `let msg` ladder arm.
+    //
+    // The first is the family the header's "a `Failure` built from a
+    // `Result<_, String>`" paragraph describes, and the largest member of it: a
+    // const-channel helper returns `Err(String)` and the caller re-wraps it at
+    // `Err(message) => Err(Failure::new(.., message))`. `failure_messages`
+    // reads the literal written as `Failure::new`'s SECOND ARGUMENT, and there
+    // the second argument is a binding, so the sentence at
+    // `const_eval.rs`'s `staged` is read by nothing. It is the one a user
+    // actually reaches — an `asset::staged` call from a `const` expression
+    // rather than from `asset::schedule_at_end`'s callback — and it shipped
+    // unrowed.
+    (
+        "`asset::staged` reads the registry AFTER evaluation has finished, and \
+         this build is still evaluating",
+        "the const channel's staging-registry refusal, re-wrapped from a \
+         helper's `Err(String)` (`const_eval.rs`)",
+    ),
+    // The second is a `let msg = if … else …` handed over by field shorthand,
+    // like the ladders above — except that its SIBLING arm is rowed (434) and
+    // it was not, which is how it hid: the `[derive]` family looked covered.
+    // Both `[service]` arms (161, 418) and both `macro_std`-missing arms (542,
+    // 543) are rowed too, so this was the one unrowed corner of a family whose
+    // other five corners had rows.
+    (
+        "`[derive({name})]` expanded before std's `{module}` declared",
+        "the derive load-ordering arm — a std that HAS the module reaching the \
+         expansion unregistered, which is B21's class and a compiler bug \
+         (`macros.rs`)",
     ),
 ];
 
@@ -2064,6 +2097,75 @@ fn every_curated_rule_statement_still_opens_as_recorded() {
         reworded.len(),
         reworded.join("\n")
     );
+}
+
+/// N99: the two messages the widened walk still cannot reach are each rowed,
+/// and rowed for the reason recorded — one pin per message, in both directions.
+///
+/// [`every_hand_rowed_row_is_still_out_of_the_enumerations_reach`] asks the
+/// general question of the whole list. What it cannot say is which SITE each
+/// entry stands for: it resolves an entry to a row and asks whether any
+/// enumerated site that row describes exists, so a message that moved to
+/// another file, or a second literal that happens to answer the same key,
+/// would keep the entry green. These two name their file, which is the half
+/// that goes stale silently.
+#[test]
+fn n99_the_two_unreachable_messages_are_rowed_at_the_files_that_build_them() {
+    /// The const channel's staging-registry refusal, at the run of its head
+    /// that is neither slot nor assembled.
+    const STAGING_REGISTRY: &str = "`asset::staged` reads the registry AFTER evaluation has finished, and this build is \
+         still evaluating";
+    /// The derive load-ordering arm, likewise.
+    const DERIVE_LOAD_ORDER: &str = "expanded before std's `{module}` declared its `{name}` macro";
+
+    for (relative, fragment, why) in [
+        (
+            "crates/vilan-core/src/const_eval.rs",
+            STAGING_REGISTRY,
+            "re-wrapped from a helper's `Err(String)`, so `Failure::new`'s second \
+             argument is a binding and the walk reads no literal",
+        ),
+        (
+            "crates/vilan-core/src/macros.rs",
+            DERIVE_LOAD_ORDER,
+            "a `let msg = if … else …` handed over by field shorthand, so there is \
+             no `msg:` anchor to read",
+        ),
+    ] {
+        // Forward: the file still builds the sentence.
+        let source = normalized(&read(relative));
+        assert!(
+            source.contains(fragment),
+            "{relative} no longer builds {fragment:?} ({why}) — re-key its row in \
+             `{INDEX}` and its prefix in ROWS_THE_ENUMERATION_CANNOT_REACH"
+        );
+        // Back: exactly one row is keyed on it. Without the row the message has
+        // no coverage at all, because the enumeration never reaches it.
+        let rowed: Vec<String> = index()
+            .into_iter()
+            .filter(|row| row.key.contains(fragment))
+            .map(|row| row.number)
+            .collect();
+        assert_eq!(
+            rowed.len(),
+            1,
+            "{fragment:?} is keyed by {} row(s) of `{INDEX}` ({}), and it must be \
+             one: {why}",
+            rowed.len(),
+            rowed.join(", ")
+        );
+        // And the reason the row exists: no enumerated site carries the
+        // sentence, so check (3) is not what holds it.
+        let enumerated = enumerated_sites()
+            .into_iter()
+            .any(|site| site.message.contains(fragment));
+        assert!(
+            !enumerated,
+            "the enumeration now reads {fragment:?} at its site — check (3) holds \
+             it, so drop its entry from ROWS_THE_ENUMERATION_CANNOT_REACH ({why} \
+             no longer describes the shape)"
+        );
+    }
 }
 
 #[test]
