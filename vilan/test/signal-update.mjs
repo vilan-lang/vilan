@@ -212,31 +212,9 @@ function $q(self, mutate, $d) {
 function $x(self) {
 	return self[0].size;
 }
-function $B(self, $f) {
-	const $C = $f;
-	let $D = null;
-	if ($C[0] === 0) {
-		const turn = $C[1];
-		$D = enqueue(turn, self[1].v);
-	} else {
-		const $E = $j(draining_turns.v);
-		let $F = null;
-		if ($E[0] === 0) {
-			const draining = $E[1];
-			$F = enqueue(draining, self[1].v);
-		} else {
-			for (const subscriber of self[1].v) {
-				subscriber[1]();
-			}
-			$F = undefined;
-		}
-		$D = $F;
-	}
-	return $D;
-}
 function $A(self, mutate, $d) {
 	mutate([ self[0], "v" ]);
-	$B(self, $d);
+	$r(self, $d);
 }
 function $I(signal, observer) {
 	const id = fresh_id();
@@ -287,7 +265,7 @@ function $V(body, $W) {
 }
 function $ab(self, value, $ac) {
 	self[0].v = __clone(value);
-	$B(self, $ac);
+	$r(self, $ac);
 }
 function $Z(self, transform, $aa) {
 	$ab(self, transform($m(self)), $aa);

@@ -4,25 +4,6 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
-function __force(cell) {
-	if (cell.state === 2) return cell.value;
-	if (cell.state === 1) throw "lazy initialization cycle: `" + cell.name + "`";
-	if (cell.state === 3) throw "lazy `" + cell.name + "` is poisoned: its initializer panicked: " + cell.value;
-	cell.state = 1;
-	try {
-		cell.value = cell.thunk();
-	} catch (failure) {
-		cell.state = 3;
-		cell.value = failure;
-		throw failure;
-	}
-	cell.state = 2;
-	cell.thunk = null;
-	return cell.value;
-}
-function __lazy(name, thunk) {
-	return { name: name, state: 0, value: undefined, thunk: thunk };
-}
 function default2() {
 	return 0;
 }
@@ -45,7 +26,7 @@ function $d(self, fallback) {
 		const x = __clone($e[1]);
 		$f = x;
 	} else {
-		$f = __clone(__force(fallback));
+		$f = __clone(fallback);
 	}
 	return $f;
 }
@@ -107,17 +88,6 @@ function $s(self, fn) {
 	}
 	return $u;
 }
-function $v(self, fallback) {
-	const $w = self;
-	let $x = null;
-	if ($w[0] === 0) {
-		const x = __clone($w[1]);
-		$x = x;
-	} else {
-		$x = __clone(__force(fallback));
-	}
-	return $x;
-}
 function $y(self, fn) {
 	const $z = self;
 	let $A = null;
@@ -163,7 +133,7 @@ function $J(self, fallback) {
 		const x = __clone($K[1]);
 		$L = x;
 	} else {
-		$L = __clone(__force(fallback));
+		$L = __clone(fallback);
 	}
 	return $L;
 }
@@ -189,17 +159,6 @@ function $P(self, b) {
 	}
 	return $R;
 }
-function $S(self, fallback) {
-	const $T = self;
-	let $U = null;
-	if ($T[0] === 0) {
-		const x = __clone($T[1]);
-		$U = x;
-	} else {
-		$U = __clone(__force(fallback));
-	}
-	return $U;
-}
 function $V(self, b) {
 	const $W = self;
 	let $X = null;
@@ -210,17 +169,6 @@ function $V(self, b) {
 		$X = b;
 	}
 	return $X;
-}
-function $Y(self, fallback) {
-	const $Z = self;
-	let $aa = null;
-	if ($Z[0] === 0) {
-		const x = __clone($Z[1]);
-		$aa = x;
-	} else {
-		$aa = __clone(__force(fallback));
-	}
-	return $aa;
 }
 function $ab(self) {
 	const $ac = self;
@@ -236,22 +184,14 @@ function $ab(self) {
 	}
 	return $ad;
 }
-function $ae(self) {
-	const $af = self;
-	return $af[0] === 0;
-}
 const ok = [ 0, 10 ];
 const err = [ 1, "boom" ];
 console.log($d($a(ok, (n) => {
 	return n + 1;
-}), __lazy("fallback", () => {
-	return 0;
-})));
+}), 0));
 console.log($d($g(err, (e) => {
 	return e;
-}), __lazy("fallback", () => {
-	return 0;
-})));
+}), 0));
 console.log($j(ok, (n) => {
 	return n > 5;
 }));
@@ -260,27 +200,17 @@ console.log($m(err, (e) => {
 }));
 console.log($d($p(ok, (n) => {
 	return [ 0, n * 2 ];
-}), __lazy("fallback", () => {
-	return 0;
-})));
-console.log($v($s(err, (e) => {
+}), 0));
+console.log($d($s(err, (e) => {
 	return [ 0, 7 ];
-}), __lazy("fallback", () => {
-	return 0;
-})));
+}), 0));
 console.log($y(err, (e) => {
 	return 99;
 }));
 console.log($E($B(ok)));
-console.log($J($G(err), __lazy("fallback", () => {
-	return "none";
-})));
+console.log($J($G(err), "none"));
 console.log($M(err));
-console.log($S($P(ok, [ 0, 5 ]), __lazy("fallback", () => {
-	return 0;
-})));
-console.log($Y($V(err, [ 0, 3 ]), __lazy("fallback", () => {
-	return 0;
-})));
+console.log($d($P(ok, [ 0, 5 ]), 0));
+console.log($d($V(err, [ 0, 3 ]), 0));
 const ro = [ 0, [ 0, 42 ] ];
-console.log($ae($ab(ro)));
+console.log($E($ab(ro)));

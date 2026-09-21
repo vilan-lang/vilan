@@ -1637,7 +1637,7 @@ impl Document {
         // — per analysis, so per keystroke — while `resolve_dependencies`
         // re-reads the manifest closure beside it. The core line cannot see any
         // of it: it starts inside `analyze`.
-        let phase_context_start = std::time::Instant::now();
+        let phase_context_start = vilan_core::PhaseClock::now();
         let mut context = resolve_project_context(entry_path);
         let phase_context = phase_context_start.elapsed();
         let manifest_problem = context.manifest_problem.take();
@@ -1681,7 +1681,7 @@ impl Document {
         // process-global caches, which a keystroke's content would leak for
         // the session (§7.5). The `AnalyzedProgram` built below owns and
         // reclaims them beside the entry text and tree.
-        let phase_analyze_start = std::time::Instant::now();
+        let phase_analyze_start = vilan_core::PhaseClock::now();
         let vilan_core::AnalyzedEntry {
             program,
             diagnostics,
@@ -1715,7 +1715,7 @@ impl Document {
             drop(unsafe { AnalyzedProgram::new(program, Some(leaked_text), ast, owned_modules) });
             return Self::unanalyzed(text);
         }
-        let phase_index_start = std::time::Instant::now();
+        let phase_index_start = vilan_core::PhaseClock::now();
 
         // The entity table the navigation queries index, computed by the one
         // function both front-ends use (`vilan_ide::entity_spans`).
@@ -1772,7 +1772,7 @@ impl Document {
         // user is looking at. Each is a full analysis under that leg's platform
         // whose program is published and then dropped — the diagnostics are all
         // the editor keeps, and hover/goto/completion stay the primary leg's.
-        let phase_legs_start = std::time::Instant::now();
+        let phase_legs_start = vilan_core::PhaseClock::now();
         let shared_diagnostics = context
             .shared_platforms
             .iter()
@@ -1828,14 +1828,14 @@ impl Document {
         // E121: the keystroke path's whole-program walk, paid HERE — once per
         // analysis, on the analysis thread — instead of once per request on
         // the keystroke thread. See [`LandedSnapshot`].
-        let phase_landed_start = std::time::Instant::now();
+        let phase_landed_start = vilan_core::PhaseClock::now();
         document.landed = document.capture_landed(entry_path);
         let phase_landed = phase_landed_start.elapsed();
         // M27: the editor tables, as ONE number the server can carry — the
         // reference/entity index and the landed walk are the same family of
         // cost (a table built over a finished analysis, thrown away by the
         // next keystroke) and no budget separates them.
-        document.index_time = phase_index + phase_landed;
+        document.index_time = (phase_index + phase_landed).wall;
         // The server's half of the `VILAN_PHASE_TIMING` split (E106): one line
         // per LSP analysis, naming the costs the core pipeline's own line
         // cannot see — project resolution (the E113 reachability walk and the
@@ -1853,15 +1853,14 @@ impl Document {
         // and it is on the line now for the same reason `lsp-index` is: a cost
         // nobody prints is a cost nobody budgets (N43's rule).
         if vilan_core::phase_timing_enabled() {
-            let milliseconds = |duration: std::time::Duration| duration.as_secs_f64() * 1000.0;
             eprintln!(
-                "[vilan phase] lsp-context {:.1}ms lsp-analyze {:.1}ms lsp-index {:.1}ms \
-                 lsp-landed {:.1}ms lsp-legs {:.1}ms legs {}",
-                milliseconds(phase_context),
-                milliseconds(phase_analyze),
-                milliseconds(phase_index),
-                milliseconds(phase_landed),
-                milliseconds(phase_legs),
+                "[vilan phase] lsp-context {} lsp-analyze {} lsp-index {} \
+                 lsp-landed {} lsp-legs {} legs {}",
+                phase_context,
+                phase_analyze,
+                phase_index,
+                phase_landed,
+                phase_legs,
                 context.shared_platforms.len(),
             );
         }
@@ -24268,6 +24267,139 @@ mod session_growth {
             .and_then(|value| value.parse().ok())
             .unwrap_or(3);
         on_big_stack(move || base_cache_keystroke_walk("kolt_src", &entries, keystrokes));
+    }
+
+    /// M76's paired probe: what one keystroke in an ENTRY-SHAPED file costs
+    /// with the checks-reuse record read and with it withheld — the same file,
+    /// both ways, alternately, inside one process.
+    ///
+    /// M70 stored an open module's world and left its checks record
+    /// withheld, so `[vilan phase] reused 0/69` on every one of the six kolt
+    /// files it names: the whole widened seam stood down there, R10's sites
+    /// and the class D tables included. M76 files the record and narrows the
+    /// reading side instead (`Analyzer::alias_reaching_sources`). The BEFORE
+    /// leg is `set_world_reuse(false)`, which is exactly the state those files
+    /// were in — no ranges sealed, nothing replayed, nothing restored — so the
+    /// two legs differ in the seam and in nothing else, at one load average.
+    ///
+    /// The census rides beside the CPU, because a leg that reused nothing
+    /// would agree with the other for a reason that is not a measurement.
+    fn checks_reuse_keystroke_walk(label: &str, entries: &[PathBuf], keystrokes: usize) {
+        let std_dir = std_root();
+        vilan_core::analyzer::set_base_cache_budget(usize::MAX);
+        for entry in entries {
+            let Ok(base) = std::fs::read_to_string(entry) else {
+                continue;
+            };
+            // One edit, timed in thread CPU, with the seam in whatever state
+            // the caller set. The warm analysis before it is what fills the
+            // world AND files its record, so neither leg measures the fill.
+            let edit = |text: &str| -> (Duration, (usize, usize, usize)) {
+                let started = thread_cpu_now();
+                drop(Document::analyze_on_this_thread(text, &std_dir, entry));
+                let ended = thread_cpu_now();
+                (
+                    started
+                        .zip(ended)
+                        .map(|(started, ended)| ended.saturating_sub(started))
+                        .unwrap_or_default(),
+                    vilan_core::analyzer::reuse_census(),
+                )
+            };
+            let mut with: Vec<Duration> = Vec::new();
+            let mut without: Vec<Duration> = Vec::new();
+            let mut census_with = (0, 0, 0);
+            let mut census_without = (0, 0, 0);
+            for keystroke in 0..keystrokes {
+                for reuse in [true, false] {
+                    vilan_core::analyzer::set_world_reuse(reuse);
+                    // The record is filed by the analysis that derives it, so
+                    // each leg re-warms under its own switch: the ON leg needs
+                    // a record to read, the OFF leg must not be measured
+                    // against one it could not have had.
+                    drop(Document::analyze_on_this_thread(&base, &std_dir, entry));
+                    let (cpu, census) = edit(&format!(
+                        "{base}\n// m76 {} {keystroke}\n",
+                        if reuse { "with" } else { "without" }
+                    ));
+                    if reuse {
+                        with.push(cpu);
+                        census_with = census;
+                    } else {
+                        without.push(cpu);
+                        census_without = census;
+                    }
+                }
+            }
+            vilan_core::analyzer::set_world_reuse(true);
+            with.sort();
+            without.sort();
+            let median = |samples: &[Duration]| {
+                samples
+                    .get(samples.len() / 2)
+                    .copied()
+                    .unwrap_or_default()
+                    .as_secs_f64()
+                    * 1000.0
+            };
+            println!(
+                "M76 {{\"section\":\"keystroke\",\"corpus\":\"{label}\",\"profile\":\"{}\",\
+                 \"load\":\"{}\",\"file\":\"{}\",\"bytes\":{},\"keystrokes\":{keystrokes},\
+                 \"reused_with\":{},\"reused_without\":{},\"sources\":{},\"entry_dirty\":{},\
+                 \"with_median_ms\":{:.2},\"without_median_ms\":{:.2}}}",
+                profile(),
+                loadavg_1m(),
+                entry.file_name().unwrap_or_default().to_string_lossy(),
+                base.len(),
+                census_with.0,
+                census_without.0,
+                census_with.2,
+                census_with.1,
+                median(&with),
+                median(&without),
+            );
+        }
+        vilan_core::analyzer::set_base_cache_budget(
+            vilan_core::analyzer::BASE_CACHE_DEFAULT_BUDGET,
+        );
+    }
+
+    /// M76's paired probe over the owner's own application:
+    ///
+    /// ```text
+    /// VILAN_PERF_KOLT=<checkout> cargo nextest run --release -p vilan-lsp \
+    ///     --run-ignored ignored-only -E 'test(checks_reuse_keystroke_cost)' --no-capture
+    /// ```
+    #[test]
+    #[ignore = "M76's paired checks-reuse probe: needs VILAN_PERF_KOLT, run deliberately"]
+    fn checks_reuse_keystroke_cost_across_a_sibling_checkout() {
+        let _guard = base_cache_guard();
+        let Some(root) = std::env::var_os("VILAN_PERF_KOLT").map(PathBuf::from) else {
+            println!("M76-SKIP keystroke: VILAN_PERF_KOLT is not set");
+            return;
+        };
+        let source = root.join("src");
+        let only: Option<Vec<String>> = std::env::var("VILAN_M76_FILES")
+            .ok()
+            .map(|value| value.split(',').map(str::to_string).collect());
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&source)
+            .unwrap_or_else(|error| panic!("read {}: {error}", source.display()))
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|extension| extension == "vl"))
+            .filter(|path| match &only {
+                Some(only) => only.iter().any(|name| {
+                    path.file_name()
+                        .is_some_and(|file| file.to_string_lossy() == *name)
+                }),
+                None => true,
+            })
+            .collect();
+        entries.sort();
+        let keystrokes = std::env::var("VILAN_M76_KEYSTROKES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3);
+        on_big_stack(move || checks_reuse_keystroke_walk("kolt_src", &entries, keystrokes));
     }
 
     /// M68's measurement: what the trim at the analysis-landing seam COSTS, and

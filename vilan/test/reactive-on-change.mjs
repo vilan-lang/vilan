@@ -315,24 +315,8 @@ function $S(self, transform, $T, $U) {
 	}), $T, $U);
 	return derived;
 }
-function $ai(signal, observer) {
-	const id = fresh_id();
-	const cell = signal[0];
-	signal[1].v.push([ id, () => {
-		const $aj = [ 0, cell ];
-		let $ak = null;
-		if ($aj[0] === 0) {
-			const live = $aj[1];
-			$ak = observer(live.v);
-		} else {
-			$ak = undefined;
-		}
-		return $ak;
-	} ]);
-	return [ signal[1], id, __shared_new([ 1 ]) ];
-}
 function $ah(self, observer) {
-	const subscription = $ai(self, observer);
+	const subscription = $d(self, observer);
 	observer($g(self));
 	return subscription;
 }

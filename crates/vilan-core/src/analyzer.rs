@@ -3501,6 +3501,14 @@ pub struct Analyzer<'src> {
     // key: a module in here is not reusable for THIS analysis, because a slot
     // it reads was ground by the buffer being edited.
     entry_dirty_sources: HashSet<SourceId>,
+    // M76: every (importing file, resolved target) pair an import or `use`
+    // statement bound in this program. The input to the ALIAS-REACH closure an
+    // entry-shaped world's checks-reuse record needs — see
+    // [`alias_reaching_sources`]. Recorded as an ENTITY rather than a source
+    // because `source_of_id` is only answerable once the source ranges are
+    // sealed, which is after `build()`; recorded unconditionally, beside
+    // `import_reaches`, which pays the same push for the same kind of reason.
+    import_targets: Vec<(SourceId, Id)>,
     // M19 T0: whether the entry tail has begun — set once, after
     // `resolve_world` on a miss and after the base-cache lookup on a hit. The
     // world's OWN resolution writes slots constantly and dirties nothing; only
@@ -4096,6 +4104,13 @@ pub struct Analyzer<'src> {
     // (`__force`), which is what makes the callee side "a plain `T`, fully
     // transparent"; the two sets above are the only places a read does not.
     lazy_cells: HashSet<Id>,
+    // M81: the `lazy` PARAMETERS this program lowers eagerly — every call site
+    // fills them with an inert expression, so no cell is built and the
+    // callee's reads do not force. A set beside `lazy_cells` rather than a
+    // removal FROM it: `lazy_cells` is also what the declaration-side refusals
+    // are gated on, and "this parameter's type is a resource" is wrong whether
+    // or not anybody calls it.
+    lazy_eager_parameters: HashSet<Id>,
     // Every `lazy let` DECLARATION, in source order, before it is known whether
     // it is module-level (§2) or a local (§3, excluded). `record_lazy_bindings`
     // partitions it: a module-level one becomes a cell, a local is refused.
@@ -5733,6 +5748,7 @@ impl<'src> Analyzer<'src> {
             reuse_derived: HashMap::default(),
             reuse_unrecordable: HashSet::default(),
             entry_dirty_sources: HashSet::default(),
+            import_targets: Vec::new(),
             entry_phase: false,
             source_texts: Vec::new(),
             type_references: Vec::new(),
@@ -5845,6 +5861,7 @@ impl<'src> Analyzer<'src> {
             lazy_argument_thunks: IndexMap::default(),
             lazy_argument_forwards: HashSet::default(),
             lazy_cells: HashSet::default(),
+            lazy_eager_parameters: HashSet::default(),
             lazy_binding_declarations: Vec::new(),
             lazy_local_bindings: Vec::new(),
             lazy_binding_initializers: IndexMap::default(),
@@ -24755,6 +24772,11 @@ impl<'src> Analyzer<'src> {
             .values()
             .map(|call| (call.subject_id, call.argument_ids.clone()))
             .collect();
+        // M81's first pass: every (lazy parameter, argument) pair this program
+        // actually resolved, banked before anything is recorded, because the
+        // elision below is a fact about the PARAMETER and the arguments decide
+        // it together.
+        let mut lazy_pairs: Vec<(Id, Id, &'src str)> = Vec::new();
         for (subject_id, argument_ids) in calls {
             let Some(Expr::Local(callee_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
                 continue;
@@ -24773,21 +24795,82 @@ impl<'src> Analyzer<'src> {
                 if !parameter.lazy {
                     continue;
                 }
-                let name = parameter.name;
-                // A bare reference to a binding that already holds a cell is a
-                // FORWARD: pass the cell, do not force it and do not wrap it in
-                // a second one. Anything else — including a reference wrapped in
-                // so much as a field access — is an expression to defer.
-                if matches!(
-                    self.expr_id_to_expr_map.get(argument_id),
-                    Some(Expr::Local(binding)) if self.lazy_cells.contains(binding)
-                ) {
-                    self.lazy_argument_forwards.insert(*argument_id);
-                } else {
-                    self.lazy_argument_thunks.insert(*argument_id, name);
-                }
+                lazy_pairs.push((*parameter_id, *argument_id, parameter.name));
             }
         }
+        // M81 — **a lazy parameter every call site fills INERTLY is eager in
+        // this program.** 111 of A103's 114 `__lazy` emissions carried a
+        // literal, an enum constant or `[]`, and each one allocated a memo
+        // cell at the call site and paid a `__force` on the callee's hot path
+        // for an expression that cannot have an effect, cannot fail and cannot
+        // cycle.
+        //
+        // The decision is per PARAMETER and not per argument, and it has to
+        // be: the callee is emitted once for every call site it has, so its
+        // reads either force or they do not. A parameter one site thunks and
+        // another fills with `0` keeps its cell at BOTH, which is why the
+        // eager set is the parameters whose every recorded argument is inert
+        // and which forward no cell.
+        //
+        // A parameter with no recorded call site at all is eager too, which is
+        // the only shape here that is not purely an optimization: a function
+        // taken as a VALUE is called through a path `record_lazy_arguments`
+        // never sees, so its lazy parameter received a plain value and the
+        // callee's `__force` read `.state` off it. That was already broken
+        // before this; eliding makes the no-direct-call case correct and
+        // leaves the mixed case as it was (reported as a finding, not fixed
+        // here).
+        // Optimistic, then retracted to a FIXPOINT, because eagerness
+        // propagates along the forwarding chain: a read of an eager
+        // parameter is itself inert (its value was fixed at the outer call
+        // site and a parameter binding is immutable), so `middle`'s hop into
+        // `inner` stays a plain pass-through instead of re-wrapping the value
+        // in a cell the way a per-pair decision would. Each round only ever
+        // removes, so it terminates in at most one round per parameter.
+        let mut eager_parameters: HashSet<Id> = self
+            .parameters
+            .values()
+            .filter(|parameter| parameter.lazy)
+            .map(|parameter| parameter.id)
+            .collect();
+        loop {
+            let retracted: Vec<Id> = lazy_pairs
+                .iter()
+                .filter(|(parameter_id, argument_id, _)| {
+                    eager_parameters.contains(parameter_id)
+                        && !self.lazy_argument_is_inert(*argument_id, &eager_parameters)
+                })
+                .map(|(parameter_id, _, _)| *parameter_id)
+                .collect();
+            if retracted.is_empty() {
+                break;
+            }
+            for parameter_id in retracted {
+                eager_parameters.remove(&parameter_id);
+            }
+        }
+        for (parameter_id, argument_id, name) in &lazy_pairs {
+            if eager_parameters.contains(parameter_id) {
+                continue;
+            }
+            // A bare reference to a binding that already holds a cell is a
+            // FORWARD: pass the cell, do not force it and do not wrap it in
+            // a second one. Anything else — including a reference wrapped in
+            // so much as a field access — is an expression to defer. An EAGER
+            // lazy parameter is in `lazy_cells` and holds no cell, so it is
+            // not a forward; its read thunks like any other value (M81).
+            if matches!(
+                self.expr_id_to_expr_map.get(argument_id),
+                Some(Expr::Local(binding))
+                    if self.lazy_cells.contains(binding)
+                        && !eager_parameters.contains(binding)
+            ) {
+                self.lazy_argument_forwards.insert(*argument_id);
+            } else {
+                self.lazy_argument_thunks.insert(*argument_id, *name);
+            }
+        }
+        self.lazy_eager_parameters = eager_parameters;
         // The effects half, in a second loop so the borrow of `self` the walk
         // takes does not fight the insert above.
         let thunks: Vec<Id> = self.lazy_argument_thunks.keys().copied().collect();
@@ -24802,6 +24885,69 @@ impl<'src> Analyzer<'src> {
                 &mut effects,
             );
             self.lazy_thunk_effects.insert(argument_id, effects);
+        }
+    }
+
+    /// M81 — whether the expression standing in a `lazy` position is INERT:
+    /// evaluating it has no effect, cannot fail, cannot suspend and cannot
+    /// reach a lazy cell, so evaluating it EAGERLY is unobservable.
+    ///
+    /// "Unobservable" is the whole claim, so the set is deliberately the
+    /// smallest one that covers what the retrofit actually sees — a literal, a
+    /// unary operator over one, an EMPTY collection literal and a nullary enum
+    /// constant. Three properties hold of every member and are what the claim
+    /// rests on:
+    ///
+    ///  - **no effects**, so evaluating it at the call site rather than at the
+    ///    first read runs nothing the program did not already run;
+    ///  - **no failure and no cycle**, so `__force`'s poison and
+    ///    initialization-cycle states are unreachable for it — a thunk that
+    ///    cannot throw makes the `at most once` memo an accounting detail;
+    ///  - **one value per evaluation site**, so a callee that reads the
+    ///    parameter twice sees the same value either way (an eager `[]` is
+    ///    one array handed over, exactly as a forced thunk's would be).
+    ///
+    /// A non-empty list literal is deliberately NOT inert: its elements are
+    /// arbitrary expressions. Nor is a `Local` — a bare binding read looks
+    /// inert and may be a lazy CELL, which is the forwarding case, and
+    /// widening this to cover it would change what forwarding means.
+    fn lazy_argument_is_inert(&self, argument_id: Id, eager: &HashSet<Id>) -> bool {
+        match self.expr_id_to_expr_map.get(&argument_id) {
+            Some(Expr::Number(..))
+            | Some(Expr::String(_))
+            | Some(Expr::Bool(_))
+            | Some(Expr::Null) => true,
+            // `-1`, `!false` — an operator over an inert operand is inert.
+            Some(Expr::Unary(_, inner)) => self.lazy_argument_is_inert(*inner, eager),
+            // `[]`. A non-empty literal carries expressions.
+            Some(Expr::List(items)) => items.is_empty(),
+            // `None`, `Ordering::Equal` — a variant constant, which is the
+            // constructor's own value and not a call of it (`Expr::Call`).
+            Some(Expr::EnumVariant(_, _)) => true,
+            // Two locals are inert, and no others.
+            //
+            // A read of a parameter this pass has already decided is EAGER: it
+            // holds a value fixed at the outer call site, and a parameter
+            // binding is immutable, so reading it here or at a later force
+            // yields the same thing. This is the forwarding chain's own rule,
+            // and it is the reason the decision is taken to a fixpoint.
+            //
+            // And a nullary VARIANT — `None`, `Ordering::Equal` — which
+            // reaches here as a reference to the variant's own declaration.
+            // It is a constant: the emission is an array literal and there is
+            // no expression under it.
+            //
+            // Any OTHER local is not: a `mut` module binding read eagerly at
+            // the call site and lazily at the first use can differ, which is
+            // exactly observable.
+            Some(Expr::Local(binding)) => {
+                eager.contains(binding)
+                    || matches!(
+                        self.expr_id_to_expr_map.get(binding),
+                        Some(Expr::EnumVariant(_, _))
+                    )
+            }
+            _ => false,
         }
     }
 
@@ -37423,6 +37569,13 @@ impl<'src> Analyzer<'src> {
             }
             return false;
         }
+        // M76: the edge, recorded where the PATH resolved rather than where a
+        // name binds — a selector-only statement (the `!bind` return just
+        // below) resolves against the target's file exactly as a binding
+        // import does, and the reach closure must not mistake it for no
+        // dependency at all. A `self` leaf is covered here too, which the
+        // `import_reaches` record below deliberately is not.
+        self.import_targets.push((source_id, target_id));
         // A `self` leaf's own span points at the namespace it re-binds.
         if name == "self" {
             self.record_reference(source_id, leaf_span, target_id);
@@ -37830,6 +37983,66 @@ impl<'src> Analyzer<'src> {
             .world_table_ranges
             .partition_point(|(start, _)| *start <= id.0);
         index > 0 && id.0 < self.world_table_ranges[index - 1].1
+    }
+
+    /// M76 — the files an ENTRY-SHAPED world's checks-reuse record must hold
+    /// back: those whose own resolution can be answered by the OPEN FILE's
+    /// declarations, because they reach it through `pkg::`.
+    ///
+    /// M19 T1's record is of checks that ran over a world resolved BEFORE the
+    /// store. An open module's world resolves inside the post-entry `build()`
+    /// instead — every analysis of it, hit or miss — so the record was
+    /// withheld outright (M70's as-built: "a claim the seam has not been
+    /// proved to support"), and `[vilan phase] reused 0/69` on every one of
+    /// M70's six kolt files is the cost of withholding it. Two guards replace
+    /// the blanket refusal, and a module needs BOTH:
+    ///
+    ///  - T0's dirty bit, unchanged, which certifies that the post-store
+    ///    phase moved none of the module's TYPE slots;
+    ///  - this set, which certifies that the module's NAME resolution cannot
+    ///    have consulted the entry — the half a type-slot watch cannot see.
+    ///
+    /// The rule is M79's deferral rule, applied to a different question: seed
+    /// with the files that import something the entry file declares (the
+    /// alias's own source is `SourceId(0)`, which is how the `pkg::<entry>`
+    /// re-entry is bound), then close under "imports from a deferred file" —
+    /// a file whose import resolves into a deferred file inherits the
+    /// dependency. A target whose source cannot be resolved at all defers its
+    /// importer: an unattributed id is a fact this cannot check, and the
+    /// conservative answer is the same one `frozen_entity` gives.
+    ///
+    /// Linear in the edges per closure round, and the rounds are bounded by
+    /// the package's import depth (three on kolt).
+    fn alias_reaching_sources(&self) -> HashSet<SourceId> {
+        let mut deferred: HashSet<SourceId> = HashSet::default();
+        // The edge list, resolved to (importer, target file) once: the closure
+        // below re-reads it per round and `source_of_id` is a binary search.
+        let edges: Vec<(SourceId, Option<SourceId>)> = self
+            .import_targets
+            .iter()
+            .filter(|(importer, _)| importer.0 != 0)
+            .map(|(importer, target)| (*importer, self.source_of_id(*target)))
+            .collect();
+        loop {
+            let before = deferred.len();
+            for (importer, target) in &edges {
+                if deferred.contains(importer) {
+                    continue;
+                }
+                let reaches = match target {
+                    // The entry file itself — the alias, or any declaration of
+                    // the open module reached through it.
+                    Some(source) => source.0 == 0 || deferred.contains(source),
+                    None => true,
+                };
+                if reaches {
+                    deferred.insert(*importer);
+                }
+            }
+            if deferred.len() == before {
+                return deferred;
+            }
+        }
     }
 
     /// The predicate the **Class A** checks ask (§3.3): module-local given the
@@ -44781,7 +44994,7 @@ impl<'src> Analyzer<'src> {
         // `Instant::now()` calls per pass, which is noise next to the pass.
         let split_on = crate::phase_timing_enabled() && !crate::macros::in_macro_world();
         let mut split_mark = crate::PhaseClock::now();
-        let mut split: Vec<(&'static str, std::time::Duration)> = Vec::new();
+        let mut split: Vec<(&'static str, crate::PhaseSpan)> = Vec::new();
         // Resolve imports/re-exports to a fixpoint: a re-export may name an item
         // bound by another re-export resolved in a later pass (a chain of relay
         // modules), so keep retrying the unresolved ones until a pass binds
@@ -44952,6 +45165,9 @@ impl<'src> Analyzer<'src> {
                     }
                     None => name,
                 };
+                // M76: a `use` binds out of a namespace exactly as an import
+                // binds out of a module, so it is the same edge.
+                self.import_targets.push((source_id, current));
                 let scope = self.mut_scope_for_scope_id(scope_id);
                 scope.name_to_id_map.insert(bind_name, current);
             }
@@ -46881,7 +47097,7 @@ impl<'src> Analyzer<'src> {
             split.push(("fixpoint", split_mark.elapsed()));
             let stages: Vec<String> = split
                 .iter()
-                .map(|(name, duration)| format!("{name} {:.1}ms", duration.as_secs_f64() * 1000.0))
+                .map(|(name, span)| format!("{name} {span}"))
                 .collect();
             eprintln!("[vilan phase] resolve_world {}", stages.join(" "));
         }
@@ -50838,6 +51054,14 @@ pub struct Program<'src> {
     /// The bindings that hold a memo cell: `lazy` parameters (§1) and `lazy let`
     /// module bindings (§2). A read of one forces it.
     pub lazy_cells: HashSet<Id>,
+    /// M81 — the `lazy` parameters this program lowers EAGERLY: every call site
+    /// filled them with an inert expression (a literal, a unary operator over
+    /// one, `[]`, an enum constant, or a read of another eager lazy
+    /// parameter), so no `__lazy` cell is built at the call site and the
+    /// callee's reads emit no `__force`. A member of this set is still in
+    /// [`Self::lazy_cells`] — the declaration-side facts about it are
+    /// unchanged — and every read of it must consult both.
+    pub lazy_eager_parameters: HashSet<Id>,
     /// A `lazy let`'s initializer expression id, mapped to the binding's name
     /// (§2) — the transformer labels the cell with it, and
     /// `check_lazy_argument_effects` names the binding in its refusals.
@@ -51705,6 +51929,38 @@ thread_local! {
 #[doc(hidden)]
 pub fn reuse_census() -> (usize, usize, usize) {
     REUSE_CENSUS.with(std::cell::Cell::get)
+}
+
+// M76's count, in the same family: how many sources this analysis held back
+// from the checks-reuse record because they reach the OPEN FILE through
+// `pkg::`. Zero on every shape but an entry-shaped world, where it is the
+// second of the two guards (T0's dirty bit is the other) and the one no clock
+// or diagnostic can otherwise observe — a closure that stopped at its seed
+// would agree with every differential and still be wrong, which is what this
+// pins.
+thread_local! {
+    static ALIAS_REACHING_CENSUS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[doc(hidden)]
+pub fn alias_reaching_census() -> usize {
+    ALIAS_REACHING_CENSUS.with(std::cell::Cell::get)
+}
+
+// M77's count, and the load-proof half of its pin: how many rows
+// `build_impl_admission` banked in `carried` for the collision refusal to
+// read. It used to be one row per import STATEMENT in the whole program, std's
+// included, the moment any collision was banked; it is now only the statements
+// that carried a COLLIDING block's file, which is what the refusal asks about.
+// A count rather than a clock, because the difference on the M75 fixture sits
+// inside one tick of the `/proc` clock that pin reads.
+thread_local! {
+    static CARRIED_ROWS_CENSUS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[doc(hidden)]
+pub fn carried_rows_census() -> usize {
+    CARRIED_ROWS_CENSUS.with(std::cell::Cell::get)
 }
 
 // M19 T1b's own count, beside T0's census rather than inside it: how many of
@@ -55925,7 +56181,7 @@ struct World<'src> {
 #[derive(Clone, Copy)]
 struct PhaseMarks {
     started: crate::PhaseClock,
-    base: std::time::Duration,
+    base: crate::PhaseSpan,
 }
 
 impl PhaseMarks {
@@ -55934,7 +56190,7 @@ impl PhaseMarks {
     fn started_at(started: crate::PhaseClock) -> PhaseMarks {
         PhaseMarks {
             started,
-            base: std::time::Duration::ZERO,
+            base: crate::PhaseSpan::ZERO,
         }
     }
 }
@@ -56329,11 +56585,14 @@ fn analyze_inner<'src>(
         // hands back a byte-identical module prefix — so it is the only shape
         // the widened seam activates on.
         //
-        // M70: except for an entry-shaped world, which now hits too. Its
-        // modules resolve in the post-entry `build()` rather than before the
-        // store, so there is no record filed under this key and none to file —
-        // the store path withholds the key for the same reason.
-        let checks_key = (!world.entry_is_open_module).then(|| base_cache_key.clone());
+        // M70 left an entry-shaped world out of it: its modules resolve in the
+        // post-entry `build()` rather than before the store, so the record
+        // would be of checks the seam had not been proved to cover. M76 proves
+        // the covered part instead of withholding all of it — the reuse set
+        // for such a world is additionally narrowed by
+        // `Analyzer::alias_reaching_sources`, which is where that argument is
+        // written — so the key rides on both shapes now.
+        let checks_key = Some(base_cache_key.clone());
         return analyze_over_world(
             world, nodes, std, pkg_root, platform, workspace, checks_key, true,
         );
@@ -58385,14 +58644,13 @@ fn analyze_inner<'src>(
         pkg_root,
         platform,
         workspace,
-        // No key for an entry-shaped world, even though M70 now STORES one:
-        // M19's per-module records are of checks that ran over a RESOLVED
-        // world, and an open module's world resolves inside the post-entry
-        // `build()` — every analysis of it, hit or miss. Recording those as
-        // this key's is a claim the seam has not been proved to support, and a
-        // saving on top of a saving is the wrong place to take that risk
-        // (recorded as a follow-up on M70).
-        (base_cacheable && !entry_is_module && !entry_is_open_module).then_some(base_cache_key),
+        // M76: an entry-shaped world files its record too. M70 withheld the
+        // key because M19's records are of checks that ran over a RESOLVED
+        // world and an open module's resolves post-store; the narrowing in
+        // `Analyzer::alias_reaching_sources` is what closes that gap, and it
+        // narrows the READING side, so the record itself is filed the same way
+        // on both shapes.
+        (base_cacheable && !entry_is_module).then_some(base_cache_key),
         false,
     )
 }
@@ -58591,10 +58849,27 @@ fn analyze_over_world<'src>(
     // module's record for that world. No dependency graph, and sound in the
     // presence of §4's whole-program impl visibility, which an import-closure
     // key could not be.
+    //
+    // M76 adds a FOURTH term, and only for an entry-shaped world: the module
+    // must not reach the open file through `pkg::`. Such a world resolves
+    // post-store, so T0's dirty bit — which watches type slots — is no longer
+    // the whole guard; `alias_reaching_sources` is the other half, and
+    // together they are what let the record be filed for this shape at all
+    // (see that function).
+    let alias_reaching: HashSet<SourceId> = if entry_is_open_module && from_base_cache {
+        analyzer.alias_reaching_sources()
+    } else {
+        HashSet::default()
+    };
+    if !crate::macros::in_macro_world() {
+        ALIAS_REACHING_CENSUS.with(|census| census.set(alias_reaching.len()));
+    }
     let reuse_candidates: HashSet<SourceId> = if from_base_cache && !entry_is_module {
         (1..sources.len() as u32)
             .map(SourceId)
-            .filter(|source| !analyzer.entry_dirty_sources.contains(source))
+            .filter(|source| {
+                !analyzer.entry_dirty_sources.contains(source) && !alias_reaching.contains(source)
+            })
             .collect()
     } else {
         HashSet::default()
@@ -59660,11 +59935,11 @@ fn analyze_over_world<'src>(
     }
     if crate::phase_timing_enabled() && !crate::macros::in_macro_world() {
         eprintln!(
-            "[vilan phase] load+walk {:.1}ms base {:.1}ms build {:.1}ms checks {:.1}ms",
-            (phase_load_walk - phase_marks.base).as_secs_f64() * 1000.0,
-            phase_marks.base.as_secs_f64() * 1000.0,
-            phase_build.as_secs_f64() * 1000.0,
-            phase_checks.as_secs_f64() * 1000.0,
+            "[vilan phase] load+walk {} base {} build {} checks {}",
+            phase_load_walk - phase_marks.base,
+            phase_marks.base,
+            phase_build,
+            phase_checks,
         );
         // The macro worlds' row (M33). It is printed WHATEVER the count, zero
         // included: "this analysis compiled no macro worlds" is the fact a warm
@@ -59676,14 +59951,14 @@ fn analyze_over_world<'src>(
         // `dispatch-refine` does not sum with the buckets it explains.
         let worlds = crate::macros::world_phases();
         eprintln!(
-            "[vilan phase] macro-worlds {} load+walk {:.1}ms base {:.1}ms build {:.1}ms \
-             checks {:.1}ms post-passes {:.1}ms",
+            "[vilan phase] macro-worlds {} load+walk {} base {} build {} \
+             checks {} post-passes {}",
             worlds.compiled,
-            worlds.load_walk.as_secs_f64() * 1000.0,
-            worlds.base.as_secs_f64() * 1000.0,
-            worlds.build.as_secs_f64() * 1000.0,
-            worlds.checks.as_secs_f64() * 1000.0,
-            worlds.post.as_secs_f64() * 1000.0,
+            worlds.load_walk,
+            worlds.base,
+            worlds.build,
+            worlds.checks,
+            worlds.post,
         );
         // A second line rather than more fields on the first: N43 made those
         // labels honest and a reader parses them positionally. `reused` is how
@@ -59692,8 +59967,12 @@ fn analyze_over_world<'src>(
         // resolution moved a type slot in, which is the number T0 exists to
         // measure and the one that decides whether any of this pays.
         eprintln!(
-            "[vilan phase] reused {}/{} entry-dirty {} tables {}",
-            reuse_census.0, reuse_census.2, reuse_census.1, table_census,
+            "[vilan phase] reused {}/{} entry-dirty {} alias-reaching {} tables {}",
+            reuse_census.0,
+            reuse_census.2,
+            reuse_census.1,
+            alias_reaching_census(),
+            table_census,
         );
     }
 
@@ -59914,6 +60193,7 @@ fn analyze_over_world<'src>(
         lazy_argument_thunks: std::mem::take(&mut analyzer.lazy_argument_thunks),
         lazy_argument_forwards: std::mem::take(&mut analyzer.lazy_argument_forwards),
         lazy_cells: std::mem::take(&mut analyzer.lazy_cells),
+        lazy_eager_parameters: std::mem::take(&mut analyzer.lazy_eager_parameters),
         lazy_binding_initializers: std::mem::take(&mut analyzer.lazy_binding_initializers),
         lazy_thunk_effects: std::mem::take(&mut analyzer.lazy_thunk_effects),
         suspending_calls: HashSet::default(),
@@ -60132,6 +60412,35 @@ pub fn build_impl_admission(program: &mut Program) {
             references.entry((*source, *span)).or_insert(*definition);
         }
     }
+    // M77: and the SECOND product inside the same pass. `statement_sources`
+    // climbs each resolved segment's ancestor modules
+    // (`ancestor_module_sources`, `names.md` §4.1 — "a child pulls its
+    // parent"), and it found each one with
+    // `canonical_sources.iter().position(..)`: a linear scan of every loaded
+    // file, twice per level, per segment, per statement. M75's indexes took
+    // the collision x file x statement product out of the refusal and left
+    // this one — 60 ms of the large leg, following the whole program's
+    // statement count. One map, built once, answers a level in a probe; the
+    // FIRST index wins, which is what `position` answered.
+    let source_of_path: HashMap<&Path, SourceId> = {
+        let mut index: HashMap<&Path, SourceId> = HashMap::default();
+        for (position, path) in program.canonical_sources.iter().enumerate() {
+            index
+                .entry(path.as_path())
+                .or_insert(SourceId(position as u32));
+        }
+        index
+    };
+    // M77: the only sources the collision refusal ever asks `carried` about —
+    // `statement_for` looks up `collision.first_source` and
+    // `collision.second_source` and nothing else. A row carrying neither is a
+    // row nobody reads, and on a program with one collision that is almost
+    // every statement in it.
+    let colliding_sources: HashSet<SourceId> = program
+        .cross_module_collisions
+        .iter()
+        .flat_map(|collision| [collision.first_source, collision.second_source])
+        .collect();
     // Per (importing file, restricted file): the member ids the file's
     // selectors admitted out of that file. An entry's absence is "unrestricted".
     let mut restricted: HashMap<(SourceId, SourceId), HashSet<Id>> = HashMap::default();
@@ -60180,9 +60489,21 @@ pub fn build_impl_admission(program: &mut Program) {
         if !restricting.contains(&row.source) && collisions.is_empty() {
             continue;
         }
-        let sources = statement_sources(program, &references, row);
+        let sources = statement_sources(program, &references, &source_of_path, row);
         if !collisions.is_empty() {
-            carried.push((row.source, row.span, sources.clone()));
+            // M77: only a COLLIDING block's file can be asked for, so only
+            // those are kept — and a statement that carried none of them
+            // contributes no row at all, which is what takes `carried` from
+            // one row per import statement in the whole program down to the
+            // handful the refusal reads.
+            let carried_sources: Vec<SourceId> = sources
+                .iter()
+                .copied()
+                .filter(|source| colliding_sources.contains(source))
+                .collect();
+            if !carried_sources.is_empty() {
+                carried.push((row.source, row.span, carried_sources));
+            }
         }
         if !restricting.contains(&row.source) {
             continue;
@@ -60331,6 +60652,7 @@ pub fn build_impl_admission(program: &mut Program) {
         hidden,
         reached,
     };
+    CARRIED_ROWS_CENSUS.with(|census| census.set(carried.len()));
     if !collisions.is_empty() {
         refuse_imported_member_collisions(program, &collisions, &carried);
     }
@@ -60880,6 +61202,7 @@ pub fn check_call_site_admission(program: &mut Program) {
 fn statement_sources(
     program: &Program,
     references: &HashMap<(SourceId, Span), Id>,
+    source_of_path: &HashMap<&Path, SourceId>,
     restriction: &ImportImplRestriction,
 ) -> Vec<SourceId> {
     let mut sources: Vec<SourceId> = Vec::new();
@@ -60893,7 +61216,9 @@ fn statement_sources(
         if home != restriction.source && !sources.contains(&home) {
             sources.push(home);
         }
-        for ancestor in ancestor_module_sources(program, home, restriction.path_spans.len()) {
+        for ancestor in
+            ancestor_module_sources(program, source_of_path, home, restriction.path_spans.len())
+        {
             if ancestor != restriction.source && !sources.contains(&ancestor) {
                 sources.push(ancestor);
             }
@@ -60920,7 +61245,12 @@ fn statement_sources(
 /// Bounded by the statement's own segment count: a walk that keeps climbing
 /// would eventually reach a package's entry file, which no import of a module
 /// under it loads.
-fn ancestor_module_sources(program: &Program, source: SourceId, bound: usize) -> Vec<SourceId> {
+fn ancestor_module_sources(
+    program: &Program,
+    source_of_path: &HashMap<&Path, SourceId>,
+    source: SourceId,
+    bound: usize,
+) -> Vec<SourceId> {
     let mut found = Vec::new();
     let Some(start) = program.canonical_sources.get(source.0 as usize) else {
         return found;
@@ -60943,16 +61273,17 @@ fn ancestor_module_sources(program: &Program, source: SourceId, bound: usize) ->
             directory.to_path_buf()
         };
         let candidates = [home.with_extension("vl"), home.join("lib.vl")];
+        // M77: a probe per candidate rather than a scan of every loaded file.
+        // The map keeps the FIRST index for a path, which is what `position`
+        // answered when two sources canonicalized the same way.
         let Some((index, hit)) = candidates.iter().find_map(|candidate| {
-            program
-                .canonical_sources
-                .iter()
-                .position(|loaded| loaded == candidate)
-                .map(|index| (index, candidate.clone()))
+            source_of_path
+                .get(candidate.as_path())
+                .map(|source| (*source, candidate.clone()))
         }) else {
             break;
         };
-        found.push(SourceId(index as u32));
+        found.push(index);
         current = hit;
     }
     found

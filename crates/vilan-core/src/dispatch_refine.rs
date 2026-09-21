@@ -86,7 +86,7 @@ thread_local! {
     /// Thread-local for that same reason: an analysis is single-threaded, and
     /// plain `cargo test` runs analyses concurrently in one process.
     static SELECTION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Total wall spent inside [`refined_edges`] on this thread since
+    /// Total wall AND CPU spent inside [`refined_edges`] on this thread since
     /// [`reset_refine_time`] — the `dispatch-refine` bucket of the
     /// `VILAN_PHASE_TIMING` post-pass line (N43).
     ///
@@ -98,8 +98,8 @@ thread_local! {
     /// sites, is what makes the shared constant readable from the line.
     /// Accumulated unconditionally, like the const pass's own sub-split: two
     /// clock reads per call are noise next to a program-wide scan.
-    static REFINE_TIME: std::cell::Cell<std::time::Duration> =
-        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+    static REFINE_TIME: std::cell::Cell<crate::PhaseSpan> =
+        const { std::cell::Cell::new(crate::PhaseSpan::ZERO) };
 }
 
 /// The number of impl selections [`refined_edges`] has evaluated on this
@@ -115,14 +115,14 @@ pub fn reset_selection_count() {
 
 /// How long this thread has spent inside [`refined_edges`] since the last
 /// [`reset_refine_time`]. See [`REFINE_TIME`].
-pub(crate) fn refine_time() -> std::time::Duration {
+pub(crate) fn refine_time() -> crate::PhaseSpan {
     REFINE_TIME.with(std::cell::Cell::get)
 }
 
 /// Zeroes this thread's [`refine_time`] — called once per analysis, at the
 /// top of `post_analysis_passes`, which is where both call sites live.
 pub(crate) fn reset_refine_time() {
-    REFINE_TIME.with(|time| time.set(std::time::Duration::ZERO));
+    REFINE_TIME.with(|time| time.set(crate::PhaseSpan::ZERO));
 }
 
 /// The trait-member name a call's dispatch record names, when the call also

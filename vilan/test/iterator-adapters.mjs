@@ -8,27 +8,8 @@ function __clone(value) {
 	if (value instanceof Map) return new Map([ ...value ].map(([ k, v ]) => [ __clone(k), __clone(v) ]));
 	return value;
 }
-function __force(cell) {
-	if (cell.state === 2) return cell.value;
-	if (cell.state === 1) throw "lazy initialization cycle: `" + cell.name + "`";
-	if (cell.state === 3) throw "lazy `" + cell.name + "` is poisoned: its initializer panicked: " + cell.value;
-	cell.state = 1;
-	try {
-		cell.value = cell.thunk();
-	} catch (failure) {
-		cell.state = 3;
-		cell.value = failure;
-		throw failure;
-	}
-	cell.state = 2;
-	cell.thunk = null;
-	return cell.value;
-}
 function __hash(value) {
 	return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
-}
-function __lazy(name, thunk) {
-	return { name: name, state: 0, value: undefined, thunk: thunk };
 }
 function __map_get(map, key) {
 	return map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];
@@ -184,22 +165,11 @@ function $A(self, predicate) {
 function $E(self, other) {
 	return [ self, __clone(other) ];
 }
-function $I(self) {
-	let $J = null;
-	if (self[1] < self[0].length) {
-		const value = __clone(__at(self[0], self[1]));
-		self[1] = self[1] + 1;
-		$J = [ 0, value ];
-	} else {
-		$J = [ 1 ];
-	}
-	return $J;
-}
 function $F(self) {
 	const $H = next(self[0]);
 	let $L = null;
 	if ($H[0] === 0) {
-		const $K = $I(self[1]);
+		const $K = $k(self[1]);
 		if ($K[0] === 0) {
 			return [ 0, [ $H[1], $K[1] ] ];
 		}
@@ -238,7 +208,7 @@ function $U(self) {
 	return [ self, 0 ];
 }
 function $V(self) {
-	const $W = $I(self[0]);
+	const $W = $k(self[0]);
 	if ($W[0] === 0) {
 		const index = self[1];
 		self[1] = index + 1;
@@ -340,7 +310,7 @@ function $at(self) {
 	return self[0].size;
 }
 function $aw(self) {
-	const $ax = $I(self[0]);
+	const $ax = $k(self[0]);
 	if ($ax[0] === 0) {
 		return [ 0, self[1]($ax[1]) ];
 	}
@@ -391,7 +361,7 @@ function $aG(self, fallback) {
 		const x = __clone($aH[1]);
 		$aI = x;
 	} else {
-		$aI = __clone(__force(fallback));
+		$aI = __clone(fallback);
 	}
 	return $aI;
 }
@@ -456,9 +426,7 @@ console.log($at($aq($an($b($a([ 1, 2, 2, 3 ]), (n) => {
 const lengths = $aA($av($c($a([ "alpha", "hi" ]), (word) => {
 	return [ word, word.length ];
 })));
-console.log($aG($aD(lengths, "hi"), __lazy("fallback", () => {
-	return -(1);
-})));
+console.log($aG($aD(lengths, "hi"), -(1)));
 let live = [ 1, 2 ];
 let cursor = $a(live);
 live.push(3);

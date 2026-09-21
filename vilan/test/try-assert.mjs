@@ -111,17 +111,6 @@ function $c(self, fallback) {
 	}
 	return $e;
 }
-function $w(self, fallback) {
-	const $x = self;
-	let $y = null;
-	if ($x[0] === 0) {
-		const x = __clone($x[1]);
-		$y = x;
-	} else {
-		$y = __clone(__force(fallback));
-	}
-	return $y;
-}
 console.log($c(doubled("hit"), __lazy("fallback", () => {
 	return 0 - 1;
 })));
@@ -171,6 +160,6 @@ $u;
 const a = 1;
 const b = 2;
 console.log(a !== b);
-console.log($w(is_twenty_one(), __lazy("fallback", () => {
+console.log($c(is_twenty_one(), __lazy("fallback", () => {
 	return false;
 })));

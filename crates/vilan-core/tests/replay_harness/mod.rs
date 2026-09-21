@@ -35,7 +35,9 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use vilan_core::{BuildOptions, PackageSpec, Platform, Workspace, analyze_source, transform};
+use vilan_core::{
+    BuildOptions, EntryMode, PackageSpec, Platform, Workspace, analyze_source, transform,
+};
 
 pub fn std_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std")
@@ -196,4 +198,124 @@ pub fn observe_in_package(
 pub fn warm_pair(pkg_root: &Path, entry_path: &Path) -> ReuseObservation {
     let _ = observe_in_package(pkg_root, entry_path, module_entry(1));
     observe_in_package(pkg_root, entry_path, module_entry(2))
+}
+
+// --- The ENTRY-SHAPED shape (M76) ----------------------------------------
+//
+// M70 gave the base cache a second SHAPE: a module a front end opened AS the
+// entry, whose own package imports it back, so `pkg::<entry>` aliases the
+// entry's scope and the world is stored UNRESOLVED. M76 files that shape's
+// checks record too, and the only thing that can hold the claim is the same
+// differential — replay must equal re-derivation over an entry-shaped world
+// exactly as it does over a resolved one.
+//
+// The fixture is THREE package files, and each is load-bearing:
+//
+//   opened.vl  the entry, handed to the analysis as a file; imports `ring`
+//   ring.vl    imports `pkg::opened` — which is what MAKES the world
+//              entry-shaped — and `pkg::probe`
+//   probe.vl   carries the Class A diagnostics, and is the module the record
+//              is actually read for
+//
+// `ring.vl` reaches the alias, so M76's narrowing holds it back; `probe.vl`
+// does not, so it is reusable. A two-file fixture could not tell those apart
+// — the only reusable module would have been std, whose diagnostics are known
+// absent anyway, and the replay half would have been vacuous.
+
+/// One entry-shaped package. Returns the directory (the caller removes it) and
+/// the OPENED file's path.
+pub fn write_open_module_package(name: &str, probe_source: &str) -> (PathBuf, PathBuf) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let directory = crate::scratch::root().join(format!(
+        "vilan_m76_open_{name}_{}_{unique}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("create the package directory");
+    std::fs::write(directory.join("probe.vl"), probe_source).expect("write the probe module");
+    std::fs::write(
+        directory.join("ring.vl"),
+        "import pkg::opened;\nimport pkg::probe;\n",
+    )
+    .expect("write the ring module");
+    let opened = directory.join("opened.vl");
+    // On disk as well as in the buffer: `pkg::opened` has to RESOLVE to a file
+    // before the loader can recognize it as the entry and alias it.
+    std::fs::write(&opened, open_module_entry(0)).expect("write the opened module");
+    (directory, opened)
+}
+
+/// The opened file's own text — held fixed except for the digit, which is the
+/// keystroke.
+pub fn open_module_entry(revision: u32) -> String {
+    format!("import pkg::ring;\n\nfun opened_probe(): i32 {{\n\t{revision}\n}}\n")
+}
+
+/// The workspace an editor hands over for a file it opened: file mode, no
+/// declared programs (so `pkg::opened` is importable — B239).
+pub fn open_file_workspace() -> Workspace {
+    Workspace {
+        entry_mode: EntryMode::OpenFile {
+            declared_entries: Vec::new(),
+        },
+        ..Workspace::default()
+    }
+}
+
+pub fn observe_open_module(
+    pkg_root: &Path,
+    entry_path: &Path,
+    entry_source: String,
+) -> ReuseObservation {
+    refuse_a_manifest_directory(pkg_root);
+    let pkg_root = pkg_root.to_path_buf();
+    let entry_path = entry_path.to_path_buf();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(entry_source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                &pkg_root,
+                &entry_path,
+                Some(Platform::default()),
+                &open_file_workspace(),
+            );
+            let diagnostics = format!("{errors:?}");
+            let warnings = program
+                .as_ref()
+                .map(|program| {
+                    format!(
+                        "{:?}#{:?}#{:?}",
+                        program.warnings, program.warning_sources, program.diagnostic_sources
+                    )
+                })
+                .unwrap_or_default();
+            let javascript = match program {
+                Some(program) if errors.is_empty() => {
+                    transform(&program, &BuildOptions::default()).ok()
+                }
+                _ => None,
+            };
+            (
+                diagnostics,
+                warnings,
+                javascript,
+                vilan_core::analyzer::reuse_census(),
+            )
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+/// A warm pair over one entry-shaped package: analysis 1 stores the world and
+/// records its modules' checks, analysis 2 hits it and — unless reuse is off —
+/// replays them. The SECOND observation is the one compared.
+pub fn warm_open_pair(pkg_root: &Path, entry_path: &Path) -> ReuseObservation {
+    let _ = observe_open_module(pkg_root, entry_path, open_module_entry(1));
+    observe_open_module(pkg_root, entry_path, open_module_entry(2))
 }

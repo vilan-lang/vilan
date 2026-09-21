@@ -925,27 +925,26 @@ pub fn post_analysis_passes(
         macros::world_phases_record_post(phase_post_start.elapsed());
     }
     if phase_timing_enabled() && !macros::in_macro_world() {
-        let milliseconds = |duration: std::time::Duration| duration.as_secs_f64() * 1000.0;
         let (const_lower, const_interp) = const_eval::phase_split();
         eprintln!(
-            "[vilan phase] post-passes {:.1}ms contexts+graph {:.1}ms async-infer {:.1}ms \
-             view-suspensions {:.1}ms async-drops {:.1}ms context-drops {:.1}ms \
-             platform-color {:.1}ms const-pass {:.1}ms const-lower {:.1}ms \
-             const-interp {:.1}ms const-fuel-max {} init-order {:.1}ms \
-             dispatch-refine {:.1}ms",
-            milliseconds(phase_post_start.elapsed()),
-            milliseconds(phase_contexts),
-            milliseconds(phase_async),
-            milliseconds(phase_views),
-            milliseconds(phase_async_drops),
-            milliseconds(phase_context_drops),
-            milliseconds(phase_platform),
-            milliseconds(phase_const),
-            milliseconds(const_lower),
-            milliseconds(const_interp),
+            "[vilan phase] post-passes {} contexts+graph {} async-infer {} \
+             view-suspensions {} async-drops {} context-drops {} \
+             platform-color {} const-pass {} const-lower {} \
+             const-interp {} const-fuel-max {} init-order {} \
+             dispatch-refine {}",
+            phase_post_start.elapsed(),
+            phase_contexts,
+            phase_async,
+            phase_views,
+            phase_async_drops,
+            phase_context_drops,
+            phase_platform,
+            phase_const,
+            const_lower,
+            const_interp,
             const_eval::max_fuel_used(),
-            milliseconds(phase_init),
-            milliseconds(dispatch_refine::refine_time()),
+            phase_init,
+            dispatch_refine::refine_time(),
         );
     }
     // The depth line (B138), after the last pass that recurses: macro worlds
@@ -984,6 +983,165 @@ pub(crate) fn leak_report_enabled() -> bool {
     })
 }
 
+/// The thread CPU clock the phase marks read beside the wall (backlog M78).
+///
+/// THREAD, not process: every phase these marks bracket is single-threaded
+/// (the analyzer, the transformer, the const interpreter, and a macro world,
+/// which is a nested analysis on this same thread), and an analysis runs on
+/// its own spawned thread — so the thread clock is both the tightest bracket
+/// available and immune to what the rest of the box is doing to the load
+/// average, which is the whole reason M78 exists.
+///
+/// Declared rather than depended on: `vilan-core`'s four dependencies are a
+/// deliberate list and `libc` is not on it — the language server, which does
+/// depend on it, holds the same reader for its own request clocks
+/// (`keystroke::gate::thread_cpu_now`). `clock_gettime` is in libc, which is
+/// linked into every Linux build already, so this costs no dependency edge,
+/// no notices row and no audit. Linux and LP64 only, because that is where
+/// the two ABI facts below are facts; everywhere else the clock DECLINES and
+/// the phase line prints `?cpu` rather than a zero pretending to be a
+/// measurement.
+///
+/// Measured on the development host: ~0.6 µs per call with ~0.8 µs of
+/// resolution — against `/proc/thread-self/schedstat`, whose
+/// `sum_exec_runtime` advances only at the scheduler tick (4 ms here, which
+/// made every sub-tick stage read either 0.0 or one whole tick).
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+fn thread_cpu_now() -> Option<std::time::Duration> {
+    /// `struct timespec` as every LP64 Linux ABI lays it out: `time_t` and
+    /// `long`, both 64-bit signed.
+    #[repr(C)]
+    struct Timespec {
+        seconds: i64,
+        nanoseconds: i64,
+    }
+
+    /// `CLOCK_THREAD_CPUTIME_ID`, `include/uapi/linux/time.h` — part of the
+    /// kernel's stable ABI, the same constant glibc and musl both re-export.
+    const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+
+    unsafe extern "C" {
+        fn clock_gettime(clock_id: i32, timespec: *mut Timespec) -> i32;
+    }
+
+    let mut timespec = Timespec {
+        seconds: 0,
+        nanoseconds: 0,
+    };
+    // SAFETY: `clock_gettime` writes the `timespec` it is handed and reads
+    // nothing else; the pointer is to a live local of the correct layout, and
+    // the return code is checked before the value is believed.
+    let result = unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &raw mut timespec) };
+    (result == 0).then(|| {
+        std::time::Duration::new(
+            timespec.seconds.max(0) as u64,
+            timespec.nanoseconds.clamp(0, 999_999_999) as u32,
+        )
+    })
+}
+
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+fn thread_cpu_now() -> Option<std::time::Duration> {
+    None
+}
+
+/// Whether this host exposes the thread CPU clock the phase line's `cpu`
+/// figures are taken on. Read once and cached, like the switch itself.
+///
+/// It answers the question "is the clock there", not "does it advance": the
+/// compiler is the wrong place to burn CPU proving the second. The PIN does
+/// that — it reads the line and DECLINES on a host whose figures stay at zero
+/// under work it knows costs CPU.
+pub fn phase_cpu_clock_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| thread_cpu_now().is_some())
+}
+
+/// The CPU reading a phase mark takes, or zero when the instrument is off.
+///
+/// Gated on the switch because the marks in [`post_analysis_passes`] and the
+/// const pass's per-site sub-split are UNCONDITIONAL — one cached `bool` load
+/// is the price of the instrument being off, and a `/proc` read per const site
+/// would not be.
+fn phase_cpu_mark() -> std::time::Duration {
+    if !phase_timing_enabled() {
+        return std::time::Duration::ZERO;
+    }
+    thread_cpu_now().unwrap_or(std::time::Duration::ZERO)
+}
+
+/// One phase's cost on BOTH clocks: the wall it took and the CPU it burned
+/// (backlog M78).
+///
+/// Every `[vilan phase]` figure used to be wall alone, so under load it was a
+/// SHARE and never an absolute — M73's stage split had to be reported as
+/// percentages for exactly that reason, and E121's ledger could take no
+/// absolute figure on a box with nine other lanes on it. Both numbers print,
+/// `wall/cpu`, because both are wanted: wall is what a user waits, CPU is what
+/// the work costs, and the gap between them is the load.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhaseSpan {
+    pub wall: std::time::Duration,
+    pub cpu: std::time::Duration,
+}
+
+impl PhaseSpan {
+    pub const ZERO: PhaseSpan = PhaseSpan {
+        wall: std::time::Duration::ZERO,
+        cpu: std::time::Duration::ZERO,
+    };
+}
+
+impl std::ops::Add for PhaseSpan {
+    type Output = PhaseSpan;
+
+    fn add(self, other: PhaseSpan) -> PhaseSpan {
+        PhaseSpan {
+            wall: self.wall + other.wall,
+            cpu: self.cpu + other.cpu,
+        }
+    }
+}
+
+impl std::ops::AddAssign for PhaseSpan {
+    fn add_assign(&mut self, other: PhaseSpan) {
+        *self = *self + other;
+    }
+}
+
+/// SATURATING, and deliberately: `load+walk` is printed as the whole
+/// pre-build span MINUS the base-cache leg, and a base-cache HIT once left a
+/// cold `base` to be subtracted from a warm span — the `Duration` underflow
+/// panicked inside `analyze_source`'s fence and turned every analysis after
+/// the first into `None` (`tests/phase_timing.rs` is that regression's pin).
+/// An instrument may print a zero; it may not eat the program.
+impl std::ops::Sub for PhaseSpan {
+    type Output = PhaseSpan;
+
+    fn sub(self, other: PhaseSpan) -> PhaseSpan {
+        PhaseSpan {
+            wall: self.wall.saturating_sub(other.wall),
+            cpu: self.cpu.saturating_sub(other.cpu),
+        }
+    }
+}
+
+/// `460.7ms/455.1cpu` — the wall figure with the CPU beside it, one token so
+/// a reader (and the positional parsers in `macro_world_phase.rs`) still finds
+/// the name and its number at a fixed offset. `?cpu` where the host has no
+/// thread CPU clock: a missing measurement says so rather than reading zero.
+impl std::fmt::Display for PhaseSpan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let milliseconds = |duration: std::time::Duration| duration.as_secs_f64() * 1000.0;
+        write!(formatter, "{:.1}ms/", milliseconds(self.wall))?;
+        if phase_cpu_clock_available() {
+            write!(formatter, "{:.1}cpu", milliseconds(self.cpu))
+        } else {
+            write!(formatter, "?cpu")
+        }
+    }
+}
+
 /// Whether `VILAN_PHASE_TIMING` asks for the per-analysis phase line (any
 /// value but empty or `0`) — the std-tax arc's instrument
 /// (proposal/analysis-reuse.md §6): one stderr line per analysis splitting
@@ -996,27 +1154,29 @@ pub(crate) fn leak_report_enabled() -> bool {
 /// crashed on its first compile. The smoke gate caught it pre-publish; this
 /// keeps the instrument for hosts and makes wasm report zeros.
 #[derive(Clone, Copy)]
-pub(crate) struct PhaseClock {
+pub struct PhaseClock {
     #[cfg(not(target_arch = "wasm32"))]
     started: std::time::Instant,
+    cpu_started: std::time::Duration,
 }
 
 impl PhaseClock {
-    pub(crate) fn now() -> Self {
+    pub fn now() -> Self {
         PhaseClock {
             #[cfg(not(target_arch = "wasm32"))]
             started: std::time::Instant::now(),
+            cpu_started: phase_cpu_mark(),
         }
     }
 
-    pub(crate) fn elapsed(&self) -> std::time::Duration {
+    pub fn elapsed(&self) -> PhaseSpan {
         #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.started.elapsed()
-        }
+        let wall = self.started.elapsed();
         #[cfg(target_arch = "wasm32")]
-        {
-            std::time::Duration::ZERO
+        let wall = std::time::Duration::ZERO;
+        PhaseSpan {
+            wall,
+            cpu: phase_cpu_mark().saturating_sub(self.cpu_started),
         }
     }
 }
