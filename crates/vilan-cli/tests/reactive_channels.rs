@@ -2712,3 +2712,109 @@ fn an_unleased_mirrors_first_lease_is_its_mint_and_a_failed_one_retries() {
         "the unleased mint went differently:\n{stdout}"
     );
 }
+
+// --- A114: a counted mirror lease is the RUN's, not the boundary's ----------
+
+/// `scoped_effect` over the one subscription in the system that costs a network
+/// frame (tracker A114): a `RemoteSource` lease. The link counts `Subscribe` and
+/// `Unsubscribe` frames going up, so "released at the run's end" is a fact about
+/// the wire rather than about a count in the client.
+///
+/// The control is a plain `effect` in the same program shape, run by hand: it
+/// reads `up=1 down=0` at every step, because all three leases are the
+/// BOUNDARY's and the channel is opened once and closed once — and after three
+/// runs one update reaches THREE observers (`run 0 sees 5`, `run 1 sees 5`,
+/// `run 2 sees 5`) instead of one. That is the accumulation `scoped_effect`
+/// exists to stop, and it is what makes `run 2 sees 5` on its own the load-
+/// bearing line here.
+const A114_SCOPED_LEASE: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::reactive::{ Disposable, Owner, Signal, SignalCell, Source, run_with_owner };
+import std::rpc::{ DuplexEnd, ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
+import std::shared::Shared;
+import std::wire::Frame;
+
+fun frame_text(frame: Frame): str {
+	match frame {
+		Frame::Text(let value) => value,
+		Frame::Binary(let _bytes) => "",
+	}
+}
+
+fun counting_link(subscribes: Shared<i32>, unsubscribes: Shared<i32>): (DuplexEnd, DuplexEnd) {
+	let (client_end, client_relay) = duplex_pair();
+	let (server_end, server_relay) = duplex_pair();
+	client_relay.on_frame(|frame| {
+		let text = frame_text(frame);
+		if text.contains("Unsubscribe") {
+			unsubscribes.write() = unsubscribes.read() + 1;
+		} else if text.contains("Subscribe") {
+			subscribes.write() = subscribes.read() + 1;
+		}
+		server_relay.send(frame);
+	});
+	server_relay.on_frame(|frame| client_relay.send(frame));
+	(client_end, server_end)
+}
+
+fun main() {
+	let subscribes: Shared<i32> = Shared::new(0);
+	let unsubscribes: Shared<i32> = Shared::new(0);
+	let (client_end, server_end) = counting_link(subscribes, unsubscribes);
+	let session = ReactiveServer::new(server_end, json_codec());
+	let client = ReactiveClient::new(client_end, json_codec());
+	let cell: SignalCell<i32> = Signal::new(1);
+	let channel = session.expose(cell);
+	let mirror: RemoteSource<i32> = client.source(channel);
+
+	let key: SignalCell<i32> = Signal::new(0);
+	let boundary = Owner::new();
+	run_with_owner(boundary, || {
+		key.scoped_effect(|run: i32| {
+			mirror.effect(|value: Option<i32>| {
+				print(i"run {run} sees {value.unwrap_or(0)}");
+			});
+		});
+	});
+	print(i"first up={subscribes.read()} down={unsubscribes.read()}");
+	key.set(1);
+	print(i"second up={subscribes.read()} down={unsubscribes.read()}");
+	key.set(2);
+	print(i"third up={subscribes.read()} down={unsubscribes.read()}");
+	// ONE observer is live after three runs, not three: the previous runs'
+	// leases were released with their owners.
+	cell.set(5);
+	boundary.dispose();
+	print(i"disposed up={subscribes.read()} down={unsubscribes.read()}");
+	cell.set(9);
+	print("done");
+}
+"#;
+
+#[test]
+fn a114_a_mirror_lease_taken_in_a_scoped_effect_is_released_at_the_runs_end() {
+    let stdout = run_program("a114_scoped_lease", A114_SCOPED_LEASE);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            // Run 0 takes the lease: one `Subscribe` on the wire.
+            "run 0 sees 1",
+            "first up=1 down=0",
+            // Run 1 replaces it: run 0's lease is released as its owner goes,
+            // and the new run takes its own.
+            "run 1 sees 1",
+            "second up=2 down=1",
+            "run 2 sees 1",
+            "third up=3 down=2",
+            // ONE observer is live after three runs. A plain `effect` prints
+            // three lines here.
+            "run 2 sees 5",
+            // The boundary releases the last run's lease: three up, three down.
+            "disposed up=3 down=3",
+            "done",
+        ],
+        "a mirror lease taken inside a scoped effect must be released when that \
+         run ends, and the last one by the boundary; got:\n{stdout}"
+    );
+}

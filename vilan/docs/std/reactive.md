@@ -21,7 +21,7 @@ import std::reactive::{
 
 | Item | Kind | One line |
 |---|---|---|
-| `Source<T>` | trait | anything readable + subscribable (requires `get`/`on_change`; `sub`/`effect`/`effect_on_change`/`map` are defaults) |
+| `Source<T>` | trait | anything readable + subscribable (requires `get`/`on_change`; `sub`/`effect`/`effect_on_change`/`scoped_effect`/`scoped_effect_on_change`/`map` are defaults) |
 | `Signal<T>` | trait | the writable half (`set`/`notify`/`set_with`); `Source` is its supertrait |
 | `SignalCell<T>` | struct | the canonical cell — mutable value plus subscribers |
 | `MaybeSignal<T>` | trait | a component value that may be static OR reactive |
@@ -29,6 +29,7 @@ import std::reactive::{
 | `combine` | fn | tuple-signal over 2+ signals |
 | `selector`, `Selector<T>` | fn/struct | per-key selection: one subscription, two writes per change |
 | `Owner` | struct | disposal bag; the lifetime unit |
+| `on_cleanup` | fn | run a cleanup when the ambient owner is released |
 | `run_with_owner`, `comp`, `get_owner`, `owner_scope` | fns/context | establish/read the ambient owner |
 | `turn`, `batch`, `flush`, `at_settle`, `FlushPolicy`, `turn_scope` | fns/context | write batching |
 | `optimistic` | fn | paint → commit → confirm-or-rollback (one shot) |
@@ -222,6 +223,8 @@ trait Source<T> {
 	fun sub(self, observer: |T| void): Subscription         // default; + one immediate call
 	fun effect_on_change(self, observer: |T| void)          // default; owner-registered
 	fun effect(self, observer: |T| void)                    // default; owner-registered, eager
+	fun scoped_effect(self, body: (sync |T| void) context owner_scope)
+	fun scoped_effect_on_change(self, body: (sync |T| void) context owner_scope)
 	fun map<U>(self, transform: sync |T| U): SignalCell<U>  // default; derived signal
 }
 ```
@@ -300,6 +303,60 @@ alike. `ReactiveServer`'s `expose` is generic the same way, and so are the
 its own `set` drives them. `Optimistic::over` takes any `Signal<T>` too — the
 cell STORES it in a field, and a field must name a real type, so the cell names
 it: `Optimistic<T, S>` carries the signal's type as a second parameter.
+
+### scoped_effect — an owner per run
+
+```vilan,fragment
+fun scoped_effect(self, body: (sync |T| void) context owner_scope)
+fun scoped_effect_on_change(self, body: (sync |T| void) context owner_scope)
+fun on_cleanup(cleanup: || void)
+```
+
+`effect`, except that **every run gets its own `Owner`**. Whatever the body
+registers — an `on_cleanup`, a nested `effect` or `map`, an `owner.take`, a
+mirror's lease — is released before the next run, and when the enclosing
+boundary goes.
+
+A plain `effect` body that subscribes to something accumulates one subscription
+per change for as long as the boundary lives. That is usually what you want for
+a body that only reads and writes; it is never what you want for a body that
+opens something:
+
+```vilan
+import std::reactive::{ Owner, Signal, SignalCell, Source, on_cleanup, run_with_owner };
+
+fun main() {
+	let selected = Signal::new(1);
+	let detail = Signal::new("loading");
+	let page = Owner::new();
+	run_with_owner(page, || {
+		// One subscription on `detail` at a time, not one per selection.
+		selected.scoped_effect(|id: i32| {
+			on_cleanup(|| print(i"closing {id}"));
+			detail.effect(|text: str| print(i"{id}: {text}"));
+		});
+	});
+	selected.set(2);   // closing 1, then the new run subscribes
+	page.dispose();    // closing 2
+}
+```
+
+`on_cleanup(cleanup)` is `get_owner().defer(cleanup)` under a name, and it is
+**one name whose meaning the ambient owner decides**: inside a `scoped_effect`
+the ambient owner is that run's, so the cleanup runs per run; inside any other
+boundary — a mounted view, a `swap` instantiation, an `each` row — it is the
+boundary's, so it runs once, at teardown. Like `effect`, it requires an
+enclosing owner *statically*: a cleanup with nothing in scope to run it is a
+compile error, not a silent no-op.
+
+The order inside a run is: release the previous run, install the fresh owner,
+call the body. So a body that throws has already had its owner installed, and
+what it registered before throwing is released by the next run (or by the
+boundary).
+
+`swap`, `when` and `each` are **not** built on this — they keep their own
+per-instantiation owners. Reach for `scoped_effect` when you want that lifetime
+without a view.
 
 ## selector — per-key selection
 
@@ -503,6 +560,7 @@ impl Owner with Disposable {
 
 let owner_scope: Context<Owner>
 fun get_owner(): Owner                                        // read the ambient owner
+fun on_cleanup(cleanup: || void)                              // = get_owner().defer(..)
 fun run_with_owner<T>(owner: Owner, body: (sync || T) context owner_scope): T
 fun comp<T>(body: (sync || T) context owner_scope): (T, Owner)     // fresh owner + result
 ```

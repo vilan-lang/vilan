@@ -902,6 +902,68 @@ export fun defer_to_owner(cleanup: || void) {
 	}
 }
 
+/// Run `cleanup` when the ambient owner is released — `get_owner().defer(..)`
+/// as a free function (tracker A114, R2).
+///
+/// ONE NAME, and the AMBIENT OWNER decides what it means. Inside a
+/// `scoped_effect` the ambient owner is that RUN's, so the cleanup runs before
+/// the next run and once more when the enclosing boundary goes: the per-run
+/// hook A113 row 4 recorded as missing. Inside any other boundary — a mounted
+/// view, a `swap` instantiation, an `each` row — it is the boundary's, so it
+/// runs once, at teardown. That is not two rules; it is `Owner::defer`, reached
+/// without having to name the owner.
+///
+/// STRICT, like `effect` and unlike `defer_to_owner`: no ambient owner is a
+/// COMPILE error. A cleanup silently dropped because nothing was in scope to
+/// run it is the defect this exists to prevent, so "there is no owner" may not
+/// be a runtime no-op.
+export fun on_cleanup(cleanup: || void) {
+	get_owner().defer(cleanup);
+}
+
+/// The per-run owner machinery the two scoped forms share (A114): a cell
+/// holding the CURRENT run's owner, and an observer that releases it before
+/// making the next one.
+///
+/// A function returning the observer rather than a body duplicated into both
+/// trait defaults, because the two differ only in which eager/lazy member they
+/// hand it to — `scoped_effect` is `effect`, `scoped_effect_on_change` is
+/// `effect_on_change`, exactly as `sub` is `on_change` plus one call.
+///
+/// `body` is INJECTED (`context owner_scope`), not captured: it is a literal at
+/// the user's call site, born before the run's owner exists, so
+/// capture-at-creation would hand it the BOUNDARY's owner and the whole point
+/// would be lost. `run_with_owner` supplies the run's owner to it instead
+/// (proposal/ambient-owner.md §5).
+///
+/// The LAST run's owner is released by the enclosing boundary, through
+/// `on_cleanup` — which is this function's own ambient owner, the boundary's,
+/// read where `scoped_runner` is CALLED. Without it the final run's
+/// registrations would outlive the effect, which is the leak the form exists to
+/// close.
+fun scoped_runner<T>(body: (sync |T| void) context owner_scope): |T| void {
+	let current: Shared<Option<Owner>> = Shared::new(None);
+	on_cleanup(|| {
+		match current.read() {
+			Some(let last) => last.dispose(),
+			None => {},
+		}
+		current.write() = None;
+	});
+	|value: T| {
+		// Release BEFORE building: the contract is that a run's registrations
+		// are gone before the next run starts, so a timer the last run armed
+		// cannot fire against this one's state.
+		match current.read() {
+			Some(let previous) => previous.dispose(),
+			None => {},
+		}
+		let fresh = Owner::new();
+		current.write() = Some(fresh);
+		run_with_owner(fresh, || body(value));
+	}
+}
+
 /// Establish `owner` as the ambient owner for the dynamic extent of `body` —
 /// the plain-function wrapper, made possible by the `context` clause
 /// (proposal/ambient-owner.md §5): `body` is an INJECTED closure, deferring
@@ -994,6 +1056,36 @@ export trait Source<T> {
 	fun effect(self, observer: |T| void) {
 		self.effect_on_change(observer);
 		observer(self.get());
+	}
+
+	/// `effect`, with an OWNER PER RUN (tracker A114): whatever `body`
+	/// registers — an `on_cleanup`, a nested `effect`/`map`, a `take`, a
+	/// mirror's lease — is released BEFORE the next run, and when the enclosing
+	/// boundary goes.
+	///
+	/// This is the per-run cleanup A113 row 4 found missing. A plain `effect`
+	/// body that subscribes, or arms a timer, or opens a channel, accumulates
+	/// one of those per change for as long as the boundary lives: the boundary
+	/// releases them all, eventually, together. Routing them through a form
+	/// (`swap` mints a fresh `Owner` per instantiation and disposes the last) was
+	/// the only way to get the run-scoped lifetime, and it costs a DOM boundary
+	/// for a lifetime question. This is that mechanism with no view in it.
+	///
+	/// Requires an enclosing `owner_scope.run`, statically, twice over: the
+	/// subscription is `effect`'s, and the last run's owner is released through
+	/// `on_cleanup`.
+	///
+	/// The forms are NOT built on this (R2): `swap`/`when`/`each` keep their own
+	/// per-instantiation owners. One mechanism is the goal, and rebasing them is
+	/// its own change.
+	fun scoped_effect(self, body: (sync |T| void) context owner_scope) {
+		self.effect(scoped_runner(body));
+	}
+
+	/// `scoped_effect` WITHOUT the immediate first call — the lazy half of the
+	/// pair, exactly as `effect_on_change` is `effect`'s.
+	fun scoped_effect_on_change(self, body: (sync |T| void) context owner_scope) {
+		self.effect_on_change(scoped_runner(body));
 	}
 
 	/// A derived signal: `transform` of this one's value, recomputed on every

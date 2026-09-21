@@ -1089,3 +1089,207 @@ fn a110_door2_an_effect_reads_a_derivation_chains_final_value_once() {
         "an effect must see a derivation chain settled, and see it once; got:\n{stdout}"
     );
 }
+
+// --- A114: an effect with an OWNER PER RUN ----------------------------------
+
+/// `Source::scoped_effect` and the free `on_cleanup` (tracker A114, R2 at Order
+/// 39's GO), on the sequence A113 row 4 named as missing: a per-run cleanup.
+///
+/// Four sections, and the first is the item's own user-code probe
+/// (`sweeps/order38/probes/scoped_effect.vl`) run through the std form. Its
+/// output here is byte-identical to the probe's on the same tree, which is the
+/// claim that the mechanism moved into std unchanged.
+///
+/// **`inline:`** — one owner per run. Each run registers an `on_cleanup` and a
+/// nested `effect` on a SECOND source; the cleanup runs before the next run, the
+/// nested subscription dies with the run (so `other`'s changes reach exactly the
+/// current run), and the LAST run is released by the enclosing boundary —
+/// `other-subscribers=0` after it, which is the leak a form-less per-run owner
+/// has no other way to close.
+///
+/// **`turn:`** — the same inside a turn, counted: runs and cleanups differ by
+/// exactly one while the effect is live (the current run has not been cleaned
+/// up yet) and are EQUAL once the boundary goes. Disposal count = creation
+/// count is the item's own acceptance line.
+///
+/// **`plain:`** — `on_cleanup` under an ordinary boundary, which is the other
+/// half of "one name, the ambient owner decides": it runs ONCE, at teardown,
+/// and not per change.
+///
+/// **`lazy:`** — `scoped_effect_on_change` makes no immediate run, exactly as
+/// `effect_on_change` makes no immediate call.
+const A114_SCOPED_EFFECT: &str = r#"import std::io::print;
+import std::reactive::{
+	Disposable, FlushPolicy, Owner, Signal, SignalCell, Source, on_cleanup, run_with_owner,
+	turn,
+};
+
+fun main() {
+	let id: SignalCell<i32> = Signal::new(1);
+	let other: SignalCell<str> = Signal::new("a");
+	let boundary = Owner::new();
+	run_with_owner(boundary, || {
+		id.scoped_effect(|value: i32| {
+			print(i"inline: run {value}");
+			on_cleanup(|| print(i"inline: cleanup {value}"));
+			other.effect(|text: str| print(i"inline: inner {value} sees {text}"));
+		});
+	});
+	id.set(2);
+	other.set("b");
+	id.set(3);
+	print("inline: dispose boundary");
+	boundary.dispose();
+	id.set(4);
+	other.set("c");
+	print(i"inline: other-subscribers={other.subscribers.read().len()}");
+
+	let key: SignalCell<i32> = Signal::new(0);
+	let runs: SignalCell<i32> = Signal::new(0);
+	let cleanups: SignalCell<i32> = Signal::new(0);
+	let scope = Owner::new();
+	run_with_owner(scope, || {
+		key.scoped_effect(|_value: i32| {
+			runs.set_with(|count| count + 1);
+			on_cleanup(|| cleanups.set_with(|count| count + 1));
+		});
+	});
+	turn(FlushPolicy::AtEnd, || {
+		key.set(1);
+	});
+	turn(FlushPolicy::AtEnd, || {
+		key.set(2);
+	});
+	print(i"turn: runs={runs.get()} cleanups={cleanups.get()}");
+	scope.dispose();
+	print(i"turn: after-dispose runs={runs.get()} cleanups={cleanups.get()}");
+
+	let ticks: SignalCell<i32> = Signal::new(0);
+	let plain = Owner::new();
+	run_with_owner(plain, || {
+		on_cleanup(|| print("plain: cleanup"));
+		ticks.effect(|value: i32| print(i"plain: tick {value}"));
+	});
+	ticks.set(1);
+	ticks.set(2);
+	plain.dispose();
+	print("plain: disposed");
+
+	let lazy_key: SignalCell<i32> = Signal::new(0);
+	let lazy_runs: SignalCell<i32> = Signal::new(0);
+	let lazy_scope = Owner::new();
+	run_with_owner(lazy_scope, || {
+		lazy_key.scoped_effect_on_change(|_value: i32| {
+			lazy_runs.set_with(|count| count + 1);
+		});
+	});
+	print(i"lazy: after-attach runs={lazy_runs.get()}");
+	lazy_key.set(1);
+	print(i"lazy: after-change runs={lazy_runs.get()}");
+	lazy_scope.dispose();
+}
+"#;
+
+#[test]
+fn a114_a_scoped_effect_releases_each_runs_registrations_before_the_next_run() {
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("a114_scoped", A114_SCOPED_EFFECT, &harness, &[]);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            // Run 1, and its nested subscription sees the other source's
+            // current value through the eager `effect`.
+            "inline: run 1",
+            "inline: inner 1 sees a",
+            // The cleanup runs BEFORE the next run, not after it.
+            "inline: cleanup 1",
+            "inline: run 2",
+            "inline: inner 2 sees a",
+            // `other` changed: exactly the CURRENT run's nested subscription
+            // hears it. Under a plain `effect` there would be two by now.
+            "inline: inner 2 sees b",
+            "inline: cleanup 2",
+            "inline: run 3",
+            "inline: inner 3 sees b",
+            "inline: dispose boundary",
+            // The last run is the BOUNDARY's to release, which is what the
+            // `on_cleanup` inside `scoped_runner` is for.
+            "inline: cleanup 3",
+            "inline: other-subscribers=0",
+            // Three runs, two cleanups: the live run has not been cleaned up.
+            "turn: runs=3 cleanups=2",
+            // …and then it has. Disposal count = creation count.
+            "turn: after-dispose runs=3 cleanups=3",
+            // `on_cleanup` under an ordinary boundary: once, at teardown.
+            "plain: tick 0",
+            "plain: tick 1",
+            "plain: tick 2",
+            "plain: cleanup",
+            "plain: disposed",
+            // The lazy twin makes no immediate run.
+            "lazy: after-attach runs=0",
+            "lazy: after-change runs=1",
+        ],
+        "a scoped effect must give every run its own owner and release it before \
+         the next run; got:\n{stdout}"
+    );
+}
+
+/// A run whose body THROWS still had its owner installed as the current one, so
+/// whatever it registered before the throw is released by the next run — and by
+/// the boundary if there is no next run.
+///
+/// The order inside the observer is what makes this true and is written that
+/// way deliberately: release the previous run, install the fresh owner, THEN
+/// call the body. A body that throws with the fresh owner already installed
+/// leaks nothing; a body called before the install would leak everything it had
+/// registered.
+const A114_THROWING_BODY: &str = r#"import std::io::{ panic, print };
+import std::reactive::{
+	Disposable, Owner, Signal, SignalCell, Source, guarded, on_cleanup, run_with_owner,
+};
+
+fun main() {
+	let id: SignalCell<i32> = Signal::new(0);
+	let released: SignalCell<i32> = Signal::new(0);
+	let scope = Owner::new();
+	run_with_owner(scope, || {
+		id.scoped_effect(|value: i32| {
+			on_cleanup(|| released.set_with(|count| count + 1));
+			if value == 1 {
+				panic("the body refused");
+			}
+		});
+	});
+	let failure = guarded(|| {
+		id.set(1);
+	});
+	print(i"caught={failure.is_some()} released={released.get()}");
+	id.set(2);
+	print(i"after-next released={released.get()}");
+	scope.dispose();
+	print(i"after-dispose released={released.get()}");
+}
+"#;
+
+#[test]
+fn a114_a_throwing_scoped_effect_body_does_not_leak_the_run_it_started() {
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("a114_throwing", A114_THROWING_BODY, &harness, &[]);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            // The throw is caught by the program; run 0's cleanup ran on the
+            // way in, which is the one release that had to happen.
+            "caught=true released=1",
+            // The FAILED run's own cleanup is released by the next run.
+            "after-next released=2",
+            // And the last run by the boundary: three runs, three releases.
+            "after-dispose released=3",
+        ],
+        "a throwing run must not leak what it registered before it threw; \
+         got:\n{stdout}"
+    );
+}
