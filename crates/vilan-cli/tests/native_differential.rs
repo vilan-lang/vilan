@@ -367,6 +367,71 @@ fn the_probes_board_program_is_byte_identical_on_both_backends() {
     );
 }
 
+/// A `lazy` parameter defers, memoizes and FORWARDS the same way on both
+/// backends (F20; `lazy.md` §1).
+///
+/// The corpus covers the feature well — thirteen programs reach a `lazy`
+/// parameter, which is the whole `Option`/`Result` combinator surface since
+/// A103 — but every one of them reaches it through a combinator whose argument
+/// is a plain value, so none of them can tell a deferral from an eager
+/// evaluation. This probe can: the argument counts its own evaluations and the
+/// program prints the counter, so an emitter that forced at the call site prints
+/// different numbers rather than the same ones.
+#[test]
+fn a_lazy_parameter_defers_and_memoizes_the_same_way_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_lazy.vl"), LAZY_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_lazy.vl"),
+        Verdict::Identical,
+        "a `lazy` parameter must defer, memoize and forward identically on both backends"
+    );
+}
+
+const LAZY_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "mut evaluations = 0;\n",
+    "\n",
+    "fun costly(): str {\n",
+    "\tevaluations = evaluations + 1;\n",
+    "\ti\"built {evaluations}\"\n",
+    "}\n",
+    "\n",
+    // The argument is never read, so the thunk never runs.
+    "fun ignore(lazy message: str): i32 { 1 }\n",
+    // Read TWICE: one evaluation, two reads.
+    "fun twice(lazy message: str): str {\n",
+    "\tlet first = message;\n",
+    "\tlet second = message;\n",
+    "\ti\"{first}/{second}\"\n",
+    "}\n",
+    // A FORWARD: the cell travels as-is, so the chain memoizes once.
+    "fun forwards(lazy message: str): str { twice(message) }\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(ignore(costly()));\n",
+    "\tprint(evaluations);\n",
+    "\tprint(twice(costly()));\n",
+    "\tprint(evaluations);\n",
+    "\tprint(forwards(costly()));\n",
+    "\tprint(evaluations);\n",
+    // A literal in the same position still works, and so does a value the
+    // callee reads on only one of two paths.
+    "\tprint(twice(\"plain\"));\n",
+    "\tprint(evaluations);\n",
+    // A103's own customers: `unwrap_or`'s fallback is `lazy`, so the `Some`
+    // path never builds it and the `None` path does.
+    "\tlet present: Option<i32> = Some(3);\n",
+    "\tprint(present.unwrap_or(costly().len()));\n",
+    "\tprint(evaluations);\n",
+    "\tlet absent: Option<i32> = None;\n",
+    "\tprint(absent.unwrap_or(costly().len()));\n",
+    "\tprint(evaluations);\n",
+    "}\n",
+);
+
 /// The canonical key, as the JS backend's `__hash` computes it (F20): a
 /// primitive keys as ITSELF and an aggregate keys as its `JSON.stringify` text,
 /// so the four `Hash` arms are the four JS primitive kinds and nothing else.

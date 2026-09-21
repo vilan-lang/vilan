@@ -475,6 +475,171 @@ impl<T: Js> Js for Weak<T> {
 /// named separately so the emitted source says which rule put it there.
 pub type Captured<T> = Shared<T>;
 
+// ------------------------------------------------------------------ lazy ---
+
+/// `proposal/lazy.md` §5's memo cell — the ONE shape both lazy positions share
+/// (a `lazy` parameter and a `lazy let` module binding), and the native twin of
+/// the JS backend's `__lazy` / `__force` pair.
+///
+/// `{ name, state, value, thunk }` is the paper's shape and the states are its
+/// four. `Running` IS the cycle trap: an initializer that transitively touches
+/// its own binding re-enters [`Lazy::force`] and finds its own flag set, which
+/// is a clear panic rather than a silent hang. A panicking thunk POISONS (§6a):
+/// the failure propagates at the touching site and every later touch re-panics
+/// naming the poison, because retrying would turn "at most once" into "at least
+/// once per attempt".
+///
+/// The thunk is dropped after a successful force, so everything it captured is
+/// released once the value exists — the JS helper's `cell.thunk = null`.
+///
+/// Counted, because a `lazy` argument FORWARDED into another lazy position
+/// travels as the same cell however deep the chain: one memo, and the eventual
+/// first read forces the original thunk.
+pub struct Lazy<T> {
+    inner: Rc<LazyCell<T>>,
+}
+
+struct LazyCell<T> {
+    name: Str,
+    state: std::cell::Cell<LazyState>,
+    value: RefCell<Option<T>>,
+    /// The poison's message, kept so every later touch can name it.
+    poison: RefCell<Option<Str>>,
+    thunk: RefCell<Option<Box<dyn FnOnce() -> T>>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LazyState {
+    Pending,
+    Running,
+    Done,
+    Poisoned,
+}
+
+impl<T> Clone for Lazy<T> {
+    fn clone(&self) -> Self {
+        Lazy {
+            inner: Rc::clone(&self.inner),
+        }
+    }
+}
+
+impl<T> Lazy<T> {
+    /// `__lazy(name, thunk)`. The name is carried because the cycle and poison
+    /// messages have to say WHICH binding, and the forcing site has no other way
+    /// to know.
+    pub fn new(name: &str, thunk: impl FnOnce() -> T + 'static) -> Self {
+        Lazy {
+            inner: Rc::new(LazyCell {
+                name: str_new(name),
+                state: std::cell::Cell::new(LazyState::Pending),
+                value: RefCell::new(None),
+                poison: RefCell::new(None),
+                thunk: RefCell::new(Some(Box::new(thunk))),
+            }),
+        }
+    }
+
+    /// An already-evaluated cell — what M81's eager set would build if the
+    /// emitter ever needed a cell for a value it had in hand.
+    pub fn ready(value: T) -> Self {
+        Lazy {
+            inner: Rc::new(LazyCell {
+                name: str_new(""),
+                state: std::cell::Cell::new(LazyState::Done),
+                value: RefCell::new(Some(value)),
+                poison: RefCell::new(None),
+                thunk: RefCell::new(None),
+            }),
+        }
+    }
+
+    /// `__force(cell)` — the read every use of a `lazy` binding goes through,
+    /// which is the whole of "the parameter reads as a plain `T`".
+    pub fn force(&self) -> T
+    where
+        T: Clone,
+    {
+        match self.inner.state.get() {
+            LazyState::Done => {
+                return self
+                    .inner
+                    .value
+                    .borrow()
+                    .clone()
+                    .expect("a forced lazy cell holds its value");
+            }
+            LazyState::Running => {
+                panic_with(&format!("lazy initialization cycle: `{}`", self.inner.name));
+            }
+            LazyState::Poisoned => {
+                let reason = self.inner.poison.borrow().clone();
+                panic_with(&format!(
+                    "lazy `{}` is poisoned: its initializer panicked: {}",
+                    self.inner.name,
+                    reason.unwrap_or_else(|| str_new("panicked"))
+                ));
+            }
+            LazyState::Pending => {}
+        }
+        let thunk = self
+            .inner
+            .thunk
+            .borrow_mut()
+            .take()
+            .expect("a pending lazy cell holds its thunk");
+        self.inner.state.set(LazyState::Running);
+        // The JS helper's `try`/`catch`: the failure is stored, the state goes
+        // to poisoned, and the panic keeps travelling from where it was thrown.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let produced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(thunk));
+        std::panic::set_hook(previous);
+        match produced {
+            Ok(value) => {
+                *self.inner.value.borrow_mut() = Some(value.clone());
+                self.inner.state.set(LazyState::Done);
+                value
+            }
+            Err(payload) => {
+                *self.inner.poison.borrow_mut() = Some(describe_panic(&payload));
+                self.inner.state.set(LazyState::Poisoned);
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+}
+
+/// `__force` as a free function, so the emitter can spell it without naming the
+/// type's own method on a value whose type it is writing inline.
+pub fn force<T: Clone>(cell: &Lazy<T>) -> T {
+    cell.force()
+}
+
+/// A cell is its VALUE wherever one is printed or compared: the cell is the
+/// deferral, not a wrapper the program can see. Both force, which is what
+/// "fully transparent" means.
+impl<T: Js + Clone> Js for Lazy<T> {
+    fn js(&self) -> String {
+        self.force().js()
+    }
+    fn js_nested(&self) -> String {
+        self.force().js_nested()
+    }
+}
+
+impl<T: PartialEq + Clone> PartialEq for Lazy<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.force() == other.force()
+    }
+}
+
+impl<T: Json + Clone> Json for Lazy<T> {
+    fn json(&self) -> String {
+        self.force().json()
+    }
+}
+
 // ------------------------------------------------------------ collections ---
 
 /// `Map<K, V>` — INSERTION-ORDERED, because a JS `Map` is and the differential

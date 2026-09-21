@@ -2137,8 +2137,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if parameter.spread {
             return Err(unsupported("a spread parameter", span));
         }
-        if parameter.lazy {
-            return Err(unsupported("a `lazy` parameter", span));
+        // F20: a `lazy` parameter carries the memo cell, by value — one handle
+        // per call, and a FORWARD passes the same cell on so a chain memoizes
+        // once. M81's eager set is the exception: a parameter every call site
+        // filled inertly holds the plain value and its reads do not force, so it
+        // is an ordinary parameter here too.
+        if parameter.lazy && !self.program.lazy_eager_parameters.contains(&id) {
+            let rendered = self.rust_type(parameter.type_id, span)?;
+            return Ok(format!(
+                "{}: vilan_rt::Lazy<{rendered}>",
+                self.binding_name(id)
+            ));
         }
         let rendered = self.rust_type(parameter.type_id, span)?;
         let form = self.receiving_form(&parameter);
@@ -2825,10 +2834,74 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
     fn read_binding(&self, binding: Id) -> String {
         let name = self.binding_name(binding);
+        // lazy.md §1: the binding holds a memo cell, so a READ of it is a force
+        // — the whole of "the parameter reads as a plain `T`, fully
+        // transparent". Only a PARAMETER's cell is forced here: a `lazy` module
+        // binding is a `thread_local!`, which is already initialized on first
+        // access, and the two positions that must not force (a forward into
+        // another lazy position, the cell's own declaration) never reach this.
+        if self.program.parameters.contains_key(&binding)
+            && self.program.lazy_cells.contains(&binding)
+            && !self.program.lazy_eager_parameters.contains(&binding)
+        {
+            return format!("vilan_rt::force(&{name})");
+        }
         if self.boxed.contains(&binding) {
             return format!("{name}.get()");
         }
         name
+    }
+
+    /// What a call site emits for an argument standing in a `lazy` parameter
+    /// (F20; lazy.md §1). `None` for every other argument, which is every
+    /// argument in a program that writes no `lazy`.
+    ///
+    /// The analyzer decided which of the two shapes this is, and the decision is
+    /// read rather than re-derived: a FORWARD is a bare reference to a binding
+    /// that already holds a cell, so the cell travels as-is — one memo however
+    /// deep the chain — and everything else is a THUNK, whose expression is
+    /// walked INSIDE the closure, because walking it into the enclosing block
+    /// would evaluate at the call site the very thing the feature defers.
+    fn lazy_argument(&mut self, argument_id: Id, depth: usize) -> Option<Result<String, Error>> {
+        if self.program.lazy_argument_forwards.contains(&argument_id) {
+            let Some(&Expr::Local(binding)) = self.program.entity_map.get(&argument_id) else {
+                return None;
+            };
+            // The cell is counted, so forwarding is a handle bump and the
+            // forwarding frame keeps its own.
+            return Some(Ok(format!("({}).clone()", self.binding_name(binding))));
+        }
+        let name = (*self.program.lazy_argument_thunks.get(&argument_id)?).to_string();
+        Some(self.lazy_thunk(argument_id, &name, depth))
+    }
+
+    fn lazy_thunk(&mut self, argument_id: Id, name: &str, depth: usize) -> Result<String, Error> {
+        // The thunk is `move`, so it takes every binding it mentions and the
+        // enclosing frame goes on reading the same ones — the capture handling a
+        // closure literal takes, for the same reason.
+        let mut declared_inside = HashSet::new();
+        let mut referenced = HashSet::new();
+        let mut visited = HashSet::new();
+        self.scan_closure(
+            argument_id,
+            &mut declared_inside,
+            &mut referenced,
+            &mut visited,
+        );
+        let captured: HashSet<Id> = referenced
+            .iter()
+            .filter(|binding| !declared_inside.contains(binding))
+            .copied()
+            .collect();
+        let prelude = self.async_capture_prelude(argument_id);
+        self.closure_captures.push(captured);
+        let value = self.value_of(argument_id, depth);
+        self.closure_captures.pop();
+        let value = value?;
+        Ok(format!(
+            "{{ {prelude}vilan_rt::Lazy::new({}, move || {{ {value} }}) }}",
+            rust_string(name)
+        ))
     }
 
     /// A read of a binding that MIGHT be a module-level one.
@@ -3121,8 +3194,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             BinaryOp::Or => "||",
             BinaryOp::UShr => return Err(unsupported("the `>>>` operator", span)),
         };
-        let left_text = self.expression(left, depth)?;
-        let right_text = self.expression(right, depth)?;
+        // An operand that is a LOANED parameter is a `&T` natively, and Rust's
+        // `PartialEq`/`PartialOrd` are not implemented across the reference
+        // (`&i32 == i32`). `value_of` is the rule already written for this —
+        // rule 1's copy at a loaned read — so both operands go through it, and
+        // `std::compare`'s `impl i32 with PartialEq { fun eq(self, b: i32) {
+        // self == b } }` compiles for every scalar it is specialized at.
+        let left_text = self.value_of(left, depth)?;
+        let right_text = self.value_of(right, depth)?;
         Ok(format!("({left_text} {symbol} {right_text})"))
     }
 
@@ -3306,6 +3385,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
         {
             subject_text = format!("({subject_text}).clone()");
         }
+        // A `str` subject is matched as a `&str`, which is the only form a
+        // string LITERAL pattern has natively — see [`Emitter::pattern`]. The
+        // question is asked of the PATTERNS rather than of the subject's type
+        // because a subject that is a call (`s.trim()`) carries no type on its
+        // own id, and a string literal in a leg is the whole evidence.
+        if legs.iter().any(|leg| {
+            matches!(&leg.pattern, ExprPattern::Literal(id)
+                if Self::string_pattern_text(self.program, *id).is_some())
+        }) {
+            subject_text = format!("&*({subject_text})");
+        }
         let pad = Self::indent(depth);
         let leg_pad = Self::indent(depth + 1);
         let mut out = format!("match {subject_text} {{\n");
@@ -3353,6 +3443,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
         (!bindings.is_empty()).then_some((subject, pattern, bindings))
     }
 
+    /// The source text of a string-LITERAL pattern, or `None` for every other
+    /// literal. A vilan `str` is an `Rc<str>` whose literal emits
+    /// `vilan_rt::str_new("..")` — a function call, and no pattern at all — so
+    /// this is what tells [`Emitter::pattern`] and [`Emitter::match_expr`] that
+    /// the leg is a `&str` one.
+    fn string_pattern_text(program: &'a Program<'src>, id: Id) -> Option<&'src str> {
+        match program.entity_map.get(&id) {
+            Some(Expr::String(text)) => Some(text),
+            _ => None,
+        }
+    }
+
     fn pattern_is_bool(&self, pattern: &ExprPattern) -> bool {
         matches!(pattern, ExprPattern::Variant(enum_id, _, _)
             if self.program.bool_enum_id == Some(*enum_id))
@@ -3373,6 +3475,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
         match pattern {
             ExprPattern::Wildcard => Ok("_".to_string()),
             ExprPattern::Binding(id) => Ok(self.binding_name(*id)),
+            // A `str` LITERAL pattern (F20). A vilan `str` is an `Rc<str>` and
+            // its literal emits `vilan_rt::str_new("..")`, which is a function
+            // CALL and no pattern at all — `parse-bool.vl` matches `"true"` /
+            // `"false"` and rustc refused both legs. The subject is matched as a
+            // `&str` ([`Emitter::match_expr`]), so the pattern is the bare Rust
+            // literal, which is what a `&str` pattern is.
+            ExprPattern::Literal(id) if Self::string_pattern_text(self.program, *id).is_some() => {
+                Ok(rust_string(
+                    Self::string_pattern_text(self.program, *id).expect("just tested"),
+                ))
+            }
             ExprPattern::Literal(id) => self.expression(*id, 0),
             ExprPattern::Variant(enum_id, index, payload) => {
                 if let Some(declaration) = self.program.enums.get(enum_id)
@@ -4556,6 +4669,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .collect();
         let mut rendered = Vec::new();
         for (index, argument) in argument_ids.iter().enumerate() {
+            // F20: an argument standing in a `lazy` parameter is a cell, not a
+            // value — see [`Emitter::lazy_argument`].
+            if let Some(cell) = self.lazy_argument(*argument, depth) {
+                rendered.push(cell?);
+                continue;
+            }
             let wants_a_place = !matches!(conventions.get(index), None | Some(Receiving::ByValue));
             let expecting = declared
                 .get(index)
