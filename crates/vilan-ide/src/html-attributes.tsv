@@ -2,9 +2,11 @@
 # is generated from (tracker E69). GENERATED FILE -- do not hand-edit.
 #
 # refresh:   python3 scripts/regen-html-attributes.py --fetch   (network)
-# consumer:  python3 scripts/regen-html-attributes.py           (TSV -> Rust)
-#            crates/vilan-ide/src/html_attributes.rs is the checked-in table;
-#            its own `mod tests` regenerates from these rows and diffs, offline.
+# consumer:  crates/vilan-ide/src/html_attributes_sync.rs   (TSV -> Rust)
+#            the ONE implementation of that arrow (N107). It renders
+#            html_attributes.rs from these rows and diffs it byte for byte on
+#            every `cargo test`, offline; VILAN_REGENERATE_HTML_ATTRIBUTES=1
+#            rewrites the table instead of failing.
 #
 # `element` is a tag name, `*` (every element) or `svg:*` (every SVG-shaped
 # element). A row with an EMPTY attribute registers the tag and nothing else.
