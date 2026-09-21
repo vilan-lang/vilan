@@ -3382,6 +3382,20 @@ pub struct Analyzer<'src> {
     /// module in the BASE root is not here: it is the same type under every
     /// platform and has no twin to name.
     std_layer_sources: HashMap<SourceId, String>,
+    // E200: the lazy ARGUMENTS `check_lazy_arguments` refused in its own words
+    // (ledger row 475, "this argument is the resource `T` …"). Recorded so R9's
+    // thunk arm can stand down on exactly those — one diagnostic per root cause
+    // (B5).
+    //
+    // A recorded SET rather than a shared predicate, because the two checks sit
+    // on opposite sides of `&mut self`: the refusal needs the resource
+    // classification memo, the capture scan runs over `&self`. It is sound in
+    // one direction only, and that is the direction the pass order already
+    // gives — `check_lazy_arguments` is a Class A check and
+    // `check_resource_moves` runs after every one of them. Both skip a REUSED
+    // argument by the same `reusable_entity` test, so a replayed diagnostic is
+    // not doubled either.
+    lazy_argument_resource_refusals: HashSet<Id>,
     // The dependency packages' sources loaded from DISK (E84,
     // diagnostics-standard.md C3a): code the user did not write, whether
     // fetched (git) or path-linked. The context-coverage pass demotes and
@@ -5684,6 +5698,7 @@ impl<'src> Analyzer<'src> {
             std_layer_sources: HashMap::default(),
             platform: Platform::default(),
             platform_reason: None,
+            lazy_argument_resource_refusals: HashSet::default(),
             dependency_sources: HashSet::default(),
             type_map_writes: 0,
             frozen_ranges: Vec::new(),
@@ -14767,6 +14782,15 @@ impl<'src> Analyzer<'src> {
         for argument_id in self.lazy_argument_thunks.keys() {
             // M19 T1: the capture is judged inside the argument's own body.
             if self.reusable_entity(*argument_id) {
+                continue;
+            }
+            // E200: `check_lazy_arguments` has already refused this argument in
+            // words that name the type and the position, so R9 stands down —
+            // one diagnostic per root cause (B5). It speaks for the shapes R9
+            // cannot describe (a field of a resource binding, a call returning
+            // a resource) and declines the bare resource BINDING, which is
+            // R9's own case and is reported below.
+            if self.lazy_argument_resource_refusals.contains(argument_id) {
                 continue;
             }
             let mut declared_inside: HashSet<Id> = HashSet::default();
@@ -24869,6 +24893,17 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             let rendered = self.pretty_print_type(&type_id.get_type(self), &HashMap::default());
+            // E200: this refusal OWNS the shape, so R9's thunk arm stands down
+            // on it. `hold(flag, holder.conn)` reached a resource through a
+            // FIELD of a resource binding and got both messages — R9's capture
+            // words naming the binding, and this one naming the field's type —
+            // two diagnostics for one mistake, which is the class B5 forbids.
+            // This one owns it because it names the TYPE and the POSITION,
+            // which together are what the author has to change; R9's words are
+            // right only where the thunk names a resource BINDING bare, and
+            // that case is exactly the one the `Expr::Local` test above hands
+            // back to it.
+            self.lazy_argument_resource_refusals.insert(argument_id);
             self.push_anchored(
                 Error {
                     trace: Vec::new(),
