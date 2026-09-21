@@ -6,6 +6,7 @@
 // returns real `K`s, and mutating the original afterward can't desync the map
 // (value semantics snapshot it on insert).
 import pkg::compare::PartialEq;
+import pkg::default::Default;
 import pkg::hash::{ Hash, Hashable };
 import pkg::native_map::NativeMap;
 import pkg::option::Option::{ self, None, Some };
@@ -110,5 +111,17 @@ impl List<(type K: Hashable, type V)> {
 			result.insert(entry.0, entry.1);
 		}
 		result
+	}
+}
+
+/// The empty map is a `Map`'s default (I4) — `Default`'s only implementors were
+/// the numeric family, so a `T: Default` bound could not be met by a container
+/// and kolt wrote this impl itself (`prefs.vl:100`, under a
+/// `// FIXME: Implement with std.`). The binder carries `Hashable` because the
+/// TYPE does: a `Map` whose key is not hashable does not exist to have a
+/// default.
+impl Map<type K: Hashable, type V> with Default {
+	fun default(): Map<K, V> {
+		Map::new()
 	}
 }

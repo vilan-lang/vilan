@@ -5885,3 +5885,123 @@ fn a_signal_cells_identity_is_its_value_cells_and_survives_a_copy() {
         "held:true\ntwin:false\n",
     );
 }
+
+// --- I4: `Default` reaches the containers -----------------------------------
+//
+// `Default`'s implementors were the numeric family (`number.vl`), `str` and
+// `bool` (`default.vl`) and `Option<T>` (`option.vl`) — no container at all, so
+// a `T: Default` bound could not be met by a `List`, a `Map` or a `Set` and a
+// `[derive(Default)]` over a struct holding one had nothing to call. kolt wrote
+// `impl Map<type K, type V> with Default` itself (`prefs.vl:100`, under a
+// `// FIXME: Implement with std.`). Each impl lives in its own type's module,
+// which is the rule `default.vl`'s own comment states and the placement
+// `Option`'s follows.
+
+/// The three empty containers answer `default()`, and the value is a real fresh
+/// container rather than a shared one: inserting into the map does not change
+/// what the next `default()` hands back.
+#[test]
+fn i4_the_containers_have_a_default_and_it_is_the_empty_one() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::default::Default;
+        import std::map::Map;
+        import std::set::Set;
+        fun make<T: Default>(): T {
+            T::default()
+        }
+        fun main() {
+            let list: List<i32> = make();
+            mut map: Map<str, i32> = make();
+            mut set: Set<i32> = make();
+            print(i"{list.len()} {map.len()} {set.len()}");
+            map.insert("a", 1);
+            set.insert(3);
+            print(i"{map.len()} {set.len()}");
+            let fresh_map: Map<str, i32> = make();
+            let fresh_set: Set<i32> = make();
+            print(i"{fresh_map.len()} {fresh_set.len()}");
+        }
+        "#,
+        "0 0 0\n1 1\n0 0\n",
+    );
+}
+
+/// The other three the item asked to verify were already there, and the pin
+/// says so rather than leaving it to a reader: `str` is `""`, `bool` is
+/// `false`, `Option<T>` is `None`, and the numeric family is zero.
+#[test]
+fn i4_the_scalars_and_option_already_had_one() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::default::Default;
+        fun make<T: Default>(): T {
+            T::default()
+        }
+        fun main() {
+            let text: str = make();
+            let flag: bool = make();
+            let slot: Option<i32> = make();
+            let whole: i32 = make();
+            let real: f64 = make();
+            print(i"'{text}' {flag} {slot.is_none()} {whole} {real}");
+        }
+        "#,
+        "'' false true 0 0\n",
+    );
+}
+
+/// The point of the batch: `[derive(Default)]` builds its literal out of
+/// `Field::default()` per field, so a struct holding a container was refused at
+/// the DERIVE before this — the shape kolt's `prefs.vl` is.
+#[test]
+fn i4_a_derived_default_admits_a_struct_holding_containers() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::map::Map;
+        import std::set::Set;
+        [derive(Default)]
+        struct Prefs {
+            names: List<str>,
+            seen: Set<i32>,
+            widths: Map<str, i32>,
+            label: str,
+            collapsed: bool,
+            width: i32,
+            last: Option<i32>,
+        }
+        fun main() {
+            let prefs = Prefs::default();
+            print(i"{prefs.names.len()} {prefs.seen.len()} {prefs.widths.len()}");
+            print(i"'{prefs.label}' {prefs.collapsed} {prefs.width} {prefs.last.is_none()}");
+        }
+        "#,
+        "0 0 0\n'' false 0 true\n",
+    );
+}
+
+/// A `Map`'s and a `Set`'s binder carries the `Hashable` its TYPE declares, so
+/// the impls do not widen what either container admits: a key that is not
+/// hashable is refused exactly where it was before, at the type.
+#[test]
+fn i4_the_container_defaults_do_not_widen_what_a_map_key_may_be() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::default::Default;
+        import std::map::Map;
+        struct Key { id: i32 }
+        fun make<T: Default>(): T {
+            T::default()
+        }
+        fun main() {
+            let map: Map<Key, i32> = make();
+            print(map.len());
+        }
+        "#,
+        "Hashable",
+    );
+}

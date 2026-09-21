@@ -40,6 +40,7 @@ impl List<type T: PartialEq> with PartialEq {
 	fun eq(self, b: List<T>): bool           // element-wise, length first
 }
 impl List<type T: Display> { fun join(self, separator: str): str }
+impl List<type T> with Default { fun default(): List<T> }       // []
 ```
 
 Indexing is `list[i]`; iterate with `for item in list` (copies) or
@@ -174,6 +175,9 @@ impl Map<type K: Hashable, type V: PartialEq> {
 	fun contains_value(self, value: V): bool
 }
 impl List<(type K: Hashable, type V)> { fun to_map(self): Map<K, V> }
+impl Map<type K: Hashable, type V> with Default {
+	fun default(): Map<K, V>                 // the empty map
+}
 ```
 
 Keys compare **by value**. Scalars work directly, and so does a **backed enum**
@@ -260,6 +264,7 @@ impl Set<type T: Hashable> {
 	fun difference(self, other: Set<T>): Set<T>
 }
 impl List<type T: Hashable> { fun to_set(self): Set<T> }
+impl Set<type T: Hashable> with Default { fun default(): Set<T> }  // the empty set
 ```
 
 Value-keyed like `Map` (element `T` must be `Hashable`); `for x in set`

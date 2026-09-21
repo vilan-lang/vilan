@@ -46,9 +46,15 @@ trait Default {
 }
 ```
 
-Zero for numbers, `""` for `str`, `false` for `bool`.
-`[derive(Default)]` composes fields' defaults. Used as a bound by helpers
-like `unwrap_or_default` and `List.sum`.
+Zero for numbers, `""` for `str`, `false` for `bool`, `None` for
+`Option<T>`, and the empty container for `List<T>`, `Map<K, V>` and
+`Set<T>`. `[derive(Default)]` composes fields' defaults — so a struct
+holding a container derives one. Used as a bound by helpers like
+`unwrap_or_default` and `List.sum`.
+
+Each impl lives in its own type's module (`Option`'s in `std::option`,
+`List`'s in `std::list`, and so on); `std::default` itself carries only
+the two scalars that have no module of their own.
 
 ## std::operators: the operator traits
 
