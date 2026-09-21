@@ -2860,3 +2860,151 @@ fn a110_nested_swaps_on_one_source_build_no_orphan_subtree_on_sign_out() {
          subtree; got:\n{stdout}"
     );
 }
+
+// --- A105: `bind_attr` over a `Source<Option<str>>` -------------------------
+
+/// `bind_attr` at both value types, on one element. The `str` arm is the
+/// control — it must behave exactly as it always did — and the `Option` arm is
+/// the new one: `Some` sets, `None` REMOVES. kolt hand-wrote this as
+/// `bind_attr_proper` (styles.vl:36) because std had no form for it, and its
+/// customer is `[data-dragging="row"] *`, a selector that reads PRESENCE, so
+/// writing "" between drags is the wrong answer rather than a tidier one.
+///
+/// The last two lines are the boundary: the effect is the nearest boundary's,
+/// like every binding's, so disposing the root stops both.
+const BIND_ATTR_OPTION: &str = r#"import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Disposable, Signal, SignalCell };
+import std::ui::{ View, mount_root, view };
+
+fun main() {
+	let dragging: SignalCell<Option<str>> = Signal::new(None);
+	let plain: SignalCell<str> = Signal::new("one");
+	let root = mount_root("app", || {
+		view("div")
+			.bind_attr("data-dragging", dragging)
+			.bind_attr("x-plain", plain)
+			.child(view("p").text("shell"))
+	});
+	print(i"initial={shell_attributes()}");
+	dragging.set(Some("row"));
+	print(i"dragging-row={shell_attributes()}");
+	dragging.set(Some("col"));
+	print(i"dragging-col={shell_attributes()}");
+	dragging.set(None);
+	print(i"released={shell_attributes()}");
+
+	// The empty string is a VALUE, not an absence — the distinction the
+	// `Option` bound exists to make.
+	dragging.set(Some(""));
+	print(i"empty-string={shell_attributes()}");
+	dragging.set(None);
+	print(i"released-again={shell_attributes()}");
+
+	// The `str` arm, unchanged.
+	plain.set("two");
+	print(i"plain={shell_attributes()}");
+
+	root.dispose();
+	dragging.set(Some("row"));
+	plain.set("three");
+	print(i"disposed={shell_attributes()}");
+}
+
+[extern("__shell_attributes")]
+external fun shell_attributes(): str;
+
+main();
+"#;
+
+#[test]
+fn a105_bind_attr_over_an_option_source_sets_and_removes_the_attribute() {
+    let harness = format!(
+        "{DOM_STUB}\nglobal.__shell_attributes = () => {{\n  \
+         const shell = documentRoot.children[0];\n  \
+         return JSON.stringify(shell.attributes);\n\
+         }};\nrequire(\"./app.js\");\n"
+    );
+    let stdout = build_and_run("bind_attr_option", BIND_ATTR_OPTION, &harness);
+    let line = |prefix: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("the {prefix} line; got:\n{stdout}"))
+            .to_string()
+    };
+    // A `None` at mount writes nothing at all — not `""`, not `"None"`.
+    assert_eq!(
+        line("initial="),
+        "{\"x-plain\":\"one\"}",
+        "a `None` must leave the attribute off entirely; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("dragging-row="),
+        "{\"x-plain\":\"one\",\"data-dragging\":\"row\"}",
+        "a `Some` must set the attribute to its text; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("dragging-col="),
+        "{\"x-plain\":\"one\",\"data-dragging\":\"col\"}",
+        "a second `Some` must replace the value; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("released="),
+        "{\"x-plain\":\"one\"}",
+        "a `None` must REMOVE the attribute, not write a value; got:\n{stdout}"
+    );
+    // The whole reason the bound is `Option<str>` and not `str`.
+    assert_eq!(
+        line("empty-string="),
+        "{\"x-plain\":\"one\",\"data-dragging\":\"\"}",
+        "`Some(\"\")` must write a present, empty attribute; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("released-again="),
+        "{\"x-plain\":\"one\"}",
+        "and the next `None` must remove it again; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("plain="),
+        "{\"x-plain\":\"two\"}",
+        "the `str` arm must still track; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("disposed="),
+        "{\"x-plain\":\"two\"}",
+        "both bindings are the boundary's, so disposing the root must stop \
+         them; got:\n{stdout}"
+    );
+}
+
+/// The SSR twin: read once, and a `None` renders nothing. There is no
+/// `remove_attribute` to mirror, because nothing was written — `toggle_attr`'s
+/// arrangement exactly.
+const BIND_ATTR_OPTION_SSR: &str = r#"import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, render, view };
+
+fun main() {
+	let held: SignalCell<Option<str>> = Signal::new(Some("row"));
+	let absent: SignalCell<Option<str>> = Signal::new(None);
+	let blank: SignalCell<Option<str>> = Signal::new(Some(""));
+	print(render(view("div").bind_attr("data-dragging", held).attr("id", "shell")));
+	print(render(view("section").bind_attr("data-dragging", absent)));
+	print(render(view("aside").bind_attr("data-dragging", blank)));
+}
+
+main();
+"#;
+
+#[test]
+fn a105_the_ssr_twin_renders_a_some_attribute_and_omits_a_none() {
+    let stdout = build_and_run_process("bind_attr_option_ssr", BIND_ATTR_OPTION_SSR);
+    assert_eq!(
+        stdout,
+        "<div data-dragging=\"row\" id=\"shell\"></div>\n<section></section>\n<aside data-dragging=\"\"></aside>\n",
+        "the server render must carry a `Some` attribute in insertion order, \
+         omit a `None` entirely, and keep `Some(\"\")` as a present empty one"
+    );
+}

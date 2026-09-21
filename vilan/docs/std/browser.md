@@ -268,7 +268,7 @@ too.
 | `bind_text` | `(source: S): View`; `S: Source<str>` | reactive text |
 | `bind_class` | `(source: S): View`; `S: Source<str>` | reactive class |
 | `bind_styled` | `(source: S): View`; `S: Source<Style>` | reactive compiled style — `styled`'s reactive twin |
-| `bind_attr` | `(name: str, source: S): View`; `S: Source<str>` | reactive attribute |
+| `bind_attr` | `(name: str, source: V): View`; `V: AttrBinding` | reactive attribute, at two value types: a `Source<str>` always has a value, a `Source<Option<str>>` says the ATTRIBUTE comes and goes — `Some(text)` sets it, `None` **removes** it (and `Some("")` is a present, empty attribute, which is a different thing) |
 | `toggle_attr` | `(name: str, source: S): View`; `S: Source<bool>` | reactive BOOLEAN attribute — presence, not value (`inert`, `disabled`, `hidden`, `open`): present when true, removed when false |
 | `bind_value` | `(signal: SignalCell<str>): View` | two-way input bind — **concrete `Signal`**: it writes back |
 | `bind_draft` | `(draft: Draft<str>): View` | local-first input bind ([drafts](reactive.md#draft--local-first-cells)) |

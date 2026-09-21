@@ -140,7 +140,9 @@ The server render creates, serializes, and discards: no effects attach, no
 subscriptions survive the request. So the bindings **read once**: `bind_text`,
 `bind_attr`, `each` (with `each_values` and `each_by`), `when`,
 and `swap` embed the source's value *at render time*. That is the value served,
-and it is the value the client re-derives.
+and it is the value the client re-derives. An `Option`-valued `bind_attr` reads
+once like the rest: a `Some` renders the attribute, a `None` omits it, and
+there is no `remove_attribute` to mirror because nothing was written.
 
 The rule this implies: **build pure, bind reactive.** A component that computes
 its structure from signals and binds them renders correctly on both legs. A

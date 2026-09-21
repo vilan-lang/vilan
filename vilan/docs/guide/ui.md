@@ -112,6 +112,24 @@ re-sets whenever it changes — `attr("href", signal)` and
 name. (`text` is unchanged: it still replaces everything the element
 contains, text nodes included, like the DOM's `textContent`.)
 
+An attribute that comes and goes is a third case, and `bind_attr` takes it
+directly: over a `Source<Option<str>>`, a `Some(text)` sets the attribute and
+a `None` **removes** it. Reach for it whenever a selector reads presence —
+`[data-dragging="row"] *` matches an element that *has* the attribute, so
+writing `""` between drags leaves the rule firing. `Some("")` is still a
+present, empty attribute, which is why the absence has to be its own value
+rather than a sentinel string.
+
+```vilan,fragment
+// `None` while nothing is being dragged; `Some("row")`/`Some("col")` while
+// something is.
+view("div").bind_attr("data-dragging", drag_status.map(|status| match status {
+	DragStatus::Still => None,
+	DragStatus::Vertical => Some("row"),
+	DragStatus::Horizontal => Some("col"),
+}))
+```
+
 A BOOLEAN attribute is a different thing and has its own binding:
 `inert`, `disabled`, `hidden` and `open` mean *present*, so there is no
 string that turns one off — `attr("disabled", "false")` is a disabled
