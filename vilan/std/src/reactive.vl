@@ -1,6 +1,6 @@
 import pkg::compare::PartialEq;
 import pkg::context::Context;
-import pkg::hash::Hashable;
+import pkg::hash::{ Hashable, canonical_hash };
 import pkg::io::panic;
 import pkg::native_map::NativeMap;
 import pkg::option::Option::{ self, None, Some };
@@ -1368,28 +1368,117 @@ export fun reconcile<T, K: PartialEq>(
 	for _ in old_keys {
 		claimed.push(false);
 	}
+	let held = old_keys.len();
+	// M82: a POSITION INDEX, so a pass stops being quadratic.
+	//
+	// The scan this replaces walked `old_keys` from 0 for every new item,
+	// skipping claimed entries — so for a list that did not reorder, item `i`
+	// matched at index `i` after walking `i + 1` entries, and a pass cost
+	// N(N+1)/2 iterations whatever the change was: 500,500 at 1,000 rows for
+	// ONE append. The index is the same thing `KeyedCell` keeps, built per
+	// pass: for each canonical key, the chain of old positions holding it,
+	// smallest first. `first` is a chain's head and `next_same[i]` is the
+	// position after `i` in `i`'s own chain — one native map of at most N
+	// entries plus one N-element list, no nested containers and no per-key list
+	// to grow.
+	//
+	// Built DESCENDING so each head ends up the smallest index in its chain,
+	// which is what makes walking a chain the same order as scanning from 0.
+	//
+	// **The plan is IDENTICAL to the scan's, for every `K`.** The scan's answer
+	// is the smallest unclaimed index whose key `==` the item's, and the index
+	// answers it directly only when the key's `==` agrees with canonical value
+	// identity. A `K` whose equality is COARSER — a case-insensitive string, a
+	// struct comparing a subset of its fields — can have an EARLIER match that
+	// hashes differently, so the earlier stretch is still scanned: from `low`,
+	// the smallest unclaimed index (everything below it is claimed), up to the
+	// candidate the chain named. Where the two agree, which is every key type
+	// in std, the corpus, the book, the examples and kolt, that stretch is
+	// empty and the pass is linear.
+	mut first: NativeMap<i32> = NativeMap::new();
+	mut next_same: List<i32> = [];
+	for _ in old_keys {
+		next_same.push(-1);
+	}
+	mut build = held - 1;
+	for build >= 0 {
+		let canonical = canonical_hash(old_keys[build]);
+		match first.get(canonical) {
+			Some(let after) => next_same[build] = after,
+			None => {},
+		}
+		first.insert(canonical, build);
+		build -= 1;
+	}
+	// The smallest index nothing has claimed. It only ever moves forward, so
+	// maintaining it is O(N) across the whole pass, and it is what bounds the
+	// coarse-equality scan below from underneath.
+	mut low = 0;
 	mut steps: List<RowStep> = [];
 	for item in items {
 		let item_key = key_of(item);
-		mut step = RowStep::Fresh;
-		mut index = 0;
-		for index < old_keys.len() {
+		let canonical = canonical_hash(item_key);
+		// The chain for this key's canonical hash. Entries at its head that are
+		// already claimed are dropped from the chain for good (`first` is
+		// advanced past them), so the total cost of skipping claimed entries
+		// across a whole pass is bounded by the number of claims.
+		mut head = match first.get(canonical) {
+			Some(let at) => at,
+			None => -1,
+		};
+		for head >= 0 {
+			if !claimed[head] {
+				jump break;
+			}
+			head = next_same[head];
+		}
+		first.insert(canonical, head);
+		mut candidate = -1;
+		mut walk = head;
+		for walk >= 0 {
+			if !claimed[walk] && old_keys[walk] == item_key {
+				candidate = walk;
+				jump break;
+			}
+			// Unclaimed, canonically the same value, and yet not `==`: a `K`
+			// whose equality is FINER than value identity. Walk on rather than
+			// advance the head, because a later item may still match here.
+			walk = next_same[walk];
+		}
+		// Anything the chain cannot see lives between `low` and the candidate
+		// (or to the end, when the chain named none). Empty for every key type
+		// whose `==` is value identity, which is what makes the common case one
+		// pass.
+		let ceiling = if candidate < 0 { held } else { candidate };
+		mut found = candidate;
+		mut index = low;
+		for index < ceiling {
 			if !claimed[index] && old_keys[index] == item_key {
-				claimed[index] = true;
-				step = if same(old_items[index], item) {
-					RowStep::Keep(index)
-				} else {
-					RowStep::Refresh(index)
-				};
+				found = index;
 				jump break;
 			}
 			index += 1;
+		}
+		mut step = RowStep::Fresh;
+		if found >= 0 {
+			claimed[found] = true;
+			step = if same(old_items[found], item) {
+				RowStep::Keep(found)
+			} else {
+				RowStep::Refresh(found)
+			};
+			for low < held {
+				if !claimed[low] {
+					jump break;
+				}
+				low += 1;
+			}
 		}
 		steps.push(step);
 	}
 	mut removed: List<i32> = [];
 	mut index = 0;
-	for index < old_keys.len() {
+	for index < held {
 		if !claimed[index] {
 			removed.push(index);
 		}

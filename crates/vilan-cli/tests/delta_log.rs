@@ -20,7 +20,11 @@
 //!    before the paper measured them: a log with NO consumers holds exactly the
 //!    op just recorded (one, not zero — `record` trims and then pushes), and the
 //!    log is trimmed at the next WRITE and not at the drain.
-//! 3. [`std_reactive_imports_nothing_from_std_wire`] — the layering the lift
+//! 3. [`reconciles_index_answers_exactly_what_the_scan_answered`] — M82's
+//!    position index inside `reconcile`, held to the scan it replaces over
+//!    1,015 cases, including a key type whose `==` is coarser than value
+//!    identity (which a first attempt got wrong).
+//! 4. [`std_reactive_imports_nothing_from_std_wire`] — the layering the lift
 //!    must not invert. `SeqOp` is a `std::reactive` type, `Delta` a `std::wire`
 //!    one, and the edge between them lives in `std::rpc`. A grep over the two
 //!    reactive-layer files is honest here and costs microseconds: there is no
@@ -189,6 +193,31 @@ main();
          harmless and both are WRITTEN DOWN in `DeltaLog::record`/`trim` \
          (incremental-collections.md §4.1) — a change here is a doc change \
          first."
+    );
+}
+
+/// M82: the indexed `reconcile` answers what the scan answered, plan for plan.
+///
+/// The program carries the pre-index scan verbatim and compares every case
+/// against it, so this gate is a DIFFERENTIAL rather than a golden: it cannot
+/// be satisfied by regenerating anything. 1,015 cases — the named shapes, 600
+/// randomized pairs over a small key alphabet so duplicates and reorders are
+/// dense, and 400 randomized pairs of a key whose equality is coarser than
+/// value identity. Non-vacuous by construction: the first version of the index
+/// answered the chain's candidate outright and this reddened at `tags 22` with
+/// both plans printed.
+#[test]
+fn reconciles_index_answers_exactly_what_the_scan_answered() {
+    let program = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/test/reconcile-index.vl");
+    let contents = std::fs::read_to_string(&program)
+        .unwrap_or_else(|error| panic!("read {program:?}: {error}"));
+    let stdout = build_and_run("reconcile", "reconcile-index.vl", &contents);
+    assert_eq!(
+        stdout, "cases=1015 differences=0\n",
+        "the reconcile differential moved. A difference is printed as a panic \
+         naming the case and both plans; a changed COUNT means the shapes \
+         moved, which is a deliberate edit to the program and not a number to \
+         update blindly."
     );
 }
 

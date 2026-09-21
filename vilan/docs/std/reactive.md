@@ -842,3 +842,20 @@ identity and whether the row moves; `same` decides, for a surviving key, reuse
 against dispose-and-rebuild. `each` passes `|a, b| a == b`;
 `each_by` passes `|_a, _b| true`, which is why it never emits a `Refresh`
 and asks nothing of `T`.
+
+**A pass is one walk, not N of them (tracker M82).** The matcher used to scan
+the old keys from 0 for every new item, so a list that did not reorder cost
+N(N+1)/2 iterations whatever the change was — 500,500 at 1,000 rows, for one
+append. It keeps a position index instead: per canonical key, the chain of old
+positions holding it. Measured over `each`'s scan half, callgrind Ir per change
+under `node --jitless`: **355.1 M → 29.1 M at 1,000 rows**, and 95.1 M → 14.8 M
+at 500 with 1,369.9 M → 58.5 M at 2,000 — 1.97× and 2.01× per doubling where it
+used to be 3.73× and 3.86×, which is linear where it was quadratic.
+
+The plan it produces is unchanged for every key type, and that is gated by a
+differential rather than by a golden: a key whose `==` is *coarser* than value
+identity — a case-insensitive string, a struct comparing a subset of its fields
+— can have an earlier match that the index cannot see, so the stretch below the
+index's candidate is still scanned. Where `==` is value identity, which is
+every key in std, the book, the examples and the shipped apps, that stretch is
+empty.

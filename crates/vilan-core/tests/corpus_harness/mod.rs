@@ -158,6 +158,7 @@ macro_rules! corpus_manifest {
             reactive => "reactive.vl",
             reactive_on_change => "reactive-on-change.vl",
             reactive_selector => "reactive-selector.vl",
+            reconcile_index => "reconcile-index.vl",
             recursion => "recursion.vl",
             remainder => "remainder.vl",
             resource_exit => "resource_exit.vl",
