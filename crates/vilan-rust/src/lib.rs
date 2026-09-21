@@ -65,7 +65,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
 use vilan_core::analyzer::{
-    Expr, ExprIfBranch, ExprMatchLeg, ExprPattern, GenericDispatch, Intrinsic, Program,
+    Backing, BackingValue, Expr, ExprIfBranch, ExprMatchLeg, ExprPattern, GenericDispatch,
+    Intrinsic, Program,
 };
 use vilan_core::error::Error;
 use vilan_core::fx::FxHashMap as HashMap;
@@ -247,6 +248,15 @@ struct Emitter<'a, 'src> {
     /// ORIGIN, which is what the unobserved-failure report names. The JS
     /// emitter keeps the same thing under the same name.
     current_origin: Option<&'src str>,
+    /// Whether the value being emitted initializes a binding that HOLDS a view
+    /// (F20) — `let v = &mut n;`, `let items = holder.items_view();`.
+    ///
+    /// Such a binding is the one value position that wants the REFERENCE rather
+    /// than what it points at: the type system has no reference form, so the
+    /// binding's recorded type is its pointee's and only the initializer's own
+    /// shape says otherwise. Without this, B109's read-through copy fired here
+    /// too and `let v = &mut n` bound an `i32`.
+    declaring_a_view: bool,
     /// Whether the position whose TYPE is being rendered, or whose VALUE is
     /// being emitted, is a DECLARED-async closure one (F20).
     ///
@@ -322,6 +332,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             host_gaps: std::collections::BTreeSet::new(),
             context_flavours: BTreeMap::new(),
             current_origin: None,
+            declaring_a_view: false,
             expects_async: false,
             expects_async_value: false,
             closure_captures: Vec::new(),
@@ -1475,6 +1486,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
         for argument in arguments {
             rendered.push(self.rust_type(*argument, span)?);
         }
+        // F20: a BACKED enum IS its backing value at runtime — a number or a
+        // string, on both backends (`backed-enums.md` §3.5). So the TYPE is that
+        // scalar, a variant is its literal, and a pattern is the same literal;
+        // there is no Rust `enum` to declare, which is also why exhaustiveness
+        // lands on the catch-all arm `match_expr` already writes (the JS side's
+        // `__enum_trap`).
+        if let Some(backing) = declaration.backing {
+            return Ok(match backing {
+                Backing::Int => "i32".to_string(),
+                Backing::Str => "vilan_rt::Str".to_string(),
+            });
+        }
         match name {
             "bool" => Ok("bool".to_string()),
             "Option" => Ok(format!(
@@ -1690,12 +1713,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     "the `resource` enum `{}` (destruction.md's teardown is a later slice)",
                     declaration.name
                 ),
-                span,
-            ));
-        }
-        if declaration.backing.is_some() {
-            return Err(unsupported(
-                &format!("the backed enum `{}`", declaration.name),
                 span,
             ));
         }
@@ -2698,6 +2715,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// own `__clone` decision, read here so the two backends copy in exactly
     /// the same places rather than in two opinions of the same places.
     fn value_of(&mut self, id: Id, depth: usize) -> Result<String, Error> {
+        // B109: a `&place` and a `borrows` CALL are leaves that name storage
+        // without being places, and in a VALUE position both are read THROUGH —
+        // which is rule 1's copy. `element-clones.vl` states the claim in its
+        // own comment ("read through the view and the three spellings are
+        // indistinguishable") and is the pin: `fun reference_of(holder:
+        // &Holder): List<i32> { &holder.items }` emitted `&holder.items` against
+        // a signature promising a value.
+        if !self.current_returns_view && !self.declaring_a_view && self.reads_through_a_view(id) {
+            if let Some(&Expr::Reference(operand, _)) = self.program.entity_map.get(&id) {
+                let operand_text = self.expression(operand, depth)?;
+                return Ok(format!("({operand_text}).clone()"));
+            }
+            let text = self.expression(id, depth)?;
+            return Ok(format!("({text}).clone()"));
+        }
         let text = self.expression(id, depth)?;
         if self.program.clone_sites.contains_key(&id) {
             return Ok(format!("({text}).clone()"));
@@ -2734,6 +2766,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Ok(format!("({text}).clone()"));
         }
         Ok(text)
+    }
+
+    /// Whether `id` is a leaf that names STORAGE without being a place — a
+    /// written `&place`, or a call to a `borrows` function. Both answer a
+    /// reference natively and a value is what the position wants.
+    fn reads_through_a_view(&self, id: Id) -> bool {
+        match self.program.entity_map.get(&id) {
+            Some(Expr::Reference(_, _)) => true,
+            Some(&Expr::Call(call_id)) => self
+                .program
+                .function_calls
+                .get(&call_id)
+                .and_then(|call| match self.program.entity_map.get(&call.subject_id) {
+                    Some(Expr::Local(target)) => self.program.functions.get(target),
+                    _ => None,
+                })
+                .is_some_and(|function| function.returns_view || function.returns_mut_view),
+            _ => false,
+        }
     }
 
     /// Whether `id` reads a binding some enclosing closure captures.
@@ -3024,19 +3075,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         else {
             return false;
         };
-        match self.program.entity_map.get(&initial) {
-            Some(Expr::Reference(_, _)) => true,
-            Some(Expr::Call(call_id)) => self
-                .program
-                .function_calls
-                .get(call_id)
-                .and_then(|call| match self.program.entity_map.get(&call.subject_id) {
-                    Some(Expr::Local(target)) => self.program.functions.get(target),
-                    _ => None,
-                })
-                .is_some_and(|function| function.returns_view || function.returns_mut_view),
-            _ => false,
-        }
+        self.reads_through_a_view(initial)
     }
 
     fn read_binding(&self, binding: Id) -> String {
@@ -3252,7 +3291,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
         };
         match variable.initial {
             Some(initial) => {
-                let value = self.value_of_expecting(initial, Some(variable.type_id), depth)?;
+                // A binding whose initializer is a `&place` or a `borrows` call
+                // HOLDS the view, so the initializer is not read through — see
+                // [`Emitter::declaring_a_view`].
+                let holds_a_view = self.reads_through_a_view(initial);
+                let saved = std::mem::replace(&mut self.declaring_a_view, holds_a_view);
+                let value = self.value_of_expecting(initial, Some(variable.type_id), depth);
+                self.declaring_a_view = saved;
+                let value = value?;
                 if self.boxed.contains(&binding) {
                     // R3: a mutably-captured binding is a counted cell, so the
                     // declaration builds one and every read and write below goes
@@ -3639,10 +3685,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // question is asked of the PATTERNS rather than of the subject's type
         // because a subject that is a call (`s.trim()`) carries no type on its
         // own id, and a string literal in a leg is the whole evidence.
-        if legs.iter().any(|leg| {
-            matches!(&leg.pattern, ExprPattern::Literal(id)
-                if Self::string_pattern_text(self.program, *id).is_some())
-        }) {
+        let matches_a_string = legs.iter().any(|leg| match &leg.pattern {
+            ExprPattern::Literal(id) => Self::string_pattern_text(self.program, *id).is_some(),
+            // A `str`-BACKED enum's variant is a string literal too.
+            ExprPattern::Variant(enum_id, _, _) => self
+                .program
+                .enums
+                .get(enum_id)
+                .is_some_and(|declaration| declaration.backing == Some(Backing::Str)),
+            _ => false,
+        });
+        if matches_a_string {
             subject_text = format!("&*({subject_text})");
         }
         let pad = Self::indent(depth);
@@ -3737,6 +3790,28 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             ExprPattern::Literal(id) => self.expression(*id, 0),
             ExprPattern::Variant(enum_id, index, payload) => {
+                // A BACKED variant is its literal, which is the same pattern a
+                // `match` over a raw number or a raw `str` already takes.
+                if let Some(declaration) = self.program.enums.get(enum_id).cloned()
+                    && let Some(value) = Self::backed_variant_value(&declaration, *index)
+                {
+                    let _ = payload;
+                    return Ok(match declaration.backing {
+                        // A `str`-backed variant matches as a `&str` literal;
+                        // the subject is deref'd by `match_expr`.
+                        Some(Backing::Str) => match &declaration.variants[*index].backing_value {
+                            BackingValue::Str(text) => rust_string(text),
+                            BackingValue::Int(discriminant) => format!("{discriminant}"),
+                        },
+                        // An integer pattern carries no suffix: the subject's
+                        // own type decides the width.
+                        _ => value
+                            .trim_start_matches('(')
+                            .trim_end_matches(')')
+                            .trim_end_matches("i32")
+                            .to_string(),
+                    });
+                }
                 if let Some(declaration) = self.program.enums.get(enum_id)
                     && declaration.name == "bool"
                 {
@@ -3847,6 +3922,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .variants
             .get(index)
             .ok_or_else(|| unsupported("an unresolved enum variant", span))?;
+        if let Some(value) = Self::backed_variant_value(&declaration, index) {
+            return Ok(value);
+        }
         match declaration.name {
             "bool" => Ok(if index == 1 { "true" } else { "false" }.to_string()),
             "Option" | "Result" => Ok(sanitize(variant.name)),
@@ -3854,6 +3932,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let name = sanitize(variant.name);
                 let instance = self.ensure_enum(enum_id, arguments, span)?;
                 Ok(format!("{}::{name}", instance.name))
+            }
+        }
+    }
+
+    /// The bare backing value of a variant, if its enum is BACKED — `Align::Start`
+    /// is the string `"start"` exactly as `Ordering::Greater` is the number `1`
+    /// (backed-enums.md §3.5). `None` for every array-form enum, and for `bool`,
+    /// which lowers to a native scalar through its own special case.
+    fn backed_variant_value(
+        declaration: &vilan_core::analyzer::Enum<'src>,
+        index: usize,
+    ) -> Option<String> {
+        declaration.backing?;
+        match &declaration.variants.get(index)?.backing_value {
+            BackingValue::Int(discriminant) => Some(format!("({discriminant}i32)")),
+            // The declaration carries the RAW literal text, so it unescapes at
+            // emission exactly like any other string literal.
+            BackingValue::Str(text) => {
+                Some(format!("vilan_rt::str_new({})", rust_string(text.as_str())))
             }
         }
     }
@@ -5451,6 +5548,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     "vilan_rt::list_remove(&mut {}, ({}) as i64)",
                     next(),
                     next()
+                )
+            }
+            // `sort_by` answers a COPY (`own self`), and its comparator arrives
+            // as an `Rc<dyn Fn>` — which implements no `Fn` trait itself, so it
+            // is bound and CALLED inside a closure the runtime can take.
+            Intrinsic::ListSortBy => {
+                let receiver = next();
+                let compare = next();
+                format!(
+                    "{{ let compare = {compare}; \
+                     vilan_rt::list_sort_by(&{receiver}, move |a, b| compare(a, b)) }}"
                 )
             }
             Intrinsic::ListInsert => format!(

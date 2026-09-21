@@ -1339,6 +1339,20 @@ pub fn list_remove<T>(list: &mut Vec<T>, index: i64) -> T {
 }
 
 /// `List::insert` — a past-the-end index appends, as the JS `splice` does.
+/// `List::sort_by` — `__list_sort_by`, which is `list.slice().sort(compare)`: a
+/// COPY, sorted, answered; the receiver is untouched (its vilan signature takes
+/// `own self`).
+///
+/// The comparator answers an `Ordering`, which natively is its BACKING value —
+/// `-1`, `0`, `1` — exactly as it is the number JS `sort` reads. Both sorts are
+/// stable, so equal elements keep their order on both backends, which is what a
+/// byte differential over a sorted list turns on.
+pub fn list_sort_by<T: Clone>(list: &[T], compare: impl Fn(T, T) -> i32) -> Vec<T> {
+    let mut sorted = list.to_vec();
+    sorted.sort_by(|left, right| compare(left.clone(), right.clone()).cmp(&0));
+    sorted
+}
+
 pub fn list_insert<T>(list: &mut Vec<T>, index: i64, value: T) {
     let at = if index < 0 {
         0
