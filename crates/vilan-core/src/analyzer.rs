@@ -51299,6 +51299,19 @@ pub struct Program<'src> {
     /// source. Tooling checks membership here to answer an explicit, honest
     /// "nothing" instead of relying on the self-loop cycle guard (E73).
     pub context_hidden_parameters: HashMap<Id, Id>,
+    /// F23: which of [`Program::context_hidden_parameters`] carry `Option<T>`
+    /// rather than the context's bare `T` — the parameter's FLAVOUR
+    /// (`reactive-turns.md` §5.1), recorded where the pass MINTS the parameter
+    /// and known there exactly: a parameter holds the bare value when its
+    /// provider is a strict node or a `run` closure, and `Option<T>` otherwise.
+    ///
+    /// The parameter itself stays record-less for the reason above, so the
+    /// flavour cannot live on a `parameters` entry. It is a separate marker for
+    /// the same reason the parameter is: a consumer that needs the TYPE (the
+    /// Rust backend, which must write one down) asks here, and no consumer
+    /// keyed on `parameters` sees plumbing dressed as source. Membership is the
+    /// bool: absent means bare.
+    pub context_optional_hidden_parameters: HashSet<Id>,
     /// E124: the module-level bindings `context::thread_contexts` recognized as
     /// ambient contexts — `let app_context = Context<AppContext>::new();`.
     ///
@@ -60769,6 +60782,7 @@ fn analyze_over_world<'src>(
         spawn_nursery_sources: HashMap::default(),
         context_erased_subjects: HashMap::default(),
         context_hidden_parameters: HashMap::default(),
+        context_optional_hidden_parameters: HashSet::default(),
         context_bindings: Vec::new(),
         bool_enum_id: analyzer.bool_enum_id,
         module_id_by_name: analyzer.module_id_by_name,

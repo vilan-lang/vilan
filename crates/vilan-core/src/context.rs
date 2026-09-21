@@ -165,7 +165,8 @@ pub fn thread_contexts(program: &mut Program) -> Option<CallGraph> {
     // Publish the context-dependent nodes (functions / `run` closures that take a
     // hidden context parameter) so `check_context_drops` can reject a `drop` body
     // that requires an ambient context (destruction.md §8). Not a graph input.
-    program.context_dependent_functions = plan.param_nodes.iter().map(|(_, node)| *node).collect();
+    program.context_dependent_functions =
+        plan.param_nodes.iter().map(|(_, node, _)| *node).collect();
 
     // E124: the bindings this pass recognized as ambient contexts, published
     // for the dead-item paint. Recorded BEFORE the `is_empty` short-circuit
@@ -223,8 +224,15 @@ enum ThreadForm {
 struct Plan {
     contexts: Vec<Id>,
     /// Nodes (functions and `run` closures) that receive their own hidden
-    /// parameter, as `(context, node)`.
-    param_nodes: Vec<(Id, Id)>,
+    /// parameter, as `(context, node, holds the bare value)`.
+    ///
+    /// F23: the third field is the parameter's FLAVOUR, and it is recorded here
+    /// because THIS is where it is known — `holds_bare` reads the node's own
+    /// provider, which the analysis just settled. A consumer that needs the
+    /// parameter's type (the Rust backend) reads it back off
+    /// `Program::context_optional_hidden_parameters` rather than re-deriving it
+    /// from what the call sites pass.
+    param_nodes: Vec<(Id, Id, bool)>,
     /// Captured closures that read the context from an enclosing node, as
     /// `(context, closure, provider node)` — the closure reuses the provider's
     /// parameter rather than taking its own.
@@ -2495,9 +2503,6 @@ fn analyze(
         for &id in &param_nodes {
             provider_of.entry(id).or_insert(id);
         }
-        for id in param_nodes {
-            plan.param_nodes.push((context, id));
-        }
         // A parameter holds the BARE value when its provider is strict or a
         // `run` closure (which `run` hands the bare value); otherwise it
         // holds `Option<T>`.
@@ -2507,6 +2512,14 @@ fn analyze(
                 .map(|provider| strict.contains(provider) || run_closure_ids.contains(provider))
                 .unwrap_or(false)
         };
+        // F23: the flavour rides along with the node, so `apply` can record it
+        // against the parameter it is about to mint. The iteration order is
+        // the set's own, unchanged — it is what decides the order the hidden
+        // parameters are minted in, and therefore the entity ids every
+        // downstream gensym is numbered from.
+        for id in param_nodes {
+            plan.param_nodes.push((context, id, holds_bare(id)));
+        }
 
         for get in gets.iter().filter(|get| get.context == context) {
             if none_rooted.contains(&get.owner.id()) {
@@ -2769,12 +2782,18 @@ fn apply(program: &mut Program, plan: Plan) {
     // no `expr_types` label — it is not source), so it is marked in
     // `context_hidden_parameters` for tooling to recognize and answer
     // honestly (editing-dx.md §19.3).
-    for &(context, node) in &plan.param_nodes {
+    for &(context, node, holds_bare) in &plan.param_nodes {
         let parameter = fresh();
         program
             .entity_map
             .insert(parameter, Expr::Parameter(parameter));
         program.context_hidden_parameters.insert(parameter, context);
+        // F23: and its FLAVOUR, which the analysis settled from the node's own
+        // provider. Recorded here rather than inferred downstream from the
+        // arguments the call sites pass.
+        if !holds_bare {
+            program.context_optional_hidden_parameters.insert(parameter);
+        }
         if let Some(function) = program.functions.get_mut(&node) {
             function.parameters.push(parameter);
         } else if let Some(closure) = program.closures.get_mut(&node) {

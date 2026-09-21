@@ -598,6 +598,109 @@ const HASH_PROBE: &str = concat!(
     "}\n",
 );
 
+/// F23: a context-threaded hidden parameter is typed from the flavour the
+/// CONTEXT PASS recorded, and one program carries both readings.
+///
+/// The parameter is deliberately record-less (no `parameters` entry, no span, no
+/// type — editing-dx.md §19.3), so the Rust emitter, which must write a type
+/// down, used to re-derive the flavour from the arguments every call site passes
+/// — a worklist that had to connect clause-typed parameters to every closure
+/// literal that can land there, and that fell back on the strict reading when
+/// nothing settled. `context.rs` knows the answer where it MINTS the parameter:
+/// a node holds the bare value when its provider is strict or a `run` closure,
+/// and `Option<T>` otherwise.
+///
+/// The probe puts a safe reader (`peek`, which `get_safe`s) and a strict one
+/// (`strict_report`, which `get`s and then calls `peek`) in one program, so the
+/// two flavours are asserted against each other rather than one at a time: a
+/// record that is uniformly wrong, or uniformly right for the wrong reason,
+/// cannot pass both halves. Flipping the recorded bool swaps the two signatures,
+/// which is what makes this non-vacuous.
+#[test]
+fn a_context_threaded_parameter_is_typed_from_the_recorded_flavour() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_context_flavour.vl"),
+        CONTEXT_PROBE,
+    )
+    .expect("write the probe program");
+    let emitted = vilan(&staged)
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_context_flavour.vl",
+        ])
+        .output()
+        .expect("build the probe");
+    assert!(
+        emitted.status.success(),
+        "the context-flavour probe was refused:\n{}",
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+    let source = String::from_utf8_lossy(&emitted.stdout);
+    let signature = |prefix: &str| -> String {
+        source
+            .lines()
+            .find(|line| line.starts_with(&format!("fn {prefix}")))
+            .unwrap_or_else(|| panic!("no `fn {prefix}..` in the emitted source:\n{source}"))
+            .to_string()
+    };
+    // The safe region's parameter carries the `Option`; the strict region's
+    // carries the value, because `run` hands it one.
+    let safe = signature("peek_");
+    assert!(
+        safe.contains(": Option<i32>"),
+        "a `get_safe`-reachable region's hidden parameter must be `Option<i32>`: {safe}"
+    );
+    let strict = signature("strict_report_");
+    assert!(
+        strict.contains(": i32") && !strict.contains(": Option<i32>"),
+        "a strict region's hidden parameter must be the bare value: {strict}"
+    );
+    // And the program means the same thing on both backends, which is what the
+    // types have to be right FOR.
+    assert_eq!(
+        compare(&staged, "native_probe_context_flavour.vl"),
+        Verdict::Identical,
+        "the context-threaded program must agree on both backends"
+    );
+}
+
+/// Both context flavours in one program: `peek` is safe (it `get_safe`s, so its
+/// hidden parameter is an `Option`), `strict_report` is strict (it `get`s, so
+/// `run` hands it the bare value) and calls `peek`, which is the covered→safe
+/// boundary that `Some`-wraps.
+const CONTEXT_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::context::Context;\n",
+    "import std::option::Option::{ Some, None };\n",
+    "\n",
+    "let current: Context<i32> = Context::new();\n",
+    "\n",
+    "fun peek(): str {\n",
+    "\tmatch current.get_safe() {\n",
+    "\t\tSome(let value) => i\"peeked {value}\",\n",
+    "\t\tNone => \"nothing\",\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun strict_report() {\n",
+    "\tlet value = current.get();\n",
+    "\tprint(i\"strict {value}\");\n",
+    "\tprint(peek());\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(peek());\n",
+    "\tcurrent.run(9, || {\n",
+    "\t\tstrict_report();\n",
+    "\t});\n",
+    "\tprint(peek());\n",
+    "}\n",
+);
+
 /// S1b's monomorphisation, held to the shape rather than to one program: a
 /// generic function, a generic struct and a generic enum each emit ONE Rust
 /// item per instantiation, and two instantiations of one declaration are two

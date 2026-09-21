@@ -240,10 +240,6 @@ struct Emitter<'a, 'src> {
     /// scope in which a capture has a native name at all (it has no `variables`
     /// record; the JS emitter substitutes the payload accessor instead).
     is_captures: HashSet<Id>,
-    /// J6: each context-threaded hidden parameter's flavour, as
-    /// [`Emitter::compute_context_flavours`] reads it off the arguments its call
-    /// sites pass.
-    context_flavours: BTreeMap<u32, ContextFlavour>,
     /// J6: the name of the function whose body is being walked — a spawn's
     /// ORIGIN, which is what the unobserved-failure report names. The JS
     /// emitter keeps the same thing under the same name.
@@ -291,20 +287,6 @@ struct Emitter<'a, 'src> {
     closure_captures: Vec<HashSet<Id>>,
 }
 
-/// Whether a context-threaded hidden parameter carries the context's value or an
-/// `Option` of it.
-///
-/// reactive-turns.md §5 (1): the hidden parameter for a `get_safe`-reachable
-/// region carries `Option<T>` and a strict-`get` region keeps the bare flavour.
-/// The context pass marks the parameter in `context_hidden_parameters` but
-/// records no type for it — it is deliberately not source — so the flavour is
-/// recovered from what the call sites PASS.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ContextFlavour {
-    Bare,
-    Optional,
-}
-
 impl<'a, 'src> Emitter<'a, 'src> {
     fn new(program: &'a Program<'src>) -> Self {
         Emitter {
@@ -330,7 +312,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
             is_captures: HashSet::new(),
             census: std::env::var_os("VILAN_NATIVE_HOST_CENSUS").is_some(),
             host_gaps: std::collections::BTreeSet::new(),
-            context_flavours: BTreeMap::new(),
             current_origin: None,
             declaring_a_view: false,
             expects_async: false,
@@ -362,7 +343,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // them must carry none of them.
         self.module_bindings = self.program.module_level_bindings().into_iter().collect();
         self.compute_boxed_bindings();
-        self.compute_context_flavours();
 
         let main = self.ensure_function(main_id, &HashMap::default())?;
         let main_body = self
@@ -431,149 +411,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
-    /// J6: which flavour each context-threaded hidden parameter carries.
-    ///
-    /// `context.rs` gives every needs-context function a record-LESS parameter
-    /// (no `parameters` entry, no span, no type) and appends the value as an
-    /// argument at each call. So the parameter's type is not written down
-    /// anywhere, but it is determined: the argument the callers pass is either
-    /// a literal `None`, a `Some(..)` wrap, or a read of the CALLER's own
-    /// hidden parameter. The first two settle a callee outright; the third
-    /// propagates, which is why this is a worklist rather than one pass.
-    ///
-    /// An undetermined parameter stays out of the map and
-    /// [`Emitter::parameter_declaration`] refuses at it — a guessed flavour
-    /// would be a type error in the emitted Rust, and a refusal by name is the
-    /// standing answer to a construct this backend cannot see through.
-    fn compute_context_flavours(&mut self) {
-        // Which closures a clause-typed PARAMETER can hold — every closure
-        // literal any call site hands it. `nursery(|n| { .. })` is the shape:
-        // the body's own hidden parameter is bound not at the `nursery(..)`
-        // call but inside `nursery`, where the parameter is CALLED, so the two
-        // have to be connected before the flavours can propagate.
-        let mut closures_by_parameter: HashMap<Id, Vec<Id>> = HashMap::default();
-        for call in self.program.function_calls.values() {
-            let Some(receiving) = self.receiving_parameters(call.subject_id) else {
-                continue;
-            };
-            for (position, parameter_id) in receiving.iter().enumerate() {
-                if let Some(argument) = call.argument_ids.get(position)
-                    && let Some(Expr::Closure(closure_id)) =
-                        self.program.entity_map.get(argument).cloned()
-                {
-                    closures_by_parameter
-                        .entry(*parameter_id)
-                        .or_default()
-                        .push(closure_id);
-                }
-            }
-        }
-
-        // (callee's hidden parameter, the argument expression a call passes it).
-        let mut edges: Vec<(Id, Id)> = Vec::new();
-        for call in self.program.function_calls.values() {
-            // A call's subject is a named callee, or — after `Context::run`
-            // lowered to `body(value)` — the closure itself, or a clause-typed
-            // parameter, in which case every closure that can land there binds
-            // its own hidden parameter at this position.
-            let mut receiving_lists: Vec<Vec<Id>> = Vec::new();
-            if let Some(receiving) = self.receiving_parameters(call.subject_id) {
-                receiving_lists.push(receiving);
-            }
-            if let Some(Expr::Local(target)) = self.program.entity_map.get(&call.subject_id)
-                && let Some(candidates) = closures_by_parameter.get(target)
-            {
-                for closure_id in candidates {
-                    if let Some(closure) = self.program.closures.get(closure_id) {
-                        receiving_lists.push(closure.parameters.clone());
-                    }
-                }
-            }
-            for receiving in receiving_lists {
-                for (position, parameter_id) in receiving.iter().enumerate() {
-                    if self
-                        .program
-                        .context_hidden_parameters
-                        .contains_key(parameter_id)
-                        && let Some(argument) = call.argument_ids.get(position)
-                    {
-                        edges.push((*parameter_id, *argument));
-                    }
-                }
-            }
-        }
-        // A call dispatched through a generic parameter or a trait
-        // (`item.dispose()` inside `Owner::take<T: Disposable>`) names its
-        // callee by MEMBER NAME: the concrete callee is chosen per
-        // instantiation, long after this pass. The hidden parameter the context
-        // pass appended belongs to the IMPLEMENTATION, so the edges above reach
-        // only the trait DECLARATION's parameter and every implementation stays
-        // undetermined — `Subscription::dispose`, whose holder is safe, then
-        // defaulted to the bare flavour and emitted `context: Turn` against
-        // callers passing `Option<Turn>`. That was `board.vl`'s last rustc
-        // refusal.
-        //
-        // The appended value is always the LAST argument and the hidden
-        // parameter is always the LAST parameter, so a candidate is a function
-        // of that name whose last parameter threads a context and whose arity
-        // matches the call's.
-        //
-        // F23 deletes this whole pass: `context.rs` knows the flavour where it
-        // mints the parameter, and re-deriving it here is the reason there is a
-        // default to be wrong about.
-        for (call_id, call) in &self.program.function_calls {
-            let member = match self
-                .program
-                .generic_dispatch
-                .get(call_id)
-                .or_else(|| self.program.generic_dispatch.get(&call.subject_id))
-            {
-                Some(
-                    GenericDispatch::OnConstraint(_, member) | GenericDispatch::OnType(_, member),
-                ) => *member,
-                None => continue,
-            };
-            let Some(&argument) = call.argument_ids.last() else {
-                continue;
-            };
-            for function in self.program.functions.values() {
-                if function.name != member || function.parameters.len() != call.argument_ids.len() {
-                    continue;
-                }
-                let Some(&last) = function.parameters.last() else {
-                    continue;
-                };
-                if self.program.context_hidden_parameters.contains_key(&last) {
-                    edges.push((last, argument));
-                }
-            }
-        }
-
-        // The two determined shapes first, then propagate through the reads.
-        for (parameter, argument) in &edges {
-            if let Some(flavour) = self.flavour_of_argument(*argument) {
-                self.context_flavours.insert(parameter.0, flavour);
-            }
-        }
-        loop {
-            let mut changed = false;
-            for (parameter, argument) in &edges {
-                if self.context_flavours.contains_key(&parameter.0) {
-                    continue;
-                }
-                if let Some(Expr::Local(source)) = self.program.entity_map.get(argument)
-                    && let Some(flavour) = self.context_flavours.get(&source.0).copied()
-                {
-                    self.context_flavours.insert(parameter.0, flavour);
-                    changed = true;
-                }
-            }
-            if !changed {
-                return;
-            }
-        }
-    }
-
     /// The native type a context's THREADED VALUE has — `let ambient_nursery:
     /// Context<Nursery>` carries it as the declared type's one argument.
     fn context_value_type(&mut self, context: Id, span: Span) -> Result<String, Error> {
@@ -611,8 +448,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// appends for it carries that binding's value type — under an `Option` for
     /// the safe flavour. There is no parameter id to key the flavour on at the
     /// type level, so it is taken from the CLOSURES: every closure that lands in
-    /// a clause position has a hidden parameter for the same context, and
-    /// [`Emitter::compute_context_flavours`] settled those. Two closures that
+    /// a clause position has a hidden parameter for the same context, and F23
+    /// records each one's flavour where the pass minted it. Two closures that
     /// disagree would need two types, which is refused rather than guessed.
     fn context_clause_type(&mut self, context: Id, span: Span) -> Result<String, Error> {
         let name = self
@@ -621,16 +458,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .get(&context)
             .map(|variable| variable.name)
             .unwrap_or("a context");
-        let mut settled: Option<ContextFlavour> = None;
+        let mut settled: Option<bool> = None;
         for closure in self.program.closures.values() {
             for parameter_id in &closure.parameters {
                 if self.program.context_hidden_parameters.get(parameter_id) != Some(&context) {
                     continue;
                 }
-                let Some(flavour) = self.context_flavours.get(&parameter_id.0).copied() else {
-                    continue;
-                };
-                if settled.is_some_and(|already| already != flavour) {
+                let optional = self
+                    .program
+                    .context_optional_hidden_parameters
+                    .contains(parameter_id);
+                if settled.is_some_and(|already| already != optional) {
                     return Err(unsupported(
                         &format!(
                             "a closure type carrying the context `{name}`, whose closures do \
@@ -639,72 +477,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         span,
                     ));
                 }
-                settled = Some(flavour);
+                settled = Some(optional);
             }
         }
-        // Same default as the parameter's own: strict, so a wrong guess is a
-        // type error rather than a wrong answer.
-        let flavour = settled.unwrap_or(ContextFlavour::Bare);
+        // No closure in the program carries this context: nothing to disagree
+        // with, and the clause names a value the callee will be handed bare.
+        let optional = settled.unwrap_or(false);
         let value = self.context_value_type(context, span)?;
-        Ok(match flavour {
-            ContextFlavour::Bare => value,
-            ContextFlavour::Optional => format!("Option<{value}>"),
+        Ok(if optional {
+            format!("Option<{value}>")
+        } else {
+            value
         })
-    }
-
-    /// The parameter list a call's SUBJECT receives against — a named callee's,
-    /// or a closure literal's where `Context::run` lowered `run(value, body)`
-    /// into `body(value)`.
-    fn receiving_parameters(&self, subject_id: Id) -> Option<Vec<Id>> {
-        match self.program.entity_map.get(&subject_id)? {
-            Expr::Local(target) => self
-                .program
-                .functions
-                .get(target)
-                .map(|function| function.parameters.clone()),
-            Expr::Closure(closure_id) => self
-                .program
-                .closures
-                .get(closure_id)
-                .map(|closure| closure.parameters.clone()),
-            _ => None,
-        }
-    }
-
-    /// The flavour a context argument's own SHAPE settles: a bare `None` or a
-    /// `Some(..)` wrap says `Option<T>`, and a read of an in-scope value says
-    /// the bare flavour. A read of another hidden parameter settles nothing here
-    /// — that is the propagating case.
-    fn flavour_of_argument(&self, argument: Id) -> Option<ContextFlavour> {
-        match self.program.entity_map.get(&argument) {
-            Some(Expr::Local(binding)) => match self.program.entity_map.get(binding) {
-                Some(Expr::EnumVariant(enum_id, _)) => self
-                    .program
-                    .enums
-                    .get(enum_id)
-                    .filter(|declaration| declaration.name == "Option")
-                    .map(|_| ContextFlavour::Optional),
-                _ if self.program.context_hidden_parameters.contains_key(binding) => None,
-                _ => Some(ContextFlavour::Bare),
-            },
-            Some(Expr::Call(call_id)) => {
-                let call = self.program.function_calls.get(call_id)?;
-                let Some(Expr::Local(subject)) = self.program.entity_map.get(&call.subject_id)
-                else {
-                    return None;
-                };
-                match self.program.entity_map.get(subject) {
-                    Some(Expr::EnumVariant(enum_id, _)) => self
-                        .program
-                        .enums
-                        .get(enum_id)
-                        .filter(|declaration| declaration.name == "Option")
-                        .map(|_| ContextFlavour::Optional),
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
     }
 
     /// Walks a closure body, collecting the bindings it DECLARES and the
@@ -2407,20 +2191,22 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 span,
             ));
         };
-        // Nothing settled it: take the STRICT reading, which is the direction to
-        // be wrong in. A parameter that is really the safe one then becomes a
-        // rustc type error rather than a wrong answer — and the reactive path
-        // (`turn_scope`, `owner_scope`) is threaded by `run` alone, where the
-        // value is always present and the strict reading is the right one.
-        let flavour = self
-            .context_flavours
-            .get(&id.0)
-            .copied()
-            .unwrap_or(ContextFlavour::Bare);
+        // F23: a LOOKUP, not an inference. `context.rs` knows the flavour where
+        // it mints the parameter (the node's provider settles it) and records
+        // it; the emitter used to re-derive it from the arguments the call
+        // sites pass, which needed a worklist, could not see through a
+        // clause-typed parameter without first connecting it to every closure
+        // literal that can land there, and defaulted to the strict reading when
+        // nothing settled — a guess that showed up as a rustc type error.
+        let optional = self
+            .program
+            .context_optional_hidden_parameters
+            .contains(&id);
         let value = self.context_value_type(context, span)?;
-        Ok(match flavour {
-            ContextFlavour::Bare => value,
-            ContextFlavour::Optional => format!("Option<{value}>"),
+        Ok(if optional {
+            format!("Option<{value}>")
+        } else {
+            value
         })
     }
 
