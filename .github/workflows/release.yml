@@ -74,7 +74,20 @@ jobs:
         # git-bash is preinstalled there, and the default pwsh speaks none of
         # this.
         shell: bash
+        # On a REHEARSAL (`workflow_dispatch`, tracker L23) the ref is a branch,
+        # so there is no version to look up: the rehearsal asks the question a
+        # tag WILL ask — are there notes to cut — of the `## Unreleased`
+        # section instead. The first rehearsal (2026-09-21) failed here in four
+        # seconds looking for `## vnext`, which is what it exists to find.
         run: |
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            if ! awk '/^## Unreleased/{inside=1; next} /^## /{inside=0} inside && /[^[:space:]]/{found=1} END{exit !found}' CHANGELOG.md; then
+              echo "rehearsal: CHANGELOG.md's '## Unreleased' section is missing or empty — a tag cut from here would have no notes."
+              exit 1
+            fi
+            echo "rehearsal on $GITHUB_REF_NAME: '## Unreleased' carries notes; a tag's own section is checked at the tag."
+            exit 0
+          fi
           VERSION="${GITHUB_REF_NAME#v}"
           if ! grep -q "^## v$VERSION " CHANGELOG.md; then
             echo "CHANGELOG.md has no '## v$VERSION — <date>' section — write the notes before tagging."
