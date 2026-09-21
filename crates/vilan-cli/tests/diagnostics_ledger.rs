@@ -23,10 +23,14 @@
 //! 1. **The index is well formed.** Rows ascend, none repeats, every key has a
 //!    literal fragment to search for (the two recorded exceptions below).
 //! 2. **Every row still lives** ([`every_indexed_row_still_lives_in_the_tree`]).
-//!    A key is split on its `{...}` slots and `...` elisions and its longest
-//!    literal fragment is searched, fixed-string, over the compiler sources and
-//!    `vilan/std`. A reworded or deleted message reds the row that keys on it.
-//!    This is the L13 re-key, run by the suite instead of by a lane.
+//!    A key is split on its `{...}` slots and `...` elisions and EVERY literal
+//!    fragment of [`MIN_FRAGMENT`] characters or more is searched,
+//!    fixed-string, over the compiler sources and `vilan/std`. A reworded or
+//!    deleted message reds the row that keys on it. This is the L13 re-key, run
+//!    by the suite instead of by a lane. It searched only the LONGEST fragment
+//!    until Order 38 (N100), which left the middle and the tail of 288 of the
+//!    532 rows held by nothing — see [`missing_fragments`] for the widening and
+//!    for why the needle is normalized.
 //! 3. **Every diagnostic is rowed**
 //!    ([`every_diagnostic_the_compiler_builds_is_indexed`]). Three anchor
 //!    families are enumerated in full — every `Error { .. msg: <literal> }` in
@@ -838,6 +842,34 @@ fn longest_fragment(key: &str) -> Option<String> {
     fragments(key).into_iter().max_by_key(|f| f.chars().count())
 }
 
+/// The fragments of `key` that [`source_blob`] does not carry — check (2),
+/// widened by N100 from the LONGEST fragment to EVERY one of them.
+///
+/// Until this order the search took `longest_fragment` alone, so a reword
+/// inside any shorter run left its row green: 288 of the index's 532 rows carry
+/// more than one searchable fragment, which is 54 % of the ledger whose middle
+/// and tail were held by nothing. Widening costs nothing — the blob is built
+/// once and a `contains` is a scan — and it is the only half of check (2) that
+/// was ever weaker than its own doc comment claimed ("its literal runs appear
+/// in order").
+///
+/// The needle is [`normalized`] the same way the haystack was, and that is not
+/// cosmetic. A key is written in the FORMAT-STRING spelling of the message it
+/// records — `{name}` for a slot, `{{` for one literal brace — because check
+/// (3) matches it against the literal as WRITTEN at its site. `source_blob`
+/// collapses `{{` to `{`, so a needle carrying the doubled brace matches
+/// nothing. Exactly two rows spell one (494 and 499, the marked-import steer
+/// `import {module}::{{ #{leaf} }};`), and they were the only two rows the
+/// widening would have reddened: not a wrong key — a needle nobody had
+/// prepared. Normalizing AFTER [`pieces`] has split the key is what keeps the
+/// doubled brace from being read as a slot on the way in.
+fn missing_fragments(key: &str, blob: &str) -> Vec<String> {
+    fragments(key)
+        .into_iter()
+        .filter(|fragment| !blob.contains(&normalized(fragment)))
+        .collect()
+}
+
 /// Whether `key` describes `message`: its literal runs appear in order from the
 /// message's start, with each slot free to swallow anything. A key is a
 /// PREFIX of the head it records (the ledger truncates; it never starts in the
@@ -1248,15 +1280,20 @@ fn every_indexed_row_still_lives_in_the_tree() {
     let blob = source_blob();
     let mut stale = Vec::new();
     for row in index() {
-        let Some(fragment) = longest_fragment(&row.key) else {
+        let missing = missing_fragments(&row.key, &blob);
+        if missing.is_empty() {
             continue;
-        };
-        if !blob.contains(&fragment) {
-            stale.push(format!(
-                "  row {}: {:?}\n      not in the tree: {fragment:?}",
-                row.number, row.key
-            ));
         }
+        let named: Vec<String> = missing
+            .iter()
+            .map(|fragment| format!("{fragment:?}"))
+            .collect();
+        stale.push(format!(
+            "  row {}: {:?}\n      not in the tree: {}",
+            row.number,
+            row.key,
+            named.join(", ")
+        ));
     }
     assert!(
         stale.is_empty(),
@@ -1265,6 +1302,60 @@ fn every_indexed_row_still_lives_in_the_tree() {
          (diagnostics-standard.md §5's standing rule):\n{}",
         stale.len(),
         stale.join("\n")
+    );
+}
+
+/// N100: check (2) reds on a reword inside a fragment that is NOT the longest.
+///
+/// The fixture is built so the old search passes and the new one fails, which
+/// is the whole of what the widening bought: the long run is in the blob, the
+/// short one is not.
+#[test]
+fn n100_a_reword_of_a_fragment_that_is_not_the_longest_reds_its_row() {
+    let key = "{subject} alpha bravo charlie {member} delta echo foxtrot golf hotel";
+    let blob = "a tree that carries delta echo foxtrot golf hotel and nothing else";
+
+    let longest = longest_fragment(key).expect("the fixture key has a fragment");
+    assert_eq!(
+        longest, "delta echo foxtrot golf hotel",
+        "the fixture's longest fragment is the one the blob keeps"
+    );
+    assert!(
+        blob.contains(&longest),
+        "the fixture must keep the LONGEST fragment in the blob — otherwise the \
+         pin would red under the single-fragment search too and would prove \
+         nothing about the widening"
+    );
+    assert_eq!(
+        missing_fragments(key, blob),
+        vec!["alpha bravo charlie".to_string()],
+        "the widened search names the short run the blob does not carry"
+    );
+}
+
+/// N100's other half: a key spelling a LITERAL brace the way a format string
+/// does (`{{`) is searched as [`source_blob`] spells it (`{`).
+///
+/// Rows 494 and 499 are the two that do, both quoting B318's marked import.
+/// Without the normalization their tail fragments are needles no tree can ever
+/// hold, and the widening above would have reddened them on the day it landed.
+#[test]
+fn n100_a_key_written_with_a_doubled_brace_is_searched_as_the_blob_spells_it() {
+    let key = "reach it — `import {module}::{{ #(impl {subject}) }};` — or write `export`";
+    let blob = normalized(key);
+
+    assert!(
+        fragments(key)
+            .iter()
+            .any(|fragment| fragment.contains("}}") && !blob.contains(fragment.as_str())),
+        "the fixture must carry a doubled-brace fragment the normalized blob \
+         cannot match verbatim, or the pin proves nothing"
+    );
+    assert!(
+        missing_fragments(key, &blob).is_empty(),
+        "every fragment of a doubled-brace key is found once the needle is \
+         normalized the way the blob was: {:?}",
+        missing_fragments(key, &blob)
     );
 }
 
