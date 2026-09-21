@@ -10932,3 +10932,62 @@ fn b356_a_qualified_path_carries_no_written_type_arguments() {
         "expected an expression",
     );
 }
+
+/// **B357 — a payload-less variant of a GENERIC enum takes its arguments from
+/// the landing constraint, and carries a real HOLE when there is none.** It
+/// typed as the bare enum with an EMPTY argument list, which unifies with every
+/// instantiation while saying nothing, and that is what made
+/// `Box<Option<str>>::new(None)` a `Box<Option>`. Observable in the message: the
+/// refusal names what the variant's type actually is.
+#[test]
+fn b357_a_payload_less_variant_takes_its_arguments_from_the_landing_constraint() {
+    assert_fails_with(
+        r#"
+        enum Slot<T> { Filled(T), Bare }
+
+        struct Box<T> { v: T }
+
+        impl Box<type T> {
+            fun new(v: T): Box<T> { Box { v = v } }
+        }
+
+        fun want(x: Box<Slot<i32>>) { let _ = x; }
+
+        fun main() {
+            let b = Box<Slot<str>>::new(Slot::Bare);
+            want(b);
+        }
+        "#,
+        "Expected Box<Slot<i32>>, but got Box<Slot<str>> instead.",
+    );
+}
+
+/// And the hole where nothing lands: a payload-less variant with no constraint
+/// to take arguments from still flows into a slot that fixes them, which is the
+/// half that must not become a refusal.
+#[test]
+fn b357_a_payload_less_variant_with_no_constraint_still_lands() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        enum Slot<T> { Filled(T), Bare }
+
+        fun want(x: Slot<str>): str {
+            match x {
+                Slot::Filled(let v) => v,
+                Slot::Bare => "bare",
+            }
+        }
+
+        fun main() {
+            let s = Slot::Bare;
+            print(want(s));
+            print(want(Slot::Filled("f")));
+            let n = None;
+            print(n.unwrap_or("d"));
+        }
+        "#,
+        "bare\nf\nd\n",
+    );
+}

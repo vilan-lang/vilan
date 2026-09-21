@@ -32643,27 +32643,24 @@ impl<'src> Analyzer<'src> {
     /// Whether `candidate` says strictly LESS about a generic than `held` does
     /// — the test [`Self::record_generic_binding`] declines on.
     ///
-    /// Two shapes, and both are "the same answer with something rubbed out":
-    /// a HOLE where the held binding has none (`Option<unknown>` against
-    /// `Option<str>`), and the same nominal head with its arguments ERASED.
-    /// The second is the one `None` produces: a payload-less variant types as
-    /// the bare enum, `Option` with an empty argument list, which carries no
-    /// hole to test for and unifies with every `Option<_>` there is.
+    /// ONE shape: "the same answer with something rubbed out" — a HOLE where
+    /// the held binding has none (`Option<unknown>` against `Option<str>`).
+    ///
+    /// B352 shipped a SECOND arm for the same nominal head with its arguments
+    /// ERASED, because that is what `None` produced: a payload-less variant
+    /// typed as the bare enum, `Option` with an empty argument list, which
+    /// carries no hole to test for and unifies with every `Option<_>` there is.
+    /// B357 fixed that at its seed — such a variant takes the landing
+    /// constraint's arguments, or a real `Unknown` per parameter — so the
+    /// erased shape no longer reaches here and the special case is RETIRED.
+    /// B352's three pins stay green without it, which is the condition the item
+    /// set for retiring it.
     ///
     /// Anything else replaces: a different type is a contradiction the
     /// reconcile that produced it has already judged, and a better-resolved
     /// answer arriving late is the ordinary way a generic lands.
     fn binding_is_weaker(&self, candidate: TypeId, held: TypeId) -> bool {
-        if self.type_has_hole(candidate) && !self.type_has_hole(held) {
-            return true;
-        }
-        match (candidate.get_type(self), held.get_type(self)) {
-            (Type::Enum(candidate_id, candidate_args), Type::Enum(held_id, held_args))
-            | (Type::Struct(candidate_id, candidate_args), Type::Struct(held_id, held_args)) => {
-                candidate_id == held_id && candidate_args.is_empty() && !held_args.is_empty()
-            }
-            _ => false,
-        }
+        self.type_has_hole(candidate) && !self.type_has_hole(held)
     }
 
     fn bind_callee_own_generics(
@@ -34144,7 +34141,43 @@ impl<'src> Analyzer<'src> {
             // variant with data acts as a constructor whose call also yields
             // the enum.
             //
-            Expr::EnumVariant(enum_id, _) => Type::Enum(*enum_id, Vec::new()),
+            // B357: a PAYLOAD-LESS variant of a GENERIC enum used to type as
+            // the bare enum with an EMPTY argument list — `None` was `Option`
+            // with no arguments, which carries no hole to test for and unifies
+            // with every instantiation there is while saying nothing. That is
+            // what made `Box<Option<str>>::new(None)` a `Box<Option>` until
+            // B352 special-cased the erased shape in `binding_is_weaker`. It
+            // takes the LANDING CONSTRAINT when the constraint names this very
+            // enum at arguments, exactly as a constructor call would, and a
+            // HOLE per parameter otherwise — a real `Unknown`, which the
+            // ordinary weaker-binding test already declines against a resolved
+            // answer, so the erased-arguments special case has nothing left to
+            // catch.
+            Expr::EnumVariant(enum_id, variant_index) => {
+                let enum_id = *enum_id;
+                let payload_less = self
+                    .enums
+                    .get(&enum_id)
+                    .and_then(|enum_| enum_.variants.get(*variant_index))
+                    .is_some_and(|variant| variant.data_type_ids.is_empty());
+                let parameters = self
+                    .enums
+                    .get(&enum_id)
+                    .map(|enum_| enum_.generic_parameter_constraint_ids.len())
+                    .unwrap_or(0);
+                match (payload_less && parameters > 0, constraint.as_ref()) {
+                    (false, _) => Type::Enum(enum_id, Vec::new()),
+                    (true, Type::Enum(wanted_id, wanted_arguments))
+                        if *wanted_id == enum_id && wanted_arguments.len() == parameters =>
+                    {
+                        Type::Enum(enum_id, wanted_arguments.clone())
+                    }
+                    (true, _) => {
+                        let hole = Type::Unknown.get_type_id(self);
+                        Type::Enum(enum_id, vec![hole; parameters])
+                    }
+                }
+            }
             Expr::Trait(trait_id) => Type::Trait(*trait_id, Vec::new()),
             Expr::Module(module_id) => Type::Module(*module_id),
             Expr::Call(id) => {
