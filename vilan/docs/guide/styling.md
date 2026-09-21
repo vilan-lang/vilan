@@ -198,6 +198,14 @@ The other keyword enums — `Display`, `Position`, `FlexDirection`,
 `std::style` and are imported from there when a file wants them. The
 prelude is a vocabulary, not a second spelling of the whole module.
 
+What the module publishes is exactly the names listed above — the 38
+functions and the 8 types, 46 in all. Its own machinery is not surface:
+each of these functions is one line over `std::style`'s constructor of
+the same name, and the alias it needs to call one (`hover` here is the
+condition, `style::hover` is what it calls) is imported inside that
+function's own body rather than at the top of the file, so it never
+resolves as a second spelling of the token.
+
 **A dotted item ending in `;` is a chain link** — a `Style` method call,
 spliced exactly where you wrote it. That is how your own helpers reach a
 block:
