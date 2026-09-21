@@ -414,7 +414,21 @@ function installStubDocument(options = {}) {
     global.window = new StubElement("window");
     global.windowListeners = { bubble: global.window.listeners, capture: global.window.captureListeners };
     global.location = { pathname: "/" };
-    global.history = { pushState(state, title, path) { global.location.pathname = path; } };
+    // The history STACK, not just the current path: `pushState` grows it and
+    // `replaceState` rewrites its top, which is the only difference between
+    // `navigate` and `navigate_replace` (A72) and therefore the only thing a
+    // pin can read. Nothing else has to look at it.
+    global.historyEntries = ["/"];
+    global.history = {
+        pushState(state, title, path) {
+            global.location.pathname = path;
+            global.historyEntries.push(path);
+        },
+        replaceState(state, title, path) {
+            global.location.pathname = path;
+            global.historyEntries[global.historyEntries.length - 1] = path;
+        },
+    };
     global.documentRoot = documentRoot;
     global.inDocument = inDocument;
     global.describe = describe;

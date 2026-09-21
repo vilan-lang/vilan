@@ -204,6 +204,20 @@ The codec-agnostic serialization protocol under `derive(Wire)` and rpc:
 the derive site. You implement `Serialize`/`Deserialize` by hand only for
 types with a custom encoding.
 
+**A reader ENFORCES the type it is asked for.** The frame is text a
+stranger chose, so a read whose value is of the wrong JSON kind poisons the
+reader with a reason naming what was expected and what was found —
+`expected a number, found a string` — and every later read answers its
+zero value. The integer lanes additionally want a WHOLE number, and the
+unsigned ones a non-negative one, because `1.5` typed `i32` is a value
+outside its own type. A list opened with `begin_list` and closed with
+`end_list` must have had all of its elements read; a list SHORTER than the
+reads is caught by the same gate, since the read runs into the enclosing
+value. `failed()` is where that shows up, and it is what the rpc route
+consults between decoding a call's arguments and running the handler — so
+a malformed call answers a `Decode` failure rather than running an
+implementation on zero values.
+
 ### Writing a `Wire` impl by hand
 
 `Wire` is two methods, and the visitor is a `&mut` view in both:

@@ -10,7 +10,9 @@ function __json_kind(value) {
 	return typeof value;
 }
 function __json_tag(value) {
-	return typeof value === "string" ? value : Object.keys(value)[0];
+	if (typeof value === "string") return value;
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return "";
+	return Object.keys(value)[0] ?? "";
 }
 function __try_parse_json(text) {
 	try {

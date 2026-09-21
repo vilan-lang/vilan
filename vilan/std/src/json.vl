@@ -471,13 +471,19 @@ export impl JsonWriter with Serialize {
 struct JsonReader {
 	stack: List<JsonValue>,
 	error: Option<str>,
+	/// The stack depth each open list must be back down to when it is closed
+	/// (FIND papers-39). `begin_list` records one; `end_list` checks it, so a
+	/// document whose list is LONGER than what the caller read is a decode
+	/// failure rather than an element left lying on the stack for whatever
+	/// reads next to take.
+	list_marks: List<i32>,
 }
 
 impl JsonReader {
 	fun new(root: JsonValue): JsonReader {
 		mut stack: List<JsonValue> = [];
 		stack.push(root);
-		JsonReader { stack, error = None }
+		JsonReader { stack, error = None, list_marks = [] }
 	}
 
 	fun ok(&self): bool {
@@ -520,6 +526,75 @@ impl JsonReader {
 			},
 		}
 	}
+
+	/// THE TYPE GATE (FIND papers-39): the value a read just took has to be of
+	/// the kind that read asked for, or the read is a decode FAILURE rather
+	/// than a host coercion. `false` means "poisoned — hand back the zero
+	/// value", which is the shape the sticky-error model already had for a
+	/// structural mismatch.
+	///
+	/// Without it every typed read was `Number(x)` / `String(x)` / `Boolean(x)`
+	/// over whatever happened to be on the stack, and the answers were the
+	/// coercions': a JSON string read as an `i32` answered `NaN`, `null`
+	/// answered `0`, `true` answered `1`, and a list SHORTER than what the
+	/// caller read answered the ENCLOSING OBJECT as a number. Every one of them
+	/// silently, with `failed()` still answering `None` — so the gates written
+	/// on it (the `[rpc]` route's `decode_failed`, which does consult it) all
+	/// passed and a malformed frame routed as a well-formed call.
+	fun expect(&mut self, value: JsonValue, wanted: JsonKind, name: str): bool {
+		if !self.ok() {
+			ret false;
+		}
+		if value.kind() == wanted {
+			ret true;
+		}
+		self.report(i"expected {name}, found {found_kind(value)}");
+		false
+	}
+
+	/// The integer lanes want a WHOLE number, and the unsigned ones a
+	/// non-negative one: `1.5` read as an `i32` used to answer `1.5` TYPED
+	/// `i32`, and `-1` read as a `u32` answered `-1` typed `u32` — values
+	/// outside their own types, which is the same defect as the wrong kind
+	/// wearing the right one.
+	///
+	/// The MAGNITUDE is deliberately not checked here: `i32`/`u32` are the JS
+	/// numeric lanes rather than hardware widths, and refusing a large value
+	/// would be a behaviour change to documents that already cross. That is its
+	/// own question, with its own estate sweep.
+	fun expect_integer(&mut self, value: JsonValue, signed: bool): bool {
+		if !self.expect(value, JsonKind::Number, "a number") {
+			ret false;
+		}
+		let number = coerce_f64(value);
+		if number != number.floor() {
+			self.report(i"expected a whole number, found {number}");
+			ret false;
+		}
+		if !signed && number < 0.0 {
+			self.report(i"expected a non-negative number, found {number}");
+			ret false;
+		}
+		true
+	}
+}
+
+/// How a decode failure NAMES the kind it found, with its article, so the two
+/// halves of "expected a number, found a string" read as one sentence.
+fun found_kind(value: JsonValue): str {
+	match value.kind() {
+		JsonKind::Null => "null",
+		JsonKind::Bool => "a boolean",
+		JsonKind::Number => "a number",
+		JsonKind::String => "a string",
+		JsonKind::Array => "an array",
+		// `__json_kind` answers exactly these six, so the last one is the
+		// FALLBACK rather than a sixth named arm: an exhaustive match over a
+		// BACKED enum emits the `__enum_trap` helper, and that would put a
+		// guard against a host value outside the set into every bundle that
+		// decodes JSON, for a value this intrinsic cannot produce.
+		_ => "an object",
+	}
 }
 
 // The visitor's read half, natively.
@@ -534,7 +609,10 @@ export impl JsonReader with Deserialize {
 
 	fun field(&mut self, name: str) {
 		let subject = self.top();
-		if self.ok() {
+		// The kind check comes FIRST and is not only a type gate: `has_json_field`
+		// is `Object.hasOwn`, which THROWS on `null` — so a `null` document
+		// reaching a struct decode took the process rather than reporting.
+		if self.expect(subject, JsonKind::Object, "an object") {
 			if has_json_field(subject, name) {
 				self.stack.push(subject.field(name));
 			} else {
@@ -549,8 +627,11 @@ export impl JsonReader with Deserialize {
 
 	fun begin_list(&mut self): i32 {
 		let subject = self.take();
-		if self.ok() {
+		if self.expect(subject, JsonKind::Array, "an array") {
 			let elements = subject.elements();
+			// Where the stack stands once every element has been read: what
+			// `end_list` holds the caller to.
+			self.list_marks.push(self.stack.len());
 			mut index = elements.len() - 1;
 			for index >= 0 {
 				self.stack.push(elements[index]);
@@ -562,7 +643,26 @@ export impl JsonReader with Deserialize {
 		}
 	}
 
-	fun end_list(&mut self) {}
+	/// The arity check (FIND papers-39). A list LONGER than what the caller
+	/// read used to leave its tail on the stack, where the next read took an
+	/// element of it instead of the value it asked for; a shorter one is caught
+	/// by the type gate above, since the read runs into the enclosing value.
+	/// Either way the answer is a decode failure and not a number.
+	///
+	/// A reader whose caller never closes its list — `std::rpc`'s
+	/// `open_request` opens the argument list and leaves it open for the route
+	/// to pull from — simply never reaches this, and its mark is never read.
+	fun end_list(&mut self) {
+		match self.list_marks.pop() {
+			Some(let mark) => {
+				if self.ok() && self.stack.len() > mark {
+					let unread = self.stack.len() - mark;
+					self.report(i"a list had {unread} element(s) left unread");
+				}
+			},
+			None => {},
+		}
+	}
 
 	fun variant_tag(&mut self): str {
 		if self.ok() {
@@ -574,7 +674,7 @@ export impl JsonReader with Deserialize {
 
 	fun begin_variant(&mut self, name: str, arity: i32) {
 		let subject = self.take();
-		if self.ok() && arity > 0 {
+		if arity > 0 && self.expect(subject, JsonKind::Object, "an object") {
 			if has_json_field(subject, name) {
 				let payload = subject.field(name);
 				if arity == 1 {
@@ -609,7 +709,7 @@ export impl JsonReader with Deserialize {
 	/// error discipline.
 	fun str_value(&mut self): str {
 		let value = self.take();
-		if self.ok() {
+		if self.expect(value, JsonKind::String, "a string") {
 			coerce_str(value)
 		} else {
 			""
@@ -618,7 +718,7 @@ export impl JsonReader with Deserialize {
 
 	fun i32_value(&mut self): i32 {
 		let value = self.take();
-		if self.ok() {
+		if self.expect_integer(value, true) {
 			coerce_i32(value)
 		} else {
 			0
@@ -627,7 +727,7 @@ export impl JsonReader with Deserialize {
 
 	fun u32_value(&mut self): u32 {
 		let value = self.take();
-		if self.ok() {
+		if self.expect_integer(value, false) {
 			coerce_u32(value)
 		} else {
 			0
@@ -636,7 +736,7 @@ export impl JsonReader with Deserialize {
 
 	fun i53_value(&mut self): i53 {
 		let value = self.take();
-		if self.ok() {
+		if self.expect_integer(value, true) {
 			coerce_i53(value)
 		} else {
 			0
@@ -645,7 +745,7 @@ export impl JsonReader with Deserialize {
 
 	fun f64_value(&mut self): f64 {
 		let value = self.take();
-		if self.ok() {
+		if self.expect(value, JsonKind::Number, "a number") {
 			coerce_f64(value)
 		} else {
 			0.0
@@ -654,7 +754,7 @@ export impl JsonReader with Deserialize {
 
 	fun bool_value(&mut self): bool {
 		let value = self.take();
-		if self.ok() {
+		if self.expect(value, JsonKind::Bool, "a boolean") {
 			coerce_bool(value)
 		} else {
 			false

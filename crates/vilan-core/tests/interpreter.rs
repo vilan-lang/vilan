@@ -376,6 +376,63 @@ fn an_impure_capability_is_a_clean_unsupported_error() {
     );
 }
 
+/// A116, the interpreter half — `__json_tag` is one of the helpers this
+/// evaluator mirrors arm for arm (AGENDA: "a new codegen helper needs a
+/// matching `interpreter.rs` arm"), and its old arm reported an INTERNAL ERROR
+/// for every document that is neither a string nor an object. That is the same
+/// defect as the codegen twin's `TypeError`, wearing a compiler's clothes: a
+/// derive decoding at expansion time would blame the compiler for a document
+/// the program was handed. Both twins now answer `""`, and the derived `_` arm
+/// reports the decode error.
+///
+/// Run through the evaluator rather than node, so this asserts the arm and not
+/// the helper text.
+#[test]
+fn a116_the_interpreters_json_tag_refuses_a_non_object_instead_of_reporting_internally() {
+    let (stdout, exit_code) = interpret(
+        r#"
+        import std::io::print;
+        import std::json::{ FromJson, Json };
+
+        [derive(Json)]
+        enum Shape {
+            Circle,
+            Square(i32),
+        }
+
+        fun show(text: str): str {
+            match Shape::from_json(text) {
+                Ok(let shape) => i"decoded:{shape.to_json()}",
+                Err(let reason) => i"refused:{reason}",
+            }
+        }
+
+        fun main() {
+            print(show("null"));
+            print(show("7"));
+            print(show("[\"Circle\"]"));
+            print(show("{}"));
+            print(show("\"Circle\""));
+            print(show("{\"Square\":3}"));
+        }
+
+        main();
+        "#,
+        50_000_000,
+    )
+    .expect("a decode of a non-object document must not fail the evaluator");
+    assert_eq!(
+        stdout,
+        "refused:unknown variant in JSON for enum Shape\n\
+         refused:unknown variant in JSON for enum Shape\n\
+         refused:unknown variant in JSON for enum Shape\n\
+         refused:unknown variant in JSON for enum Shape\n\
+         decoded:\"Circle\"\n\
+         decoded:{\"Square\":3}\n"
+    );
+    assert_eq!(exit_code, 0);
+}
+
 // --- The portable node runner (windows-support.md §4) ------------------------
 //
 // `corpus_harness::run_node_within` replaced a `timeout 30 node …` shell-out, so

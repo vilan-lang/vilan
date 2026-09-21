@@ -652,6 +652,29 @@ export impl type S: Source<str> with AttrValue {
 	}
 }
 
+/// Rendered only for a `Some` (A115): a `None` omits the attribute, which is
+/// the server's whole answer to the browser twin's "write nothing".
+export impl Option<str> with AttrValue {
+	fun apply(self, parent: View, name: str) {
+		match self {
+			Some(let text) => set_attribute(parent.attributes, name, text),
+			None => {},
+		}
+	}
+}
+
+/// Read once, rendered only for a `Some` (A115) — the twin of the browser's
+/// removing arm. Nothing was written, so there is no `remove_attribute` to
+/// mirror, which is `AttrBinding`'s arrangement exactly.
+export impl type S: Source<Option<str>> with AttrValue {
+	fun apply(self, parent: View, name: str) {
+		match self.get() {
+			Some(let text) => set_attribute(parent.attributes, name, text),
+			None => {},
+		}
+	}
+}
+
 /// What `View::bind_attr` accepts (A105) — the twin of the browser's
 /// `AttrBinding`, read once. `bind_attr` means "reactive attribute", so this
 /// vocabulary is sources only and does not admit a static `str`; `AttrValue`
@@ -754,4 +777,55 @@ export fun chunk_pending(): SignalCell<bool> {
 
 export fun chunk_failure(): SignalCell<Option<str>> {
 	chunk_error_signal
+}
+
+// === `when_some`: the conditional form that BINDS the value (A119) ==========
+//
+// The server twin: read once, and the body is handed a `SignalCell<T>` holding
+// the current payload, so the SAME component source compiles on both legs (R6
+// at Order 39's GO — the browser twin's row survives a payload change through
+// that cell, and there is nothing here for it to survive).
+// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
+
+/// Content that exists while `source` is `Some`, with the payload bound — the
+/// `when_some` slot value (A119).
+export struct WhenSome<T, S: Source<Option<T>>, C: Slot> {
+	source: S,
+	render: (|SignalCell<T>| C) context owner_scope,
+}
+
+/// `Some`-conditional content at THIS position, read once: the body renders
+/// when `source` currently holds a value and nothing when it is `None`. The
+/// body takes a `SignalCell<T>` for the browser twin's reason (R6).
+export fun when_some<T, S: Source<Option<T>>, C: Slot>(
+	source: S,
+	render: (sync |SignalCell<T>| C) context owner_scope,
+): WhenSome<T, S, C> {
+	WhenSome { source, render }
+}
+
+export impl WhenSome<type T, type S: Source<Option<T>>, type C: Slot> with Slot {
+	fun place(self, parent: View) {
+		place_when_some(parent, self.source, self.render);
+	}
+}
+
+/// `when_some`'s body, server side — the body for the CURRENT payload, in
+/// position, or nothing at all. A named helper beside `place_swap`'s and
+/// `place_each`'s, which is also what keeps the two twins' surfaces in parity
+/// (`std_twin_parity`).
+fun place_when_some<T, S: Source<Option<T>>, C: Slot>(
+	parent: View,
+	source: S,
+	render: (sync |SignalCell<T>| C) context owner_scope,
+) {
+	match source.get() {
+		Some(let payload) => {
+			let region = Region::open(parent);
+			let cell: SignalCell<T> = SignalCell::new(payload);
+			let owner = Owner::new();
+			let _row = run_with_owner(owner, || region.open_row(render(cell)));
+		},
+		None => {},
+	}
 }

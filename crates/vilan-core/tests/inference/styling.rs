@@ -6423,6 +6423,206 @@ fn a106_a_local_declaration_still_beats_a_newly_added_prelude_name() {
     assert!(css.contains("{padding:1rem}"), "{css}");
 }
 
+// --- A117: the prelude's SURFACE is the 46 names it was designed with -------
+//
+// `export *;` re-exports what a module BINDS, an aliased import included, so
+// the twenty-one aliases this module needs on the way in — `open_style`,
+// `scale_step`, `value_piece`, `custom_property` and seventeen `*_condition`
+// spellings — resolved from outside as 21 more exports nobody designed: 21 of
+// the module's 67, a vocabulary with two spellings for everything, and A106
+// door 2's largest objection. Each alias now lives INSIDE the one body it is
+// for, where a function-scoped import binds in the function's scope and no
+// other module can reach it.
+//
+// The aliases are not droppable: the free name and the local one collide by
+// construction (`hover()` here IS the condition and calls `style::hover`), so
+// "hide the alias" and "delete the alias" are different changes and only the
+// first one is available.
+
+/// The designed surface, written down. 8 types and 38 one-line functions —
+/// every name a css hole or a chain reaches for, and nothing else.
+const A117_PRELUDE_SURFACE: &[&str] = &[
+    // The keyword-property types and the currencies (A106's door 1).
+    "AlignItems",
+    "Color",
+    "Condition",
+    "CssPiece",
+    "Cursor",
+    "Length",
+    "Style",
+    "TextAlign",
+    // Lengths.
+    "auto",
+    "em",
+    "pct",
+    "px",
+    "rem",
+    "space",
+    "vh",
+    "vw",
+    // Colors and the two value builders.
+    "black",
+    "blue",
+    "gray",
+    "green",
+    "hex",
+    "oklch",
+    "piece",
+    "red",
+    "rgba",
+    "transparent",
+    "var",
+    "white",
+    // The builder.
+    "s",
+    // The conditions (A95).
+    "active",
+    "attribute",
+    "children",
+    "disabled",
+    "divide",
+    "element",
+    "first",
+    "focus",
+    "hover",
+    "last",
+    "lg",
+    "md",
+    "media",
+    "pseudo",
+    "sm",
+    "within",
+    "xl",
+];
+
+/// The twenty-one spellings that used to ride out on `export *;`.
+const A117_RETIRED_ALIAS_SPELLINGS: &[&str] = &[
+    "active_condition",
+    "attribute_condition",
+    "children_condition",
+    "custom_property",
+    "disabled_condition",
+    "divide_condition",
+    "element_condition",
+    "first_condition",
+    "focus_condition",
+    "hover_condition",
+    "last_condition",
+    "lg_condition",
+    "md_condition",
+    "media_condition",
+    "open_style",
+    "pseudo_condition",
+    "scale_step",
+    "sm_condition",
+    "value_piece",
+    "within_condition",
+    "xl_condition",
+];
+
+/// The count is the claim, so it is asserted rather than left to be read off a
+/// list: 46 exports, 8 + 38.
+#[test]
+fn a117_the_designed_surface_is_forty_six_names() {
+    assert_eq!(A117_PRELUDE_SURFACE.len(), 46);
+    let mut sorted = A117_PRELUDE_SURFACE.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 46, "the written surface repeats a name");
+    assert_eq!(A117_RETIRED_ALIAS_SPELLINGS.len(), 21);
+}
+
+/// Every designed name still resolves through the module, in ONE import list —
+/// which is what keeps the hiding from having taken surface with it.
+#[test]
+fn a117_every_designed_name_still_imports_from_the_prelude() {
+    let names = A117_PRELUDE_SURFACE.join(", ");
+    assert_compiles(&format!(
+        "import std::style::prelude::{{ {names} }};\nfun main() {{}}\nmain();\n"
+    ));
+}
+
+/// And every alias spelling is gone. One case per name: the set is the
+/// surface's complement and a single representative would let twenty of them
+/// creep back.
+#[test]
+fn a117_no_alias_spelling_resolves_from_outside_the_prelude() {
+    for alias in A117_RETIRED_ALIAS_SPELLINGS {
+        let source =
+            format!("import std::style::prelude::{{ {alias} }};\nfun main() {{}}\nmain();\n");
+        let diagnostics = failure_diagnostics(&source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|(message, _)| message.contains("in the imported path")),
+            "`{alias}` still resolves out of std::style::prelude: {diagnostics:#?}"
+        );
+    }
+}
+
+/// The module's own source is the other half of the claim: a name added to the
+/// file-level import, or a new top-level `fun`, is a change to the SURFACE and
+/// reddens here rather than shipping. Read off the text, because that is where
+/// `export *;` reads it too.
+#[test]
+fn a117_the_preludes_source_binds_exactly_the_designed_surface() {
+    let source = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vilan/std/src/style/prelude.vl"),
+    )
+    .expect("read std::style::prelude");
+    let mut bound: Vec<String> = Vec::new();
+    let mut inside_file_level_import = false;
+    for line in source.lines() {
+        // A function-scoped import is indented; the file-level one is not, and
+        // it is the only import whose names `export *;` publishes.
+        if let Some(rest) = line.strip_prefix("import pkg::style::{") {
+            inside_file_level_import = !rest.contains('}');
+            for name in rest.trim_end_matches(&['}', ';'][..]).split(',') {
+                let name = name.trim();
+                if !name.is_empty() {
+                    bound.push(name.to_string());
+                }
+            }
+            continue;
+        }
+        if inside_file_level_import {
+            if line.starts_with('}') {
+                inside_file_level_import = false;
+                continue;
+            }
+            let name = line.trim().trim_end_matches(',').trim();
+            if !name.is_empty() {
+                bound.push(name.to_string());
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("fun ") {
+            let name: String = rest
+                .chars()
+                .take_while(|character| character.is_alphanumeric() || *character == '_')
+                .collect();
+            bound.push(name);
+        }
+    }
+    bound.sort();
+    let mut designed: Vec<String> = A117_PRELUDE_SURFACE
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    designed.sort();
+    assert_eq!(
+        bound, designed,
+        "std::style::prelude binds a different set than the designed surface"
+    );
+    for alias in A117_RETIRED_ALIAS_SPELLINGS {
+        assert!(
+            !bound.iter().any(|name| name == alias),
+            "`{alias}` is bound at the module's top level again"
+        );
+    }
+}
+
 // --- A68: a block is `const` BY CONSTRUCTION ---------------------------------
 //
 // `Style::raw` calls `emit`, the compile-time channel, so a chain only means

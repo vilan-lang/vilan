@@ -60,10 +60,11 @@ fn write(dir: &Path, relative: &str, contents: &str) {
 /// It exercises every read-once binding form: static `class`/`attr`, `bind_text`,
 /// `bind_class`, `bind_attr`, `bind_styled` (a `SignalCell<Style>` over compiled
 /// atomic classes), `each` (keyed, over a list), `when` (taken),
-/// `show` (hidden), `swap` (a value branch), `bind_value`, a discarded `on`
-/// handler, and nested composition — with `&`/`<`/`>`/`"` in the data to drive
-/// escaping on both sides.
-const COMPONENT: &str = r#"import std::ui::{ View, each, each_values, swap, view, when };
+/// `when_some` (both a `Some` and a `None`, A119), `show` (hidden), `swap` (a
+/// value branch), `bind_value`, a discarded `on` handler, and nested
+/// composition — with `&`/`<`/`>`/`"` in the data to drive escaping on both
+/// sides.
+const COMPONENT: &str = r#"import std::ui::{ View, each, each_values, swap, view, when, when_some };
 import std::reactive::{ Signal, SignalCell };
 import std::style::{ style, space, Style };
 
@@ -96,6 +97,11 @@ fun app(): View {
 	let theme: SignalCell<Style> = Signal::new(compact);
 	let width = Signal::new("40px");
 	let tags: SignalCell<List<str>> = Signal::new(["a & b", "c < d"]);
+	// A119: the two halves of `when_some`, side by side — a `Some` whose body
+	// reads the payload off the row cell, and a `None` that renders nothing on
+	// either leg.
+	let selected: SignalCell<Option<Row>> = Signal::new(Some(Row { id = 3, label = "picked & <held>" }));
+	let unselected: SignalCell<Option<Row>> = Signal::new(None);
 	view("main")
 		.class("app")
 		.attr("id", "root")
@@ -119,6 +125,15 @@ fun app(): View {
 		])))
 		.child(view("dl").child(each_values(tags, |t: str| t)))
 		.child(view("p").child(when(show_banner, || view("em").text("more & more"))))
+		.child(view("figure")
+			.child(when_some(selected, |row| {
+				view("figcaption").bind_text(row.map(|current| current.label))
+			})))
+		.child(view("figure")
+			.attr("id", "unselected")
+			.child(when_some(unselected, |row| {
+				view("figcaption").bind_text(row.map(|current| current.label))
+			})))
 		.child(view("input").attr("type", "text").bind_value(query))
 		.child(view("button").text("save").on("click", || query.set("x")))
 		.child(view("p").attr("id", "themed").bind_styled(theme).text("styled"))
@@ -285,6 +300,16 @@ fn ssr_process_render_matches_browser_dom_tree() {
                 "<svg xmlns=\"http://www.w3.org/2000/svg\" class=\"icon\" viewBox=\"0 0 24 24\"><path d=\"M5 12h14\"></path></svg>"
             ),
         "rendered markup is missing expected structure: {server_markup}"
+    );
+    // A119: `when_some` on both twins — the `Some` body reading its payload off
+    // the row cell, and the `None` rendering nothing. BOTH halves, because an
+    // empty `<figure>` on its own would also be what a form that never rendered
+    // anything produces.
+    assert!(
+        server_markup
+            .contains("<figure><figcaption>picked &amp; &lt;held&gt;</figcaption></figure>")
+            && server_markup.contains("<figure id=\"unselected\"></figure>"),
+        "when_some did not render its Some body and omit its None: {server_markup}"
     );
     // `bind_styled` on both twins: the class is the CONTENT HASH of
     // `padding:var(--space-2)` — the same name the `style.vl` corpus golden

@@ -229,7 +229,7 @@ fun mount(id: str, view: View)                                   // attach only
 fun mount_root(id: str, body: (sync || View) context owner_scope): Owner
 
 trait Slot { fun place(self, parent: View) }   // str | View | List<View>, and a Source of each
-trait AttrValue { fun apply(self, parent: View, name: str) }   // str | SignalCell<str>
+trait AttrValue { fun apply(self, parent: View, name: str) }   // str | Option<str>, and a Source of each
 ```
 
 `mount_root` = fresh owner + turn boundary + attach; it returns the root
@@ -259,7 +259,7 @@ too.
 | `text` | `(content: str): View` | static text |
 | `class` | `(name: str): View` | static class |
 | `styled` | `(style: Style): View` | classes from a compiled style |
-| `attr` | `(name: str, value: V): View`; `V: AttrValue` | `str` sets once, `SignalCell<str>` tracks |
+| `attr` | `(name: str, value: V): View`; `V: AttrValue` | `str` sets once, any `Source<str>` tracks; an `Option<str>` sets it or leaves it off, and a `Source<Option<str>>` tracks with `None` **removing** it (A115) — so the element-syntax form `<div data-dragging(maybe)>` takes every shape `bind_attr` does |
 | `style_var` | `(name: str, source: S): View`; `S: Source<str>` | reactive CSS custom property; registers with the enclosing boundary like every `bind_*` |
 | `on` | `(event: str, handler: (\|\| void) context turn_scope): View` | handler runs in a fresh turn |
 | `on_event` | `(event: str, handler: (\|Event\| void) context turn_scope): View` | same, with the DOM event |
@@ -284,12 +284,13 @@ Semantics, choosing between `show`/`when`/`swap`, and examples: the
 The conditional, the dynamic subtree and the keyed run are **values**, not
 `View` methods. Each fills a child position, so it sits exactly where it is
 written — between siblings, not after them. They are bare names in the
-`std::web` prelude, and `std::ui::{ when, swap, each, each_values, each_by }`
-otherwise:
+`std::web` prelude, and
+`std::ui::{ when, when_some, swap, each, each_values, each_by }` otherwise:
 
 | function | signature | returns |
 |---|---|---|
 | `when` | `(condition: S, body: (sync \|\| C) context owner_scope)`; `S: Source<bool>, C: Slot` | `Conditional<S, C>` |
+| `when_some` | `(source: S, render: (sync \|SignalCell<T>\| C) context owner_scope)`; `S: Source<Option<T>>, C: Slot` | `WhenSome<T, S, C>` |
 | `swap` | `(source: S, render: (sync \|T\| C) context owner_scope)`; `T: PartialEq, S: Source<T>, C: Slot` | `Swap<T, S, C>` |
 | `each` | `(source: S, key: sync \|T\| K, render: (sync \|T\| C) context owner_scope)`; `T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot` | `Each<T, K, S, C>` |
 | `each_values` | `(source: S, render: (sync \|T\| C) context owner_scope)`; `T: PartialEq, S: Source<List<T>>, C: Slot` | `EachValues<T, S, C>` |
@@ -391,7 +392,7 @@ impl Stored<type T> with Source<T> {
 ```
 
 `Stored<str>` now feeds `bind_text`, `bind_class`, `bind_attr`,
-`bind_styled`, `style_var`, `show`, the five slot values (`when`, `swap`,
+`bind_styled`, `style_var`, `show`, the six slot values (`when`, `when_some`, `swap`,
 `each`, `each_values`, `each_by`) and `chunk_preload` — on both the browser
 layer and the SSR twin.
 
@@ -401,15 +402,17 @@ Two things deliberately still ask for the concrete type:
   declares `get` and `on_change` and no `set`, so there is nothing to widen to
   yet — the write side is its own design question.
 - **`attr` and `child`**, whose reactive arms are the `AttrValue` and
-  `Slot` traits — so `<div href(source)>` and `<p>{source}</p>` still want
-  a `SignalCell<str>`. Widening a trait ARM is a blanket impl rather than a
-  bound on a parameter, and that is a separate piece of machinery.
+  `Slot` traits. Widening a trait ARM is a blanket impl rather than a bound
+  on a parameter, and that is a separate piece of machinery — which B158/B165
+  then built, so `<div href(source)>` and `<p>{source}</p>` do take any
+  `Source` today; `AttrValue`'s `Option` arms (A115) arrived the same way.
 
 ## std::router
 
 ```vilan,fragment
 fun current_path(): SignalCell<str>       // location.pathname, live (navigate + back/forward)
 fun navigate(path: str)               // pushState + update current_path
+fun navigate_replace(path: str)       // replaceState — same, WITHOUT a new history entry
 fun location_url(): str               // pathname + search + hash — the whole relative URL
 fun segments(path: str): List<str>    // "/w/3/task/7" → ["w", "3", "task", "7"], RAW
 fun percent_decode(text: str): str    // decodeURIComponent, total (a bad escape decodes to itself)
@@ -431,6 +434,17 @@ impl View {
 fun pending(): SignalCell<bool>                 // a route chunk is in flight
 fun chunk_error(): SignalCell<Option<str>>      // the last fetch failed, with the reason
 ```
+
+`navigate` pushes a history entry; `navigate_replace` rewrites the one that
+is there. Reach for the replacing form wherever the entry would not be a
+place a user meant to go back to — a redirect off a bare path onto its
+canonical form, a sign-in bounce landing on the page they asked for, a filter
+or tab written into the URL so a reload restores it. Pushing there is what
+makes Back walk through the redirect and arrive where it started. Both
+advance `current_path()` identically and both join the caller's ambient turn;
+there is no `navigate(path, replace)` because vilan has neither overloading
+nor default arguments, and a bare `true` at the call site says less than the
+name does.
 
 `current_path()` is a singleton signal: every caller gets the same one, and
 the `popstate` listener is wired on first use. `link` renders a real anchor

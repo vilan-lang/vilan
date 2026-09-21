@@ -5656,3 +5656,88 @@ fn an_rpc_method_named_for_a_generated_member_is_refused_at_the_attribute() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// FIND (papers-39): the JSON reader's type enforcement, at the `[rpc]` face.
+///
+/// The route DOES consult `decode_failed` between the `arg` pulls and the impl
+/// call — the reader just never set it. Reading an `i32` out of a JSON list
+/// went straight through the host coercion, so a short argument list read the
+/// enclosing REQUEST OBJECT as a number (`NaN`), a string argument answered
+/// `NaN`, `null` answered `0`, `true` answered `1` and `1.5` answered `1.5`
+/// typed `i32` — each of them unpoisoned, so the guard passed and the impl ran
+/// on garbage. Over HTTP that is `{"method":"add","args":[]}` answering
+/// `{"Success":NaN}` to a caller who sent nothing. Harmless vilan-to-vilan (the
+/// contract hash refuses a disagreeing client) and not harmless at all for a
+/// plain-HTTP caller, which is what A120 is about.
+///
+/// One row per shape, and the control LAST so a passing run proves the route
+/// still works rather than that it stopped answering.
+#[test]
+fn a_malformed_rpc_argument_answers_a_decode_failure_rather_than_success() {
+    let dir = temp_project("rpc_arg_types");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(&dir, "src/main.vl", BYTE_IDENTICAL_SERVER);
+
+    let server = StreamingServer::spawn(&dir);
+    let ready = server.await_line("ready", Duration::from_secs(60));
+    let port: u16 = ready
+        .split_whitespace()
+        .next_back()
+        .expect("the ready line carries the bound port")
+        .parse()
+        .expect("the announced port is a number");
+
+    for (body, expected) in [
+        // No argument at all: the read runs past the list into the request
+        // object. This is the row that answered `{"Success":NaN}`.
+        (
+            "{\"method\":\"add\",\"args\":[]}",
+            "{\"Failure\":{\"Decode\":\"expected a number, found an object\"}}",
+        ),
+        (
+            "{\"method\":\"add\",\"args\":[\"x\"]}",
+            "{\"Failure\":{\"Decode\":\"expected a number, found a string\"}}",
+        ),
+        (
+            "{\"method\":\"add\",\"args\":[null]}",
+            "{\"Failure\":{\"Decode\":\"expected a number, found null\"}}",
+        ),
+        (
+            "{\"method\":\"add\",\"args\":[true]}",
+            "{\"Failure\":{\"Decode\":\"expected a number, found a boolean\"}}",
+        ),
+        (
+            "{\"method\":\"add\",\"args\":[1.5]}",
+            "{\"Failure\":{\"Decode\":\"expected a whole number, found 1.5\"}}",
+        ),
+        // The args key holding something that is not a list at all.
+        (
+            "{\"method\":\"add\",\"args\":7}",
+            "{\"Failure\":{\"Decode\":\"expected an array, found a number\"}}",
+        ),
+        // The control: a well-formed call still routes and still answers.
+        ("{\"method\":\"add\",\"args\":[2]}", "{\"Success\":2}"),
+    ] {
+        let response = raw_http_closed(
+            port,
+            &format!(
+                "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "`{body}` should still be answered with 200 (a decode failure is an \
+             envelope, not a status): {response}"
+        );
+        assert!(
+            response.ends_with(expected),
+            "`{body}` should answer `{expected}`: {response}"
+        );
+    }
+}

@@ -5637,6 +5637,93 @@ fn a104_a_malformed_result_document_is_a_decode_error_and_never_a_crash() {
     );
 }
 
+// --- A116: `[derive(Json)]` on an ENUM never crashes on a non-object ---------
+//
+// A104 gave `std::result::Result` a hand-written shape guard AHEAD of the tag
+// read; a DERIVED enum has no such guard and read the tag first, so
+// `__json_tag` reached `Object.keys(null)` and threw a `TypeError` out of a
+// decode that `FromJson`'s own doc promises can only return `Err` (json.vl,
+// "Decoding is fallible and NEVER crashes"). The fix is in the helper rather
+// than in the derive: `__json_tag` answers `""` for everything that is not a
+// tagged enum, which no variant can be spelled with, so the generated `_` arm
+// reports the decode error it was always there to report.
+//
+// One pin per document shape, because each reaches the helper differently:
+// `null` threw, a number reached `Object.keys(3)` (empty) and answered
+// `undefined`, an array answered its first INDEX (`"0"`, a tag by accident),
+// and `{}` answered `undefined` too. The control below proves the two real
+// spellings still decode, so a helper that answered `""` unconditionally would
+// not pass this set.
+
+/// The shared fixture: a plain two-variant derived enum and a reporter that
+/// prints the decode outcome. `Shape` carries a payload on one variant so the
+/// object form is a real `{"Square":…}` document and not only a bare tag.
+const A116_DERIVED_ENUM: &str = r#"
+        import std::io::print;
+        import std::json::{ FromJson, Json };
+        [derive(Json)]
+        enum Shape {
+            Circle,
+            Square(i32),
+        }
+        fun show(text: str): str {
+            match Shape::from_json(text) {
+                Ok(let shape) => i"decoded:{shape.to_json()}",
+                Err(let reason) => i"refused:{reason}",
+            }
+        }
+    "#;
+
+/// A116 — JSON `null` is the crashing case the item was filed for.
+#[test]
+fn a116_a_derived_enum_refuses_a_null_document_instead_of_throwing() {
+    assert_compiles_and_runs(
+        &format!("{A116_DERIVED_ENUM}\nfun main() {{ print(show(\"null\")); }}\n"),
+        "refused:unknown variant in JSON for enum Shape\n",
+    );
+}
+
+/// A116 — a NUMBER has no keys at all, so the tag read answered `undefined`.
+#[test]
+fn a116_a_derived_enum_refuses_a_number_document() {
+    assert_compiles_and_runs(
+        &format!("{A116_DERIVED_ENUM}\nfun main() {{ print(show(\"7\")); }}\n"),
+        "refused:unknown variant in JSON for enum Shape\n",
+    );
+}
+
+/// A116 — an ARRAY answered its first INDEX as the tag, which is a tag by
+/// accident: `["Circle"]` would have decoded through a key that is not a name.
+#[test]
+fn a116_a_derived_enum_refuses_an_array_document() {
+    assert_compiles_and_runs(
+        &format!("{A116_DERIVED_ENUM}\nfun main() {{ print(show(\"[\\\"Circle\\\"]\")); }}\n"),
+        "refused:unknown variant in JSON for enum Shape\n",
+    );
+}
+
+/// A116 — an EMPTY object is an object with no tag in it.
+#[test]
+fn a116_a_derived_enum_refuses_an_empty_object_document() {
+    assert_compiles_and_runs(
+        &format!("{A116_DERIVED_ENUM}\nfun main() {{ print(show(\"{{}}\")); }}\n"),
+        "refused:unknown variant in JSON for enum Shape\n",
+    );
+}
+
+/// A116's control — both tagged spellings still decode, so the four refusals
+/// above are about the shapes and not about the helper having stopped working.
+#[test]
+fn a116_a_derived_enum_still_decodes_a_bare_tag_and_a_single_key_object() {
+    assert_compiles_and_runs(
+        &format!(
+            "{A116_DERIVED_ENUM}\nfun main() {{ print(show(\"\\\"Circle\\\"\")); \
+             print(show(\"{{\\\"Square\\\":3}}\")); }}\n"
+        ),
+        "decoded:\"Circle\"\ndecoded:{\"Square\":3}\n",
+    );
+}
+
 /// The sized numeric family (numeric-types.md §5) is Wire, each width riding
 /// the visitor lane that holds it exactly — `i8`/`i16` on `i32`, `u8`/`u16` on
 /// `u32`, `u53` on `i53`, `f32` on `f64` — so the round trip is exact at both
@@ -6003,5 +6090,337 @@ fn i4_the_container_defaults_do_not_widen_what_a_map_key_may_be() {
         }
         "#,
         "Hashable",
+    );
+}
+
+// --- A118: `std::random::range` is HALF-OPEN ---------------------------------
+//
+// `docs/std/numbers.md` has said `[low, high)` since the module landed and the
+// integer helper implemented `[low, high]` — `Math.floor(rand * (high - low +
+// 1)) + low` — so `random::range(1, 7)` answered 7 about one run in eight. R7
+// at Order 39's GO: the DOC is the contract, fix the implementation.
+//
+// The draws below are the pin's instrument. A distribution cannot be asserted
+// from one sample, so each case draws over a range small enough that the claim
+// is decided by ~2^-N rather than by luck: 400 draws of a two-value range that
+// must never answer its bound is red at probability 1 - 2^-400 under the old
+// helper, which is a certainty in every sense that matters to a suite. Output
+// is a verdict rather than the draws, so the pins are deterministic even
+// though the program is not.
+
+/// A118 — the bound itself is NOT in the range. The case the item was filed
+/// for, at the tightest range where "inclusive" and "half-open" differ:
+/// `[0, 1)` holds exactly one value.
+#[test]
+fn a118_an_integer_range_never_answers_its_upper_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::random;
+        fun main() {
+            mut draws = 0;
+            mut outside = 0;
+            for draws < 400 {
+                if random::range(0, 1) != 0 {
+                    outside += 1;
+                }
+                draws += 1;
+            }
+            print(i"outside:{outside}");
+        }
+        "#,
+        "outside:0\n",
+    );
+}
+
+/// A118 — and every value BELOW the bound still is, so the fix is not "answer
+/// `low`". `[0, 3)` is three values; 400 draws miss one at 3 * (2/3)^400.
+#[test]
+fn a118_an_integer_range_still_answers_every_value_below_its_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::random;
+        fun main() {
+            mut seen = [false, false, false];
+            mut outside = 0;
+            mut draws = 0;
+            for draws < 400 {
+                let value = random::range(0, 3);
+                if value < 0 || value > 2 {
+                    outside += 1;
+                } else {
+                    seen[value] = true;
+                }
+                draws += 1;
+            }
+            print(i"outside:{outside} zero:{seen[0]} one:{seen[1]} two:{seen[2]}");
+        }
+        "#,
+        "outside:0 zero:true one:true two:true\n",
+    );
+}
+
+/// A118 — a DEGENERATE range answers `low`. `[4, 4)` holds nothing, and `low`
+/// is the only value there is to answer; the doc says so rather than leaving a
+/// reader to find out.
+#[test]
+fn a118_a_degenerate_integer_range_answers_its_low_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::random;
+        fun main() {
+            mut draws = 0;
+            mut other = 0;
+            for draws < 100 {
+                if random::range(4, 4) != 4 {
+                    other += 1;
+                }
+                draws += 1;
+            }
+            print(i"other:{other}");
+        }
+        "#,
+        "other:0\n",
+    );
+}
+
+/// A118 — the FLOAT arm was already half-open (`Math.random()` is `[0, 1)`), so
+/// this is the guard that the two arms now say the same thing about their
+/// bounds and keep saying it.
+#[test]
+fn a118_a_float_range_is_half_open_too() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::random;
+        fun main() {
+            mut draws = 0;
+            mut outside = 0;
+            for draws < 400 {
+                let value = random::range(0.0, 1.0);
+                if value < 0.0 || value >= 1.0 {
+                    outside += 1;
+                }
+                draws += 1;
+            }
+            print(i"outside:{outside}");
+        }
+        "#,
+        "outside:0\n",
+    );
+}
+
+// --- FIND (papers-39): the JSON reader enforces the type it is asked to read -
+//
+// `JsonReader`'s typed reads went straight through the host coercion
+// (`Number(x)`, `String(x)`, `Boolean(x)`) over whatever happened to be on the
+// value stack, and NEVER poisoned: a JSON string read as an `i32` answered
+// `NaN`, `null` answered `0`, `true` answered `1`, `1.5` answered `1.5` typed
+// `i32`, and a list SHORTER than what the caller read answered the enclosing
+// OBJECT as a number. `failed()` kept answering `None` through all of it, so
+// every gate written on it — the `[rpc]` route's `decode_failed`, which does
+// consult it — passed, and a malformed frame routed as a well-formed call.
+//
+// One pin per row of the find's own table, because each reaches the gate
+// differently, plus the arity check and a control. The wire does not move:
+// only malformed input changes behaviour, which is what the frame-level
+// suites (`service_layer`, `reactive_channels`, `rpc_http`) hold.
+
+/// Two `i32`s read out of one JSON list — the find's own shape, with `rpc`
+/// taken out of it. Answers either what it read or the first decode failure.
+const JSON_READER_TWO: &str = r#"
+        import std::io::print;
+        import std::json::json_codec;
+        import std::wire::{ Frame, Wire };
+        fun read_two(text: str): str {
+            let codec = json_codec();
+            mut deserializer = (codec.reader)(Frame::Text(text));
+            (deserializer.begin_struct)();
+            (deserializer.field)("args");
+            let _arity = (deserializer.begin_list)();
+            let left: i32 = i32::rebuild(&mut deserializer);
+            let right: i32 = i32::rebuild(&mut deserializer);
+            match (deserializer.failed)() {
+                Some(let reason) => i"refused:{reason}",
+                None => i"read:{left},{right}",
+            }
+        }
+    "#;
+
+/// The control, and it comes first: a well-formed document still reads.
+#[test]
+fn the_json_reader_still_reads_a_well_formed_list() {
+    assert_compiles_and_runs(
+        &format!(
+            "{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[1,2]}}\")); }}\n"
+        ),
+        "read:1,2\n",
+    );
+}
+
+/// A SHORT list: the second read runs past the list into the request object,
+/// which used to answer `NaN` unpoisoned. This is the row the find opened on.
+#[test]
+fn the_json_reader_refuses_a_list_shorter_than_the_reads() {
+    assert_compiles_and_runs(
+        &format!(
+            "{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[1]}}\")); }}\n"
+        ),
+        "refused:expected a number, found an object\n",
+    );
+}
+
+/// An EMPTY list — the `args: []` an arbitrary HTTP caller sends.
+#[test]
+fn the_json_reader_refuses_an_empty_list_where_a_value_is_read() {
+    assert_compiles_and_runs(
+        &format!("{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[]}}\")); }}\n"),
+        "refused:expected a number, found an object\n",
+    );
+}
+
+/// A STRING where a number is read: `Number("x")` is `NaN`.
+#[test]
+fn the_json_reader_refuses_a_string_where_a_number_is_read() {
+    assert_compiles_and_runs(
+        &format!(
+            "{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[\\\"x\\\",2]}}\")); }}\n"
+        ),
+        "refused:expected a number, found a string\n",
+    );
+}
+
+/// `null` where a number is read: `Number(null)` is `0`, which is a value the
+/// caller never sent.
+#[test]
+fn the_json_reader_refuses_a_null_where_a_number_is_read() {
+    assert_compiles_and_runs(
+        &format!(
+            "{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[null,2]}}\")); }}\n"
+        ),
+        "refused:expected a number, found null\n",
+    );
+}
+
+/// `true` where a number is read: `Number(true)` is `1`.
+#[test]
+fn the_json_reader_refuses_a_boolean_where_a_number_is_read() {
+    assert_compiles_and_runs(
+        &format!(
+            "{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[true,2]}}\")); }}\n"
+        ),
+        "refused:expected a number, found a boolean\n",
+    );
+}
+
+/// A FRACTION where an integer is read — the wrong kind wearing the right one:
+/// `1.5` is a JSON number, and `1.5` typed `i32` is a value outside its type.
+#[test]
+fn the_json_reader_refuses_a_fraction_where_an_integer_is_read() {
+    assert_compiles_and_runs(
+        &format!(
+            "{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":[1.5,2]}}\")); }}\n"
+        ),
+        "refused:expected a whole number, found 1.5\n",
+    );
+}
+
+/// And the same rule on the unsigned lane, where the value out of its type is
+/// a negative one.
+#[test]
+fn the_json_reader_refuses_a_negative_number_where_an_unsigned_is_read() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::json_codec;
+        import std::wire::{ Frame, Wire };
+        fun main() {
+            let codec = json_codec();
+            mut deserializer = (codec.reader)(Frame::Text("{\"args\":[-1]}"));
+            (deserializer.begin_struct)();
+            (deserializer.field)("args");
+            let _arity = (deserializer.begin_list)();
+            let only: u32 = u32::rebuild(&mut deserializer);
+            match (deserializer.failed)() {
+                Some(let reason) => print(i"refused:{reason}"),
+                None => print(i"read:{only}"),
+            }
+        }
+        "#,
+        "refused:expected a non-negative number, found -1\n",
+    );
+}
+
+/// The OPENERS take the same gate. A document whose `args` is not a list at
+/// all used to walk into `elements()` on a non-array and read indices off it.
+#[test]
+fn the_json_reader_refuses_a_non_list_where_a_list_is_opened() {
+    assert_compiles_and_runs(
+        &format!("{JSON_READER_TWO}\nfun main() {{ print(read_two(\"{{\\\"args\\\":7}}\")); }}\n"),
+        "refused:expected an array, found a number\n",
+    );
+}
+
+/// And a struct read of a document that is not an object at all. This one was
+/// not merely wrong: `has_json_field` is `Object.hasOwn`, which THROWS on
+/// `null`, so a `null` frame took the process rather than reporting — against
+/// the same never-crash contract A116 closed on the derive side.
+#[test]
+fn the_json_reader_refuses_a_null_document_where_a_field_is_read() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::json_codec;
+        import std::wire::{ Frame, Wire };
+        fun main() {
+            let codec = json_codec();
+            mut deserializer = (codec.reader)(Frame::Text("null"));
+            (deserializer.begin_struct)();
+            (deserializer.field)("args");
+            match (deserializer.failed)() {
+                Some(let reason) => print(i"refused:{reason}"),
+                None => print("read"),
+            }
+        }
+        "#,
+        "refused:expected an object, found null\n",
+    );
+}
+
+/// The ARITY check: a list LONGER than what the caller reads used to leave its
+/// tail on the value stack, where whatever read next took an element of it
+/// instead of the value it asked for. `end_list` is where that is caught — a
+/// caller that never closes its list (`std::rpc::open_request` leaves the
+/// argument list open for the route to pull from) simply never reaches it.
+#[test]
+fn the_json_reader_refuses_a_list_longer_than_the_reads_at_its_close() {
+    let program = |document: &str| {
+        format!(
+            r#"
+        import std::io::print;
+        import std::json::json_codec;
+        import std::wire::{{ Frame, Wire }};
+        fun main() {{
+            let codec = json_codec();
+            mut deserializer = (codec.reader)(Frame::Text("{document}"));
+            (deserializer.begin_struct)();
+            (deserializer.field)("args");
+            let _arity = (deserializer.begin_list)();
+            let only: i32 = i32::rebuild(&mut deserializer);
+            (deserializer.end_list)();
+            match (deserializer.failed)() {{
+                Some(let reason) => print(i"refused:{{reason}}"),
+                None => print(i"read:{{only}}"),
+            }}
+        }}
+        "#
+        )
+    };
+    assert_compiles_and_runs(&program("{\\\"args\\\":[1]}"), "read:1\n");
+    assert_compiles_and_runs(
+        &program("{\\\"args\\\":[1,2]}"),
+        "refused:a list had 1 element(s) left unread\n",
     );
 }
