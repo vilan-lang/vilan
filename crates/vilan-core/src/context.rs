@@ -115,6 +115,14 @@ pub fn thread_contexts(program: &mut Program) -> Option<CallGraph> {
             // already failing, and E191's claim is that the arity error
             // reports ALONE.
             //
+            // And the warning rather than a NOTE on the primary error (N112,
+            // decided 2026-09-21, against growing `Error.note` into a list of
+            // footnotes). The deferral is a statement about this pass, not a
+            // second location for whatever the program's last error happens to
+            // be, and `anchor` below — the last diagnostic — is a source id to
+            // render against, never a claim that the two are related. The
+            // reasoning is at `error::Note`, beside the contract it keeps.
+            //
             // What made this unbuildable until now was not the pins it turns
             // off — three restate as deferrals — but
             // `b279_an_unresolvable_dispatch_site_still_fences_its_candidates`,
