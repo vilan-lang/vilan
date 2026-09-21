@@ -338,64 +338,116 @@ fn every_platform_free_program_is_identical_or_named() {
     );
 }
 
-/// `native-apps.md`'s own probe, and the pin that tracks how far it gets.
+/// `native-apps.md`'s own probe — **the differential this pin was written to
+/// become** (F20).
 ///
-/// **S1b moved the wall, and it did not reach the flip.** At S1a the first wall
-/// was `SignalCell<i32>` — a generic type, so monomorphisation, which is this
-/// slice's whole subject — and behind it stood `std::reactive`'s module-level
-/// turn registers, `Shared`'s intrinsics, `Weak`, a closure-typed struct field
-/// and a context-threaded hidden parameter. Every one of those now compiles.
-/// What is left is ONE construct: an `is`-test capture in a position that is
-/// not an `if` condition, which has no name natively (a capture has no
-/// declaration of its own — the JS emitter substitutes the payload accessor at
-/// every reference, and `matches!` binds nothing). The `if` form restructures
-/// into an `if let`; the rest needs the same treatment for a `while`, a `&&`
-/// and a tail position.
+/// It was a named-gap pin for two slices. S1a's wall was `SignalCell<i32>`, a
+/// generic type; S1b removed every wall it named and recorded the host type
+/// `Hash`. F20 built `Hash` (`vilan_rt::Hash`, the `CanonicalHash`/`HashEq`
+/// intrinsics and `JSON.stringify`'s own renderer), and behind it stood
+/// `std::reactive`'s three glue bindings (`__guarded`, `__with_finally`,
+/// `queueMicrotask`) and five move/copy defects the program was the first to
+/// reach: `Shared::write()` as a place, a `Shared` binding read twice, a `move`
+/// closure taking a capture the frame still needs, a `match` leg destructuring a
+/// place the body reads afterwards, and a boxed binding pushed through a COPY of
+/// its value (which printed `0 0` against the JS backend's `2 2`).
 ///
-/// The pin holds the CURRENT wall by name, so the next lane to move it sees
-/// exactly what is left rather than a stale sentence about generics.
+/// So the assertion is now the claim rather than the gap: the paper's probe
+/// prints the same bytes as a native binary and as a JS one.
 #[test]
-fn the_probes_board_program_names_its_own_gap() {
+fn the_probes_board_program_is_byte_identical_on_both_backends() {
     let staged = stage();
-    let probe = staged.join("native_probe_board.vl");
-    std::fs::write(&probe, BOARD_PROBE).expect("write the probe program");
-    let output = vilan(&staged)
-        .args([
-            "build",
-            "--backend",
-            "rust",
-            "--stdout",
-            "native_probe_board.vl",
-        ])
-        .output()
-        .expect("build the probe");
-    let message = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "the probe compiled natively — this pin is now the differential it was written to become"
-    );
-    assert!(
-        message.contains("the host type `Hash`"),
-        "the probe's wall has moved; the refusal must still name ONE construct, and the pin's \
-         own comment must be updated to it. It said:\n{message}"
-    );
-    assert!(
-        !message.contains("unbound generic type parameter"),
-        "the probe is no longer refused for generics — S1b closed that, and a refusal naming one \
-         again is a regression:\n{message}"
-    );
-    // J6 moved the wall one construct further along: the read of a
-    // context-threaded hidden parameter was being refused as an `is`-test
-    // capture, because such a parameter is in neither the `variables` nor the
-    // `parameters` table — deliberately, and for the same reason it has no
-    // type. It is a real parameter of the emitted signature, so a refusal
-    // naming an `is` capture here again is a regression.
-    assert!(
-        !message.contains("a value captured by an `is` test"),
-        "the probe is refused as an `is` capture again, which is the context-threaded \
-         parameter's false positive:\n{message}"
+    std::fs::write(staged.join("native_probe_board.vl"), BOARD_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_board.vl"),
+        Verdict::Identical,
+        "`native-apps.md`'s board probe is the native path's exit; it must print the same bytes \
+         on both backends"
     );
 }
+
+/// The canonical key, as the JS backend's `__hash` computes it (F20): a
+/// primitive keys as ITSELF and an aggregate keys as its `JSON.stringify` text,
+/// so the four `Hash` arms are the four JS primitive kinds and nothing else.
+///
+/// Every stock `impl Hashable` in `std::hash` is exercised through a `Map` key,
+/// because keying is the only thing a `Hash` is for and a wrong canonicalisation
+/// shows up as a lookup that misses or a duplicate that collides — not as a
+/// printed value. The `1` / `"1"` pair is the case a naive
+/// canonicalise-to-a-string would get wrong: two DIFFERENT JS primitives, so two
+/// different keys.
+#[test]
+fn a_canonical_hash_keys_the_same_values_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_hash.vl"), HASH_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_hash.vl"),
+        Verdict::Identical,
+        "a canonical hash must key the same values on both backends"
+    );
+}
+
+const HASH_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::map::Map;\n",
+    "import std::set::Set;\n",
+    "\n",
+    "[derive(Hashable, PartialEq)]\n",
+    "struct Point { x: i32, y: i32 }\n",
+    "\n",
+    "fun main() {\n",
+    // A string key and an integer key that render the same: two JS primitives,
+    // two keys.
+    "\tmut mixed: Map<str, i32> = Map::new();\n",
+    "\tmixed.insert(\"1\", 10);\n",
+    "\tmixed.insert(\"one\", 11);\n",
+    "\tprint(mixed.len());\n",
+    "\tprint(mixed.get(\"1\"));\n",
+    "\tmut numbers: Map<i32, str> = Map::new();\n",
+    "\tnumbers.insert(1, \"one\");\n",
+    "\tnumbers.insert(2, \"two\");\n",
+    "\tnumbers.insert(1, \"uno\");\n",
+    "\tprint(numbers.len());\n",
+    "\tprint(numbers.get(1));\n",
+    // A re-insert keeps the ORIGINAL position, as a JS `Map` does.
+    "\tfor key in numbers.keys() { print(key); }\n",
+    // `bool` and `f64` keys — the other two primitive arms.
+    "\tmut flags: Map<bool, i32> = Map::new();\n",
+    "\tflags.insert(true, 1);\n",
+    "\tflags.insert(false, 0);\n",
+    "\tprint(flags.get(true));\n",
+    "\tprint(flags.contains_key(false));\n",
+    "\tmut reals: Map<f64, str> = Map::new();\n",
+    "\treals.insert(1.5, \"half\");\n",
+    "\treals.insert(0.0, \"zero\");\n",
+    "\tprint(reals.get(1.5));\n",
+    "\tprint(reals.len());\n",
+    // An AGGREGATE key: `[derive(Hashable)]` canonicalises through
+    // `JSON.stringify`, so two equal points are one key and a different one is
+    // its own.
+    "\tmut points: Map<Point, str> = Map::new();\n",
+    "\tpoints.insert(Point { x = 1, y = 2 }, \"a\");\n",
+    "\tpoints.insert(Point { x = 1, y = 2 }, \"b\");\n",
+    "\tpoints.insert(Point { x = 2, y = 1 }, \"c\");\n",
+    "\tprint(points.len());\n",
+    "\tprint(points.get(Point { x = 1, y = 2 }));\n",
+    // A `List` key — `impl List<T: Hashable> with Hashable`.
+    "\tmut lists: Map<List<i32>, str> = Map::new();\n",
+    "\tlists.insert([1, 2], \"twelve\");\n",
+    "\tprint(lists.get([1, 2]));\n",
+    "\tprint(lists.get([2, 1]));\n",
+    // A `Set`, which keys the same way.
+    "\tmut words: Set<str> = Set::new();\n",
+    "\twords.insert(\"a\");\n",
+    "\twords.insert(\"a\");\n",
+    "\twords.insert(\"b\");\n",
+    "\tprint(words.len());\n",
+    "\tprint(words.contains(\"b\"));\n",
+    "\tprint(words.contains(\"z\"));\n",
+    "}\n",
+);
 
 /// S1b's monomorphisation, held to the shape rather than to one program: a
 /// generic function, a generic struct and a generic enum each emit ONE Rust

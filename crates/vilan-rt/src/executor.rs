@@ -1113,6 +1113,80 @@ pub fn spawn_in<T: 'static>(
     Task { node, value }
 }
 
+/// `queueMicrotask(callback)` — `std::reactive`'s continuation-settling
+/// primitive (F20).
+///
+/// A DEFERRED callback, which is the whole point of it: `enqueue`'s settled path
+/// schedules one drain per segment and the callback must not run inside the
+/// write that scheduled it. The microtask queue holds task ids rather than
+/// closures, so the callback becomes a one-suspension task: the eager first poll
+/// parks it on the queue, and the drain runs the body. A panicking callback
+/// settles that task as a failure, which is reported once with its origin —
+/// node's uncaught-exception path for the same callback.
+pub fn queue_microtask(callback: impl Fn() + 'static) {
+    spawn(
+        async move {
+            YieldOnce { yielded: false }.await;
+            callback();
+        },
+        "queueMicrotask",
+    );
+}
+
+/// One microtask hop — what JavaScript's `await` always costs and Rust's
+/// `.await` never does (F20).
+///
+/// `await p` in JS queues the continuation on the microtask queue even when `p`
+/// is already resolved; `future.await` in Rust continues in the same poll when
+/// the future is ready. So an `async fun` that suspends nowhere ran to
+/// completion INSIDE its spawn natively and after the enclosing sync body on the
+/// JS backend — `reactive-turns.vl` prints `a -> 5` on the wrong side of
+/// `end-sync` without this. The emitter spends one of these at every `.await`
+/// it writes, which is the hop the JS backend spends there too.
+pub async fn yield_now() {
+    YieldOnce { yielded: false }.await
+}
+
+/// Pending exactly once, re-enqueueing the polling task — the "be a microtask"
+/// future. Nothing else in this file needs it, because every other leaf parks on
+/// an object that owns a wake list.
+struct YieldOnce {
+    yielded: bool,
+}
+
+impl Future for YieldOnce {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<()> {
+        if self.yielded {
+            return Poll::Ready(());
+        }
+        self.yielded = true;
+        if let Some(task) = current_task() {
+            enqueue(task);
+        }
+        Poll::Pending
+    }
+}
+
+/// The event loop a program runs AFTER its synchronous body returns (F20).
+///
+/// node does not exit when the module's top level finishes; it exits when the
+/// loop has nothing left. A SYNCHRONOUS `fun main` can still leave work behind —
+/// `std::reactive`'s late-write path calls [`queue_microtask`] — and dropping it
+/// would be a native program that prints less than the JS one. So an emitted
+/// sync `main` ends with this, which is [`block_on`]'s loop without a root task
+/// and a no-op for a program that queued nothing.
+pub fn run_pending() {
+    loop {
+        drain_microtasks();
+        report_unobserved_failures();
+        reap_settled();
+        if !advance_timers() {
+            break;
+        }
+    }
+}
+
 /// `async fun main` — run `body` as the root task and drive the loop until both
 /// the microtask queue and the deadline list are empty (§10 (2)), the way node
 /// exits when its event loop has nothing left to do.
