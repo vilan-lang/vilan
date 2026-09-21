@@ -13731,6 +13731,92 @@ pub(crate) mod tests {
         assert_eq!(hover, "```vilan\nx: i32\n```");
     }
 
+    // --- E211: every candidate states the prefix it replaces ----------------
+
+    /// The text `src` analyzes as, and the candidates at its `¦` marker.
+    fn completion_replacements(src: &str) -> (String, Vec<Completion>) {
+        let offset = src.find('¦').expect("test source needs a `¦` marker");
+        let text = src.replace('¦', "");
+        let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
+        let _ = offset;
+        (text.clone(), {
+            let offset = src.find('¦').expect("marker");
+            document.completion(offset)
+        })
+    }
+
+    #[test]
+    fn e211_a_hyphenated_attribute_prefix_is_replaced_whole() {
+        // E194's own position. The server now STATES that `stroke-w` is the
+        // prefix, so a client with no `wordPattern` of its own — every LSP
+        // client but the one this repo configures — filters against it rather
+        // than against the `w` its default word rule reads.
+        let source = format!("{ELEMENT_HEAD_PRELUDE}fun main() {{\n\t<svg stroke-w¦></svg>\n}}\n");
+        let (text, items) = completion_replacements(&source);
+        let candidate = items
+            .iter()
+            .find(|item| item.label == "stroke-width")
+            .expect("`stroke-width` is offered");
+        let span = candidate.replace_span.expect("a replace span").into_range();
+        assert_eq!(
+            &text[span], "stroke-w",
+            "the hyphen is inside the prefix, which is the whole of E194"
+        );
+        assert_eq!(candidate.filter_text.as_deref(), Some("stroke-width"));
+    }
+
+    #[test]
+    fn e211_a_css_property_prefix_is_replaced_whole() {
+        let source = format!(
+            "{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet card = css {{\n\t\tflex-dir¦\n\t}};\n}}\n"
+        );
+        let (text, items) = completion_replacements(&source);
+        let candidate = items
+            .iter()
+            .find(|item| item.label == "flex-direction")
+            .expect("`flex-direction` is offered at a property position");
+        let span = candidate.replace_span.expect("a replace span").into_range();
+        assert_eq!(&text[span], "flex-dir");
+        assert_eq!(candidate.filter_text.as_deref(), Some("flex-direction"));
+    }
+
+    #[test]
+    fn e211_an_ordinary_identifier_prefix_stops_at_the_word() {
+        // In CODE a `-` is subtraction and no identifier carries one, so the
+        // hyphenated rule stays out of expression position: `b` is the prefix
+        // of `a-b`, not `a-b`.
+        let source = "fun main() {\n\tlet alpha = 1;\n\tlet _c = 1-al¦\n}\n";
+        let (text, items) = completion_replacements(source);
+        let candidate = items
+            .iter()
+            .find(|item| item.label == "alpha")
+            .expect("`alpha` is in scope");
+        let span = candidate.replace_span.expect("a replace span").into_range();
+        assert_eq!(&text[span], "al");
+    }
+
+    #[test]
+    fn e211_every_candidate_of_a_request_carries_both_fields() {
+        // The stamp is a property of the REQUEST, so it is on every candidate
+        // of every context — not only the hyphenated ones that needed it.
+        for source in [
+            "fun main() {\n\tlet name = \"vilan\";\n\tlet _n = name.le¦\n}\n",
+            "import std::io::pri¦\n",
+            "fun main() {\n\tlet _x = pri¦\n}\n",
+        ] {
+            let (_, items) = completion_replacements(source);
+            assert!(!items.is_empty(), "candidates at {source:?}");
+            for item in &items {
+                assert!(
+                    item.replace_span.is_some() && item.filter_text.is_some(),
+                    "{:?} at {source:?} carries neither",
+                    item.label
+                );
+                assert_eq!(item.filter_text.as_deref(), Some(item.label.as_str()));
+            }
+        }
+    }
+
     // --- E202: the server places a generic `<`'s `>` ------------------------
 
     /// The `>` the server would insert for a `<` just typed at the marker, or

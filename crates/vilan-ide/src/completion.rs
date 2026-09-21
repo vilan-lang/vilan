@@ -77,6 +77,25 @@ pub struct Completion {
     /// the only thing offered at its position, so burying it would be
     /// nonsense.
     pub insert: Option<InsertText>,
+    /// What the CLIENT should match the typed prefix against (E211). `None`
+    /// means the label, which is the LSP default.
+    ///
+    /// E194 fixed this from the client's side for VS Code by declaring a
+    /// `wordPattern` that reads `stroke-width` and `--card-gap` as one word.
+    /// Every other LSP client has its own word rules and no such file, so a
+    /// hyphenated candidate was filtered out of its own list there — the server
+    /// said `stroke-width`, the client saw the word `w`, and the candidate the
+    /// author was typing towards was the one that disappeared.
+    pub filter_text: Option<String>,
+    /// The span this candidate REPLACES when it is accepted (E211), in LIVE
+    /// coordinates. `None` inserts at the cursor, which is the LSP default.
+    ///
+    /// This is the half that actually fixes a hyphenated candidate: a client
+    /// given an explicit edit range filters against the text in THAT range
+    /// rather than against its own notion of a word, so `stroke-w` is the
+    /// prefix wherever the list is being shown. It is also what makes accepting
+    /// one replace the prefix instead of doubling it.
+    pub replace_span: Option<Span>,
     /// The import this candidate needs before it resolves (E54c) — `None` for
     /// a candidate already reachable without one (every candidate except the
     /// ones [`Analysis::auto_import_completions`] adds). The server
@@ -113,6 +132,8 @@ impl Completion {
             call_parameters: None,
             snippet: None,
             insert: None,
+            filter_text: None,
+            replace_span: None,
             needs_import: None,
         }
     }
@@ -133,6 +154,8 @@ impl Completion {
                 fallback: keyword.to_string(),
             }),
             insert: None,
+            filter_text: None,
+            replace_span: None,
             needs_import: None,
         }
     }
@@ -1620,26 +1643,41 @@ impl<'a, 'src> Analysis<'a, 'src> {
         }
         let (tokens, _errors) = tokenize(text);
         let context = self.cursor_context(text, &tokens, offset, start);
+        // E211: the prefix this request's candidates REPLACE, which is what
+        // every front-end filters against once the server states it. The
+        // hyphenated positions get the wider word — a css property, an element
+        // attribute and a custom property are one name each, and E194's whole
+        // defect was a client reading `stroke-w` as `w`.
+        let replaced = match context {
+            CursorContext::CssBlock(_) | CursorContext::ElementHead { .. } => {
+                Span::from(hyphenated_word_start(bytes, offset)..offset)
+            }
+            _ => Span::from(start..offset),
+        };
         match context {
             // Text, not code (kolt.local 001): a name here is a caption or a
             // note, and every candidate would be wrong.
             CursorContext::NoCode => return Vec::new(),
             // Macro names are always bare, so they bypass the call-suppression
             // below.
-            CursorContext::MacroName => return self.macro_name_completions(),
+            CursorContext::MacroName => {
+                return stamp_replacements(self.macro_name_completions(), replaced);
+            }
             CursorContext::ElementHead { chain, tag } => {
-                return self.element_head_completions(chain, tag);
+                return stamp_replacements(self.element_head_completions(chain, tag), replaced);
             }
             CursorContext::CssBlock(position) => {
-                return self.css_block_completions(position, offset);
+                return stamp_replacements(self.css_block_completions(position, offset), replaced);
             }
             // A field position offers the struct's fields and NOTHING else
             // (E160) — the element head's rule, for the element head's reason:
             // a name in scope is not a field name, and the one thing the author
             // is typing is the latter.
             CursorContext::StructInitializer { struct_id, open } => {
-                return self
-                    .struct_initializer_completions(&tokens, struct_id, open, offset, start);
+                return stamp_replacements(
+                    self.struct_initializer_completions(&tokens, struct_id, open, offset, start),
+                    replaced,
+                );
             }
             _ => {}
         }
@@ -1697,7 +1735,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 candidate.call_parameters = None;
             }
         }
-        candidates
+        stamp_replacements(candidates, replaced)
     }
 
     /// What the cursor is IN — the one classification every completion path
@@ -2988,6 +3026,8 @@ impl<'a, 'src> Analysis<'a, 'src> {
                     call_parameters: None,
                     snippet: None,
                     insert: None,
+                    filter_text: None,
+                    replace_span: None,
                     needs_import: Some(AutoImport {
                         module_path: module.path.clone(),
                         edit_span: span,
@@ -3469,6 +3509,42 @@ fn offered_importables<'a>(
     importables
         .iter()
         .filter(|row| !curated || row.exported.is_exported())
+        .collect()
+}
+
+/// The start of the word ending at `offset` under the HYPHENATED rule (E211):
+/// identifier bytes plus `-`, which is what makes `stroke-width`,
+/// `font-family` and `--card-gap` one name each.
+///
+/// Used only where a hyphen can be part of a NAME — inside a css block and
+/// inside an element head. In code a `-` is the subtraction operator and a
+/// vilan identifier cannot contain one, so the ordinary identifier scan stands
+/// there and `a-b` is not offered as one word.
+fn hyphenated_word_start(bytes: &[u8], offset: usize) -> usize {
+    let mut start = offset.min(bytes.len());
+    while start > 0 && (is_identifier_byte(bytes[start - 1]) || bytes[start - 1] == b'-') {
+        start -= 1;
+    }
+    start
+}
+
+/// Stamps every candidate of one request with the span it replaces and the
+/// text the client should filter it by (E211).
+///
+/// One place, applied to every context's list, because the answer is a property
+/// of the REQUEST and not of the candidate: the prefix being replaced is where
+/// the cursor is, and a candidate that carried its own would be a second
+/// opinion about that. `filter_text` is the label — stating it explicitly is
+/// what an LSP client without a `wordPattern` of its own needs, and it is what
+/// the label already meant for every client that has one.
+fn stamp_replacements(candidates: Vec<Completion>, replaced: Span) -> Vec<Completion> {
+    candidates
+        .into_iter()
+        .map(|mut candidate| {
+            candidate.filter_text = Some(candidate.label.clone());
+            candidate.replace_span = Some(replaced);
+            candidate
+        })
         .collect()
 }
 

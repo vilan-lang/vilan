@@ -966,6 +966,8 @@ pub fn candidates(entries: &[SymbolEntry], prefix: &str) -> Vec<Completion> {
             call_parameters: entry.call_parameters.clone(),
             snippet: None,
             insert: None,
+            filter_text: None,
+            replace_span: None,
             needs_import: None,
         })
         .collect()
