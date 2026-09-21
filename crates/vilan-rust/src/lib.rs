@@ -117,6 +117,10 @@ pub fn emit(program: &Program<'_>, _options: &BuildOptions) -> Result<Emitted, E
 /// conflict — the lane's report asks for the widening instead.
 const RENDER_MEMBER: &str = "to_string";
 
+/// The name `async fun main`'s body takes, since `fn main` cannot be `async`
+/// and the executor has to be entered from a synchronous frame.
+const ASYNC_MAIN_BODY: &str = "vilan_async_main";
+
 /// The prelude every emitted program carries.
 const PRELUDE: &str = "\
 #![allow(unused_imports, unused_parens, unused_variables, unused_mut, unused_braces)]
@@ -225,6 +229,28 @@ struct Emitter<'a, 'src> {
     /// scope in which a capture has a native name at all (it has no `variables`
     /// record; the JS emitter substitutes the payload accessor instead).
     is_captures: HashSet<Id>,
+    /// J6: each context-threaded hidden parameter's flavour, as
+    /// [`Emitter::compute_context_flavours`] reads it off the arguments its call
+    /// sites pass.
+    context_flavours: BTreeMap<u32, ContextFlavour>,
+    /// J6: the name of the function whose body is being walked — a spawn's
+    /// ORIGIN, which is what the unobserved-failure report names. The JS
+    /// emitter keeps the same thing under the same name.
+    current_origin: Option<&'src str>,
+}
+
+/// Whether a context-threaded hidden parameter carries the context's value or an
+/// `Option` of it.
+///
+/// reactive-turns.md §5 (1): the hidden parameter for a `get_safe`-reachable
+/// region carries `Option<T>` and a strict-`get` region keeps the bare flavour.
+/// The context pass marks the parameter in `context_hidden_parameters` but
+/// records no type for it — it is deliberately not source — so the flavour is
+/// recovered from what the call sites PASS.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ContextFlavour {
+    Bare,
+    Optional,
 }
 
 impl<'a, 'src> Emitter<'a, 'src> {
@@ -251,6 +277,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             is_captures: HashSet::new(),
             census: std::env::var_os("VILAN_NATIVE_HOST_CENSUS").is_some(),
             host_gaps: std::collections::BTreeSet::new(),
+            context_flavours: BTreeMap::new(),
+            current_origin: None,
         }
     }
 
@@ -277,6 +305,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // them must carry none of them.
         self.module_bindings = self.program.module_level_bindings().into_iter().collect();
         self.compute_boxed_bindings();
+        self.compute_context_flavours();
 
         let main = self.ensure_function(main_id, &HashMap::default())?;
         let main_body = self
@@ -342,6 +371,235 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     self.boxed.insert(binding);
                 }
             }
+        }
+    }
+
+    /// J6: which flavour each context-threaded hidden parameter carries.
+    ///
+    /// `context.rs` gives every needs-context function a record-LESS parameter
+    /// (no `parameters` entry, no span, no type) and appends the value as an
+    /// argument at each call. So the parameter's type is not written down
+    /// anywhere, but it is determined: the argument the callers pass is either
+    /// a literal `None`, a `Some(..)` wrap, or a read of the CALLER's own
+    /// hidden parameter. The first two settle a callee outright; the third
+    /// propagates, which is why this is a worklist rather than one pass.
+    ///
+    /// An undetermined parameter stays out of the map and
+    /// [`Emitter::parameter_declaration`] refuses at it — a guessed flavour
+    /// would be a type error in the emitted Rust, and a refusal by name is the
+    /// standing answer to a construct this backend cannot see through.
+    fn compute_context_flavours(&mut self) {
+        // Which closures a clause-typed PARAMETER can hold — every closure
+        // literal any call site hands it. `nursery(|n| { .. })` is the shape:
+        // the body's own hidden parameter is bound not at the `nursery(..)`
+        // call but inside `nursery`, where the parameter is CALLED, so the two
+        // have to be connected before the flavours can propagate.
+        let mut closures_by_parameter: HashMap<Id, Vec<Id>> = HashMap::default();
+        for call in self.program.function_calls.values() {
+            let Some(receiving) = self.receiving_parameters(call.subject_id) else {
+                continue;
+            };
+            for (position, parameter_id) in receiving.iter().enumerate() {
+                if let Some(argument) = call.argument_ids.get(position)
+                    && let Some(Expr::Closure(closure_id)) =
+                        self.program.entity_map.get(argument).cloned()
+                {
+                    closures_by_parameter
+                        .entry(*parameter_id)
+                        .or_default()
+                        .push(closure_id);
+                }
+            }
+        }
+
+        // (callee's hidden parameter, the argument expression a call passes it).
+        let mut edges: Vec<(Id, Id)> = Vec::new();
+        for call in self.program.function_calls.values() {
+            // A call's subject is a named callee, or — after `Context::run`
+            // lowered to `body(value)` — the closure itself, or a clause-typed
+            // parameter, in which case every closure that can land there binds
+            // its own hidden parameter at this position.
+            let mut receiving_lists: Vec<Vec<Id>> = Vec::new();
+            if let Some(receiving) = self.receiving_parameters(call.subject_id) {
+                receiving_lists.push(receiving);
+            }
+            if let Some(Expr::Local(target)) = self.program.entity_map.get(&call.subject_id)
+                && let Some(candidates) = closures_by_parameter.get(target)
+            {
+                for closure_id in candidates {
+                    if let Some(closure) = self.program.closures.get(closure_id) {
+                        receiving_lists.push(closure.parameters.clone());
+                    }
+                }
+            }
+            for receiving in receiving_lists {
+                for (position, parameter_id) in receiving.iter().enumerate() {
+                    if self
+                        .program
+                        .context_hidden_parameters
+                        .contains_key(parameter_id)
+                        && let Some(argument) = call.argument_ids.get(position)
+                    {
+                        edges.push((*parameter_id, *argument));
+                    }
+                }
+            }
+        }
+        // The two determined shapes first, then propagate through the reads.
+        for (parameter, argument) in &edges {
+            if let Some(flavour) = self.flavour_of_argument(*argument) {
+                self.context_flavours.insert(parameter.0, flavour);
+            }
+        }
+        loop {
+            let mut changed = false;
+            for (parameter, argument) in &edges {
+                if self.context_flavours.contains_key(&parameter.0) {
+                    continue;
+                }
+                if let Some(Expr::Local(source)) = self.program.entity_map.get(argument)
+                    && let Some(flavour) = self.context_flavours.get(&source.0).copied()
+                {
+                    self.context_flavours.insert(parameter.0, flavour);
+                    changed = true;
+                }
+            }
+            if !changed {
+                return;
+            }
+        }
+    }
+
+    /// The native type a context's THREADED VALUE has — `let ambient_nursery:
+    /// Context<Nursery>` carries it as the declared type's one argument.
+    fn context_value_type(&mut self, context: Id, span: Span) -> Result<String, Error> {
+        let name = self
+            .program
+            .variables
+            .get(&context)
+            .map(|variable| variable.name)
+            .unwrap_or("a context");
+        let declared = self
+            .program
+            .variables
+            .get(&context)
+            .map(|variable| variable.type_id)
+            .ok_or_else(|| {
+                unsupported(&format!("the context `{name}`, which has no type"), span)
+            })?;
+        let argument = match self.resolve(declared).cloned() {
+            Some(Type::Struct(_, arguments)) => arguments.first().copied(),
+            _ => None,
+        };
+        let Some(argument) = argument else {
+            return Err(unsupported(
+                &format!("the context `{name}`, whose value type did not resolve"),
+                span,
+            ));
+        };
+        self.rust_type(argument, span)
+    }
+
+    /// The native type one entry of a `context` clause contributes to a closure
+    /// type (J6).
+    ///
+    /// A clause entry is a context BINDING id, and the parameter the pass
+    /// appends for it carries that binding's value type — under an `Option` for
+    /// the safe flavour. There is no parameter id to key the flavour on at the
+    /// type level, so it is taken from the CLOSURES: every closure that lands in
+    /// a clause position has a hidden parameter for the same context, and
+    /// [`Emitter::compute_context_flavours`] settled those. Two closures that
+    /// disagree would need two types, which is refused rather than guessed.
+    fn context_clause_type(&mut self, context: Id, span: Span) -> Result<String, Error> {
+        let name = self
+            .program
+            .variables
+            .get(&context)
+            .map(|variable| variable.name)
+            .unwrap_or("a context");
+        let mut settled: Option<ContextFlavour> = None;
+        for closure in self.program.closures.values() {
+            for parameter_id in &closure.parameters {
+                if self.program.context_hidden_parameters.get(parameter_id) != Some(&context) {
+                    continue;
+                }
+                let Some(flavour) = self.context_flavours.get(&parameter_id.0).copied() else {
+                    continue;
+                };
+                if settled.is_some_and(|already| already != flavour) {
+                    return Err(unsupported(
+                        &format!(
+                            "a closure type carrying the context `{name}`, whose closures do \
+                             not agree on whether the threaded value arrives as an `Option`"
+                        ),
+                        span,
+                    ));
+                }
+                settled = Some(flavour);
+            }
+        }
+        // Same default as the parameter's own: strict, so a wrong guess is a
+        // type error rather than a wrong answer.
+        let flavour = settled.unwrap_or(ContextFlavour::Bare);
+        let value = self.context_value_type(context, span)?;
+        Ok(match flavour {
+            ContextFlavour::Bare => value,
+            ContextFlavour::Optional => format!("Option<{value}>"),
+        })
+    }
+
+    /// The parameter list a call's SUBJECT receives against — a named callee's,
+    /// or a closure literal's where `Context::run` lowered `run(value, body)`
+    /// into `body(value)`.
+    fn receiving_parameters(&self, subject_id: Id) -> Option<Vec<Id>> {
+        match self.program.entity_map.get(&subject_id)? {
+            Expr::Local(target) => self
+                .program
+                .functions
+                .get(target)
+                .map(|function| function.parameters.clone()),
+            Expr::Closure(closure_id) => self
+                .program
+                .closures
+                .get(closure_id)
+                .map(|closure| closure.parameters.clone()),
+            _ => None,
+        }
+    }
+
+    /// The flavour a context argument's own SHAPE settles: a bare `None` or a
+    /// `Some(..)` wrap says `Option<T>`, and a read of an in-scope value says
+    /// the bare flavour. A read of another hidden parameter settles nothing here
+    /// — that is the propagating case.
+    fn flavour_of_argument(&self, argument: Id) -> Option<ContextFlavour> {
+        match self.program.entity_map.get(&argument) {
+            Some(Expr::Local(binding)) => match self.program.entity_map.get(binding) {
+                Some(Expr::EnumVariant(enum_id, _)) => self
+                    .program
+                    .enums
+                    .get(enum_id)
+                    .filter(|declaration| declaration.name == "Option")
+                    .map(|_| ContextFlavour::Optional),
+                _ if self.program.context_hidden_parameters.contains_key(binding) => None,
+                _ => Some(ContextFlavour::Bare),
+            },
+            Some(Expr::Call(call_id)) => {
+                let call = self.program.function_calls.get(call_id)?;
+                let Some(Expr::Local(subject)) = self.program.entity_map.get(&call.subject_id)
+                else {
+                    return None;
+                };
+                match self.program.entity_map.get(subject) {
+                    Some(Expr::EnumVariant(enum_id, _)) => self
+                        .program
+                        .enums
+                        .get(enum_id)
+                        .filter(|declaration| declaration.name == "Option")
+                        .map(|_| ContextFlavour::Optional),
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 
@@ -836,6 +1094,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
     // ------------------------------------------------------------- names ---
 
     fn binding_name(&self, id: Id) -> String {
+        // J6: a context-threaded hidden parameter has no `parameters` record to
+        // take a name from — it is not source. Its name says what it is, so an
+        // emitted signature carrying one reads honestly.
+        if self.program.context_hidden_parameters.contains_key(&id) {
+            return format!("context_{}", id.0);
+        }
         let name = self
             .program
             .variables
@@ -898,10 +1162,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let element = self.rust_type(element, span)?;
                 Ok(format!("[{element}; {length}]"))
             }
-            Type::Closure(parameters, return_type, _) => {
+            Type::Closure(parameters, return_type, contexts) => {
                 let mut parts = Vec::new();
                 for parameter in &parameters {
                     parts.push(self.rust_type(*parameter, span)?);
+                }
+                // B309: the `context` clause is part of the TYPE, and
+                // `context::thread_contexts` appends one hidden parameter per
+                // clause entry to every closure that lands in this position —
+                // so the type has to name them or the emitted `Fn` has the
+                // wrong arity. The value type is the context binding's, under
+                // an `Option` for the safe flavour, and the flavour is the one
+                // the closures themselves settled.
+                for context in &contexts {
+                    parts.push(self.context_clause_type(*context, span)?);
                 }
                 let returned = self.rust_type(return_type, span)?;
                 // F16, applied as ruled: a closure VALUE that can reach a
@@ -1028,6 +1302,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .cloned()
                     .unwrap_or_else(|| "()".to_string())
             )),
+            // J6: the four host types the executor IS.
+            "Task" => Ok(format!(
+                "vilan_rt::executor::Task<{}>",
+                rendered
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "()".to_string())
+            )),
+            "Nursery" => Ok("vilan_rt::executor::Nursery".to_string()),
+            "CancelSignal" => Ok("vilan_rt::executor::CancelSignal".to_string()),
+            "TimerHandle" => Ok("vilan_rt::executor::TimerHandle".to_string()),
             _ if external => {
                 let what = format!("the host type `{name}`");
                 self.host_gap(what, span).map(|_| "()".to_string())
@@ -1366,9 +1651,55 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .parameters
                 .get(binding)
                 .map(|parameter| parameter.type_id),
-            Expr::Call(call_id) => self.program.inferred_return_types.get(call_id).copied(),
+            Expr::Call(call_id) => self
+                .program
+                .inferred_return_types
+                .get(call_id)
+                .copied()
+                .or_else(|| self.declared_return_type(*call_id)),
+            Expr::Await(awaited) => self.awaited_type(*awaited),
             _ => None,
         }
+    }
+
+    /// The type an `await` produces (J6): a `Task<T>`'s payload.
+    ///
+    /// `(await pending).id` reads a field off the await, and the await
+    /// expression carries no type of its own — `pending` carries `Task<Row>`
+    /// and the field is `Row`'s. An operand that is already the payload (an
+    /// implicitly-awaited call, whose recorded type is its declared return
+    /// type) passes through unchanged.
+    fn awaited_type(&self, awaited: Id) -> Option<TypeId> {
+        let type_id = self.type_of(awaited)?;
+        match self.resolve(type_id)? {
+            Type::Struct(struct_id, arguments)
+                if self
+                    .program
+                    .structs
+                    .get(struct_id)
+                    .is_some_and(|declaration| declaration.name == "Task") =>
+            {
+                arguments.first().copied()
+            }
+            _ => Some(type_id),
+        }
+    }
+
+    /// The DECLARED return type of a call's callee — what
+    /// [`Emitter::type_of`] falls back to when the solver banked no inferred
+    /// return for the call site.
+    ///
+    /// `inferred_return_types` is keyed by call and filled where inference had
+    /// something to add; a monomorphic callee with a written return type adds
+    /// nothing, so a field read straight off such a call (`fetch_row().id`) had
+    /// no subject type at all and was refused. The declaration is the answer at
+    /// exactly those sites.
+    fn declared_return_type(&self, call_id: Id) -> Option<TypeId> {
+        let call = self.program.function_calls.get(&call_id)?;
+        let Some(Expr::Local(target)) = self.program.entity_map.get(&call.subject_id) else {
+            return None;
+        };
+        self.program.functions.get(target)?.return_type_id
     }
 
     // --------------------------------------------------------- functions ---
@@ -1419,12 +1750,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 span,
             ));
         }
-        if function.is_async {
-            return Err(unsupported(
-                &format!("the async function `{}`", function.name),
-                span,
-            ));
-        }
 
         let is_main = self
             .program
@@ -1466,6 +1791,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         is_main: bool,
         name: &str,
     ) -> Result<String, Error> {
+        // J6: asyncness is the INFERRED set, not the declared keyword — a
+        // function whose body awaits is async whether or not it says so, and
+        // `async_functions` is what the JS emitter reads for the same reason.
+        let is_async = self.program.async_functions.contains(&function.id);
         let mut parameters = Vec::new();
         for parameter_id in &function.parameters {
             parameters.push(self.parameter_declaration(*parameter_id, span)?);
@@ -1493,15 +1822,37 @@ impl<'a, 'src> Emitter<'a, 'src> {
             &mut self.current_returns_view,
             function.returns_view || function.returns_mut_view,
         );
+        let saved_origin = self.current_origin.replace(function.name);
         let walked = self.emit_block(&function.body.0, function.body.1, &mut body, 1);
+        self.current_origin = saved_origin;
         self.current_returns_view = saved_view;
         walked?;
 
         let mut out = String::new();
         if is_main {
-            let _ = writeln!(out, "fn main() {{");
+            if is_async {
+                // `async fun main` — `main` itself cannot be async, so the real
+                // body is its own `async fn` and `main` is the one call into the
+                // executor. `block_on` drives the loop until both the microtask
+                // queue and the deadline list are empty, which is where node
+                // exits too.
+                let _ = writeln!(out, "fn main() {{");
+                let _ = writeln!(
+                    out,
+                    "    vilan_rt::executor::block_on({ASYNC_MAIN_BODY}());"
+                );
+                let _ = writeln!(out, "}}");
+                let _ = writeln!(out, "async fn {ASYNC_MAIN_BODY}() {{");
+            } else {
+                let _ = writeln!(out, "fn main() {{");
+            }
         } else {
-            let _ = writeln!(out, "fn {name}({}) -> {returned} {{", parameters.join(", "));
+            let _ = writeln!(
+                out,
+                "{}fn {name}({}) -> {returned} {{",
+                if is_async { "async " } else { "" },
+                parameters.join(", ")
+            );
         }
         out.push_str(&body);
         let _ = writeln!(out, "}}");
@@ -1584,8 +1935,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
     }
 
     fn parameter_declaration(&mut self, id: Id, span: Span) -> Result<String, Error> {
-        if let Some(declaration) = self.context_parameter_declaration(id, span)? {
-            return Ok(declaration);
+        if self.program.context_hidden_parameters.contains_key(&id) {
+            return self.context_parameter_declaration(id, span);
         }
         let parameter = self
             .program
@@ -1621,8 +1972,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Ok(format!("{binder}{}: {declaration}", self.binding_name(id)))
     }
 
-    /// A HIDDEN CONTEXT parameter's declaration, or `None` when `id` is an
-    /// ordinary parameter.
+    /// A HIDDEN CONTEXT parameter's declaration (J6).
     ///
     /// `context::thread_contexts` rewrites every ambient read into a parameter
     /// and every call into one that passes the value — so by the time a program
@@ -1633,40 +1983,40 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// leaves a marker naming the context binding the parameter threads.
     ///
     /// So the type comes from that binding: it is declared `Context<T>`, and
-    /// the value threaded through is its `T`. The SAFE flavour threads an
-    /// `Option<T>` instead (`ambient-owner.md` §2.1), and this takes the strict
-    /// reading — a program whose parameter is really the safe one is a rustc
-    /// type error rather than a wrong answer, which is the direction to be
-    /// wrong in. (`native-b-38` builds the flavour analysis for the executor's
-    /// own sake; this is the minimum that lets `board.vl` compile.)
-    fn context_parameter_declaration(
-        &mut self,
-        id: Id,
-        span: Span,
-    ) -> Result<Option<String>, Error> {
-        if self.program.parameters.contains_key(&id) {
-            return Ok(None);
-        }
-        let Some(binding) = self.program.context_hidden_parameters.get(&id).copied() else {
-            return Ok(None);
-        };
-        let Some(Type::Struct(_, arguments)) = self
-            .program
-            .variables
-            .get(&binding)
-            .map(|variable| variable.type_id)
-            .and_then(|type_id| self.resolve(type_id))
-        else {
+    /// the value threaded through is its `T` — under an `Option` for the SAFE
+    /// flavour (`ambient-owner.md` §2.1), which is what
+    /// [`Emitter::context_parameter_type`] decides. The binder is `mut` because
+    /// nothing in the IR says whether the plumbing writes it, and an unused
+    /// `mut` is in `PRELUDE`'s allow list.
+    fn context_parameter_declaration(&mut self, id: Id, span: Span) -> Result<String, Error> {
+        let rendered = self.context_parameter_type(id, span)?;
+        Ok(format!("mut {}: {rendered}", self.binding_name(id)))
+    }
+
+    /// The native type a context-threaded hidden parameter carries — the
+    /// context's value type, under an `Option` for the safe flavour.
+    fn context_parameter_type(&mut self, id: Id, span: Span) -> Result<String, Error> {
+        let Some(context) = self.program.context_hidden_parameters.get(&id).copied() else {
             return Err(unsupported(
-                "a hidden context parameter whose context binding did not resolve",
+                "a parameter that is not context-threaded",
                 span,
             ));
         };
-        let Some(value_type) = arguments.first().copied() else {
-            return Err(unsupported("a context with no value type", span));
-        };
-        let rendered = self.rust_type(value_type, span)?;
-        Ok(Some(format!("mut {}: {rendered}", self.binding_name(id))))
+        // Nothing settled it: take the STRICT reading, which is the direction to
+        // be wrong in. A parameter that is really the safe one then becomes a
+        // rustc type error rather than a wrong answer — and the reactive path
+        // (`turn_scope`, `owner_scope`) is threaded by `run` alone, where the
+        // value is always present and the strict reading is the right one.
+        let flavour = self
+            .context_flavours
+            .get(&id.0)
+            .copied()
+            .unwrap_or(ContextFlavour::Bare);
+        let value = self.context_value_type(context, span)?;
+        Ok(match flavour {
+            ContextFlavour::Bare => value,
+            ContextFlavour::Optional => format!("Option<{value}>"),
+        })
     }
 
     /// How a parameter is RECEIVED natively.
@@ -1777,6 +2127,22 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Expr::String(text) => format!("vilan_rt::str_new({})", rust_string(text)),
             Expr::MultilineString(_) => {
                 return Err(unsupported("a triple-quoted string", span));
+            }
+            // J6: a `None` or a variant the context pass synthesized as an
+            // argument names the VARIANT, not a place — `Expr::Local` of the
+            // variant's own declaration id.
+            Expr::Local(binding)
+                if matches!(
+                    self.program.entity_map.get(&binding),
+                    Some(Expr::EnumVariant(_, _))
+                ) =>
+            {
+                let Some(Expr::EnumVariant(enum_id, index)) =
+                    self.program.entity_map.get(&binding).cloned()
+                else {
+                    unreachable!("the guard just matched an enum variant");
+                };
+                self.variant_path(enum_id, index, &[], span)?
             }
             Expr::Local(binding) => self.read_module_binding_or_local(binding, span)?,
             Expr::Parameter(binding) => self.binding_name(binding),
@@ -1898,6 +2264,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             Expr::Dereference(operand) => format!("(*{})", self.expression(operand, depth)?),
             Expr::Call(call_id) => self.call(id, call_id, depth, span)?,
+            Expr::Async(spawned) => self.async_spawn(id, spawned, depth, span)?,
+            Expr::Await(awaited) => self.await_of(awaited, depth)?,
             Expr::Closure(closure_id) => self.closure(closure_id, depth, span)?,
             Expr::Is(subject, pattern) => self.is_test(subject, &pattern, depth, span)?,
             Expr::EnumVariant(enum_id, index) => {
@@ -1955,6 +2323,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if self.reads_a_closure_binding(id) {
             return Ok(format!("({text}).clone()"));
         }
+        // J6, the same rule for the executor's HANDLES. A `Task`, a `Nursery`,
+        // a `CancelSignal` and a `TimerHandle` are counted handles, and a copy
+        // of one is the same task/nursery/timer — which is why `clone_sites`
+        // never marks a read of one: on the JS backend a handle is a class
+        // instance and `__clone` passes it through untouched, so no copy is
+        // owed there. Natively the second read is a use-after-move unless the
+        // count is bumped.
+        if self.reads_a_handle_binding(id) {
+            return Ok(format!("({text}).clone()"));
+        }
         // A LOANED parameter (`&T` / `&mut T` natively) read where a value is
         // wanted is rule 1's copy: `fun to_string(self): str { self }` hands
         // back a `str`, and `self` is a loan of one.
@@ -1989,6 +2367,42 @@ impl<'a, 'src> Emitter<'a, 'src> {
         self.type_of(id)
             .and_then(|type_id| self.resolve(type_id))
             .is_some_and(|resolved| matches!(resolved, Type::Closure(_, _, _)))
+    }
+
+    /// Whether `id` READS a binding holding one of the executor's host handles
+    /// (J6) — the shape that owes a refcount bump, exactly as a closure
+    /// binding does.
+    fn reads_a_handle_binding(&self, id: Id) -> bool {
+        let binding = match self.program.entity_map.get(&id) {
+            Some(Expr::Local(binding)) | Some(Expr::Parameter(binding)) => *binding,
+            _ => return false,
+        };
+        // A context-threaded hidden parameter carries no recorded type at all,
+        // so the type test below cannot see it — and what it carries IS a
+        // handle wherever the executor is involved (`ambient_nursery`). It is
+        // retained unconditionally: a context value is `Clone` by
+        // construction, and the alternative is a use-after-move on the second
+        // read of a parameter the pass appended.
+        if self
+            .program
+            .context_hidden_parameters
+            .contains_key(&binding)
+        {
+            return true;
+        }
+        self.type_of(id)
+            .and_then(|type_id| self.resolve(type_id))
+            .and_then(|resolved| match resolved {
+                Type::Struct(struct_id, _) => self.program.structs.get(struct_id),
+                _ => None,
+            })
+            .is_some_and(|declaration| {
+                declaration.external
+                    && matches!(
+                        declaration.name,
+                        "Task" | "Nursery" | "CancelSignal" | "TimerHandle"
+                    )
+            })
     }
 
     /// An assignment, which has FOUR shapes natively where JS has one.
@@ -2224,9 +2638,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // a restructuring of the `if` and not of the read — so it is named
             // rather than emitted, and it is named HERE because the emitted
             // alternative was a reference to a name nothing declares.
+            // J6: a context-threaded hidden parameter is in neither table
+            // EITHER, and for the same reason it has no type — `context.rs`
+            // keeps it out of `parameters` deliberately. It is a real
+            // parameter of the emitted signature, so it reads as its own name;
+            // without this exclusion every program reaching a `sleep` was
+            // refused as an `is` capture it has nothing to do with.
             if !self.program.variables.contains_key(&binding)
                 && !self.program.parameters.contains_key(&binding)
                 && !self.is_captures.contains(&binding)
+                && !self
+                    .program
+                    .context_hidden_parameters
+                    .contains_key(&binding)
             {
                 return self.host_gap(
                     "a value captured by an `is` test outside an `if` condition (only \
@@ -3122,6 +3546,22 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .get(&closure_id)
             .cloned()
             .ok_or_else(|| unsupported("an unresolved closure", span))?;
+        // J6: an `async` closure VALUE. Natively its type is different in kind
+        // — a closure that answers a future, not a value — and a callee handed
+        // one at one site and a synchronous closure at another is compiled TWICE
+        // on the JS backend (async-polymorphism.md A.1's adapted instances,
+        // which this emitter does not model: it monomorphizes on types, and
+        // asyncness is not one). So it is named rather than emitted. The spawn
+        // (`async <body>`) and the runtime helpers that take a body do NOT come
+        // through here — they read the body directly and wrap it in a future.
+        if self.program.async_functions.contains(&closure_id) {
+            return self.host_gap(
+                "an `async` closure as a VALUE (a callee taking one at one call site and a \
+                 synchronous closure at another is an adapted instance)"
+                    .to_string(),
+                span,
+            );
+        }
         let mut parameters = Vec::new();
         for parameter_id in &closure.parameters {
             parameters.push(self.parameter_declaration(*parameter_id, span)?);
@@ -3160,9 +3600,396 @@ impl<'a, 'src> Emitter<'a, 'src> {
         ))
     }
 
+    // ----------------------------------------------------------- async ----
+
+    /// `async <body>` — the spawn (J6; `__task` is the contract).
+    ///
+    /// The JS helper takes the body as a CLOSURE and invokes it inside the
+    /// constructor, which is how it is eager; natively the body is an `async`
+    /// block and `spawn` polls it once before it answers, which is the same
+    /// thing without an `Rc<dyn Fn>` in the middle. The origin is the enclosing
+    /// function's name, as it is on the JS side, and the ambient nursery — when
+    /// the context pass connected this spawn to one — is the third argument.
+    fn async_spawn(
+        &mut self,
+        spawn_id: Id,
+        spawned: Id,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        let Some(Expr::Closure(closure_id)) = self.program.entity_map.get(&spawned).cloned() else {
+            return Err(unsupported(
+                "an `async` spawn of something but a body",
+                span,
+            ));
+        };
+        let closure = self
+            .program
+            .closures
+            .get(&closure_id)
+            .cloned()
+            .ok_or_else(|| unsupported("an `async` spawn whose body did not resolve", span))?;
+        if !closure.parameters.is_empty() {
+            return Err(unsupported(
+                "an `async` spawn whose body takes a parameter",
+                span,
+            ));
+        }
+        let body = self.expression(closure.return_, depth)?;
+        let origin = rust_string(self.current_origin.unwrap_or("top level"));
+        let prelude = self.async_capture_prelude(closure.return_);
+        let Some(&(source_entity, is_option)) = self.program.spawn_nursery_sources.get(&spawn_id)
+        else {
+            return Ok(format!(
+                "{{ {prelude}vilan_rt::executor::spawn(async move {{ {body} }}, {origin}) }}"
+            ));
+        };
+        // A safe holder carries `Option<Nursery>` and a covered one the nursery
+        // itself; `spawn_in` takes the `Option`, so a bare source is wrapped
+        // here exactly as `__nursery_of` unwraps the other way on the JS side.
+        let source = self.expression(source_entity, depth)?;
+        let nursery = if is_option {
+            format!("({source}).clone()")
+        } else {
+            format!("Some(({source}).clone())")
+        };
+        // The handle is taken BEFORE the block, because the block is `async
+        // move` and the body usually reads the very same threaded parameter —
+        // `sleep` does, through `ambient_signal` — so taking it afterwards is a
+        // read of a place the block has moved. A handle is counted; a copy of
+        // one is the same nursery.
+        let holder = format!("nursery_{}", spawn_id.0);
+        Ok(format!(
+            "{{ {prelude}let {holder} = {nursery}; vilan_rt::executor::spawn_in(async move {{ {body} }}, {origin}, {holder}) }}"
+        ))
+    }
+
+    /// `await <operand>` — `.await` (J6).
+    ///
+    /// A `Task` read out of a BINDING is retained rather than moved: awaiting it
+    /// twice is legal vilan (a task is a handle, and awaiting a settled one
+    /// answers again), and `.await` on the binding itself would move out of a
+    /// place the program may read later.
+    fn await_of(&mut self, awaited: Id, depth: usize) -> Result<String, Error> {
+        // `value_of` retains a handle read out of a binding (J6's rule for the
+        // executor's handles), which is exactly what awaiting a task twice
+        // needs: a task is a handle, and awaiting a settled one answers again.
+        let operand = self.value_of(awaited, depth)?;
+        Ok(format!("({operand}).await"))
+    }
+
+    /// The host bindings `vilan-rt`'s executor answers (J6).
+    ///
+    /// `std::task` and `std::time` reach the event loop through named runtime
+    /// helpers (`__sleep`, `__timer`, the three nursery helpers) and
+    /// `[extern(method, ..)]` methods on the handles those return, plus
+    /// `Promise.all`/`Promise.race` on `Task<T>`. Each one below has a body in
+    /// `vilan_rt::executor` written against the JS helper of the same name, so
+    /// the mapping is a rename rather than a reimplementation. `Ok(None)` means
+    /// "not one of ours", and the caller refuses by name — which is what every
+    /// other host binding still gets.
+    ///
+    /// The four method symbols (`signal_of`, `cancel`, `is_cancelled`, `wait`)
+    /// are unique in std: the only other `[extern(method)]` bindings are
+    /// `encode`/`decode` on the text codecs and `exec`/`prepare` on the sqlite
+    /// handle, so a name here cannot capture a stranger's method.
+    ///
+    /// Still NOT here, deliberately: `__with_finally_async`, which only
+    /// `Debounce` reaches and which no program in the census does.
+    fn runtime_host_binding(
+        &mut self,
+        name: &str,
+        binding: Option<&ExternBinding<'src>>,
+        argument_ids: &[Id],
+        depth: usize,
+        span: Span,
+    ) -> Result<Option<String>, Error> {
+        let Some(binding) = binding else {
+            return Ok(None);
+        };
+        let rendered = match binding {
+            ExternBinding::Function {
+                module: None,
+                symbol: "__sleep",
+            } => format!(
+                "vilan_rt::executor::sleep({}, {})",
+                self.value_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            ExternBinding::Function {
+                module: None,
+                symbol: "__timer",
+            } => format!(
+                "vilan_rt::executor::timer({})",
+                self.value_argument(argument_ids, 0, depth)?
+            ),
+            ExternBinding::Function {
+                module: None,
+                symbol: "__nursery_new",
+            } => format!(
+                "vilan_rt::executor::nursery_new({})",
+                self.value_argument(argument_ids, 0, depth)?
+            ),
+            ExternBinding::Function {
+                module: None,
+                symbol: "__nursery_new_detached",
+            } => "vilan_rt::executor::nursery_new_detached()".to_string(),
+            // The join takes the body as a FUTURE where the JS helper takes a
+            // closure it invokes: `await body()` there is `body.await` here, and
+            // a `Pin<Box<dyn Future>>` is what lets the join hold it across the
+            // drain without the emitted source ever naming `Pin`.
+            ExternBinding::Function {
+                module: None,
+                symbol: "__nursery_run",
+            } => format!(
+                "vilan_rt::executor::nursery_run({}, {})",
+                self.value_argument(argument_ids, 0, depth)?,
+                self.pinned_body_argument(argument_ids, 1, depth, span)?
+            ),
+            ExternBinding::Function {
+                module: None,
+                symbol: "Promise.all",
+            } => format!(
+                "vilan_rt::executor::settle_all({})",
+                self.value_argument(argument_ids, 0, depth)?
+            ),
+            ExternBinding::Function {
+                module: None,
+                symbol: "Promise.race",
+            } => format!(
+                "vilan_rt::executor::race({})",
+                self.value_argument(argument_ids, 0, depth)?
+            ),
+            // The methods on the handles. `[extern(method)]` defaults the host
+            // name to the function's own, so the vilan name is consulted where
+            // the attribute wrote none. A receiver is a PLACE, never a copy:
+            // every one of these handles is counted, and a copy of a handle is
+            // the same handle anyway.
+            ExternBinding::Method { symbol } => match symbol.unwrap_or(name) {
+                // `Nursery::signal_of` — `ambient_signal()` reaches this one for
+                // every `sleep` inside a nursery's extent.
+                "signal_of" => format!(
+                    "({}).signal()",
+                    self.place_argument(argument_ids, 0, depth)?
+                ),
+                "cancel" => format!(
+                    "({}).cancel()",
+                    self.place_argument(argument_ids, 0, depth)?
+                ),
+                "is_cancelled" => format!(
+                    "({}).is_cancelled()",
+                    self.place_argument(argument_ids, 0, depth)?
+                ),
+                // `TimerHandle::wait(self, signal)`.
+                "wait" => format!(
+                    "({}).wait({})",
+                    self.place_argument(argument_ids, 0, depth)?,
+                    self.value_argument(argument_ids, 1, depth)?
+                ),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        Ok(Some(rendered))
+    }
+
+    /// An `async || T` argument as a pinned future — the shape the executor's
+    /// join takes.
+    ///
+    /// The argument is a closure LITERAL at every call site std writes (the
+    /// helper exists to be handed one), and what the future needs is its BODY,
+    /// not an `Rc<dyn Fn>` wrapping it. Anything else is refused rather than
+    /// wrapped, because a body this cannot see through is a body the join cannot
+    /// await.
+    fn pinned_body_argument(
+        &mut self,
+        argument_ids: &[Id],
+        index: usize,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        let Some(&argument) = argument_ids.get(index) else {
+            return Err(unsupported("a runtime helper called with no body", span));
+        };
+        let Some(Expr::Closure(closure_id)) = self.program.entity_map.get(&argument).cloned()
+        else {
+            return Err(unsupported(
+                "a runtime helper whose body is not written as a closure at the call site",
+                span,
+            ));
+        };
+        let closure = self
+            .program
+            .closures
+            .get(&closure_id)
+            .cloned()
+            .ok_or_else(|| unsupported("a runtime helper whose body did not resolve", span))?;
+        if !closure.parameters.is_empty() {
+            return Err(unsupported(
+                "a runtime helper whose body takes a parameter",
+                span,
+            ));
+        }
+        let body = self.expression(closure.return_, depth)?;
+        let prelude = self.async_capture_prelude(closure.return_);
+        Ok(format!(
+            "{{ {prelude}vilan_rt::executor::pin_future(async move {{ {body} }}) }}"
+        ))
+    }
+
+    /// The `let x = x.clone();` run that goes BEFORE an `async move` block the
+    /// emitter writes (J6).
+    ///
+    /// The block is `move`, so it takes every binding it mentions — and the
+    /// enclosing frame almost always reads the same ones afterwards (`sleep`
+    /// reads the threaded nursery the spawn then hands to `spawn_in`, and
+    /// `nursery`'s join reads the nursery it also passes as an argument). The
+    /// clones are bound in a fresh scope OUTSIDE the block and shadow the
+    /// originals, so the block moves copies and the frame keeps its own. Every
+    /// value a vilan program can capture is `Clone` by construction: rule 1
+    /// already says a capture is a copy, and a handle's copy is the same
+    /// handle.
+    fn async_capture_prelude(&mut self, body: Id) -> String {
+        let mut declared_inside = HashSet::new();
+        let mut referenced = HashSet::new();
+        let mut visited = HashSet::new();
+        self.scan_closure(body, &mut declared_inside, &mut referenced, &mut visited);
+        let mut captures: Vec<Id> = referenced
+            .into_iter()
+            .filter(|binding| {
+                !declared_inside.contains(binding)
+                    // A `Local` naming an enum VARIANT is not a place, and a
+                    // module-level binding is read through its own cell.
+                    && !self.module_bindings.contains(binding)
+                    && (self.program.variables.contains_key(binding)
+                        || self.program.parameters.contains_key(binding)
+                        || self
+                            .program
+                            .context_hidden_parameters
+                            .contains_key(binding))
+            })
+            .collect();
+        captures.sort_by_key(|binding| binding.0);
+        captures
+            .iter()
+            .map(|binding| {
+                let name = self.binding_name(*binding);
+                format!("let {name} = {name}.clone(); ")
+            })
+            .collect()
+    }
+
+    /// A closure literal applied at its own call site, as a block binding the
+    /// parameters (J6).
+    ///
+    /// `Some` when the shape is one this can take, `None` when the caller should
+    /// fall back to building the closure and calling it — which is the honest
+    /// answer for a body that `ret`urns, since a `return` inside the block would
+    /// leave the ENCLOSING function rather than the closure.
+    fn applied_closure(
+        &mut self,
+        closure_id: Id,
+        argument_ids: &[Id],
+        depth: usize,
+        span: Span,
+    ) -> Result<Option<String>, Error> {
+        let closure = self
+            .program
+            .closures
+            .get(&closure_id)
+            .cloned()
+            .ok_or_else(|| unsupported("an unresolved closure", span))?;
+        if closure.parameters.len() != argument_ids.len()
+            || !closure.parameter_destructures.is_empty()
+            || self.body_returns(closure.return_)
+        {
+            return Ok(None);
+        }
+        let mut bindings = String::new();
+        for (parameter_id, argument) in closure.parameters.iter().zip(argument_ids) {
+            let value = self.value_of(*argument, depth)?;
+            let _ = write!(
+                bindings,
+                "let {} = {value}; ",
+                self.binding_name(*parameter_id)
+            );
+        }
+        let body = self.expression(closure.return_, depth)?;
+        Ok(Some(format!("{{ {bindings}{body} }}")))
+    }
+
+    /// Whether an expression tree contains a `ret` — the one thing that makes
+    /// inlining a closure body into its caller's frame observable.
+    fn body_returns(&self, expr_id: Id) -> bool {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return true;
+        };
+        if matches!(
+            self.program.entity_map.get(&expr_id),
+            Some(Expr::FunctionReturn(_))
+        ) {
+            return true;
+        }
+        self.children_of(expr_id)
+            .into_iter()
+            .any(|child| self.body_returns(child))
+    }
+
+    /// Whether a call site awaits — the union of the two channels the JS emitter
+    /// reads (J2, async-polymorphism.md A.1): a call to an async callee, and a
+    /// call the async inference recorded as awaiting because its subject is not
+    /// a plain binding (an async field, an async-returning call, an adapted
+    /// parameter).
+    fn call_awaits(&self, call_expr_id: Id, call_id: Id) -> bool {
+        if self.program.awaited_calls.contains(&call_expr_id)
+            || self.program.awaited_calls.contains(&call_id)
+        {
+            return true;
+        }
+        let Some(call) = self.program.function_calls.get(&call_id) else {
+            return false;
+        };
+        let Some(Expr::Local(target)) = self.program.entity_map.get(&call.subject_id) else {
+            return false;
+        };
+        self.program.async_functions.contains(target) || self.program.async_values.contains(target)
+    }
+
     // ----------------------------------------------------------- the call --
 
+    /// One call, plus the `.await` an async callee owes (J6).
     fn call(
+        &mut self,
+        call_expr_id: Id,
+        call_id: Id,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        // A closure LITERAL applied right here — which is what
+        // `Context::run(value, body)` lowers to (`body(value)`, the literal as
+        // the call's own subject). It becomes a BLOCK binding the parameters
+        // rather than an `Rc<dyn Fn>` built and called in one breath: one fewer
+        // allocation, and — the reason it is not just a tidy-up — an `await` in
+        // the body then sits inside the enclosing `async fn` instead of inside a
+        // non-async closure, which is the only way `nursery`'s own body
+        // compiles. It takes no `.await` of its own: the awaits are already in
+        // the body where the closure wrote them.
+        if let Some(call) = self.program.function_calls.get(&call_id).cloned()
+            && let Some(Expr::Closure(closure_id)) =
+                self.program.entity_map.get(&call.subject_id).cloned()
+            && let Some(rendered) =
+                self.applied_closure(closure_id, &call.argument_ids, depth, span)?
+        {
+            return Ok(rendered);
+        }
+        let rendered = self.call_expression(call_expr_id, call_id, depth, span)?;
+        if self.call_awaits(call_expr_id, call_id) {
+            return Ok(format!("({rendered}).await"));
+        }
+        Ok(rendered)
+    }
+
+    fn call_expression(
         &mut self,
         call_expr_id: Id,
         call_id: Id,
@@ -3175,11 +4002,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .get(&call_id)
             .cloned()
             .ok_or_else(|| unsupported("an unresolved call", span))?;
-        if self.program.awaited_calls.contains(&call_expr_id)
-            || self.program.awaited_calls.contains(&call_id)
-        {
-            return Err(unsupported("an `await`", span));
-        }
         let Some(Expr::Local(target)) = self.program.entity_map.get(&function_call.subject_id)
         else {
             // A value call — `(h.f)()`. The subject is a counted closure.
@@ -3192,6 +4014,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // A variant constructor builds the value directly.
         if let Some(Expr::EnumVariant(enum_id, index)) = self.program.entity_map.get(&target) {
             let (enum_id, index) = (*enum_id, *index);
+            // A VIEW inside an enum payload (`Option<&mut T>`, the shape behind
+            // a view-returning `Arena::get`). The type system has no reference
+            // form — a payload's type is its POINTEE's, and viewness is
+            // recorded beside it — so the emitted variant takes a value and
+            // `Some(&mut x)` does not typecheck. Named rather than emitted:
+            // carrying the viewness into the payload type is its own slice.
+            if function_call.argument_ids.iter().any(|argument| {
+                matches!(
+                    self.program.entity_map.get(argument),
+                    Some(Expr::Reference(_, _))
+                )
+            }) {
+                return self.host_gap(
+                    "a view inside an enum payload (`Option<&mut T>`: the payload's type is \
+                     its pointee's, so the emitted variant takes a value)"
+                        .to_string(),
+                    span,
+                );
+            }
             let arguments =
                 self.variant_arguments(call_expr_id, enum_id, index, &function_call.argument_ids);
             let path = self.variant_path(enum_id, index, &arguments, span)?;
@@ -3284,6 +4125,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let Some(external) = self.program.external_functions.get(&target) {
             let name = external.name;
             let binding = external.extern_binding.clone();
+            // J6: the concurrency helpers have native bodies in
+            // `vilan_rt::executor`. Everything else is still a host binding
+            // this backend has nothing to put behind it.
+            if let Some(rendered) = self.runtime_host_binding(
+                name,
+                binding.as_ref(),
+                &function_call.argument_ids,
+                depth,
+                span,
+            )? {
+                return Ok(rendered);
+            }
             let what = format!(
                 "the host binding `{name}`{}",
                 match binding {
