@@ -3281,6 +3281,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // suffix)`), not two. Reading the fraction as the suffix turned `3.5f`
         // into `3i32` — caught here by rustc, which is luck rather than a
         // design, so the pieces are named.
+        // F20: the `n` suffix is a `BigInt` literal — ARBITRARY precision, and
+        // node prints one with the `n` back on (`9007199254740993n % 4n` is
+        // `1n`, not `1`). This runtime is dependency-free by rule, so there is
+        // no bignum to lower it to and no width that is the same value AND the
+        // same bytes; `i64` is neither. Refused by name rather than narrowed.
+        // `remainder.vl` is the corpus's only one and it was refused for its
+        // overloaded `%` until now, which is why this had never been asked.
+        if suffix == Some("n") {
+            return Err(unsupported(
+                "a `BigInt` literal (arbitrary precision, and node prints it with its `n`)",
+                span,
+            ));
+        }
         let cleaned = match fraction {
             Some(fraction) => format!("{whole}.{fraction}").replace('_', ""),
             None => whole.replace('_', ""),
@@ -3354,8 +3367,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
         span: Span,
     ) -> Result<String, Error> {
-        if self.program.binary_op_dispatch.contains_key(&id) {
-            return Err(unsupported("an overloaded operator", span));
+        // F20: an OVERLOADED operator is a call to the impl's member, which is
+        // what the analyzer already resolved it to — the same record the JS
+        // emitter reads, so the two backends dispatch to one answer rather than
+        // to two opinions of it. The monomorphisation channel is
+        // `call_substitution`'s, keyed on the BINARY expression's own id, which
+        // is where a method call's substitution is recorded.
+        if let Some(&member_id) = self.program.binary_op_dispatch.get(&id) {
+            let substitution = self.call_substitution(id, member_id, &[]);
+            let instance = self.ensure_function(member_id, &substitution)?;
+            let arguments = self.call_arguments(member_id, &[left, right], depth)?;
+            let call = format!("{}({})", instance.name, arguments.join(", "));
+            // `a != b` dispatches to `eq` and negates: an impl provides `eq`,
+            // and `ne` is its `!eq` default.
+            return Ok(if matches!(op, BinaryOp::NotEq) {
+                format!("!({call})")
+            } else {
+                call
+            });
         }
         // `str + str` is a concatenation, which is a runtime call natively
         // rather than an operator — and an INTERPOLATION is a chain of them
@@ -3527,7 +3556,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let captured = self.is_condition_captures(*condition);
                 let head = match &captured {
                     Some((subject, pattern, bindings)) => {
-                        let subject_text = self.expression(*subject, depth)?;
+                        let mut subject_text = self.expression(*subject, depth)?;
+                        // The same copy a destructuring `match` takes (F20): an
+                        // `if let` over a PLACE binds its captures by REFERENCE
+                        // under Rust's default binding modes, so
+                        // `std::compare`'s `if this is Some(let x)` on a
+                        // `&Option<i32>` bound `x: &i32` and `x == y` had no
+                        // `PartialEq` across the reference. A capture is a copy
+                        // (rule 1), and copying the subject is how it binds one.
+                        if matches!(
+                            self.program.entity_map.get(subject),
+                            Some(Expr::Local(_) | Expr::Parameter(_) | Expr::Field(_, _, _))
+                        ) {
+                            subject_text = format!("({subject_text}).clone()");
+                        }
                         let subject_type = self.type_of(*subject);
                         let pattern_text =
                             self.pattern(pattern, subject_type, self.span_of(*condition))?;
