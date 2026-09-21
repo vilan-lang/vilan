@@ -466,7 +466,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// span and a type id, so there is no entity to look up and no
     /// `definition_name_span` to ask. The span it does carry is enough, and
     /// this is the same read `doc_comment_of` performs.
-    pub(crate) fn doc_comment_at(&self, source: SourceId, name_start: usize) -> Option<String> {
+    pub fn doc_comment_at(&self, source: SourceId, name_start: usize) -> Option<String> {
         let owned;
         let text: &str = if source == SourceId(0) {
             self.analyzed.text()

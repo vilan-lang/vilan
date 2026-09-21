@@ -42,6 +42,20 @@ included; a field's `name: type` and a method's full signature behind a
 `.`; your own doc comments; and documentation on the language's own
 keywords, deep-linked into this book.
 
+A `///` above a struct FIELD reaches every position that field appears in:
+its declaration, a read of it, the field name inside a `Point { x = … }`
+literal, and both completion lists that offer it (where the popup shows
+the first paragraph, as it does for a function). Hovering a field answers
+about the field; the struct's whole declaration block is what its own
+name answers.
+
+Hovering a call to a GENERIC function shows two signatures in one block:
+the declaration as it is written, then the same signature under the
+bindings this call solved — `fun get_or(self, key: K, make: || V): V`
+above `fun get_or(self, key: UserId, make: || SignalCell<Option<User>>):
+SignalCell<Option<User>>`. A call that substitutes nothing, and a hover on
+the declaration itself, show the one line they always did.
+
 **Inlay hints** — the inferred type of a binding you left unannotated
 (`let`/`mut`, a `for` binder, a comprehension binder). A parameter is not
 hinted: its type is written in the signature already.

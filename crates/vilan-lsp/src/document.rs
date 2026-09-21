@@ -2918,6 +2918,14 @@ impl Document {
         if let Some(rendered) = self.namespace_hover(program, offset) {
             return Some(rendered);
         }
+        // A field's own DECLARATION, or the field name in a struct
+        // initializer (E204): `x: i32` and `x`'s `///`. Asked before the type
+        // reference below, which would otherwise answer both positions with the
+        // enclosing struct's whole block — the answer for the type's NAME, and
+        // a restatement of the screen for a caret on one of its fields.
+        if let Some(rendered) = self.field_declaration_hover(program, offset) {
+            return Some(rendered);
+        }
         // A type name in type position: the full declaration when known.
         if let Some((definition, label)) = self.type_reference_at(program, offset) {
             if let Some(definition) = definition
@@ -3363,7 +3371,95 @@ impl Document {
         }
         let name = self.analyzed_text().get(member_span.into_range())?;
         let type_label = self.analysis(program).hover_label(id)?;
-        Some(format!("```vilan\n{name}: {type_label}\n```"))
+        let mut out = format!("```vilan\n{name}: {type_label}\n```");
+        // E204: a FIELD's own `///`, where the read resolves to one. A field
+        // carries no entity id, so `doc_comment_of` has nothing to look up —
+        // `Expr::Field`'s (struct, index) key is what names the declaration,
+        // and `doc_comment_at` reads the block above its name span in the
+        // DECLARING source, which is the same read every other doc consumer
+        // performs.
+        if let Some(docs) = self.field_docs(program, id) {
+            out.push_str("\n\n");
+            out.push_str(&docs);
+        }
+        Some(out)
+    }
+
+    /// The `///` block above the struct field `id` reads, or `None` when `id`
+    /// is not a field read or the field carries no doc (E204).
+    fn field_docs(&self, program: &Program, id: Id) -> Option<String> {
+        let Expr::Field(_, struct_id, index) = program.entity_map.get(&id)? else {
+            return None;
+        };
+        self.struct_field_docs(program, *struct_id, *index)
+    }
+
+    /// The `///` block above the `index`-th field of `struct_id` (E204) — the
+    /// one read every field-doc consumer shares, hover and completion alike.
+    fn struct_field_docs(&self, program: &Program, struct_id: Id, index: usize) -> Option<String> {
+        let field = program.structs.get(&struct_id)?.fields.get(index)?;
+        let source = program.source_of(struct_id)?;
+        self.analysis(program)
+            .doc_comment_at(source, field.name_span.into_range().start)
+    }
+
+    /// The hover for a field's DECLARATION or for the field name in a struct
+    /// INITIALIZER (E204): the fenced `name: T` a field read answers, plus the
+    /// field's own `///`.
+    ///
+    /// Both positions used to fall through to the enclosing struct's block —
+    /// `struct Point { x: i32, y: i32 }`, the whole declaration, for a caret on
+    /// one field of it. That is the answer for the struct's NAME and a
+    /// restatement of what is on screen for a field: the caret is on `x`, and
+    /// what a reader wants is `x`'s type and `x`'s sentence. The struct block
+    /// stays exactly where it belongs, on the type's own name.
+    ///
+    /// Matched by SPAN against two records the analyzer already keeps, rather
+    /// than by re-reading the text: the struct's own `Field::name_span` for a
+    /// declaration, and `struct_initializer_field_spans` — the use-site table
+    /// B-rename needed, `(file, span, struct, index)` — for an initializer key.
+    /// Both answer the same `(struct, index)` pair, which is why the two
+    /// positions are one function and cannot drift apart.
+    fn field_declaration_hover(&self, program: &Program, offset: usize) -> Option<String> {
+        let (struct_id, index) = self.field_at_offset(program, offset)?;
+        let structure = program.structs.get(&struct_id)?;
+        let field = structure.fields.get(index)?;
+        let type_label = self
+            .analysis(program)
+            .field_type_label(struct_id, index, field.name)?;
+        let mut out = format!("```vilan\n{}: {type_label}\n```", field.name);
+        if let Some(docs) = self.struct_field_docs(program, struct_id, index) {
+            out.push_str("\n\n");
+            out.push_str(&docs);
+        }
+        Some(out)
+    }
+
+    /// The struct field whose DECLARATION name span, or whose initializer KEY
+    /// span, contains `offset` in this document (E204). Entry-file only, like
+    /// every other span-containment answer here: `offset` is an analyzed-space
+    /// offset into this buffer.
+    fn field_at_offset(&self, program: &Program, offset: usize) -> Option<(Id, usize)> {
+        let contains = |span: Span| {
+            let range = span.into_range();
+            range.start <= offset && offset < range.end
+        };
+        for (struct_id, structure) in &program.structs {
+            if program.source_of(*struct_id) != Some(SourceId(0)) {
+                continue;
+            }
+            for (index, field) in structure.fields.iter().enumerate() {
+                if contains(field.name_span) {
+                    return Some((*struct_id, index));
+                }
+            }
+        }
+        for (source, span, struct_id, index) in &program.struct_initializer_field_spans {
+            if *source == SourceId(0) && contains(*span) {
+                return Some((*struct_id, *index));
+            }
+        }
+        None
     }
 
     /// The struct/enum definition an entity names in VALUE position — a
@@ -13534,6 +13630,130 @@ pub(crate) mod tests {
         )
         .expect("hovering the field should produce a label");
         assert_eq!(hover, "```vilan\nx: i32\n```");
+    }
+
+    // --- E204: a field's `///` reaches every field position -----------------
+    //
+    // The census, measured before the fix (the item's own ask): a `///` above a
+    // field PARSES, `vilan fmt` keeps it byte for byte, and ONE consumer read
+    // it — the struct-initializer completion's `documentation`
+    // (`struct_initializer_completion_details_the_field_type_and_doc`, E160).
+    // Everything else either dropped it or answered the wrong thing:
+    //
+    //   - hover on a field READ (`p.x`) gave `x: i32` and no doc;
+    //   - hover on the field's DECLARATION gave the enclosing struct's WHOLE
+    //     block — the answer for the type's name, restated for a caret on one
+    //     field of it;
+    //   - hover on an initializer's field KEY (`Point { x = … }`) gave the same
+    //     struct block;
+    //   - MEMBER completion after `p.` offered a bare label: no detail, no doc,
+    //     while the initializer position two lines away offered both.
+    //
+    // Three census rows have no consumer to fix rather than a broken one, and
+    // are recorded here because a reader will look: there is no docs GENERATOR
+    // in this tree (no `vilan doc`; the book is hand-written markdown, gated by
+    // `-p vilan-core --test docs`), the playground exposes completion and no
+    // hover at all, and a PAYLOAD position of an enum variant is unnamed — the
+    // variant itself takes a `///` and compiles, a position inside its
+    // parentheses has no name to hang one on, and vilan has no tuple structs.
+
+    /// A two-field struct whose first field carries a two-paragraph `///`.
+    const DOCUMENTED_FIELDS: &str = "struct Point {\n\t/// The abscissa.\n\t///\n\t/// Measured from the left edge.\n\tx: i32,\n\ty: i32,\n}\n\nfun main() {\n\tlet p = Point { x = 1, y = 2 };\n\tlet _n = p.x + p.y;\n}\n";
+
+    #[test]
+    fn e204_hover_on_a_field_read_carries_the_fields_doc() {
+        let hover = hover_at_marker(&DOCUMENTED_FIELDS.replace("p.x +", "p.¦x +"), '¦')
+            .expect("hover on the field read");
+        assert_eq!(
+            hover, "```vilan\nx: i32\n```\n\nThe abscissa.\n\nMeasured from the left edge.",
+            "the whole `///` block, as a function's hover shows a function's"
+        );
+    }
+
+    #[test]
+    fn e204_hover_on_a_field_declaration_answers_the_field_and_not_the_struct() {
+        let hover = hover_at_marker(&DOCUMENTED_FIELDS.replace("\tx: i32,", "\t¦x: i32,"), '¦')
+            .expect("hover on the field declaration");
+        assert!(hover.starts_with("```vilan\nx: i32\n```"), "{hover}");
+        assert!(hover.contains("The abscissa."), "{hover}");
+        assert!(
+            !hover.contains("struct Point"),
+            "the struct's block is the answer for the struct's NAME: {hover}"
+        );
+    }
+
+    #[test]
+    fn e204_hover_on_an_initializer_field_key_answers_the_field() {
+        let hover = hover_at_marker(&DOCUMENTED_FIELDS.replace("{ x = 1", "{ ¦x = 1"), '¦')
+            .expect("hover on the initializer key");
+        assert!(hover.starts_with("```vilan\nx: i32\n```"), "{hover}");
+        assert!(hover.contains("The abscissa."), "{hover}");
+        assert!(!hover.contains("struct Point"), "{hover}");
+    }
+
+    #[test]
+    fn e204_the_struct_name_still_hovers_its_whole_block() {
+        // The other half of the rule: nothing above moved the struct block off
+        // the position it belongs to.
+        let hover = hover_at_marker(
+            &DOCUMENTED_FIELDS.replace("struct Point", "struct ¦Point"),
+            '¦',
+        )
+        .expect("hover on the struct name");
+        assert!(hover.contains("struct Point {"), "{hover}");
+        assert!(hover.contains("\tx: i32,"), "{hover}");
+    }
+
+    #[test]
+    fn e204_an_undocumented_field_hovers_exactly_as_before() {
+        let hover = hover_at_marker(&DOCUMENTED_FIELDS.replace("p.y;", "p.¦y;"), '¦')
+            .expect("hover on the undocumented field");
+        assert_eq!(hover, "```vilan\ny: i32\n```");
+    }
+
+    #[test]
+    fn e204_member_completion_carries_the_field_type_and_its_first_paragraph() {
+        let items = completion_items_at_marker(
+            &DOCUMENTED_FIELDS.replace("let _n = p.x + p.y;", "let _n = p.¦"),
+            '¦',
+        );
+        let x = items
+            .iter()
+            .find(|item| item.label == "x")
+            .expect("`x` is offered after the dot");
+        assert_eq!(x.detail.as_deref(), Some("i32"));
+        assert_eq!(
+            x.documentation.as_deref(),
+            Some("The abscissa."),
+            "the FIRST paragraph, which is the rule a function's completion follows"
+        );
+        let y = items
+            .iter()
+            .find(|item| item.label == "y")
+            .expect("`y` is offered too");
+        assert_eq!(y.detail.as_deref(), Some("i32"));
+        assert_eq!(y.documentation, None, "an undocumented field carries none");
+    }
+
+    #[test]
+    fn e204_a_derived_member_inherits_no_field_doc() {
+        // `[derive]`-generated members should inherit nothing: the doc read is
+        // anchored on the FIELD's own name span, and a generated method has no
+        // `///` above its own name.
+        let items = completion_items_at_marker(
+            "[derive(Debug)]\nstruct Point {\n\t/// The abscissa.\n\tx: i32,\n}\n\nfun main() {\n\tlet p = Point { x = 1 };\n\tlet _d = p.¦\n}\n",
+            '¦',
+        );
+        for item in &items {
+            if item.label == "x" {
+                continue;
+            }
+            assert!(
+                item.documentation.as_deref() != Some("The abscissa."),
+                "a derived member picked up the field's doc: {:?}",
+                item.label
+            );
+        }
     }
 
     // A std METHOD name answers the method's declaration, fenced — through

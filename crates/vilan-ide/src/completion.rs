@@ -43,10 +43,15 @@ pub struct SnippetInsertion {
 pub struct Completion {
     pub label: String,
     pub kind: CompletionKind,
-    /// The signature (functions/methods) or type (variables) shown in the
-    /// completion popup's detail line — the same house rendering hover uses.
-    /// `None` for keywords, macros, modules, types, and fields (WO-3: a field's
-    /// type is not cheaply renderable from the analyzed `Program`).
+    /// The signature (functions/methods) or type (variables/fields) shown in
+    /// the completion popup's detail line — the same house rendering hover
+    /// uses. `None` for keywords, macros, modules and types.
+    ///
+    /// A FIELD carries its declared type since E204, read out of the struct's
+    /// pre-rendered declaration label ([`Analysis::field_type_label`]). WO-3's
+    /// "a field's type is not cheaply renderable from the analyzed `Program`"
+    /// was true until E160 gave that label a reader; it is not any more, and
+    /// the two field positions answer alike.
     pub detail: Option<String>,
     /// The first paragraph of the declaration's `///` doc, where present.
     pub documentation: Option<String>,
@@ -1999,7 +2004,7 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// with the analysis. The field's own name is checked off the line rather
     /// than assumed, so a label whose shape ever changes yields `None` — no
     /// detail — instead of a wrong type.
-    fn field_type_label(&self, struct_id: Id, index: usize, name: &str) -> Option<String> {
+    pub fn field_type_label(&self, struct_id: Id, index: usize, name: &str) -> Option<String> {
         let label = self.program.declaration_labels.get(&struct_id)?;
         // Line 0 is `struct Name… {`; the fields follow in declaration order.
         let line = label.lines().nth(index + 1)?.trim();
@@ -2068,15 +2073,28 @@ impl<'a, 'src> Analysis<'a, 'src> {
     }
 
     /// The fields + methods of one nominal type — the member-completion list.
+    ///
+    /// A field carries the same two lines a struct-initializer field does
+    /// (E204): its declared type as the popup's `detail`, read out of the
+    /// pre-rendered declaration label by [`Self::field_type_label`], and its own
+    /// `///` first paragraph as the documentation. The two field positions a
+    /// program has now answer alike — there was no reason for the one after a
+    /// `.` to say less than the one inside a `{ … }`, and `Completion::detail`'s
+    /// old "a field's type is not cheaply renderable" was true before E160 gave
+    /// the label a reader.
     fn nominal_member_completions(&self, type_id: Id) -> Vec<Completion> {
         let program = self.program;
         let mut items = Vec::new();
         if let Some(structure) = program.structs.get(&type_id) {
-            for field in &structure.fields {
-                items.push(Completion::bare(
-                    field.name.to_string(),
-                    CompletionKind::Field,
-                ));
+            let source = program.source_of(type_id);
+            for (index, field) in structure.fields.iter().enumerate() {
+                let mut completion =
+                    Completion::bare(field.name.to_string(), CompletionKind::Field);
+                completion.detail = self.field_type_label(type_id, index, field.name);
+                completion.documentation = source.and_then(|source| {
+                    self.doc_first_paragraph_at(source, field.name_span.into_range().start)
+                });
+                items.push(completion);
             }
         }
         self.push_methods(type_id, true, &mut items);
