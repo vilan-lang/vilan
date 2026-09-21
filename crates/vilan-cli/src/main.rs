@@ -405,27 +405,33 @@ fn run_cli() -> ExitCode {
 /// nobody can reach is the bad kind. This is the gesture that reaches it, and
 /// the age guard covers it for the same reason (a check running right now is
 /// holding its table open).
+///
+/// THREE since F19. `~/.vilan/rt-cache` holds the native backend's runtime
+/// crate, materialized by content hash on exactly the same terms — so a machine
+/// that has run `--backend rust` under several toolchains can reach those trees
+/// with the gesture that reaches the others, rather than accumulating a root
+/// this command does not know about.
 fn cache_prune(all: bool, dry_run: bool) -> ExitCode {
     let max_age = (!all).then_some(vilan_embedded_std::STALE_AFTER);
-    let std_trees = prune_one_cache_root(
-        &vilan_embedded_std::default_cache_root(),
-        max_age,
-        dry_run,
-        all,
-        Some("this binary's own tree is never pruned"),
-    );
-    let check_tables = prune_one_cache_root(
-        &vilan_embedded_std::default_check_cache_root(),
-        max_age,
-        dry_run,
-        all,
-        None,
-    );
-    if std_trees == ExitCode::SUCCESS {
-        check_tables
-    } else {
-        std_trees
+    let roots = [
+        (
+            vilan_embedded_std::default_cache_root(),
+            Some("this binary's own tree is never pruned"),
+        ),
+        (vilan_embedded_std::default_check_cache_root(), None),
+        (
+            vilan_embedded_std::default_rt_cache_root(),
+            Some("this binary's own runtime tree is never pruned"),
+        ),
+    ];
+    let mut outcome = ExitCode::SUCCESS;
+    for (root, protected) in &roots {
+        let one = prune_one_cache_root(root, max_age, dry_run, all, *protected);
+        if one != ExitCode::SUCCESS {
+            outcome = one;
+        }
     }
+    outcome
 }
 
 /// One cache root pruned and reported. Split out when the check tables became a

@@ -34,27 +34,65 @@ pub fn record_boxed_bindings(count: usize) {
     BOXED_BINDINGS.store(count, Ordering::Relaxed);
 }
 
-/// Where the runtime crate lives.
+/// Where the runtime crate lives (tracker F19).
 ///
-/// `VILAN_RT` wins, exactly as `VILAN_STD` does for the standard library, and
-/// the fallback is this crate's sibling in the source tree. **A released binary
-/// has neither**, which is a known gap of S1a and not a hidden one: the answer
-/// is to embed `vilan-rt` the way `vilan-embedded-std` embeds std, and that is
-/// S1b's, filed as such in the lane's report. Until then the native backend is
-/// a from-source tool and says so when it cannot find the crate.
-fn runtime_crate() -> Option<PathBuf> {
+/// THREE roots, in a fixed order, and the order is B346's one-root rule applied
+/// to a second toolchain asset: **`$VILAN_RT` wins and never falls through.** A
+/// variable naming a directory that holds no `Cargo.toml` is a mistake to
+/// report, not a reason to silently link a different runtime than the one the
+/// developer pointed at — mixing two runtimes in one build is the outcome worse
+/// than refusing, exactly as mixing two std worlds is.
+///
+/// With nothing named: the `crates/vilan-rt` of the CHECKOUT the entry sits in,
+/// so a tree editing the runtime builds against its edits rather than against
+/// whatever was embedded when the compiler was last linked; else the embedded
+/// copy materialized under `~/.vilan/rt-cache/<hash>/`, which is what makes
+/// `--backend rust` work from an INSTALLED toolchain (before F19 it worked from
+/// a source checkout and nowhere else).
+///
+/// The walk is `std_dir`'s, deliberately, and it asks for `vilan/std/vilan.toml`
+/// beside the runtime rather than for the runtime alone: an ancestor that
+/// carries both is the SAME root `std_dir` would have resolved, so the runtime
+/// and the standard library can never come from two different trees. A
+/// compile-time `CARGO_MANIFEST_DIR` sibling — S1a's spelling — cannot express
+/// that, and worse, it is baked into a copied binary, so an "installed" one went
+/// on reading whatever checkout it was built in.
+fn runtime_crate(unit: &Unit) -> Result<PathBuf, String> {
     if let Some(from_env) = std::env::var_os("VILAN_RT") {
         let path = PathBuf::from(from_env);
         if path.join("Cargo.toml").is_file() {
-            return Some(path);
+            return Ok(path);
         }
-        return None;
+        return Err(format!(
+            "`VILAN_RT` is set to {}, which holds no `Cargo.toml`. It must name the \
+             `vilan-rt` crate's own directory (`crates/vilan-rt` in a vilan checkout). \
+             Unset it to use this toolchain's own embedded runtime.",
+            path.display()
+        ));
     }
-    let sibling = Path::new(env!("CARGO_MANIFEST_DIR")).join("../vilan-rt");
-    sibling
-        .join("Cargo.toml")
-        .is_file()
-        .then(|| vilan_core::util::canonical_path(&sibling))
+    let entry_dir = unit
+        .entry
+        .canonicalize()
+        .ok()
+        .and_then(|file| file.parent().map(Path::to_path_buf));
+    let working_dir = std::env::current_dir().ok();
+    for start in [entry_dir, working_dir].into_iter().flatten() {
+        let mut directory = Some(start.as_path());
+        while let Some(current) = directory {
+            let candidate = current.join("crates").join("vilan-rt");
+            if candidate.join("Cargo.toml").is_file()
+                && current
+                    .join("vilan")
+                    .join("std")
+                    .join("vilan.toml")
+                    .is_file()
+            {
+                return Ok(vilan_core::util::canonical_path(&candidate));
+            }
+            directory = current.parent();
+        }
+    }
+    vilan_embedded_std::materialize_rt()
 }
 
 /// The project directory for `unit` — `dist/native/<entry-stem>/`, beside the
@@ -117,14 +155,15 @@ fn write_project(
     emit_debug: bool,
 ) -> Result<(PathBuf, String), ExitCode> {
     let source = emit_source(unit, platform, emit_debug)?;
-    let Some(runtime) = runtime_crate() else {
-        eprintln!(
-            "{} the native backend needs the `vilan-rt` crate and cannot find it. Set `VILAN_RT` \
-             to its directory (it is `crates/vilan-rt` in a vilan checkout). Embedding it in the \
-             released toolchain is F1 S1b's work.",
-            paint::error_prefix()
-        );
-        return Err(ExitCode::FAILURE);
+    let runtime = match runtime_crate(unit) {
+        Ok(runtime) => runtime,
+        Err(reason) => {
+            eprintln!(
+                "{} the native backend needs the `vilan-rt` crate: {reason}",
+                paint::error_prefix()
+            );
+            return Err(ExitCode::FAILURE);
+        }
     };
     let directory = project_dir(unit);
     let name = package_name(unit);

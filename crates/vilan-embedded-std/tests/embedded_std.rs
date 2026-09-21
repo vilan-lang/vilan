@@ -8,7 +8,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use vilan_embedded_std::{CONTENT_HASH, FILES, materialize_into};
+use vilan_embedded_std::{
+    CONTENT_HASH, FILES, RT_CONTENT_HASH, RT_FILES, RT_MANIFEST, materialize_into,
+};
 
 mod scratch;
 
@@ -68,6 +70,117 @@ fn the_table_matches_the_working_tree_in_both_directions() {
             keys.contains(&file.as_str()),
             "{file} exists in the checkout but is not embedded (collector gap)"
         );
+    }
+}
+
+/// F19's table, held to the working tree in both directions exactly as std's is
+/// — and its manifest held to being STANDALONE, which is the one way the two
+/// tables differ: the real `crates/vilan-rt/Cargo.toml` is a workspace member
+/// (`[lints] workspace = true`), so embedding it verbatim would materialize a
+/// crate that only builds inside this repository.
+#[test]
+fn the_runtime_table_matches_the_crate_and_its_manifest_stands_alone() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let keys: Vec<&str> = RT_FILES.iter().map(|(key, _)| *key).collect();
+    assert!(keys.contains(&"vilan-rt/src/lib.rs"), "{keys:?}");
+    assert!(keys.is_sorted(), "the table must be sorted (stable hash)");
+    assert!(
+        !keys.contains(&"vilan-rt/Cargo.toml"),
+        "the manifest is generated, not embedded: {keys:?}"
+    );
+    assert_eq!(RT_CONTENT_HASH.len(), 16);
+    assert_ne!(
+        RT_CONTENT_HASH, CONTENT_HASH,
+        "the two trees take separate hashes so neither invalidates the other"
+    );
+    for (key, contents) in RT_FILES {
+        let on_disk = fs::read_to_string(root.join(key))
+            .unwrap_or_else(|error| panic!("embedded {key} missing on disk: {error}"));
+        assert!(
+            on_disk == *contents,
+            "embedded {key} differs from the working tree (stale build script output?)"
+        );
+    }
+    let mut on_disk = Vec::new();
+    walk_rust(&root.join("vilan-rt"), Path::new("vilan-rt"), &mut on_disk);
+    for file in on_disk {
+        assert!(
+            keys.contains(&file.as_str()),
+            "{file} exists in the crate but is not embedded (collector gap)"
+        );
+    }
+
+    let real = fs::read_to_string(root.join("vilan-rt/Cargo.toml")).expect("the real manifest");
+    assert!(
+        real.contains("workspace = true"),
+        "the premise of the generated manifest is that the real one inherits \
+         workspace lints; it no longer does, so the generation can be simplified"
+    );
+    assert!(!RT_MANIFEST.contains("workspace = true"), "{RT_MANIFEST}");
+    assert!(RT_MANIFEST.contains("[workspace]"), "{RT_MANIFEST}");
+    assert!(RT_MANIFEST.contains("name = \"vilan-rt\""), "{RT_MANIFEST}");
+    assert!(RT_MANIFEST.contains("edition = \"2024\""), "{RT_MANIFEST}");
+    assert!(RT_MANIFEST.contains("[dependencies]"), "{RT_MANIFEST}");
+}
+
+/// F19: materializing the runtime is complete, idempotent, and lands the crate
+/// under `<hash>/vilan-rt/` with a manifest beside its sources.
+#[test]
+fn the_runtime_materializes_completely_and_idempotently() {
+    let cache_root = scratch::root().join(format!(
+        "vilan-embedded-rt-test-{}-{RT_CONTENT_HASH}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&cache_root);
+
+    let crate_dir = vilan_embedded_std::materialize_rt_into(&cache_root).expect("first");
+    assert!(crate_dir.ends_with(Path::new(RT_CONTENT_HASH).join("vilan-rt")));
+    assert_eq!(
+        fs::read_to_string(crate_dir.join("Cargo.toml")).expect("manifest"),
+        RT_MANIFEST
+    );
+    for (key, contents) in RT_FILES {
+        let written = fs::read_to_string(cache_root.join(RT_CONTENT_HASH).join(key)).expect(key);
+        assert!(written == *contents, "materialized {key} differs");
+    }
+
+    let before = fs::metadata(crate_dir.join("src/lib.rs"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let again = vilan_embedded_std::materialize_rt_into(&cache_root).expect("second");
+    assert_eq!(again, crate_dir);
+    assert_eq!(
+        before,
+        fs::metadata(crate_dir.join("src/lib.rs"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        "an existing cache entry must not be rewritten"
+    );
+
+    let _ = fs::remove_dir_all(&cache_root);
+}
+
+/// Every `.rs` file under `directory`, as the table's keys spell them.
+fn walk_rust(directory: &Path, prefix: &Path, out: &mut Vec<String>) {
+    for entry in fs::read_dir(directory)
+        .expect("read the runtime crate")
+        .flatten()
+    {
+        let path = entry.path();
+        let relative = prefix.join(entry.file_name());
+        if path.is_dir() {
+            walk_rust(&path, &relative, out);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            out.push(
+                relative
+                    .components()
+                    .map(|component| component.as_os_str().to_str().unwrap())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            );
+        }
     }
 }
 

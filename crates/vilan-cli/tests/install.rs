@@ -49,6 +49,9 @@ impl Machine {
                 .args(arguments)
                 .current_dir(&self.root)
                 .env_remove("VILAN_STD")
+                // F19's twin of `VILAN_STD`: an installed machine names neither,
+                // and a lane's shell may well have it set.
+                .env_remove("VILAN_RT")
                 .env("HOME", &self.home)
                 .env_remove("USERPROFILE")
                 .output();
@@ -112,6 +115,99 @@ fn an_installed_binary_compiles_and_runs_without_a_checkout() {
         manifest_modified,
         "a warm cache must not be rewritten"
     );
+}
+
+/// F19: `--backend rust` from an INSTALLED layout — no checkout in any
+/// ancestor, no `$VILAN_RT` — materializes the embedded runtime crate under
+/// `~/.vilan/rt-cache/<hash>/vilan-rt/` and builds against it.
+///
+/// This is the gap the slice closed: S1a resolved the runtime through
+/// `$VILAN_RT` or a compile-time source sibling, so a released binary had
+/// neither and the second backend was a from-source tool. The pin is
+/// non-vacuous by construction — remove the materialization fallback and the
+/// build fails with "needs the `vilan-rt` crate".
+///
+/// It pays a real `cargo build` of the runtime plus the program, so it is one
+/// test over one small program; the corpus-wide claim is
+/// `native_differential`'s, which points `VILAN_RT` at the tree on purpose.
+#[test]
+fn an_installed_binary_builds_natively_against_its_embedded_runtime() {
+    if which_cargo().is_none() {
+        eprintln!("skipped: the native backend needs `cargo` on PATH");
+        return;
+    }
+    let machine = Machine::new("native");
+    fs::write(
+        machine.root.join("native.vl"),
+        "import std::io::print;\n\nfun main() {\n    print(6 * 7);\n}\n",
+    )
+    .expect("write native.vl");
+
+    let run = machine.vilan(&["run", "--backend", "rust", "native.vl"]);
+    assert!(
+        run.status.success(),
+        "the installed binary could not build natively:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "42\n",
+        "the native binary's output"
+    );
+
+    // The runtime landed in the scratch home under its own content-keyed root,
+    // beside the std cache and not inside it.
+    let cache = machine.home.join(".vilan").join("rt-cache");
+    let entries: Vec<_> = fs::read_dir(&cache)
+        .expect("the runtime cache directory exists")
+        .filter_map(Result::ok)
+        .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+        .collect();
+    assert_eq!(entries.len(), 1, "one content-keyed runtime entry");
+    let materialized = entries[0].path().join("vilan-rt");
+    assert!(materialized.join("Cargo.toml").is_file());
+    assert!(materialized.join("src/lib.rs").is_file());
+    // The materialized manifest is standalone: no `[lints] workspace = true`
+    // (which resolves only inside the vilan workspace) and a `[workspace]` of
+    // its own, so cargo stops walking up out of the cache.
+    let manifest = fs::read_to_string(materialized.join("Cargo.toml")).expect("read the manifest");
+    assert!(
+        !manifest.contains("workspace = true"),
+        "the materialized manifest inherits workspace lints:\n{manifest}"
+    );
+    assert!(manifest.contains("[workspace]"), "{manifest}");
+
+    // B346's one-root rule: a named root that is not one is REFUSED, never
+    // silently replaced by the embedded copy.
+    let misnamed = machine.root.join("not-the-runtime");
+    fs::create_dir_all(&misnamed).expect("create the misnamed root");
+    let refused = Command::new(&machine.binary)
+        .args(["build", "--backend", "rust", "native.vl"])
+        .current_dir(&machine.root)
+        .env_remove("VILAN_STD")
+        .env("HOME", &machine.home)
+        .env_remove("USERPROFILE")
+        .env("VILAN_RT", &misnamed)
+        .output()
+        .expect("run the copied binary");
+    assert!(!refused.status.success(), "a misnamed VILAN_RT must refuse");
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        message.contains("`VILAN_RT` is set to") && message.contains("no `Cargo.toml`"),
+        "the refusal must name the variable and what is wrong with it:\n{message}"
+    );
+}
+
+/// Whether `cargo` is on PATH — the native backend shells out to it, and a
+/// machine without it skips rather than fails.
+fn which_cargo() -> Option<()> {
+    Command::new("cargo")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|_| ())
 }
 
 #[test]

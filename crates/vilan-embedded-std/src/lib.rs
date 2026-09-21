@@ -13,6 +13,14 @@
 //! a different std materializes fresh — the cache can never be stale — and an
 //! existing directory is complete by construction: the tree is written to a
 //! temporary sibling and atomically renamed into place.
+//!
+//! The same mechanism carries a SECOND tree since tracker F19: `vilan-rt`, the
+//! runtime the emit-Rust backend's generated cargo project depends on by path
+//! ([`RT_FILES`], [`materialize_rt`], `~/.vilan/rt-cache/<RT_CONTENT_HASH>/`).
+//! It lives here rather than in `vilan-rust` because `~/.vilan`'s layout is
+//! this crate's — one place to name a cache root, so the CLI and the language
+//! server can never disagree about where one is — and it takes its own root and
+//! its own hash so the two trees never invalidate each other.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,6 +41,70 @@ pub fn materialize() -> Result<PathBuf, String> {
 /// upgrade command's cache pruning.
 pub fn default_cache_root() -> PathBuf {
     toolchain_cache("std-cache")
+}
+
+/// Materializes the embedded `vilan-rt` and returns the runtime crate's
+/// **package directory** — the path the emit-Rust backend's generated
+/// `Cargo.toml` points its `vilan-rt = { path = … }` at (tracker F19).
+///
+/// Why this exists: `--backend rust` writes a cargo project that depends on
+/// `vilan-rt` by path, and until F19 the only paths it knew were `$VILAN_RT` and
+/// this crate's source sibling — so the native backend worked from a checkout
+/// and nowhere else. A released binary has neither, and a materialized copy is
+/// the same answer the standard library already takes.
+pub fn materialize_rt() -> Result<PathBuf, String> {
+    materialize_rt_into(&default_rt_cache_root())
+}
+
+/// The runtime cache root: `~/.vilan/rt-cache`, beside the std cache and under
+/// the same home-directory rules. Its own root and its own content hash, so a
+/// std edit never re-materializes the runtime and a runtime edit never
+/// invalidates a machine's std trees.
+pub fn default_rt_cache_root() -> PathBuf {
+    toolchain_cache("rt-cache")
+}
+
+/// [`materialize_rt`] into an explicit cache root (the seam tests use).
+pub fn materialize_rt_into(cache_root: &Path) -> Result<PathBuf, String> {
+    let target = cache_root.join(RT_CONTENT_HASH);
+    let crate_dir = target.join("vilan-rt");
+    if target.is_dir() {
+        return Ok(crate_dir);
+    }
+    let staging = cache_root.join(format!(
+        ".staging-{}-{}",
+        RT_CONTENT_HASH,
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&staging);
+    let mut written: Vec<(PathBuf, &str)> = RT_FILES
+        .iter()
+        .map(|(key, contents)| (staging.join(key), *contents))
+        .collect();
+    written.push((staging.join("vilan-rt").join("Cargo.toml"), RT_MANIFEST));
+    for (path, contents) in written {
+        let parent = path.parent().expect("every embedded file has a parent");
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        fs::write(&path, contents)
+            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    }
+    match fs::rename(&staging, &target) {
+        Ok(()) => {
+            prune_stale(cache_root, STALE_AFTER);
+            Ok(crate_dir)
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            if target.is_dir() {
+                return Ok(crate_dir); // lost the race; the winner's tree is identical
+            }
+            Err(format!(
+                "cannot move the runtime cache into place at {}: {error}",
+                target.display()
+            ))
+        }
+    }
 }
 
 /// Where a READ-ONLY command's on-disk memory lives: `~/.vilan/check-cache`,
@@ -94,9 +166,15 @@ pub struct CacheEntry {
     /// How long ago the entry was created, from its directory mtime — `None`
     /// when the platform will not answer (the entry is then treated as young).
     pub age: Option<std::time::Duration>,
-    /// Whether this is the tree THIS binary materializes into. It is never
+    /// Whether this is a tree THIS binary materializes into. It is never
     /// removed: the next resolution would write it straight back, and a
     /// concurrent compile is reading it right now.
+    ///
+    /// EITHER hash answers, because one walk serves both roots (the std trees
+    /// and, since F19, the runtime trees) and a root only ever holds its own
+    /// kind. A cross-match would take a 64-bit collision between the two
+    /// tables, and its whole effect would be sparing one extra tree — the
+    /// conservative direction, which is the direction this flag exists for.
     pub current: bool,
 }
 
@@ -120,7 +198,7 @@ pub fn cache_entries(cache_root: &Path) -> Vec<CacheEntry> {
             .ok()
             .and_then(|modified| now.duration_since(modified).ok());
         out.push(CacheEntry {
-            current: name == CONTENT_HASH,
+            current: name == CONTENT_HASH || name == RT_CONTENT_HASH,
             bytes: directory_bytes(&path),
             name,
             path,

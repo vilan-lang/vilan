@@ -36,7 +36,10 @@ Rust workspace, eight crates, plus the language's own tree:
   including `wasm32-unknown-unknown`, where the language server's tower-lsp/tokio
   stack cannot follow. A completion behavior belongs here, not in `vilan-lsp`, whose
   `line_index.rs` is only a newtype speaking `lsp_types` at the protocol edge.
-- `crates/vilan-embedded-std` — embeds the std source into the binary.
+- `crates/vilan-embedded-std` — embeds the std source into the binary, and since
+  F19 the `vilan-rt` source beside it; it also owns the `~/.vilan` cache layout
+  (`std-cache`, `check-cache`, `git-deps`, `rt-cache`), so nothing else names a
+  cache root.
 - `crates/vilan-wasm` — the compiler as a WebAssembly module; the web
   playground's engine (`proposals/projects/vilan/proposal/web-playground.md`). The compile logic is
   plain Rust tested natively on the host; the `wasm_bindgen` layer at the
