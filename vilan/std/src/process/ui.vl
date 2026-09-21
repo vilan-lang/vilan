@@ -652,6 +652,29 @@ export impl type S: Source<str> with AttrValue {
 	}
 }
 
+/// Rendered only for a `Some` (A115): a `None` omits the attribute, which is
+/// the server's whole answer to the browser twin's "write nothing".
+export impl Option<str> with AttrValue {
+	fun apply(self, parent: View, name: str) {
+		match self {
+			Some(let text) => set_attribute(parent.attributes, name, text),
+			None => {},
+		}
+	}
+}
+
+/// Read once, rendered only for a `Some` (A115) — the twin of the browser's
+/// removing arm. Nothing was written, so there is no `remove_attribute` to
+/// mirror, which is `AttrBinding`'s arrangement exactly.
+export impl type S: Source<Option<str>> with AttrValue {
+	fun apply(self, parent: View, name: str) {
+		match self.get() {
+			Some(let text) => set_attribute(parent.attributes, name, text),
+			None => {},
+		}
+	}
+}
+
 /// What `View::bind_attr` accepts (A105) — the twin of the browser's
 /// `AttrBinding`, read once. `bind_attr` means "reactive attribute", so this
 /// vocabulary is sources only and does not admit a static `str`; `AttrValue`

@@ -1656,6 +1656,40 @@ export impl type S: Source<str> with AttrValue {
 	}
 }
 
+/// Set once, or NOT AT ALL: a `None` writes nothing (A115). The static twin of
+/// the removal arm below, and the one an element-syntax attribute needs when
+/// the value is an `Option` in hand — `<div data-dragging(maybe)>` — which was
+/// refused at the bound before this arm existed even though `Style::attribute`
+/// (A89) and `bind_attr` (A105) both took the `Option` shape.
+///
+/// `Some("")` is a present, empty attribute and `None` is no attribute: that
+/// distinction is the whole reason an absence needs its own value rather than a
+/// sentinel string, exactly as `AttrBinding` states it.
+export impl Option<str> with AttrValue {
+	fun apply(self, parent: View, name: str) {
+		match self {
+			Some(let text) => parent.element.set_attribute(name, text),
+			None => {},
+		}
+	}
+}
+
+/// Set and track, with `None` REMOVING the attribute (A115) — `AttrBinding`'s
+/// coming-and-going arm, reached from element syntax. Its customer is a
+/// selector that reads PRESENCE (`[data-dragging] *`), where there is no string
+/// that turns the attribute off.
+export impl type S: Source<Option<str>> with AttrValue {
+	fun apply(self, parent: View, name: str) {
+		let element = parent.element;
+		self.effect(|value| {
+			match value {
+				Some(let text) => element.set_attribute(name, text),
+				None => element.remove_attribute(name),
+			}
+		});
+	}
+}
+
 /// What `View::bind_attr` accepts (A105) — the REACTIVE attribute vocabulary,
 /// as `AttrValue` above is the element-syntax one. The two are deliberately
 /// separate rather than one widened trait: element syntax desugars to `.attr`,

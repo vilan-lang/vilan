@@ -229,7 +229,7 @@ fun mount(id: str, view: View)                                   // attach only
 fun mount_root(id: str, body: (sync || View) context owner_scope): Owner
 
 trait Slot { fun place(self, parent: View) }   // str | View | List<View>, and a Source of each
-trait AttrValue { fun apply(self, parent: View, name: str) }   // str | SignalCell<str>
+trait AttrValue { fun apply(self, parent: View, name: str) }   // str | Option<str>, and a Source of each
 ```
 
 `mount_root` = fresh owner + turn boundary + attach; it returns the root
@@ -259,7 +259,7 @@ too.
 | `text` | `(content: str): View` | static text |
 | `class` | `(name: str): View` | static class |
 | `styled` | `(style: Style): View` | classes from a compiled style |
-| `attr` | `(name: str, value: V): View`; `V: AttrValue` | `str` sets once, `SignalCell<str>` tracks |
+| `attr` | `(name: str, value: V): View`; `V: AttrValue` | `str` sets once, any `Source<str>` tracks; an `Option<str>` sets it or leaves it off, and a `Source<Option<str>>` tracks with `None` **removing** it (A115) — so the element-syntax form `<div data-dragging(maybe)>` takes every shape `bind_attr` does |
 | `style_var` | `(name: str, source: S): View`; `S: Source<str>` | reactive CSS custom property; registers with the enclosing boundary like every `bind_*` |
 | `on` | `(event: str, handler: (\|\| void) context turn_scope): View` | handler runs in a fresh turn |
 | `on_event` | `(event: str, handler: (\|Event\| void) context turn_scope): View` | same, with the DOM event |
@@ -401,9 +401,10 @@ Two things deliberately still ask for the concrete type:
   declares `get` and `on_change` and no `set`, so there is nothing to widen to
   yet — the write side is its own design question.
 - **`attr` and `child`**, whose reactive arms are the `AttrValue` and
-  `Slot` traits — so `<div href(source)>` and `<p>{source}</p>` still want
-  a `SignalCell<str>`. Widening a trait ARM is a blanket impl rather than a
-  bound on a parameter, and that is a separate piece of machinery.
+  `Slot` traits. Widening a trait ARM is a blanket impl rather than a bound
+  on a parameter, and that is a separate piece of machinery — which B158/B165
+  then built, so `<div href(source)>` and `<p>{source}</p>` do take any
+  `Source` today; `AttrValue`'s `Option` arms (A115) arrived the same way.
 
 ## std::router
 

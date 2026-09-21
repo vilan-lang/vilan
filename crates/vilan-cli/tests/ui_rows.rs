@@ -2980,6 +2980,170 @@ fn a105_bind_attr_over_an_option_source_sets_and_removes_the_attribute() {
     );
 }
 
+// --- A115: element syntax admits an `Option` attribute ----------------------
+//
+// `bind_attr` (A105) took `Source<Option<str>>` and `AttrValue` — the trait
+// element syntax desugars THROUGH (`.attr`, never `.bind_attr`) — had arms for
+// `str` and `Source<str>` only, so `<div data-dragging(maybe)>` was refused at
+// the bound while the method form of the same binding was fine. Two arms close
+// it on both twins: a static `Option<str>` writes nothing for a `None`, and a
+// `Source<Option<str>>` tracks with a `None` REMOVING the attribute, which is
+// `AttrBinding`'s own arm reached from the sugar.
+
+/// A STATIC `Option<str>` through element syntax, both ways at once: the `Some`
+/// attribute is written and the `None` one is not there at all.
+const ELEMENT_OPTION_ATTRIBUTE: &str = r#"import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::ui::{ View, mount_root, view };
+
+fun main() {
+	let held: Option<str> = Some("row");
+	let absent: Option<str> = None;
+	let blank: Option<str> = Some("");
+	mount_root("app", || {
+		<div data-held(held) data-absent(absent) data-blank(blank) id("shell")></div>
+	});
+	print(i"attributes={shell_attributes()}");
+}
+
+[extern("__shell_attributes")]
+external fun shell_attributes(): str;
+
+main();
+"#;
+
+#[test]
+fn a115_element_syntax_takes_a_static_option_attribute() {
+    let harness = format!(
+        "{DOM_STUB}\nglobal.__shell_attributes = () => {{\n  \
+         const shell = documentRoot.children[0];\n  \
+         return JSON.stringify(shell.attributes);\n\
+         }};\nrequire(\"./app.js\");\n"
+    );
+    let stdout = build_and_run(
+        "element_option_attribute",
+        ELEMENT_OPTION_ATTRIBUTE,
+        &harness,
+    );
+    let attributes = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("attributes="))
+        .unwrap_or_else(|| panic!("the attributes line; got:\n{stdout}"));
+    assert_eq!(
+        attributes, "{\"data-held\":\"row\",\"data-blank\":\"\",\"id\":\"shell\"}",
+        "a `Some` writes its text, `Some(\"\")` a present empty attribute, and a \
+         `None` nothing at all; got:\n{stdout}"
+    );
+}
+
+/// A REACTIVE `Source<Option<str>>` through element syntax — the arm whose
+/// customer is a presence selector, where no string turns the attribute off.
+const ELEMENT_OPTION_SOURCE_ATTRIBUTE: &str = r#"import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, mount_root, view };
+
+fun main() {
+	let dragging: SignalCell<Option<str>> = Signal::new(None);
+	let root = mount_root("app", || <div data-dragging(dragging) id("shell")></div>);
+	print(i"initial={shell_attributes()}");
+	dragging.set(Some("row"));
+	print(i"dragging-row={shell_attributes()}");
+	dragging.set(Some(""));
+	print(i"empty-string={shell_attributes()}");
+	dragging.set(None);
+	print(i"released={shell_attributes()}");
+	root.dispose();
+	dragging.set(Some("row"));
+	print(i"disposed={shell_attributes()}");
+}
+
+[extern("__shell_attributes")]
+external fun shell_attributes(): str;
+
+main();
+"#;
+
+#[test]
+fn a115_element_syntax_tracks_an_option_source_attribute() {
+    let harness = format!(
+        "{DOM_STUB}\nglobal.__shell_attributes = () => {{\n  \
+         const shell = documentRoot.children[0];\n  \
+         return JSON.stringify(shell.attributes);\n\
+         }};\nrequire(\"./app.js\");\n"
+    );
+    let stdout = build_and_run(
+        "element_option_source_attribute",
+        ELEMENT_OPTION_SOURCE_ATTRIBUTE,
+        &harness,
+    );
+    let line = |prefix: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("the {prefix} line; got:\n{stdout}"))
+            .to_string()
+    };
+    assert_eq!(
+        line("initial="),
+        "{\"id\":\"shell\"}",
+        "a `None` at mount writes nothing; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("dragging-row="),
+        "{\"id\":\"shell\",\"data-dragging\":\"row\"}",
+        "a `Some` sets the attribute; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("empty-string="),
+        "{\"id\":\"shell\",\"data-dragging\":\"\"}",
+        "`Some(\"\")` is a present, empty attribute; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("released="),
+        "{\"id\":\"shell\"}",
+        "a `None` REMOVES it; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("disposed="),
+        "{\"id\":\"shell\"}",
+        "the binding is the boundary's, so disposal stops it; got:\n{stdout}"
+    );
+}
+
+/// The SSR twin of both arms, from the sugar: a `Some` renders, a `None` is
+/// omitted, and `Some("")` stays a present empty attribute.
+const ELEMENT_OPTION_ATTRIBUTE_SSR: &str = r#"import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, render, view };
+
+fun main() {
+	let held: Option<str> = Some("row");
+	let absent: Option<str> = None;
+	let live: SignalCell<Option<str>> = Signal::new(Some("cell"));
+	let gone: SignalCell<Option<str>> = Signal::new(None);
+	print(render(<div data-held(held) id("shell")></div>));
+	print(render(<section data-absent(absent)></section>));
+	print(render(<article data-live(live)></article>));
+	print(render(<aside data-gone(gone)></aside>));
+}
+
+main();
+"#;
+
+#[test]
+fn a115_the_ssr_twin_renders_an_option_attribute_from_element_syntax() {
+    let stdout =
+        build_and_run_process("element_option_attribute_ssr", ELEMENT_OPTION_ATTRIBUTE_SSR);
+    assert_eq!(
+        stdout,
+        "<div data-held=\"row\" id=\"shell\"></div>\n<section></section>\n\
+         <article data-live=\"cell\"></article>\n<aside></aside>\n",
+        "the server render carries a `Some` from either arm and omits a `None`"
+    );
+}
+
 /// The SSR twin: read once, and a `None` renders nothing. There is no
 /// `remove_attribute` to mirror, because nothing was written — `toggle_attr`'s
 /// arrangement exactly.

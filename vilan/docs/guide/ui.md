@@ -112,9 +112,12 @@ re-sets whenever it changes — `attr("href", signal)` and
 name. (`text` is unchanged: it still replaces everything the element
 contains, text nodes included, like the DOM's `textContent`.)
 
-An attribute that comes and goes is a third case, and `bind_attr` takes it
-directly: over a `Source<Option<str>>`, a `Some(text)` sets the attribute and
-a `None` **removes** it. Reach for it whenever a selector reads presence —
+An attribute that comes and goes is a third case, and both forms take it
+directly: over an `Option<str>` or a `Source<Option<str>>`, a `Some(text)`
+sets the attribute and a `None` leaves it off — removing it, where the value
+is reactive and the attribute was there a moment ago. `bind_attr` spells it by
+name and element syntax by type, so `<div data-dragging(drag_status)>` is the
+same binding as the chain below. Reach for it whenever a selector reads presence —
 `[data-dragging="row"] *` matches an element that *has* the attribute, so
 writing `""` between drags leaves the rule firing. `Some("")` is still a
 present, empty attribute, which is why the absence has to be its own value
