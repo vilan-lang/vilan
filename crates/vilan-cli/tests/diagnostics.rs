@@ -650,6 +650,131 @@ fn phase_timing_env_var_prints_the_post_pass_breakdown() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Every `[vilan phase]` figure carries a CPU reading beside its wall
+/// (backlog M78).
+///
+/// The marks were `Instant` alone, so every number the perf arc reads was
+/// WALL — and wall on a loaded box is a share, never an absolute: M73's stage
+/// split had to be reported as percentages for exactly that reason, and
+/// E121's ledger could take no absolute figure while nine other jobs ran. A
+/// thread CPU clock is immune to the load, so the phase line prints
+/// `wall/cpu` and both facts are readable from one run.
+///
+/// The pin DECLINES where the host exposes no thread CPU clock (anything but
+/// LP64 Linux): it then asserts the `?cpu` rendering — a missing measurement
+/// saying so — and stops, because "the figures advance" is not a property of
+/// a clock that is not there.
+#[test]
+fn the_phase_line_carries_a_cpu_figure_beside_every_wall_figure() {
+    let dir = temp_package(
+        "phasecpu",
+        "import std::io::print;\nfun main() { print(7); }\n",
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
+    command
+        .current_dir(&dir)
+        .args(["build"])
+        .env("VILAN_PHASE_TIMING", "1");
+    let output = command.output().expect("run vilan");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let phase_lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("[vilan phase]"))
+        .collect();
+    assert!(
+        !phase_lines.is_empty(),
+        "VILAN_PHASE_TIMING=1 printed no phase line; stderr was: {stderr}"
+    );
+
+    // Every timing token on every phase line, with the field name that
+    // precedes it. A token is a timing exactly when it ends in `cpu` — the
+    // non-timing fields (`macro-worlds 1`, `const-fuel-max 0`, `legs 2`,
+    // the whole `reused 0/25` row) carry bare numbers and are skipped.
+    let mut timings: Vec<(String, f64, Option<f64>)> = Vec::new();
+    for line in &phase_lines {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        for (position, word) in words.iter().enumerate() {
+            if !word.ends_with("cpu") {
+                continue;
+            }
+            let name = words
+                .get(position.wrapping_sub(1))
+                .copied()
+                .unwrap_or("<first word>")
+                .to_string();
+            let (wall, cpu) = word
+                .split_once("ms/")
+                .unwrap_or_else(|| panic!("`{name} {word}` is not a `<wall>ms/<cpu>cpu` token"));
+            let wall: f64 = wall
+                .parse()
+                .unwrap_or_else(|_| panic!("`{name} {word}`'s wall figure must be a number"));
+            let cpu = cpu.strip_suffix("cpu").expect("just matched the suffix");
+            let cpu = (cpu != "?").then(|| {
+                cpu.parse::<f64>().unwrap_or_else(|_| {
+                    panic!("`{name} {word}`'s cpu figure must be `?` or a number")
+                })
+            });
+            timings.push((name, wall, cpu));
+        }
+    }
+    assert!(
+        timings.len() >= 20,
+        "the four core phase lines carry more than twenty timing fields \
+         between them; found {} in: {phase_lines:#?}",
+        timings.len()
+    );
+
+    if !vilan_core::phase_cpu_clock_available() {
+        // The decline, and it is still an assertion: a host without the clock
+        // must print `?cpu` everywhere rather than a zero that reads as a
+        // measurement.
+        println!(
+            "M78-DECLINE: this host exposes no thread CPU clock, so the phase \
+             line's cpu figures are `?` and cannot be checked for advance"
+        );
+        for (name, _, cpu) in &timings {
+            assert!(
+                cpu.is_none(),
+                "`{name}` printed a cpu number on a host with no thread CPU \
+                 clock; a missing measurement must print `?cpu`"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
+    // The clock is there, so it must ADVANCE: a whole analysis of a package
+    // burns CPU, and a reader who cannot tell a stuck clock from a fast
+    // compiler has no instrument.
+    assert!(
+        timings
+            .iter()
+            .any(|(_, _, cpu)| cpu.is_some_and(|cpu| cpu > 0.0)),
+        "every cpu figure read 0.0 for a complete analysis — the clock is \
+         present but not advancing, so the instrument is reporting nothing: \
+         {phase_lines:#?}"
+    );
+    // And it must stay UNDER the wall: each phase brackets work on one
+    // thread, so the CPU it burned cannot exceed the time it took. The
+    // tolerance is two printed digits' worth of rounding, since both figures
+    // are rendered to 0.1 ms.
+    for (name, wall, cpu) in &timings {
+        let Some(cpu) = *cpu else {
+            panic!(
+                "`{name}` printed `?cpu` although this host has the clock; \
+                 the rendering must follow the capability"
+            );
+        };
+        assert!(
+            cpu <= wall + 0.2,
+            "`{name}` burned {cpu} ms of CPU in {wall} ms of wall — a phase \
+             runs on one thread, so this is a clock mismatch and not a \
+             measurement: {phase_lines:#?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The B138 instrument: with `VILAN_DEPTH_STATS` set, every top-level
 /// analysis prints one stderr line with, per recursive family, the peak
 /// recursion depth and the stack consumed at that peak — the numbers the

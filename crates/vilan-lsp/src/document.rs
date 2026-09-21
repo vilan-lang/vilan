@@ -1637,7 +1637,7 @@ impl Document {
         // — per analysis, so per keystroke — while `resolve_dependencies`
         // re-reads the manifest closure beside it. The core line cannot see any
         // of it: it starts inside `analyze`.
-        let phase_context_start = std::time::Instant::now();
+        let phase_context_start = vilan_core::PhaseClock::now();
         let mut context = resolve_project_context(entry_path);
         let phase_context = phase_context_start.elapsed();
         let manifest_problem = context.manifest_problem.take();
@@ -1681,7 +1681,7 @@ impl Document {
         // process-global caches, which a keystroke's content would leak for
         // the session (§7.5). The `AnalyzedProgram` built below owns and
         // reclaims them beside the entry text and tree.
-        let phase_analyze_start = std::time::Instant::now();
+        let phase_analyze_start = vilan_core::PhaseClock::now();
         let vilan_core::AnalyzedEntry {
             program,
             diagnostics,
@@ -1715,7 +1715,7 @@ impl Document {
             drop(unsafe { AnalyzedProgram::new(program, Some(leaked_text), ast, owned_modules) });
             return Self::unanalyzed(text);
         }
-        let phase_index_start = std::time::Instant::now();
+        let phase_index_start = vilan_core::PhaseClock::now();
 
         // The entity table the navigation queries index, computed by the one
         // function both front-ends use (`vilan_ide::entity_spans`).
@@ -1772,7 +1772,7 @@ impl Document {
         // user is looking at. Each is a full analysis under that leg's platform
         // whose program is published and then dropped — the diagnostics are all
         // the editor keeps, and hover/goto/completion stay the primary leg's.
-        let phase_legs_start = std::time::Instant::now();
+        let phase_legs_start = vilan_core::PhaseClock::now();
         let shared_diagnostics = context
             .shared_platforms
             .iter()
@@ -1828,14 +1828,14 @@ impl Document {
         // E121: the keystroke path's whole-program walk, paid HERE — once per
         // analysis, on the analysis thread — instead of once per request on
         // the keystroke thread. See [`LandedSnapshot`].
-        let phase_landed_start = std::time::Instant::now();
+        let phase_landed_start = vilan_core::PhaseClock::now();
         document.landed = document.capture_landed(entry_path);
         let phase_landed = phase_landed_start.elapsed();
         // M27: the editor tables, as ONE number the server can carry — the
         // reference/entity index and the landed walk are the same family of
         // cost (a table built over a finished analysis, thrown away by the
         // next keystroke) and no budget separates them.
-        document.index_time = phase_index + phase_landed;
+        document.index_time = (phase_index + phase_landed).wall;
         // The server's half of the `VILAN_PHASE_TIMING` split (E106): one line
         // per LSP analysis, naming the costs the core pipeline's own line
         // cannot see — project resolution (the E113 reachability walk and the
@@ -1853,15 +1853,14 @@ impl Document {
         // and it is on the line now for the same reason `lsp-index` is: a cost
         // nobody prints is a cost nobody budgets (N43's rule).
         if vilan_core::phase_timing_enabled() {
-            let milliseconds = |duration: std::time::Duration| duration.as_secs_f64() * 1000.0;
             eprintln!(
-                "[vilan phase] lsp-context {:.1}ms lsp-analyze {:.1}ms lsp-index {:.1}ms \
-                 lsp-landed {:.1}ms lsp-legs {:.1}ms legs {}",
-                milliseconds(phase_context),
-                milliseconds(phase_analyze),
-                milliseconds(phase_index),
-                milliseconds(phase_landed),
-                milliseconds(phase_legs),
+                "[vilan phase] lsp-context {} lsp-analyze {} lsp-index {} \
+                 lsp-landed {} lsp-legs {} legs {}",
+                phase_context,
+                phase_analyze,
+                phase_index,
+                phase_landed,
+                phase_legs,
                 context.shared_platforms.len(),
             );
         }

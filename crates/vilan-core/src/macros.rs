@@ -766,22 +766,22 @@ pub(crate) struct MacroWorldPhases {
     /// the package's on-disk expansion table) compiles nothing and adds
     /// nothing, so a warm run's row reads 0 and says exactly that.
     pub(crate) compiled: usize,
-    pub(crate) load_walk: std::time::Duration,
-    pub(crate) base: std::time::Duration,
-    pub(crate) build: std::time::Duration,
-    pub(crate) checks: std::time::Duration,
-    pub(crate) post: std::time::Duration,
+    pub(crate) load_walk: crate::PhaseSpan,
+    pub(crate) base: crate::PhaseSpan,
+    pub(crate) build: crate::PhaseSpan,
+    pub(crate) checks: crate::PhaseSpan,
+    pub(crate) post: crate::PhaseSpan,
 }
 
 thread_local! {
     static WORLD_PHASES: std::cell::Cell<MacroWorldPhases> =
         const { std::cell::Cell::new(MacroWorldPhases {
             compiled: 0,
-            load_walk: std::time::Duration::ZERO,
-            base: std::time::Duration::ZERO,
-            build: std::time::Duration::ZERO,
-            checks: std::time::Duration::ZERO,
-            post: std::time::Duration::ZERO,
+            load_walk: crate::PhaseSpan::ZERO,
+            base: crate::PhaseSpan::ZERO,
+            build: crate::PhaseSpan::ZERO,
+            checks: crate::PhaseSpan::ZERO,
+            post: crate::PhaseSpan::ZERO,
         }) };
 }
 
@@ -807,10 +807,10 @@ pub(crate) fn world_phases_record_compiled() {
 /// One world's analysis phases, added to this thread's tally. Called from the
 /// site that would have PRINTED the world's own line.
 pub(crate) fn world_phases_record_analysis(
-    load_walk: std::time::Duration,
-    base: std::time::Duration,
-    build: std::time::Duration,
-    checks: std::time::Duration,
+    load_walk: crate::PhaseSpan,
+    base: crate::PhaseSpan,
+    build: crate::PhaseSpan,
+    checks: crate::PhaseSpan,
 ) {
     WORLD_PHASES.with(|cell| {
         let mut phases = cell.get();
@@ -823,7 +823,7 @@ pub(crate) fn world_phases_record_analysis(
 }
 
 /// One world's post-passes, added to this thread's tally.
-pub(crate) fn world_phases_record_post(post: std::time::Duration) {
+pub(crate) fn world_phases_record_post(post: crate::PhaseSpan) {
     WORLD_PHASES.with(|cell| {
         let mut phases = cell.get();
         phases.post += post;

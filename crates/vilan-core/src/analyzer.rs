@@ -44709,7 +44709,7 @@ impl<'src> Analyzer<'src> {
         // `Instant::now()` calls per pass, which is noise next to the pass.
         let split_on = crate::phase_timing_enabled() && !crate::macros::in_macro_world();
         let mut split_mark = crate::PhaseClock::now();
-        let mut split: Vec<(&'static str, std::time::Duration)> = Vec::new();
+        let mut split: Vec<(&'static str, crate::PhaseSpan)> = Vec::new();
         // Resolve imports/re-exports to a fixpoint: a re-export may name an item
         // bound by another re-export resolved in a later pass (a chain of relay
         // modules), so keep retrying the unresolved ones until a pass binds
@@ -46809,7 +46809,7 @@ impl<'src> Analyzer<'src> {
             split.push(("fixpoint", split_mark.elapsed()));
             let stages: Vec<String> = split
                 .iter()
-                .map(|(name, duration)| format!("{name} {:.1}ms", duration.as_secs_f64() * 1000.0))
+                .map(|(name, span)| format!("{name} {span}"))
                 .collect();
             eprintln!("[vilan phase] resolve_world {}", stages.join(" "));
         }
@@ -55838,7 +55838,7 @@ struct World<'src> {
 #[derive(Clone, Copy)]
 struct PhaseMarks {
     started: crate::PhaseClock,
-    base: std::time::Duration,
+    base: crate::PhaseSpan,
 }
 
 impl PhaseMarks {
@@ -55847,7 +55847,7 @@ impl PhaseMarks {
     fn started_at(started: crate::PhaseClock) -> PhaseMarks {
         PhaseMarks {
             started,
-            base: std::time::Duration::ZERO,
+            base: crate::PhaseSpan::ZERO,
         }
     }
 }
@@ -59564,11 +59564,11 @@ fn analyze_over_world<'src>(
     }
     if crate::phase_timing_enabled() && !crate::macros::in_macro_world() {
         eprintln!(
-            "[vilan phase] load+walk {:.1}ms base {:.1}ms build {:.1}ms checks {:.1}ms",
-            (phase_load_walk - phase_marks.base).as_secs_f64() * 1000.0,
-            phase_marks.base.as_secs_f64() * 1000.0,
-            phase_build.as_secs_f64() * 1000.0,
-            phase_checks.as_secs_f64() * 1000.0,
+            "[vilan phase] load+walk {} base {} build {} checks {}",
+            phase_load_walk - phase_marks.base,
+            phase_marks.base,
+            phase_build,
+            phase_checks,
         );
         // The macro worlds' row (M33). It is printed WHATEVER the count, zero
         // included: "this analysis compiled no macro worlds" is the fact a warm
@@ -59580,14 +59580,14 @@ fn analyze_over_world<'src>(
         // `dispatch-refine` does not sum with the buckets it explains.
         let worlds = crate::macros::world_phases();
         eprintln!(
-            "[vilan phase] macro-worlds {} load+walk {:.1}ms base {:.1}ms build {:.1}ms \
-             checks {:.1}ms post-passes {:.1}ms",
+            "[vilan phase] macro-worlds {} load+walk {} base {} build {} \
+             checks {} post-passes {}",
             worlds.compiled,
-            worlds.load_walk.as_secs_f64() * 1000.0,
-            worlds.base.as_secs_f64() * 1000.0,
-            worlds.build.as_secs_f64() * 1000.0,
-            worlds.checks.as_secs_f64() * 1000.0,
-            worlds.post.as_secs_f64() * 1000.0,
+            worlds.load_walk,
+            worlds.base,
+            worlds.build,
+            worlds.checks,
+            worlds.post,
         );
         // A second line rather than more fields on the first: N43 made those
         // labels honest and a reader parses them positionally. `reused` is how

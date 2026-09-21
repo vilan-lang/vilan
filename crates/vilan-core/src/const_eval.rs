@@ -101,10 +101,10 @@ thread_local! {
     /// `post_analysis_passes` for its phase line. Thread-local because an
     /// analysis is single-threaded, the same way the transformer's
     /// `CONST_LOWERING_COUNT` is.
-    static PHASE_LOWER: std::cell::Cell<std::time::Duration> =
-        const { std::cell::Cell::new(std::time::Duration::ZERO) };
-    static PHASE_INTERP: std::cell::Cell<std::time::Duration> =
-        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+    static PHASE_LOWER: std::cell::Cell<crate::PhaseSpan> =
+        const { std::cell::Cell::new(crate::PhaseSpan::ZERO) };
+    static PHASE_INTERP: std::cell::Cell<crate::PhaseSpan> =
+        const { std::cell::Cell::new(crate::PhaseSpan::ZERO) };
     /// The most fuel any single explicit `const` site consumed this analysis —
     /// the budget instrument beside the timing split: `EXPLICIT_LIMITS.fuel`
     /// is sized against measured workloads, and this is how a workload gets
@@ -117,7 +117,7 @@ thread_local! {
 /// the `VILAN_PHASE_TIMING` line. The two do NOT sum to the pass: the
 /// remainder is classification (free locals, `check_const_only`) and failure
 /// attribution.
-pub(crate) fn phase_split() -> (std::time::Duration, std::time::Duration) {
+pub(crate) fn phase_split() -> (crate::PhaseSpan, crate::PhaseSpan) {
     (
         PHASE_LOWER.with(std::cell::Cell::get),
         PHASE_INTERP.with(std::cell::Cell::get),
@@ -131,7 +131,7 @@ pub(crate) fn max_fuel_used() -> u64 {
 }
 
 fn phase_add(
-    bucket: &'static std::thread::LocalKey<std::cell::Cell<std::time::Duration>>,
+    bucket: &'static std::thread::LocalKey<std::cell::Cell<crate::PhaseSpan>>,
     started: crate::PhaseClock,
 ) {
     bucket.with(|cell| cell.set(cell.get() + started.elapsed()));
@@ -853,8 +853,8 @@ pub struct Evaluated {
 pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) -> Evaluated {
     // Reset the phase buckets FIRST, before any early return, so the timing
     // line never reports a previous analysis's accumulation.
-    PHASE_LOWER.with(|cell| cell.set(std::time::Duration::ZERO));
-    PHASE_INTERP.with(|cell| cell.set(std::time::Duration::ZERO));
+    PHASE_LOWER.with(|cell| cell.set(crate::PhaseSpan::ZERO));
+    PHASE_INTERP.with(|cell| cell.set(crate::PhaseSpan::ZERO));
     FUEL_MAX.with(|cell| cell.set(0));
     // A program that already failed analysis skips evaluation entirely: the
     // transformer's entity lookups (used to lower the const world) assume
