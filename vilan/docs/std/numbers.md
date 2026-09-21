@@ -200,14 +200,28 @@ fun range<T: Random>(low: T, high: T): T   // uniform in [low, high)
 // implemented for i32, u32, f64
 ```
 
+The range is **half-open**: `low` is reachable, `high` is not, for the
+integer arms and the float one alike. That is what makes
+`range(0, items.len())` an index, and `range(4, 4)` answers `4` — the
+empty range has nothing else to answer.
+
 ```vilan
+import std::io::panic;
 import std::random;
 
 fun main() {
-	let roll = random::range(1, 7);   // 1..=6
-	print(roll >= 1 && roll <= 6);
+	let roll = random::range(1, 7);   // 1..=6, never 7
+	if roll < 1 || roll > 6 {
+		panic(i"a d6 rolled {roll}");
+	}
+	print("rolled");
 }
 ```
+
+The fence panics rather than printing a bool, deliberately: a bool tells a
+reader what the range is and tells the gate nothing, and this one was
+printing `false` about one run in eight while the line above it said
+`1..=6` (A118).
 
 Not cryptographic: for tokens and ids use `std::crypto`
 (`random_uuid`, `random_bytes`; see [misc](misc.md)).

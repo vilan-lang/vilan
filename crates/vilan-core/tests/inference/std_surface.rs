@@ -6092,3 +6092,122 @@ fn i4_the_container_defaults_do_not_widen_what_a_map_key_may_be() {
         "Hashable",
     );
 }
+
+// --- A118: `std::random::range` is HALF-OPEN ---------------------------------
+//
+// `docs/std/numbers.md` has said `[low, high)` since the module landed and the
+// integer helper implemented `[low, high]` — `Math.floor(rand * (high - low +
+// 1)) + low` — so `random::range(1, 7)` answered 7 about one run in eight. R7
+// at Order 39's GO: the DOC is the contract, fix the implementation.
+//
+// The draws below are the pin's instrument. A distribution cannot be asserted
+// from one sample, so each case draws over a range small enough that the claim
+// is decided by ~2^-N rather than by luck: 400 draws of a two-value range that
+// must never answer its bound is red at probability 1 - 2^-400 under the old
+// helper, which is a certainty in every sense that matters to a suite. Output
+// is a verdict rather than the draws, so the pins are deterministic even
+// though the program is not.
+
+/// A118 — the bound itself is NOT in the range. The case the item was filed
+/// for, at the tightest range where "inclusive" and "half-open" differ:
+/// `[0, 1)` holds exactly one value.
+#[test]
+fn a118_an_integer_range_never_answers_its_upper_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::random;
+        fun main() {
+            mut draws = 0;
+            mut outside = 0;
+            for draws < 400 {
+                if random::range(0, 1) != 0 {
+                    outside += 1;
+                }
+                draws += 1;
+            }
+            print(i"outside:{outside}");
+        }
+        "#,
+        "outside:0\n",
+    );
+}
+
+/// A118 — and every value BELOW the bound still is, so the fix is not "answer
+/// `low`". `[0, 3)` is three values; 400 draws miss one at 3 * (2/3)^400.
+#[test]
+fn a118_an_integer_range_still_answers_every_value_below_its_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::random;
+        fun main() {
+            mut seen = [false, false, false];
+            mut outside = 0;
+            mut draws = 0;
+            for draws < 400 {
+                let value = random::range(0, 3);
+                if value < 0 || value > 2 {
+                    outside += 1;
+                } else {
+                    seen[value] = true;
+                }
+                draws += 1;
+            }
+            print(i"outside:{outside} zero:{seen[0]} one:{seen[1]} two:{seen[2]}");
+        }
+        "#,
+        "outside:0 zero:true one:true two:true\n",
+    );
+}
+
+/// A118 — a DEGENERATE range answers `low`. `[4, 4)` holds nothing, and `low`
+/// is the only value there is to answer; the doc says so rather than leaving a
+/// reader to find out.
+#[test]
+fn a118_a_degenerate_integer_range_answers_its_low_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::random;
+        fun main() {
+            mut draws = 0;
+            mut other = 0;
+            for draws < 100 {
+                if random::range(4, 4) != 4 {
+                    other += 1;
+                }
+                draws += 1;
+            }
+            print(i"other:{other}");
+        }
+        "#,
+        "other:0\n",
+    );
+}
+
+/// A118 — the FLOAT arm was already half-open (`Math.random()` is `[0, 1)`), so
+/// this is the guard that the two arms now say the same thing about their
+/// bounds and keep saying it.
+#[test]
+fn a118_a_float_range_is_half_open_too() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::random;
+        fun main() {
+            mut draws = 0;
+            mut outside = 0;
+            for draws < 400 {
+                let value = random::range(0.0, 1.0);
+                if value < 0.0 || value >= 1.0 {
+                    outside += 1;
+                }
+                draws += 1;
+            }
+            print(i"outside:{outside}");
+        }
+        "#,
+        "outside:0\n",
+    );
+}

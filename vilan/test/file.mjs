@@ -8,7 +8,7 @@ async function __fs_close_awaited(file) {
 	await file.close();
 }
 function __random_int(low, high) {
-	return Math.floor(Math.random() * (high - low + 1)) + low;
+	return Math.floor(Math.random() * (high - low)) + low;
 }
 function __shared_new(value) {
 	return { v: value };

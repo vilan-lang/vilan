@@ -120,7 +120,7 @@ function __fs_watch_stop(watcher) {
 	watcher.stop();
 }
 function __random_int(low, high) {
-	return Math.floor(Math.random() * (high - low + 1)) + low;
+	return Math.floor(Math.random() * (high - low)) + low;
 }
 function __substring(text, start, end) {
 	if (0 <= start && start <= end && end <= text.length) return text.substring(start, end);

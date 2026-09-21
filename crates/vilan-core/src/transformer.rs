@@ -1252,9 +1252,15 @@ fn helper_source(name: &str) -> &'static str {
         "__is_null" => {
             "function __is_null(value) {\n\treturn value === null || value === undefined;\n}"
         }
+        // A118: HALF-OPEN, `[low, high)` — the contract `docs/std/numbers.md`
+        // has always stated, and the one the float twin below has always
+        // implemented (`Math.random()` is itself `[0, 1)`). The `+ 1` made the
+        // integer arm inclusive, so `random::range(1, 7)` answered 7 about one
+        // run in eight while the doc beside it said `1..=6`. A degenerate range
+        // answers `low`: `high - low` is 0, and there is nothing else to answer.
         "__random_int" => {
             "function __random_int(low, high) {\n\
-             \treturn Math.floor(Math.random() * (high - low + 1)) + low;\n\
+             \treturn Math.floor(Math.random() * (high - low)) + low;\n\
              }"
         }
         "__random_float" => {
