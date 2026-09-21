@@ -544,6 +544,154 @@ fn a_filter_that_rejects_everything_is_exhausted_not_stuck() {
     );
 }
 
+/// I3's remainder, filed off kolt's `server.vl:92` (`List::map_filter`, under a
+/// `// FIXME: Implement with std.`): `map` and `filter` in ONE pass, where the
+/// projection's `None` drops the element. The intermediate `Option` is never
+/// materialized, which is the difference from `it.map(f)` followed by a filter.
+#[test]
+fn filter_map_projects_and_drops_in_one_pass() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut halves = [1, 2, 3, 4, 5, 6].iter().filter_map(|n| {
+                    if n % 2 == 0 {
+                        Some(n / 2)
+                    } else {
+                        None
+                    }
+                });
+                for value in halves {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "1\n2\n3\n",
+    );
+}
+
+/// The projection may change the element type, exactly as `map`'s may — the
+/// adapter carries three parameters (upstream, in, out) for this reason.
+#[test]
+fn filter_map_changes_the_element_type() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut labelled = [1, 2, 3].iter().filter_map(|n| {
+                    if n == 2 {
+                        None
+                    } else {
+                        Some(i"n{n}")
+                    }
+                });
+                for value in labelled {
+                    print(value);
+                }
+            }
+            "#,
+        ),
+        "n1\nn3\n",
+    );
+}
+
+/// `filter`'s pin, on the projecting twin: the loop inside `next` has to end on
+/// the UPSTREAM's `None` and not only on a `Some` from the projection, so a
+/// projection that answers `None` for everything is exhausted rather than stuck.
+#[test]
+fn a_filter_map_that_drops_everything_is_exhausted_not_stuck() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut none = [1, 2, 3].iter().filter_map(|n| {
+                    if n > 100 {
+                        Some(n)
+                    } else {
+                        None
+                    }
+                });
+                mut seen = 0;
+                for _value in none {
+                    seen = seen + 1;
+                }
+                print(seen);
+                let empty: List<i32> = [];
+                print(empty.iter().filter_map(|n| Some(n)).next().is_none());
+            }
+            "#,
+        ),
+        "0\ntrue\n",
+    );
+}
+
+/// Lazy like every other adapter, and it composes: bounded by a later `take`,
+/// an unbounded source is pulled only as far as the budget needs — which is
+/// also what keeps this pin from hanging.
+#[test]
+fn filter_map_stays_lazy_and_composes_with_take() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut thirds = Naturals { at = 0 }.filter_map(|n| {
+                    if n % 3 == 0 {
+                        Some(n)
+                    } else {
+                        None
+                    }
+                }).take(2);
+                for value in thirds {
+                    print(value);
+                }
+                mut pulls = 0;
+                mut unpulled = [1, 2, 3].iter().filter_map(|n| {
+                    pulls = pulls + 1;
+                    Some(n)
+                });
+                print(i"built {pulls}");
+            }
+            "#,
+        ),
+        "3\n6\nbuilt 0\n",
+    );
+}
+
+/// The EAGER twin, which is what a call site holding a `List` reaches for: it
+/// lives in `option.vl` beside `find`, because the always-loaded core stays off
+/// the `option` chain, and it does not route through `iter()` — that would copy
+/// the list for a single pass.
+#[test]
+fn the_eager_list_filter_map_is_the_one_pass_twin() {
+    assert_compiles_and_runs(
+        &adapter_program(
+            r#"
+            fun main() {
+                let kept = [1, 2, 3, 4].filter_map(|n| {
+                    if n % 2 == 0 {
+                        Some(i"n{n}")
+                    } else {
+                        None
+                    }
+                });
+                print(kept.len());
+                for value in kept {
+                    print(value);
+                }
+                let empty: List<i32> = [];
+                print(empty.filter_map(|n| Some(n)).len());
+                // kolt's own shape: a list of pairs projected through `zip`.
+                let pairs = [["a", "1"], ["b"]];
+                let both = pairs.filter_map(|row| row.get(0).zip(row.get(1)));
+                print(both.len());
+            }
+            "#,
+        ),
+        "2\nn2\nn4\n0\n1\n",
+    );
+}
+
 #[test]
 fn take_stops_at_its_budget() {
     assert_compiles_and_runs(

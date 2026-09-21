@@ -447,4 +447,25 @@ impl List<type T> {
 		}
 		None
 	}
+
+	/// `map` and `filter` in one pass: `fn` answers `Some(value)` to keep that
+	/// value and `None` to drop the element, so a partial or fallible
+	/// projection needs neither a two-stage chain nor an `Option` to unwrap
+	/// afterwards (I3; the shape kolt hand-wrote as `List::map_filter` at
+	/// `server.vl:92`).
+	///
+	/// The eager twin of `Iterator::filter_map`, and it is here rather than in
+	/// `list.vl` beside `map`/`filter` for this block's own reason: it reads the
+	/// `Option` vocabulary, and the always-loaded core stays off that chain. It
+	/// does not route through `iter()` either — that would cost a copy of the
+	/// list for a single pass.
+	fun filter_map<U>(self, fn: |T| Option<U>): List<U> {
+		mut result: List<U> = [];
+		for item in self {
+			if fn(item) is Some(let projected) {
+				result.push(projected);
+			}
+		}
+		result
+	}
 }

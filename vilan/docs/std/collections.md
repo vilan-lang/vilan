@@ -23,6 +23,7 @@ impl List<type T> {
 	fun last(self): Option<T>
 	fun map<U>(self, fn: |T| U): List<U>
 	fun filter(self, predicate: |T| bool): List<T>
+	fun filter_map<U>(self, fn: |T| Option<U>): List<U>   // both, one pass
 	fun find(self, predicate: |T| bool): Option<T>
 	fun fold<B>(self, init: B, fn: |B, T| B): B
 	fun for_each(self, fn: |T| void)
@@ -538,12 +539,18 @@ all of them:
 ```vilan,fragment
 fun map<U>(self, fn: |T| U): Mapped<Self, T, U>
 fun filter(self, predicate: |T| bool): Filtered<Self, T>
+fun filter_map<U>(self, fn: |T| Option<U>): FilterMapped<Self, T, U>   // both, one pass
 fun take(self, count: i32): Taken<Self, T>
 fun skip(self, count: i32): Skipped<Self, T>
 fun enumerate(self): Enumerated<Self, T>                       // (0, a), (1, b), …
 fun zip<U, J: Iterator<U>>(self, other: J): Zipped<Self, J, T, U>
 fun chain<J: Iterator<T>>(self, other: J): Chained<Self, J, T>
 ```
+
+`filter_map` is `map` and `filter` at once: the projection answers
+`Some(value)` to keep that value and `None` to drop the element, so a partial
+or fallible projection needs neither a two-stage chain nor an `Option` to
+unwrap afterwards. `List` carries the eager twin under the same name.
 
 They are **lazy**: each returns a small struct holding its upstream, and nothing
 runs until something pulls. So a chain makes one pass over the source and builds

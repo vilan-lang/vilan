@@ -19,6 +19,16 @@ trait Iterator<T> {
 		Filtered { upstream = self, predicate }
 	}
 
+	/// `map` and `filter` in one pass: `fn` answers `Some(value)` to keep that
+	/// value and `None` to drop the element, so a fallible or partial
+	/// projection needs neither a two-stage chain nor an `Option` to unwrap
+	/// afterwards. `it.filter_map(f)` is `it.map(f).filter(is_some)` with the
+	/// intermediate `Option` never materialized (I3; kolt hand-wrote the eager
+	/// form as `List::map_filter` at `server.vl:92`).
+	fun filter_map<U>(self, fn: |T| Option<U>): FilterMapped<Self, T, U> {
+		FilterMapped { upstream = self, fn }
+	}
+
 	/// The first `count` values, then exhausted. `take` is what makes an
 	/// unbounded source usable: it never pulls past its budget, so
 	/// `source.take(3).to_list()` terminates over an infinite `from_fn`.
@@ -207,6 +217,33 @@ impl Filtered<type I: Iterator<T>, type T> with Iterator<T> {
 			if self.upstream.next() is Some(let value) {
 				if (self.predicate)(value) {
 					found = Some(value);
+					searching = false;
+				}
+			} else {
+				searching = false;
+			}
+		}
+		found
+	}
+}
+
+struct FilterMapped<I, T, U> {
+	upstream: I,
+	fn: |T| Option<U>,
+}
+
+impl FilterMapped<type I: Iterator<T>, type T, type U> with Iterator<U> {
+	fun next(&mut self): Option<U> {
+		// `Filtered`'s loop, projecting as it goes: the upstream is pulled until
+		// the projection answers `Some` or the upstream runs out, so the dropped
+		// elements are consumed here rather than materialized — which is what
+		// keeps one pass one pass.
+		mut found: Option<U> = None;
+		mut searching = true;
+		for searching {
+			if self.upstream.next() is Some(let value) {
+				if (self.fn)(value) is Some(let projected) {
+					found = Some(projected);
 					searching = false;
 				}
 			} else {
