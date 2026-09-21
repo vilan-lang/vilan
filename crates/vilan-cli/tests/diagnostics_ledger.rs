@@ -688,23 +688,56 @@ fn walk(directory: &Path, extension: &str, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Every source a diagnostic's text can live in: the compiler crates and the
+/// Every crate of the workspace, as the repository-relative path the root
+/// `Cargo.toml` lists — read from that file rather than copied (N104).
+///
+/// The list used to be four names written here, and a crate absent from it is
+/// INVISIBLE to the whole file: its messages are not enumerated by check (3),
+/// and check (2) cannot find a key that lives in it, so a row keyed on one of
+/// its sentences reads as stale. `vilan-rust` landed in Order 37 carrying
+/// user-facing refusals and was outside the walk until somebody noticed;
+/// `vilan-rt` and `vilan-ide` are still outside it as far as this list was
+/// concerned. Deriving it means the next crate is walked on the day it joins
+/// the workspace, and [`every_workspace_crate_is_walked`] holds the derivation
+/// to the manifest in case the manifest's shape changes under it.
+fn workspace_crates() -> Vec<PathBuf> {
+    let manifest = read("Cargo.toml");
+    let (_, after) = manifest
+        .split_once("members = [")
+        .expect("the root manifest declares `members = [`");
+    let (list, _) = after
+        .split_once(']')
+        .expect("the members list is closed on the same table");
+    let root = repository_root();
+    let mut crates = Vec::new();
+    for line in list.lines() {
+        let trimmed = line.trim();
+        // The list carries comments; a member is a quoted path.
+        let Some(opened) = trimmed.strip_prefix('"') else {
+            continue;
+        };
+        let Some((member, _)) = opened.split_once('"') else {
+            continue;
+        };
+        crates.push(root.join(member));
+    }
+    assert!(
+        crates.len() >= 8,
+        "the workspace members list read as {} crate(s), which is fewer than \
+         the workspace has ever had — the manifest's shape moved under \
+         `workspace_crates`",
+        crates.len()
+    );
+    crates
+}
+
+/// Every source a diagnostic's text can live in: the workspace's crates and the
 /// standard library (whose runtime refusals the ledger rows from 230 on).
 fn message_sources() -> Vec<PathBuf> {
     let root = repository_root();
     let mut paths = Vec::new();
-    for crate_directory in [
-        "vilan-core",
-        "vilan-cli",
-        "vilan-lsp",
-        "vilan-wasm",
-        "vilan-rust",
-    ] {
-        walk(
-            &root.join("crates").join(crate_directory).join("src"),
-            "rs",
-            &mut paths,
-        );
+    for crate_directory in workspace_crates() {
+        walk(&crate_directory.join("src"), "rs", &mut paths);
     }
     walk(&root.join("vilan/std/src"), "vl", &mut paths);
     walk(&root.join("vilan/macro_std"), "vl", &mut paths);
@@ -722,21 +755,10 @@ fn message_sources() -> Vec<PathBuf> {
 /// `tests/` is where most of the class lives, because that is where the `.vl`
 /// program consts are.
 fn rust_sources() -> Vec<PathBuf> {
-    let root = repository_root();
     let mut paths = Vec::new();
-    for crate_directory in [
-        "vilan-core",
-        "vilan-cli",
-        "vilan-lsp",
-        "vilan-wasm",
-        "vilan-rust",
-        "vilan-rt",
-        "vilan-ide",
-        "vilan-embedded-std",
-    ] {
-        let base = root.join("crates").join(crate_directory);
-        walk(&base.join("src"), "rs", &mut paths);
-        walk(&base.join("tests"), "rs", &mut paths);
+    for crate_directory in workspace_crates() {
+        walk(&crate_directory.join("src"), "rs", &mut paths);
+        walk(&crate_directory.join("tests"), "rs", &mut paths);
     }
     paths
 }
@@ -1651,6 +1673,59 @@ fn the_index_is_well_formed() {
             "row {number} is recorded as keyless but appears in the index"
         );
     }
+}
+
+/// N104: every crate the workspace declares is inside this file's walks.
+///
+/// A crate the walks miss is invisible twice over — its messages escape check
+/// (3), and a row keyed on one of its sentences reads as stale in check (2) —
+/// and the miss is silent in both directions, which is how `vilan-rust`
+/// shipped user-facing refusals outside the ledger for an order. The list is
+/// derived from the root manifest now, so the question this asks is whether
+/// the DERIVATION still holds: that every member's `src/` was reached, and
+/// that the count is the count the manifest declares.
+#[test]
+fn every_workspace_crate_is_walked() {
+    let crates = workspace_crates();
+    let sources = message_sources();
+    let rust = rust_sources();
+
+    let unreached: Vec<String> = crates
+        .iter()
+        .filter(|crate_directory| {
+            let source_root = crate_directory.join("src");
+            !source_root.is_dir()
+                || !sources.iter().any(|path| path.starts_with(&source_root))
+                || !rust.iter().any(|path| path.starts_with(&source_root))
+        })
+        .map(|crate_directory| format!("  {}", crate_directory.display()))
+        .collect();
+    assert!(
+        unreached.is_empty(),
+        "{} workspace crate(s) contribute no source to the ledger's walks. A \
+         crate outside them is invisible to checks (2) and (3) both — its \
+         messages are never enumerated and a row keyed on one reads as \
+         stale:\n{}",
+        unreached.len(),
+        unreached.join("\n")
+    );
+
+    // And the derivation reaches all of them rather than the first few: the
+    // count is the manifest's, read independently of the parse above.
+    let declared = read("Cargo.toml")
+        .lines()
+        .skip_while(|line| !line.contains("members = ["))
+        .take_while(|line| !line.trim_start().starts_with(']'))
+        .filter(|line| line.trim_start().starts_with('"'))
+        .count();
+    assert_eq!(
+        crates.len(),
+        declared,
+        "`workspace_crates` read {} member(s) where the manifest declares {} — \
+         the members list's shape moved",
+        crates.len(),
+        declared
+    );
 }
 
 #[test]
