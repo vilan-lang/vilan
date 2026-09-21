@@ -1168,9 +1168,14 @@ const CAPABILITY_CLAIMS: &[CapabilityClaim] = &[
     ("**Formatting**", true, |c| {
         c.document_formatting_provider.is_some()
     }),
-    ("there is no range or on-type formatting", false, |c| {
+    ("there is no range formatting", false, |c| {
         c.document_range_formatting_provider.is_some()
-            || c.document_on_type_formatting_provider.is_some()
+    }),
+    // E202: on-type formatting exists now, and it does exactly one thing —
+    // which is why the page's claim is the sentence about the `<` rather than
+    // the LSP feature's name.
+    ("**A generic `<` closes itself.**", true, |c| {
+        c.document_on_type_formatting_provider.is_some()
     }),
     ("**Linked editing**", true, |c| {
         c.linked_editing_range_provider.is_some()

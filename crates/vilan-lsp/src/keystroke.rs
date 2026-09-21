@@ -943,7 +943,7 @@ pub fn cursor_context(text: &str, offset: usize) -> CursorContext {
     CursorContext::Scope { prefix }
 }
 
-fn is_identifier_char(character: char) -> bool {
+pub(crate) fn is_identifier_char(character: char) -> bool {
     character.is_alphanumeric() || character == '_'
 }
 

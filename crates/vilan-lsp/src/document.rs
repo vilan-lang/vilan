@@ -23,7 +23,8 @@ use vilan_core::{
 
 use crate::keystroke::{
     Anchor, CursorContext, LandedSnapshot, ModuleSymbols, SymbolEntry, SymbolIndex, Verdict,
-    candidates, cursor_context, module_name_of, shape_stamp, sort_and_deoverlap, syntax_tokens_in,
+    candidates, cursor_context, is_identifier_char, module_name_of, shape_stamp,
+    sort_and_deoverlap, syntax_tokens_in,
 };
 use crate::line_index::LineIndex;
 use crate::references::{Definition, DefinitionKind, ReferenceIndex};
@@ -2900,6 +2901,104 @@ impl Document {
             find_linked_tags(item, offset, &mut found);
         }
         found
+    }
+
+    /// The edits the server makes in answer to a character the author just
+    /// typed (`textDocument/onTypeFormatting`) — today exactly one: the `>`
+    /// that closes a `<` opened in TYPE position (E202, R9 at Order 39's GO).
+    ///
+    /// **Why the server and not `autoClosingPairs`.** `<` is also the
+    /// comparison operator, and a static language-configuration pair cannot
+    /// tell `List<` from `a < b`: its only filter is `notIn: [string, comment]`,
+    /// so pairing `<` there would grow a `>` in every comparison anybody types.
+    /// The server knows which is which, because it knows what the names mean.
+    ///
+    /// The rule, and it is deliberately narrow — a wrong `>` is worse than a
+    /// missing one, since the author has to delete a character they did not
+    /// type, in the middle of an expression:
+    ///
+    /// 1. The typed character is `<`, and the position is code (not inside a
+    ///    string body or after a `//` on the same line).
+    /// 2. The `<` sits IMMEDIATELY after an identifier — no space between. A
+    ///    comparison is written with spaces by every formatter this project
+    ///    ships, and `vilan fmt` is not optional here.
+    /// 3. That identifier either names a generic-capable declaration the
+    ///    analysis knows (a struct, enum or trait — `List<`, `Map<`,
+    ///    `Option<`, or a generic function's turbofish `echo<`), or it is a
+    ///    declaration's own name being given a type-parameter list, which is
+    ///    the token before it: `fun`, `struct`, `enum`, `trait`, `impl` or
+    ///    `type`.
+    ///
+    /// A binding, a literal and a bare word the analysis has never seen fail
+    /// all three readings and get nothing, which is the answer for `a < b`,
+    /// `count<10` and a name mid-rename. The retained program is the one the
+    /// last analysis produced, so this keeps working while the buffer is
+    /// mid-edit — the whole point of asking the server.
+    ///
+    /// The span is zero-width at `offset` (just past the `<`), so the client
+    /// inserts and leaves the caret where it is, which is what an auto-closing
+    /// pair does.
+    pub fn on_type_edits(&self, offset: usize, typed: &str) -> Vec<(Span, String)> {
+        if typed != "<" || !self.opens_a_generic_list(offset) {
+            return Vec::new();
+        }
+        vec![(Span::from(offset..offset), ">".to_string())]
+    }
+
+    /// Whether the `<` ending at `offset` opens a generic argument or
+    /// type-parameter list — [`on_type_edits`](Self::on_type_edits)'s rule.
+    fn opens_a_generic_list(&self, offset: usize) -> bool {
+        let text = &self.text;
+        let Some(open) = offset.checked_sub(1) else {
+            return false;
+        };
+        if text.as_bytes().get(open).copied() != Some(b'<') {
+            return false;
+        }
+        if cursor_context(text, open) == CursorContext::None {
+            return false;
+        }
+        // The identifier the `<` is glued to.
+        let head = &text[..open];
+        let name_start = head
+            .rfind(|character: char| !is_identifier_char(character))
+            .map_or(0, |position| {
+                position + head[position..].chars().next().map_or(1, char::len_utf8)
+            });
+        let name = &head[name_start..];
+        if name.is_empty() {
+            return false;
+        }
+        // A declaration's own type-parameter list: `fun name<`, `struct Name<`,
+        // and the three beside them. Read before the program, because the
+        // declaration being written is by definition not in it yet.
+        let before = head[..name_start].trim_end();
+        let keyword_start = before
+            .rfind(|character: char| !is_identifier_char(character))
+            .map_or(0, |position| {
+                position + before[position..].chars().next().map_or(1, char::len_utf8)
+            });
+        if matches!(
+            &before[keyword_start..],
+            "fun" | "struct" | "enum" | "trait" | "impl" | "type"
+        ) {
+            return true;
+        }
+        let Some(program) = self.program.as_ref() else {
+            return false;
+        };
+        program
+            .structs
+            .values()
+            .any(|structure| structure.name == name)
+            || program
+                .enums
+                .values()
+                .any(|enumeration| enumeration.name == name)
+            || program.traits.values().any(|trait_| trait_.name == name)
+            || program.functions.values().any(|function| {
+                function.name == name && !function.generic_parameter_constraint_ids.is_empty()
+            })
     }
 
     pub fn hover(&self, offset: usize) -> Option<String> {
@@ -13630,6 +13729,96 @@ pub(crate) mod tests {
         )
         .expect("hovering the field should produce a label");
         assert_eq!(hover, "```vilan\nx: i32\n```");
+    }
+
+    // --- E202: the server places a generic `<`'s `>` ------------------------
+
+    /// The `>` the server would insert for a `<` just typed at the marker, or
+    /// `None` when it declines. The marker stands where the caret is — one past
+    /// the `<` — which is the position `onTypeFormatting` sends.
+    fn closing_angle_at(src: &str) -> Option<usize> {
+        let offset = src.find('¦').expect("test source needs a `¦` marker");
+        let text = src.replace('¦', "");
+        let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
+        let edits = document.on_type_edits(offset, "<");
+        assert!(edits.len() <= 1, "one edit or none: {edits:?}");
+        edits.first().map(|(span, replacement)| {
+            assert_eq!(replacement, ">");
+            assert_eq!(
+                span.into_range(),
+                offset..offset,
+                "a zero-width insertion at the caret"
+            );
+            span.into_range().start
+        })
+    }
+
+    #[test]
+    fn e202_a_generic_type_name_gets_its_closing_angle() {
+        for source in [
+            // A std container, in an annotation and in a turbofish-style call.
+            "fun main() {\n\tlet xs: List<¦\n}\n",
+            "fun main() {\n\tlet m: Map<¦\n}\n",
+            "fun main() {\n\tlet o: Option<¦\n}\n",
+            // A user struct and a user enum.
+            "struct Holder<type T> {\n\tvalue: T,\n}\n\nfun main() {\n\tlet h: Holder<¦\n}\n",
+            "enum Either<type L, type R> {\n\tLeft(L),\n\tRight(R),\n}\n\nfun main() {\n\tlet e: Either<¦\n}\n",
+            // A generic function's own written argument list.
+            "fun echo<T>(value: T): T {\n\tvalue\n}\n\nfun main() {\n\tlet _s = echo<¦\n}\n",
+            // A DECLARATION's type-parameter list — decided by the keyword
+            // before the name, because the declaration being written is not in
+            // the analyzed program yet.
+            "fun pair<¦\n",
+            "struct Pair<¦\n",
+            "enum Choice<¦\n",
+            "trait Shaped<¦\n",
+            "impl Holder<¦\n",
+        ] {
+            assert!(
+                closing_angle_at(source).is_some(),
+                "a generic `<` must close itself: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn e202_a_comparison_gets_nothing() {
+        // The hazard the whole item turns on. Every one of these is a `<` that
+        // must stay a `<`.
+        for source in [
+            // The spaced comparison `vilan fmt` writes.
+            "fun main() {\n\tlet a = 1;\n\tlet b = 2;\n\tlet _c = a <¦\n}\n",
+            // And the unspaced one somebody types.
+            "fun main() {\n\tlet a = 1;\n\tlet _c = a<¦\n}\n",
+            // A literal, and a name the analysis has never seen.
+            "fun main() {\n\tlet _c = 10<¦\n}\n",
+            "fun main() {\n\tlet _c = whatever<¦\n}\n",
+            // A `<` inside a string body and after a `//` are not code.
+            "fun main() {\n\tlet _s = \"a <¦\n}\n",
+            "fun main() {\n\t// List<¦\n}\n",
+        ] {
+            assert_eq!(
+                closing_angle_at(source),
+                None,
+                "this `<` must stay a `<`: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn e202_only_a_typed_angle_asks_for_an_edit() {
+        // The handler is registered for `<` alone, and the document agrees:
+        // every other character it could be handed answers with no edits.
+        let text = "fun main() {\n\tlet xs: List<\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let offset = text.find('<').expect("the angle") + 1;
+        assert!(!document.on_type_edits(offset, "<").is_empty());
+        for typed in [">", "(", "{", "\"", "`", "a"] {
+            assert!(
+                document.on_type_edits(offset, typed).is_empty(),
+                "{typed:?} must ask for nothing"
+            );
+        }
     }
 
     // --- E204: a field's `///` reaches every field position -----------------

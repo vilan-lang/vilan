@@ -2670,6 +2670,17 @@ fn server_capabilities() -> ServerCapabilities {
         })),
         document_symbol_provider: Some(OneOf::Left(true)),
         document_formatting_provider: Some(OneOf::Left(true)),
+        // E202 (R9): the `>` that closes a `<` opened in TYPE position. `<` is
+        // also the comparison operator, and a static `autoClosingPairs` entry
+        // cannot tell the two apart — its only filter is
+        // `notIn: [string, comment]` — so the decision is the server's, where
+        // the names have meanings. Whole-document formatting is still the only
+        // thing `formatting` does; this shares nothing with it but the LSP
+        // family name.
+        document_on_type_formatting_provider: Some(DocumentOnTypeFormattingOptions {
+            first_trigger_character: "<".to_string(),
+            more_trigger_character: None,
+        }),
         completion_provider: Some(CompletionOptions {
             // `.` and `:` (the second `:` of `::`) re-trigger completion so
             // member/path candidates appear without a manual invoke.
@@ -3602,6 +3613,38 @@ impl LanguageServer for Backend {
                 result_id: None,
                 data,
             })))
+        })
+    }
+
+    /// E202 (R9): the `>` that closes a `<` the author opened in TYPE position.
+    ///
+    /// LIVE coordinates, in and out, for `linked_editing_range`'s reason: the
+    /// client sends the position it has just typed into and applies the edit to
+    /// the buffer it has now, so naming a position in the ANALYZED snapshot
+    /// would insert into whatever code had moved into those offsets during the
+    /// debounce. The decision itself reads the retained program (which names
+    /// are types), and that is a question about the last landing rather than
+    /// about the current keystroke.
+    async fn on_type_formatting(
+        &self,
+        params: DocumentOnTypeFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        self.fenced("onTypeFormatting", Ok(None), || {
+            let uri = params.text_document_position.text_document.uri;
+            let position = params.text_document_position.position;
+            let Some(document) = self.documents.get(&uri) else {
+                return Ok(None);
+            };
+            let offset = document.line_index.offset(position);
+            let edits: Vec<TextEdit> = document
+                .on_type_edits(offset, &params.ch)
+                .into_iter()
+                .map(|(span, new_text)| TextEdit {
+                    range: document.line_index.range(&span),
+                    new_text,
+                })
+                .collect();
+            Ok((!edits.is_empty()).then_some(edits))
         })
     }
 
