@@ -341,7 +341,13 @@ is the current directory. Formatting is conservative and a fixed point:
   untouched, never half-formatted — and **said out loud**, not silently. One
   `declined <file>:<line>` line names it and what the formatter met: a
   construct the printer has no rule for yet, a reprint its own safety net
-  threw away, or a file that does not lex or parse.
+  threw away, a reprint that is not a Vilan file, or a file that does not lex
+  or parse. The safety net is two checks, not one: the reprint must carry the
+  source's tokens, **and** it must read back as a Vilan file — the formatter
+  parses its own output before it writes anything. The second check is not
+  implied by the first, because the token comparison deliberately ignores an
+  insignificant trailing comma, so a printer that wrote one in the wrong place
+  would satisfy it with output nothing can parse.
 
 `--check` reports the files that would change and exits 1 if any (the
 CI spelling). Nothing is rewritten.

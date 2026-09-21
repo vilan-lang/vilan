@@ -4,8 +4,10 @@
 //!
 //! Safety: reprinting from the AST could, given a bug, silently change a program.
 //! So `format` re-lexes its own output and checks the token stream matches the
-//! input's (ignoring spans, whitespace, and comments); on any mismatch it returns
-//! the source unchanged rather than risk corrupting the file.
+//! input's (ignoring spans, whitespace, and comments), and then re-PARSES it, so
+//! a printer bug cannot write a file that does not read back (E209); on any
+//! failure it returns the source unchanged rather than risk corrupting the file.
+//! [`verify_reprint`] is where both checks live and why they are two.
 
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -2917,6 +2919,12 @@ pub enum DeclineReason {
     /// threw it away. Also a printer gap, and a worse one: the rule exists and
     /// is wrong.
     WouldChangeTheCode,
+    /// The reprint carried the source's token stream — the net above was
+    /// satisfied — and is still not a Vilan file: it does not lex, or it does
+    /// not parse (E209). The worst printer gap of the four, because it is the
+    /// one the token-stream net cannot see; see [`verify_reprint`] for why the
+    /// two checks are independent.
+    ReprintDoesNotParse,
 }
 
 /// What [`reprint`] declined on: the reason, and — for a printer gap — the
@@ -2944,6 +2952,12 @@ impl Decline {
             DeclineReason::WouldChangeTheCode => format!(
                 "reprinting it would have changed the code, so the reprint was \
                  thrown away (the formatter's own safety net): `{}`",
+                self.construct
+            ),
+            DeclineReason::ReprintDoesNotParse => format!(
+                "reprinting it produced text that is not a Vilan file, so the \
+                 reprint was thrown away (the formatter's own safety net): the \
+                 printer's output reads `{}` where it stops being readable",
                 self.construct
             ),
         }
@@ -3001,17 +3015,92 @@ pub fn reprint(original: &str) -> Result<String, Decline> {
     if let Some(declined) = printer.declined {
         return Err(decline(source, DeclineReason::NoRule, declined.span));
     }
-    let matches = code_tokens(&printer.out)
-        .is_some_and(|reprinted| normalize(reprinted) == normalize(original_tokens));
-    if matches {
-        Ok(printer.out)
-    } else {
-        // The safety net has no span to offer — it compares two whole token
-        // streams — so it names the file's first item, which is as close as the
-        // net can get to "where to start looking".
-        let first = items.first().map(|(_, span)| *span);
-        Err(decline(source, DeclineReason::WouldChangeTheCode, first))
+    verify_reprint(source, original_tokens, &items, &printer.out)?;
+    Ok(printer.out)
+}
+
+/// The safety net over a finished reprint: the two independent checks that
+/// stand between the printer and the file on disk. `Ok(())` means the reprint
+/// is safe to write.
+///
+/// **(a) The token stream.** The reprint must carry the source's tokens, up to
+/// trivia and the canonical orders [`normalize`] folds in.
+///
+/// **(b) The reprint must be a Vilan file** (E209). Not implied by (a), and
+/// that is the whole reason it exists: three of `normalize`'s
+/// canonicalizations are DELETIONS — [`drop_trailing_commas`],
+/// [`drop_anonymous_binder_keywords`], [`drop_redundant_import_aliases`] — so
+/// two streams that are not the same stream normalize to the same stream, by
+/// design. That is how (a) accepts the printer writing a trailing comma in or
+/// out, and it is also how a printer emitting `fun main() {,}` passes (a) with
+/// output the parser rejects: the stray comma is dropped from both sides.
+/// N108's real bug — a `const { … }` statement printed without its `;` — was
+/// caught by (a) only because that particular loss happened to be visible to
+/// it; the same loss inside a canonicalized shape would have shipped a file
+/// that does not parse. One more whole-buffer parse per format is the price,
+/// and it is paid only on (a)'s success path.
+fn verify_reprint(
+    source: &str,
+    original_tokens: Vec<Token<'_>>,
+    items: &NodeList<'_>,
+    reprinted: &str,
+) -> Result<(), Decline> {
+    let canonical_source = normalize(original_tokens);
+    match code_tokens(reprinted).map(normalize) {
+        Some(canonical_reprint) if canonical_reprint == canonical_source => {}
+        Some(_) => {
+            // The safety net has no span to offer — it compares two whole
+            // token streams — so it names the file's first item, which is as
+            // close as the net can get to "where to start looking".
+            let first = items.first().map(|(_, span)| *span);
+            return Err(decline(source, DeclineReason::WouldChangeTheCode, first));
+        }
+        // A reprint that does not even lex cannot be compared, and it is
+        // exactly (b)'s class — so it takes (b)'s answer rather than being
+        // reported as a token drift the net could not actually measure.
+        None => return Err(reprint_is_not_a_vilan_file(reprinted)),
     }
+    if unreadable_line_of(reprinted).is_some() {
+        return Err(reprint_is_not_a_vilan_file(reprinted));
+    }
+    Ok(())
+}
+
+/// The [`DeclineReason::ReprintDoesNotParse`] decline, naming the line of the
+/// PRINTER'S OWN OUTPUT where the output stops being readable.
+///
+/// The construct comes from the reprint, not the source, because that is where
+/// the defect is — and [`Decline::line`] is deliberately `None` for it: the
+/// number would be a line of a text the reader cannot see, and a tool printing
+/// `file:line` would send them to the wrong place in the file they can. The
+/// line's TEXT is what travels, since it is usually greppable in the source.
+fn reprint_is_not_a_vilan_file(reprinted: &str) -> Decline {
+    Decline {
+        reason: DeclineReason::ReprintDoesNotParse,
+        construct: unreadable_line_of(reprinted).unwrap_or_default(),
+        line: None,
+    }
+}
+
+/// The first line of `text` that the lexer or the parser refuses, trimmed —
+/// `None` when `text` is a Vilan file. The formatter's own output is the only
+/// caller: this is E209's check.
+///
+/// Lexing is asked first and separately, because [`crate::parsing`] tokenizes
+/// and then parses whatever tokens it got: a source that does not lex can
+/// still reach the parser with a clean-looking stream, so a parse alone would
+/// wave an unlexable reprint through.
+fn unreadable_line_of(text: &str) -> Option<String> {
+    let (_, lex_errors) = crate::lexing::tokenize(text);
+    if let Some(error) = lex_errors.first() {
+        let at = Span::new((), error.position..error.position);
+        return Some(line_text_at(text, at));
+    }
+    BUFFER_PARSES.with(|count| count.set(count.get() + 1));
+    let (_, parse_errors) = crate::parsing::parse_preserving_groups(text);
+    parse_errors
+        .first()
+        .map(|error| line_text_at(text, error.span))
 }
 
 /// Builds the [`Decline`] a reprint answers with: the reason, and the construct
@@ -3053,6 +3142,37 @@ fn first_line_at(source: &str, span: Span) -> String {
         .next()
         .unwrap_or_default()
         .trim();
+    clip(text)
+}
+
+/// The whole source LINE `span` starts on, trimmed and clipped.
+///
+/// The companion to [`first_line_at`], for a decline anchored at a TOKEN
+/// rather than at a node. A token's own text is usually no help to a reader —
+/// N108's lost terminator is a bare `;`, and `` `;` `` names nothing — while
+/// the line it sits on is `};`, which is exactly the construct to go and look
+/// at. Sliced through `get` for the same reason [`line_of`] is: a formatter
+/// that panics on a span is worse than one that declines.
+fn line_text_at(source: &str, span: Span) -> String {
+    let at = span.into_range().start.min(source.len());
+    let start = source
+        .get(..at)
+        .unwrap_or_default()
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let line = source
+        .get(start..)
+        .unwrap_or_default()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim();
+    clip(line)
+}
+
+/// One line of a decline's construct, clipped so a tool's output stays one
+/// line however wide the source's was.
+fn clip(text: &str) -> String {
     const CLIP: usize = 120;
     if text.chars().count() > CLIP {
         format!("{}…", text.chars().take(CLIP).collect::<String>())
@@ -14878,5 +14998,113 @@ mod declines {
         assert_eq!(first_line_at(source, span), "fun one() {");
         let second = source.find("fun two").expect("the second item");
         assert_eq!(line_of(source, (second..source.len()).into()), 4);
+    }
+}
+
+#[cfg(test)]
+mod reprint_safety_net {
+    //! E209: the token-stream net is not the whole contract.
+    //!
+    //! [`verify_reprint`]'s check (a) compares two NORMALIZED streams, and
+    //! three of [`normalize`]'s canonicalizations are deletions — that is what
+    //! lets the printer write a trailing comma in or out. The same latitude
+    //! lets a printer bug through: `fun main() {,}` normalizes to
+    //! `fun main() {}`, satisfies (a), and does not parse. N108 shipped a
+    //! `const { … }` statement with no `;` and was caught only because that
+    //! loss happened to be visible to (a).
+    //!
+    //! So the printer reads its own output back. These pins plant the bug (a)
+    //! cannot see and hold the decline it now produces.
+
+    use super::{
+        Decline, DeclineReason, Token, code_tokens, normalize, parse, reprint, verify_reprint,
+    };
+
+    /// The planted printer bug: what the printer WOULD have written, handed to
+    /// the safety net in place of its own output. The bug is planted rather
+    /// than found because the printer has no such gap today — and a pin that
+    /// waits for one to appear pins nothing.
+    fn net(source: &str, planted: &str) -> Result<(), Decline> {
+        let tokens: Vec<Token<'_>> = code_tokens(source)
+            .expect("the fixture lexes")
+            .into_iter()
+            .collect();
+        let items = parse(source).expect("the fixture parses");
+        verify_reprint(source, tokens, &items, planted)
+    }
+
+    #[test]
+    fn a_planted_stray_comma_slips_the_token_net_and_is_caught_by_the_re_read() {
+        let source = "fun main() {}\n";
+        let planted = "fun main() {,}\n";
+        // NON-VACUITY, asserted rather than assumed: check (a) — the only
+        // check there was — accepts this output. `drop_trailing_commas` takes
+        // the stray comma out of the reprint's stream, so the two streams are
+        // the same stream and the net has nothing to report.
+        assert_eq!(
+            normalize(code_tokens(planted).expect("the planted output lexes")),
+            normalize(code_tokens(source).expect("the fixture lexes")),
+            "the plant must pass the token net, or it pins nothing"
+        );
+        let declined = net(source, planted).expect_err("the re-read must decline");
+        assert_eq!(declined.reason, DeclineReason::ReprintDoesNotParse);
+        assert_eq!(declined.construct, "fun main() {,}");
+        // The line is withheld: it would be a line of a text the reader cannot
+        // see, and `file:1` would send them to the wrong place in the file
+        // they can.
+        assert_eq!(declined.line, None);
+        assert_eq!(
+            declined.sentence(),
+            "reprinting it produced text that is not a Vilan file, so the reprint \
+             was thrown away (the formatter's own safety net): the printer's output \
+             reads `fun main() {,}` where it stops being readable"
+        );
+    }
+
+    #[test]
+    fn the_construct_a_reprint_decline_names_is_the_output_line_that_stopped_parsing() {
+        // The defect is on the THIRD line of the plant, and that is the line
+        // the decline names — not the file's first item, and not the whole
+        // output.
+        let source = "fun main() {\n\tlet x = 1;\n\tlet y = [x];\n}\n";
+        let planted = "fun main() {\n\tlet x = 1;\n\tlet y = [x,,];\n}\n";
+        let declined = net(source, planted).expect_err("the re-read must decline");
+        assert_eq!(declined.reason, DeclineReason::ReprintDoesNotParse);
+        assert_eq!(declined.construct, "let y = [x,,];");
+    }
+
+    #[test]
+    fn a_planted_output_that_does_not_lex_takes_the_same_reason() {
+        // An unterminated string: the LEXER refuses, so there is no stream to
+        // compare at all. That is E209's class too — the printer wrote
+        // something that is not a Vilan file — and it must not be reported as
+        // a token drift the net never actually measured.
+        let source = "fun main() {\n\tlet x = \"ok\";\n}\n";
+        let planted = "fun main() {\n\tlet x = \"ok;\n}\n";
+        let declined = net(source, planted).expect_err("an unlexable output declines");
+        assert_eq!(declined.reason, DeclineReason::ReprintDoesNotParse);
+        assert_eq!(declined.construct, "let x = \"ok;");
+    }
+
+    #[test]
+    fn a_token_drift_keeps_its_own_reason() {
+        // The pre-existing net still answers first: a plant that CHANGES the
+        // token stream is `WouldChangeTheCode`, not the new reason, however
+        // badly it parses.
+        let source = "fun main() {\n\tlet x = 1;\n}\n";
+        let planted = "fun main() {\n\tlet x = 2;\n}\n";
+        let declined = net(source, planted).expect_err("a token drift declines");
+        assert_eq!(declined.reason, DeclineReason::WouldChangeTheCode);
+    }
+
+    #[test]
+    fn the_printers_real_output_passes_both_checks() {
+        // The check that matters for every other file in the tree: the real
+        // printer's real output is a Vilan file, so nothing declines here and
+        // the second parse costs correctness nothing.
+        let source = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\n";
+        assert_eq!(reprint(source), Ok(source.to_string()));
+        let formatted = reprint("fun  main( ) {\n let x=1;\n}\n").expect("reprints");
+        assert_eq!(formatted, "fun main() {\n\tlet x = 1;\n}\n");
     }
 }

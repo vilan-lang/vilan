@@ -19129,7 +19129,7 @@ pub(crate) mod tests {
             let declined = vilan_core::formatter::reprint(source)
                 .expect_err("a non-clean source must decline, not reprint");
             // A source-level decline, never a PRINTER GAP: these fixtures are
-            // broken code, and the distinction is the point of the four reasons
+            // broken code, and the distinction is the point of the five reasons
             // — a gap here would be a formatter defect wearing a user's typo as
             // a disguise. (Which of the two source reasons it is depends on the
             // fixture: `RECOVERABLE_INBODY` carries an unterminated token.)
