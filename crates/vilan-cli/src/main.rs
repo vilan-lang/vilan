@@ -251,24 +251,32 @@ fn main() -> ExitCode {
     // it is BOUNDED now (B138/B139/B142, `VILAN_DEPTH_STATS`) — which is what
     // brought this number down from 256 MiB:
     //
-    //   * the PARSER, at 500 levels of nesting. The deepest consumer in the
-    //     pipeline and the one that runs first, so before B142 it reached the
-    //     cliff before either analyzer bound could refuse. Measured through
-    //     this binary on the worst plant (5000 nested parentheses): peak depth
-    //     501, 35.2 MiB unoptimized, ~10 MiB optimized.
-    //   * the phase-1 expression walk, ~36 KiB per level (500 levels, ~18 MiB).
+    //   * the PARSER, at 500 levels of nesting. It runs FIRST, so before B142
+    //     it reached the cliff before either analyzer bound could refuse.
+    //     Measured through this binary on the worst plant (5000 nested
+    //     parentheses): peak depth 501, 34,181 bytes (33.4 KiB) per level of
+    //     source nesting, 16.24 MiB unoptimized, 3.93 MiB optimized.
+    //   * the phase-1 expression walk, 42,464 bytes (41.5 KiB) per level
+    //     (500 levels, ~20.3 MiB) — the deepest consumer by bytes per level.
     //   * the return-inference chain, ~12.8 KiB per call link (500, ~6.4 MiB).
+    //
+    // The parse and walk figures are N101's re-measurement: the record had the
+    // parse frame at ~71.8 KiB a level and 35.2 MiB at the bound, and the walk
+    // at ~36 KiB, and neither reproduces (N97 re-keyed the walk; the parse
+    // numbers are 2.2x what `VILAN_DEPTH_STATS` reads). `deep_nesting.rs` holds
+    // both with the method that produced them, and a canary each.
     //
     // Each refuses with a diagnostic rather than overflowing, and the phases
     // run in SEQUENCE — the parse has unwound before analysis starts — so the
-    // worst case is the largest of them, not their sum: ~35 MiB unoptimized.
-    // Real code is nowhere near it: all 211 corpus entries peak at 23 parser
-    // levels against a bound of 500, and a realistic analysis peaks under 1 MiB.
+    // worst case is the largest of them, not their sum: ~20 MiB unoptimized,
+    // and it is the WALK now rather than the parse. Real code is nowhere near
+    // it: all 211 corpus entries peak at 23 parser levels against a bound of
+    // 500, and a realistic analysis peaks under 1 MiB.
     //
-    // 128 MiB is ~3.6x that measured worst case, and the headroom is not idle.
+    // 128 MiB is ~6.3x that measured worst case, and the headroom is not idle.
     // A macro-world compile NESTS a full pipeline inside the running analysis
     // (see `Document::analyze` in vilan-lsp), so a deep walk carrying a deep
-    // nested parse inside it composes to roughly 53 MiB; this covers that with
+    // nested parse inside it composes to roughly 37 MiB; this covers that with
     // room over. Bounding the parser is what made the number finite at all —
     // before B142 there was no worst case to size anything against, and the
     // margin was standing in for a bound that did not exist.

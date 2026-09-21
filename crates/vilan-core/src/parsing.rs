@@ -2430,8 +2430,13 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// **What the bound buys.** A finite worst case where there was none, which
     /// is what the stack margins are sized from: measured through the CLI on the
     /// worst plant (5000 nested parentheses), a bounded parse peaks at depth 501
-    /// and **35.2 MiB** unoptimized, ~10 MiB optimized, against no ceiling at all
-    /// before. And because the parser will not descend past this, it cannot
+    /// and **16.24 MiB** unoptimized, 3.93 MiB optimized, against no ceiling at
+    /// all before. (Re-measured for N101 — the record said 35.2 MiB and ~10 MiB,
+    /// 2.2× what `VILAN_DEPTH_STATS` reads at this sha; `deep_nesting.rs`'s
+    /// parse pins carry the method and what is and is not settled about the
+    /// difference. `vilan check` and not `vilan build`: on a plant the bound
+    /// refuses, `build` exits before the instrument reports.) And because the
+    /// parser will not descend past this, it cannot
     /// BUILD a tree deeper than it either — so every later walk over the AST is
     /// bounded by construction rather than by a bound of its own.
     ///
