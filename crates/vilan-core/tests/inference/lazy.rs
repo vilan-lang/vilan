@@ -953,10 +953,11 @@ fn a_bare_lazy_says_what_the_form_is() {
     );
 }
 
-// --- §6b, S3: the std retrofit (A103) -------------------------------------
+// --- §6b, S3: the std retrofit (A103, completed by A109) ------------------
 //
-// Four members take a lazy argument: `Option::expect`, `Option::unwrap_or`,
-// `Result::expect` and `Result::unwrap_or`. Each pin reads the retrofit off
+// Five members take a lazy argument: `Option::expect`, `Option::unwrap_or`,
+// `Result::expect`, `Result::unwrap_or` and `Result::expect_err` (A109 — the
+// one the first pass left behind). Each pin reads the retrofit off
 // BEHAVIOUR — a counting side effect in the argument position, which the eager
 // spelling ran on the happy path and the lazy one does not — because that is
 // the whole of what §6b changed. `unwrap_or_else` stays the explicit form and
@@ -1088,6 +1089,55 @@ fn result_expect_builds_its_message_only_on_the_err_path() {
         }
         "#,
         "7\nbuilt 0\n",
+    );
+}
+
+/// A109 — `expect_err`'s mirror image, and the member the first pass missed:
+/// the same position, the same argument shape, and until now the only one of
+/// the five that evaluated it eagerly. The panicking path is the `Ok` one, so
+/// the message is built there and nowhere else: an `Err` leaves the counter at
+/// zero.
+#[test]
+fn result_expect_err_builds_its_message_only_on_the_ok_path() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::result::Result::{ self, Ok, Err };
+
+        mut built = 0;
+
+        fun why(): str {
+            built += 1;
+            "not an error"
+        }
+
+        fun main() {
+            let bad: Result<i32, str> = Err("boom");
+            print(bad.expect_err(i"{why()}"));
+            print(i"built {built}");
+        }
+        "#,
+        "boom\nbuilt 0\n",
+    );
+}
+
+/// The `Ok` path forces the message and panics with the author's own text — a
+/// real `str` by the time `panic` sees it, not a cell (`expect`'s pin, on the
+/// other arm).
+#[test]
+fn result_expect_err_panics_with_the_message_it_was_given() {
+    assert_run_panics(
+        r#"
+        import std::io::print;
+        import std::result::Result::{ self, Ok, Err };
+
+        fun main() {
+            let key = "ada";
+            let good: Result<i32, str> = Ok(7);
+            print(good.expect_err(i"{key} was fine"));
+        }
+        "#,
+        "ada was fine",
     );
 }
 
