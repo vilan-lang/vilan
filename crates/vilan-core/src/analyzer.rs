@@ -11841,6 +11841,7 @@ impl<'src> Analyzer<'src> {
         }
         let skip = |analyzer: &Self, id: Id| restored_enrolment && analyzer.table_entity(id);
         let mut asked = 0usize;
+        crate::drop_plan_stats::reset_literal_evidence();
         let mut memo: HashMap<TypeId, bool> = HashMap::default();
         for function in self.functions.values() {
             if !function.has_body {
@@ -12008,7 +12009,24 @@ impl<'src> Analyzer<'src> {
             Some(Expr::Local(binding) | Expr::Variable(binding) | Expr::Parameter(binding)) => {
                 self.binding_reaches_resource(*binding, nominals, memo)
             }
-            Some(Expr::StructInitializer(struct_id, _)) => nominals.contains(struct_id),
+            // B365: the payload here is the LITERAL's own expression id, not
+            // the struct's declaration — `Expr::StructInitializer(initializer_id,
+            // fields)`, as `resolve_struct_initializer` builds it — so testing
+            // it against the set of struct DEFINITION ids answered `false` for
+            // every program there has ever been. `struct_initializer_to_def` is
+            // the map from the one to the other, written at the same place;
+            // the `EnumVariant` arm beside this one already carries its
+            // declaration's id, which is why only this arm was dead.
+            Some(Expr::StructInitializer(initializer_id, _)) => self
+                .struct_initializer_to_def
+                .get(initializer_id)
+                .is_some_and(|struct_id| {
+                    let reaches = nominals.contains(struct_id);
+                    if reaches {
+                        crate::drop_plan_stats::note_literal_evidence();
+                    }
+                    reaches
+                }),
             Some(Expr::EnumVariant(enum_id, _)) => nominals.contains(enum_id),
             Some(Expr::Call(call_id)) => self.call_reaches_resource(*call_id, nominals, memo),
             _ => false,

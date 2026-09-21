@@ -7998,3 +7998,84 @@ fn m28_the_resource_free_control_still_compiles_and_runs() {
         "2\n8\n",
     );
 }
+
+// --- B365: the enrolment gate's struct-literal arm -----------------------------
+//
+// `expr_is_resource_evidence`'s literal arm read
+// `Expr::StructInitializer(struct_id, _) => nominals.contains(struct_id)`, and
+// that payload is the LITERAL's own expression id — never a struct declaration
+// — so the arm answered `false` for every program there has ever been. It now
+// goes through `struct_initializer_to_def`, the map written at the same place
+// the literal is recorded, exactly as the `EnumVariant` arm beside it already
+// carried its declaration's id.
+//
+// MEASURED, and reported with the repair: the arm is SUBSUMED today. The check
+// above it reads the literal's recorded type and asks
+// `type_mentions_nominal`, whose `Type::Struct(id, ..)` arm is
+// `nominals.contains(&id)` — the same question — so the arm can only decide a
+// literal whose type the solver has NOT recorded at the gate, and seven shapes
+// were probed without producing one (a plain literal, a discarded literal, a
+// literal in a generic body, in a wrapper literal, in a closure, beside a
+// derive, and a resource-holding generic never instantiated;
+// `drop_plan_stats::literal_evidence()` read 0 for all seven). So this pin is
+// the ROUTE, which is what is observable: each shape enrols its body. The
+// counter is the instrument that will show the day a literal reaches the gate
+// untyped.
+
+#[test]
+fn b365_a_struct_literal_of_a_resource_type_enrols_its_body() {
+    let base = r#"
+        import std::io::print;
+
+        resource struct Handle { id: i32 }
+
+        impl Handle with std::drop::Drop {
+        	fun destroy(own self) { print("closed"); }
+        }
+    "#;
+    let shapes = [
+        // A literal returned from a helper.
+        "fun build(): Handle { Handle { id = 1 } }\n\nfun main() { let h = build(); print(h.id); }",
+        // A literal inside another struct's literal.
+        "struct Wrapper { handle: Handle }\n\nfun main() { let w = Wrapper { handle = Handle { id = 1 } }; print(w.handle.id); }",
+        // A literal built inside a closure.
+        "fun main() { let make = || Handle { id = 2 }; let h = make(); print(h.id); }",
+    ];
+    for shape in shapes {
+        let source = format!("{base}\n{shape}\n");
+        let (planned, offered) = drop_plan_enrolment(&source);
+        assert!(
+            planned > 0 && planned < offered,
+            "a body building a resource literal must be ENROLLED, and the gate \
+             must still be selective: planned={planned} offered={offered} for\n{source}"
+        );
+    }
+}
+
+/// The counter is wired: it is reset per analysis and readable. Deliberately
+/// NOT pinned to a value — it reads 0 today because the recorded-type check
+/// subsumes the arm, and the day a literal reaches the gate untyped it should
+/// move without a pin standing in the way.
+#[test]
+fn b365_the_literal_evidence_counter_is_wired() {
+    let (planned, _offered) = drop_plan_enrolment(
+        r#"
+        import std::io::print;
+
+        resource struct Handle { id: i32 }
+
+        impl Handle with std::drop::Drop {
+        	fun destroy(own self) { print("closed"); }
+        }
+
+        fun main() { let h = Handle { id = 1 }; print(h.id); }
+        "#,
+    );
+    assert!(
+        planned > 0,
+        "the body building the resource must be enrolled"
+    );
+    // Reading it is the assertion: an unwired counter is a compile error here,
+    // and a stale one (never reset) would grow across the suite's analyses.
+    let _literal_evidence = vilan_core::drop_plan_stats::literal_evidence();
+}
