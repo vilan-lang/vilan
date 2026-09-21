@@ -18382,11 +18382,33 @@ pub(crate) mod tests {
 
     // Formatting a source that does not parse cleanly degrades to no edit: the
     // formatter's net requires a clean parse, so `format` returns the input
-    // verbatim, and the LSP `formatting` handler turns `formatted == source`
-    // into `Ok(None)` — no edit, no error popup.
+    // verbatim, and the LSP `formatting` handler answers `Ok(None)` — no edit,
+    // no error popup.
+    //
+    // E197: the handler reads `reprint` now, so it also KNOWS this happened and
+    // says so once per file per cause (`main.rs`'s
+    // `formatting_decline_notice`). The answer to the request is unchanged —
+    // there is genuinely nothing to edit — which is what this pin holds; the
+    // decline's own sentence is pinned beside the notice.
     #[test]
     fn a_broken_source_formats_to_no_edit() {
         for source in [RECOVERABLE_INBODY, RECOVERABLE_TOPLEVEL] {
+            let declined = vilan_core::formatter::reprint(source)
+                .expect_err("a non-clean source must decline, not reprint");
+            // A source-level decline, never a PRINTER GAP: these fixtures are
+            // broken code, and the distinction is the point of the four reasons
+            // — a gap here would be a formatter defect wearing a user's typo as
+            // a disguise. (Which of the two source reasons it is depends on the
+            // fixture: `RECOVERABLE_INBODY` carries an unterminated token.)
+            assert!(
+                matches!(
+                    declined.reason,
+                    vilan_core::formatter::DeclineReason::DoesNotLex
+                        | vilan_core::formatter::DeclineReason::DoesNotParse
+                ),
+                "broken code declines at the source, not at the printer: {:?}",
+                declined.reason,
+            );
             assert_eq!(
                 vilan_core::formatter::format(source),
                 source,

@@ -594,6 +594,16 @@ struct Backend {
     /// operation on it is "move this one to the front", and the order IS the
     /// state. Poison-recovering like every other synchronous lock here (E97).
     focus: Arc<std::sync::Mutex<Vec<Url>>>,
+    /// E197: the formatting decline each document was last TOLD about, by
+    /// cause. `window/showMessage` is a toast and format-on-save fires on every
+    /// save, so a file the printer cannot render would raise one per save
+    /// otherwise — which is how a useful message becomes noise the user turns
+    /// off. One per file per cause: the same decline stays quiet, a DIFFERENT
+    /// one speaks (the author moved the construct, or fixed one gap and met
+    /// another), and a format that succeeds clears the entry so the next
+    /// decline is heard again. Evicted on close like every other per-URI table
+    /// here.
+    formatting_declines: Arc<DashMap<Url, String>>,
 }
 
 /// What a cached read of a file is only valid for: the file's length and its
@@ -2722,6 +2732,50 @@ fn formatting_declined(path: &std::path::Path) -> bool {
     vilan_core::manifest::generated_root_covering(path).is_some()
 }
 
+/// E197: the `window/showMessage` a formatting decline earns — or `None`
+/// because this document has already been told about this exact cause.
+///
+/// The silence N90 closed for the terminal was still whole in the editor.
+/// `formatter::format` answers the original bytes on every way out, so the
+/// handler's `formatted == source` test read "the printer cannot render this
+/// file" and "this file is already canonical" as the same thing and returned no
+/// edit for both: format-on-save on a declining file did nothing, said nothing,
+/// and looked exactly like success.
+///
+/// The sentence is [`vilan_core::formatter::Decline::sentence`] — the CLI's own
+/// (`report_decline`), so the two tools name the same construct in the same
+/// words and neither can drift — under a lead-in that says what did not happen,
+/// because a toast arrives with no command line above it to explain itself.
+///
+/// `seen` is the per-document cause record. The KEY is the sentence, not the
+/// reason: the reason is one of four, while the sentence carries the construct,
+/// so moving on to a second unprintable construct in the same file speaks
+/// again.
+fn formatting_decline_notice(
+    seen: &DashMap<Url, String>,
+    uri: &Url,
+    decline: &vilan_core::formatter::Decline,
+) -> Option<String> {
+    let sentence = decline.sentence();
+    if seen.get(uri).is_some_and(|last| *last == sentence) {
+        return None;
+    }
+    seen.insert(uri.clone(), sentence.clone());
+    let name = uri
+        .to_file_path()
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| uri.to_string());
+    let where_ = match decline.line {
+        Some(line) => format!("{name}:{line}"),
+        None => name,
+    };
+    Some(format!("vilan fmt left {where_} unchanged — {sentence}"))
+}
+
 #[cfg(test)]
 mod formatting_gate_tests {
     use super::formatting_declined;
@@ -2801,6 +2855,119 @@ mod formatting_gate_tests {
             "and the hand-written module beside it still formats"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod formatting_decline_notice_tests {
+    //! E197: format-on-save SAYS it declined — once per file per cause.
+    //!
+    //! The handler itself cannot be unit-tested without a `Client` to toast
+    //! into, so the decision is a pure function of the cause record and the
+    //! decline, and this is the pin on it. What the handler adds around it is
+    //! one `show_message` and the `remove` on a successful reprint, both of
+    //! which are one line at the site.
+    use super::formatting_decline_notice;
+    use dashmap::DashMap;
+    use tower_lsp::lsp_types::Url;
+    use vilan_core::formatter::{Decline, DeclineReason};
+
+    fn uri(name: &str) -> Url {
+        Url::parse(&format!("file:///tmp/{name}")).expect("a file url")
+    }
+
+    fn gap(construct: &str, line: usize) -> Decline {
+        Decline {
+            reason: DeclineReason::NoRule,
+            construct: construct.to_string(),
+            line: Some(line),
+        }
+    }
+
+    /// The first decline speaks, and it names the file, the line and the
+    /// construct — "this file did not format" sends a reader into a long module
+    /// looking for what, which is the lesson `report_decline` already learned.
+    #[test]
+    fn the_first_decline_names_the_file_the_line_and_the_construct() {
+        let seen = DashMap::new();
+        let notice = formatting_decline_notice(&seen, &uri("client.vl"), &gap("const {", 7))
+            .expect("the first decline is reported");
+        assert!(notice.contains("client.vl:7"), "{notice}");
+        assert!(notice.contains("const {"), "{notice}");
+        assert!(
+            notice.contains("vilan fmt left"),
+            "the lead-in says what did NOT happen: {notice}"
+        );
+    }
+
+    /// Format-on-save fires on every save. The same cause must go quiet, or the
+    /// message is a toast per save and the user turns it off.
+    #[test]
+    fn the_same_cause_is_reported_once_and_a_different_one_speaks_again() {
+        let seen = DashMap::new();
+        let file = uri("client.vl");
+        assert!(formatting_decline_notice(&seen, &file, &gap("const {", 7)).is_some());
+        assert!(
+            formatting_decline_notice(&seen, &file, &gap("const {", 7)).is_none(),
+            "the second save on the same cause is silent"
+        );
+        // A DIFFERENT construct is a different fact about the file — the author
+        // fixed one gap and met another, or moved this one.
+        assert!(
+            formatting_decline_notice(&seen, &file, &gap("css {", 40)).is_some(),
+            "a new cause speaks"
+        );
+        assert!(formatting_decline_notice(&seen, &file, &gap("css {", 40)).is_none());
+        // And back to the first: the record holds ONE cause, so returning to it
+        // is news again. Cheap, and it cannot go silent forever on a file the
+        // author is editing back and forth.
+        assert!(formatting_decline_notice(&seen, &file, &gap("const {", 7)).is_some());
+    }
+
+    /// Per FILE, not per session: two declining documents each get their word.
+    #[test]
+    fn two_documents_are_reported_independently() {
+        let seen = DashMap::new();
+        let decline = gap("const {", 7);
+        assert!(formatting_decline_notice(&seen, &uri("a.vl"), &decline).is_some());
+        assert!(formatting_decline_notice(&seen, &uri("b.vl"), &decline).is_some());
+        assert!(formatting_decline_notice(&seen, &uri("a.vl"), &decline).is_none());
+    }
+
+    /// The two reasons that carry no construct still produce a readable
+    /// sentence, and the line-less one does not print a bare `:`.
+    #[test]
+    fn a_source_that_does_not_lex_or_parse_reports_without_a_line() {
+        let seen = DashMap::new();
+        for reason in [DeclineReason::DoesNotLex, DeclineReason::DoesNotParse] {
+            let decline = Decline {
+                reason,
+                construct: String::new(),
+                line: None,
+            };
+            let notice =
+                formatting_decline_notice(&seen, &uri(&format!("{reason:?}.vl")), &decline)
+                    .expect("reported");
+            assert!(!notice.contains(".vl:"), "no empty line suffix: {notice}");
+            assert!(notice.ends_with(&decline.sentence()), "{notice}");
+        }
+    }
+
+    /// A clean reprint CLEARS the record (the handler's `remove`), so a decline
+    /// that comes back is heard. Pinned here over the same map the handler
+    /// holds, since that is the whole of the interaction.
+    #[test]
+    fn a_successful_format_lets_the_next_decline_speak() {
+        let seen = DashMap::new();
+        let file = uri("client.vl");
+        let decline = gap("const {", 7);
+        assert!(formatting_decline_notice(&seen, &file, &decline).is_some());
+        assert!(formatting_decline_notice(&seen, &file, &decline).is_none());
+        seen.remove(&file);
+        assert!(
+            formatting_decline_notice(&seen, &file, &decline).is_some(),
+            "after a format that stood, the same decline is news again"
+        );
     }
 }
 
@@ -3186,6 +3353,10 @@ impl LanguageServer for Backend {
         self.revision.fetch_add(1, Ordering::SeqCst);
         self.documents.remove(&uri);
         self.semantic_token_cache.remove(&uri);
+        // E197: and the formatting-decline record, so re-opening the file hears
+        // its decline once more rather than inheriting a silence from a session
+        // the user has forgotten.
+        self.formatting_declines.remove(&uri);
         // M63: give the retained slot back. A closed document holds nothing,
         // and leaving its URI in the focus list would spend one of the two
         // slots on a file that is gone — the next document to be focused would
@@ -3723,33 +3894,60 @@ impl LanguageServer for Backend {
         })
     }
 
+    /// E197: `reprint`, not `format`. A decline is a `window/showMessage`
+    /// (once per file per cause, [`formatting_decline_notice`]) instead of the
+    /// silent no-edit that read as success — the answer to the REQUEST is
+    /// unchanged, since there is genuinely nothing to edit.
+    ///
+    /// The toast is sent after `fenced` returns rather than from inside it: the
+    /// fence's closure is synchronous (that is what makes it a `catch_unwind`
+    /// seam), so the notice travels out beside the answer and is awaited here.
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
-        self.fenced("formatting", Err(handler_panicked()), || {
-            let uri = params.text_document.uri;
+        let (answer, notice) = self.fenced("formatting", (Err(handler_panicked()), None), || {
+            let uri = params.text_document.uri.clone();
             if let Ok(path) = uri.to_file_path()
                 && formatting_declined(&path)
             {
-                return Ok(None);
+                // Not a printer gap: a product under a declared `generated`
+                // root is deliberately not formatted, and saying so on every
+                // save would toast a file the developer only opened to read.
+                return (Ok(None), None);
             }
             let Some(document) = self.documents.get(&uri) else {
-                return Ok(None);
+                return (Ok(None), None);
             };
             let source = document.line_index.text();
-            let formatted = vilan_core::formatter::format(source);
-            // `format` returns the input unchanged when the file is already canonical
-            // or hits a construct it can't print (it never produces non-round-tripping
-            // output) — either way there is nothing to edit.
+            let formatted = match vilan_core::formatter::reprint(source) {
+                Ok(formatted) => formatted,
+                Err(decline) => {
+                    let notice =
+                        formatting_decline_notice(&self.formatting_declines, &uri, &decline);
+                    return (Ok(None), notice);
+                }
+            };
+            // A reprint that equals the source is an already-canonical file —
+            // now distinguishable from a decline, which is the whole item. It
+            // also clears the cause record, so a decline that comes BACK (the
+            // construct re-typed) is heard again.
+            self.formatting_declines.remove(&uri);
             if formatted == source {
-                return Ok(None);
+                return (Ok(None), None);
             }
             // Replace the whole document in one edit, from the start to the end
             // position the line index reports for the final byte.
             let end = document.line_index.position(source.len());
-            Ok(Some(vec![TextEdit {
-                range: Range::new(Position::new(0, 0), end),
-                new_text: formatted,
-            }]))
-        })
+            (
+                Ok(Some(vec![TextEdit {
+                    range: Range::new(Position::new(0, 0), end),
+                    new_text: formatted,
+                }])),
+                None,
+            )
+        });
+        if let Some(notice) = notice {
+            self.client.show_message(MessageType::WARNING, notice).await;
+        }
+        answer
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
@@ -4096,6 +4294,7 @@ mod snapshot_consistency_tests {
             package_revision: Arc::new(DashMap::new()),
             union_tokens: Arc::new(DashMap::new()),
             focus: Arc::new(std::sync::Mutex::new(Vec::new())),
+            formatting_declines: Arc::new(DashMap::new()),
         })
     }
 
@@ -5830,6 +6029,7 @@ async fn main() {
         package_revision: Arc::new(DashMap::new()),
         union_tokens: Arc::new(DashMap::new()),
         focus: Arc::new(std::sync::Mutex::new(Vec::new())),
+        formatting_declines: Arc::new(DashMap::new()),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }

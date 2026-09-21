@@ -518,27 +518,56 @@ fn recompiling_identical_source_interns_the_entry_text() {
 
 #[test]
 fn a_misindented_program_formats_to_the_canonical_layout() {
-    let formatted = vilan_wasm::format_program("fun main() {\n      let a = 1;\n\tprint(a);\n}\n");
+    let outcome = vilan_wasm::format_program("fun main() {\n      let a = 1;\n\tprint(a);\n}\n");
     assert_eq!(
-        formatted, "fun main() {\n\tlet a = 1;\n\tprint(a);\n}\n",
+        outcome.text, "fun main() {\n\tlet a = 1;\n\tprint(a);\n}\n",
         "format must canonicalize indentation the way `vilan fmt` does"
     );
     assert_eq!(
-        vilan_wasm::format_program(&formatted),
-        formatted,
-        "formatting must be idempotent"
+        outcome.declined, None,
+        "a reprint that stands declines nothing"
     );
+    let again = vilan_wasm::format_program(&outcome.text);
+    assert_eq!(again.text, outcome.text, "formatting must be idempotent");
+    assert_eq!(again.declined, None);
 }
 
+/// E197: the page can tell "already canonical" from "the printer could not
+/// render this", which `formatter::format` made indistinguishable — it answers
+/// the original bytes on every way out, so the Format button did nothing and
+/// said nothing on a file it could not print.
 #[test]
-fn a_program_that_does_not_parse_formats_to_itself() {
+fn a_program_that_does_not_parse_formats_to_itself_and_says_so() {
     let broken = "fun main( {\n   let a = ;\n";
+    let outcome = vilan_wasm::format_program(broken);
     assert_eq!(
-        vilan_wasm::format_program(broken),
-        broken,
-        "a bail must return the original bytes untouched — a file the \
+        outcome.text, broken,
+        "a decline must return the original bytes untouched — a file the \
          formatter does not understand is not one to rewrite"
     );
+    assert_eq!(
+        outcome.declined.as_deref(),
+        Some("it does not parse"),
+        "and it must say which of the four ways out it took"
+    );
+    // The already-canonical file is the other side of the same question: same
+    // text back, and NOTHING said — which is what makes the sentence above
+    // information rather than noise.
+    let canonical = "fun main() {\n\tlet a = 1;\n}\n";
+    let clean = vilan_wasm::format_program(canonical);
+    assert_eq!(clean.text, canonical);
+    assert_eq!(clean.declined, None);
+}
+
+/// The printer-gap face, which is the one the item is about: a construct the
+/// safety net throws away reports the construct, not just "no".
+#[test]
+fn a_construct_the_printer_cannot_render_names_itself() {
+    // An unterminated string reaches the LEXER's refusal, the one decline that
+    // carries no construct — pinned so the page's note is never an empty
+    // sentence.
+    let outcome = vilan_wasm::format_program("fun main() {\n\tlet a = \"open;\n}\n");
+    assert_eq!(outcome.declined.as_deref(), Some("it does not lex"));
 }
 
 // --- compile_for: the server check mode's contract ---------------------------

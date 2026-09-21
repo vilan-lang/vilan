@@ -56,7 +56,11 @@ a symbol, they also find the open files that import it.
 
 **Formatting** — the same `vilan_core` formatter `vilan fmt` runs, so the
 editor and the CLI cannot disagree. Whole-document only; there is no range
-or on-type formatting.
+or on-type formatting. When the printer *declines* a file — it does not
+parse, or it carries a construct the printer has no rule for — the server
+says so in a message naming the line and the construct, rather than
+leaving a save that did nothing looking like a save that had nothing to
+do. Once per file per cause, so format-on-save does not repeat it.
 
 **Linked editing** for markup tag pairs: rename `<div>` and `</div>`
 follows.
