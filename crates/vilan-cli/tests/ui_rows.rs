@@ -2850,16 +2850,22 @@ fn a110_nested_swaps_on_one_source_build_no_orphan_subtree_on_sign_out() {
         "navigating back in must build exactly one page; got:\n{stdout}"
     );
 
-    // In a TURN the inner page is still built once and then torn down: the
-    // wave order is child-before-parent (A110 face 1), which is DOOR 2's
-    // ordering rule and not this fix. What door 1 guarantees here is the pair —
-    // every owner created was disposed, and the document holds only the Login
-    // shell — so the wasted build is a wasted build and not a leak.
+    // In a TURN the inner page is not built at all, and THAT is door 2. Under
+    // door 1 alone this read `builds=3 teardowns=3`: the wave ran in
+    // subscription order, the outer reached `route` one derivation later than
+    // the inner, so the inner form rendered a page for `/login` and the outer
+    // tore it down in the next wave — a wasted build door 1 could only make
+    // safe. Door 2 runs the derivation in the wave's FIRST phase, so the outer
+    // effect is in the queue before phase 2 starts and its id is the lower one
+    // (a parent form's effect is created when the parent is PLACED, its child's
+    // when the parent's render runs), and the inner subscription is disposed
+    // before its turn in the queue comes. The pair still balances, which is
+    // door 1's claim, and there is one fewer of each.
     assert_eq!(
         line("turn-signout "),
-        "builds=3 teardowns=3 tree=<root><main><section>sign in</section></main></root>",
-        "signing out in a turn must leave no live page owner and no orphan \
-         subtree; got:\n{stdout}"
+        "builds=2 teardowns=2 tree=<root><main><section>sign in</section></main></root>",
+        "signing out in a turn must build no page for the shell it is leaving, \
+         and must leave no live page owner and no orphan subtree; got:\n{stdout}"
     );
 }
 

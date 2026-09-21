@@ -50,6 +50,18 @@ export struct Subscriber {
 	/// the owning `Subscription` holds, so lowering is O(1) and does not depend
 	/// on finding the entry in any list.
 	live: Shared<bool>,
+	/// CLASS — is this subscriber a DERIVATION (A110 door 2)? A derivation
+	/// exists to publish a value; an effect exists to act on one. `drain` runs
+	/// the derivations of a wave to a fixpoint FIRST and only then the effects,
+	/// which is what makes an effect see a settled graph.
+	///
+	/// A plain field and not a cell, deliberately, where `live` above is a
+	/// cell: liveness CHANGES after the subscriber is made and every copy must
+	/// see the change, and a class never changes at all. It is decided by the
+	/// one thing that mints a subscriber (`observe`) from the mark
+	/// `as_derivation` leaves, and it is read at exactly one place (`enqueue`,
+	/// to pick the bucket).
+	derived: bool,
 }
 
 /// The liveness cell every DEFERRAL subscriber shares — `at_settle`'s and
@@ -63,6 +75,61 @@ export struct Subscriber {
 /// change. A future `Subscriber` that something CAN dispose mints its own, as
 /// `observe` does.
 let always_live: Shared<bool> = Shared::new(true);
+
+/// The DERIVATION MARK (A110 door 2) — set by `as_derivation`, consumed by the
+/// `observe` the marked attach reaches.
+///
+/// Tagging a derivation AT ITS OWN `on_change` call is not something the trait
+/// can express: `Source::map` calls `self.on_change(..)`, and for a generic
+/// source that is the impl's member and not `observe`. But every `Source` in
+/// the world bottoms out in `observe` — `RemoteSource::on_change` is
+/// `self.cache.on_change(observer)`, `KeyedCell`'s is
+/// `self.elements.on_change(observer)` — so the mark is left at the derivation
+/// site and read where the `Subscriber` is actually minted, one layer below
+/// every impl.
+///
+/// CONSUMED rather than merely read, which is what keeps the window one
+/// subscriber wide: `RemoteSource::on_change` attaches and then `acquire()`s,
+/// and a seeding frame arriving inside that call must not be able to mint a
+/// second derivation. The attach is the first statement of every one of those
+/// bodies, so the mark reaches exactly the subscriber it was left for.
+let minting_derivation: Shared<bool> = Shared::new(false);
+
+/// Mark the subscriber the NEXT attach mints as a DERIVATION — one statement
+/// above the attach it describes:
+///
+///     as_derivation();
+///     let _owned = register_with_owner(self.on_change(|value| ..));
+///
+/// A bare statement and not a wrapper, and neither half of that is stylistic.
+/// A CLOSURE wrapper (`as_derivation(|| register_with_owner(..))`, which is
+/// what lane reactive-38's instrument wrote) carries the ambient contexts, and
+/// that put an 8-node component into the no-cycle gate's UNMOUNTED reading
+/// (`reactive_lifetimes::a_disposed_exemplar_holds_no_reactive_cycle`), which
+/// is the one number in the suite that may never be regenerated. A marker
+/// taking the SOURCE and handing it back (`as_derivation(self).on_change(..)`)
+/// reads better and costs a `__clone` of the source per derivation, because
+/// returning a value is a copy — nineteen new copy sites across the corpus.
+/// Nothing is passed and nothing is returned, so neither is bought.
+fun as_derivation() {
+	minting_derivation.write() = true;
+}
+
+/// `as_derivation` in the ARGUMENT position: mark, and hand `observer` straight
+/// back so the mark can be left inside an expression that has no room for a
+/// statement above it. Arguments are evaluated after the receiver and before
+/// the call, so `source.on_change(as_derivation_for(|value| ..))` marks exactly
+/// the attach it is written on.
+///
+/// `combine`'s mapped-tuple comprehension is the caller, and it is the only one:
+/// the comprehension mints a subscriber per input and there is nowhere in it to
+/// put a statement. Nothing is captured and nothing is copied — a closure is a
+/// reference on this backend, where the `source` a `SignalCell`-shaped marker
+/// would take is a struct and would be cloned.
+fun as_derivation_for<T>(observer: |T| void): |T| void {
+	minting_derivation.write() = true;
+	observer
+}
 
 /// Monotonic ids for subscribers — module-level, one counter for the program.
 let next_subscriber_id: Shared<i32> = Shared::new(0);
@@ -122,11 +189,32 @@ export [extern("__guarded")]
 external fun guarded(body: || void): Option<str>;
 
 export struct Turn {
+	// The EFFECT queue, kept ASCENDING BY SUBSCRIBER ID (A110 door 2): the ids
+	// are minted by one monotonic counter and a parent form's effect is created
+	// when the parent is PLACED, before anything its render closure creates, so
+	// ascending id is parent-before-child with no owner-depth bookkeeping
+	// anywhere. `enqueue` does the ordered insert rather than `drain` sorting a
+	// wave, because entries arrive close to in order already — the scan is one
+	// comparison in the common case, against O(k²) for an insertion sort per
+	// wave (reactive-turns.md §7.5: 60 % of the naive cost).
 	pending: Shared<List<Subscriber>>,
+	// The DERIVATION queue (A110 door 2). Bucketed at INSERT time, so `drain`
+	// has nothing to partition: it runs this bucket to a fixpoint and only then
+	// the effects. Unordered — a derivation publishes a value, and the fixpoint
+	// is what makes the order among them unobservable.
+	pending_derived: Shared<List<Subscriber>>,
 	// The ids in `pending`, as a keyed set — `enqueue`'s dedup (A44). Kept in
 	// exact step with `pending`: cleared when a wave is taken out, scrubbed
 	// when a `Subscription` removes itself.
 	queued: Shared<NativeMap<bool>>,
+	// The same dedup for `pending_derived`, and a SECOND map rather than one
+	// map over both queues. The two queues have two wave boundaries, so one
+	// shared map could no longer be cleared wholesale when a wave is taken out
+	// — it would have to lose ids one `remove` at a time, which is a change to
+	// the drain's hot path with a cost of its own (tracker M83, measured
+	// separately). Two maps keep the fresh-map-per-wave shape exactly as it
+	// was, so door 2 is charged for door 2 only.
+	queued_derived: Shared<NativeMap<bool>>,
 	draining: Shared<bool>,
 	// True once the extent's own settle ran; a LATE enqueue (an async
 	// continuation's write) then schedules its own segment-coalesced drain.
@@ -138,11 +226,20 @@ export impl Turn {
 	fun new(): Turn {
 		Turn {
 			pending = Shared::new([]),
+			pending_derived = Shared::new([]),
 			queued = Shared::new(NativeMap::new()),
+			queued_derived = Shared::new(NativeMap::new()),
 			draining = Shared::new(false),
 			settled = Shared::new(false),
 			scheduled = Shared::new(false),
 		}
+	}
+
+	/// Nothing left to run — BOTH queues empty (A110 door 2). The drain's own
+	/// loop condition, named: with two buckets there are two ways for a turn to
+	/// still have work, and a settle is over when neither has any.
+	fun is_quiescent(self): bool {
+		self.pending.read().is_empty() && self.pending_derived.read().is_empty()
 	}
 }
 
@@ -194,12 +291,43 @@ let releasing_turns: Shared<List<Option<Turn>>> = Shared::new([]);
 /// O(n²) — which is exactly the regime `selector` exists to serve, a thousand
 /// rows deep. `queued` holds the ids in `pending` and nothing else, so the
 /// semantics are unchanged, one entry per subscriber per wave.
+///
+/// The entry is ROUTED BY CLASS (A110 door 2). A derivation goes to
+/// `pending_derived`, unordered — the fixpoint is what makes the order among
+/// derivations unobservable. An effect goes to `pending`, INSERTED so that the
+/// queue stays ascending by subscriber id, which is the ordering contract
+/// itself: within one settle, a parent form's effect runs before anything its
+/// render created.
+///
+/// The insert scans BACKWARDS from the end, and that is the whole reason this
+/// is not a sort: a wave's entries arrive close to in order already (one
+/// cell's subscriber list is in attach order, and attach order is creation
+/// order), so the common case is one comparison and a push at the end. A
+/// partition-and-sort per wave measured 2.2× the drain's cost against this
+/// shape's +23.5 % (reactive-turns.md §7.5, §7.10).
 fun enqueue(turn: Turn, subscribers: List<Subscriber>) {
 	for subscriber in subscribers {
 		let key = subscriber.id.hash();
-		if !turn.queued.read().contains_key(key) {
+		if subscriber.derived {
+			if !turn.queued_derived.read().contains_key(key) {
+				turn.queued_derived.write().insert(key, true);
+				turn.pending_derived.write().push(subscriber);
+			}
+		} else if !turn.queued.read().contains_key(key) {
 			turn.queued.write().insert(key, true);
-			turn.pending.write().push(subscriber);
+			// The scan reads through `write()` and not through `read()`, and
+			// that is the difference between O(1) and O(n) PER ENQUEUE: `read()`
+			// yields a VALUE, so binding the queue to a local copies the whole
+			// list (`__clone`), and a wave of n observers on one cell then costs
+			// n² element copies — the shape reactive-turns.md §7.5 records as
+			// "a trap for whoever builds this", measured here at 7.6 s against
+			// 80 ms for A44's 2,000-observer pin. A `&mut` view indexes the
+			// storage in place.
+			mut index = turn.pending.write().len();
+			for index > 0 && turn.pending.write()[index - 1].id > subscriber.id {
+				index -= 1;
+			}
+			turn.pending.write().insert(index, subscriber);
 		}
 	}
 	// A write AFTER the extent settled — an async continuation's — must not
@@ -244,7 +372,32 @@ export fun drain(turn: Turn) {
 		// pops its own entry.
 		with_finally(|| {
 			mut budget = 100000;
-			for !turn.pending.read().is_empty() && budget > 0 {
+			for !turn.is_quiescent() && budget > 0 {
+				// PHASE 1 — DERIVATIONS, to a fixpoint (A110 door 2). A
+				// `map`/`combine`/`flatten`/`selector` subscriber exists to
+				// publish a value, not to act on one, so every derivation the
+				// wave can reach — and every derivation those writes reach,
+				// until nothing new is enqueued — runs before any effect. That
+				// is what extends the dedup's glitch-freeness from "each
+				// subscriber fires once" to "each subscriber fires once, on
+				// final values".
+				for !turn.pending_derived.read().is_empty() && budget > 0 {
+					let derivations = turn.pending_derived.read();
+					turn.pending_derived.write() = [];
+					turn.queued_derived.write() = NativeMap::new();
+					for subscriber in derivations {
+						if subscriber.live.read() {
+							(subscriber.notify)();
+						}
+						budget -= 1;
+					}
+				}
+				// PHASE 2 — EFFECTS, in the order `enqueue` already put them
+				// in: ascending subscriber id, which is parent-before-child
+				// wherever the forms are genuinely nested. Order among
+				// INDEPENDENT observers of one source is NOT part of the
+				// contract (reactive-turns.md §7.10) — it is what this queue
+				// happens to do.
 				let wave = turn.pending.read();
 				turn.pending.write() = [];
 				// The wave is out of the queue, so its ids are free to
@@ -259,6 +412,12 @@ export fun drain(turn: Turn) {
 					// in `pending` — and neither can a disposer whose own ambient
 					// turn is not this one. The budget is charged either way: it
 					// is a cascade cutoff, not a count of work done.
+					//
+					// Door 2 is why the flag rather than a live queue: an effect
+					// that disposes a child EFFECT of the same wave — which is
+					// every nested form's teardown — cannot be asked to reach
+					// into the list phase 2 is walking (reactive-turns.md §7.4,
+					// finding one, resolved by door 1 landing first).
 					if subscriber.live.read() {
 						(subscriber.notify)();
 					}
@@ -322,7 +481,11 @@ export fun at_release_settle(id: i32, action: || void) {
 /// difference between the two callers above is which turn they resolve, and
 /// that question belongs at the seam, not in here.
 fun defer_to_turn(turn: Option<Turn>, id: i32, action: || void) {
-	let deferred = [Subscriber { id, notify = action, live = always_live }];
+	// EFFECT-CLASS (A110 door 2), and not a third class of its own: a deferred
+	// action acts, it does not publish, so it belongs after the derivations
+	// have settled — which is what "when the turn settles" means. Its position
+	// among the effects is its `id`'s, exactly like a notification's.
+	let deferred = [Subscriber { id, notify = action, live = always_live, derived = false }];
 	match turn {
 		Some(let ambient) => enqueue(ambient, deferred),
 		None => {
@@ -541,6 +704,19 @@ export impl Subscription with Disposable {
 				}
 				turn.pending.write() = kept_pending;
 				turn.queued.write().remove(self.id.hash());
+				// BOTH queues (A110 door 2). The handle does not know its
+				// subscriber's class — `derived` is the `Subscriber`'s and this
+				// is the `Subscription` — and it does not need to: an id is in
+				// at most one bucket, so scrubbing both is one wasted walk of an
+				// empty list in the common case and correct in every case.
+				mut kept_derived: List<Subscriber> = [];
+				for subscriber in turn.pending_derived.read() {
+					if subscriber.id != self.id {
+						kept_derived.push(subscriber);
+					}
+				}
+				turn.pending_derived.write() = kept_derived;
+				turn.queued_derived.write().remove(self.id.hash());
 			},
 			None => {},
 		}
@@ -830,6 +1006,10 @@ export trait Source<T> {
 	/// wants.
 	fun map<U>(self, transform: sync |T| U): SignalCell<U> {
 		let derived = SignalCell::new(transform(self.get()));
+		// A DERIVATION (A110 door 2): it publishes rather than acts, so it runs
+		// in the wave's first phase and every effect downstream of it sees the
+		// settled value.
+		as_derivation();
 		let _owned = register_with_owner(self.on_change(|value| {
 			derived.set(transform(value));
 		}));
@@ -967,9 +1147,16 @@ export fun observe<T>(signal: SignalCell<T>, observer: |T| void): Subscription {
 	// `Subscriber` the list carries and by the `Subscription` handed back, so
 	// `dispose` lowers it in O(1) without having to find the entry again.
 	let live: Shared<bool> = Shared::new(true);
+	// The CLASS (A110 door 2), read off the mark `as_derivation` left and
+	// CLEARED here: this is the one place a `Subscriber` is minted, so it is
+	// the one place the mark can be spent, and spending it is what keeps the
+	// mark from reaching a second attach further down the same call.
+	let derived = minting_derivation.read();
+	minting_derivation.write() = false;
 	signal.subscribers.write().push(Subscriber {
 		id,
 		live,
+		derived,
 		notify = || {
 			match cell.upgrade() {
 				// `upgrade` rather than `get`: `observer` takes a VALUE, and
@@ -1138,9 +1325,17 @@ export fun combine<T: (2..)>(sources: (U in T: SignalCell<U>)): SignalCell<T> {
 	// `on_change` attaches without the call. The handles are the AMBIENT
 	// OWNER's from here on — the tuple itself is what is dropped, not the
 	// subscriptions.
-	let _owned = (source in sources => register_with_owner(source.on_change(|_| {
+	// Each is a DERIVATION (A110 door 2), and the mark has to be left ONCE PER
+	// INPUT, because `observe` spends one mark per subscriber and the tuple
+	// mints one subscriber per input. So it is left in the ARGUMENT position
+	// (`as_derivation_for`), where an argument is evaluated after the receiver
+	// and before the call: a statement above the comprehension would mark only
+	// the first, and a BLOCK for the element is not an option — the emitter
+	// drops a mapped-tuple element that is a block, statements and all, with no
+	// diagnostic (found here, filed as a miscompile).
+	let _owned = (source in sources => register_with_owner(source.on_change(as_derivation_for(|_| {
 		derived.set(snapshot());
-	})));
+	}))));
 	derived
 }
 
@@ -1187,6 +1382,9 @@ export struct Selector<T> {
 export fun selector<T: Hashable + PartialEq, S: Source<T>>(source: S): Selector<T> {
 	let cells: Shared<NativeMap<SignalCell<bool>>> = Shared::new(NativeMap::new());
 	let current: Shared<T> = Shared::new(source.get());
+	// A DERIVATION (A110 door 2): its two writes publish the per-key cells, and
+	// a row's own effect must see them settled.
+	as_derivation();
 	let _owned = register_with_owner(source.on_change(|value| {
 		let previous = current.read();
 		current.write() = value;
@@ -1249,8 +1447,13 @@ export impl type S: Source<type I: Source<type U>> {
 		let derived = SignalCell::new(self.get().get());
 		let inner_subscription: Shared<Option<Subscription>> = Shared::new(None);
 		// `sub` runs its observer immediately, so the first inner wires here too.
+		// BOTH subscriptions are DERIVATIONS (A110 door 2) — the outer switches
+		// which inner publishes, the inner publishes — and each attach spends
+		// its own mark, the inner's inside the observer the outer's `sub` runs.
+		as_derivation();
 		let _outer = register_with_owner(self.sub(|inner| {
 			inner_subscription.read()?.dispose();
+			as_derivation();
 			inner_subscription.write() = Some(inner.sub(|value| {
 				derived.set(value);
 			}));
@@ -1282,10 +1485,13 @@ export impl type S: Source<Option<type I: Source<type U>>> {
 			None => None,
 		});
 		let inner_subscription: Shared<Option<Subscription>> = Shared::new(None);
+		// DERIVATIONS, both halves, exactly as in the total join above.
+		as_derivation();
 		let _outer = register_with_owner(self.sub(|held| {
 			inner_subscription.read()?.dispose();
 			match held {
 				Some(let inner) => {
+					as_derivation();
 					inner_subscription.write() = Some(inner.sub(|value| {
 						derived.set(Some(value));
 					}));
