@@ -26,6 +26,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::rc;
 use std::rc::Rc;
 
 // ---------------------------------------------------------------- strings ---
@@ -335,6 +336,85 @@ impl<T> Shared<T> {
     /// The count, for the measurement C14 S4 will want and for tests here.
     pub fn strong_count(&self) -> usize {
         Rc::strong_count(&self.inner)
+    }
+
+    /// This CELL's identity — the same number for every handle to one cell,
+    /// different for every other cell, stable for a run (`shared.vl`'s
+    /// `identity`). The JS backend mints a counter per cell; here the cell's
+    /// own address IS its identity, and it is narrowed to the `i53` range the
+    /// language promises.
+    pub fn identity(&self) -> i64 {
+        (Rc::as_ptr(&self.inner) as usize as u64 & 0x1f_ffff_ffff_ffff) as i64
+    }
+
+    /// The back-edge handle (`shared.vl`'s `downgrade`): it names the cell and
+    /// does not keep it alive.
+    pub fn downgrade(&self) -> Weak<T> {
+        Weak {
+            inner: Rc::downgrade(&self.inner),
+        }
+    }
+}
+
+/// Reference equality, which is what `==` between two cells means on the JS
+/// backend: a `Shared` is an object there, and two of them compare `===`, so
+/// the answer is whether they are the SAME cell. Cloning a handle keeps the
+/// answer `true`, which is the property the reactive code relies on.
+impl<T> PartialEq for Shared<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+/// A cell prints as the object the JS backend spells it with: `{ v: value }`,
+/// with node's spacing.
+impl<T: Js> Js for Shared<T> {
+    fn js(&self) -> String {
+        format!("{{ v: {} }}", self.inner.borrow().js_nested())
+    }
+}
+
+/// `Weak<T>` — a handle that names a [`Shared`] cell without keeping it alive.
+///
+/// On the JS backend `downgrade` is the identity and `upgrade` is always
+/// `Some`, because nothing counts there; here the count is real, so `upgrade`
+/// answers `None` once the last strong handle is gone. `shared.vl`'s own note
+/// says that is the shape landing ahead of the guarantee, and a program written
+/// against the `Option` keeps working either way.
+pub struct Weak<T> {
+    inner: rc::Weak<RefCell<T>>,
+}
+
+impl<T> Clone for Weak<T> {
+    fn clone(&self) -> Self {
+        Weak {
+            inner: rc::Weak::clone(&self.inner),
+        }
+    }
+}
+
+impl<T> Weak<T> {
+    /// A strong handle to the cell, or `None` if the cell is gone. The `Some`
+    /// case RETAINS.
+    pub fn upgrade(&self) -> Option<Shared<T>> {
+        self.inner.upgrade().map(|inner| Shared { inner })
+    }
+}
+
+impl<T> PartialEq for Weak<T> {
+    fn eq(&self, other: &Self) -> bool {
+        rc::Weak::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+/// On the JS backend `downgrade` is the identity, so a weak handle prints as
+/// the cell it names.
+impl<T: Js> Js for Weak<T> {
+    fn js(&self) -> String {
+        match self.upgrade() {
+            Some(cell) => cell.js(),
+            None => "undefined".to_string(),
+        }
     }
 }
 

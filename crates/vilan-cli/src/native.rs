@@ -34,6 +34,17 @@ pub fn record_boxed_bindings(count: usize) {
     BOXED_BINDINGS.store(count, Ordering::Relaxed);
 }
 
+/// The host surface the last emit reached (F18's work list), recorded on the
+/// same terms and for the same reason as the boxed count above: the number
+/// belongs to the COMPILE and the caller that wants it drives the binary.
+static HOST_GAPS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub fn record_host_gaps(gaps: Vec<String>) {
+    *HOST_GAPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = gaps;
+}
+
 /// Where the runtime crate lives (tracker F19).
 ///
 /// THREE roots, in a fixed order, and the order is B346's one-root rule applied
@@ -242,7 +253,21 @@ pub fn build(unit: &Unit, platform: Platform, emit_debug: bool, stdout: bool) ->
         // would leave a `dist/native/` behind.
         return match emit_source(unit, platform, emit_debug) {
             Ok(source) => {
-                print!("{source}");
+                // The host census (F18's work list) prints the list INSTEAD of
+                // the source: the source a census emit produces carries
+                // `unimplemented!()` where a host body belongs and is not a
+                // build. See `vilan_rust::Emitted::host_gaps`.
+                if std::env::var_os("VILAN_NATIVE_HOST_CENSUS").is_some() {
+                    let gaps = HOST_GAPS
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    println!("vilan-native: {} host gaps", gaps.len());
+                    for gap in gaps.iter() {
+                        println!("  {gap}");
+                    }
+                } else {
+                    print!("{source}");
+                }
                 RoundOutcome::Succeeded
             }
             Err(_) => RoundOutcome::Failed,
