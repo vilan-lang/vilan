@@ -13851,6 +13851,9 @@ pub(crate) mod tests {
             "enum Either<type L, type R> {\n\tLeft(L),\n\tRight(R),\n}\n\nfun main() {\n\tlet e: Either<¦\n}\n",
             // A generic function's own written argument list.
             "fun echo<T>(value: T): T {\n\tvalue\n}\n\nfun main() {\n\tlet _s = echo<¦\n}\n",
+            // A `::` PATH head (E202's third owed pin): `Option<i32>::Some`
+            // opens its argument list on the enum's own name.
+            "import std::option::Option::{ self, Some, None };\n\nfun main() {\n\tlet _v = Option<¦\n}\n",
             // A DECLARATION's type-parameter list — decided by the keyword
             // before the name, because the declaration being written is not in
             // the analyzed program yet.
@@ -13874,6 +13877,8 @@ pub(crate) mod tests {
         for source in [
             // The spaced comparison `vilan fmt` writes.
             "fun main() {\n\tlet a = 1;\n\tlet b = 2;\n\tlet _c = a <¦\n}\n",
+            // The item's own exhibit, in the position it is written in.
+            "fun main() {\n\tlet a = 1;\n\tlet b = 2;\n\tif a <¦\n}\n",
             // And the unspaced one somebody types.
             "fun main() {\n\tlet a = 1;\n\tlet _c = a<¦\n}\n",
             // A literal, and a name the analysis has never seen.

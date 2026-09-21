@@ -371,6 +371,20 @@ fn language_configuration() -> String {
 /// `List<` from `a < b` (its only filter is `notIn: [string, comment]`), so
 /// that half is the SERVER's — `onTypeFormatting`, which knows which names are
 /// types. A `<` entry here would grow a `>` in every comparison anybody typed.
+///
+/// **What the server half costs, written down because the pin cannot hold it.**
+/// VS Code types OVER a closing character only when it auto-inserted that
+/// character itself (`editor.autoClosingOvertype: "auto"`), and an edit the
+/// server returned is not that — so typing the `>` of `List<i32>` by hand
+/// yields `List<i32>>`, and an `onTypeFormatting` answer cannot fix it because
+/// a text edit cannot move the caret past a character it leaves in place
+/// (`List<List<i32>>` needs the caret between the two, not before them). The
+/// only configuration that buys overtype is an `autoClosingPairs` entry for
+/// `<`, which is the hazard this pin exists to keep out. Tracker E202's owed
+/// "typing `>` over the placed one does not double it" is therefore NOT
+/// pinnable by configuration and is reported as an open question, with a
+/// client-side `type` override in `extension.ts` — which can move the caret —
+/// as the candidate follow-up.
 #[test]
 fn e202_the_angle_pair_surrounds_but_does_not_auto_close() {
     let config = language_configuration();
@@ -406,6 +420,34 @@ fn e203_the_backtick_is_a_global_pair_outside_strings() {
     );
 }
 
+/// E203: a pair is placed only BEFORE one of a conservative set of characters,
+/// stated rather than inherited.
+///
+/// VS Code's `autoCloseBefore` decides whether an auto-closing pair fires at
+/// all: it fires only when the character AFTER the cursor is one of these (or
+/// the line ends there). Without the field a language inherits exactly this
+/// set, so declaring it changes nothing today — and that is the point. The
+/// behaviour a backtick needs (typing one before a WORD character must not
+/// pair, because `` `word `` is somebody quoting a word that is already
+/// written) now reads off this file instead of off a default that could move
+/// under it.
+#[test]
+fn e203_a_pair_fires_only_before_the_conservative_set() {
+    let config = language_configuration();
+    assert!(
+        config.contains(r#""autoCloseBefore":";:.,=}])> \n\t""#),
+        "the language declares its own `autoCloseBefore`: {config}"
+    );
+    // The characters a backtick must NOT pair before are the ones absent from
+    // that set, and a word character is the case the item names.
+    for character in ['a', 'Z', '0', '_', '`'] {
+        assert!(
+            !";:.,=}])> \n\t".contains(character),
+            "`{character}` must stay out of the set, or a backtick pairs before a word"
+        );
+    }
+}
+
 /// The premise a GLOBAL backtick pair rests on: the lexer has no backtick
 /// token at all, so a backtick is never syntax and pairing one can never
 /// change what a program means (E203).
@@ -426,7 +468,7 @@ fn e203_the_lexer_still_has_no_backtick_token() {
         lexing.matches(&literal).count(),
         0,
         "the lexer now matches a backtick: E203's global pair assumed it could not, \
-         and the pair's `notIn` list must be re-decided"
+         and the pair's `notIn` list must be re-decided (tracker E203)"
     );
     let token = std::fs::read_to_string(repo_root().join("crates/vilan-core/src/token.rs"))
         .expect("read token.rs");
