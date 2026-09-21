@@ -475,6 +475,55 @@ impl<T: Js> Js for Weak<T> {
 /// named separately so the emitted source says which rule put it there.
 pub type Captured<T> = Shared<T>;
 
+// ------------------------------------------------------- reference equality ---
+
+/// The equality a value holding a FUNCTION has: JavaScript's `===`, which for a
+/// function value is reference identity (F20).
+///
+/// The emitter writes `Rc::ptr_eq` directly for a field that IS a closure. This
+/// trait is for the ones that merely CONTAIN one — `std::http`'s
+/// `Server.upgrade_handler: Option<|Request| void>`, and an enum payload the
+/// same way — where the derive cannot help because `Rc<dyn Fn>` implements no
+/// `PartialEq` at any depth. The impls are written out rather than blanketed
+/// over `T: PartialEq`, which would overlap; the emitter reaches this only for a
+/// type whose rendering mentions `dyn Fn`, and refuses BY NAME for a shape with
+/// no impl here.
+pub trait ReferenceEq {
+    fn reference_eq(&self, other: &Self) -> bool;
+}
+
+impl<T: ?Sized> ReferenceEq for Rc<T> {
+    fn reference_eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(self, other)
+    }
+}
+
+impl<T: ReferenceEq> ReferenceEq for Option<T> {
+    fn reference_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Some(left), Some(right)) => left.reference_eq(right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+impl<T: ReferenceEq> ReferenceEq for Vec<T> {
+    fn reference_eq(&self, other: &Self) -> bool {
+        self.len() == other.len()
+            && self
+                .iter()
+                .zip(other.iter())
+                .all(|(left, right)| left.reference_eq(right))
+    }
+}
+
+/// [`ReferenceEq::reference_eq`] as a free function, so the emitter can spell it
+/// without naming the trait at the site.
+pub fn reference_eq<T: ReferenceEq + ?Sized>(left: &T, right: &T) -> bool {
+    left.reference_eq(right)
+}
+
 // ------------------------------------------------------------------ lazy ---
 
 /// `proposal/lazy.md` §5's memo cell — the ONE shape both lazy positions share

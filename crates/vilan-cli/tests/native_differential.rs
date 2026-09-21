@@ -367,6 +367,90 @@ fn the_probes_board_program_is_byte_identical_on_both_backends() {
     );
 }
 
+/// The four lowering classes a `std::http` server program reaches and no corpus
+/// program does (F20, found by lane native-b-39 while building the HTTP
+/// runtime).
+///
+/// They are pinned as ONE probe rather than four because they are one shape —
+/// an aggregate that holds a callback — seen from four sides, and because the
+/// program that found them is not in the corpus, so the whole-set gate cannot
+/// see any of them. In order: a struct field declared `async |T| U` (the type is
+/// `Rc<dyn Fn(T) -> Boxed<U>>` and a SYNC literal landing in it is wrapped,
+/// which is `Server::builder()`'s default handler); a field holding an `Option`
+/// of a closure, which defeats the derived `PartialEq` exactly as a bare closure
+/// field does; an ENUM payload holding a closure, which `ensure_enum` guarded
+/// neither for equality nor for rendering; and a non-`Copy` field read off a
+/// `&`-loaned receiver, which is a MOVE out of a shared reference where
+/// `clone_sites` elided rule 1's copy.
+#[test]
+fn an_aggregate_holding_a_callback_compiles_the_same_way_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_callbacks.vl"), CALLBACK_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_callbacks.vl"),
+        Verdict::Identical,
+        "an aggregate holding a callback must compile and print identically on both backends"
+    );
+}
+
+const CALLBACK_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    // A struct field declared `async |T| U`, plus an `Option` of a closure.
+    "struct Server {\n",
+    "\thandler: async |i32| str,\n",
+    "\ton_close: Option<|| void>,\n",
+    "\tname: str,\n",
+    "}\n",
+    "\n",
+    "impl Server {\n",
+    "\tfun builder(): Server {\n",
+    // A SYNC literal in the async field — the wrap.
+    "\t\tServer { handler = |n| { \"default\" }, on_close = None, name = \"s\" }\n",
+    "\t}\n",
+    "\n",
+    "\tasync fun serve(self, n: i32): str {\n",
+    "\t\tawait (self.handler)(n)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    // An enum PAYLOAD holding a closure.
+    "enum Body {\n",
+    "\tFixed(str),\n",
+    "\tStream(|| str),\n",
+    "}\n",
+    "\n",
+    "fun render(body: Body): str {\n",
+    "\tmatch body {\n",
+    "\t\tBody::Fixed(let text) => text,\n",
+    "\t\tBody::Stream(let make) => make(),\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    // A non-`Copy` field read off a loaned receiver.
+    "struct Builder { body: str, items: List<i32> }\n",
+    "\n",
+    "impl Builder {\n",
+    "\tfun build(self): Builder {\n",
+    "\t\tBuilder { body = self.body, items = self.items }\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "async fun main() {\n",
+    "\tlet server = Server::builder();\n",
+    "\tprint(await server.serve(1));\n",
+    "\tlet custom = Server { handler = |n| { i\"n={n}\" }, on_close = None, name = \"c\" };\n",
+    "\tprint(await custom.serve(7));\n",
+    "\tprint(render(Body::Fixed(\"fixed\")));\n",
+    "\tprint(render(Body::Stream(|| { \"streamed\" })));\n",
+    "\tlet builder = Builder { body = \"b\", items = [1, 2] };\n",
+    "\tlet copy = builder.build();\n",
+    "\tprint(copy.body);\n",
+    "\tprint(copy.items.len());\n",
+    "}\n",
+);
+
 /// A `lazy` parameter defers, memoizes and FORWARDS the same way on both
 /// backends (F20; `lazy.md` §1).
 ///
