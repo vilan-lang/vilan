@@ -867,6 +867,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
     }
 
     fn rust_type(&mut self, type_id: TypeId, span: Span) -> Result<String, Error> {
+        let rendered = self.rust_type_inner(type_id, span);
+        match rendered {
+            Err(error) if self.census => {
+                self.host_gaps.insert(census_entry(&error));
+                Ok("()".to_string())
+            }
+            other => other,
+        }
+    }
+
+    fn rust_type_inner(&mut self, type_id: TypeId, span: Span) -> Result<String, Error> {
         let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
             return Err(unsupported("a type nested past the recursion guard", span));
         };
@@ -1733,6 +1744,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
     }
 
     fn expression(&mut self, id: Id, depth: usize) -> Result<String, Error> {
+        let rendered = self.expression_inner(id, depth);
+        // The census (see [`Emitted::host_gaps`]) records a refusal and carries
+        // on, so ONE emit answers "what does this program still need" instead
+        // of answering with its first sentence. Only here: an expression
+        // position accepts `unimplemented!()`, which types as anything.
+        match rendered {
+            Err(error) if self.census => {
+                self.host_gaps.insert(census_entry(&error));
+                Ok("unimplemented!()".to_string())
+            }
+            other => other,
+        }
+    }
+
+    fn expression_inner(&mut self, id: Id, depth: usize) -> Result<String, Error> {
         // B105's hoist: this expression was evaluated once into a temp ahead of
         // the write, and both walks of the place name that temp.
         if let Some(name) = self.hoisted.get(&id) {
@@ -2202,11 +2228,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 && !self.program.parameters.contains_key(&binding)
                 && !self.is_captures.contains(&binding)
             {
-                return Err(unsupported(
+                return self.host_gap(
                     "a value captured by an `is` test outside an `if` condition (only \
-                     `if subject is Pattern(let x)` restructures into an `if let`)",
+                     `if subject is Pattern(let x)` restructures into an `if let`)"
+                        .to_string(),
                     span,
-                ));
+                );
             }
             return Ok(self.read_binding(binding));
         }
@@ -3811,6 +3838,19 @@ fn scalar_type(name: &str) -> Option<&'static str> {
         "str" => "vilan_rt::Str",
         _ => return None,
     })
+}
+
+/// One census row from a refusal: the construct, without the boilerplate
+/// sentence every refusal carries.
+fn census_entry(error: &Error) -> String {
+    let message = error.msg.as_str();
+    let start = message
+        .find("does not emit ")
+        .map(|offset| offset + "does not emit ".len())
+        .unwrap_or(0);
+    let rest = &message[start..];
+    let end = rest.find(" yet — this is").unwrap_or(rest.len());
+    rest[..end].to_string()
 }
 
 /// Whether a rendered Rust type is a counted closure (F16: every closure type
