@@ -17,20 +17,30 @@
 //! binary's own copy in `tests/inference/support.rs`.
 //!
 //! This gate is the rule: a test file does not name `std::env::temp_dir()`.
-//! The sweep is not finished, and the tail is NAMED rather than left to be
-//! rediscovered — [`BINARIES_STILL_ON_THE_SHARED_TMPFS`] is what is left.
+//! The sweep is finished but for three files, and the tail is NAMED rather
+//! than left to be rediscovered — [`BINARIES_STILL_ON_THE_SHARED_TMPFS`] is
+//! what is left, and [`PATHS_THE_BINARY_OWNS`] is what cannot move at all.
 
 use std::path::{Path, PathBuf};
 
 /// The `vilan-cli` suites still writing to the shared tmpfs, by file (N86's
-/// tail).
+/// tail, swept by N102).
 ///
-/// Every one of them builds its own scratch path inline rather than through
-/// `support`, and most do not declare `mod support;` at all — so porting them
-/// is a structural edit to forty files that five lanes are adding tests to
-/// this order, which is a merge cost out of all proportion to the fix. They
-/// are listed instead, so the sweep's remainder is a fact in the tree rather
-/// than a memory.
+/// **Thirty-eight at Order 37, three now.** The tail was listed rather than
+/// ported because porting looked like a structural edit to forty files that
+/// five lanes were adding tests to. It was not: each one builds its scratch
+/// path inline from `std::env::temp_dir()` in ONE helper, so a suite costs one
+/// call site and a `mod support;` line — thirty-eight call sites across
+/// thirty-five files, and no test logic touched. `CARGO_TARGET_TMPDIR` is
+/// expanded per including binary, so a suite that joins `support` gets a root
+/// nothing else writes into, which is what the old inline paths were faking
+/// with a process id.
+///
+/// The three that stay are the three another lane is adding pins to this order
+/// (reactive-38's `bind_attr` and disposal pins): a structural edit to a file
+/// head is a merge cost, and paying it for a file somebody else is editing
+/// buys nothing this sweep needs. They are one line each when that lane's
+/// work has landed.
 ///
 /// Listed by FILE and not by COUNT, deliberately: a suite here may grow
 /// another scratch path without reding this gate, because reding it would
@@ -40,58 +50,33 @@ use std::path::{Path, PathBuf};
 /// naming it, which must be delisted so the list cannot outlive the work
 /// (N42's rule for an exemption that only ever subtracts).
 const BINARIES_STILL_ON_THE_SHARED_TMPFS: &[&str] = &[
-    "vilan-cli/tests/brew_formula.rs",
-    "vilan-cli/tests/build_explain.rs",
-    "vilan-cli/tests/build_manifest.rs",
-    "vilan-cli/tests/conditional_get.rs",
-    "vilan-cli/tests/database.rs",
-    "vilan-cli/tests/debug_dumps.rs",
-    "vilan-cli/tests/diagnostics.rs",
-    "vilan-cli/tests/dom_events.rs",
-    "vilan-cli/tests/element_head_order.rs",
-    "vilan-cli/tests/fs.rs",
-    "vilan-cli/tests/git_deps.rs",
-    "vilan-cli/tests/hmr_overlay.rs",
-    "vilan-cli/tests/http_port.rs",
-    "vilan-cli/tests/infer_preset.rs",
-    "vilan-cli/tests/install.rs",
-    "vilan-cli/tests/macro_expansion_cache.rs",
-    "vilan-cli/tests/macro_std.rs",
-    "vilan-cli/tests/macro_world_phase.rs",
-    "vilan-cli/tests/module_paths.rs",
-    "vilan-cli/tests/mount_missing_id.rs",
-    "vilan-cli/tests/npm_stub.rs",
-    "vilan-cli/tests/perf_baseline.rs",
-    "vilan-cli/tests/print_chunks.rs",
-    "vilan-cli/tests/process.rs",
     "vilan-cli/tests/reactive_lifetimes.rs",
-    "vilan-cli/tests/reactive_selection.rs",
-    "vilan-cli/tests/release_scripts.rs",
-    "vilan-cli/tests/request_header.rs",
-    "vilan-cli/tests/router.rs",
-    "vilan-cli/tests/source_bindings.rs",
-    "vilan-cli/tests/source_encoding.rs",
     "vilan-cli/tests/ssr_differential.rs",
-    "vilan-cli/tests/storage_handle.rs",
-    "vilan-cli/tests/style_chain_order.rs",
-    "vilan-cli/tests/style_when.rs",
     "vilan-cli/tests/ui_rows.rs",
-    "vilan-cli/tests/upgrade.rs",
-    "vilan-cli/tests/workspace.rs",
 ];
 
-/// Files that name the call because the path is the BINARY's, not the
-/// harness's — with what writes it.
+/// Files that name the call because the scratch root CANNOT serve them — with
+/// the reason.
 ///
-/// `vilan run --watch` writes its script to `env::temp_dir()`
-/// (`main.rs`'s `watch_script_path`), and the two harnesses that assert the
-/// script is written and then removed have to look where it actually lands. A
-/// scratch root would be a test waiting five minutes for a file nothing will
-/// write — which is exactly what N86's first sweep produced here, and what
-/// this entry exists so nobody repeats.
+/// Three reasons, all of them the environment's rather than the harness's, and
+/// each found by porting the file and watching it fail (N102):
+///
+/// - **The path is the BINARY's.** `vilan run --watch` writes its script to
+///   `env::temp_dir()` (`main.rs`'s `watch_script_path`), and the harnesses
+///   that assert the script is written and then removed have to look where it
+///   actually lands. A scratch root would be a test waiting five minutes for a
+///   file nothing will write — which is exactly what N86's first sweep
+///   produced here.
+/// - **The scratch root is inside a checkout.** `CARGO_TARGET_TMPDIR` is
+///   `<worktree>/target/tmp`, so a test whose premise is "no vilan checkout at
+///   or above this directory" cannot use it: the ancestor walk for `vilan/std`
+///   finds the worktree's own, the embedded toolchain is never materialized,
+///   and the stand-in checkout the test stages decides nothing.
+/// - **The path is too LONG.** A `sockaddr_un` must fit in about 108 bytes,
+///   and a lane's worktree spends sixty of them before the project name.
 ///
 /// This is a different exemption from the one above: those files are waiting
-/// to be ported, these two must never be.
+/// to be ported, these cannot be.
 const PATHS_THE_BINARY_OWNS: &[(&str, &str)] = &[
     (
         "vilan-cli/tests/watch_lifecycle.rs",
@@ -100,6 +85,28 @@ const PATHS_THE_BINARY_OWNS: &[(&str, &str)] = &[
     (
         "vilan-cli/tests/support/mod.rs",
         "the same script, asserted by the shared watch harness",
+    ),
+    (
+        "vilan-cli/tests/install.rs",
+        "a machine with NO checkout — under `<worktree>/target/tmp` the \
+         ancestor walk finds the worktree's own `vilan/std`, the embedded \
+         toolchain is never materialized, and the content-keyed cache this \
+         suite asserts about is never written (N102)",
+    ),
+    (
+        "vilan-cli/tests/module_paths.rs",
+        "the same reason, from the other side: these pins turn on WHICH \
+         checkout the ancestor walk reaches, and a scratch root inside one \
+         makes the stand-in checkout they stage decide nothing (N102)",
+    ),
+    (
+        "vilan-cli/tests/fs.rs",
+        "`SUN_LEN` — `scan_dir_does_not_follow_symlinks_…` binds a unix socket \
+         INSIDE its project tree (the program under test scans the directory \
+         the socket is in), and a `sockaddr_un` path must fit in about 108 \
+         bytes. `CARGO_TARGET_TMPDIR` is `<worktree>/target/tmp`, sixty \
+         characters into the budget before the project name in a lane's \
+         worktree, and the bind fails outright (N102)",
     ),
 ];
 

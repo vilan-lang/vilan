@@ -17,6 +17,16 @@ struct Machine {
 }
 
 impl Machine {
+    /// A scratch machine root.
+    ///
+    /// `std::env::temp_dir()` and NOT the support scratch root, for the reason
+    /// this suite exists (N102): `CARGO_TARGET_TMPDIR` is
+    /// `<worktree>/target/tmp`, which is INSIDE a vilan checkout, and the
+    /// premise here is a machine with no checkout at all. Under a scratch root
+    /// the ancestor walk finds the worktree's own `vilan/std` and the embedded
+    /// toolchain is never materialized, so the cache the test asserts about is
+    /// never written. Recorded in `harness_scratch.rs`'s
+    /// `PATHS_THE_BINARY_OWNS`: not waiting to be ported, unable to be.
     fn new(name: &str) -> Machine {
         let root =
             std::env::temp_dir().join(format!("vilan-install-{name}-{}", std::process::id()));

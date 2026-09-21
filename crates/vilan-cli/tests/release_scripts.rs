@@ -27,6 +27,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod support;
+
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -62,7 +64,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(name: &str, changelog: &str) -> Fixture {
-        let root = std::env::temp_dir().join(format!(
+        let root = support::scratch_root().join(format!(
             "vilan-release-scripts-{name}-{}",
             std::process::id()
         ));
@@ -1169,7 +1171,7 @@ impl Installer {
     fn new(name: &str, sha256_tool: Option<&Path>) -> Installer {
         use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join(format!(
+        let root = support::scratch_root().join(format!(
             "vilan-install-script-{name}-{}",
             std::process::id()
         ));

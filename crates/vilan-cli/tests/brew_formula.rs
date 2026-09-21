@@ -26,6 +26,8 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+mod support;
+
 /// The release the committed formula describes: the version whose checksums
 /// `SHA256SUMS` are, and therefore the version the generator has to be handed
 /// to reproduce the file byte-for-byte.
@@ -74,7 +76,7 @@ fn formula() -> String {
 /// Runs the generator the way the release workflow does — the script by its
 /// own path, so the test also depends on its executable bit being intact.
 fn generate(label: &str, version: &str, sums: &str) -> Output {
-    let file = std::env::temp_dir().join(format!(
+    let file = support::scratch_root().join(format!(
         "vilan-brew-{label}-{}.sha256sums.txt",
         std::process::id()
     ));

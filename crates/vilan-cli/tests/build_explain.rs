@@ -26,6 +26,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+mod support;
+
 /// The resource `asset::bundle` carries under its own path.
 const ICON: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\"><circle r=\"4\"/></svg>\n";
 
@@ -40,7 +42,7 @@ const VERSION: &str = "2026.8.29\n";
 fn temp_project(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = support::scratch_root().join(format!(
         "vilan_explain_{tag}_{}_{unique}",
         std::process::id()
     ));

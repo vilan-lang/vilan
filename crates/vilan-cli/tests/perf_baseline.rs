@@ -66,6 +66,8 @@ use vilan_core::{
     post_analysis_passes, transform,
 };
 
+mod support;
+
 // ---------------------------------------------------------------------------
 // The summary
 // ---------------------------------------------------------------------------
@@ -577,7 +579,8 @@ fn check_once(directory: &Path) -> (Duration, bool) {
 /// program `support::reference_compile` builds — into a fresh temporary
 /// directory. The unit every end-to-end row is also reported in.
 fn write_reference_project() -> Option<PathBuf> {
-    let project = std::env::temp_dir().join(format!("vilan_perf_reference_{}", std::process::id()));
+    let project =
+        support::scratch_root().join(format!("vilan_perf_reference_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&project);
     std::fs::create_dir_all(project.join("src")).ok()?;
     std::fs::write(

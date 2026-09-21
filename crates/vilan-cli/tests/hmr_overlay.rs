@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+mod support;
+
 /// The dev-runtime shim, read from source so this test exercises exactly what
 /// ships. Its four placeholders are substituted the way `hmr::instrument` does.
 const SHIM: &str = include_str!("../src/hmr_shim.js");
@@ -18,7 +20,7 @@ const SHIM: &str = include_str!("../src/hmr_shim.js");
 fn temp_file(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
+    support::scratch_root().join(format!(
         "vilan_hmr_overlay_{tag}_{}_{unique}.mjs",
         std::process::id()
     ))

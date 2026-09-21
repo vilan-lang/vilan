@@ -12,11 +12,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+mod support;
+
 /// A fresh temp directory holding one test's single-package project.
 fn temp_package(tag: &str, source: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = support::scratch_root().join(format!(
         "vilan_diagnostics_{tag}_{}_{unique}",
         std::process::id()
     ));
@@ -177,7 +179,7 @@ fn build_stdout_javascript_is_never_mixed_with_a_diagnostic() {
 fn temp_files(tag: &str, files: &[(&str, &str)]) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = support::scratch_root().join(format!(
         "vilan_diagnostics_{tag}_{}_{unique}",
         std::process::id()
     ));

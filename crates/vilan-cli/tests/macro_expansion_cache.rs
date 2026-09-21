@@ -34,6 +34,8 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 /// A package that defines its own macro and uses it. Package-local rather than
 /// leaning on a std derive, so a test can EDIT the macro's source and watch the
 /// key move — std belongs to the toolchain and is not a test's to change.
@@ -51,7 +53,7 @@ fn entry(tag: i32) -> String {
 }
 
 fn temp_package(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = support::scratch_root().join(format!(
         "vilan-m33-cache-{name}-{}-{:?}",
         std::process::id(),
         std::thread::current().id(),

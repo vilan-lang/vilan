@@ -23,6 +23,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 /// The exhibit: a user type that is a `Source` and is not a `Signal`. `set`
 /// lives outside the trait, so nothing a binding does could reach it — a
 /// binding that needed the write side would not compile against this at all.
@@ -63,7 +65,7 @@ const DOM_STUB: &str = concat!(
 );
 
 fn temp_project(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = support::scratch_root().join(format!(
         "vilan_source_bindings_{tag}_{}",
         std::process::id()
     ));

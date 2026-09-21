@@ -15,6 +15,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 /// The 015 exhibit's shape: a base style and two deltas on independent state
 /// axes, spelled both ways, over all four cells of the two flags.
 const EXHIBIT: &str = r#"import std::io::print;
@@ -62,7 +64,7 @@ fn std_dir() -> PathBuf {
 }
 
 fn build_and_run(program: &str) -> String {
-    let dir = std::env::temp_dir().join(format!("vilan_style_when_{}", std::process::id()));
+    let dir = support::scratch_root().join(format!("vilan_style_when_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create the program directory");
     let source = dir.join("app.vl");

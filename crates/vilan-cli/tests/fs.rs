@@ -11,6 +11,17 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// A fresh temp directory for the test's project tree.
+///
+/// `std::env::temp_dir()` and NOT the support scratch root, for a reason the
+/// kernel owns (N102). `scan_dir_does_not_follow_symlinks_and_reports_other_
+/// kinds_as_none_of_the_three` binds a unix socket INSIDE this tree — the
+/// program under test scans the directory the socket is in — and a
+/// `sockaddr_un` path must fit in `SUN_LEN`, about 108 bytes.
+/// `CARGO_TARGET_TMPDIR` is `<worktree>/target/tmp`, which in a lane's
+/// worktree is already sixty characters before the project name, so the bind
+/// fails with `path must be shorter than SUN_LEN`. This file is recorded in
+/// `harness_scratch.rs`'s `PATHS_THE_BINARY_OWNS` rather than in the sweep's
+/// tail: it is not waiting to be ported, it cannot be.
 fn temp_project(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("vilan_fs_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

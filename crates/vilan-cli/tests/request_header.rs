@@ -15,9 +15,11 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
+mod support;
+
 fn temp_project(tag: &str) -> PathBuf {
     let dir =
-        std::env::temp_dir().join(format!("vilan_request_header_{tag}_{}", std::process::id()));
+        support::scratch_root().join(format!("vilan_request_header_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
