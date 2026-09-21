@@ -3283,11 +3283,40 @@ impl<'a, 'src> Parser<'a, 'src> {
             if !parser.peek_is_op("::") {
                 return None;
             }
+            parser.refuse_generic_self(name, start);
             Some((
                 Node::AccessorWithGenerics(name, generic_arguments),
                 parser.span_from(start),
             ))
         })
+    }
+
+    /// B361 (R4) — `Self<..>`, refused with the steer.
+    ///
+    /// `Self` names the impl's SUBJECT, which is already the whole applied type:
+    /// inside `impl Cell<type T>`, `Self` IS `Cell<T>`, so writing arguments on
+    /// it names a second application of a type that has one. It parsed in a
+    /// type position, in a `::`-path head and at a struct literal, and nothing
+    /// in std, the corpus, the examples, the docs, the templates, the website,
+    /// the playground or kolt ever wrote it — and where it was written it did
+    /// not work: `fun same(self): Self<i32>` with a matching body was refused
+    /// `Expected i32, but got i32 instead`, and `Self<i32> { .. }` with
+    /// `cannot initialize a non-struct: Self`. A spelling with no use and no
+    /// coherent meaning is one refusal, at the spelling, naming the fix.
+    fn refuse_generic_self(&mut self, name: &'src str, start: usize) {
+        if name != "Self" {
+            return;
+        }
+        self.errors.push(ParseError {
+            span: self.span_from(start),
+            reason: ParseErrorReason::Rule(
+                "`Self` already names the impl's subject WITH its arguments — inside \
+                 `impl Cell<type T>` it is `Cell<T>` — so it takes none of its own: write \
+                 the type's name (`Cell<i32>`)",
+            ),
+            context: self.context_stack.clone(),
+            hint: None,
+        });
     }
 
     /// The chain head: in expression mode a `css { … }` block, then a struct
@@ -3358,6 +3387,12 @@ impl<'a, 'src> Parser<'a, 'src> {
             let generic_arguments = parser.parse_generic_arguments();
             if !parser.peek_is_ctrl('{') {
                 return None;
+            }
+            // B361's third position: `Self<i32> { .. }`. Refused only once the
+            // `{` has been seen, so a declining attempt never pushes it — the
+            // attempt's own truncation covers the rest.
+            if generic_arguments.is_some() && namespace.is_empty() {
+                parser.refuse_generic_self(name, name_start);
             }
             // The `{ field, ... }` list, clean or recovered to empty fields on a
             // garbled body (chumsky's `nested_delimiters` on the struct-initializer
@@ -5376,6 +5411,9 @@ impl<'a, 'src> Parser<'a, 'src> {
             name = self.eat_ident().expect("peeked as an identifier");
         }
         let generic_arguments = self.attempt(Self::parse_generic_arguments);
+        if generic_arguments.is_some() && namespace.is_none() {
+            self.refuse_generic_self(name, start);
+        }
         let node = match namespace {
             Some(namespace) => Node::StaticAccessor(Box::new(namespace), name, generic_arguments),
             None => match generic_arguments {

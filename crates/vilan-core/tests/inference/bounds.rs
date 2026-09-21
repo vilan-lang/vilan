@@ -10800,6 +10800,7 @@ fn b353_an_agreeing_closure_body_still_compiles() {
 //   static fn, enum subject       `Holder<i32>::wrap("x")`      checked
 //   trait static                  `Signal<i32>::new("x")`       checked (B352)
 //   `Self<..>::member`            `Self<i32>::make("x")`        checked
+//                                 (RETIRED by B361: `Self<..>` is refused)
 //   VARIANT constructor           `Holder<i32>::Full("x")`      INERT
 //
 // and the seventh shape the sweep named — a qualified `pkg::mod::T<..>::f` —
@@ -10890,9 +10891,11 @@ fn b356_the_already_checked_path_shapes_stay_checked() {
         "let _a = Boxy<i32> { value = \"x\" };",
         // A static function on an enum subject.
         "let _h = Holder<i32>::wrap(\"x\");",
-        // `Self<..>::member` inside the impl (the impl's own binder is NOT what
-        // the path wrote).
-        "let _a = Boxy<i32>::relay();",
+        // B361 retired the `Self<..>::member` row: `Self<i32>::make("x")` is
+        // refused at the spelling now (`Self` already carries the impl's
+        // arguments), so the shape this row covered no longer exists. Its
+        // NAMED twin — the same path written `Boxy<i32>::make("x")` — is the
+        // first row above, and B361's own pins hold the refusal.
     ];
     for body in shapes {
         let source = format!(
@@ -10901,7 +10904,6 @@ fn b356_the_already_checked_path_shapes_stay_checked() {
 
             impl Boxy<type T> {{
                 fun make(value: T): Boxy<T> {{ Boxy {{ value }} }}
-                fun relay(): Boxy<i32> {{ Self<i32>::make("x") }}
             }}
 
             enum Holder<T> {{ Full(T), Empty }}
@@ -11150,6 +11152,100 @@ fn b370_a_literal_shift_in_an_unsigned_context_emits_unsigned() {
         }
         "#,
         "2147483648\n-2147483648\n",
+    );
+}
+
+// --- B361 (R4): `Self<..>` is refused -----------------------------------------
+//
+// `Self` names the impl's SUBJECT, which already carries its arguments —
+// inside `impl Cell<type T>` it IS `Cell<T>` — so arguments written on it name
+// a second application of a type that has one. It parsed in three positions
+// (a type, a `::`-path head, a struct literal), and the census found it
+// nowhere: not in std, `vilan/test`, `vilan/examples`, the docs fences,
+// `vilan/benchmarks`, the `vilan init` templates, `vilan-website`,
+// `vilan-playground` or kolt — ONE site in the whole estate, a `.vl` program
+// const in this file (`b356_the_already_checked_path_shapes_stay_checked`,
+// rewritten below to name the type).
+//
+// Its premise wanted correcting: the spelling was NOT coherent. `fun same(self):
+// Self<i32>` with a matching body was refused `Expected i32, but got i32
+// instead.`, and `Self<i32> { .. }` with `cannot initialize a non-struct:
+// Self`. It was a spelling with no use AND no meaning.
+
+#[test]
+fn b361_self_with_arguments_is_refused_in_a_type_position() {
+    assert_fails_with(
+        r#"
+        struct Cell<T> { value: T }
+
+        impl Cell<type T> {
+        	fun make(value: T): Cell<T> { Cell { value } }
+        	fun same(self): Self<i32> { Cell<i32>::make(1) }
+        }
+
+        fun main() { print(Cell<i32>::make(5).value); }
+        "#,
+        "write the type's name (`Cell<i32>`)",
+    );
+}
+
+#[test]
+fn b361_self_with_arguments_is_refused_as_a_path_head() {
+    assert_fails_with(
+        r#"
+        struct Cell<T> { value: T }
+
+        impl Cell<type T> {
+        	fun make(value: T): Cell<T> { Cell { value } }
+        	fun relay(self): Cell<i32> { Self<i32>::make(2) }
+        }
+
+        fun main() { print(Cell<i32>::make(5).value); }
+        "#,
+        "`Self` already names the impl's subject WITH its arguments",
+    );
+}
+
+#[test]
+fn b361_self_with_arguments_is_refused_at_a_struct_literal() {
+    assert_fails_with(
+        r#"
+        struct Cell<T> { value: T }
+
+        impl Cell<type T> {
+        	fun make(value: T): Cell<T> { Cell { value } }
+        	fun build(self): Cell<i32> { Self<i32> { value = 3 } }
+        }
+
+        fun main() { print(Cell<i32>::make(5).value); }
+        "#,
+        "so it takes none of its own",
+    );
+}
+
+/// The CONTROLS: a bare `Self` is untouched in every position, and a generic
+/// literal of the type's own name still works — the refusal is about the
+/// ARGUMENTS on `Self`, not about either half on its own.
+#[test]
+fn b361_a_bare_self_and_a_named_generic_application_still_compile() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Cell<T> { value: T }
+
+        impl Cell<type T> {
+        	fun make(value: T): Cell<T> { Cell { value } }
+        	fun same(self): Self { Cell { value = self.value } }
+        	fun relay(self): Cell<T> { Self::make(self.value) }
+        }
+
+        fun main() {
+        	print(Cell<i32> { value = 5 }.same().value);
+        	print(Cell<i32>::make(6).relay().value);
+        }
+        "#,
+        "5\n6\n",
     );
 }
 
