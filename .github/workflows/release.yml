@@ -3,11 +3,35 @@
 # build paths remapped away, packages tarballs + the VS Code .vsix + the
 # install script, and publishes the GitHub Release with the changelog section
 # as its notes. Cutting a release is: bump, changelog, commit, tag, push.
+#
+# It is also RUNNABLE as a dry run (tracker L23): `workflow_dispatch` walks the
+# same graph up to the asset list and stops, because every publishing step and
+# job is guarded on the ref being a `v*` tag. That is what a bump to
+# `upload-artifact` or `download-artifact` is merged on — a green dispatch on
+# its own branch — instead of being first RUN on a tag, where four of the five
+# channels are one-way.
 name: release
 
 on:
   push:
     tags: ["v*"]
+  # The DRY RUN (tracker L23). Every job below runs on a dispatch except the
+  # ones that publish, so the artifact actions — upload, download, the
+  # checksum pass and the asset list — are exercised on a branch instead of
+  # for the first time on a tag, where four of the five channels are one-way.
+  #
+  # The trigger is here and not in a sibling workflow because a sibling would
+  # be a second copy of this graph, and a rehearsal of a different graph is
+  # not a rehearsal. What makes it safe is that the publishing steps are
+  # guarded on the REF being a tag, not on the event: a dispatch cannot reach
+  # a channel however it is spelled, and neither can a `push` to a branch if
+  # one is ever added.
+  #
+  # The gate jobs run too. They duplicate `ci.yml`, which is a cost, and
+  # skipping them would change the `needs` graph the dry run is meant to
+  # rehearse — a skipped `needs` skips its dependents, so the shape a release
+  # takes would not be the shape the dispatch takes.
+  workflow_dispatch:
 
 # The gate runs on the SAME platform matrix as ci.yml (ubuntu + windows,
 # backlog L17): a tag can be pushed from a commit no PR ever saw, and a gate
@@ -376,7 +400,37 @@ jobs:
           # special-casing here. (Scratch dir is release-assets, NOT assets/
           # — that is a tracked directory holding the brand SVGs.)
           cd release-assets && sha256sum * > sha256sums.txt
+      # The asset list a release carries, asserted before anything is
+      # published — and the whole of what a DRY RUN checks (L23). Five
+      # platform archives, the .vsix, the playground wasm, the two install
+      # scripts and the checksum file. A leg that silently stopped uploading
+      # shows up here rather than as a release missing a platform.
+      - name: The asset list is the one a release carries
+        run: |
+          # `-e` explicitly: the default shell is `bash -e {0}`, and a step
+          # whose failure depends on an implicit flag is the shape L23 is
+          # about.
+          set -eu
+          # Scratch files live OUTSIDE release-assets/, because `publish`
+          # below uploads that directory by glob: a file written into it is a
+          # file published with the release.
+          ls -1 release-assets | sort > "$RUNNER_TEMP/actual.txt"
+          cat > "$RUNNER_TEMP/expected.txt" <<'ASSETS'
+          install.ps1
+          install.sh
+          sha256sums.txt
+          vilan-aarch64-apple-darwin.tar.gz
+          vilan-aarch64-unknown-linux-musl.tar.gz
+          vilan-playground-wasm.tar.gz
+          vilan-vscode.vsix
+          vilan-x86_64-apple-darwin.tar.gz
+          vilan-x86_64-pc-windows-msvc.zip
+          vilan-x86_64-unknown-linux-musl.tar.gz
+          ASSETS
+          diff -u "$RUNNER_TEMP/expected.txt" "$RUNNER_TEMP/actual.txt"
+          test -s release-assets/sha256sums.txt
       - name: Release notes from the changelog
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           awk -v heading="^## v$VERSION " \
@@ -412,7 +466,11 @@ jobs:
                       f"(https://github.com/vilan-lang/vilan/blob/v{version}/CHANGELOG.md).*\n")
               open("notes.md", "w").write("\n<!-- family:".join(kept) + tail)
           PY
+      # The one step a dry run must not reach. Guarded on the REF and not on
+      # the event, so nothing but a `v*` tag can publish however this workflow
+      # comes to run (L23).
       - name: Publish
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -429,6 +487,9 @@ jobs:
     # never replaced, so npm must not carry a version whose GitHub Release
     # failed to go out.
     needs: [build, publish]
+    # Tag-only (L23): a dry run must not reach a channel. On the REF and not
+    # on the event, so the guard holds however this workflow comes to run.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       # Trusted publishing (distribution.md §2): npm trusts *this workflow in
@@ -539,6 +600,9 @@ jobs:
     # marketplace version can be unpublished but never replaced, so it must not
     # carry a version whose GitHub Release failed to go out.
     needs: [vsix, publish]
+    # Tag-only (L23): a dry run must not reach a channel. On the REF and not
+    # on the event, so the guard holds however this workflow comes to run.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     # The environment is not decoration: the federated credential in Entra
     # trusts the subject `repo:vilan-lang/vilan:environment:marketplace`, so
@@ -606,6 +670,9 @@ jobs:
     # Separate from the marketplace job on purpose: one gallery being down, or
     # one token missing, must not hold the other back.
     needs: [vsix, publish]
+    # Tag-only (L23): a dry run must not reach a channel. On the REF and not
+    # on the event, so the guard holds however this workflow comes to run.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -667,6 +734,9 @@ jobs:
     # retry. `build` is named too because those are the archives being pointed
     # at.
     needs: [build, publish]
+    # Tag-only (L23): a dry run must not reach a channel. On the REF and not
+    # on the event, so the guard holds however this workflow comes to run.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
