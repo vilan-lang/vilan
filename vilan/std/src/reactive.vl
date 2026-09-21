@@ -8,6 +8,27 @@ import pkg::result::Result::{ self, Err, Ok };
 import pkg::shared::{ Shared, Weak };
 import pkg::time::Timer;
 
+// === The change structure (A112 S1) ==========================================
+//
+// The delta log, its cursor and the op vocabulary are `std::reactive`'s by
+// design — `SeqOp` is a reactive type where `Delta` is a `std::wire` one, and
+// this module still imports nothing from `std::wire`. Their BODIES sit in
+// `delta.vl`, which imports `Source` and `fresh_id` from here; re-exporting
+// them is what makes the designed spelling (`std::reactive::DeltaCursor`)
+// resolve without this file growing a second subject.
+//
+// `proposal/incremental-collections.md` §4 is the design; `std::rpc`'s
+// `KeyedCell` is the first consumer (A54's machinery, lifted).
+export import pkg::delta::{
+	DeltaCursor,
+	DeltaLog,
+	DeltaSource,
+	MapOp,
+	SeqOp,
+	SetOp,
+	delta_log_limit,
+};
+
 /// A resource that can be released. An `Owner` collects `Disposable`s and releases
 /// them as a group; `Subscription`, `Owner`, and `std::ui`'s `View` are disposable.
 export trait Disposable {

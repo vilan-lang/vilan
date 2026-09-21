@@ -38,6 +38,16 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ("browser/router.vl", 1, "R: the module-level `wired` latch"),
     ("browser/ui.vl", 21, "O: per-boundary row/owner bookkeeping"),
     (
+        "delta.vl",
+        9,
+        "E: the delta log's ops/version/base/cursors (twice — `new` and \
+         `with_limit`) plus a cursor's own sequence. Every one of them is \
+         minted by the CELL that holds the log and read by the CONSUMERS that \
+         hold cursors into it, which is the E class exactly; they are A54's \
+         five cells, lifted out of `rpc.vl` and spelled once per constructor \
+         (A112 S1).",
+    ),
+    (
         "memo.vl",
         1,
         "E: the memo cache outlives every maker's scope",
@@ -63,8 +73,10 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "rpc.vl",
-        52,
-        "R + O + E: sessions, wiring, the mirrors' leases",
+        47,
+        "R + O + E: sessions, wiring, the mirrors' leases. FIVE fewer since \
+         A112 S1: `KeyedCell`'s own log, version, base and cursors, and its \
+         cursor's sequence, are `DeltaLog`'s now (see `delta.vl`).",
     ),
     ("time.vl", 3, "O: the debouncer's pending/running/timer"),
     ("ws.vl", 4, "O: the frame decoder's state"),
@@ -180,7 +192,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 121,
+        total, 125,
         "the total number of `Shared` construction sites in std changed"
     );
 

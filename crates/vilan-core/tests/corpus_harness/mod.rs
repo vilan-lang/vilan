@@ -84,6 +84,7 @@ macro_rules! corpus_manifest {
             db => "db.vl",
             default_generic_param => "default-generic-param.vl",
             default => "default.vl",
+            delta_law => "delta-law.vl",
             derive_debug => "derive-debug.vl",
             derive_default => "derive-default.vl",
             derive_enum => "derive-enum.vl",

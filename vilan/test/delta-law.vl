@@ -1,0 +1,420 @@
+// THE DERIVATIVE LAW over `std::reactive`'s delta log, as a randomized
+// property test (A112, proposal/incremental-collections.md §5).
+//
+//     f(a (+) da) == f(a) (+) f'(a, da)
+//
+// read at the only place it is observable — the settle of a turn, where the
+// derived cell must hold exactly what re-running the whole derivation would
+// produce:
+//
+//     derived.get() == source.get().map(g)
+//
+// The generator is a seeded MINSTD Lehmer sequence (`state * 16807 % 2^31-1`),
+// so the run is deterministic and reproducible while still being a random walk
+// over the op vocabulary. 400 turns; every turn opens ONE `batch` and draws 1-4
+// ops from {push, insert_at, remove_at, set_at, clear, set(whole)}, biased to
+// grow — which puts the coalescing claim under test too: one notification per
+// turn, every op drained at the settle.
+//
+// Four readers watch one cell whose log holds 30 ops:
+//   1. `derived`     — a `map_each(g)` cell whose cursor is always current;
+//   2. `mirror_near` — a cursor drained every 3rd turn: normally answered with
+//                      OPS;
+//   3. `mirror_far`  — a cursor drained every 20th turn: normally PAST the
+//                      log's `base`, so answered with a `Reset`;
+//   4. the reference rerun, recomputed from scratch every turn.
+//
+// Asserted every turn, as a `panic` rather than a print, because the corpus
+// gate compares emitted bytes: the law for `derived`, the law for whichever
+// mirror drained, exactly ONE notification per turn whatever the op count, and
+// the `g` call count. The printed tail is the golden.
+//
+// The cell here is a TEST-LOCAL `ListCell` — std's is A112 S2 — and that is
+// deliberate: what S1 owes is that `DeltaLog`, `DeltaCursor`, `SeqOp` and the
+// `DeltaSource` bound are enough for a cell an APPLICATION writes, with the
+// twelve collection methods falling out of one primitive as trait defaults.
+import std::io::{ panic, print };
+import std::option::Option::{ self, None, Some };
+import std::reactive::{
+	DeltaCursor,
+	DeltaLog,
+	DeltaSource,
+	SeqOp,
+	Signal,
+	SignalCell,
+	Source,
+	Subscription,
+	batch,
+};
+import std::shared::Shared;
+
+// === A sequence cell over the lifted log =====================================
+
+struct ListCell<T> {
+	elements: SignalCell<List<T>>,
+	log: DeltaLog<SeqOp<T>>,
+}
+
+impl ListCell<type T> {
+	fun new(initial: List<T>): ListCell<T> {
+		ListCell { elements = Signal::new(initial), log = DeltaLog<SeqOp<T>>::new() }
+	}
+
+	fun bounded(initial: List<T>, limit: i32): ListCell<T> {
+		ListCell { elements = Signal::new(initial), log = DeltaLog<SeqOp<T>>::with_limit(limit) }
+	}
+
+	/// The wholesale write: `Reset`, N derivations, and the honest answer to
+	/// "replacing N elements costs what replacing N elements costs". The diff
+	/// door is a different name (`reconcile_to`, S2's).
+	fun set(self, value: List<T>) {
+		self.elements.update(|&mut list| {
+			list = value;
+			self.log.record(SeqOp::Reset(value));
+		});
+	}
+
+	fun set_at(self, at: i32, value: T) {
+		self.elements.update(|&mut list| {
+			// Bound before the store: `SetAt` carries BOTH values.
+			let previous = list[at];
+			list[at] = value;
+			self.log.record(SeqOp::SetAt(at, previous, value));
+		});
+	}
+}
+
+impl ListCell<type T> with Source<List<T>> {
+	fun get(self): List<T> {
+		self.elements.get()
+	}
+
+	[must_use]
+	fun on_change(self, observer: |List<T>| void): Subscription {
+		self.elements.on_change(observer)
+	}
+}
+
+/// The cell offers its log — which is all an operator needs from it.
+impl ListCell<type T> with DeltaSource<List<T>, SeqOp<T>> {
+	fun cursor(self): DeltaCursor {
+		self.log.cursor()
+	}
+
+	fun drop_cursor(self, cursor: DeltaCursor) {
+		self.log.drop_cursor(cursor);
+	}
+
+	fun since(self, cursor: DeltaCursor): List<SeqOp<T>> {
+		match self.log.since(cursor) {
+			Some(let ops) => ops,
+			None => {
+				mut lost: List<SeqOp<T>> = [];
+				lost.push(SeqOp::Reset(self.elements.get()));
+				lost
+			},
+		}
+	}
+}
+
+/// The collection surface as trait DEFAULTS over ONE primitive: `push` is
+/// `splice(len, 0, [x])`, `remove_at(i)` is `splice(i, 1, [])`, `clear()` is
+/// `splice(0, len, [])`. `ListCell` writes exactly `size` and `splice` and
+/// inherits the rest.
+trait SequenceCell<T> {
+	fun size(self): i32;
+
+	fun splice(self, at: i32, removed: i32, inserted: List<T>);
+
+	fun push(self, value: T) {
+		self.splice(self.size(), 0, [value])
+	}
+
+	fun insert_at(self, at: i32, value: T) {
+		self.splice(at, 0, [value])
+	}
+
+	fun remove_at(self, at: i32) {
+		self.splice(at, 1, [])
+	}
+
+	fun clear(self) {
+		self.splice(0, self.size(), [])
+	}
+}
+
+impl ListCell<type T> with SequenceCell<T> {
+	fun size(self): i32 {
+		self.elements.get().len()
+	}
+
+	fun splice(self, at: i32, removed: i32, inserted: List<T>) {
+		self.elements.update(|&mut list| {
+			// The removed VALUES are the op's payload, so a fold's derivative
+			// can subtract what left without reading the collection.
+			mut left: List<T> = [];
+			mut taken = 0;
+			for taken < removed {
+				left.push(list.remove(at));
+				taken += 1;
+			}
+			mut offset = 0;
+			let count = inserted.len();
+			for offset < count {
+				match inserted.get(offset) {
+					Some(let value) => list.insert(at + offset, value),
+					None => {},
+				}
+				offset += 1;
+			}
+			self.log.record(SeqOp::Splice(at, left, inserted));
+		});
+	}
+}
+
+// === The generator ===========================================================
+
+let seed: Shared<i53> = Shared::new(1i53);
+
+fun next_random(bound: i32): i32 {
+	let state = (seed.read() * 16807i53) % 2147483647i53;
+	seed.write() = state;
+	(state % bound.as_i53()).as_i32()
+}
+
+// === The derivation under test ===============================================
+
+let calls: Shared<i32> = Shared::new(0);
+let naive_calls: Shared<i32> = Shared::new(0);
+let notifications: Shared<i32> = Shared::new(0);
+let resets_to_mirror: Shared<i32> = Shared::new(0);
+let ops_to_mirror: Shared<i32> = Shared::new(0);
+let incremental_calls: Shared<i32> = Shared::new(0);
+let reset_calls: Shared<i32> = Shared::new(0);
+let checks: Shared<i32> = Shared::new(0);
+
+fun g(value: i32): i32 {
+	calls.write() = calls.read() + 1;
+	value * 2 + 1
+}
+
+/// `map_each`, written against the BOUND rather than against a cell type: one
+/// call of `g` per inserted or updated element, and nothing else looked at.
+fun map_each<S: DeltaSource<List<i32>, SeqOp<i32>>>(source: S): ListCell<i32> {
+	let cursor = source.cursor();
+	mut seeded: List<i32> = [];
+	for value in source.get() {
+		seeded.push(g(value));
+	}
+	let out: ListCell<i32> = ListCell<i32>::new(seeded);
+	let _owned = source.on_change(|_list| {
+		notifications.write() = notifications.read() + 1;
+		for op in source.since(cursor) {
+			match op {
+				SeqOp::Splice(let at, let removed, let inserted) => {
+					mut mapped: List<i32> = [];
+					for value in inserted {
+						incremental_calls.write() = incremental_calls.read() + 1;
+						mapped.push(g(value));
+					}
+					out.splice(at, removed.len(), mapped);
+				},
+				SeqOp::SetAt(let at, let _previous, let value) => {
+					incremental_calls.write() = incremental_calls.read() + 1;
+					out.set_at(at, g(value));
+				},
+				SeqOp::Reset(let items) => {
+					mut mapped: List<i32> = [];
+					for value in items {
+						reset_calls.write() = reset_calls.read() + 1;
+						mapped.push(g(value));
+					}
+					out.set(mapped);
+				},
+				// Nothing in S1 or S2 emits a `Move`; the default derivative
+				// for a consumer that does not care is the splice pair, and
+				// for `map_each` the mapped elements are unchanged, so a
+				// reorder of the source is the same reorder of the output.
+				SeqOp::Move(let _from, let _count, let _to) => {
+					panic("the generator emits no Move");
+				},
+			}
+		}
+	});
+	out
+}
+
+fun same(left: List<i32>, right: List<i32>): bool {
+	if left.len() != right.len() {
+		ret false;
+	}
+	mut index = 0;
+	mut equal = true;
+	for index < left.len() {
+		if left.get(index).ne(right.get(index)) {
+			equal = false;
+		}
+		index += 1;
+	}
+	equal
+}
+
+fun render(list: List<i32>): str {
+	mut out = "";
+	for value in list {
+		out = out + i"{value} ";
+	}
+	out
+}
+
+/// Two LAGGING consumers, each a raw mirror drained on its own cadence against
+/// a log that holds 30 ops: `near` (every 3rd turn) normally gets OPS, `far`
+/// (every 20th turn) normally falls past `base` and gets a `Reset`. Both must
+/// land on the source's own contents.
+fun drain_mirror(
+	source: ListCell<i32>,
+	cursor: DeltaCursor,
+	held: List<i32>,
+	label: str,
+	at_turn: i32,
+): List<i32> {
+	mut mirror = held;
+	for op in source.since(cursor) {
+		match op {
+			SeqOp::Reset(let items) => {
+				resets_to_mirror.write() = resets_to_mirror.read() + 1;
+				mirror = items;
+			},
+			SeqOp::SetAt(let at, let _previous, let value) => {
+				ops_to_mirror.write() = ops_to_mirror.read() + 1;
+				mirror[at] = value;
+			},
+			SeqOp::Splice(let at, let removed, let inserted) => {
+				ops_to_mirror.write() = ops_to_mirror.read() + 1;
+				mut taken = 0;
+				let leaving = removed.len();
+				for taken < leaving {
+					let _dropped = mirror.remove(at);
+					taken += 1;
+				}
+				mut offset = 0;
+				let count = inserted.len();
+				for offset < count {
+					match inserted.get(offset) {
+						Some(let value) => mirror.insert(at + offset, value),
+						None => {},
+					}
+					offset += 1;
+				}
+			},
+			SeqOp::Move(let _from, let _count, let _to) => {
+				panic("the generator emits no Move");
+			},
+		}
+	}
+	checks.write() = checks.read() + 1;
+	if !same(mirror, source.get()) {
+		panic(i"turn {at_turn}: {label}=[{render(mirror)}] source=[{render(source.get())}]");
+	}
+	mirror
+}
+
+fun main() {
+	let source: ListCell<i32> = ListCell<i32>::bounded([1, 2, 3], 30);
+	let derived = map_each(source);
+	let near = source.cursor();
+	let far = source.cursor();
+	mut mirror_near: List<i32> = [1, 2, 3];
+	mut mirror_far: List<i32> = [1, 2, 3];
+
+	mut turn_index = 1;
+	for turn_index <= 400 {
+		let before = notifications.read();
+		let op_count = 1 + next_random(4);
+		batch(|| {
+			mut made = 0;
+			for made < op_count {
+				let size = source.size();
+				let choice = next_random(20);
+				// The mix is biased to GROW — a walk that collapses to two
+				// elements proves nothing about a collection operator.
+				if choice < 9 || size == 0 {
+					source.push(next_random(100));
+				} else if choice < 13 {
+					source.insert_at(next_random(size), next_random(100));
+				} else if choice < 16 {
+					source.remove_at(next_random(size));
+				} else if choice < 18 {
+					source.set_at(next_random(size), next_random(100));
+				} else if choice < 19 && size > 15 {
+					// The wholesale write — a `Reset`, N derivations.
+					mut fresh: List<i32> = [];
+					mut fill = 0;
+					let length = 1 + next_random(8);
+					for fill < length {
+						fresh.push(next_random(100));
+						fill += 1;
+					}
+					source.set(fresh);
+				} else if size > 25 {
+					// `clear` — a default one-liner over `size` + `splice`.
+					source.clear();
+				} else {
+					source.push(next_random(100));
+				}
+				made += 1;
+			}
+		});
+
+		// ONE notification per turn, whatever the op count.
+		let waves = notifications.read() - before;
+		if waves != 1 {
+			panic(i"turn {turn_index}: notifications={waves} (expected 1)");
+		}
+
+		// THE LAW for the always-current consumer.
+		mut reference: List<i32> = [];
+		for value in source.get() {
+			naive_calls.write() = naive_calls.read() + 1;
+			reference.push(value * 2 + 1);
+		}
+		checks.write() = checks.read() + 1;
+		if !same(derived.get(), reference) {
+			panic(i"turn {turn_index}: derived=[{render(derived.get())}] expected=[{render(reference)}]");
+		}
+
+		if turn_index % 3 == 0 {
+			mirror_near = drain_mirror(source, near, mirror_near, "mirror_near", turn_index);
+		}
+		if turn_index % 20 == 0 {
+			mirror_far = drain_mirror(source, far, mirror_far, "mirror_far", turn_index);
+		}
+
+		turn_index += 1;
+	}
+
+	// Drain both to the end, so no cursor is left pinning the log.
+	let _near_final = drain_mirror(source, near, mirror_near, "mirror_near", 0);
+	let _far_final = drain_mirror(source, far, mirror_far, "mirror_far", 0);
+
+	// Both cursor paths must have been EXERCISED, or the run proves less than
+	// it looks like it proves.
+	if ops_to_mirror.read() == 0 {
+		panic("no lagging cursor was ever answered with ops");
+	}
+	if resets_to_mirror.read() == 0 {
+		panic("no lagging cursor ever fell past the log's base");
+	}
+	if calls.read() >= naive_calls.read() {
+		panic(i"the derivation made {calls.read()} calls against the rerun's {naive_calls.read()}");
+	}
+
+	print(i"turns=400 checks={checks.read()} failures=0");
+	print(i"lagging cursors: ops drained={ops_to_mirror.read()} resets={resets_to_mirror.read()}");
+	print(i"g calls: incremental={calls.read()} (splice/set_at={incremental_calls.read()}, reset={reset_calls.read()}) naive-rerun={naive_calls.read()}");
+	print(i"final length {source.get().len()}, log held {source.log.held()} ops, base {source.log.oldest()}, version {source.log.at()}");
+	source.drop_cursor(near);
+	source.drop_cursor(far);
+}
+
+main();

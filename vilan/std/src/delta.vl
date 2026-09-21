@@ -1,0 +1,324 @@
+// The change structure under `std::reactive` (proposal/incremental-collections.md,
+// tracker A112, slice S1).
+//
+// A collection `C` gets a change type — its OP — and an apply; every operator
+// `f: C -> D` gets a derivative `f': C -> Op<C> -> Op<D>`, and the law is
+//
+//     f(a (+) da) == f(a) (+) f'(a, da)
+//
+// read at the only place it is observable, the settle of a turn:
+// `derived.get() == source.get().map(g)`. For `map g` the derivative of "three
+// elements arrived at position 4" is "three MAPPED elements arrived at
+// position 4": `g` runs three times and nothing else is looked at — not N
+// cache checks, zero.
+//
+// This module is the LOG half of that: an op vocabulary per collection SHAPE
+// (not per method), a bounded op log with per-consumer cursors, and the thin
+// trait a cell offers so operators are written against the ops once and serve
+// every cell kind. It is `KeyedCell`'s machinery (A54), lifted out of
+// `std::rpc` and made generic in the OP rather than in the collection — which
+// is what lets a `List<str>` have a delta source at all: `KeyedCell` demands
+// keys because its consumer is a wire protocol that addresses elements by key,
+// and a local derivation addresses them by position.
+//
+// **Why a file of its own, and why the names read as `std::reactive`'s.** The
+// log belongs to the reactive layer — `std::reactive` imports nothing from
+// `std::wire`, and that stays true: `SeqOp` is a reactive type, `Delta` a wire
+// one, and the edge between them lives in `std::rpc`, where it lives today.
+// `reactive.vl` re-exports everything below, so the designed spelling
+// `std::reactive::DeltaCursor` resolves; this file is where the bodies sit.
+//
+// Coalescing is free and is already how the turn scheduler behaves: writes in
+// one turn produce ONE notification and the consumer drains every op at the
+// settle, so the log is as long as one turn's writes.
+import pkg::hash::Hashable;
+import pkg::map::Map;
+import pkg::option::Option::{ self, None, Some };
+import pkg::reactive::{ Source, fresh_id };
+import pkg::set::Set;
+import pkg::shared::Shared;
+
+/// How many ops a `DeltaLog` will hold for a consumer that has stopped
+/// draining. Past it the history is dropped and every lagging cursor falls
+/// back to its shape's `Reset` — bounded memory, at the cost of one
+/// whole-collection payload to a consumer that could not keep up. In practice
+/// nothing reaches it: a consumer drains at the settle of the turn that wrote,
+/// so the log is as long as one turn's writes and no longer.
+///
+/// `keyed_log_limit` before the lift (A54), with its sentence unchanged.
+export let delta_log_limit: i32 = 1024;
+
+/// One consumer's place in a log: the sequence number it has been told
+/// through. Identified rather than compared, because two consumers may
+/// legitimately sit at the same sequence.
+///
+/// `KeyedCursor` before the lift (A54) — the cursor is shape-neutral, so it
+/// is spelled once here instead of once per collection.
+export struct DeltaCursor {
+	id: i32,
+	at: Shared<i32>,
+}
+
+// === The op vocabulary, per SHAPE ============================================
+//
+// Every arm carries WHAT LEFT as well as what arrived, and that is a
+// requirement rather than a convenience: the O(1) derivative of a fold over a
+// group — `sum`, `count`, `mean` — is "add what arrived, subtract what left",
+// and a count cannot say what left, so the operator would have to read the
+// collection, which is the O(N) rerun this module exists to delete. The same
+// payload is what makes an op invertible (undo), and it is what `std::rpc`'s
+// translation to `Delta<K, T>` needs: `Delta::Remove(key)` wants the key of
+// the element that WENT, and only the value carries it.
+
+/// A sequence's change — the primitive shape. Positional: keyed addressing is
+/// a position index on top of it, which is exactly what `KeyedCell` keeps.
+export enum SeqOp<T> {
+	/// `removed` left and `inserted` arrived, both at `at`.
+	Splice(i32, List<T>, List<T>),
+	/// The element at `at` was the first value and is now the second.
+	///
+	/// Deliberately NOT `Splice(at, [old], [new])`, though it means the same
+	/// thing to the collection: for `each` and for a per-element derivation
+	/// the two are different events — an element changed in place, versus one
+	/// left and another arrived — and the difference is whether the
+	/// per-element owner survives.
+	SetAt(i32, T, T),
+	/// The collection BECAME this list. The honest escape hatch: a wholesale
+	/// write, a lagging cursor's fallback, and the compat path for a source
+	/// that keeps no log at all.
+	Reset(List<T>),
+	/// `count` elements moved from `from` to `to`, unchanged.
+	///
+	/// In the vocabulary from S1 although nothing in std EMITS one yet:
+	/// adding an arm to a public op enum later is a breaking change to every
+	/// `match` in every consumer, and a reorder is exactly where the
+	/// splice-pair encoding loses information a consumer needs — a `Splice`
+	/// that removes an element and a `Splice` that re-inserts it are, to a
+	/// per-element owner, a disposal and a rebuild, where a `Move` says "same
+	/// element, new place". A consumer that does not care may treat it as the
+	/// splice pair; `std::rpc`'s wire translation lowers it to
+	/// `Delta::Reset`, which is what a reorder sends today.
+	Move(i32, i32, i32),
+}
+
+/// A map's change. `Put`'s `Option<V>` is the difference between an insert and
+/// an overwrite, which a group fold over the values needs.
+///
+/// Recorded, not slated: nothing asks for a reactive `Map` cell yet. It is
+/// written here so the log's shape is chosen against more than one collection.
+///
+/// `K: Hashable` is the `Reset` arm's bound, not the op's: `Map<K, V>` demands
+/// it, and an op that carries the whole collection carries its bounds with it.
+export enum MapOp<K: Hashable, V> {
+	/// The key, what was there, and what is there now.
+	Put(K, Option<V>, V),
+	/// The key and the value that left.
+	Delete(K, V),
+	/// The collection BECAME this map.
+	Reset(Map<K, V>),
+}
+
+/// A set's change. Recorded, not slated — `MapOp`'s sentence applies.
+export enum SetOp<T: Hashable> {
+	Add(T),
+	Remove(T),
+	Reset(Set<T>),
+}
+
+// === The log =================================================================
+
+/// A bounded op log with per-consumer cursors — `KeyedCell`'s machinery,
+/// lifted and made generic in the OP rather than in the collection.
+///
+/// Three cell kinds want it (a local sequence cell, the keyed cell, an
+/// optimistic or remote cell) and copying it three times is the anti-DRY
+/// failure one layer up from the one A112 complains about, so it is a value
+/// type a cell HOLDS rather than a shape a cell repeats.
+export struct DeltaLog<O> {
+	/// The ops still worth keeping, oldest first: sequence numbers
+	/// `base + 1 ..= version`.
+	ops: Shared<List<O>>,
+	/// The sequence number of the newest op the log has been told.
+	version: Shared<i32>,
+	/// The sequence number BEFORE the oldest op the log still holds. A cursor
+	/// left behind it has lost history and is answered with `None`.
+	base: Shared<i32>,
+	/// One per live consumer. The log trims to the laggiest of them, so a log
+	/// nobody is watching keeps no history at all.
+	cursors: Shared<List<DeltaCursor>>,
+	/// This log's ceiling, `delta_log_limit` unless a cell asked for another.
+	/// A plain field rather than a cell: it is written once, at construction.
+	limit: i32,
+}
+
+export impl DeltaLog<type O> {
+	/// An empty log at `delta_log_limit`.
+	fun new(): DeltaLog<O> {
+		DeltaLog {
+			ops = Shared::new([]),
+			version = Shared::new(0),
+			base = Shared::new(0),
+			cursors = Shared::new([]),
+			limit = delta_log_limit,
+		}
+	}
+
+	/// An empty log at a ceiling of its caller's choosing — what a test that
+	/// wants to reach the lag path without writing a thousand ops asks for.
+	fun with_limit(limit: i32): DeltaLog<O> {
+		DeltaLog {
+			ops = Shared::new([]),
+			version = Shared::new(0),
+			base = Shared::new(0),
+			cursors = Shared::new([]),
+			limit,
+		}
+	}
+
+	/// Append one op and bump the sequence. The trim comes FIRST, so a log
+	/// whose consumers are all current holds one op and a log with no
+	/// consumers holds exactly the op just recorded — ONE, not zero, because
+	/// the trim happened before the push. Harmless, and stated here because it
+	/// is easy to state wrongly.
+	///
+	/// Past `limit` the history is dropped instead of appended and `base`
+	/// jumps to the new sequence: every cursor behind it now reads as lagging
+	/// and is answered with `None` on its next drain, which the CELL turns
+	/// into its shape's `Reset`. The op is not lost — it is IN the collection,
+	/// which is what the `Reset` carries.
+	fun record(self, op: O) {
+		self.trim();
+		let next = self.version.read() + 1;
+		self.version.write() = next;
+		if self.ops.read().len() >= self.limit {
+			self.ops.write() = [];
+			self.base.write() = next;
+		} else {
+			self.ops.write().push(op);
+		}
+	}
+
+	/// Drop the ops every live cursor has already been told. With no cursors
+	/// the whole log goes: nothing is watching, so nothing is owed.
+	///
+	/// The log is trimmed at the next WRITE, not at the drain: after a lone
+	/// cursor has drained four ops the log still holds four, and they go on
+	/// the next `record`. A cell written once and then read for ever holds one
+	/// op's worth of history for ever. Also harmless, and also easy to state
+	/// wrongly.
+	fun trim(self) {
+		mut lowest = self.version.read();
+		for cursor in self.cursors.read() {
+			let at = cursor.at.read();
+			if at < lowest {
+				lowest = at;
+			}
+		}
+		let base = self.base.read();
+		if lowest > base {
+			let dropped = lowest - base;
+			mut kept: List<O> = [];
+			mut index = dropped;
+			let held = self.ops.read();
+			let length = held.len();
+			for index < length {
+				match held.get(index) {
+					Some(let op) => kept.push(op),
+					None => {},
+				}
+				index += 1;
+			}
+			self.ops.write() = kept;
+			self.base.write() = lowest;
+		}
+	}
+
+	/// Register a consumer's cursor, at the sequence the log is at NOW — the
+	/// consumer is about to seed from the current collection, so it is owed
+	/// nothing before this point.
+	fun cursor(self): DeltaCursor {
+		let minted = DeltaCursor { id = fresh_id(), at = Shared::new(self.version.read()) };
+		self.cursors.write().push(minted);
+		minted
+	}
+
+	/// Retire a cursor: its consumer is gone, so the log no longer has to hold
+	/// anything for it. Called from the consumer's `Subscription::release`.
+	fun drop_cursor(self, cursor: DeltaCursor) {
+		mut kept: List<DeltaCursor> = [];
+		for held in self.cursors.read() {
+			if held.id != cursor.id {
+				kept.push(held);
+			}
+		}
+		self.cursors.write() = kept;
+	}
+
+	/// Everything `cursor` has not been told, and advance it. A cursor behind
+	/// `base` has lost history and is answered with `None`.
+	///
+	/// `None` rather than a `Reset` because the LOG does not know what a
+	/// `Reset` is for its op type and the CELL does — the one place the two
+	/// layers have to know about each other, and three lines in each cell.
+	fun since(self, cursor: DeltaCursor): Option<List<O>> {
+		let at = cursor.at.read();
+		let version = self.version.read();
+		mut ops: List<O> = [];
+		if at >= version {
+			ret Some(ops);
+		}
+		cursor.at.write() = version;
+		let base = self.base.read();
+		if at < base {
+			ret None;
+		}
+		mut index = at - base;
+		let held = self.ops.read();
+		let length = held.len();
+		for index < length {
+			match held.get(index) {
+				Some(let op) => ops.push(op),
+				None => {},
+			}
+			index += 1;
+		}
+		Some(ops)
+	}
+
+	/// How many ops the log is holding — what a pin on the trim reads.
+	fun held(self): i32 {
+		self.ops.read().len()
+	}
+
+	/// The newest sequence the log has been told.
+	fun at(self): i32 {
+		self.version.read()
+	}
+
+	/// The sequence before the oldest op still held.
+	fun oldest(self): i32 {
+		self.base.read()
+	}
+}
+
+/// A source whose WRITES are its deltas. `C` is the collection, `O` its op.
+///
+/// The bound is what makes an operator generic in the CELL rather than in one
+/// cell type: a derivation takes an `S: DeltaSource<List<T>, SeqOp<T>>`, so it
+/// serves a local sequence cell, `KeyedCell`, and anything an app writes.
+///
+/// vilan has no associated types, so both the collection and its op are
+/// parameters.
+export trait DeltaSource<C, O> with Source<C> {
+	/// A cursor into this source's log, at the sequence it is at now.
+	fun cursor(self): DeltaCursor;
+
+	/// Retire a cursor. A derivation calls it on disposal, so a dead consumer
+	/// stops pinning history.
+	fun drop_cursor(self, cursor: DeltaCursor);
+
+	/// Everything `cursor` has not been told. Unlike the LOG's `since` this
+	/// never fails: a cursor that lost history is answered with the shape's
+	/// `Reset`, carrying the collection.
+	fun since(self, cursor: DeltaCursor): List<O>;
+}
