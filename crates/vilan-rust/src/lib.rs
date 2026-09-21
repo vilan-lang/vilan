@@ -28,15 +28,49 @@
 //! call `p.bump(2)` has already been RESOLVED by the analyzer into a call whose
 //! subject is the member's own id and whose first argument is the receiver. So
 //! this emitter needs no impl selection and no dispatch table for the concrete
-//! case; it needs one for the GENERIC case, which is precisely the case it
-//! refuses in S1a.
+//! case.
+//!
+//! # S1b: monomorphisation, and where its parts come from
+//!
+//! 51 of S1a's 98 refusals were generics, and closing them is this slice. The
+//! JS emitter has done monomorphisation since long before either backend
+//! existed, and **its instance set is not a data structure this one can read**:
+//! `Transformer::instances` is minted DURING the JS walk, keyed by
+//! `(function, type keys, adapted-asyncness bits)`, and its values are JS
+//! function nodes. There is no pre-computed set on `Program` to consume (see the
+//! lane's report — this was the slice's first open question).
+//!
+//! What IS shared, and is what this emitter reads, is the backend-independent
+//! half: [`vilan_core::impl_select`] (`select_member`, `bind_subject`,
+//! `applying_trait_ids` — selecting an impl for a concrete receiver, and
+//! recovering the bindings that selection implies) plus the analyzer's own
+//! records, `method_call_substitution`, `generic_dispatch`,
+//! `own_generic_call_bindings` and `bound_dispatch_traits`. The mechanism around
+//! them — a substitution threaded through the walk, a `resolve_type_id` that
+//! follows a `Generic` to its binding, a structural instance key, one memo per
+//! instance — is reproduced here rather than lifted out of `transformer.rs`,
+//! because lifting it is a refactor of a file three other lanes are editing this
+//! order. That the two mechanisms must agree is exactly what the differential
+//! measures.
+//!
+//! One thing is genuinely different, and it is the reason the reproduction is
+//! not a copy: **JS needs no concrete types and Rust needs nothing else.** The
+//! JS emitter resolves a bare `Generic` and stops, because `List<T>` and
+//! `List<i32>` are the same array. Here `List<T>` must come out `Vec<i32>`, and
+//! `struct Pair<T>` must come out as one Rust `struct` PER instantiation — so
+//! type rendering resolves structurally, and a nominal declaration is emitted
+//! once per concrete argument list.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
-use vilan_core::analyzer::{Expr, ExprIfBranch, ExprMatchLeg, ExprPattern, Intrinsic, Program};
+use vilan_core::analyzer::{
+    Expr, ExprIfBranch, ExprMatchLeg, ExprPattern, GenericDispatch, Intrinsic, Program,
+};
 use vilan_core::error::Error;
+use vilan_core::fx::FxHashMap as HashMap;
 use vilan_core::id::Id;
+use vilan_core::impl_select;
 use vilan_core::node::{BinaryOp, Convention, ExternBinding};
 use vilan_core::options::BuildOptions;
 use vilan_core::span::Span;
@@ -46,6 +80,17 @@ use vilan_core::type_::{Type, TypeId};
 pub struct Emitted {
     /// The whole program, as one `main.rs`.
     pub source: String,
+    /// The HOST surface the program reached, in name order — the platform
+    /// bindings, intrinsics and external types this backend has no native body
+    /// for (tracker F18's work list).
+    ///
+    /// Filled only under `VILAN_NATIVE_HOST_CENSUS=1`, which makes a host gap a
+    /// RECORDED `unimplemented!()` instead of a refusal so one emit can walk a
+    /// whole program and answer with the list rather than with its first
+    /// sentence. The source such an emit produces is a census, not a build:
+    /// nothing compiles it, and the mode exists because "what does this program
+    /// still need" is a question one run should answer.
+    pub host_gaps: Vec<String>,
     /// R3's measurement: how many bindings this program had to box into
     /// `vilan_rt::Captured<_>` (an `Rc<RefCell<_>>`) because a closure captures
     /// them and something writes them. C15's by-value capture optimisation is
@@ -63,9 +108,20 @@ pub fn emit(program: &Program<'_>, _options: &BuildOptions) -> Result<Emitted, E
     Emitter::new(program).run()
 }
 
+/// The member a concatenation's render dispatch calls (B176).
+///
+/// `analyzer::RENDER_MEMBER` is the source of truth and is `pub(crate)`, so a
+/// backend crate outside `vilan-core` cannot name it. Copied here rather than
+/// widened, because the ownership map for this order gives `analyzer.rs` to
+/// three other lanes and a one-token visibility change is not worth a merge
+/// conflict — the lane's report asks for the widening instead.
+const RENDER_MEMBER: &str = "to_string";
+
 /// The prelude every emitted program carries.
 const PRELUDE: &str = "\
-#![allow(unused_imports, unused_parens, unused_variables, dead_code, clippy::all)]
+#![allow(unused_imports, unused_parens, unused_variables, unused_mut, unused_braces)]
+#![allow(dead_code)]
+#![allow(unreachable_patterns, non_camel_case_types, non_snake_case, clippy::all)]
 use vilan_rt::Js as _;
 ";
 
@@ -75,28 +131,100 @@ fn unsupported(what: &str, span: Span) -> Error {
         note: None,
         span,
         msg: format!(
-            "the `rust` backend does not emit {what} yet — this is F1's slice S1a, \
-             whose scope is structs, enums, `Option`/`Result`, `str`, `List`, `Map`/`Set`, \
-             closures, `impl`s, `print`, `panic` and the reactive cell. Build this program \
-             with `--backend js`."
+            "the `rust` backend does not emit {what} yet — this is F1's slice S1b, \
+             whose scope is structs, enums, generics, `Option`/`Result`, `str`, `List`, \
+             `Map`/`Set`, closures, `impl`s, traits, operators, `?`, `print`, `panic` and \
+             the reactive cell. Build this program with `--backend js`."
         ),
     }
 }
 
+/// Where in the emitted file one reserved slot's text goes, and under what name.
+struct Reserved {
+    name: String,
+    slot: usize,
+}
+
 struct Emitter<'a, 'src> {
     program: &'a Program<'src>,
-    /// Function bodies, keyed by id so the output is deterministic.
-    functions: BTreeMap<u32, String>,
-    /// Functions already emitted or in progress — recursion needs the mark
-    /// BEFORE the body is walked, exactly as the JS emitter's does.
-    started: HashSet<Id>,
-    /// Nominal types the program reached, emitted once each.
-    types: BTreeMap<u32, String>,
-    started_types: HashSet<Id>,
+    /// Function bodies, keyed by the slot reserved for them — so the emitted
+    /// order is discovery order and a body written during a nested walk cannot
+    /// reorder the file.
+    functions: BTreeMap<usize, String>,
+    /// Instances emitted or in progress, keyed by (function, the structural keys
+    /// of the concrete types its generic parameters are bound to). An empty key
+    /// list is the non-generic case, which keeps its plain `{name}_{id}`.
+    ///
+    /// The memo is written BEFORE the body is walked, exactly as the JS
+    /// emitter's is — a self-recursive body has to be able to call itself.
+    instances: HashMap<(Id, Vec<String>), Reserved>,
+    /// Trait DEFAULT bodies, specialized per concrete receiver type: (default,
+    /// that type's structural key). Keyed separately from [`Self::instances`]
+    /// because what varies is `Self`, not a written generic parameter.
+    default_instances: HashMap<(Id, String), Reserved>,
+    /// Nominal type declarations, keyed by (declaration, its concrete
+    /// arguments). `Pair<i32>` and `Pair<str>` are two Rust structs.
+    types: BTreeMap<usize, String>,
+    type_instances: HashMap<(Id, Vec<String>), Reserved>,
+    /// The next reserved slot. Functions and types number independently
+    /// (they are two sections of the file).
+    next_function_slot: usize,
+    next_type_slot: usize,
+    /// The generic binding in force while a body is walked: generic constraint
+    /// id -> the type it is bound to. [`Emitter::concrete`] follows it.
+    current_substitution: HashMap<TypeId, TypeId>,
+    /// The concrete type a trait default is being specialized for, so a
+    /// `self.method()` inside it re-dispatches there (the JS emitter's
+    /// `current_self_type`).
+    current_self_type: Option<TypeId>,
+    /// The trait whose default is being specialized, plus its supertraits.
+    ///
+    /// Inside a default body `self` is typed as the TRAIT, not as the type the
+    /// default is being specialized for — so `fun shout(self): str {
+    /// self.describe() + "!" }` asks this emitter to render a parameter of
+    /// trait type, which natively is nothing. The set is what makes the
+    /// rewrite to `current_self_type` narrow: only the traits this body's
+    /// `Self` actually satisfies are rewritten, so a genuinely trait-typed
+    /// value elsewhere keeps its refusal rather than quietly becoming `Self`.
+    current_self_traits: HashSet<Id>,
+    /// Whether the function being emitted hands back a VIEW (`borrows`). Its
+    /// return positions then pass the loan on instead of copying out of it —
+    /// `fun same(x: &mut i32): &mut i32 { x }` returns `x`, and rule 1's copy
+    /// there is a type error, not a copy.
+    current_returns_view: bool,
+    /// The type the position an expression is being emitted INTO declares, when
+    /// that position declares one — a binding's annotation, a call argument's
+    /// parameter, a struct field, a `ret`'s return type.
+    ///
+    /// It exists for one job the JS emitter has no use for: a generic variant
+    /// CONSTRUCTOR records an open type at its own site (`Tree::Leaf(7)` is
+    /// `Tree<any>` until the annotation beside it closes the hole), and a Rust
+    /// enum cannot be minted over a hole. Consulted ONLY where the recorded
+    /// type is not grounded, and only when it names the same declaration, so it
+    /// can narrow an answer and never change one.
+    expected_type: Option<TypeId>,
     /// R3: the bindings boxed into a counted cell, and why they had to be.
     boxed: HashSet<Id>,
-    /// Every module-level binding in the world, refused at the READ.
+    /// Every module-level binding in the world, lowered to a `thread_local!`.
     module_bindings: HashSet<Id>,
+    /// The module-level bindings this program actually READ, in reach order,
+    /// with the `thread_local!` block each lowered to.
+    module_binding_cells: BTreeMap<u32, String>,
+    /// Module-level bindings whose cell is being built, so a binding whose
+    /// initializer reads another one does not recurse forever.
+    module_bindings_started: HashSet<Id>,
+    /// B105: expression ids standing for a temp the compound-assignment hoist
+    /// declared ahead of the write. Live only while one assignment is rendered.
+    hoisted: HashMap<Id, String>,
+    /// Whether this emit is a HOST CENSUS rather than a build (see
+    /// [`Emitted::host_gaps`]).
+    census: bool,
+    /// The host surface a census emit reached, deduplicated and ordered.
+    host_gaps: std::collections::BTreeSet<String>,
+    /// `is`-test captures currently bound by an enclosing `if let` — the only
+    /// scope in which a capture has a native name at all (it has no `variables`
+    /// record; the JS emitter substitutes the payload accessor instead).
+    is_captures: HashSet<Id>,
 }
 
 impl<'a, 'src> Emitter<'a, 'src> {
@@ -104,11 +232,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Emitter {
             program,
             functions: BTreeMap::new(),
-            started: HashSet::new(),
+            instances: HashMap::default(),
+            default_instances: HashMap::default(),
             types: BTreeMap::new(),
-            started_types: HashSet::new(),
+            type_instances: HashMap::default(),
+            next_function_slot: 0,
+            next_type_slot: 0,
+            current_substitution: HashMap::default(),
+            current_self_type: None,
+            current_self_traits: HashSet::new(),
+            current_returns_view: false,
+            expected_type: None,
             boxed: HashSet::new(),
             module_bindings: HashSet::new(),
+            module_binding_cells: BTreeMap::new(),
+            module_bindings_started: HashSet::new(),
+            hoisted: HashMap::default(),
+            is_captures: HashSet::new(),
+            census: std::env::var_os("VILAN_NATIVE_HOST_CENSUS").is_some(),
+            host_gaps: std::collections::BTreeSet::new(),
         }
     }
 
@@ -129,24 +271,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 span: Span::new((), 0..0),
             })?;
 
-        // A module-level binding is a `static` with a constructor, which needs a
-        // `thread_local!` and an initialization order this slice does not build.
-        // Recorded now and refused where one is READ, not where one exists: std
-        // declares several (`PI`, the reactive turn's registers) that a program
-        // reaching none of them must not be refused for.
+        // A module-level binding is a `static` with a constructor. It is
+        // lowered where one is READ, not where one exists: std declares several
+        // (`PI`, the reactive turn's registers) and a program reaching none of
+        // them must carry none of them.
         self.module_bindings = self.program.module_level_bindings().into_iter().collect();
         self.compute_boxed_bindings();
 
-        self.ensure_function(main_id)?;
+        let main = self.ensure_function(main_id, &HashMap::default())?;
         let main_body = self
             .functions
-            .remove(&main_id.0)
+            .remove(&main.slot)
             .expect("main was just emitted");
 
         let mut source = String::from(PRELUDE);
         for declaration in self.types.values() {
             source.push('\n');
             source.push_str(declaration);
+        }
+        for cell in self.module_binding_cells.values() {
+            source.push('\n');
+            source.push_str(cell);
         }
         for body in self.functions.values() {
             source.push('\n');
@@ -156,6 +301,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         source.push_str(&main_body);
         Ok(Emitted {
             source,
+            host_gaps: self.host_gaps.iter().cloned().collect(),
             boxed_bindings: self.boxed.len(),
         })
     }
@@ -321,21 +467,373 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .unwrap_or(Span::new((), 0..0))
     }
 
-    // ------------------------------------------------------------- names ---
+    // ----------------------------------------------- the substitution ---
 
-    /// Emitted names carry the vilan name AND the id: the id is what makes two
-    /// same-named members of different impls distinct without a rename pass,
-    /// and the name is what makes the emitted source readable when rustc
-    /// reports something about it.
-    fn function_name(&self, id: Id) -> String {
-        let name = self
-            .program
-            .functions
-            .get(&id)
-            .map(|function| function.name)
-            .unwrap_or("fun");
-        format!("{}_{}", sanitize(name), id.0)
+    /// A type id under the active substitution: a bare `Generic` followed to
+    /// what it is bound to, anything else left alone. The JS emitter's
+    /// `resolve_type_id`, guard included — a substitution that binds a generic
+    /// to ITSELF (which reconciling an impl's own parameter records) would
+    /// otherwise loop forever.
+    ///
+    /// Only the HEAD is resolved here. A constructor-headed type is resolved
+    /// structurally as it is rendered ([`Self::rust_type`] recurses into the
+    /// arguments) and as it is keyed ([`Self::type_key`] does the same), which
+    /// is the part the JS emitter has no use for and this one cannot do without.
+    fn concrete(&self, type_id: TypeId) -> TypeId {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return type_id;
+        };
+        // The substitution is keyed by CONSTRAINT id, and a type id is looked up
+        // directly before its `Type` is consulted. The direct hop is not an
+        // optimisation: a nominal declaration's parameter can arrive as the
+        // constraint id ITSELF — `enum Tree<T>`'s `Leaf(T)` records T's
+        // constraint id, whose `Type` is `Any`, where `struct Pair<A, B>`'s
+        // fields record `Generic(..)` nodes — so a `Generic`-only lookup
+        // resolves a generic struct's field and leaves a generic enum's payload
+        // abstract. Type ids are deliberately NOT interned
+        // (`type_id_for_type`), so a key can only ever be the parameter it was
+        // minted for.
+        if let Some(bound) = self.current_substitution.get(&type_id) {
+            // A binding to ITSELF, which reconciling an impl's own parameter
+            // records: following it would loop forever, so it stays abstract.
+            if *bound != type_id {
+                return self.concrete(*bound);
+            }
+            return type_id;
+        }
+        match self.program.type_id_to_type_map.get(&type_id) {
+            Some(Type::Generic(constraint_id)) => {
+                match self.current_substitution.get(constraint_id) {
+                    Some(bound)
+                        if !matches!(
+                            self.program.type_id_to_type_map.get(bound),
+                            Some(Type::Generic(other)) if other == constraint_id
+                        ) =>
+                    {
+                        self.concrete(*bound)
+                    }
+                    _ => type_id,
+                }
+            }
+            // `Self` inside a trait default, which the analyzer types as the
+            // trait itself. Rewritten only to the traits THIS body's `Self`
+            // satisfies ([`Self::current_self_traits`]).
+            Some(Type::Trait(trait_id, _)) if self.current_self_traits.contains(trait_id) => {
+                match self.current_self_type {
+                    Some(self_type) if self_type != type_id => self.concrete(self_type),
+                    _ => type_id,
+                }
+            }
+            _ => type_id,
+        }
     }
+
+    /// The trait declaring `default_id`, closed over its supertraits — the set
+    /// a default body's `Self` satisfies.
+    fn self_traits_of(&self, default_id: Id) -> HashSet<Id> {
+        let mut out = HashSet::new();
+        let Some((trait_id, _)) = self
+            .program
+            .traits
+            .iter()
+            .find(|(_, trait_)| trait_.declarations.values().any(|id| *id == default_id))
+        else {
+            return out;
+        };
+        let mut stack = vec![*trait_id];
+        while let Some(id) = stack.pop() {
+            if !out.insert(id) {
+                continue;
+            }
+            if let Some(trait_) = self.program.traits.get(&id) {
+                for supertrait_type_id in &trait_.supertraits {
+                    if let Some(Type::Trait(super_id, _)) =
+                        self.program.type_id_to_type_map.get(supertrait_type_id)
+                    {
+                        stack.push(*super_id);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// A stable key identifying a type under the active substitution — the
+    /// instance memo's key, and the discriminator between two Rust types minted
+    /// from one declaration.
+    ///
+    /// STRUCTURAL rather than id-keyed, for the reason `transformer.rs`'s
+    /// `type_key` spells out (B95): a nominal `Type` carries its arguments as
+    /// raw `TypeId`s, and inference can mint two ids for one type, so a key that
+    /// followed the ids would emit one body twice. It is written here rather
+    /// than borrowed because it must resolve THROUGH the substitution at every
+    /// level — the JS one resolves only where it is asked to.
+    ///
+    /// It never fails. A type this emitter cannot RENDER still has to be keyed,
+    /// or two instances it will refuse would collide and the refusal would name
+    /// the wrong one.
+    fn type_key(&self, type_id: TypeId) -> String {
+        let mut key = String::new();
+        self.write_type_key(type_id, &mut key);
+        key
+    }
+
+    fn write_type_key(&self, type_id: TypeId, out: &mut String) {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            out.push_str("...");
+            return;
+        };
+        let type_id = self.concrete(type_id);
+        let Some(type_) = self.program.type_id_to_type_map.get(&type_id) else {
+            let _ = write!(out, "?{}", type_id.0);
+            return;
+        };
+        match type_ {
+            Type::Struct(id, arguments) => {
+                let _ = write!(out, "S{}", id.0);
+                self.write_key_arguments(arguments, out);
+            }
+            Type::Enum(id, arguments) => {
+                let _ = write!(out, "E{}", id.0);
+                self.write_key_arguments(arguments, out);
+            }
+            Type::Trait(id, arguments) => {
+                let _ = write!(out, "T{}", id.0);
+                self.write_key_arguments(arguments, out);
+            }
+            Type::Tuple(elements) => {
+                out.push_str("Tup");
+                self.write_key_arguments(elements, out);
+            }
+            Type::Closure(parameters, return_type_id, _) => {
+                out.push_str("Fn");
+                self.write_key_arguments(parameters, out);
+                out.push_str("->");
+                self.write_type_key(*return_type_id, out);
+            }
+            Type::Array(element_type_id, length) => {
+                out.push_str("Arr[");
+                self.write_type_key(*element_type_id, out);
+                let _ = write!(out, ";{length}]");
+            }
+            // A generic the substitution did not reach is an ABSTRACT type, and
+            // two distinct binders are two distinct abstract types — so this one
+            // position stays id-keyed, exactly as the JS emitter's does.
+            Type::Generic(constraint_id) => {
+                let _ = write!(out, "G{}", constraint_id.0);
+            }
+            Type::Void => out.push_str("void"),
+            other => {
+                let _ = write!(out, "X{}", describe(other));
+            }
+        }
+    }
+
+    fn write_key_arguments(&self, arguments: &[TypeId], out: &mut String) {
+        out.push('<');
+        for argument in arguments {
+            self.write_type_key(*argument, out);
+            out.push(',');
+        }
+        out.push('>');
+    }
+
+    /// The bindings the active substitution provides for the generics a
+    /// callee's signature mentions — for a generic call inside a monomorphized
+    /// body whose type arguments come only from the enclosing instantiation, so
+    /// the analyzer recorded no substitution of its own. The JS emitter's
+    /// `inherited_substitution`.
+    fn inherited_substitution(&self, target_id: Id) -> HashMap<TypeId, TypeId> {
+        if self.current_substitution.is_empty() {
+            return HashMap::default();
+        }
+        let Some(function) = self.program.functions.get(&target_id) else {
+            return HashMap::default();
+        };
+        let mut generics = Vec::new();
+        for parameter_id in &function.parameters {
+            if let Some(parameter) = self.program.parameters.get(parameter_id) {
+                self.collect_type_generics(parameter.type_id, 0, &mut generics);
+            }
+        }
+        if let Some(return_type_id) = function.return_type_id {
+            self.collect_type_generics(return_type_id, 0, &mut generics);
+        }
+        // A generic parameter the SIGNATURE does not mention still has to be
+        // bound when the enclosing instantiation can bind it: `fun make<T>():
+        // T` is covered by the return type, but `T::describe()` inside a body
+        // whose `T` is the caller's own is not reachable from either list.
+        for constraint_id in &function.generic_parameter_constraint_ids {
+            if !generics.contains(constraint_id) {
+                generics.push(*constraint_id);
+            }
+        }
+        generics
+            .into_iter()
+            .filter_map(|constraint_id| {
+                self.current_substitution
+                    .get(&constraint_id)
+                    .map(|type_id| (constraint_id, *type_id))
+            })
+            .collect()
+    }
+
+    /// The `Generic` constraint ids a type's structure mentions.
+    fn collect_type_generics(&self, type_id: TypeId, depth: usize, out: &mut Vec<TypeId>) {
+        if depth > 24 {
+            return;
+        }
+        match self.program.type_id_to_type_map.get(&type_id) {
+            Some(Type::Generic(constraint_id)) => {
+                if !out.contains(constraint_id) {
+                    out.push(*constraint_id);
+                }
+            }
+            Some(
+                Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Tuple(arguments),
+            ) => {
+                for argument in arguments.clone() {
+                    self.collect_type_generics(argument, depth + 1, out);
+                }
+            }
+            Some(Type::Closure(parameters, return_type_id, _)) => {
+                let parameters = parameters.clone();
+                let return_type_id = *return_type_id;
+                for parameter in parameters {
+                    self.collect_type_generics(parameter, depth + 1, out);
+                }
+                self.collect_type_generics(return_type_id, depth + 1, out);
+            }
+            Some(Type::Array(element_id, _)) => {
+                self.collect_type_generics(*element_id, depth + 1, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// The generic binding to monomorphize a call's callee with, from whichever
+    /// channel carries it — the written type arguments (`id<i32>`), the
+    /// receiver/own-generic substitution the analyzer recorded, or the inherited
+    /// slice of the active one. The JS emitter's `call_substitution`, B192's
+    /// merge included: a written list is a PREFIX laid OVER the recorded
+    /// substitution, never a replacement for it.
+    fn call_substitution(
+        &self,
+        call_id: Id,
+        target_id: Id,
+        generic_argument_ids: &[TypeId],
+    ) -> HashMap<TypeId, TypeId> {
+        let function = self.program.functions.get(&target_id);
+        let is_generic =
+            function.is_some_and(|function| !function.generic_parameter_constraint_ids.is_empty());
+        let mut substitution = match self.program.method_call_substitution.get(&call_id) {
+            Some(recorded) => recorded.clone(),
+            None => self.inherited_substitution(target_id),
+        };
+        if is_generic && !generic_argument_ids.is_empty() {
+            for (constraint_id, argument_id) in function
+                .expect("a generic callee is a function")
+                .generic_parameter_constraint_ids
+                .iter()
+                .copied()
+                .zip(generic_argument_ids.iter().copied())
+            {
+                substitution.insert(constraint_id, argument_id);
+            }
+        }
+        // The call's OWN generic values, recorded positionally by the analyzer
+        // where the written-argument channel carries nothing (a bound method
+        // reached through a trait surface).
+        if let Some(values) = self.program.own_generic_call_bindings.get(&call_id)
+            && let Some(function) = function
+        {
+            for (constraint_id, value) in function
+                .generic_parameter_constraint_ids
+                .iter()
+                .zip(values.iter())
+            {
+                substitution.insert(*constraint_id, *value);
+            }
+        }
+        substitution
+    }
+
+    /// The substitution a trait DEFAULT body is specialized under: the trait's
+    /// own generic parameters bound to the arguments `type_id` implements the
+    /// trait at, plus the providing impl's binders bound from the concrete
+    /// receiver. The JS emitter's `trait_parameter_substitution` (B58).
+    fn trait_parameter_substitution(
+        &self,
+        default_id: Id,
+        type_id: TypeId,
+    ) -> HashMap<TypeId, TypeId> {
+        let mut substitution = HashMap::default();
+        let Some((trait_id, trait_)) = self
+            .program
+            .traits
+            .iter()
+            .find(|(_, trait_)| trait_.declarations.values().any(|id| *id == default_id))
+        else {
+            return substitution;
+        };
+        if trait_.generic_parameter_constraint_ids.is_empty() {
+            return substitution;
+        }
+        let Some(implementation) =
+            impl_select::select_implementation(self.program, None, type_id, *trait_id)
+        else {
+            return substitution;
+        };
+        impl_select::bind_subject(
+            self.program,
+            implementation.subject,
+            type_id,
+            &mut substitution,
+        );
+        let Some((_, arguments)) = implementation
+            .trait_args
+            .iter()
+            .find(|(provided, _)| provided == trait_id)
+        else {
+            return substitution;
+        };
+        for (parameter_id, argument_id) in trait_
+            .generic_parameter_constraint_ids
+            .iter()
+            .zip(arguments)
+        {
+            substitution.insert(*parameter_id, *argument_id);
+        }
+        substitution
+    }
+
+    /// Composes `entries` onto the substitution in force and installs the
+    /// result, answering the old one for the caller to restore.
+    ///
+    /// COMPOSES rather than replaces, for B244's reason: a bound type that is
+    /// constructor-headed with a generic inside (`Option<T>`) cannot be grounded
+    /// at the point of binding, so dropping the outer entries strands that inner
+    /// `T`. Keeping the ones the inner entries do not shadow leaves the chain
+    /// walkable, and [`Self::concrete`] already follows a binding to a binding.
+    fn enter_substitution(&mut self, entries: Vec<(TypeId, TypeId)>) -> HashMap<TypeId, TypeId> {
+        let mut composed = self.current_substitution.clone();
+        composed.extend(entries);
+        std::mem::replace(&mut self.current_substitution, composed)
+    }
+
+    /// `substitution`'s entries with every bound type resolved under the
+    /// substitution in force, ordered by constraint id — the memo key's input,
+    /// and the composition's.
+    fn resolved_entries(&self, substitution: &HashMap<TypeId, TypeId>) -> Vec<(TypeId, TypeId)> {
+        let mut entries: Vec<(TypeId, TypeId)> = substitution
+            .iter()
+            .map(|(constraint_id, type_id)| (*constraint_id, self.concrete(*type_id)))
+            .collect();
+        entries.sort_by_key(|(constraint_id, _)| constraint_id.0);
+        entries
+    }
+
+    // ------------------------------------------------------------- names ---
 
     fn binding_name(&self, id: Id) -> String {
         let name = self
@@ -358,11 +856,32 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
     // ------------------------------------------------------------- types ---
 
+    /// What a type IS, under the substitution in force. Every "what shape is
+    /// this" question in the walk goes through here, so a generic parameter is
+    /// followed to its binding in ONE place — a second spelling that forgot to
+    /// is how a monomorphized body comes to ask about `T` instead of `i32`.
     fn resolve(&self, type_id: TypeId) -> Option<&Type> {
-        self.program.type_id_to_type_map.get(&type_id)
+        self.program
+            .type_id_to_type_map
+            .get(&self.concrete(type_id))
     }
 
     fn rust_type(&mut self, type_id: TypeId, span: Span) -> Result<String, Error> {
+        let rendered = self.rust_type_inner(type_id, span);
+        match rendered {
+            Err(error) if self.census => {
+                self.host_gaps.insert(census_entry(&error));
+                Ok("()".to_string())
+            }
+            other => other,
+        }
+    }
+
+    fn rust_type_inner(&mut self, type_id: TypeId, span: Span) -> Result<String, Error> {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return Err(unsupported("a type nested past the recursion guard", span));
+        };
+        let type_id = self.concrete(type_id);
         let Some(resolved) = self.resolve(type_id).cloned() else {
             return Err(unsupported("a value whose type did not resolve", span));
         };
@@ -399,12 +918,62 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             Type::Struct(id, arguments) => self.nominal_struct(id, &arguments, span),
             Type::Enum(id, arguments) => self.nominal_enum(id, &arguments, span),
-            Type::Generic(_) => Err(unsupported("a generic type parameter", span)),
+            // A generic the substitution did not reach. The refusal names the
+            // PARAMETER, because which one went unbound is the whole diagnosis
+            // when it happens.
+            Type::Generic(constraint_id) => Err(unsupported(
+                &format!(
+                    "a value of an unbound generic type parameter ({})",
+                    self.generic_name(constraint_id)
+                ),
+                span,
+            )),
             other => Err(unsupported(
                 &format!("a value of type `{}`", describe(&other)),
                 span,
             )),
         }
+    }
+
+    /// Which generic parameter went unbound, for a refusal whose whole
+    /// diagnosis is that. Only a `trait` records its parameters' written NAMES,
+    /// so everything else is named by its declaration and position — which is
+    /// what a reader needs either way.
+    fn generic_name(&self, constraint_id: TypeId) -> String {
+        for trait_ in self.program.traits.values() {
+            if let Some(position) = trait_
+                .generic_parameter_constraint_ids
+                .iter()
+                .position(|id| *id == constraint_id)
+            {
+                return match trait_.generic_parameter_names.get(position) {
+                    Some(name) => format!("`{name}` of trait `{}`", trait_.name),
+                    None => format!("parameter {} of trait `{}`", position + 1, trait_.name),
+                };
+            }
+        }
+        let position_in = |constraints: &[TypeId]| {
+            constraints
+                .iter()
+                .position(|id| *id == constraint_id)
+                .map(|position| position + 1)
+        };
+        for function in self.program.functions.values() {
+            if let Some(position) = position_in(&function.generic_parameter_constraint_ids) {
+                return format!("parameter {position} of `{}`", function.name);
+            }
+        }
+        for declaration in self.program.structs.values() {
+            if let Some(position) = position_in(&declaration.generic_parameter_constraint_ids) {
+                return format!("parameter {position} of struct `{}`", declaration.name);
+            }
+        }
+        for declaration in self.program.enums.values() {
+            if let Some(position) = position_in(&declaration.generic_parameter_constraint_ids) {
+                return format!("parameter {position} of enum `{}`", declaration.name);
+            }
+        }
+        format!("#{}", constraint_id.0)
     }
 
     fn nominal_struct(
@@ -420,6 +989,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let Some(scalar) = scalar_type(name) {
             return Ok(scalar.to_string());
         }
+        let external = declaration.external;
         let mut rendered = Vec::new();
         for argument in arguments {
             rendered.push(self.rust_type(*argument, span)?);
@@ -447,14 +1017,22 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .cloned()
                     .unwrap_or_else(|| "()".to_string())
             )),
-            _ if declaration.external => Err(unsupported(&format!("the host type `{name}`"), span)),
-            _ => {
-                if !arguments.is_empty() {
-                    return Err(unsupported(&format!("the generic struct `{name}`"), span));
-                }
-                self.ensure_struct(id, span)?;
-                Ok(format!("{}_{}", sanitize(name), id.0))
+            // C14's back edge (`shared.vl`): `Weak<T>` names a cell without
+            // keeping it alive. On JS it is the identity because nothing
+            // counts; natively the count is real, which is the whole reason the
+            // std surface answers an `Option`.
+            "Weak" => Ok(format!(
+                "vilan_rt::Weak<{}>",
+                rendered
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "()".to_string())
+            )),
+            _ if external => {
+                let what = format!("the host type `{name}`");
+                self.host_gap(what, span).map(|_| "()".to_string())
             }
+            _ => Ok(self.ensure_struct(id, arguments, span)?.name),
         }
     }
 
@@ -477,17 +1055,41 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .unwrap_or_else(|| "()".to_string())
             )),
             "Result" => Ok(format!("Result<{}>", rendered.join(", "))),
-            _ => {
-                if !arguments.is_empty() {
-                    return Err(unsupported(&format!("the generic enum `{name}`"), span));
-                }
-                self.ensure_enum(id, span)?;
-                Ok(format!("{}_{}", sanitize(name), id.0))
-            }
+            _ => Ok(self.ensure_enum(id, arguments, span)?.name),
         }
     }
 
-    fn ensure_struct(&mut self, id: Id, span: Span) -> Result<(), Error> {
+    /// The substitution a nominal declaration's own body is written under: its
+    /// generic parameters bound to the arguments this instantiation supplies.
+    ///
+    /// The arguments are resolved through the substitution in force FIRST, so a
+    /// `Pair<T>` reached from inside a `T = i32` instance instantiates
+    /// `Pair<i32>` rather than re-binding `T` to itself.
+    fn nominal_entries(
+        &self,
+        parameters: &[TypeId],
+        arguments: &[TypeId],
+    ) -> Vec<(TypeId, TypeId)> {
+        parameters
+            .iter()
+            .zip(arguments.iter())
+            .map(|(parameter, argument)| (*parameter, self.concrete(*argument)))
+            .collect()
+    }
+
+    /// Emits (or reuses) the Rust `struct` for one instantiation of `id`.
+    ///
+    /// `Pair<i32>` and `Pair<str>` are TWO Rust structs, so the memo is keyed by
+    /// the concrete arguments and each instantiation carries its own name and
+    /// its own `impl Js`. A non-generic declaration keys on an empty argument
+    /// list and keeps its plain `{Name}_{id}`, which is what leaves every
+    /// program S1a already emitted byte-identical.
+    fn ensure_struct(
+        &mut self,
+        id: Id,
+        arguments: &[TypeId],
+        span: Span,
+    ) -> Result<Reserved, Error> {
         let declaration = self.program.structs.get(&id).cloned().unwrap();
         // The refusal comes BEFORE the once-only mark, or a first call that
         // swallowed the error would let a second one through on the mark alone
@@ -501,41 +1103,120 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 span,
             ));
         }
-        if !self.started_types.insert(id) {
-            return Ok(());
+        let entries =
+            self.nominal_entries(&declaration.generic_parameter_constraint_ids, arguments);
+        let key: Vec<String> = entries
+            .iter()
+            .map(|(_, type_id)| self.type_key(*type_id))
+            .collect();
+        if let Some(reserved) = self.type_instances.get(&(id, key.clone())) {
+            return Ok(Reserved {
+                name: reserved.name.clone(),
+                slot: reserved.slot,
+            });
         }
-        let mut fields = Vec::new();
-        for field in &declaration.fields {
-            let rendered = self.rust_type(field.type_id, span)?;
-            fields.push(format!("    {}: {rendered},", sanitize(field.name)));
-        }
+        let type_name = self.mint_type_name(declaration.name, id, &key);
+        let slot = self.next_type_slot;
+        self.next_type_slot += 1;
+        self.type_instances.insert(
+            (id, key),
+            Reserved {
+                name: type_name.clone(),
+                slot,
+            },
+        );
+
+        let saved = self.enter_substitution(entries);
+        let rendered_types: Result<Vec<String>, Error> = declaration
+            .fields
+            .iter()
+            .map(|field| self.rust_type(field.type_id, span))
+            .collect();
+        self.current_substitution = saved;
+        let rendered_types = rendered_types?;
+        let holds_a_closure = rendered_types
+            .iter()
+            .any(|rendered| is_closure_type(rendered));
+
         let mut out = String::new();
-        let _ = writeln!(out, "#[derive(Clone, PartialEq)]");
-        let _ = writeln!(out, "struct {}_{} {{", sanitize(declaration.name), id.0);
-        for field in fields {
-            let _ = writeln!(out, "{field}");
+        // A CLOSURE field is why `PartialEq` cannot simply be derived:
+        // `Rc<dyn Fn>` does not implement it. The answer is not to drop
+        // equality — a struct holding a callback is compared in real reactive
+        // code — but to write the impl JavaScript's `===` already gives, which
+        // for a function value is REFERENCE equality and for an `Rc` is
+        // `ptr_eq`.
+        if holds_a_closure {
+            let _ = writeln!(out, "#[derive(Clone)]");
+        } else {
+            let _ = writeln!(out, "#[derive(Clone, PartialEq)]");
+        }
+        let _ = writeln!(out, "struct {type_name} {{");
+        for (field, rendered) in declaration.fields.iter().zip(rendered_types.iter()) {
+            let _ = writeln!(out, "    {}: {rendered},", sanitize(field.name));
         }
         let _ = writeln!(out, "}}");
+        if holds_a_closure {
+            let comparisons: Vec<String> = declaration
+                .fields
+                .iter()
+                .zip(rendered_types.iter())
+                .map(|(field, rendered)| {
+                    let name = sanitize(field.name);
+                    if is_closure_type(rendered) {
+                        format!("std::rc::Rc::ptr_eq(&self.{name}, &other.{name})")
+                    } else {
+                        format!("self.{name} == other.{name}")
+                    }
+                })
+                .collect();
+            let body = if comparisons.is_empty() {
+                "true".to_string()
+            } else {
+                comparisons.join(" && ")
+            };
+            let _ = writeln!(out, "impl PartialEq for {type_name} {{");
+            let _ = writeln!(out, "    fn eq(&self, other: &Self) -> bool {{");
+            let _ = writeln!(out, "        {body}");
+            let _ = writeln!(out, "    }}");
+            let _ = writeln!(out, "}}");
+        }
         // `print(value)` is `console.log`, and on the JS backend a struct value
         // IS its flat field array — so a struct prints as `[ a, b ]`. The
         // rendering is emitted beside the declaration rather than derived,
         // because `vilan_rt` cannot name a type the emitter just invented.
-        let type_name = format!("{}_{}", sanitize(declaration.name), id.0);
-        let parts: Vec<String> = declaration
-            .fields
-            .iter()
-            .map(|field| format!("self.{}.js_nested()", sanitize(field.name)))
-            .collect();
         let _ = writeln!(out, "impl vilan_rt::Js for {type_name} {{");
         let _ = writeln!(out, "    fn js(&self) -> String {{");
-        let _ = writeln!(out, "        vilan_rt::js_tuple(&[{}])", parts.join(", "));
+        if holds_a_closure {
+            // Node prints a function value as `[Function (anonymous)]` or
+            // `[Function: <name>]` depending on how it was WRITTEN, and the
+            // emitted name of a gensym'd JS function is not a thing this
+            // backend can reproduce. So printing such a value is refused — at
+            // run time, loudly, by name, rather than by guessing a string the
+            // differential would then disagree about. No corpus program does
+            // it; a program that starts to gets this message.
+            let _ = writeln!(
+                out,
+                "        vilan_rt::panic_with(\"the rust backend cannot print a value holding \\
+                 a function\")"
+            );
+        } else {
+            let parts: Vec<String> = declaration
+                .fields
+                .iter()
+                .map(|field| format!("self.{}.js_nested()", sanitize(field.name)))
+                .collect();
+            let _ = writeln!(out, "        vilan_rt::js_tuple(&[{}])", parts.join(", "));
+        }
         let _ = writeln!(out, "    }}");
         let _ = writeln!(out, "}}");
-        self.types.insert(id.0, out);
-        Ok(())
+        self.types.insert(slot, out);
+        Ok(Reserved {
+            name: type_name,
+            slot,
+        })
     }
 
-    fn ensure_enum(&mut self, id: Id, span: Span) -> Result<(), Error> {
+    fn ensure_enum(&mut self, id: Id, arguments: &[TypeId], span: Span) -> Result<Reserved, Error> {
         let declaration = self.program.enums.get(&id).cloned().unwrap();
         if declaration.resource {
             return Err(unsupported(
@@ -552,33 +1233,64 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 span,
             ));
         }
-        if !self.started_types.insert(id) {
-            return Ok(());
+        let entries =
+            self.nominal_entries(&declaration.generic_parameter_constraint_ids, arguments);
+        let key: Vec<String> = entries
+            .iter()
+            .map(|(_, type_id)| self.type_key(*type_id))
+            .collect();
+        if let Some(reserved) = self.type_instances.get(&(id, key.clone())) {
+            return Ok(Reserved {
+                name: reserved.name.clone(),
+                slot: reserved.slot,
+            });
         }
-        let mut variants = Vec::new();
+        let type_name = self.mint_type_name(declaration.name, id, &key);
+        let slot = self.next_type_slot;
+        self.next_type_slot += 1;
+        self.type_instances.insert(
+            (id, key),
+            Reserved {
+                name: type_name.clone(),
+                slot,
+            },
+        );
+
+        let saved = self.enter_substitution(entries);
+        let mut rendered = Ok(Vec::new());
         for variant in &declaration.variants {
             let mut payload = Vec::new();
             for data_type_id in &variant.data_type_ids {
-                payload.push(self.rust_type(*data_type_id, span)?);
+                match self.rust_type(*data_type_id, span) {
+                    Ok(one) => payload.push(one),
+                    Err(error) => {
+                        rendered = Err(error);
+                        break;
+                    }
+                }
             }
-            if payload.is_empty() {
-                variants.push(format!("    {},", sanitize(variant.name)));
-            } else {
-                variants.push(format!(
+            match &mut rendered {
+                Ok(variants) if payload.is_empty() => {
+                    variants.push(format!("    {},", sanitize(variant.name)));
+                }
+                Ok(variants) => variants.push(format!(
                     "    {}({}),",
                     sanitize(variant.name),
                     payload.join(", ")
-                ));
+                )),
+                Err(_) => break,
             }
         }
+        self.current_substitution = saved;
+        let variants = rendered?;
+
         let mut out = String::new();
         let _ = writeln!(out, "#[derive(Clone, PartialEq)]");
-        let _ = writeln!(out, "enum {}_{} {{", sanitize(declaration.name), id.0);
+        let _ = writeln!(out, "enum {type_name} {{");
         for variant in variants {
             let _ = writeln!(out, "{variant}");
         }
         let _ = writeln!(out, "}}");
-        let type_name = format!("{}_{}", sanitize(declaration.name), id.0);
         let _ = writeln!(out, "impl vilan_rt::Js for {type_name} {{");
         let _ = writeln!(out, "    fn js(&self) -> String {{");
         let _ = writeln!(out, "        match self {{");
@@ -606,8 +1318,31 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let _ = writeln!(out, "        }}");
         let _ = writeln!(out, "    }}");
         let _ = writeln!(out, "}}");
-        self.types.insert(id.0, out);
-        Ok(())
+        self.types.insert(slot, out);
+        Ok(Reserved {
+            name: type_name,
+            slot,
+        })
+    }
+
+    /// The Rust name for one instantiation of a nominal declaration.
+    ///
+    /// A non-generic one is `{Name}_{id}` — unchanged from S1a, so every
+    /// program the previous slice emitted still emits the same bytes. An
+    /// instantiation appends a per-emitter sequence number rather than the
+    /// structural key, because the key is long, contains `<`/`,` and would make
+    /// rustc's own messages unreadable.
+    fn mint_type_name(&self, name: &str, id: Id, key: &[String]) -> String {
+        if key.is_empty() {
+            return format!("{}_{}", sanitize(name), id.0);
+        }
+        let mut sequence = 0;
+        for (existing, _) in self.type_instances.keys() {
+            if *existing == id {
+                sequence += 1;
+            }
+        }
+        format!("{}_{}_{}", sanitize(name), id.0, sequence)
     }
 
     fn type_of(&self, expr_id: Id) -> Option<TypeId> {
@@ -638,27 +1373,49 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
     // --------------------------------------------------------- functions ---
 
-    fn ensure_function(&mut self, id: Id) -> Result<(), Error> {
-        if !self.started.insert(id) {
-            return Ok(());
-        }
+    /// Emits (or reuses) ONE instance of `id`, specialized by `substitution`.
+    ///
+    /// This is the single monomorphisation path — a free function, an impl
+    /// member, an operator's method, a nested generic call all come through
+    /// here, because a binding recorded in one channel and read in another is
+    /// how the two halves of a monomorphisation come to disagree. The memo key
+    /// is (function, the structural keys of the bound types); the reservation is
+    /// made BEFORE the body is walked, so a recursive body can call itself.
+    ///
+    /// A non-generic function reached with an empty substitution keys on an
+    /// empty list and keeps its plain `{name}_{id}`, which is what leaves S1a's
+    /// emitted programs byte-identical.
+    fn ensure_function(
+        &mut self,
+        id: Id,
+        substitution: &HashMap<TypeId, TypeId>,
+    ) -> Result<Reserved, Error> {
         let function =
             self.program.functions.get(&id).cloned().ok_or_else(|| {
                 unsupported("a call to a function with no body", self.span_of(id))
             })?;
         let span = function.name_span;
+        // Every entry of the binding THIS call carries belongs in the key — the
+        // function's own parameters and the impl binders the analyzer recorded
+        // beside them, both of which the body can read. The caller's unrelated
+        // bindings are not in it: composition keeps them REACHABLE
+        // ([`Self::enter_substitution`]) without keying on them, which is what
+        // stops one body per caller.
+        let entries: Vec<(TypeId, TypeId)> = self.resolved_entries(substitution);
+        let key: Vec<String> = entries
+            .iter()
+            .map(|(_, type_id)| self.type_key(*type_id))
+            .collect();
+        if let Some(reserved) = self.instances.get(&(id, key.clone())) {
+            return Ok(Reserved {
+                name: reserved.name.clone(),
+                slot: reserved.slot,
+            });
+        }
+
         if !function.has_body {
             return Err(unsupported(
                 &format!("the body-less function `{}`", function.name),
-                span,
-            ));
-        }
-        if !function.generic_parameter_constraint_ids.is_empty() {
-            return Err(unsupported(
-                &format!(
-                    "the generic function `{}` (monomorphisation is S1b's)",
-                    function.name
-                ),
                 span,
             ));
         }
@@ -676,11 +1433,44 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .and_then(|scope| scope.name_to_id_map.get("main"))
             == Some(&id);
 
+        let name = if is_main {
+            "main".to_string()
+        } else {
+            self.mint_function_name(function.name, id, &key)
+        };
+        let slot = self.next_function_slot;
+        self.next_function_slot += 1;
+        self.instances.insert(
+            (id, key),
+            Reserved {
+                name: name.clone(),
+                slot,
+            },
+        );
+
+        let saved = self.enter_substitution(entries);
+        let emitted = self.function_body(&function, span, is_main, &name);
+        self.current_substitution = saved;
+        let out = emitted?;
+        self.functions.insert(slot, out);
+        Ok(Reserved { name, slot })
+    }
+
+    /// One instance's signature and body, under the substitution already
+    /// installed. Split out so `ensure_function` restores the substitution on
+    /// the refusal path as well as the success one.
+    fn function_body(
+        &mut self,
+        function: &vilan_core::analyzer::Function<'src>,
+        span: Span,
+        is_main: bool,
+        name: &str,
+    ) -> Result<String, Error> {
         let mut parameters = Vec::new();
         for parameter_id in &function.parameters {
             parameters.push(self.parameter_declaration(*parameter_id, span)?);
         }
-        let returned = match function.return_type_id {
+        let returned = match self.return_type_of(function) {
             Some(type_id) => {
                 let rendered = self.rust_type(type_id, span)?;
                 // The type system has no reference form — a `borrows` function's
@@ -699,26 +1489,104 @@ impl<'a, 'src> Emitter<'a, 'src> {
         };
 
         let mut body = String::new();
-        self.emit_block(&function.body.0, function.body.1, &mut body, 1)?;
+        let saved_view = std::mem::replace(
+            &mut self.current_returns_view,
+            function.returns_view || function.returns_mut_view,
+        );
+        let walked = self.emit_block(&function.body.0, function.body.1, &mut body, 1);
+        self.current_returns_view = saved_view;
+        walked?;
 
         let mut out = String::new();
         if is_main {
             let _ = writeln!(out, "fn main() {{");
         } else {
-            let _ = writeln!(
-                out,
-                "fn {}({}) -> {returned} {{",
-                self.function_name(id),
-                parameters.join(", ")
-            );
+            let _ = writeln!(out, "fn {name}({}) -> {returned} {{", parameters.join(", "));
         }
         out.push_str(&body);
         let _ = writeln!(out, "}}");
-        self.functions.insert(id.0, out);
-        Ok(())
+        Ok(out)
+    }
+
+    /// What a function hands back — the DECLARED return type where one was
+    /// written, else the type of its body's tail, else its first `ret`'s.
+    ///
+    /// The fallback is not a nicety. `impl Id with Default { fun default() {
+    /// Id::new(0) } }` writes no return type because the trait declared
+    /// `Self`, and reading only the declaration emitted `-> ()` for a body that
+    /// hands back an `Id` — rustc's `expected Id_8605, found ()`. JavaScript
+    /// never had to ask, which is why the gap survived S1a.
+    fn return_type_of(&self, function: &vilan_core::analyzer::Function<'src>) -> Option<TypeId> {
+        if let Some(type_id) = function.return_type_id {
+            return Some(type_id);
+        }
+        let from_tail = self.value_type_of(function.body.1);
+        if from_tail.is_some() {
+            return from_tail;
+        }
+        function
+            .rets
+            .iter()
+            .find_map(|(_, value)| value.and_then(|value| self.value_type_of(value)))
+    }
+
+    /// The type an expression EVALUATES to, for the return-type inference above
+    /// — `type_of`, and, where that is silent about a call, the callee's own
+    /// answer.
+    ///
+    /// The recursion is what `default.vl` needs: the impl's `fun default() {
+    /// Id::new(0) }` writes no return type and its tail is a call to
+    /// `Id::new`, which writes none either, so one hop of inference answers
+    /// `()` for a chain the analyzer had fully typed.
+    fn value_type_of(&self, expr_id: Id) -> Option<TypeId> {
+        let _guard = vilan_core::util::RecursionGuard::enter()?;
+        if let Some(type_id) = self
+            .type_of(expr_id)
+            .filter(|type_id| !matches!(self.resolve(*type_id), Some(Type::Void) | None))
+        {
+            return Some(type_id);
+        }
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&expr_id) else {
+            return None;
+        };
+        let subject_id = self.program.function_calls.get(call_id)?.subject_id;
+        match self.program.entity_map.get(&subject_id) {
+            Some(Expr::Local(target)) => {
+                let callee = self.program.functions.get(target)?;
+                self.return_type_of(callee)
+            }
+            // A VALUE call — `(self.fn)()`. The subject's own type is a
+            // closure, and a closure type carries its return type: `fun
+            // next(self): T { (self.fn)() }` writes no return type (the trait
+            // declared one), and without this hop the instance was emitted
+            // `-> ()` over a body handing back an `i32`.
+            _ => match self.resolve(self.type_of(subject_id)?)? {
+                Type::Closure(_, return_type_id, _) => Some(*return_type_id),
+                _ => None,
+            },
+        }
+    }
+
+    /// The Rust name for one instance. `{name}_{id}` for the non-generic case
+    /// (S1a's spelling, kept so its output does not move) and a per-function
+    /// sequence number after it for an instantiation.
+    fn mint_function_name(&self, name: &str, id: Id, key: &[String]) -> String {
+        if key.is_empty() {
+            return format!("{}_{}", sanitize(name), id.0);
+        }
+        let mut sequence = 0;
+        for (existing, _) in self.instances.keys() {
+            if *existing == id {
+                sequence += 1;
+            }
+        }
+        format!("{}_{}_{}", sanitize(name), id.0, sequence)
     }
 
     fn parameter_declaration(&mut self, id: Id, span: Span) -> Result<String, Error> {
+        if let Some(declaration) = self.context_parameter_declaration(id, span)? {
+            return Ok(declaration);
+        }
         let parameter = self
             .program
             .parameters
@@ -732,12 +1600,73 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Err(unsupported("a `lazy` parameter", span));
         }
         let rendered = self.rust_type(parameter.type_id, span)?;
-        let declaration = match self.receiving_form(&parameter) {
+        let form = self.receiving_form(&parameter);
+        let declaration = match form {
             Receiving::ByValue => rendered,
             Receiving::Ref => format!("&{rendered}"),
             Receiving::RefMut => format!("&mut {rendered}"),
         };
-        Ok(format!("{}: {declaration}", self.binding_name(id)))
+        // H9 (`mut-parameters.md`): `mut x` is BINDER mutability of the
+        // callee's by-value copy, which is exactly Rust's `mut x: T`. Written
+        // on every by-value parameter rather than only the `mut` ones, because
+        // a by-value parameter IS a local copy and a `mut` binder on one
+        // changes nothing a caller can observe — while getting the set wrong
+        // is a rustc refusal (`cannot assign to immutable argument`). A
+        // reference parameter keeps no `mut`: there the binder's mutability
+        // would be the POINTER's, which is a different claim.
+        let binder = match form {
+            Receiving::ByValue => "mut ",
+            _ => "",
+        };
+        Ok(format!("{binder}{}: {declaration}", self.binding_name(id)))
+    }
+
+    /// A HIDDEN CONTEXT parameter's declaration, or `None` when `id` is an
+    /// ordinary parameter.
+    ///
+    /// `context::thread_contexts` rewrites every ambient read into a parameter
+    /// and every call into one that passes the value — so by the time a program
+    /// reaches a backend, a `context` clause is ordinary plumbing. What it is
+    /// NOT is an ordinary `parameters` record: the pass keeps those out of the
+    /// map deliberately (editing-dx.md §19.3 — a fabricated entry would dress
+    /// compiler plumbing as source in completion and every other consumer), and
+    /// leaves a marker naming the context binding the parameter threads.
+    ///
+    /// So the type comes from that binding: it is declared `Context<T>`, and
+    /// the value threaded through is its `T`. The SAFE flavour threads an
+    /// `Option<T>` instead (`ambient-owner.md` §2.1), and this takes the strict
+    /// reading — a program whose parameter is really the safe one is a rustc
+    /// type error rather than a wrong answer, which is the direction to be
+    /// wrong in. (`native-b-38` builds the flavour analysis for the executor's
+    /// own sake; this is the minimum that lets `board.vl` compile.)
+    fn context_parameter_declaration(
+        &mut self,
+        id: Id,
+        span: Span,
+    ) -> Result<Option<String>, Error> {
+        if self.program.parameters.contains_key(&id) {
+            return Ok(None);
+        }
+        let Some(binding) = self.program.context_hidden_parameters.get(&id).copied() else {
+            return Ok(None);
+        };
+        let Some(Type::Struct(_, arguments)) = self
+            .program
+            .variables
+            .get(&binding)
+            .map(|variable| variable.type_id)
+            .and_then(|type_id| self.resolve(type_id))
+        else {
+            return Err(unsupported(
+                "a hidden context parameter whose context binding did not resolve",
+                span,
+            ));
+        };
+        let Some(value_type) = arguments.first().copied() else {
+            return Err(unsupported("a context with no value type", span));
+        };
+        let rendered = self.rust_type(value_type, span)?;
+        Ok(Some(format!("mut {}: {rendered}", self.binding_name(id))))
     }
 
     /// How a parameter is RECEIVED natively.
@@ -747,11 +1676,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// arrives as `&T` even though nothing in the source wrote an `&`. Every
     /// other bare parameter is a by-value copy, which rule 1 already paid for
     /// at the call site.
+    ///
+    /// `mut self` is NOT that loan: H9 makes it the callee's own by-value copy,
+    /// and `mut-parameters.vl` is the pin — `original.with_x(9)` leaves
+    /// `original.x` at 0, so the receiver was copied. Reading it as a loan
+    /// emitted `&Point` where the body assigns a field, which rustc refuses.
     fn receiving_form(&self, parameter: &vilan_core::analyzer::Parameter<'_>) -> Receiving {
         match parameter.convention {
             Convention::Ref => Receiving::Ref,
             Convention::RefMut => Receiving::RefMut,
-            Convention::Bare if parameter.name == "self" => Receiving::Ref,
+            Convention::Bare if parameter.name == "self" && !parameter.mutable => Receiving::Ref,
             Convention::Bare | Convention::Own => Receiving::ByValue,
         }
     }
@@ -781,7 +1715,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // block evaluates to — so rule 1's copy is owed here exactly as it
             // is at an argument. `fun to_string(self): str { self }` is the
             // shape: the tail reads a loan and the signature hands back a value.
-            let rendered = self.value_of(tail, depth)?;
+            //
+            // UNLESS this is the body tail of a `borrows` function, whose
+            // return type IS a reference: `fun same(x: &mut i32): &mut i32 { x }`
+            // passes the loan on, and copying out of it answers `i32` where the
+            // signature promised `&mut i32`.
+            let returns_the_loan = depth == 1 && self.current_returns_view;
+            let rendered = if returns_the_loan {
+                self.expression(tail, depth)?
+            } else {
+                self.value_of(tail, depth)?
+            };
             let _ = writeln!(out, "{pad}{rendered}");
         }
         Ok(())
@@ -800,6 +1744,26 @@ impl<'a, 'src> Emitter<'a, 'src> {
     }
 
     fn expression(&mut self, id: Id, depth: usize) -> Result<String, Error> {
+        let rendered = self.expression_inner(id, depth);
+        // The census (see [`Emitted::host_gaps`]) records a refusal and carries
+        // on, so ONE emit answers "what does this program still need" instead
+        // of answering with its first sentence. Only here: an expression
+        // position accepts `unimplemented!()`, which types as anything.
+        match rendered {
+            Err(error) if self.census => {
+                self.host_gaps.insert(census_entry(&error));
+                Ok("unimplemented!()".to_string())
+            }
+            other => other,
+        }
+    }
+
+    fn expression_inner(&mut self, id: Id, depth: usize) -> Result<String, Error> {
+        // B105's hoist: this expression was evaluated once into a temp ahead of
+        // the write, and both walks of the place name that temp.
+        if let Some(name) = self.hoisted.get(&id) {
+            return Ok(name.clone());
+        }
         let span = self.span_of(id);
         let Some(expr) = self.program.entity_map.get(&id).cloned() else {
             return Ok("()".to_string());
@@ -814,21 +1778,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Expr::MultilineString(_) => {
                 return Err(unsupported("a triple-quoted string", span));
             }
-            Expr::Local(binding) => {
-                if self.module_bindings.contains(&binding) {
-                    let name = self
-                        .program
-                        .variables
-                        .get(&binding)
-                        .map(|variable| variable.name)
-                        .unwrap_or("it");
-                    return Err(unsupported(
-                        &format!("a read of the module-level binding `{name}`"),
-                        span,
-                    ));
-                }
-                self.read_binding(binding)
-            }
+            Expr::Local(binding) => self.read_module_binding_or_local(binding, span)?,
             Expr::Parameter(binding) => self.binding_name(binding),
             Expr::Variable(binding) => self.declaration(binding, depth)?,
             Expr::Block((statements, tail)) => {
@@ -867,24 +1817,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 other => return Err(unsupported(&format!("`jump {other}`"), span)),
             },
             Expr::FunctionReturn(value) => match value {
+                Some(value) if self.current_returns_view => {
+                    format!("return {}", self.expression(value, depth)?)
+                }
                 Some(value) => format!("return {}", self.value_of(value, depth)?),
                 None => "return".to_string(),
             },
-            Expr::Assignment(target, value) => {
-                let boxed_target = match self.program.entity_map.get(&target) {
-                    Some(Expr::Local(binding)) => Some(*binding),
-                    _ => None,
-                }
-                .filter(|binding| self.boxed.contains(binding));
-                if let Some(binding) = boxed_target {
-                    let value_text = self.value_of(value, depth)?;
-                    format!("{}.set({value_text})", self.binding_name(binding))
-                } else {
-                    let target_text = self.expression(target, depth)?;
-                    let value_text = self.value_of(value, depth)?;
-                    format!("{target_text} = {value_text}")
-                }
-            }
+            Expr::Assignment(target, value) => self.assignment(target, value, depth, span)?,
             Expr::Field(subject, _, index) => {
                 let subject_text = self.expression(subject, depth)?;
                 let field = self.field_name(subject, index, span)?;
@@ -896,9 +1835,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 format!("{subject_text}[({index_text}) as usize]")
             }
             Expr::List(elements) => {
+                // An element's position declares the list's ELEMENT type, not
+                // the list's — `mut xs: List<u32> = [0]` needs `0u32`.
+                let element_type = self
+                    .type_of(id)
+                    .or(self.expected_type)
+                    .and_then(|type_id| self.resolve(type_id))
+                    .and_then(|resolved| match resolved {
+                        Type::Struct(_, arguments) => arguments.first().copied(),
+                        Type::Array(element, _) => Some(*element),
+                        _ => None,
+                    });
                 let mut parts = Vec::new();
                 for element in &elements {
-                    parts.push(self.value_of(*element, depth)?);
+                    parts.push(self.value_of_expecting(*element, element_type, depth)?);
                 }
                 format!("vec![{}]", parts.join(", "))
             }
@@ -920,11 +1870,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .iter()
                     .map(|(index, value)| (*index, *value))
                     .collect();
-                // The initializer's own id carries the STRUCT it builds; the id
-                // in the node is the name it was written under, which the JS
-                // emitter ignores because an array needs no declaration. Here it
-                // is the declaration or nothing, so the type is the answer and
-                // the written name is the fallback.
+                // The initializer's own id carries the STRUCT it builds AND the
+                // arguments it builds it at; the id in the node is the name it
+                // was written under, which the JS emitter ignores because an
+                // array needs no declaration. Here it is the declaration or
+                // nothing, so the type is the answer and the written name is the
+                // fallback.
                 let struct_id = self
                     .type_of(id)
                     .and_then(|type_id| self.resolve(type_id))
@@ -934,7 +1885,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     })
                     .filter(|struct_id| self.program.structs.contains_key(struct_id))
                     .unwrap_or(named);
-                self.struct_literal(struct_id, &pairs, depth, span)?
+                let arguments = self.struct_arguments_at(id, struct_id);
+                self.struct_literal(struct_id, &arguments, &pairs, depth, span)?
             }
             Expr::Reference(operand, mutable) => {
                 let operand_text = self.expression(operand, depth)?;
@@ -948,7 +1900,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Expr::Call(call_id) => self.call(id, call_id, depth, span)?,
             Expr::Closure(closure_id) => self.closure(closure_id, depth, span)?,
             Expr::Is(subject, pattern) => self.is_test(subject, &pattern, depth, span)?,
-            Expr::EnumVariant(enum_id, index) => self.variant_path(enum_id, index, span)?,
+            Expr::EnumVariant(enum_id, index) => {
+                let arguments = self.enum_arguments_at(id, enum_id);
+                self.variant_path(enum_id, index, &arguments, span)?
+            }
             Expr::Function(_)
             | Expr::Struct(_)
             | Expr::Enum(_)
@@ -965,6 +1920,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
         };
         Ok(rendered)
+    }
+
+    /// [`Self::value_of`] under a declared expectation — the type the position
+    /// being filled asks for, which is how a generic constructor whose own site
+    /// records an open type finds its arguments.
+    fn value_of_expecting(
+        &mut self,
+        id: Id,
+        expecting: Option<TypeId>,
+        depth: usize,
+    ) -> Result<String, Error> {
+        let saved = std::mem::replace(&mut self.expected_type, expecting);
+        let rendered = self.value_of(id, depth);
+        self.expected_type = saved;
+        rendered
     }
 
     /// An expression in a VALUE position — rule 1's copy applied where the
@@ -1021,12 +1991,306 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .is_some_and(|resolved| matches!(resolved, Type::Closure(_, _, _)))
     }
 
+    /// An assignment, which has FOUR shapes natively where JS has one.
+    ///
+    /// A plain place assigns. A mutably-captured binding is a counted cell and
+    /// assigns through it (R3). A module-level binding is a `thread_local!` and
+    /// assigns through its `RefCell`. And a binding that HOLDS A VIEW assigns
+    /// through the view — `let cell = &mut x; cell = 5;` writes `x`, which is
+    /// `*cell = 5` and not `cell = 5` (the latter reseats the reference, which
+    /// rustc refuses outright for a non-`mut` binder and would silently do the
+    /// wrong thing for a `mut` one).
+    fn assignment(
+        &mut self,
+        target: Id,
+        value: Id,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        if let Some(hoisted) = self.hoist_compound_target(target, value, depth)? {
+            return Ok(hoisted);
+        }
+        // A write THROUGH a counted cell — `*self.value = v`, which the
+        // analyzer lowers to a deref of the cell's read intrinsic. The place
+        // is not a Rust place at all (`Shared` hands out a value, not a
+        // reference), so the write is the cell's own `set`; rendering the
+        // target and assigning to it produced `(*(cell).set(())) = v`, which
+        // rustc refused — the intrinsic's second argument had nowhere to come
+        // from because the VALUE is the assignment's.
+        if let Some(receiver) = self.cell_write_receiver(target) {
+            let receiver_text = self.expression(receiver, depth)?;
+            let value_text = self.value_of(value, depth)?;
+            return Ok(format!("({receiver_text}).set({value_text})"));
+        }
+        let named = match self.program.entity_map.get(&target) {
+            Some(Expr::Local(binding)) => Some(*binding),
+            _ => None,
+        };
+        if let Some(binding) = named {
+            if self.boxed.contains(&binding) {
+                let value_text = self.value_of(value, depth)?;
+                return Ok(format!("{}.set({value_text})", self.binding_name(binding)));
+            }
+            if self.module_bindings.contains(&binding) {
+                let cell = self.ensure_module_binding(binding, span)?;
+                let value_text = self.value_of(value, depth)?;
+                return Ok(format!(
+                    "{cell}.with(|cell| *cell.borrow_mut() = {value_text})"
+                ));
+            }
+            if self.binding_holds_a_view(binding) {
+                let value_text = self.value_of(value, depth)?;
+                return Ok(format!("*{} = {value_text}", self.binding_name(binding)));
+            }
+        }
+        let target_text = self.expression(target, depth)?;
+        let value_text = self.value_of(value, depth)?;
+        Ok(format!("{target_text} = {value_text}"))
+    }
+
+    /// The CELL an assignment writes through, when its target is a deref of a
+    /// `Shared`'s own read — the shape `*cell = value` lowers to. The receiver
+    /// is the intrinsic call's first argument, which is the cell itself.
+    fn cell_write_receiver(&self, target: Id) -> Option<Id> {
+        let Some(Expr::Dereference(inner)) = self.program.entity_map.get(&target) else {
+            return None;
+        };
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(inner) else {
+            return None;
+        };
+        let call = self.program.function_calls.get(call_id)?;
+        let Some(Expr::Local(subject)) = self.program.entity_map.get(&call.subject_id) else {
+            return None;
+        };
+        matches!(
+            self.program.intrinsics.get(subject),
+            Some(Intrinsic::SharedValue | Intrinsic::SharedWrite)
+        )
+        .then(|| call.argument_ids.first().copied())
+        .flatten()
+    }
+
+    /// The compound-assignment subscript hoist (B105), natively.
+    ///
+    /// `x[i] op= v` desugars to `x[i] = x[i] op v`, and the two `x[i]`s are two
+    /// independent walks of the same source place — so an effectful subscript
+    /// ran TWICE. `compound-index.vl` is the pin and it caught this backend:
+    /// `ys[bump()] += 1` incremented the counter twice, printing `2` where the
+    /// JS backend printed `1`.
+    ///
+    /// Each subscript is evaluated ONCE into a `let` ahead of the write, and
+    /// both spines name it. The compound-ness comes from the analyzer's own
+    /// record ([`Program::compound_rereads`]) rather than from the shape:
+    /// `ys[f()] = ys[g()] + 1` looks identical and has two genuinely different
+    /// subscripts. Unlike the JS emitter this hoists a PURE subscript too —
+    /// there is no golden to churn here, and "evaluate the place once" is the
+    /// rule with no exception to keep track of.
+    fn hoist_compound_target(
+        &mut self,
+        target: Id,
+        value: Id,
+        depth: usize,
+    ) -> Result<Option<String>, Error> {
+        let Some(&Expr::Binary(_, left, _)) = self.program.entity_map.get(&value) else {
+            return Ok(None);
+        };
+        // A VIEW target wraps both halves in a synthetic `Dereference`, under
+        // which the analyzer's mark sits.
+        let reread = match self.program.entity_map.get(&left) {
+            Some(&Expr::Dereference(operand)) => operand,
+            _ => left,
+        };
+        if !self.program.compound_rereads.contains(&reread) {
+            return Ok(None);
+        }
+        let mut prelude = String::new();
+        let saved = std::mem::take(&mut self.hoisted);
+        let paired = self.pair_places(target, reread, &mut prelude, depth);
+        let rendered = paired.and_then(|_| {
+            let target_text = self.expression(target, depth)?;
+            let value_text = self.value_of(value, depth)?;
+            Ok((target_text, value_text))
+        });
+        self.hoisted = saved;
+        let (target_text, value_text) = rendered?;
+        if prelude.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(format!(
+            "{{ {prelude}{target_text} = {value_text}; }}"
+        )))
+    }
+
+    /// The two place spines in lockstep — they are the same source place walked
+    /// twice, so they match node for node, and pairing them is what lets the
+    /// re-read name the write's temp. Descends to the ROOT first, so the temps
+    /// land in source order (`grid[f()][g()]` evaluates `f()` before `g()`).
+    fn pair_places(
+        &mut self,
+        target: Id,
+        reread: Id,
+        prelude: &mut String,
+        depth: usize,
+    ) -> Result<(), Error> {
+        match (
+            self.program.entity_map.get(&target).cloned(),
+            self.program.entity_map.get(&reread).cloned(),
+        ) {
+            (
+                Some(Expr::Index(target_subject, target_index)),
+                Some(Expr::Index(reread_subject, reread_index)),
+            ) => {
+                self.pair_places(target_subject, reread_subject, prelude, depth)?;
+                let name = format!("__hoist{}", self.hoisted.len());
+                let rendered = self.expression(target_index, depth)?;
+                let _ = write!(prelude, "let {name} = {rendered}; ");
+                self.hoisted.insert(target_index, name.clone());
+                self.hoisted.insert(reread_index, name);
+                Ok(())
+            }
+            (Some(Expr::Field(target_subject, _, _)), Some(Expr::Field(reread_subject, _, _)))
+            | (Some(Expr::Dereference(target_subject)), Some(Expr::Dereference(reread_subject)))
+            | (
+                Some(Expr::TupleIndex(target_subject, _, _)),
+                Some(Expr::TupleIndex(reread_subject, _, _)),
+            ) => self.pair_places(target_subject, reread_subject, prelude, depth),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether a local binding holds a VIEW rather than a value — its
+    /// initializer is a `&`/`&mut`, or a call to a `borrows` function.
+    ///
+    /// The type system has no reference form (a view's `type_id` is its
+    /// pointee's), so this is read off the initializer, which is where the
+    /// `&` was written.
+    fn binding_holds_a_view(&self, binding: Id) -> bool {
+        let Some(initial) = self
+            .program
+            .variables
+            .get(&binding)
+            .and_then(|variable| variable.initial)
+        else {
+            return false;
+        };
+        match self.program.entity_map.get(&initial) {
+            Some(Expr::Reference(_, _)) => true,
+            Some(Expr::Call(call_id)) => self
+                .program
+                .function_calls
+                .get(call_id)
+                .and_then(|call| match self.program.entity_map.get(&call.subject_id) {
+                    Some(Expr::Local(target)) => self.program.functions.get(target),
+                    _ => None,
+                })
+                .is_some_and(|function| function.returns_view || function.returns_mut_view),
+            _ => false,
+        }
+    }
+
     fn read_binding(&self, binding: Id) -> String {
         let name = self.binding_name(binding);
         if self.boxed.contains(&binding) {
             return format!("{name}.get()");
         }
         name
+    }
+
+    /// A read of a binding that MIGHT be a module-level one.
+    ///
+    /// A module-level `let` is a program-lifetime value with a constructor, and
+    /// natively that is a `thread_local!` — the single-threaded executor J6
+    /// designs means a thread local is exactly as visible as a JS module
+    /// binding, and unlike a `static` it can run arbitrary vilan code to
+    /// initialize itself. Lowered at the READ rather than declared up front:
+    /// std declares several (`PI`, the reactive turn's registers) and a program
+    /// reaching none of them must carry none of them.
+    ///
+    /// The read answers a VALUE (`cell.borrow().clone()`) — a counted one
+    /// (`str`, a closure, a `Shared`) copies as a refcount bump, so nothing
+    /// observes the difference between the cell and a copy of it. The cell is a
+    /// `RefCell` because a module-level binding can be `mut`
+    /// (`compound-index.vl` counts calls in one), and a `thread_local!`
+    /// `static` is otherwise immutable; an immutable binding pays one
+    /// `RefCell`, which is the same thing S1a's ruling already pays everywhere
+    /// else (R3).
+    fn read_module_binding_or_local(&mut self, binding: Id, span: Span) -> Result<String, Error> {
+        if !self.module_bindings.contains(&binding) {
+            // A binding in neither table is not a binding at all: it is an
+            // `is`-test CAPTURE, which the analyzer records as a value aliased
+            // to the subject's payload slot with no declaration of its own (the
+            // JS emitter substitutes the accessor at every reference through
+            // `is_bindings`). Natively the shape is `if let Some(x) = subject`,
+            // a restructuring of the `if` and not of the read — so it is named
+            // rather than emitted, and it is named HERE because the emitted
+            // alternative was a reference to a name nothing declares.
+            if !self.program.variables.contains_key(&binding)
+                && !self.program.parameters.contains_key(&binding)
+                && !self.is_captures.contains(&binding)
+            {
+                return self.host_gap(
+                    "a value captured by an `is` test outside an `if` condition (only \
+                     `if subject is Pattern(let x)` restructures into an `if let`)"
+                        .to_string(),
+                    span,
+                );
+            }
+            return Ok(self.read_binding(binding));
+        }
+        let cell = self.ensure_module_binding(binding, span)?;
+        Ok(format!("{cell}.with(|cell| cell.borrow().clone())"))
+    }
+
+    /// Emits the `thread_local!` for one module-level binding, once, and
+    /// answers the cell's name.
+    fn ensure_module_binding(&mut self, binding: Id, span: Span) -> Result<String, Error> {
+        let variable = self
+            .program
+            .variables
+            .get(&binding)
+            .cloned()
+            .ok_or_else(|| unsupported("an unresolved module-level binding", span))?;
+        let cell = format!(
+            "MODULE_{}_{}",
+            sanitize(variable.name).to_uppercase(),
+            binding.0
+        );
+        if !self.module_bindings_started.insert(binding) {
+            // Either already emitted, or being emitted right now — a module
+            // binding whose initializer reads another one. The cycle is the
+            // analyzer's to refuse (`init_order`), so reaching here twice means
+            // the first one will land.
+            return Ok(cell);
+        }
+        if self.program.lazy_cells.contains(&binding) {
+            // A `lazy` module binding is a memoized thunk (A100), and a
+            // `thread_local!` is ALREADY lazily initialized on first access —
+            // so the two agree by construction and the only thing that would
+            // differ is a read that never happens, which is unobservable.
+            // Nothing extra to build; the eager form below is the lazy one.
+        }
+        let initial = variable
+            .initial
+            .ok_or_else(|| unsupported("a module-level binding with no initializer", span))?;
+        // The initializer is emitted under NO substitution: a module-level
+        // binding is outside every instantiation, and a generic it could not
+        // ground would be a refusal there rather than a wrong grounding here.
+        let saved = std::mem::take(&mut self.current_substitution);
+        let rendered = self
+            .rust_type(variable.type_id, span)
+            .and_then(|rendered| self.value_of(initial, 0).map(|value| (rendered, value)));
+        self.current_substitution = saved;
+        let (rendered, value) = rendered?;
+        let mut out = String::new();
+        let _ = writeln!(out, "thread_local! {{");
+        let _ = writeln!(
+            out,
+            "    static {cell}: std::cell::RefCell<{rendered}> = \
+             std::cell::RefCell::new({value});"
+        );
+        let _ = writeln!(out, "}}");
+        self.module_binding_cells.insert(binding.0, out);
+        Ok(cell)
     }
 
     fn declaration(&mut self, binding: Id, depth: usize) -> Result<String, Error> {
@@ -1063,7 +2327,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         };
         match variable.initial {
             Some(initial) => {
-                let value = self.value_of(initial, depth)?;
+                let value = self.value_of_expecting(initial, Some(variable.type_id), depth)?;
                 if self.boxed.contains(&binding) {
                     // R3: a mutably-captured binding is a counted cell, so the
                     // declaration builds one and every read and write below goes
@@ -1095,8 +2359,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Some(fraction) => format!("{whole}.{fraction}").replace('_', ""),
             None => whole.replace('_', ""),
         };
+        // The literal's own recorded type, else the type of the POSITION it
+        // fills. Without the second, `Id::new(0)` against `n: u32` emitted
+        // `(0i32)` and rustc refused the argument — JavaScript has one numeric
+        // type and never had to ask.
+        // The expectation is consulted only when it names a NUMERIC scalar: a
+        // literal inside a `List<i32>` initializer inherits the list's own
+        // expectation otherwise, and `(1Vec<i32>)` is not a Rust literal.
+        let expected_scalar = self.expected_type.filter(|type_id| {
+            self.resolve(*type_id)
+                .and_then(|resolved| match resolved {
+                    Type::Struct(struct_id, _) => self.program.structs.get(struct_id),
+                    _ => None,
+                })
+                .and_then(|declaration| scalar_type(declaration.name))
+                .is_some_and(|scalar| scalar != "vilan_rt::Str")
+        });
         let rendered = match self
             .type_of(id)
+            .or(expected_scalar)
             .and_then(|type_id| self.rust_type(type_id, span).ok())
         {
             Some(rust) => rust,
@@ -1157,21 +2438,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // which is what makes the substitution sound; anything else goes
         // through a user `render` this slice does not monomorphise, so it is
         // refused rather than guessed at.
-        if matches!(op, BinaryOp::Add) && self.is_str_expr(left) {
-            let left_text = self.expression(left, depth)?;
-            let right_text = self.expression(right, depth)?;
-            if self.is_str_expr(right) {
-                return Ok(format!("vilan_rt::str_concat(&{left_text}, &{right_text})"));
-            }
-            if self.is_scalar_expr(right) {
-                return Ok(format!(
-                    "vilan_rt::str_concat(&{left_text}, &vilan_rt::js_of(&({right_text})))"
-                ));
-            }
-            return Err(unsupported(
-                "an interpolation of a value with its own `render`",
-                span,
-            ));
+        // `str + str` is a concatenation, which is a runtime call natively
+        // rather than an operator. EITHER side answering `str` makes it one:
+        // inside a trait default `self.describe() + "!"` has a left operand
+        // whose callee is only known once the default is specialized, so the
+        // left side carries no type at all and the literal on the right is the
+        // whole evidence. The other side is then rendered AS a string — its
+        // `console.log` form, which is what makes the substitution sound for a
+        // scalar; anything else goes through a user `render`, which is refused
+        // rather than guessed at.
+        let concatenates = matches!(op, BinaryOp::Add)
+            && (self.is_str_expr(left) || self.is_str_expr(right) || self.is_str(id));
+        if concatenates {
+            let left_text = self.as_string(left, None, depth, span)?;
+            let right_text = self.as_string(right, Some(id), depth, span)?;
+            return Ok(format!("vilan_rt::str_concat(&{left_text}, &{right_text})"));
         }
         let symbol = match op {
             BinaryOp::Add => "+",
@@ -1197,6 +2478,62 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let left_text = self.expression(left, depth)?;
         let right_text = self.expression(right, depth)?;
         Ok(format!("({left_text} {symbol} {right_text})"))
+    }
+
+    /// One operand of a concatenation, rendered as a `str`.
+    ///
+    /// `concat` names the enclosing binary expression for the RIGHT operand,
+    /// which is where the analyzer records a render dispatch (B176): `"v=" +
+    /// value` with `value: T` bounded to a trait providing `to_string` is
+    /// ADMITTED, so the emission owes the operand that impl's answer and not
+    /// the value's runtime shape.
+    fn as_string(
+        &mut self,
+        id: Id,
+        concat: Option<Id>,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        if let Some(&(constraint_id, trait_id)) =
+            concat.and_then(|concat| self.program.concat_render_dispatch.get(&concat))
+            && let Some(&bound) = self.current_substitution.get(&constraint_id)
+        {
+            let concrete = self.concrete(bound);
+            // Never-silent (B55's pattern): falling through here would emit the
+            // very raw rendering this channel exists to replace, and the
+            // program would print the wrong string.
+            let Some(dispatch) = self.resolve_dispatch(
+                concrete,
+                RENDER_MEMBER,
+                &[],
+                Some((trait_id, Vec::new())),
+                span,
+            )?
+            else {
+                return Err(unsupported(
+                    "a concatenation whose operand's `to_string` bound resolves to no impl",
+                    span,
+                ));
+            };
+            return self.emit_dispatch(dispatch, &[id], depth, span);
+        }
+        let text = self.expression(id, depth)?;
+        if self.is_str_expr(id) {
+            return Ok(text);
+        }
+        // A scalar renders as its `console.log` form, which is the same string
+        // on both backends. So does an operand whose type this emitter cannot
+        // see at all — which happens for exactly one shape, a call inside a
+        // trait default whose callee the specialization picks, and whose real
+        // type is the `str` the analyzer already checked. `js_of` of a `str` is
+        // that `str`, so the two cases share an answer.
+        if self.is_scalar_expr(id) || self.type_of(id).is_none() {
+            return Ok(format!("vilan_rt::js_of(&({text}))"));
+        }
+        Err(unsupported(
+            "an interpolation of a value with its own `render`",
+            span,
+        ))
     }
 
     /// Whether an expression is a `str` — by its resolved type where it has
@@ -1249,10 +2586,35 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let pad = Self::indent(depth);
         match branch {
             ExprIfBranch::If(condition, (statements, tail), next) => {
-                let condition_text = self.expression(*condition, depth)?;
+                // `if subject is Some(let x) { .. }` is Rust's `if let`, and it
+                // is the ONLY place an `is`-test capture has a name natively: a
+                // capture has no declaration of its own (the JS emitter
+                // substitutes the payload accessor at every reference), so
+                // `matches!` — which binds nothing — cannot serve a pattern
+                // that captures. Every other position keeps the refusal.
+                let captured = self.is_condition_captures(*condition);
+                let head = match &captured {
+                    Some((subject, pattern, bindings)) => {
+                        let subject_text = self.expression(*subject, depth)?;
+                        let subject_type = self.type_of(*subject);
+                        let pattern_text =
+                            self.pattern(pattern, subject_type, self.span_of(*condition))?;
+                        for binding in bindings {
+                            self.is_captures.insert(*binding);
+                        }
+                        format!("if let {pattern_text} = {subject_text}")
+                    }
+                    None => format!("if {}", self.expression(*condition, depth)?),
+                };
                 let mut body = String::new();
-                self.emit_block(statements, *tail, &mut body, depth + 1)?;
-                let mut out = format!("if {condition_text} {{\n{body}{pad}}}");
+                let walked = self.emit_block(statements, *tail, &mut body, depth + 1);
+                if let Some((_, _, bindings)) = &captured {
+                    for binding in bindings {
+                        self.is_captures.remove(binding);
+                    }
+                }
+                walked?;
+                let mut out = format!("{head} {{\n{body}{pad}}}");
                 if let Some(next) = next {
                     let _ = write!(out, " else {}", self.if_branch(next, depth)?);
                 }
@@ -1274,6 +2636,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         span: Span,
     ) -> Result<String, Error> {
         let subject_text = self.expression(subject, depth)?;
+        let subject_type = self.type_of(subject);
         let pad = Self::indent(depth);
         let leg_pad = Self::indent(depth + 1);
         let mut out = format!("match {subject_text} {{\n");
@@ -1282,7 +2645,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             if leg.guard.is_some() {
                 return Err(unsupported("a guarded `match` leg", span));
             }
-            let pattern = self.pattern(&leg.pattern, span)?;
+            let pattern = self.pattern(&leg.pattern, subject_type, span)?;
             if matches!(leg.pattern, ExprPattern::Wildcard | ExprPattern::Binding(_))
                 || self.pattern_is_bool(&leg.pattern)
             {
@@ -1307,12 +2670,37 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Ok(out)
     }
 
+    /// An `if` condition that is an `is`-test WITH captures: the subject, the
+    /// pattern, and the binding ids it introduces. `None` for every other
+    /// condition, including an `is` test that binds nothing (which stays a
+    /// `matches!`, so `if x is None` reads as it did).
+    fn is_condition_captures(&self, condition: Id) -> Option<(Id, ExprPattern, Vec<Id>)> {
+        let Some(Expr::Is(subject, pattern)) = self.program.entity_map.get(&condition).cloned()
+        else {
+            return None;
+        };
+        let mut bindings = Vec::new();
+        collect_pattern_bindings(&pattern, &mut bindings);
+        (!bindings.is_empty()).then_some((subject, pattern, bindings))
+    }
+
     fn pattern_is_bool(&self, pattern: &ExprPattern) -> bool {
         matches!(pattern, ExprPattern::Variant(enum_id, _, _)
             if self.program.bool_enum_id == Some(*enum_id))
     }
 
-    fn pattern(&mut self, pattern: &ExprPattern, span: Span) -> Result<String, Error> {
+    /// One pattern, against the type of the value it matches.
+    ///
+    /// The subject's type is threaded because a variant pattern on a GENERIC
+    /// enum names one instance's variant: `Tree<i32>::Leaf` and
+    /// `Tree<str>::Leaf` are two Rust paths, and a pattern carries no type of
+    /// its own to read them off.
+    fn pattern(
+        &mut self,
+        pattern: &ExprPattern,
+        subject_type: Option<TypeId>,
+        span: Span,
+    ) -> Result<String, Error> {
         match pattern {
             ExprPattern::Wildcard => Ok("_".to_string()),
             ExprPattern::Binding(id) => Ok(self.binding_name(*id)),
@@ -1325,25 +2713,72 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     // runtime on both backends.
                     return Ok(if *index == 1 { "true" } else { "false" }.to_string());
                 }
-                let path = self.variant_path(*enum_id, *index, span)?;
+                let arguments = self.enum_arguments_of(subject_type, *enum_id);
+                let path = self.variant_path(*enum_id, *index, &arguments, span)?;
                 if payload.is_empty() {
                     return Ok(path);
                 }
+                let payload_types = self.variant_payload_types(*enum_id, *index, &arguments);
                 let mut parts = Vec::new();
-                for sub in payload {
-                    parts.push(self.pattern(sub, span)?);
+                for (slot, sub) in payload.iter().enumerate() {
+                    parts.push(self.pattern(sub, payload_types.get(slot).copied(), span)?);
                 }
                 Ok(format!("{path}({})", parts.join(", ")))
             }
             ExprPattern::Tuple(elements) => {
+                let element_types = match subject_type.and_then(|type_id| self.resolve(type_id)) {
+                    Some(Type::Tuple(types)) => types.clone(),
+                    _ => Vec::new(),
+                };
                 let mut parts = Vec::new();
-                for (element, _) in elements {
-                    parts.push(self.pattern(element, span)?);
+                for (slot, (element, _)) in elements.iter().enumerate() {
+                    parts.push(self.pattern(element, element_types.get(slot).copied(), span)?);
                 }
                 Ok(format!("({},)", parts.join(", ")))
             }
             ExprPattern::Array(_) => Err(unsupported("an array pattern", span)),
         }
+    }
+
+    /// The arguments `enum_id` is instantiated at, from a known subject type.
+    fn enum_arguments_of(&self, subject_type: Option<TypeId>, enum_id: Id) -> Vec<TypeId> {
+        if let Some(Type::Enum(found, arguments)) =
+            subject_type.and_then(|type_id| self.resolve(type_id))
+            && *found == enum_id
+        {
+            return arguments.clone();
+        }
+        self.program
+            .enums
+            .get(&enum_id)
+            .map(|declaration| declaration.generic_parameter_constraint_ids.clone())
+            .unwrap_or_default()
+    }
+
+    /// One variant's payload types, resolved under the instantiation — the
+    /// subject types a nested pattern needs.
+    fn variant_payload_types(
+        &mut self,
+        enum_id: Id,
+        index: usize,
+        arguments: &[TypeId],
+    ) -> Vec<TypeId> {
+        let Some(declaration) = self.program.enums.get(&enum_id).cloned() else {
+            return Vec::new();
+        };
+        let Some(variant) = declaration.variants.get(index) else {
+            return Vec::new();
+        };
+        let entries =
+            self.nominal_entries(&declaration.generic_parameter_constraint_ids, arguments);
+        let saved = self.enter_substitution(entries);
+        let resolved = variant
+            .data_type_ids
+            .iter()
+            .map(|type_id| self.concrete(*type_id))
+            .collect();
+        self.current_substitution = saved;
+        resolved
     }
 
     fn is_test(
@@ -1354,11 +2789,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
         span: Span,
     ) -> Result<String, Error> {
         let subject_text = self.expression(subject, depth)?;
-        let pattern_text = self.pattern(pattern, span)?;
+        let subject_type = self.type_of(subject);
+        let pattern_text = self.pattern(pattern, subject_type, span)?;
         Ok(format!("matches!({subject_text}, {pattern_text})"))
     }
 
-    fn variant_path(&mut self, enum_id: Id, index: usize, span: Span) -> Result<String, Error> {
+    /// One variant's Rust path, in the INSTANCE `arguments` name.
+    ///
+    /// `Tree<i32>::Leaf` and `Tree<str>::Leaf` are variants of two Rust enums,
+    /// so the path cannot be derived from the declaration alone — which is why
+    /// every caller has to say which instantiation it is in.
+    fn variant_path(
+        &mut self,
+        enum_id: Id,
+        index: usize,
+        arguments: &[TypeId],
+        span: Span,
+    ) -> Result<String, Error> {
         let declaration = self
             .program
             .enums
@@ -1373,15 +2820,174 @@ impl<'a, 'src> Emitter<'a, 'src> {
             "bool" => Ok(if index == 1 { "true" } else { "false" }.to_string()),
             "Option" | "Result" => Ok(sanitize(variant.name)),
             _ => {
-                self.ensure_enum(enum_id, span)?;
-                Ok(format!(
-                    "{}_{}::{}",
-                    sanitize(declaration.name),
-                    enum_id.0,
-                    sanitize(variant.name)
-                ))
+                let name = sanitize(variant.name);
+                let instance = self.ensure_enum(enum_id, arguments, span)?;
+                Ok(format!("{}::{name}", instance.name))
             }
         }
+    }
+
+    /// The type arguments an enum is instantiated at, at one expression — from
+    /// the type the analyzer recorded there, else the declaration's own
+    /// parameters (which for a non-generic enum is the empty list, and for a
+    /// generic one leaves the parameters unbound so the refusal names them).
+    fn enum_arguments_at(&self, expr_id: Id, enum_id: Id) -> Vec<TypeId> {
+        if let Some(Type::Enum(found, arguments)) = self
+            .type_of(expr_id)
+            .and_then(|type_id| self.resolve(type_id))
+            && *found == enum_id
+        {
+            return arguments.clone();
+        }
+        self.program
+            .enums
+            .get(&enum_id)
+            .map(|declaration| declaration.generic_parameter_constraint_ids.clone())
+            .unwrap_or_default()
+    }
+
+    /// The arguments a VARIANT CONSTRUCTOR instantiates its enum at.
+    ///
+    /// Two sources, in order, because neither is total. The type recorded at the
+    /// call site is the general answer, but for a generic enum it can be
+    /// OPEN — `Tree::Leaf(7)` records `Tree<any>`, its parameter still a hole
+    /// the surrounding `let`'s annotation closes later (this is B357's shape
+    /// from the emitter's side). So an open argument list falls back to the one
+    /// place the answer is certainly present: the constructor's own arguments,
+    /// bound against the variant's declared payload types by the same walk that
+    /// binds an impl subject.
+    ///
+    /// A NULLARY variant of a generic enum has neither — nothing to read the
+    /// parameter off — and the refusal names it rather than instantiating a
+    /// second Rust enum over a hole.
+    fn variant_arguments(
+        &mut self,
+        expr_id: Id,
+        enum_id: Id,
+        index: usize,
+        argument_ids: &[Id],
+    ) -> Vec<TypeId> {
+        let Some(declaration) = self.program.enums.get(&enum_id).cloned() else {
+            return Vec::new();
+        };
+        let parameters = &declaration.generic_parameter_constraint_ids;
+        if parameters.is_empty() {
+            return Vec::new();
+        }
+        let recorded = self.enum_arguments_at(expr_id, enum_id);
+        if recorded.len() == parameters.len()
+            && recorded.iter().all(|argument| self.is_grounded(*argument))
+        {
+            return recorded;
+        }
+        // The position this constructor is being emitted into, when it declares
+        // the same enum with its arguments closed.
+        if let Some(Type::Enum(found, expected)) =
+            self.expected_type.and_then(|type_id| self.resolve(type_id))
+            && *found == enum_id
+            && expected.len() == parameters.len()
+        {
+            let expected = expected.clone();
+            if expected.iter().all(|argument| self.is_grounded(*argument)) {
+                return expected;
+            }
+        }
+        let mut bound: HashMap<TypeId, TypeId> = HashMap::default();
+        if let Some(variant) = declaration.variants.get(index) {
+            for (slot, data_type_id) in variant.data_type_ids.iter().enumerate() {
+                if let Some(argument_type) = argument_ids.get(slot).and_then(|id| self.type_of(*id))
+                {
+                    let concrete = self.concrete(argument_type);
+                    self.bind_parameters(parameters, *data_type_id, concrete, &mut bound);
+                }
+            }
+        }
+        parameters
+            .iter()
+            .map(|parameter| bound.get(parameter).copied().unwrap_or(*parameter))
+            .collect()
+    }
+
+    /// Binds a declaration's own generic `parameters` from the matching
+    /// positions of a concrete type — `Leaf(T)` against `Leaf(i32)` giving
+    /// `{T -> i32}`.
+    ///
+    /// `impl_select::bind_subject` is the same walk for an impl SUBJECT, and it
+    /// is not reusable here: it binds a `Type::Generic` node, and a nominal
+    /// declaration's parameter can appear in its own body as the constraint id
+    /// itself (whose `Type` is `Any`). This one is told which ids are
+    /// parameters, so both spellings bind.
+    fn bind_parameters(
+        &self,
+        parameters: &[TypeId],
+        pattern: TypeId,
+        concrete: TypeId,
+        out: &mut HashMap<TypeId, TypeId>,
+    ) {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return;
+        };
+        if parameters.contains(&pattern) {
+            out.entry(pattern).or_insert(concrete);
+            return;
+        }
+        match self.program.type_id_to_type_map.get(&pattern) {
+            Some(Type::Generic(constraint_id)) if parameters.contains(constraint_id) => {
+                out.entry(*constraint_id).or_insert(concrete);
+            }
+            Some(
+                Type::Struct(_, pattern_arguments)
+                | Type::Enum(_, pattern_arguments)
+                | Type::Tuple(pattern_arguments),
+            ) => {
+                let pattern_arguments = pattern_arguments.clone();
+                let concrete_arguments = match self.program.type_id_to_type_map.get(&concrete) {
+                    Some(
+                        Type::Struct(_, arguments)
+                        | Type::Enum(_, arguments)
+                        | Type::Tuple(arguments),
+                    ) => arguments.clone(),
+                    _ => return,
+                };
+                for (inner_pattern, inner_concrete) in
+                    pattern_arguments.iter().zip(concrete_arguments.iter())
+                {
+                    self.bind_parameters(parameters, *inner_pattern, *inner_concrete, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether a type argument is CLOSED — something a Rust type can be minted
+    /// from. `any`, an unresolved hole and a still-abstract generic are not.
+    fn is_grounded(&self, type_id: TypeId) -> bool {
+        match self.resolve(type_id) {
+            Some(Type::Any | Type::Unknown | Type::Unresolved | Type::Generic(_)) | None => false,
+            Some(
+                Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Tuple(arguments),
+            ) => arguments
+                .clone()
+                .iter()
+                .all(|inner| self.is_grounded(*inner)),
+            Some(_) => true,
+        }
+    }
+
+    /// The same, for a struct.
+    fn struct_arguments_at(&self, expr_id: Id, struct_id: Id) -> Vec<TypeId> {
+        if let Some(Type::Struct(found, arguments)) = self
+            .type_of(expr_id)
+            .and_then(|type_id| self.resolve(type_id))
+            && *found == struct_id
+        {
+            return arguments.clone();
+        }
+        self.program
+            .structs
+            .get(&struct_id)
+            .map(|declaration| declaration.generic_parameter_constraint_ids.clone())
+            .unwrap_or_default()
     }
 
     fn field_name(&self, subject: Id, index: usize, span: Span) -> Result<String, Error> {
@@ -1408,6 +3014,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
     fn struct_literal(
         &mut self,
         struct_id: Id,
+        arguments: &[TypeId],
         fields: &[(usize, Id)],
         depth: usize,
         span: Span,
@@ -1418,28 +3025,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .get(&struct_id)
             .cloned()
             .ok_or_else(|| unsupported("an unresolved struct literal", span))?;
-        if !declaration.generic_parameter_constraint_ids.is_empty() {
-            return Err(unsupported(
-                &format!("the generic struct `{}`", declaration.name),
-                span,
-            ));
-        }
-        self.ensure_struct(struct_id, span)?;
+        let entries =
+            self.nominal_entries(&declaration.generic_parameter_constraint_ids, arguments);
+        let instance = self.ensure_struct(struct_id, arguments, span)?;
         let mut parts = Vec::new();
         for (index, value) in fields.iter() {
-            let name = declaration
+            let field = declaration
                 .fields
                 .get(*index)
-                .map(|field| sanitize(field.name))
                 .ok_or_else(|| unsupported("a struct field past the declaration", span))?;
-            parts.push(format!("{name}: {}", self.value_of(*value, depth)?));
+            let name = sanitize(field.name);
+            // The field's declared type under THIS instantiation, so a field
+            // holding a generic enum can ground it.
+            let saved = self.enter_substitution(entries.clone());
+            let expecting = self.concrete(field.type_id);
+            self.current_substitution = saved;
+            parts.push(format!(
+                "{name}: {}",
+                self.value_of_expecting(*value, Some(expecting), depth)?
+            ));
         }
-        Ok(format!(
-            "{}_{} {{ {} }}",
-            sanitize(declaration.name),
-            struct_id.0,
-            parts.join(", ")
-        ))
+        Ok(format!("{} {{ {} }}", instance.name, parts.join(", ")))
     }
 
     fn for_each(
@@ -1518,22 +3124,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .ok_or_else(|| unsupported("an unresolved closure", span))?;
         let mut parameters = Vec::new();
         for parameter_id in &closure.parameters {
-            let parameter = self
-                .program
-                .parameters
-                .get(parameter_id)
-                .cloned()
-                .ok_or_else(|| unsupported("an unresolved closure parameter", span))?;
-            let rendered = self.rust_type(parameter.type_id, span)?;
-            let declaration = match self.receiving_form(&parameter) {
-                Receiving::ByValue => rendered,
-                Receiving::Ref => format!("&{rendered}"),
-                Receiving::RefMut => format!("&mut {rendered}"),
-            };
-            parameters.push(format!(
-                "{}: {declaration}",
-                self.binding_name(*parameter_id)
-            ));
+            parameters.push(self.parameter_declaration(*parameter_id, span)?);
         }
         let body = self.expression(closure.return_, depth)?;
         // A `move` closure takes its captures by value, so a captured CELL has
@@ -1593,87 +3184,114 @@ impl<'a, 'src> Emitter<'a, 'src> {
         else {
             // A value call — `(h.f)()`. The subject is a counted closure.
             let subject = self.expression(function_call.subject_id, depth)?;
-            let mut arguments = Vec::new();
-            for argument in &function_call.argument_ids {
-                arguments.push(self.value_of(*argument, depth)?);
-            }
+            let arguments = self.value_arguments(&function_call.argument_ids, depth)?;
             return Ok(format!("({subject})({})", arguments.join(", ")));
         };
         let target = *target;
 
-        if !function_call.generic_argument_ids.is_empty() {
-            return Err(unsupported("a call with explicit generic arguments", span));
+        // A variant constructor builds the value directly.
+        if let Some(Expr::EnumVariant(enum_id, index)) = self.program.entity_map.get(&target) {
+            let (enum_id, index) = (*enum_id, *index);
+            let arguments =
+                self.variant_arguments(call_expr_id, enum_id, index, &function_call.argument_ids);
+            let path = self.variant_path(enum_id, index, &arguments, span)?;
+            if function_call.argument_ids.is_empty() {
+                return Ok(path);
+            }
+            let arguments = self.value_arguments(&function_call.argument_ids, depth)?;
+            return Ok(format!("{path}({})", arguments.join(", ")));
         }
-        if self.program.generic_dispatch.contains_key(&call_id)
-            || self
-                .program
-                .generic_dispatch
-                .contains_key(&function_call.subject_id)
+
+        // `T::member(..)` inside a monomorphized body, and `value.method()` on
+        // a value whose type IS a bounded `T`: the analyzer could not pin the
+        // callee, so it recorded how to re-resolve it at each instantiation.
+        // Both are keyed by the CONSTRAINT, one against the accessor and one
+        // against the call (the JS emitter reads the same two places).
+        for keyed_on in [function_call.subject_id, call_id] {
+            if let Some(GenericDispatch::OnConstraint(constraint_id, member)) =
+                self.program.generic_dispatch.get(&keyed_on).copied()
+                && let Some(&bound) = self.current_substitution.get(&constraint_id)
+            {
+                let concrete = self.concrete(bound);
+                let own_values = self
+                    .program
+                    .own_generic_call_bindings
+                    .get(&call_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let preferred = self
+                    .program
+                    .bound_dispatch_traits
+                    .get(&call_id)
+                    .or_else(|| {
+                        self.program
+                            .bound_dispatch_traits
+                            .get(&function_call.subject_id)
+                    })
+                    .cloned();
+                if let Some(dispatch) =
+                    self.resolve_dispatch(concrete, member, &own_values, preferred, span)?
+                {
+                    return self.emit_dispatch(dispatch, &function_call.argument_ids, depth, span);
+                }
+                return Err(unsupported(
+                    &format!(
+                        "a call to `{member}` through a generic parameter that resolves to no \
+                         member of the concrete type"
+                    ),
+                    span,
+                ));
+            }
+        }
+        // A trait method re-dispatched to the receiver's concrete type: an
+        // inherited default called on a concrete value, or a `self`-call inside
+        // a default body (no type recorded — it dispatches on the type the
+        // default is being specialized for).
+        if let Some(GenericDispatch::OnType(recorded, member)) =
+            self.program.generic_dispatch.get(&call_id).copied()
+            && let Some(type_id) = recorded.or(self.current_self_type)
         {
+            let concrete = self.concrete(type_id);
+            let preferred = self.program.bound_dispatch_traits.get(&call_id).cloned();
+            if let Some(dispatch) = self.resolve_dispatch(concrete, member, &[], preferred, span)? {
+                return self.emit_dispatch(dispatch, &function_call.argument_ids, depth, span);
+            }
             return Err(unsupported(
-                "a call dispatched through a generic parameter (monomorphisation is S1b's)",
+                &format!("a trait call to `{member}` that resolves to no member of the receiver"),
                 span,
             ));
         }
 
-        // A variant constructor builds the value directly.
-        if let Some(Expr::EnumVariant(enum_id, index)) = self.program.entity_map.get(&target) {
-            let (enum_id, index) = (*enum_id, *index);
-            let path = self.variant_path(enum_id, index, span)?;
-            if function_call.argument_ids.is_empty() {
-                return Ok(path);
-            }
-            let mut arguments = Vec::new();
-            for argument in &function_call.argument_ids {
-                arguments.push(self.value_of(*argument, depth)?);
-            }
-            return Ok(format!("{path}({})", arguments.join(", ")));
-        }
-
-        let mut arguments = Vec::new();
-        for argument in &function_call.argument_ids {
-            arguments.push(self.value_of(*argument, depth)?);
-        }
-
         if Some(target) == self.program.print_fn_id {
-            let value = arguments
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "()".to_string());
+            let value = self.place_argument(&function_call.argument_ids, 0, depth)?;
             return Ok(format!("vilan_rt::print(&({value}))"));
         }
         if Some(target) == self.program.panic_fn_id {
-            let value = arguments
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "()".to_string());
+            let value = self.place_argument(&function_call.argument_ids, 0, depth)?;
             return Ok(format!("vilan_rt::panic_with(&({value}))"));
         }
         if Some(target) == self.program.list_new_fn_id {
             return Ok("Vec::new()".to_string());
         }
         if Some(target) == self.program.list_push_fn_id {
-            let mut parts = arguments.into_iter();
-            let receiver = parts.next().unwrap_or_else(|| "()".to_string());
-            let item = parts.next().unwrap_or_else(|| "()".to_string());
+            let receiver = self.place_argument(&function_call.argument_ids, 0, depth)?;
+            let item = self.value_argument(&function_call.argument_ids, 1, depth)?;
             return Ok(format!("{receiver}.push({item})"));
         }
         if let Some(intrinsic) = self.program.intrinsics.get(&target).copied() {
-            return self.intrinsic(intrinsic, arguments, span);
+            return self.emit_intrinsic(intrinsic, &function_call.argument_ids, depth, span);
         }
         if let Some(external) = self.program.external_functions.get(&target) {
             let name = external.name;
             let binding = external.extern_binding.clone();
-            return Err(unsupported(
-                &format!(
-                    "the host binding `{name}`{}",
-                    match binding {
-                        Some(ExternBinding::Function { symbol, .. }) => format!(" (`{symbol}`)"),
-                        _ => String::new(),
-                    }
-                ),
-                span,
-            ));
+            let what = format!(
+                "the host binding `{name}`{}",
+                match binding {
+                    Some(ExternBinding::Function { symbol, .. }) => format!(" (`{symbol}`)"),
+                    _ => String::new(),
+                }
+            );
+            return self.host_gap(what, span);
         }
 
         // A named BINDING that holds a closure — `g()` where `g` is a
@@ -1682,18 +3300,39 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if self.program.parameters.contains_key(&target)
             || self.program.variables.contains_key(&target)
         {
-            return Ok(format!(
-                "({})({})",
-                self.read_binding(target),
-                arguments.join(", ")
-            ));
+            let arguments = self.value_arguments(&function_call.argument_ids, depth)?;
+            let callee = self.read_module_binding_or_local(target, span)?;
+            return Ok(format!("({callee})({})", arguments.join(", ")));
         }
 
-        // An ordinary call. The receiver of a loaned `self` arrives as a place
-        // in the IR and as a reference natively, so the `&`/`&mut` the source
-        // never wrote is synthesized here, from the callee's own conventions.
-        self.ensure_function(target)?;
-        let conventions: Vec<Receiving> = self
+        // An ordinary call, monomorphized against whatever binds it.
+        let substitution =
+            self.call_substitution(call_id, target, &function_call.generic_argument_ids);
+        let name = self.ensure_function(target, &substitution)?.name;
+        let arguments = self.call_arguments(target, &function_call.argument_ids, depth)?;
+        Ok(format!("{name}({})", arguments.join(", ")))
+    }
+
+    // ------------------------------------------------- arguments by position --
+
+    /// One call's arguments, rendered per POSITION against the callee's own
+    /// conventions: a by-value parameter takes a VALUE (rule 1's copy where the
+    /// analyzer recorded one), a `&`/`&mut` parameter takes a PLACE.
+    ///
+    /// The distinction is not cosmetic, and getting it wrong was a live
+    /// miscompile: every argument used to be rendered as a value, so a loaned
+    /// parameter handed on to a `&mut` position became `&mut (xs).clone()` —
+    /// `xs.push(1)` inside `fun bump(xs: &mut List<i32>)` pushed into a
+    /// temporary and `side-effect-let.vl` printed `0 0` where the JS backend
+    /// printed `1 2`. A borrow is by definition not a copy, so a reference
+    /// position never takes one.
+    fn call_arguments(
+        &mut self,
+        target: Id,
+        argument_ids: &[Id],
+        depth: usize,
+    ) -> Result<Vec<String>, Error> {
+        let declared: Vec<vilan_core::analyzer::Parameter<'src>> = self
             .program
             .functions
             .get(&target)
@@ -1701,32 +3340,378 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .unwrap_or_default()
             .iter()
             .filter_map(|parameter_id| self.program.parameters.get(parameter_id).cloned())
-            .map(|parameter| self.receiving_form(&parameter))
             .collect();
-        let adjusted: Vec<String> = arguments
-            .into_iter()
-            .enumerate()
-            .map(|(index, text)| {
-                let already_a_reference = function_call
-                    .argument_ids
-                    .get(index)
-                    .and_then(|argument| self.program.entity_map.get(argument))
-                    .is_some_and(|expr| matches!(expr, Expr::Reference(_, _)));
-                if already_a_reference {
-                    return text;
-                }
-                match conventions.get(index) {
-                    Some(Receiving::Ref) => format!("&{text}"),
-                    Some(Receiving::RefMut) => format!("&mut {text}"),
-                    _ => text,
-                }
+        let conventions: Vec<Receiving> = declared
+            .iter()
+            .map(|parameter| self.receiving_form(parameter))
+            .collect();
+        let mut rendered = Vec::new();
+        for (index, argument) in argument_ids.iter().enumerate() {
+            let wants_a_place = !matches!(conventions.get(index), None | Some(Receiving::ByValue));
+            let expecting = declared
+                .get(index)
+                .map(|parameter| self.concrete(parameter.type_id));
+            let mut text = if wants_a_place {
+                self.expression(*argument, depth)?
+            } else {
+                self.value_of_expecting(*argument, expecting, depth)?
+            };
+            // H9: a `mut` parameter of aggregate type is copied at BODY ENTRY
+            // on the JS backend (`parameter_entry_clones`), because there the
+            // callee and the caller share one array and the copy has to happen
+            // somewhere. Natively the argument is MOVED into the callee, so the
+            // one place the copy can happen is here — `grow(list)` followed by
+            // `list.len()` was a borrow-after-move on a program the JS backend
+            // runs. The same copy, at the only seam Rust offers for it.
+            if declared.get(index).is_some_and(|parameter| {
+                self.program.parameter_entry_clones.contains(&parameter.id)
+            }) {
+                text = format!("({text}).clone()");
+            }
+            // The receiver of a loaned `self` arrives as a place in the IR and
+            // as a reference natively, so the `&`/`&mut` the source never wrote
+            // is synthesized here — unless the source DID write one.
+            let already_a_reference = self
+                .program
+                .entity_map
+                .get(argument)
+                .is_some_and(|expr| matches!(expr, Expr::Reference(_, _)));
+            rendered.push(match conventions.get(index) {
+                Some(Receiving::Ref) if !already_a_reference => format!("&{text}"),
+                Some(Receiving::RefMut) if !already_a_reference => format!("&mut {text}"),
+                _ => text,
+            });
+        }
+        Ok(rendered)
+    }
+
+    /// Every argument as a VALUE — a closure call and a variant constructor,
+    /// both of which consume what they are handed.
+    fn value_arguments(&mut self, argument_ids: &[Id], depth: usize) -> Result<Vec<String>, Error> {
+        let mut rendered = Vec::new();
+        for argument in argument_ids {
+            rendered.push(self.value_of(*argument, depth)?);
+        }
+        Ok(rendered)
+    }
+
+    fn value_argument(
+        &mut self,
+        argument_ids: &[Id],
+        index: usize,
+        depth: usize,
+    ) -> Result<String, Error> {
+        match argument_ids.get(index) {
+            Some(argument) => self.value_of(*argument, depth),
+            None => Ok("()".to_string()),
+        }
+    }
+
+    /// One argument as a PLACE: the receiver of an intrinsic (`xs.push(..)`,
+    /// `list_pop(&mut xs)`) and the argument of `print`/`panic`, which take a
+    /// reference. Copying either would be wrong in the first case and wasteful
+    /// in the second.
+    fn place_argument(
+        &mut self,
+        argument_ids: &[Id],
+        index: usize,
+        depth: usize,
+    ) -> Result<String, Error> {
+        match argument_ids.get(index) {
+            Some(argument) => self.expression(*argument, depth),
+            None => Ok("()".to_string()),
+        }
+    }
+
+    // ------------------------------------------------- generic dispatch --
+
+    /// The trait-scoped / inherent / inherited-default resolution of `member`
+    /// on a concrete receiver — [`vilan_core::impl_select`]'s selection, then
+    /// the bindings that selection implies. `Ok(None)` means the type provides
+    /// no such member, which the caller reports with the name it was looking
+    /// for.
+    ///
+    /// The file scope is `None` on purpose: B318's admission is a
+    /// FRONT-END rule, and a program that reaches emission has already been
+    /// held to it — re-asking it here with no `current_admitting_file` to
+    /// supply would refuse a member the analyzer admitted.
+    fn resolve_dispatch(
+        &mut self,
+        type_id: TypeId,
+        member: &str,
+        own_generic_values: &[TypeId],
+        preferred_trait: Option<(Id, Vec<TypeId>)>,
+        span: Span,
+    ) -> Result<Option<NativeDispatch>, Error> {
+        let type_id = self.concrete(type_id);
+        if let Some((trait_id, written)) = preferred_trait {
+            let arguments: Vec<TypeId> = written
+                .iter()
+                .map(|argument| self.concrete(*argument))
+                .collect();
+            let wanted = impl_select::WantedTrait {
+                trait_id,
+                arguments: &arguments,
+            };
+            if let Some(selected) =
+                impl_select::select_member(self.program, None, type_id, member, Some(wanted))
+            {
+                return self
+                    .dispatch_to_member(selected, type_id, own_generic_values, span)
+                    .map(Some);
+            }
+            if let Some(default_id) = self.trait_default_member(trait_id, member) {
+                let name = self.default_instance(default_id, type_id, span)?;
+                return Ok(Some(NativeDispatch::Call(name)));
+            }
+            // The preference did not materialize (it should not, for a call the
+            // analyzer resolved) — fall through to the general lookup.
+        }
+        if self.selectable_receiver(type_id)
+            && let Some(selected) =
+                impl_select::select_member(self.program, None, type_id, member, None)
+        {
+            return self
+                .dispatch_to_member(selected, type_id, own_generic_values, span)
+                .map(Some);
+        }
+        let Some(default_id) = self.resolve_inherited_default(type_id, member) else {
+            return Ok(None);
+        };
+        let name = self.default_instance(default_id, type_id, span)?;
+        Ok(Some(NativeDispatch::Call(name)))
+    }
+
+    /// One HOST gap: a refusal in an ordinary build, a recorded
+    /// `unimplemented!()` under `VILAN_NATIVE_HOST_CENSUS=1`.
+    ///
+    /// The census answers the question a whole slice is sized from — "what host
+    /// surface does this program still need" — in one emit instead of one emit
+    /// per gap. A build never takes this path: the mode is off unless the
+    /// variable is set, and the source a census produces is never compiled.
+    fn host_gap(&mut self, what: String, span: Span) -> Result<String, Error> {
+        if !self.census {
+            return Err(unsupported(&what, span));
+        }
+        self.host_gaps.insert(what);
+        Ok("unimplemented!()".to_string())
+    }
+
+    /// Whether a receiver is a shape an impl can be written for — the nominal
+    /// ones plus the two structural ones (spec §5.7). `select_member` admits
+    /// impl SUBJECTS of every shape past this; the guard is about the RECEIVER,
+    /// so a blanket subject cannot "apply" to something still abstract.
+    fn selectable_receiver(&self, type_id: TypeId) -> bool {
+        matches!(
+            self.program.type_id_to_type_map.get(&type_id),
+            Some(Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..))
+        )
+    }
+
+    /// Lowers a selected member to its dispatch, binding the impl's own
+    /// generics from the concrete receiver (so a method whose body uses the
+    /// impl's parameter grounds it) plus the method's own from the call's
+    /// ordered values.
+    fn dispatch_to_member(
+        &mut self,
+        selected: impl_select::SelectedMember,
+        type_id: TypeId,
+        own_generic_values: &[TypeId],
+        span: Span,
+    ) -> Result<NativeDispatch, Error> {
+        let member_id = selected.member_id;
+        if let Some(intrinsic) = self.program.intrinsics.get(&member_id).copied() {
+            return Ok(NativeDispatch::Intrinsic(intrinsic));
+        }
+        if let Some(external) = self.program.external_functions.get(&member_id) {
+            let what = format!("the host binding `{}`", external.name);
+            return self
+                .host_gap(what, span)
+                .map(|_| NativeDispatch::Call("unimplemented!()".to_string()));
+        }
+        let mut substitution = HashMap::default();
+        impl_select::bind_subject(
+            self.program,
+            selected.impl_subject,
+            type_id,
+            &mut substitution,
+        );
+        if !own_generic_values.is_empty()
+            && let Some(function) = self.program.functions.get(&member_id)
+        {
+            for (constraint_id, value) in function
+                .generic_parameter_constraint_ids
+                .iter()
+                .zip(own_generic_values.iter())
+            {
+                substitution.insert(*constraint_id, *value);
+            }
+        }
+        let name = self.ensure_function(member_id, &substitution)?.name;
+        Ok(NativeDispatch::Call(name))
+    }
+
+    /// Emits a resolved dispatch's call, with the receiver as the first
+    /// argument — the shape the analyzer already put a method call in.
+    fn emit_dispatch(
+        &mut self,
+        dispatch: NativeDispatch,
+        argument_ids: &[Id],
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        match dispatch {
+            NativeDispatch::Intrinsic(intrinsic) => {
+                self.emit_intrinsic(intrinsic, argument_ids, depth, span)
+            }
+            NativeDispatch::Call(name) => {
+                // The callee is known by id only inside `dispatch_to_member`;
+                // what is known here is the NAME. The conventions come from the
+                // member the name was minted for, so the lookup is by the
+                // instance's own record.
+                let target = self.instance_target(&name);
+                let arguments = match target {
+                    Some(target) => self.call_arguments(target, argument_ids, depth)?,
+                    None => self.value_arguments(argument_ids, depth)?,
+                };
+                Ok(format!("{name}({})", arguments.join(", ")))
+            }
+        }
+    }
+
+    /// The function id one emitted instance name belongs to, so a dispatched
+    /// call can render its arguments against that member's conventions.
+    fn instance_target(&self, name: &str) -> Option<Id> {
+        self.instances
+            .iter()
+            .find(|(_, reserved)| reserved.name == name)
+            .map(|((id, _), _)| *id)
+            .or_else(|| {
+                self.default_instances
+                    .iter()
+                    .find(|(_, reserved)| reserved.name == name)
+                    .map(|((id, _), _)| *id)
             })
-            .collect();
-        Ok(format!(
-            "{}({})",
-            self.function_name(target),
-            adjusted.join(", ")
-        ))
+    }
+
+    /// Emits a trait DEFAULT body specialized for one concrete type, keyed by
+    /// (default, that type) so each pairing is emitted once. While the body is
+    /// walked `current_self_type` is the concrete type, so its `self.method()`
+    /// calls re-dispatch there, and the substitution binds the TRAIT's own
+    /// generic parameters to the arguments this type implements it at (B58).
+    fn default_instance(
+        &mut self,
+        default_id: Id,
+        type_id: TypeId,
+        span: Span,
+    ) -> Result<String, Error> {
+        let type_id = self.concrete(type_id);
+        let key = (default_id, self.type_key(type_id));
+        if let Some(reserved) = self.default_instances.get(&key) {
+            return Ok(reserved.name.clone());
+        }
+        let function = self
+            .program
+            .functions
+            .get(&default_id)
+            .cloned()
+            .ok_or_else(|| unsupported("an unresolved trait default", span))?;
+        let sequence = self
+            .default_instances
+            .keys()
+            .filter(|(id, _)| *id == default_id)
+            .count();
+        let name = format!("{}_{}_d{sequence}", sanitize(function.name), default_id.0);
+        let slot = self.next_function_slot;
+        self.next_function_slot += 1;
+        self.default_instances.insert(
+            key,
+            Reserved {
+                name: name.clone(),
+                slot,
+            },
+        );
+        // REPLACED rather than composed, exactly as the JS emitter does it: a
+        // default body has no generic parameters of its own, and the trait's
+        // arguments for THIS type are the whole binding it runs under.
+        let substitution = self.trait_parameter_substitution(default_id, type_id);
+        let saved_self = self.current_self_type.replace(type_id);
+        let self_traits = self.self_traits_of(default_id);
+        let saved_traits = std::mem::replace(&mut self.current_self_traits, self_traits);
+        let saved = std::mem::replace(&mut self.current_substitution, substitution);
+        let emitted = self.function_body(&function, function.name_span, false, &name);
+        self.current_substitution = saved;
+        self.current_self_traits = saved_traits;
+        self.current_self_type = saved_self;
+        self.functions.insert(slot, emitted?);
+        Ok(name)
+    }
+
+    /// `member` as an INHERITED trait default on a concrete type — a member no
+    /// impl declares but a (super)trait it implements provides with a body.
+    fn resolve_inherited_default(&self, type_id: TypeId, member: &str) -> Option<Id> {
+        impl_select::applying_trait_ids(self.program, None, type_id)
+            .into_iter()
+            .find_map(|trait_id| self.trait_default_member(trait_id, member))
+    }
+
+    /// A trait and its supertraits, searched for a member WITH a body.
+    fn trait_default_member(&self, trait_id: Id, member: &str) -> Option<Id> {
+        let mut stack = vec![trait_id];
+        let mut seen = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(trait_) = self.program.traits.get(&id) else {
+                continue;
+            };
+            if let Some(&member_id) = trait_.declarations.get(member)
+                && self.function_has_body(member_id)
+            {
+                return Some(member_id);
+            }
+            for supertrait_type_id in &trait_.supertraits {
+                if let Some(Type::Trait(super_id, _)) =
+                    self.program.type_id_to_type_map.get(supertrait_type_id)
+                {
+                    stack.push(*super_id);
+                }
+            }
+        }
+        None
+    }
+
+    fn function_has_body(&self, member_id: Id) -> bool {
+        match self.program.entity_map.get(&member_id) {
+            Some(Expr::Function(function_id)) => self
+                .program
+                .functions
+                .get(function_id)
+                .is_some_and(|function| function.has_body),
+            _ => false,
+        }
+    }
+
+    fn emit_intrinsic(
+        &mut self,
+        intrinsic: Intrinsic,
+        argument_ids: &[Id],
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        // Argument 0 of an intrinsic is its RECEIVER, and every arm below
+        // renders it as a place (`&`, `&mut`, or a method receiver). The rest
+        // are values.
+        let mut arguments = Vec::new();
+        for (index, argument) in argument_ids.iter().enumerate() {
+            arguments.push(if index == 0 {
+                self.expression(*argument, depth)?
+            } else {
+                self.value_of(*argument, depth)?
+            });
+        }
+        self.intrinsic(intrinsic, arguments, span)
     }
 
     fn intrinsic(
@@ -1790,6 +3775,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Intrinsic::SharedNew => format!("vilan_rt::Shared::new({})", next()),
             Intrinsic::SharedClone => format!("({}).clone()", next()),
             Intrinsic::SharedValue => format!("({}).get()", next()),
+            Intrinsic::SharedWrite => format!("({}).set({})", next(), next()),
+            Intrinsic::SharedIdentity => format!("({}).identity()", next()),
+            Intrinsic::SharedDowngrade => format!("({}).downgrade()", next()),
+            Intrinsic::WeakUpgrade => format!("({}).upgrade()", next()),
+            Intrinsic::OptionTake => format!("({}).take()", next()),
+            Intrinsic::OptionReplace => format!("({}).replace({})", next(), next()),
             Intrinsic::SetNew => "vilan_rt::Set::new()".to_string(),
             Intrinsic::SetInsert => format!("{}.insert({})", next(), next()),
             Intrinsic::SetContains => format!("{}.contains(&{})", next(), next()),
@@ -1803,12 +3794,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Intrinsic::MapLen => format!("({}.len() as i32)", next()),
             Intrinsic::MapKeys => format!("{}.keys()", next()),
             Intrinsic::MapValues => format!("{}.values()", next()),
-            other => {
-                return Err(unsupported(&format!("the intrinsic `{other:?}`"), span));
-            }
+            other => return self.host_gap(format!("the intrinsic `{other:?}`"), span),
         };
         Ok(rendered)
     }
+}
+
+/// How a generically dispatched member is CALLED, once resolved: the member may
+/// be an intrinsic (a runtime form, not a call to an emitted function) or an
+/// emitted instance. Without the distinction a generic dispatch landing on an
+/// intrinsic would mint a name nothing defines.
+enum NativeDispatch {
+    Intrinsic(Intrinsic),
+    Call(String),
 }
 
 /// How a parameter is received natively.
@@ -1842,6 +3840,25 @@ fn scalar_type(name: &str) -> Option<&'static str> {
     })
 }
 
+/// One census row from a refusal: the construct, without the boilerplate
+/// sentence every refusal carries.
+fn census_entry(error: &Error) -> String {
+    let message = error.msg.as_str();
+    let start = message
+        .find("does not emit ")
+        .map(|offset| offset + "does not emit ".len())
+        .unwrap_or(0);
+    let rest = &message[start..];
+    let end = rest.find(" yet — this is").unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
+/// Whether a rendered Rust type is a counted closure (F16: every closure type
+/// is `Rc<dyn Fn(..) -> ..>`), which is neither `PartialEq` nor printable.
+fn is_closure_type(rendered: &str) -> bool {
+    rendered.contains("dyn Fn")
+}
+
 fn is_integer_type(rendered: &str) -> bool {
     matches!(
         rendered,
@@ -1866,20 +3883,70 @@ fn sanitize(name: &str) -> String {
     name.replace(|c: char| !c.is_alphanumeric() && c != '_', "_")
 }
 
+/// A string literal's source text, as a Rust literal.
+///
+/// **The text is not the value.** An `Expr::String`'s text is the SOURCE body
+/// of the literal, escapes unprocessed, and the JS emitter turns it into a
+/// value with `transformer::unescape_string` before its formatter re-escapes it
+/// for JavaScript. S1a wrote the text straight into a Rust literal and escaped
+/// its backslashes, so `print("a\nb")` printed `a\nb` natively against the JS
+/// backend's two lines — and no program in the accepted corpus carried an
+/// escape, so the differential never saw it.
+///
+/// The escape set is `unescape_string`'s, exactly: `\n`, `\t`, `\r`, `\"`,
+/// `\\`, `\0`, an unknown escape keeping BOTH characters (which is what makes
+/// the lexer's `RAW_BACKSLASH` doubling round-trip), and a CRLF folded to one
+/// `\n` (`windows-support.md` §2). It is reproduced rather than called because
+/// the function is private to `transformer.rs`; the lane's report asks for it to
+/// be shared.
 fn rust_string(text: &str) -> String {
+    let value = unescape_string_value(text);
     let mut out = String::from("\"");
-    for character in text.chars() {
+    for character in value.chars() {
         match character {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\0"),
+            other if (other as u32) < 0x20 || other as u32 == 0x7f => {
+                let _ = write!(out, "\\u{{{:x}}}", other as u32);
+            }
             other => out.push(other),
         }
     }
     out.push('"');
     out
+}
+
+/// The VALUE of a vilan string literal's body — `transformer::unescape_string`,
+/// which is where a literal's value is BUILT on the JS side.
+fn unescape_string_value(raw: &str) -> String {
+    let raw = vilan_core::util::normalize_newlines(raw);
+    let mut result = String::with_capacity(raw.len());
+    let mut characters = raw.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            result.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some('n') => result.push('\n'),
+            Some('t') => result.push('\t'),
+            Some('r') => result.push('\r'),
+            Some('"') => result.push('"'),
+            Some('\\') => result.push('\\'),
+            Some('0') => result.push('\0'),
+            // An unknown escape keeps both characters.
+            Some(other) => {
+                result.push('\\');
+                result.push(other);
+            }
+            None => result.push('\\'),
+        }
+    }
+    result
 }
 
 fn describe(resolved: &Type) -> String {
@@ -1892,6 +3959,24 @@ fn describe(resolved: &Type) -> String {
         Type::Module(_) => "a module".to_string(),
         Type::Unknown | Type::Unresolved => "an unresolved type".to_string(),
         _ => "an unsupported type".to_string(),
+    }
+}
+
+/// Every binding a pattern introduces, in source order.
+fn collect_pattern_bindings(pattern: &ExprPattern, out: &mut Vec<Id>) {
+    match pattern {
+        ExprPattern::Binding(id) => out.push(*id),
+        ExprPattern::Variant(_, _, payload) => {
+            for sub in payload {
+                collect_pattern_bindings(sub, out);
+            }
+        }
+        ExprPattern::Tuple(elements) => {
+            for (element, _) in elements {
+                collect_pattern_bindings(element, out);
+            }
+        }
+        ExprPattern::Wildcard | ExprPattern::Literal(_) | ExprPattern::Array(_) => {}
     }
 }
 

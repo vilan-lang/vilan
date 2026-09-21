@@ -50,6 +50,15 @@ use std::process::Command;
 /// `board.vl`, the paper's own probe, is deliberately NOT here: it does not
 /// compile natively yet, and [`the_probes_board_program_names_its_own_gap`]
 /// pins WHY rather than pretending otherwise.
+///
+/// S1b adds six rows, one per thing the slice built: monomorphisation of a
+/// generic function over two instantiations (`generic-inference.vl`), a
+/// generic parameter's own defaulted bound (`default-generic-param.vl`), a
+/// trait default specialized per type plus an inferred return type
+/// (`default.vl`), `mut` parameters (`mut-parameters.vl`), a module-level
+/// binding read and WRITTEN plus B105's hoist (`compound-index.vl`), and a
+/// string literal's escapes (`interpolated-multiline-string.vl` — the class
+/// S1a got wrong for every escape there is).
 const DEFAULT_SUITE: &[&str] = &[
     "bool.vl",
     "recursion.vl",
@@ -61,6 +70,12 @@ const DEFAULT_SUITE: &[&str] = &[
     "display.vl",
     "match-ergonomics.vl",
     "borrows.vl",
+    "generic-inference.vl",
+    "default-generic-param.vl",
+    "default.vl",
+    "mut-parameters.vl",
+    "compound-index.vl",
+    "interpolated-multiline-string.vl",
 ];
 
 /// Modules whose presence in an `import` means the program reaches a platform
@@ -145,18 +160,38 @@ fn stage() -> PathBuf {
     let staged = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("native-differential-src-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staged);
-    std::fs::create_dir_all(&staged).expect("create the staging directory");
-    for entry in std::fs::read_dir(corpus_dir())
+    copy_tree(&corpus_dir(), &staged);
+    staged
+}
+
+/// Copies the corpus tree, DIRECTORIES INCLUDED.
+///
+/// The files-only copy was a harness defect that read as a backend one:
+/// `module-dirs.vl` imports `pkg::nested::…`, whose modules live in
+/// `vilan/test/nested/`, and a staging directory without it failed the native
+/// leg with `cannot find 'nested' in the imported path` — which `compare`
+/// classifies as BROKEN, because the message carries no refusal. The JS leg was
+/// never reached, so the program looked like an emitter failure while the JS
+/// backend would have failed identically. One recursive copy, and the
+/// `dist/native/` a build writes still lands in the copy rather than the tree.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("create the staging directory");
+    for entry in std::fs::read_dir(from)
         .expect("read the corpus directory")
         .flatten()
     {
         let path = entry.path();
-        if path.is_file() {
-            let name = path.file_name().expect("a corpus entry has a name");
-            std::fs::copy(&path, staged.join(name)).expect("stage a corpus program");
+        let name = path.file_name().expect("a corpus entry has a name");
+        // `dist` is a build artifact of the tree, not a corpus input.
+        if name == "dist" || name == "target" {
+            continue;
+        }
+        if path.is_dir() {
+            copy_tree(&path, &to.join(name));
+        } else if path.is_file() {
+            std::fs::copy(&path, to.join(name)).expect("stage a corpus program");
         }
     }
-    staged
 }
 
 fn vilan(staged: &Path) -> Command {
@@ -284,15 +319,24 @@ fn every_platform_free_program_is_identical_or_named() {
     );
 }
 
+/// `native-apps.md`'s own probe, and the pin that tracks how far it gets.
+///
+/// **S1b moved the wall, and it did not reach the flip.** At S1a the first wall
+/// was `SignalCell<i32>` — a generic type, so monomorphisation, which is this
+/// slice's whole subject — and behind it stood `std::reactive`'s module-level
+/// turn registers, `Shared`'s intrinsics, `Weak`, a closure-typed struct field
+/// and a context-threaded hidden parameter. Every one of those now compiles.
+/// What is left is ONE construct: an `is`-test capture in a position that is
+/// not an `if` condition, which has no name natively (a capture has no
+/// declaration of its own — the JS emitter substitutes the payload accessor at
+/// every reference, and `matches!` binds nothing). The `if` form restructures
+/// into an `if let`; the rest needs the same treatment for a `while`, a `&&`
+/// and a tail position.
+///
+/// The pin holds the CURRENT wall by name, so the next lane to move it sees
+/// exactly what is left rather than a stale sentence about generics.
 #[test]
 fn the_probes_board_program_names_its_own_gap() {
-    // `native-apps.md`'s own probe. It does NOT compile natively in S1a, and
-    // this pin says why rather than leaving a reader of the paper to discover
-    // it. The FIRST wall is `SignalCell<i32>` — a generic type, so
-    // monomorphisation, which is S1b's whole subject; behind it stand
-    // `std::reactive`'s turn registers, which are module-level bindings, and
-    // `Shared`'s intrinsics. When S1b lands, this pin flips to a comparison and
-    // the probe becomes the headline it was written to be.
     let staged = stage();
     let probe = staged.join("native_probe_board.vl");
     std::fs::write(&probe, BOARD_PROBE).expect("write the probe program");
@@ -309,13 +353,233 @@ fn the_probes_board_program_names_its_own_gap() {
     let message = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
-        "the probe compiled natively — S1b has landed and this pin is now the differential it \
-         was written to become"
+        "the probe compiled natively — this pin is now the differential it was written to become"
     );
     assert!(
-        message.contains("does not emit a generic type parameter"),
-        "the probe must be refused for its generics — monomorphisation is the first wall — and \
-         the refusal must name the construct; it said:\n{message}"
+        message.contains("a value captured by an `is` test outside an `if` condition"),
+        "the probe's wall has moved; the refusal must still name ONE construct, and the pin's \
+         own comment must be updated to it. It said:\n{message}"
+    );
+    assert!(
+        !message.contains("unbound generic type parameter"),
+        "the probe is no longer refused for generics — S1b closed that, and a refusal naming one \
+         again is a regression:\n{message}"
+    );
+}
+
+/// S1b's monomorphisation, held to the shape rather than to one program: a
+/// generic function, a generic struct and a generic enum each emit ONE Rust
+/// item per instantiation, and two instantiations of one declaration are two
+/// distinct items.
+///
+/// Written as an inline probe rather than over the corpus because the corpus
+/// has no program that instantiates one declaration at two types AND prints
+/// both — which is precisely the case a single-instance emitter would pass.
+#[test]
+fn one_declaration_at_two_types_emits_two_rust_items() {
+    let staged = stage();
+    let probe = staged.join("native_probe_mono.vl");
+    std::fs::write(&probe, MONO_PROBE).expect("write the probe program");
+    let output = vilan(&staged)
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_mono.vl",
+        ])
+        .output()
+        .expect("build the probe");
+    let source = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the monomorphisation probe was refused:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Two instances of the function, two of the struct, two of the enum. The
+    // names carry the declaration's id and a per-declaration sequence number,
+    // so counting the DECLARED items is counting the instances.
+    let count = |needle: &str| source.matches(needle).count();
+    assert_eq!(
+        count("fn identity_"),
+        2,
+        "two instances of `identity`:\n{source}"
+    );
+    assert_eq!(
+        count("struct Pair_"),
+        2,
+        "two instances of `Pair`:\n{source}"
+    );
+    assert_eq!(count("enum Tree_"), 2, "two instances of `Tree`:\n{source}");
+    // And the instantiations are really distinct: one `Pair` holds an i32 left,
+    // the other a string one.
+    assert!(source.contains("left: i32"), "{source}");
+    assert!(source.contains("left: vilan_rt::Str"), "{source}");
+    // A NON-generic declaration keeps S1a's plain `{name}_{id}` — the property
+    // that leaves every program the previous slice emitted byte-identical.
+    assert!(
+        source.contains("fn plain_"),
+        "a non-generic function keeps its unsuffixed name:\n{source}"
+    );
+
+    let run = vilan(&staged)
+        .args(["run", "--backend", "rust", "native_probe_mono.vl"])
+        .output()
+        .expect("run the probe natively");
+    let javascript = vilan(&staged)
+        .args(["run", "native_probe_mono.vl"])
+        .output()
+        .expect("run the probe on the JS backend");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&javascript.stdout),
+        "the two backends disagree about the monomorphised program"
+    );
+}
+
+/// The monomorphisation probe: one generic function, one generic struct and
+/// one generic enum, each at TWO instantiations, plus a non-generic function
+/// whose emitted name must not move.
+const MONO_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun identity<T>(value: T): T { value }\n",
+    "\n",
+    "fun plain(n: i32): i32 { n + 1 }\n",
+    "\n",
+    "struct Pair<A, B> { left: A, right: B }\n",
+    "\n",
+    "enum Tree<T> { Leaf(T), Empty }\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(identity(3));\n",
+    "\tprint(identity(\"hi\"));\n",
+    "\tprint(plain(1));\n",
+    "\tlet a = Pair { left = 1, right = \"two\" };\n",
+    "\tlet b = Pair { left = \"a\", right = 2 };\n",
+    "\tprint(a.left);\n",
+    "\tprint(b.right);\n",
+    "\tlet leaf: Tree<i32> = Tree::Leaf(7);\n",
+    "\tlet word: Tree<str> = Tree::Leaf(\"x\");\n",
+    "\tmatch leaf {\n",
+    "\t\tTree::Leaf(let v) => { print(v); },\n",
+    "\t\tTree::Empty => { print(0); },\n",
+    "\t}\n",
+    "\tmatch word {\n",
+    "\t\tTree::Leaf(let v) => { print(v); },\n",
+    "\t\tTree::Empty => { print(\"\"); },\n",
+    "\t}\n",
+    "}\n",
+);
+
+/// A string literal's ESCAPES mean the same thing on both backends.
+///
+/// S1a wrote a literal's source text straight into a Rust literal and escaped
+/// its backslashes, so `print("a\nb")` printed `a\nb` natively against the JS
+/// backend's two lines — and because no program in the accepted corpus carried
+/// an escape, the differential never saw it. This is that class, as a probe,
+/// covering each of the six escapes vilan recognises, an unknown escape (which
+/// keeps both characters), and a literal backslash.
+#[test]
+fn a_string_literals_escapes_mean_the_same_thing_on_both_backends() {
+    let staged = stage();
+    let probe = staged.join("native_probe_escapes.vl");
+    std::fs::write(&probe, ESCAPE_PROBE).expect("write the probe program");
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "native_probe_escapes.vl"])
+        .output()
+        .expect("run the escape probe natively");
+    assert!(
+        native.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    let javascript = vilan(&staged)
+        .args(["run", "native_probe_escapes.vl"])
+        .output()
+        .expect("run the escape probe on the JS backend");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        String::from_utf8_lossy(&javascript.stdout),
+        "the two backends disagree about a string literal's escapes"
+    );
+    // Non-vacuous by construction: the JS side really does interpret them.
+    assert!(
+        String::from_utf8_lossy(&javascript.stdout).contains("a\nb"),
+        "the probe's `\\n` must be a real newline on the JS side: {:?}",
+        String::from_utf8_lossy(&javascript.stdout)
+    );
+}
+
+const ESCAPE_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(\"a\\nb\");\n",
+    "\tprint(\"tab\\there\");\n",
+    "\tprint(\"cr\\rhere\");\n",
+    "\tprint(\"quote\\\"q\");\n",
+    "\tprint(\"back\\\\slash\");\n",
+    "\tprint(\"unknown\\u0041escape\");\n",
+    "}\n",
+);
+
+/// C15's measurement, as a pin rather than as a number in a report: the
+/// emitter's boxed-binding count is REACHABLE, and it is zero over a program
+/// with no mutably-captured binding and non-zero over one that has.
+///
+/// R3 ruled that v1 boxes every mutably-captured binding and that the count is
+/// what pays for the by-value capture optimisation later. A measurement nothing
+/// holds to a shape is a measurement that silently stops being taken.
+#[test]
+fn the_boxed_binding_count_is_reachable_and_counts_the_right_bindings() {
+    let staged = stage();
+    let none = staged.join("native_probe_boxed_none.vl");
+    std::fs::write(
+        &none,
+        "import std::io::print;\n\nfun main() {\n\tlet n = 1;\n\tlet f = || { n + 1 };\n\tprint(f());\n}\n",
+    )
+    .expect("write the probe");
+    let some = staged.join("native_probe_boxed_some.vl");
+    std::fs::write(
+        &some,
+        "import std::io::print;\n\nfun main() {\n\tmut n = 1;\n\tlet bump = || { n = n + 1; };\n\tbump();\n\tbump();\n\tprint(n);\n}\n",
+    )
+    .expect("write the probe");
+
+    let count = |program: &str| {
+        let output = vilan(&staged)
+            .env("VILAN_NATIVE_REPORT_BOXED", "1")
+            .args(["build", "--backend", "rust", program])
+            .output()
+            .expect("build the probe");
+        assert!(
+            output.status.success(),
+            "{program}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        text.lines()
+            .find_map(|line| line.strip_prefix("vilan-native: boxed-bindings="))
+            .unwrap_or_else(|| panic!("{program} printed no boxed-bindings line:\n{text}"))
+            .trim()
+            .parse::<usize>()
+            .expect("a count")
+    };
+    assert_eq!(
+        count("native_probe_boxed_none.vl"),
+        0,
+        "a binding a closure only READS is not boxed"
+    );
+    assert_eq!(
+        count("native_probe_boxed_some.vl"),
+        1,
+        "a binding a closure WRITES is boxed (spec §6.9: a closure captures the binding)"
     );
 }
 
