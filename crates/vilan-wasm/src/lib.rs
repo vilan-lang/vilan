@@ -143,6 +143,14 @@ pub struct CompletionItem {
     /// The import an auto-import candidate adds when accepted (E54c), in the
     /// LIVE text's coordinates.
     pub import_edit: Option<ImportEdit>,
+    /// What the page should MATCH the typed prefix against (E211) — the label,
+    /// stated rather than left to the host's own word rules, which is what a
+    /// hyphenated candidate (`stroke-width`, `--card-gap`) needs.
+    pub filter_text: Option<String>,
+    /// The prefix this candidate REPLACES when it is accepted (E211), in the
+    /// LIVE text's coordinates — the same span the language server sends as a
+    /// `textEdit` range, so the two front-ends filter and insert alike.
+    pub replace: Option<ImportEdit>,
 }
 
 /// A text edit that adds an import: the range to replace (zero-based line,
@@ -211,6 +219,20 @@ impl CompletionItem {
                 text: auto_import.edit_replacement,
             }
         });
+        // E211: the prefix being replaced, in the page's coordinates. Reuses
+        // `ImportEdit`'s shape because it is the same thing — a range plus the
+        // text that goes in it — and the text here is the insertion above, so
+        // a page that applies the range cannot drop a call shape or a snippet.
+        let replace = completion.replace_span.map(|span| {
+            let (start, end) = live.range(&span);
+            ImportEdit {
+                line: start.line,
+                character: start.character,
+                end_line: end.line,
+                end_character: end.character,
+                text: insert.clone(),
+            }
+        });
         CompletionItem {
             label: completion.label,
             kind,
@@ -220,6 +242,8 @@ impl CompletionItem {
             is_snippet,
             boost,
             import_edit,
+            filter_text: completion.filter_text,
+            replace,
         }
     }
 }
@@ -1014,6 +1038,13 @@ mod bindings {
         pub import_end_line: Option<u32>,
         pub import_end_character: Option<u32>,
         pub import_text: Option<String>,
+        /// E211: what to filter by, and the prefix accepting this candidate
+        /// replaces — flat for the same reason the import edit is.
+        pub filter_text: Option<String>,
+        pub replace_line: Option<u32>,
+        pub replace_character: Option<u32>,
+        pub replace_end_line: Option<u32>,
+        pub replace_end_character: Option<u32>,
     }
 
     /// Completion candidates at `line`/`character` (zero-based line, UTF-16
@@ -1026,6 +1057,7 @@ mod bindings {
             .into_iter()
             .map(|item| {
                 let edit = item.import_edit;
+                let replace = item.replace;
                 CompletionItem {
                     label: item.label,
                     kind: item.kind.to_string(),
@@ -1039,6 +1071,11 @@ mod bindings {
                     import_end_line: edit.as_ref().map(|edit| edit.end_line),
                     import_end_character: edit.as_ref().map(|edit| edit.end_character),
                     import_text: edit.map(|edit| edit.text),
+                    filter_text: item.filter_text,
+                    replace_line: replace.as_ref().map(|range| range.line),
+                    replace_character: replace.as_ref().map(|range| range.character),
+                    replace_end_line: replace.as_ref().map(|range| range.end_line),
+                    replace_end_character: replace.as_ref().map(|range| range.end_character),
                 }
             })
             .collect()

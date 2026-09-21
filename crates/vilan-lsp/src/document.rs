@@ -23,7 +23,8 @@ use vilan_core::{
 
 use crate::keystroke::{
     Anchor, CursorContext, LandedSnapshot, ModuleSymbols, SymbolEntry, SymbolIndex, Verdict,
-    candidates, cursor_context, module_name_of, shape_stamp, sort_and_deoverlap, syntax_tokens_in,
+    candidates, cursor_context, is_identifier_char, module_name_of, shape_stamp,
+    sort_and_deoverlap, syntax_tokens_in,
 };
 use crate::line_index::LineIndex;
 use crate::references::{Definition, DefinitionKind, ReferenceIndex};
@@ -2902,6 +2903,104 @@ impl Document {
         found
     }
 
+    /// The edits the server makes in answer to a character the author just
+    /// typed (`textDocument/onTypeFormatting`) — today exactly one: the `>`
+    /// that closes a `<` opened in TYPE position (E202, R9 at Order 39's GO).
+    ///
+    /// **Why the server and not `autoClosingPairs`.** `<` is also the
+    /// comparison operator, and a static language-configuration pair cannot
+    /// tell `List<` from `a < b`: its only filter is `notIn: [string, comment]`,
+    /// so pairing `<` there would grow a `>` in every comparison anybody types.
+    /// The server knows which is which, because it knows what the names mean.
+    ///
+    /// The rule, and it is deliberately narrow — a wrong `>` is worse than a
+    /// missing one, since the author has to delete a character they did not
+    /// type, in the middle of an expression:
+    ///
+    /// 1. The typed character is `<`, and the position is code (not inside a
+    ///    string body or after a `//` on the same line).
+    /// 2. The `<` sits IMMEDIATELY after an identifier — no space between. A
+    ///    comparison is written with spaces by every formatter this project
+    ///    ships, and `vilan fmt` is not optional here.
+    /// 3. That identifier either names a generic-capable declaration the
+    ///    analysis knows (a struct, enum or trait — `List<`, `Map<`,
+    ///    `Option<`, or a generic function's turbofish `echo<`), or it is a
+    ///    declaration's own name being given a type-parameter list, which is
+    ///    the token before it: `fun`, `struct`, `enum`, `trait`, `impl` or
+    ///    `type`.
+    ///
+    /// A binding, a literal and a bare word the analysis has never seen fail
+    /// all three readings and get nothing, which is the answer for `a < b`,
+    /// `count<10` and a name mid-rename. The retained program is the one the
+    /// last analysis produced, so this keeps working while the buffer is
+    /// mid-edit — the whole point of asking the server.
+    ///
+    /// The span is zero-width at `offset` (just past the `<`), so the client
+    /// inserts and leaves the caret where it is, which is what an auto-closing
+    /// pair does.
+    pub fn on_type_edits(&self, offset: usize, typed: &str) -> Vec<(Span, String)> {
+        if typed != "<" || !self.opens_a_generic_list(offset) {
+            return Vec::new();
+        }
+        vec![(Span::from(offset..offset), ">".to_string())]
+    }
+
+    /// Whether the `<` ending at `offset` opens a generic argument or
+    /// type-parameter list — [`on_type_edits`](Self::on_type_edits)'s rule.
+    fn opens_a_generic_list(&self, offset: usize) -> bool {
+        let text = &self.text;
+        let Some(open) = offset.checked_sub(1) else {
+            return false;
+        };
+        if text.as_bytes().get(open).copied() != Some(b'<') {
+            return false;
+        }
+        if cursor_context(text, open) == CursorContext::None {
+            return false;
+        }
+        // The identifier the `<` is glued to.
+        let head = &text[..open];
+        let name_start = head
+            .rfind(|character: char| !is_identifier_char(character))
+            .map_or(0, |position| {
+                position + head[position..].chars().next().map_or(1, char::len_utf8)
+            });
+        let name = &head[name_start..];
+        if name.is_empty() {
+            return false;
+        }
+        // A declaration's own type-parameter list: `fun name<`, `struct Name<`,
+        // and the three beside them. Read before the program, because the
+        // declaration being written is by definition not in it yet.
+        let before = head[..name_start].trim_end();
+        let keyword_start = before
+            .rfind(|character: char| !is_identifier_char(character))
+            .map_or(0, |position| {
+                position + before[position..].chars().next().map_or(1, char::len_utf8)
+            });
+        if matches!(
+            &before[keyword_start..],
+            "fun" | "struct" | "enum" | "trait" | "impl" | "type"
+        ) {
+            return true;
+        }
+        let Some(program) = self.program.as_ref() else {
+            return false;
+        };
+        program
+            .structs
+            .values()
+            .any(|structure| structure.name == name)
+            || program
+                .enums
+                .values()
+                .any(|enumeration| enumeration.name == name)
+            || program.traits.values().any(|trait_| trait_.name == name)
+            || program.functions.values().any(|function| {
+                function.name == name && !function.generic_parameter_constraint_ids.is_empty()
+            })
+    }
+
     pub fn hover(&self, offset: usize) -> Option<String> {
         // A keyword under the cursor: its one-line meaning + a book link. This
         // is purely lexical, so it works even when analysis produced no program
@@ -2916,6 +3015,14 @@ impl Document {
         }
         // A module directory with no body: what it HOLDS (E152).
         if let Some(rendered) = self.namespace_hover(program, offset) {
+            return Some(rendered);
+        }
+        // A field's own DECLARATION, or the field name in a struct
+        // initializer (E204): `x: i32` and `x`'s `///`. Asked before the type
+        // reference below, which would otherwise answer both positions with the
+        // enclosing struct's whole block — the answer for the type's NAME, and
+        // a restatement of the screen for a caret on one of its fields.
+        if let Some(rendered) = self.field_declaration_hover(program, offset) {
             return Some(rendered);
         }
         // A type name in type position: the full declaration when known.
@@ -2938,11 +3045,22 @@ impl Document {
             return Some(rendered);
         }
         let id = self.entity_at(offset)?;
-        // A function (or requirement-carrying binding): the full signature.
+        // A function (or requirement-carrying binding): the full signature —
+        // and, at a GENERIC call site, the signature that call reached under it
+        // (E206). The site's label is keyed by the id under the cursor, so no
+        // reverse index and no second resolution: the entity that answered
+        // `function_target` is the entity the analyzer keyed.
         if let Some(target) = self.analysis(program).function_target(id) {
             let requirement = self.platform_requirements.get(&target).cloned();
             if let Some(declaration) = program.declaration_labels.get(&target) {
-                return Some(self.compose_hover(program, target, declaration, requirement));
+                let resolved = program.call_signature_labels.get(&id);
+                return Some(self.compose_declaration_hover(
+                    program,
+                    target,
+                    declaration,
+                    requirement,
+                    resolved.map(String::as_str),
+                ));
             }
         }
         // A struct/enum name in value position (a constructor, a variant).
@@ -3173,12 +3291,44 @@ impl Document {
         declaration: &str,
         requirement: Option<String>,
     ) -> String {
-        let declaration = if program.async_functions.contains(&declaration_id)
-            && !declaration.starts_with("async ")
-        {
-            format!("async {declaration}")
-        } else {
-            declaration.to_string()
+        self.compose_declaration_hover(program, declaration_id, declaration, requirement, None)
+    }
+
+    /// [`compose_hover`] with E206's second line: the same signature rendered
+    /// under the SUBSTITUTION this call site solved
+    /// (`Program::call_signature_labels`).
+    ///
+    /// Both lines go in ONE fenced `vilan` block with a blank line between them
+    /// (the owner's own spelling of the ask), rather than two blocks under a
+    /// caption: they are two readings of one signature, and a reader comparing
+    /// them wants them column-aligned in the same monospace run. The declared
+    /// line comes first because it is the thing that exists in the file; the
+    /// computed one answers "and which function did THIS call reach".
+    ///
+    /// `resolved` is `None` wherever the site added nothing — a non-generic
+    /// callee, a hover on the declaration itself, a call inside another generic
+    /// body whose parameters are all still open — and then this is exactly
+    /// [`compose_hover`]. The analyzer decides that, by writing no entry;
+    /// nothing here re-derives it.
+    fn compose_declaration_hover(
+        &self,
+        program: &Program,
+        declaration_id: Id,
+        declaration: &str,
+        requirement: Option<String>,
+        resolved: Option<&str>,
+    ) -> String {
+        let asyncify = |signature: &str| {
+            if program.async_functions.contains(&declaration_id) && !signature.starts_with("async ")
+            {
+                format!("async {signature}")
+            } else {
+                signature.to_string()
+            }
+        };
+        let declaration = match resolved {
+            Some(resolved) => format!("{}\n\n{}", asyncify(declaration), asyncify(resolved)),
+            None => asyncify(declaration),
         };
         let mut out = format!("```vilan\n{declaration}\n```");
         if let Some(docs) = self.analysis(program).doc_comment_of(declaration_id) {
@@ -3320,7 +3470,95 @@ impl Document {
         }
         let name = self.analyzed_text().get(member_span.into_range())?;
         let type_label = self.analysis(program).hover_label(id)?;
-        Some(format!("```vilan\n{name}: {type_label}\n```"))
+        let mut out = format!("```vilan\n{name}: {type_label}\n```");
+        // E204: a FIELD's own `///`, where the read resolves to one. A field
+        // carries no entity id, so `doc_comment_of` has nothing to look up —
+        // `Expr::Field`'s (struct, index) key is what names the declaration,
+        // and `doc_comment_at` reads the block above its name span in the
+        // DECLARING source, which is the same read every other doc consumer
+        // performs.
+        if let Some(docs) = self.field_docs(program, id) {
+            out.push_str("\n\n");
+            out.push_str(&docs);
+        }
+        Some(out)
+    }
+
+    /// The `///` block above the struct field `id` reads, or `None` when `id`
+    /// is not a field read or the field carries no doc (E204).
+    fn field_docs(&self, program: &Program, id: Id) -> Option<String> {
+        let Expr::Field(_, struct_id, index) = program.entity_map.get(&id)? else {
+            return None;
+        };
+        self.struct_field_docs(program, *struct_id, *index)
+    }
+
+    /// The `///` block above the `index`-th field of `struct_id` (E204) — the
+    /// one read every field-doc consumer shares, hover and completion alike.
+    fn struct_field_docs(&self, program: &Program, struct_id: Id, index: usize) -> Option<String> {
+        let field = program.structs.get(&struct_id)?.fields.get(index)?;
+        let source = program.source_of(struct_id)?;
+        self.analysis(program)
+            .doc_comment_at(source, field.name_span.into_range().start)
+    }
+
+    /// The hover for a field's DECLARATION or for the field name in a struct
+    /// INITIALIZER (E204): the fenced `name: T` a field read answers, plus the
+    /// field's own `///`.
+    ///
+    /// Both positions used to fall through to the enclosing struct's block —
+    /// `struct Point { x: i32, y: i32 }`, the whole declaration, for a caret on
+    /// one field of it. That is the answer for the struct's NAME and a
+    /// restatement of what is on screen for a field: the caret is on `x`, and
+    /// what a reader wants is `x`'s type and `x`'s sentence. The struct block
+    /// stays exactly where it belongs, on the type's own name.
+    ///
+    /// Matched by SPAN against two records the analyzer already keeps, rather
+    /// than by re-reading the text: the struct's own `Field::name_span` for a
+    /// declaration, and `struct_initializer_field_spans` — the use-site table
+    /// B-rename needed, `(file, span, struct, index)` — for an initializer key.
+    /// Both answer the same `(struct, index)` pair, which is why the two
+    /// positions are one function and cannot drift apart.
+    fn field_declaration_hover(&self, program: &Program, offset: usize) -> Option<String> {
+        let (struct_id, index) = self.field_at_offset(program, offset)?;
+        let structure = program.structs.get(&struct_id)?;
+        let field = structure.fields.get(index)?;
+        let type_label = self
+            .analysis(program)
+            .field_type_label(struct_id, index, field.name)?;
+        let mut out = format!("```vilan\n{}: {type_label}\n```", field.name);
+        if let Some(docs) = self.struct_field_docs(program, struct_id, index) {
+            out.push_str("\n\n");
+            out.push_str(&docs);
+        }
+        Some(out)
+    }
+
+    /// The struct field whose DECLARATION name span, or whose initializer KEY
+    /// span, contains `offset` in this document (E204). Entry-file only, like
+    /// every other span-containment answer here: `offset` is an analyzed-space
+    /// offset into this buffer.
+    fn field_at_offset(&self, program: &Program, offset: usize) -> Option<(Id, usize)> {
+        let contains = |span: Span| {
+            let range = span.into_range();
+            range.start <= offset && offset < range.end
+        };
+        for (struct_id, structure) in &program.structs {
+            if program.source_of(*struct_id) != Some(SourceId(0)) {
+                continue;
+            }
+            for (index, field) in structure.fields.iter().enumerate() {
+                if contains(field.name_span) {
+                    return Some((*struct_id, index));
+                }
+            }
+        }
+        for (source, span, struct_id, index) in &program.struct_initializer_field_spans {
+            if *source == SourceId(0) && contains(*span) {
+                return Some((*struct_id, *index));
+            }
+        }
+        None
     }
 
     /// The struct/enum definition an entity names in VALUE position — a
@@ -13493,6 +13731,311 @@ pub(crate) mod tests {
         assert_eq!(hover, "```vilan\nx: i32\n```");
     }
 
+    // --- E211: every candidate states the prefix it replaces ----------------
+
+    /// The text `src` analyzes as, and the candidates at its `¦` marker.
+    fn completion_replacements(src: &str) -> (String, Vec<Completion>) {
+        let offset = src.find('¦').expect("test source needs a `¦` marker");
+        let text = src.replace('¦', "");
+        let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
+        let _ = offset;
+        (text.clone(), {
+            let offset = src.find('¦').expect("marker");
+            document.completion(offset)
+        })
+    }
+
+    #[test]
+    fn e211_a_hyphenated_attribute_prefix_is_replaced_whole() {
+        // E194's own position. The server now STATES that `stroke-w` is the
+        // prefix, so a client with no `wordPattern` of its own — every LSP
+        // client but the one this repo configures — filters against it rather
+        // than against the `w` its default word rule reads.
+        let source = format!("{ELEMENT_HEAD_PRELUDE}fun main() {{\n\t<svg stroke-w¦></svg>\n}}\n");
+        let (text, items) = completion_replacements(&source);
+        let candidate = items
+            .iter()
+            .find(|item| item.label == "stroke-width")
+            .expect("`stroke-width` is offered");
+        let span = candidate.replace_span.expect("a replace span").into_range();
+        assert_eq!(
+            &text[span], "stroke-w",
+            "the hyphen is inside the prefix, which is the whole of E194"
+        );
+        assert_eq!(candidate.filter_text.as_deref(), Some("stroke-width"));
+    }
+
+    #[test]
+    fn e211_a_css_property_prefix_is_replaced_whole() {
+        let source = format!(
+            "{CSS_BLOCK_PRELUDE}fun main() {{\n\tlet card = css {{\n\t\tflex-dir¦\n\t}};\n}}\n"
+        );
+        let (text, items) = completion_replacements(&source);
+        let candidate = items
+            .iter()
+            .find(|item| item.label == "flex-direction")
+            .expect("`flex-direction` is offered at a property position");
+        let span = candidate.replace_span.expect("a replace span").into_range();
+        assert_eq!(&text[span], "flex-dir");
+        assert_eq!(candidate.filter_text.as_deref(), Some("flex-direction"));
+    }
+
+    #[test]
+    fn e211_an_ordinary_identifier_prefix_stops_at_the_word() {
+        // In CODE a `-` is subtraction and no identifier carries one, so the
+        // hyphenated rule stays out of expression position: `b` is the prefix
+        // of `a-b`, not `a-b`.
+        let source = "fun main() {\n\tlet alpha = 1;\n\tlet _c = 1-al¦\n}\n";
+        let (text, items) = completion_replacements(source);
+        let candidate = items
+            .iter()
+            .find(|item| item.label == "alpha")
+            .expect("`alpha` is in scope");
+        let span = candidate.replace_span.expect("a replace span").into_range();
+        assert_eq!(&text[span], "al");
+    }
+
+    #[test]
+    fn e211_every_candidate_of_a_request_carries_both_fields() {
+        // The stamp is a property of the REQUEST, so it is on every candidate
+        // of every context — not only the hyphenated ones that needed it.
+        for source in [
+            "fun main() {\n\tlet name = \"vilan\";\n\tlet _n = name.le¦\n}\n",
+            "import std::io::pri¦\n",
+            "fun main() {\n\tlet _x = pri¦\n}\n",
+        ] {
+            let (_, items) = completion_replacements(source);
+            assert!(!items.is_empty(), "candidates at {source:?}");
+            for item in &items {
+                assert!(
+                    item.replace_span.is_some() && item.filter_text.is_some(),
+                    "{:?} at {source:?} carries neither",
+                    item.label
+                );
+                assert_eq!(item.filter_text.as_deref(), Some(item.label.as_str()));
+            }
+        }
+    }
+
+    // --- E202: the server places a generic `<`'s `>` ------------------------
+
+    /// The `>` the server would insert for a `<` just typed at the marker, or
+    /// `None` when it declines. The marker stands where the caret is — one past
+    /// the `<` — which is the position `onTypeFormatting` sends.
+    fn closing_angle_at(src: &str) -> Option<usize> {
+        let offset = src.find('¦').expect("test source needs a `¦` marker");
+        let text = src.replace('¦', "");
+        let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
+        let edits = document.on_type_edits(offset, "<");
+        assert!(edits.len() <= 1, "one edit or none: {edits:?}");
+        edits.first().map(|(span, replacement)| {
+            assert_eq!(replacement, ">");
+            assert_eq!(
+                span.into_range(),
+                offset..offset,
+                "a zero-width insertion at the caret"
+            );
+            span.into_range().start
+        })
+    }
+
+    #[test]
+    fn e202_a_generic_type_name_gets_its_closing_angle() {
+        for source in [
+            // A std container, in an annotation and in a turbofish-style call.
+            "fun main() {\n\tlet xs: List<¦\n}\n",
+            "fun main() {\n\tlet m: Map<¦\n}\n",
+            "fun main() {\n\tlet o: Option<¦\n}\n",
+            // A user struct and a user enum.
+            "struct Holder<type T> {\n\tvalue: T,\n}\n\nfun main() {\n\tlet h: Holder<¦\n}\n",
+            "enum Either<type L, type R> {\n\tLeft(L),\n\tRight(R),\n}\n\nfun main() {\n\tlet e: Either<¦\n}\n",
+            // A generic function's own written argument list.
+            "fun echo<T>(value: T): T {\n\tvalue\n}\n\nfun main() {\n\tlet _s = echo<¦\n}\n",
+            // A `::` PATH head (E202's third owed pin): `Option<i32>::Some`
+            // opens its argument list on the enum's own name.
+            "import std::option::Option::{ self, Some, None };\n\nfun main() {\n\tlet _v = Option<¦\n}\n",
+            // A DECLARATION's type-parameter list — decided by the keyword
+            // before the name, because the declaration being written is not in
+            // the analyzed program yet.
+            "fun pair<¦\n",
+            "struct Pair<¦\n",
+            "enum Choice<¦\n",
+            "trait Shaped<¦\n",
+            "impl Holder<¦\n",
+        ] {
+            assert!(
+                closing_angle_at(source).is_some(),
+                "a generic `<` must close itself: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn e202_a_comparison_gets_nothing() {
+        // The hazard the whole item turns on. Every one of these is a `<` that
+        // must stay a `<`.
+        for source in [
+            // The spaced comparison `vilan fmt` writes.
+            "fun main() {\n\tlet a = 1;\n\tlet b = 2;\n\tlet _c = a <¦\n}\n",
+            // The item's own exhibit, in the position it is written in.
+            "fun main() {\n\tlet a = 1;\n\tlet b = 2;\n\tif a <¦\n}\n",
+            // And the unspaced one somebody types.
+            "fun main() {\n\tlet a = 1;\n\tlet _c = a<¦\n}\n",
+            // A literal, and a name the analysis has never seen.
+            "fun main() {\n\tlet _c = 10<¦\n}\n",
+            "fun main() {\n\tlet _c = whatever<¦\n}\n",
+            // A `<` inside a string body and after a `//` are not code.
+            "fun main() {\n\tlet _s = \"a <¦\n}\n",
+            "fun main() {\n\t// List<¦\n}\n",
+        ] {
+            assert_eq!(
+                closing_angle_at(source),
+                None,
+                "this `<` must stay a `<`: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn e202_only_a_typed_angle_asks_for_an_edit() {
+        // The handler is registered for `<` alone, and the document agrees:
+        // every other character it could be handed answers with no edits.
+        let text = "fun main() {\n\tlet xs: List<\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let offset = text.find('<').expect("the angle") + 1;
+        assert!(!document.on_type_edits(offset, "<").is_empty());
+        for typed in [">", "(", "{", "\"", "`", "a"] {
+            assert!(
+                document.on_type_edits(offset, typed).is_empty(),
+                "{typed:?} must ask for nothing"
+            );
+        }
+    }
+
+    // --- E204: a field's `///` reaches every field position -----------------
+    //
+    // The census, measured before the fix (the item's own ask): a `///` above a
+    // field PARSES, `vilan fmt` keeps it byte for byte, and ONE consumer read
+    // it — the struct-initializer completion's `documentation`
+    // (`struct_initializer_completion_details_the_field_type_and_doc`, E160).
+    // Everything else either dropped it or answered the wrong thing:
+    //
+    //   - hover on a field READ (`p.x`) gave `x: i32` and no doc;
+    //   - hover on the field's DECLARATION gave the enclosing struct's WHOLE
+    //     block — the answer for the type's name, restated for a caret on one
+    //     field of it;
+    //   - hover on an initializer's field KEY (`Point { x = … }`) gave the same
+    //     struct block;
+    //   - MEMBER completion after `p.` offered a bare label: no detail, no doc,
+    //     while the initializer position two lines away offered both.
+    //
+    // Three census rows have no consumer to fix rather than a broken one, and
+    // are recorded here because a reader will look: there is no docs GENERATOR
+    // in this tree (no `vilan doc`; the book is hand-written markdown, gated by
+    // `-p vilan-core --test docs`), the playground exposes completion and no
+    // hover at all, and a PAYLOAD position of an enum variant is unnamed — the
+    // variant itself takes a `///` and compiles, a position inside its
+    // parentheses has no name to hang one on, and vilan has no tuple structs.
+
+    /// A two-field struct whose first field carries a two-paragraph `///`.
+    const DOCUMENTED_FIELDS: &str = "struct Point {\n\t/// The abscissa.\n\t///\n\t/// Measured from the left edge.\n\tx: i32,\n\ty: i32,\n}\n\nfun main() {\n\tlet p = Point { x = 1, y = 2 };\n\tlet _n = p.x + p.y;\n}\n";
+
+    #[test]
+    fn e204_hover_on_a_field_read_carries_the_fields_doc() {
+        let hover = hover_at_marker(&DOCUMENTED_FIELDS.replace("p.x +", "p.¦x +"), '¦')
+            .expect("hover on the field read");
+        assert_eq!(
+            hover, "```vilan\nx: i32\n```\n\nThe abscissa.\n\nMeasured from the left edge.",
+            "the whole `///` block, as a function's hover shows a function's"
+        );
+    }
+
+    #[test]
+    fn e204_hover_on_a_field_declaration_answers_the_field_and_not_the_struct() {
+        let hover = hover_at_marker(&DOCUMENTED_FIELDS.replace("\tx: i32,", "\t¦x: i32,"), '¦')
+            .expect("hover on the field declaration");
+        assert!(hover.starts_with("```vilan\nx: i32\n```"), "{hover}");
+        assert!(hover.contains("The abscissa."), "{hover}");
+        assert!(
+            !hover.contains("struct Point"),
+            "the struct's block is the answer for the struct's NAME: {hover}"
+        );
+    }
+
+    #[test]
+    fn e204_hover_on_an_initializer_field_key_answers_the_field() {
+        let hover = hover_at_marker(&DOCUMENTED_FIELDS.replace("{ x = 1", "{ ¦x = 1"), '¦')
+            .expect("hover on the initializer key");
+        assert!(hover.starts_with("```vilan\nx: i32\n```"), "{hover}");
+        assert!(hover.contains("The abscissa."), "{hover}");
+        assert!(!hover.contains("struct Point"), "{hover}");
+    }
+
+    #[test]
+    fn e204_the_struct_name_still_hovers_its_whole_block() {
+        // The other half of the rule: nothing above moved the struct block off
+        // the position it belongs to.
+        let hover = hover_at_marker(
+            &DOCUMENTED_FIELDS.replace("struct Point", "struct ¦Point"),
+            '¦',
+        )
+        .expect("hover on the struct name");
+        assert!(hover.contains("struct Point {"), "{hover}");
+        assert!(hover.contains("\tx: i32,"), "{hover}");
+    }
+
+    #[test]
+    fn e204_an_undocumented_field_hovers_exactly_as_before() {
+        let hover = hover_at_marker(&DOCUMENTED_FIELDS.replace("p.y;", "p.¦y;"), '¦')
+            .expect("hover on the undocumented field");
+        assert_eq!(hover, "```vilan\ny: i32\n```");
+    }
+
+    #[test]
+    fn e204_member_completion_carries_the_field_type_and_its_first_paragraph() {
+        let items = completion_items_at_marker(
+            &DOCUMENTED_FIELDS.replace("let _n = p.x + p.y;", "let _n = p.¦"),
+            '¦',
+        );
+        let x = items
+            .iter()
+            .find(|item| item.label == "x")
+            .expect("`x` is offered after the dot");
+        assert_eq!(x.detail.as_deref(), Some("i32"));
+        assert_eq!(
+            x.documentation.as_deref(),
+            Some("The abscissa."),
+            "the FIRST paragraph, which is the rule a function's completion follows"
+        );
+        let y = items
+            .iter()
+            .find(|item| item.label == "y")
+            .expect("`y` is offered too");
+        assert_eq!(y.detail.as_deref(), Some("i32"));
+        assert_eq!(y.documentation, None, "an undocumented field carries none");
+    }
+
+    #[test]
+    fn e204_a_derived_member_inherits_no_field_doc() {
+        // `[derive]`-generated members should inherit nothing: the doc read is
+        // anchored on the FIELD's own name span, and a generated method has no
+        // `///` above its own name.
+        let items = completion_items_at_marker(
+            "[derive(Debug)]\nstruct Point {\n\t/// The abscissa.\n\tx: i32,\n}\n\nfun main() {\n\tlet p = Point { x = 1 };\n\tlet _d = p.¦\n}\n",
+            '¦',
+        );
+        for item in &items {
+            if item.label == "x" {
+                continue;
+            }
+            assert!(
+                item.documentation.as_deref() != Some("The abscissa."),
+                "a derived member picked up the field's doc: {:?}",
+                item.label
+            );
+        }
+    }
+
     // A std METHOD name answers the method's declaration, fenced — through
     // `function_target`'s wired subject, like a user method.
     #[test]
@@ -13776,13 +14319,21 @@ pub(crate) mod tests {
     }
 
     // E9: a parameter's `context` clause renders in the hovered signature.
+    //
+    // The fixture takes `hover_at_marker` (below), not `hover_at_cursor`: the
+    // latter's `replace('|', "")` strips a closure type's own pipes too, so
+    // this pin used to analyze `fun with_owner(body: ( void) context
+    // owner_scope)` and assert a clause that could only have come from the
+    // stale per-parameter append E207 deleted — vacuous in exactly the shape it
+    // was built to guard (an E207 FIND).
     #[test]
     fn hover_renders_a_parameters_context_clause() {
-        let hover = hover_at_cursor(
-            "import std::reactive::{ owner_scope, Owner };\n\nfun with_o|wner(body: (|| void) context owner_scope) {\n\tlet _b = body;\n}\n\nfun main() {}\n",
+        let hover = hover_at_marker(
+            "import std::reactive::{ owner_scope, Owner };\n\nfun with_o¦wner(body: (|| void) context owner_scope) {\n\tlet _b = body;\n}\n\nfun main() {}\n",
+            '¦',
         )
         .expect("hover on the declaration");
-        assert!(hover.contains("context owner_scope"), "{hover}");
+        assert!(hover.contains("(|| void) context owner_scope"), "{hover}");
     }
 
     // B242: a `fun`'s DECLARED `context` clause renders in its hovered
@@ -13794,6 +14345,262 @@ pub(crate) mod tests {
         )
         .expect("hover on the declaration");
         assert!(hover.contains("context settings"), "{hover}");
+    }
+
+    // --- E207: a `context` clause renders EXACTLY ONCE ----------------------
+    //
+    // Why the two pins above did not catch the doubling: both assert
+    // `contains`, and a label reading `(|| void) context owner_scope context
+    // owner_scope` satisfies `contains("context owner_scope")` perfectly well.
+    // Every pin below COUNTS the clause instead. The defect (analyzer.rs's
+    // `function_signature_label_for`) appended
+    // `context_clause_label(parameter_contexts[parameter])` after a parameter's
+    // type label, which since B309 already prints the clause as part of the
+    // closure TYPE's own form — one written annotation, two channels.
+
+    /// [`hover_at_cursor`] with an explicit cursor marker, for the reason
+    /// [`completions_at_marker`] has one: these fixtures carry closure types,
+    /// whose `|` the default marker would claim (and `hover_at_cursor`'s
+    /// `replace('|', "")` would strip every one of them).
+    fn hover_at_marker(src: &str, marker: char) -> Option<String> {
+        let offset = src
+            .find(marker)
+            .unwrap_or_else(|| panic!("test source needs a `{marker}` cursor marker"));
+        let text = src.replace(marker, "");
+        let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
+        document.hover(offset)
+    }
+
+    // --- E206: a generic call site hovers BOTH signatures -------------------
+
+    /// The owner's own exhibit, as a fixture: a generic `Memo` with `get_or`
+    /// declared over the impl's binders, called at `UserId` /
+    /// `SignalCell<Option<User>>`.
+    fn generic_memo_fixture(call: &str) -> String {
+        format!(
+            "import std::reactive::SignalCell;\nimport std::option::Option::{{ self, Some, None }};\n\n\
+             struct UserId {{\n\tvalue: i32,\n}}\n\n\
+             struct User {{\n\tname: str,\n}}\n\n\
+             struct Memo<type K, type V> {{\n\tslot: Option<V>,\n}}\n\n\
+             impl Memo<type K, type V> {{\n\
+             \tfun get_or(self, key: K, make: || V): V {{\n\t\tmake()\n\t}}\n\
+             }}\n\n\
+             fun main() {{\n\
+             \tlet cache: Memo<UserId, SignalCell<Option<User>>> = Memo {{ slot = None }};\n\
+             \t{call}\n\
+             }}\n"
+        )
+    }
+
+    #[test]
+    fn e206_a_generic_call_hovers_the_declaration_and_the_substituted_signature() {
+        let source = generic_memo_fixture(
+            "let _held = cache.get_or¦(UserId { value = 1 }, || SignalCell::new(None));",
+        );
+        let hover = hover_at_marker(&source, '¦').expect("hover on the method call");
+        assert!(
+            hover.contains("fun get_or(self, key: K, make: || V): V"),
+            "the DECLARATION as written is the first line: {hover}"
+        );
+        assert!(
+            hover.contains("key: UserId"),
+            "and the substituted signature is the second: {hover}"
+        );
+        assert!(
+            hover.contains("SignalCell<Option<User>>"),
+            "with the impl's binders carried out: {hover}"
+        );
+        // One fenced block, the two lines separated by a blank one (the owner's
+        // spelling), and no `<K, V>` on the line where nothing is open.
+        assert_eq!(
+            hover.matches("```").count(),
+            2,
+            "exactly one fenced block: {hover}"
+        );
+        assert!(
+            hover.contains(": V\n\nfun get_or("),
+            "a blank line between the two signatures: {hover}"
+        );
+    }
+
+    #[test]
+    fn e206_a_non_generic_call_hovers_one_signature() {
+        let hover = hover_at_cursor(
+            "fun twice(x: i32): i32 {\n\tx + x\n}\n\nfun main() {\n\tlet _n = twi|ce(2);\n}\n",
+        )
+        .expect("hover on the call");
+        assert_eq!(
+            hover.matches("fun twice").count(),
+            1,
+            "nothing is substituted, so there is one line: {hover}"
+        );
+    }
+
+    #[test]
+    fn e206_the_declaration_itself_hovers_one_signature() {
+        // No site, no substitution — a generic function hovered where it is
+        // WRITTEN says what it says.
+        let source = generic_memo_fixture(
+            "let _held = cache.get_or(UserId { value = 1 }, || SignalCell::new(None));",
+        );
+        let source = source.replace("fun get_or(self", "fun get_or¦(self");
+        let hover = hover_at_marker(&source, '¦').expect("hover on the declaration");
+        assert_eq!(hover.matches("fun get_or").count(), 1, "{hover}");
+    }
+
+    #[test]
+    fn e206_a_functions_own_generic_renders_under_the_calls_bindings() {
+        let hover = hover_at_cursor(
+            "fun echo<T>(value: T): T {\n\tvalue\n}\n\nfun main() {\n\tlet _s = ec|ho(\"hi\");\n}\n",
+        )
+        .expect("hover on the call");
+        assert!(
+            hover.contains("fun echo<T>(value: T): T"),
+            "the declaration keeps its list: {hover}"
+        );
+        assert!(
+            hover.contains("fun echo(value: str): str"),
+            "and the bound parameter leaves the substituted line's list: {hover}"
+        );
+    }
+
+    #[test]
+    fn e206_an_open_parameter_stays_as_written_on_the_second_line() {
+        // A PARTIAL substitution: `pair`'s `A` is bound at the site, `B` is the
+        // caller's own still-open parameter, so it renders as written.
+        let hover = hover_at_cursor(
+            "fun pair<A, B>(left: A, right: B): A {\n\tleft\n}\n\nfun wrap<B>(right: B): i32 {\n\tpa|ir(1, right)\n}\n\nfun main() {}\n",
+        )
+        .expect("hover on the call");
+        assert!(
+            hover.contains("fun pair<B>(left: i32, right: B): i32"),
+            "the open parameter stays, the bound one goes: {hover}"
+        );
+    }
+
+    #[test]
+    fn e206_a_trait_default_renders_under_the_receivers_arguments() {
+        // `Source<T>::map` is a trait DEFAULT: the substitution comes from the
+        // receiver's own arguments rather than from the callee's list, which is
+        // the third of the three ways a signature can be generic at a site (the
+        // other two — a function's own `<T>` and an impl's binders — are pinned
+        // above).
+        let hover = hover_at_marker(
+            "import std::reactive::{ SignalCell, Source };\n\nfun main() {\n\tlet cell = SignalCell::new(2);\n\tlet _doubled = cell.map¦(|value: i32| value * 2);\n}\n",
+            '¦',
+        )
+        .expect("hover on the trait default");
+        assert!(hover.contains("fun map"), "{hover}");
+        assert!(
+            hover.matches("fun map").count() == 2,
+            "a generic trait default at a call site shows both readings: {hover}"
+        );
+        assert!(
+            hover.contains("i32"),
+            "the receiver's argument reaches the second line: {hover}"
+        );
+    }
+
+    #[test]
+    fn e206_a_clause_survives_onto_the_substituted_line() {
+        // E207's other half of the reason it had to land first: a clause on the
+        // second line comes from the substituted TYPE, so it neither doubles
+        // nor disappears.
+        let hover = hover_at_marker(
+            "import std::reactive::{ owner_scope, Owner };\n\nfun hold<T>(value: T, body: (|| void) context owner_scope): T {\n\tlet _b = body;\n\tvalue\n}\n\nfun main() {\n\tlet _n = hold¦(1, || {});\n}\n",
+            '¦',
+        )
+        .expect("hover on the call");
+        assert!(
+            hover.contains("fun hold(value: i32, body: (|| void) context owner_scope): i32"),
+            "{hover}"
+        );
+        assert_eq!(occurrences(&hover, "context owner_scope"), 2, "{hover}");
+    }
+
+    /// How many times `needle` occurs in `haystack` — the assertion E207 owes,
+    /// where `contains` is what let the bug ship.
+    fn occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
+    #[test]
+    fn e207_a_parameters_context_clause_renders_exactly_once() {
+        let hover = hover_at_marker(
+            "import std::reactive::{ owner_scope, Owner };\n\nfun with_owner¦(body: (|| void) context owner_scope) {\n\tlet _b = body;\n}\n\nfun main() {}\n",
+            '¦',
+        )
+        .expect("hover on the declaration");
+        assert_eq!(
+            occurrences(&hover, "context owner_scope"),
+            1,
+            "the clause is a property of the TYPE (B309) and prints with it: {hover}"
+        );
+    }
+
+    #[test]
+    fn e207_a_multi_context_clause_renders_exactly_once() {
+        let hover = hover_at_marker(
+            "import std::context::Context;\n\nlet a_ctx: Context<i32> = Context::new();\nlet b_ctx: Context<i32> = Context::new();\n\nfun run_both¦(body: (|| void) context (a_ctx, b_ctx)) {\n\tlet _b = body;\n}\n\nfun main() {}\n",
+            '¦',
+        )
+        .expect("hover on the declaration");
+        assert_eq!(occurrences(&hover, "context (a_ctx, b_ctx)"), 1, "{hover}");
+    }
+
+    #[test]
+    fn e207_a_declared_function_context_clause_renders_exactly_once() {
+        // B242's channel — `declared_function_contexts`, not
+        // `parameter_contexts` — asserted by count for the same reason.
+        let hover = hover_at_cursor(
+            "import std::context::Context;\n\nlet settings: Context<i32> = Context::new();\n\nfun ren|der(x: i32): i32 context settings {\n\tsettings.get() + x\n}\n\nfun main() {}\n",
+        )
+        .expect("hover on the declaration");
+        assert_eq!(occurrences(&hover, "context settings"), 1, "{hover}");
+    }
+
+    #[test]
+    fn e207_a_binding_holding_an_injected_closure_renders_its_clause_once() {
+        // The OTHER `parameter_contexts` owner: a `let` with a clause-carrying
+        // closure type. Its hover has always gone through the type's printed
+        // form alone, and the pin holds that.
+        let hover = hover_at_marker(
+            "import std::reactive::{ owner_scope, Owner };\n\nfun main() {\n\tlet held¦: (|| void) context owner_scope = || {};\n\tlet _h = held;\n}\n",
+            '¦',
+        )
+        .expect("hover on the binding");
+        assert_eq!(occurrences(&hover, "context owner_scope"), 1, "{hover}");
+    }
+
+    #[test]
+    fn e207_a_struct_field_of_closure_type_renders_its_clause_once() {
+        // A field has no declaration id in `parameter_contexts` at all (B309's
+        // record moved onto the type precisely because a field, a return and a
+        // generic argument have no owner), so this is the channel the fix keeps.
+        let hover = hover_at_marker(
+            "import std::reactive::{ owner_scope, Owner };\n\nstruct Holder {\n\tbody¦: (|| void) context owner_scope,\n}\n\nfun main() {}\n",
+            '¦',
+        )
+        .expect("hover on the field declaration");
+        assert_eq!(occurrences(&hover, "context owner_scope"), 1, "{hover}");
+    }
+
+    #[test]
+    fn e207_a_completion_detail_renders_the_clause_once() {
+        // Completion's `detail` line is the other consumer of the same label
+        // (the server has no signature-help popup — `docs/appendix/editor.md`
+        // "What it does not have" — so hover and this line are the whole of
+        // where a signature reaches a reader).
+        let items = completion_items_at_marker(
+            "import std::reactive::{ owner_scope, Owner };\n\nfun with_owner(body: (|| void) context owner_scope) {\n\tlet _b = body;\n}\n\nfun main() {\n\twith_ow¦\n}\n",
+            '¦',
+        );
+        let detail = items
+            .iter()
+            .find(|item| item.label == "with_owner")
+            .and_then(|item| item.detail.clone())
+            .expect("the candidate carries a detail line");
+        assert_eq!(occurrences(&detail, "context owner_scope"), 1, "{detail}");
     }
 
     // std is documented with `///` (user decision): hovering a std function

@@ -376,6 +376,59 @@ pub(crate) fn resolve_macro_std(std: &PackageSpec) -> Option<PackageSpec> {
     Some(crate::manifest::resolve_std(&dir))
 }
 
+/// The ONE refusal a split toolchain earns, or `None` when the toolchain is
+/// whole (B346, E212).
+///
+/// A toolchain is two packages, `std` and `macro_std`, and only the first has a
+/// discovery path a user can point at. A root carrying only `std` compiles no
+/// macro at all — not std's own derives, not a user's — so this is a fact about
+/// the configuration rather than about any file, and it is asked ONCE, before
+/// the first registration, and attributed to the entry at offset 0 so the
+/// actionable sentence is the first thing printed rather than the eleventh.
+/// [`split_toolchain_refusal`], pushed onto `diagnostics` unless the same
+/// sentence is already there.
+///
+/// One analysis can reach the registration seam twice — the load region builds
+/// the registry, and an entry expanded over a STORED world registers its own
+/// file again — and a fact about the configuration is one fact however many
+/// times it is asked. The de-duplication is by message rather than by a flag,
+/// because the two seams hold different analyzers and the message is what the
+/// reader would have seen twice.
+pub(crate) fn push_split_toolchain_refusal(std: &PackageSpec, diagnostics: &mut Vec<Error>) {
+    let Some(error) = split_toolchain_refusal(std) else {
+        return;
+    };
+    if diagnostics.iter().any(|existing| existing.msg == error.msg) {
+        return;
+    }
+    diagnostics.push(error);
+}
+
+pub(crate) fn split_toolchain_refusal(std: &PackageSpec) -> Option<Error> {
+    if resolve_macro_std(std).is_some() {
+        return None;
+    }
+    // Both paths, because "no `macro_std`" names nothing a reader can act on
+    // while "this `std`, that missing `macro_std`" names the mistake and the
+    // fix at once — and the whole mistake is WHICH `std`.
+    let (package, macro_std) = crate::manifest::split_toolchain(std)
+        .unwrap_or_else(|| (std.base_root.clone(), std.base_root.clone()));
+    Some(Error {
+        trace: Vec::new(),
+        note: None,
+        span: (0..0).into(),
+        msg: format!(
+            "the `macro_std` package was not found beside `std`: macros need the \
+             toolchain's `macro_std`, and this `std` has none — `std` resolved to `{}`, \
+             so `macro_std` was looked for at `{}`. A `std` moved away from its toolchain \
+             (a copy, a packaged std, `$VILAN_STD` pointing outside the checkout) is half \
+             a toolchain: point it at a `std` whose own directory has `macro_std` beside it",
+            package.display(),
+            macro_std.display(),
+        ),
+    })
+}
+
 /// The top-level `macro fun`s of a file, with each definition's full span.
 fn macro_funs<'a, 'src>(nodes: &'a NodeList<'src>) -> Vec<(&'a Func<'src>, Span)> {
     nodes
@@ -466,27 +519,19 @@ pub(crate) fn register_file(
         .map(|(_, span)| *span)
         .or_else(|| blocks.first().map(|(_, span)| *span))
         .unwrap_or_else(|| (0..0).into());
+    let _ = first_span;
     let Some(macro_std) = resolve_macro_std(std) else {
-        // B346: a `std` copied, packaged or cached away from its own tree
-        // resolves perfectly and arrives with no `macro_std` behind it, and the
-        // sentence this used to end on named neither half. Both paths, so the
-        // reader can see which `std` won and where its sibling was expected.
-        let (package, macro_std) = crate::manifest::split_toolchain(std)
-            .unwrap_or_else(|| (std.base_root.clone(), std.base_root.clone()));
-        diagnostics.push(Error {
-            trace: Vec::new(),
-            note: None,
-            span: first_span,
-            msg: format!(
-                "the `macro_std` package was not found beside `std`: macros need the \
-                 toolchain's `macro_std`, and this `std` has none — `std` resolved to `{}`, \
-                 so `macro_std` was looked for at `{}`. A `std` moved away from its toolchain \
-                 (a copy, a packaged std, `$VILAN_STD` pointing outside the checkout) is half \
-                 a toolchain: point it at a `std` whose own directory has `macro_std` beside it",
-                package.display(),
-                macro_std.display(),
-            ),
-        });
+        // E212: SILENT here, deliberately. B346's refusal used to be pushed
+        // from this arm, which runs once per macro-DEFINING file — and std
+        // declares macros in six of its own modules, so a split toolchain
+        // produced ten copies of one sentence, each anchored on a `macro fun`
+        // in a file the reader did not write and cannot fix, after a first
+        // diagnostic that blamed their own code for the consequence.
+        //
+        // The refusal is the CALLER's now, once, against the entry
+        // ([`split_toolchain_refusal`]): a half toolchain is a fact about the
+        // configuration, not about any one file that happens to define a
+        // macro. This arm stays as the guard it always was.
         return;
     };
 

@@ -350,3 +350,131 @@ fn the_word_pattern_keeps_every_word_the_default_read() {
     // not seen — and it is the price of the hyphen, named rather than hidden.
     assert_eq!(word_at_end("let d = a-b").as_deref(), Some("a-b"));
 }
+
+// --- E202 / E203: the pairs the configuration declares -----------------------
+
+/// The language configuration, as node parses it, printed as JSON so a pin can
+/// assert over the whole list rather than one field.
+fn language_configuration() -> String {
+    json_field(
+        &extension_dir().join("language-configuration.json"),
+        "JSON.stringify(JSON.parse(require('fs').readFileSync(process.env.VILAN_JSON, 'utf8')))",
+    )
+}
+
+/// E202 (R9): `<`/`>` is a SURROUNDING pair — select a type name, type `<`, and
+/// the selection is wrapped — and deliberately NOT an auto-closing one.
+///
+/// The two are different questions. Surrounding a SELECTION is unambiguous:
+/// there is no reading of "wrap this in `<>`" that means a comparison. Typing
+/// `<` on its own is ambiguous, and a static auto-closing pair cannot tell
+/// `List<` from `a < b` (its only filter is `notIn: [string, comment]`), so
+/// that half is the SERVER's — `onTypeFormatting`, which knows which names are
+/// types. A `<` entry here would grow a `>` in every comparison anybody typed.
+///
+/// **What the server half costs, written down because the pin cannot hold it.**
+/// VS Code types OVER a closing character only when it auto-inserted that
+/// character itself (`editor.autoClosingOvertype: "auto"`), and an edit the
+/// server returned is not that — so typing the `>` of `List<i32>` by hand
+/// yields `List<i32>>`, and an `onTypeFormatting` answer cannot fix it because
+/// a text edit cannot move the caret past a character it leaves in place
+/// (`List<List<i32>>` needs the caret between the two, not before them). The
+/// only configuration that buys overtype is an `autoClosingPairs` entry for
+/// `<`, which is the hazard this pin exists to keep out. Tracker E202's owed
+/// "typing `>` over the placed one does not double it" is therefore NOT
+/// pinnable by configuration and is reported as an open question, with a
+/// client-side `type` override in `extension.ts` — which can move the caret —
+/// as the candidate follow-up.
+#[test]
+fn e202_the_angle_pair_surrounds_but_does_not_auto_close() {
+    let config = language_configuration();
+    assert!(
+        config.contains(r#"["<","<>"#) || config.contains(r#"["<",">"]"#),
+        "`surroundingPairs` must carry [\"<\", \">\"]: {config}"
+    );
+    assert_eq!(
+        config.matches(r#""open":"<""#).count(),
+        0,
+        "`<` must NOT be an autoClosingPair — `a < b` would grow a `>` (E202): {config}"
+    );
+}
+
+/// E203 (R9): the backtick is a GLOBAL pair with `notIn: ["string"]`.
+///
+/// Global — not scoped to comments — because a backtick means nothing to the
+/// lexer, so there is no position where pairing one breaks code. `notIn:
+/// ["string"]` is the one exclusion that matters: a string body is text the
+/// author is writing literally, and a second backtick appearing inside one is
+/// a character they did not type. Doc prose is where backticks live (every std
+/// `///` uses them), and it is a comment, which the exclusion does not cover.
+#[test]
+fn e203_the_backtick_is_a_global_pair_outside_strings() {
+    let config = language_configuration();
+    assert!(
+        config.contains(r#"{"open":"`","close":"`","notIn":["string"]}"#),
+        "the backtick must auto-close everywhere but inside a string body: {config}"
+    );
+    assert!(
+        config.contains(r#"["`","`"]"#),
+        "and surround a selection, which is the other half of the ask: {config}"
+    );
+}
+
+/// E203: a pair is placed only BEFORE one of a conservative set of characters,
+/// stated rather than inherited.
+///
+/// VS Code's `autoCloseBefore` decides whether an auto-closing pair fires at
+/// all: it fires only when the character AFTER the cursor is one of these (or
+/// the line ends there). Without the field a language inherits exactly this
+/// set, so declaring it changes nothing today — and that is the point. The
+/// behaviour a backtick needs (typing one before a WORD character must not
+/// pair, because `` `word `` is somebody quoting a word that is already
+/// written) now reads off this file instead of off a default that could move
+/// under it.
+#[test]
+fn e203_a_pair_fires_only_before_the_conservative_set() {
+    let config = language_configuration();
+    assert!(
+        config.contains(r#""autoCloseBefore":";:.,=}])> \n\t""#),
+        "the language declares its own `autoCloseBefore`: {config}"
+    );
+    // The characters a backtick must NOT pair before are the ones absent from
+    // that set, and a word character is the case the item names.
+    for character in ['a', 'Z', '0', '_', '`'] {
+        assert!(
+            !";:.,=}])> \n\t".contains(character),
+            "`{character}` must stay out of the set, or a backtick pairs before a word"
+        );
+    }
+}
+
+/// The premise a GLOBAL backtick pair rests on: the lexer has no backtick
+/// token at all, so a backtick is never syntax and pairing one can never
+/// change what a program means (E203).
+///
+/// A grep, deliberately — the claim is about the absence of a token, and an
+/// absence has no behavior to observe. It COUNTS rather than `contains`-es, so
+/// the day someone adds a template-literal token this pin reds and the pair's
+/// scope is re-decided with the real case in hand.
+#[test]
+fn e203_the_lexer_still_has_no_backtick_token() {
+    let lexing = std::fs::read_to_string(repo_root().join("crates/vilan-core/src/lexing.rs"))
+        .expect("read lexing.rs");
+    // Doc comments quote code with backticks by the hundred, so the search is
+    // for the CHARACTER LITERAL a lexer arm would have to match on, not for the
+    // character.
+    let literal = format!("'{}'", '`');
+    assert_eq!(
+        lexing.matches(&literal).count(),
+        0,
+        "the lexer now matches a backtick: E203's global pair assumed it could not, \
+         and the pair's `notIn` list must be re-decided (tracker E203)"
+    );
+    let token = std::fs::read_to_string(repo_root().join("crates/vilan-core/src/token.rs"))
+        .expect("read token.rs");
+    assert_eq!(
+        token.to_lowercase().matches("backtick").count(),
+        0,
+        "a `Backtick` token appeared: see above"
+    );
+}

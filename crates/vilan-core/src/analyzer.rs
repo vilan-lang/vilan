@@ -3962,7 +3962,12 @@ pub struct Analyzer<'src> {
     prepped_number_literals: Vec<Id>,
     // `context`-typed closure parameters (proposal/ambient-owner.md §5):
     // parameter entity -> the context bindings its clause names, in written
-    // order (the hidden-argument order). The context pass consumes this.
+    // order (the hidden-argument order). The CONTEXT PASS is its only consumer
+    // — it asks "does this parameter or binding hold an injected closure?",
+    // which is a question about an entity and not about a type. It is not a
+    // label channel: the clause's printed form belongs to the closure TYPE
+    // (B309), and the per-parameter hover append that read this index printed
+    // the clause a second time (E207).
     parameter_contexts: HashMap<Id, Vec<Id>>,
     // Clause sites awaiting post-import resolution: the names may be
     // IMPORTED bindings, which only resolve after the import fixpoint —
@@ -18934,10 +18939,38 @@ impl<'src> Analyzer<'src> {
     /// nobody can type. The bound is already visible where it was written, on
     /// the parameter.
     fn generic_list_label(&self, constraint_ids: &[TypeId]) -> String {
+        self.generic_list_label_under(constraint_ids, &HashMap::default())
+    }
+
+    /// [`generic_list_label`] with a call's substitution applied (E206): a
+    /// parameter the site bound to a CONCRETE type is no longer a parameter of
+    /// the function the call reached, so it leaves the list — which is what
+    /// makes the owner's second line read `fun get_or(self, key: UserId, …)`
+    /// rather than `fun get_or<K, V>(…)`.
+    ///
+    /// A parameter bound to another still-OPEN parameter has not gone away, it
+    /// has been RENAMED: a generic call inside a generic body passes its
+    /// caller's own binder down, and the type positions print that binder's
+    /// name. So the list keeps it under the name it will print as, and the
+    /// second line stays a signature somebody could write
+    /// (`fun pair<B>(left: i32, right: B): i32`, never a bare `B` with no `<B>`
+    /// declaring it).
+    fn generic_list_label_under(
+        &self,
+        constraint_ids: &[TypeId],
+        substitution: &SubstitutionContext,
+    ) -> String {
         let constraint_ids: Vec<TypeId> = constraint_ids
             .iter()
             .copied()
             .filter(|constraint_id| !self.implicit_generic_scopes.contains_key(constraint_id))
+            .filter_map(|constraint_id| match substitution.get(&constraint_id) {
+                None => Some(constraint_id),
+                Some(bound) => match bound.get_type(self) {
+                    Type::Generic(open) => Some(open),
+                    _ => None,
+                },
+            })
             .collect();
         if constraint_ids.is_empty() {
             return String::new();
@@ -19110,6 +19143,83 @@ impl<'src> Analyzer<'src> {
         function: &Function,
         subject: Option<&SignatureSubject<'_>>,
     ) -> String {
+        self.render_function_signature(function, subject, &HashMap::default())
+    }
+
+    /// [`function_signature_label`] rendered UNDER a call site's substitution
+    /// (E206): every type position printed with the bindings the solver chose
+    /// THERE, so a generic function's hover can show the declaration as written
+    /// and the exact function this call reached. The substitution is the
+    /// analyzer's own record for the site (`method_call_substitution`, the one
+    /// channel an impl's binders, a method's own generics and a free call's
+    /// inferred or written arguments all write into).
+    ///
+    /// Clauses render on this line exactly as they do on the declaration's,
+    /// because they are part of the contract at either reading — and after E207
+    /// they render through the TYPE, which means a substituted closure type
+    /// carries its `context` clause along without a second channel to keep in
+    /// step.
+    fn function_signature_label_under(
+        &self,
+        function: &Function,
+        substitution: &SubstitutionContext,
+    ) -> String {
+        self.render_function_signature(function, None, substitution)
+    }
+
+    /// The FUNCTION a call site's subject names, following the same
+    /// `expr_id_to_expr_map` chain a use site resolves through (a bare name is
+    /// a `Local`; a method call's wired subject is a `Local` pointing at the
+    /// resolved member). A seen-list, because the map is data a lowering can
+    /// rewire into a cycle and E73 proved it does. `None` for anything that is
+    /// not a declared `fun` — a closure value, an external, a constructor.
+    fn signature_site_callee(&self, subject_id: Id) -> Option<Id> {
+        let mut seen: Vec<Id> = Vec::new();
+        let mut current = subject_id;
+        loop {
+            if self.functions.contains_key(&current) {
+                return Some(current);
+            }
+            if seen.contains(&current) {
+                return None;
+            }
+            seen.push(current);
+            match self.expr_id_to_expr_map.get(&current)? {
+                Expr::Local(inner) | Expr::Variable(inner) | Expr::Parameter(inner) => {
+                    current = *inner;
+                }
+                Expr::Function(function_id) => return Some(*function_id),
+                _ => return None,
+            }
+        }
+    }
+
+    /// One type position of a signature label: the trait/impl pair's reading
+    /// where there is a subject (B206, E128), the call site's where there is a
+    /// substitution (E206), the declaration's otherwise. The two are never
+    /// combined — a trait member's declaration renders for its trait, a call
+    /// site renders for its bindings.
+    fn signature_type_label(
+        &self,
+        type_id: TypeId,
+        subject: Option<&SignatureSubject<'_>>,
+        substitution: &SubstitutionContext,
+    ) -> String {
+        if subject.is_some() {
+            return self.declaration_type_label_for(type_id, subject);
+        }
+        if substitution.is_empty() {
+            return self.declaration_type_label(type_id);
+        }
+        self.pretty_print_type(&type_id.get_type(self), substitution)
+    }
+
+    fn render_function_signature(
+        &self,
+        function: &Function,
+        subject: Option<&SignatureSubject<'_>>,
+        substitution: &SubstitutionContext,
+    ) -> String {
         let mut parameters: Vec<String> = Vec::new();
         for parameter_id in &function.parameters {
             let Some(parameter) = self.parameters.get(parameter_id) else {
@@ -19125,28 +19235,33 @@ impl<'src> Analyzer<'src> {
                 // reason `...` does (lazy.md §5, "hover renders `lazy` in
                 // signatures like the other effect surface"): it tells a reader
                 // whether their argument runs here or inside the callee.
-                let mut label = format!(
+                let label = format!(
                     "{}{}{}: {}",
                     if parameter.lazy { "lazy " } else { "" },
                     if parameter.spread { "..." } else { "" },
                     parameter.name,
-                    self.declaration_type_label_for(parameter.type_id, subject)
+                    self.signature_type_label(parameter.type_id, subject, substitution)
                 );
-                // A `context` clause is part of the signature's contract —
-                // render it (E9: hover shows clauses).
-                if let Some(contexts) = self.parameter_contexts.get(parameter_id) {
-                    label.push_str(&self.context_clause_label(contexts));
-                }
+                // A `context` clause is part of the signature's contract, and
+                // `declaration_type_label_for` has already rendered it: since
+                // B309 the clause is a property of the closure TYPE
+                // (`Type::Closure`'s third slot), so it prints wherever that
+                // type does. E9's original per-parameter append lived here and
+                // printed it a SECOND time, bare, after the parenthesized
+                // one — `body: (|| void) context owner_scope context
+                // owner_scope` (E207). Nothing is appended now; the entity-keyed
+                // `parameter_contexts` index answers the context pass alone.
                 parameters.push(label);
             }
         }
-        let generics = self.generic_list_label(&function.generic_parameter_constraint_ids);
+        let generics =
+            self.generic_list_label_under(&function.generic_parameter_constraint_ids, substitution);
         let return_label = function
             .return_type_id
             .map(|return_type_id| {
                 format!(
                     ": {}",
-                    self.declaration_type_label_for(return_type_id, subject)
+                    self.signature_type_label(return_type_id, subject, substitution)
                 )
             })
             .unwrap_or_default();
@@ -50701,6 +50816,10 @@ pub struct Program<'src> {
     pub division_generic_lhs: HashMap<Id, TypeId>,
     /// `context`-typed closure parameters (proposal/ambient-owner.md §5):
     /// parameter entity -> the named context bindings, in clause order.
+    ///
+    /// Read by the context pass (`context.rs`) and by nothing that renders: a
+    /// clause's printed form is the closure type's (B309), so a reader after a
+    /// LABEL wants `pretty_print_type_at`, not this (E207).
     pub parameter_contexts: HashMap<Id, Vec<Id>>,
     /// B242: the contexts each `fun` DECLARES (`fun f(x: f64) context settings`),
     /// keyed by the function's entity, in written order.
@@ -51162,6 +51281,19 @@ pub struct Program<'src> {
     /// Full declaration labels for hover (E9): function signatures,
     /// struct/enum blocks — keyed by declaration id, fenced by the LSP.
     pub declaration_labels: HashMap<Id, String>,
+    /// E206: the signature a GENERIC call site reached, rendered under the
+    /// bindings the solver chose there — `fun get_or(self, key: UserId, make:
+    /// || SignalCell<Option<User>>): SignalCell<Option<User>>` where the
+    /// declaration reads `fun get_or(self, key: K, make: || V): V`. Keyed by
+    /// both entity ids of the site (the call and its subject), so a hover looks
+    /// the id under the cursor up directly.
+    ///
+    /// An entry exists only where the substitution CHANGED the rendering, so a
+    /// reader that finds none shows the declaration alone — which is the answer
+    /// for a non-generic function, for a generic one hovered at its
+    /// declaration, and for a call inside another generic body whose parameters
+    /// are all still open.
+    pub call_signature_labels: HashMap<Id, String>,
     // The resolved type id of every typed expression and binding (same merge as
     // `expr_types`). The transformer reads this to compute a tuple's flat-storage
     // layout — which elements are themselves tuples (and so are spread, not nested)
@@ -56228,16 +56360,25 @@ fn expand_entry_over_world<'src>(
 ) -> bool {
     if !crate::macros::in_macro_world() {
         let before = world.analyzer.diagnostics.len();
-        crate::macros::register_file(
-            &mut world.macro_registry,
-            crate::macros::ModuleKey::Entry,
-            &nodes.0,
-            entry_source,
-            entry_path,
-            SourceId(0),
-            std,
-            &mut world.analyzer.diagnostics,
-        );
+        // E212: the same one-refusal rule as the load-region path above. A
+        // stored world was compiled against a WHOLE toolchain, so this fires
+        // only where a session's `std` changed under it — and then the entry's
+        // own registration is the thing to skip, not to report ten times.
+        match crate::macros::split_toolchain_refusal(std) {
+            Some(_) => {
+                crate::macros::push_split_toolchain_refusal(std, &mut world.analyzer.diagnostics)
+            }
+            None => crate::macros::register_file(
+                &mut world.macro_registry,
+                crate::macros::ModuleKey::Entry,
+                &nodes.0,
+                entry_source,
+                entry_path,
+                SourceId(0),
+                std,
+                &mut world.analyzer.diagnostics,
+            ),
+        }
         world
             .analyzer
             .attribute_new_diagnostics(before, SourceId(0));
@@ -58011,6 +58152,18 @@ fn analyze_inner<'src>(
             // expansion below still runs with the empty registry, so std's
             // own derives generate through the Rust fallback.
             if crate::macros::in_macro_world() {
+                return registry;
+            }
+            // E212: a SPLIT toolchain is refused here, once, before the first
+            // registration — a root carrying only `std` compiles no macro at
+            // all, so there is nothing for the loop below to do and no file to
+            // blame. Attributed to the entry at offset 0, which is what puts
+            // the actionable sentence first instead of behind the type errors
+            // the unexpanded derives go on to cause.
+            if crate::macros::split_toolchain_refusal(std).is_some() {
+                let before = analyzer.diagnostics.len();
+                crate::macros::push_split_toolchain_refusal(std, &mut analyzer.diagnostics);
+                analyzer.attribute_new_diagnostics(before, SourceId(0));
                 return registry;
             }
             let before = analyzer.diagnostics.len();
@@ -59957,6 +60110,53 @@ fn analyze_over_world<'src>(
         };
         declaration_labels.insert(*function_id, label);
     }
+    // E206: the signature each generic call SITE reached, rendered under the
+    // bindings the solver chose there. Keyed by every entity id a cursor can
+    // land on for that site — the call's own id and its source subject (a
+    // method call's wired subject is the resolved member, and which of the two
+    // `entity_at` answers depends on where in the expression the caret sits) —
+    // so a consumer looks the hovered id up directly and needs no reverse
+    // index. An entry exists ONLY where the substitution changed the rendering:
+    // a non-generic callee, and a generic one whose parameters are all still
+    // open (a call inside another generic body), write nothing, which is what
+    // keeps "show one line when nothing is substituted" a property of the map
+    // rather than a rule its readers each have to remember.
+    //
+    // ENTRY-FILE sites only, which is not a shortcut but the reach of the one
+    // question this answers: a hover resolves through `entity_at`, whose table
+    // is the entry's id range and nothing else (M27), so a label for a call
+    // inside std could never be looked up — and std is where the generic call
+    // sites are. This is the compiler's largest per-process retention's
+    // neighbourhood (M11), and a String per generic call in the whole world is
+    // what the unfiltered loop would have kept.
+    let mut call_signature_labels: HashMap<Id, String> = HashMap::default();
+    for (call_id, substitution) in &analyzer.method_call_substitution {
+        if substitution.is_empty() {
+            continue;
+        }
+        if analyzer.source_of_id(*call_id) != Some(SourceId(0)) {
+            continue;
+        }
+        let Some(call) = analyzer.function_calls.get(call_id) else {
+            continue;
+        };
+        // The call's written subject. The context pass's `context_erased_subjects`
+        // is deliberately not consulted: that pass runs AFTER this label build,
+        // so what is recorded here is the source subject already.
+        let subject_id = call.subject_id;
+        let Some(function_id) = analyzer.signature_site_callee(subject_id) else {
+            continue;
+        };
+        let Some(function) = analyzer.functions.get(&function_id) else {
+            continue;
+        };
+        let computed = analyzer.function_signature_label_under(function, substitution);
+        if declaration_labels.get(&function_id) == Some(&computed) {
+            continue;
+        }
+        call_signature_labels.insert(*call_id, computed.clone());
+        call_signature_labels.insert(subject_id, computed);
+    }
     for (function_id, external) in &analyzer.external_functions {
         let mut parameters: Vec<String> = Vec::new();
         for parameter_id in &external.parameters {
@@ -60380,6 +60580,7 @@ fn analyze_over_world<'src>(
         prelude_bindings: analyzer.prelude_entry_bindings.clone(),
         expr_types,
         declaration_labels,
+        call_signature_labels,
         expr_type_ids,
         inferred_return_types: std::mem::take(&mut analyzer.inferred_return_types),
         tuple_element_types: std::mem::take(&mut analyzer.tuple_element_types),

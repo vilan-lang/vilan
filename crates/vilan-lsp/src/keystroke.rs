@@ -943,7 +943,7 @@ pub fn cursor_context(text: &str, offset: usize) -> CursorContext {
     CursorContext::Scope { prefix }
 }
 
-fn is_identifier_char(character: char) -> bool {
+pub(crate) fn is_identifier_char(character: char) -> bool {
     character.is_alphanumeric() || character == '_'
 }
 
@@ -966,6 +966,8 @@ pub fn candidates(entries: &[SymbolEntry], prefix: &str) -> Vec<Completion> {
             call_parameters: entry.call_parameters.clone(),
             snippet: None,
             insert: None,
+            filter_text: None,
+            replace_span: None,
             needs_import: None,
         })
         .collect()

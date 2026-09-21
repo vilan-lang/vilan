@@ -42,6 +42,20 @@ included; a field's `name: type` and a method's full signature behind a
 `.`; your own doc comments; and documentation on the language's own
 keywords, deep-linked into this book.
 
+A `///` above a struct FIELD reaches every position that field appears in:
+its declaration, a read of it, the field name inside a `Point { x = … }`
+literal, and both completion lists that offer it (where the popup shows
+the first paragraph, as it does for a function). Hovering a field answers
+about the field; the struct's whole declaration block is what its own
+name answers.
+
+Hovering a call to a GENERIC function shows two signatures in one block:
+the declaration as it is written, then the same signature under the
+bindings this call solved — `fun get_or(self, key: K, make: || V): V`
+above `fun get_or(self, key: UserId, make: || SignalCell<Option<User>>):
+SignalCell<Option<User>>`. A call that substitutes nothing, and a hover on
+the declaration itself, show the one line they always did.
+
 **Inlay hints** — the inferred type of a binding you left unannotated
 (`let`/`mut`, a `for` binder, a comprehension binder). A parameter is not
 hinted: its type is written in the signature already.
@@ -56,7 +70,7 @@ a symbol, they also find the open files that import it.
 
 **Formatting** — the same `vilan_core` formatter `vilan fmt` runs, so the
 editor and the CLI cannot disagree. Whole-document only; there is no range
-or on-type formatting. When the printer *declines* a file — it does not
+formatting. When the printer *declines* a file — it does not
 parse, or it carries a construct the printer has no rule for — the server
 says so in a message naming the line and the construct, rather than
 leaving a save that did nothing looking like a save that had nothing to
@@ -64,6 +78,16 @@ do. Once per file per cause, so format-on-save does not repeat it.
 
 **Linked editing** for markup tag pairs: rename `<div>` and `</div>`
 follows.
+
+**A generic `<` closes itself.** `List<`, `Map<`, `fun pair<` and a
+generic call's own argument list each get their `>` as you type the `<`.
+The editor's static bracket pairs cannot do this — `<` is also the
+comparison operator, and `a < b` must not grow a `>` — so the server
+decides, on what the name before the `<` means: a struct, an enum, a
+trait or a generic function, or a declaration's own name right after
+`fun`, `struct`, `enum`, `trait`, `impl` or `type`. Everything else is
+left alone. Selecting text and typing `<` wraps it either way, and so
+does a backtick, which pairs everywhere except inside a string.
 
 **Dead code, faded.** Code nothing uses is dimmed rather than warned
 about: it does not enter the Problems count, does not badge the file, and

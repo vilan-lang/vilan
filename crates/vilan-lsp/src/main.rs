@@ -241,6 +241,30 @@ fn to_completion_item(
         }]);
         item.sort_text = Some(format!("|{}{}", auto_import.origin_tier, item.label));
     }
+    // E211: state the prefix this candidate replaces, and the text to filter it
+    // by. E194 fixed the hyphenated case from the CLIENT's side, in VS Code's
+    // `wordPattern`; every other LSP client has its own word rules and no such
+    // file, so `stroke-width` was filtered out of its own list there. A
+    // `textEdit` settles it for all of them at once: a client given an explicit
+    // range filters against the text in THAT range rather than against its own
+    // notion of a word, and accepting the candidate replaces the prefix instead
+    // of doubling it.
+    //
+    // The edit carries whatever insertion the passes above settled on
+    // (`insert_text`), because `textEdit` WINS over `insertText` per the spec —
+    // leaving the two to disagree would silently drop a call shape or a
+    // snippet body. `insert_text` stays set for a client that reads it instead.
+    if let Some(span) = completion.replace_span {
+        let new_text = item
+            .insert_text
+            .clone()
+            .unwrap_or_else(|| completion.label.clone());
+        item.text_edit = Some(CompletionTextEdit::Edit(TextEdit {
+            range: line_index.range(&span),
+            new_text,
+        }));
+    }
+    item.filter_text = completion.filter_text;
     item
 }
 
@@ -834,7 +858,9 @@ mod manifest_routing_tests {
 mod completion_item_tests {
     use super::{CompletionFunctionCall, to_completion_item};
     use crate::line_index::LineIndex;
-    use tower_lsp::lsp_types::{CompletionItemKind, Documentation, InsertTextFormat};
+    use tower_lsp::lsp_types::{
+        CompletionItemKind, CompletionTextEdit, Documentation, InsertTextFormat,
+    };
     use vilan_ide::{AutoImport, Completion, CompletionKind, SnippetInsertion};
 
     /// An empty-buffer index — every fixture below whose `needs_import` is
@@ -855,6 +881,8 @@ mod completion_item_tests {
                 .map(|names| names.into_iter().map(str::to_string).collect()),
             snippet: None,
             insert: None,
+            filter_text: None,
+            replace_span: None,
             needs_import: None,
         }
     }
@@ -993,6 +1021,8 @@ mod completion_item_tests {
                 fallback: "for".to_string(),
             }),
             insert: None,
+            filter_text: None,
+            replace_span: None,
             needs_import: None,
         }
     }
@@ -1010,6 +1040,8 @@ mod completion_item_tests {
             call_parameters: None,
             snippet: None,
             insert: None,
+            filter_text: None,
+            replace_span: None,
             needs_import: Some(AutoImport {
                 module_path: module_path.iter().map(|part| part.to_string()).collect(),
                 edit_span: vilan_core::Span { start: 0, end: 0 },
@@ -1017,6 +1049,64 @@ mod completion_item_tests {
                 origin_tier: tier,
             }),
         }
+    }
+
+    // --- E211: the prefix a candidate replaces, and what to filter by -------
+
+    /// A `LineIndex` over one line of text, for the range conversions below.
+    fn index_over(text: &str) -> LineIndex {
+        LineIndex::new(text)
+    }
+
+    // A candidate carrying a replace span becomes a `textEdit` over exactly
+    // that range, and the edit's text is the INSERTION the other passes
+    // settled on — `textEdit` wins over `insertText` per the spec, so the two
+    // disagreeing would silently drop a call shape.
+    #[test]
+    fn e211_a_replace_span_becomes_a_text_edit_carrying_the_insertion() {
+        let text = "\t\t<svg stroke-w";
+        let mut candidate = function(Some(vec!["host"]));
+        candidate.label = "stroke-width".to_string();
+        candidate.filter_text = Some("stroke-width".to_string());
+        candidate.replace_span = Some(vilan_core::Span {
+            start: text.find("stroke-w").expect("the prefix"),
+            end: text.len(),
+        });
+        let item = to_completion_item(
+            candidate,
+            CompletionFunctionCall::Full,
+            true,
+            &index_over(text),
+        );
+        let CompletionTextEdit::Edit(edit) = item.text_edit.expect("a text edit") else {
+            panic!("a plain edit, not an insert/replace pair");
+        };
+        assert_eq!(edit.range.start.character, 7, "the `s` of `stroke-w`");
+        assert_eq!(edit.range.end.character, text.chars().count() as u32);
+        assert_eq!(
+            edit.new_text, "stroke-width(${1:host})$0",
+            "the edit carries the call shape, not the bare label"
+        );
+        assert_eq!(item.filter_text.as_deref(), Some("stroke-width"));
+        assert_eq!(
+            item.insert_text.as_deref(),
+            Some("stroke-width(${1:host})$0"),
+            "and `insert_text` stays, for a client that reads it instead"
+        );
+    }
+
+    // No span, no edit — which is what the keystroke path's candidates carry,
+    // and today's behavior for every client.
+    #[test]
+    fn e211_a_candidate_without_a_span_sends_no_text_edit() {
+        let item = to_completion_item(
+            function(None),
+            CompletionFunctionCall::None,
+            true,
+            &blank_index(),
+        );
+        assert!(item.text_edit.is_none());
+        assert!(item.filter_text.is_none());
     }
 
     // E14: a snippet-capable client gets the SNIPPET-iconed item with the
@@ -2670,6 +2760,17 @@ fn server_capabilities() -> ServerCapabilities {
         })),
         document_symbol_provider: Some(OneOf::Left(true)),
         document_formatting_provider: Some(OneOf::Left(true)),
+        // E202 (R9): the `>` that closes a `<` opened in TYPE position. `<` is
+        // also the comparison operator, and a static `autoClosingPairs` entry
+        // cannot tell the two apart — its only filter is
+        // `notIn: [string, comment]` — so the decision is the server's, where
+        // the names have meanings. Whole-document formatting is still the only
+        // thing `formatting` does; this shares nothing with it but the LSP
+        // family name.
+        document_on_type_formatting_provider: Some(DocumentOnTypeFormattingOptions {
+            first_trigger_character: "<".to_string(),
+            more_trigger_character: None,
+        }),
         completion_provider: Some(CompletionOptions {
             // `.` and `:` (the second `:` of `::`) re-trigger completion so
             // member/path candidates appear without a manual invoke.
@@ -3602,6 +3703,38 @@ impl LanguageServer for Backend {
                 result_id: None,
                 data,
             })))
+        })
+    }
+
+    /// E202 (R9): the `>` that closes a `<` the author opened in TYPE position.
+    ///
+    /// LIVE coordinates, in and out, for `linked_editing_range`'s reason: the
+    /// client sends the position it has just typed into and applies the edit to
+    /// the buffer it has now, so naming a position in the ANALYZED snapshot
+    /// would insert into whatever code had moved into those offsets during the
+    /// debounce. The decision itself reads the retained program (which names
+    /// are types), and that is a question about the last landing rather than
+    /// about the current keystroke.
+    async fn on_type_formatting(
+        &self,
+        params: DocumentOnTypeFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        self.fenced("onTypeFormatting", Ok(None), || {
+            let uri = params.text_document_position.text_document.uri;
+            let position = params.text_document_position.position;
+            let Some(document) = self.documents.get(&uri) else {
+                return Ok(None);
+            };
+            let offset = document.line_index.offset(position);
+            let edits: Vec<TextEdit> = document
+                .on_type_edits(offset, &params.ch)
+                .into_iter()
+                .map(|(span, new_text)| TextEdit {
+                    range: document.line_index.range(&span),
+                    new_text,
+                })
+                .collect();
+            Ok((!edits.is_empty()).then_some(edits))
         })
     }
 
