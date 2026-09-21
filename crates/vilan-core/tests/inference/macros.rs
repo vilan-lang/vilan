@@ -2937,9 +2937,18 @@ main();
     );
 }
 
-/// And it is per CONTEXT, not per program: the context whose `run` failed
-/// stands down; a second context's genuinely uncovered read in the same
-/// program keeps its refusal.
+/// **RESTATED AS A DEFERRAL (B355 / E189's broad gate).** It used to say that
+/// the stand-down is per CONTEXT, not per program: the context whose `run`
+/// failed stood down, and a second context's genuinely uncovered read in the
+/// same program kept its refusal. The program does not type — the `run`'s
+/// struct literal is missing a field — and the whole context family now stands
+/// down on such a program and says so once, because every verdict this pass
+/// reaches is computed over a call graph that a call the solver could not wire
+/// leaves holes in. So the claim that survives is the DEFERRAL: neither
+/// context is spoken about, the primary error stands alone, and the warning
+/// names how many checks did not run. The per-context grain is still real and
+/// is pinned on a CLEAN program by
+/// `b229_the_stand_down_is_per_context_on_a_program_that_types`.
 #[test]
 fn b229_only_the_unresolved_run_s_own_context_stands_down() {
     let source = r#"
@@ -2974,11 +2983,15 @@ fun main() {
 }
 main();
         "#;
-    assert_fails_once_with(
-        source,
-        "context `other_ctx` is read here, but this code can be reached without an enclosing `run`",
-    );
+    assert_fails_without(source, "context `other_ctx` is read here");
     assert_fails_without(source, "context `app_ctx` is read here");
+    assert!(
+        warnings(source)
+            .iter()
+            .any(|warning| warning.contains("`context` check")),
+        "the deferral must say so: {:#?}",
+        warnings(source)
+    );
 }
 
 /// B229's second face: a trace label on a METHOD-call hop points at the
@@ -3189,6 +3202,87 @@ fun main() {
     print(reads_b());
     a_ctx.run(10, || {
         print(reads_a());
+    });
+}
+main();
+        "#;
+    // RESTATED AS A DEFERRAL (B355 / E189's broad gate): the program carries an
+    // arity error, so the context family stands down whole rather than fencing
+    // `b_ctx`'s genuinely uncovered read. The arity error reports alone and the
+    // warning says what was not checked; the fence itself is pinned on a clean
+    // program by `b241_a_genuinely_uncovered_read_on_a_program_that_types_still_fences`.
+    assert_fails_once_with(source, "`reads_a` expects 1 argument, but got 0 instead");
+    assert_fails_without(source, "context `b_ctx` is read here");
+    assert_fails_without(source, "context `a_ctx` is read here");
+    assert!(
+        warnings(source)
+            .iter()
+            .any(|warning| warning.contains("`context` check")),
+        "the deferral must say so: {:#?}",
+        warnings(source)
+    );
+}
+
+/// The per-CONTEXT grain B229's pin above used to carry, moved to a program
+/// that TYPES: one context's uncovered read is refused and a second context,
+/// properly covered, is silent. Nothing defers here, so the grain is what is
+/// being observed.
+#[test]
+fn b229_the_stand_down_is_per_context_on_a_program_that_types() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let app_ctx: Context<i32> = Context::new();
+let other_ctx: Context<i32> = Context::new();
+
+fun label(): i32 {
+    app_ctx.get()
+}
+
+fun tint(): i32 {
+    other_ctx.get()
+}
+
+fun main() {
+    print(tint());
+    app_ctx.run(10, || {
+        print(label());
+    });
+}
+main();
+        "#;
+    assert_fails_once_with(
+        source,
+        "context `other_ctx` is read here, but this code can be reached without an enclosing `run`",
+    );
+    assert_fails_without(source, "context `app_ctx` is read here");
+}
+
+/// B241's fence, on a program that TYPES: the uncovered read is refused, the
+/// covered one is not, and no deferral is involved. This is the claim the
+/// arity-shaped pin above can no longer make for itself.
+#[test]
+fn b241_a_genuinely_uncovered_read_on_a_program_that_types_still_fences() {
+    let source = r#"
+import std::io::print;
+import std::context::Context;
+
+let a_ctx: Context<i32> = Context::new();
+let b_ctx: Context<i32> = Context::new();
+
+fun reads_a(x: i32): i32 {
+    a_ctx.get() + x
+}
+
+fun reads_b(): i32 {
+    b_ctx.get()
+}
+
+fun main() {
+    print(reads_b());
+    a_ctx.run(10, || {
+        print(reads_a(1));
     });
 }
 main();
