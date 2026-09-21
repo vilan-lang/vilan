@@ -761,7 +761,13 @@ fn refuse(connection: &Rc<Connection>, status: u16, phrase: &str) {
 pub type Handler = Rc<dyn Fn(Request, Response) -> Boxed<()>>;
 
 /// The upgrade handler: `(request, raw socket, head bytes)`.
-pub type UpgradeHandler = Rc<dyn Fn(Request, Socket, Bytes) -> Boxed<()>>;
+///
+/// SYNCHRONOUS, unlike [`Handler`], because that is how `std::http` declares it
+/// (`|NodeRequest, NodeSocket, Bytes| void`). A40 made the vilan-level upgrade
+/// handler allowed to suspend, and an rpc service's `authorize` hook uses it;
+/// natively that is the adapted-instance shape (a declared-sync position holding
+/// an async closure) and it is Order 40's, named here rather than guessed at.
+pub type UpgradeHandler = Rc<dyn Fn(Request, Socket, Bytes)>;
 
 /// `NodeServer` — what `createServer` answers.
 #[derive(Clone)]
@@ -790,6 +796,28 @@ pub fn create_server(handler: Handler) -> Server {
         closing: Cell::new(false),
         on_closed: RefCell::new(None),
     }))
+}
+
+/// `AddressInfo` — what a listening server reports. Only the port is read, and
+/// only the port is here: `std::http`'s `NodeAddress` binds exactly `port`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Address {
+    port: i32,
+}
+
+impl Address {
+    pub fn port(&self) -> i32 {
+        self.port
+    }
+}
+
+impl Js for Address {
+    fn js(&self) -> String {
+        crate::panic_with(
+            "printing an address is a host object's own inspection, which the native backend \
+             does not reproduce",
+        )
+    }
 }
 
 impl Server {
@@ -827,7 +855,14 @@ impl Server {
         on_ready();
     }
 
-    /// `server.address().port` — the port actually bound.
+    /// `server.address()`.
+    pub fn address(&self) -> Address {
+        Address {
+            port: self.0.port.get() as i32,
+        }
+    }
+
+    /// The port actually bound — what `address().port` reads.
     pub fn port(&self) -> i32 {
         self.0.port.get() as i32
     }
@@ -997,10 +1032,7 @@ impl Server {
                 Some(handler) => {
                     connection.stage.set(Stage::Upgraded);
                     let socket = Socket(Rc::clone(connection));
-                    spawn(
-                        handler(request, socket, Bytes::from_vec(body)),
-                        "an http upgrade handler",
-                    );
+                    handler(request, socket, Bytes::from_vec(body));
                 }
                 // Node destroys an unclaimed upgrade socket, and so does
                 // `std::http`'s own documentation of this path.
@@ -1430,16 +1462,13 @@ mod tests {
             server.on_upgrade(
                 "upgrade",
                 Rc::new(move |request: Request, socket: Socket, head: Bytes| {
-                    let seen = Rc::clone(&seen);
-                    crate::executor::pin_future(async move {
-                        *seen.borrow_mut() = format!(
-                            "{} head={}",
-                            request.url(),
-                            String::from_utf8_lossy(head.as_slice())
-                        );
-                        socket.write_text("HTTP/1.1 101 Switching Protocols\r\n\r\n");
-                        socket.destroy();
-                    })
+                    *seen.borrow_mut() = format!(
+                        "{} head={}",
+                        request.url(),
+                        String::from_utf8_lossy(head.as_slice())
+                    );
+                    socket.write_text("HTTP/1.1 101 Switching Protocols\r\n\r\n");
+                    socket.destroy();
                 }),
             );
             server.listen(0, Rc::new(|| {}));

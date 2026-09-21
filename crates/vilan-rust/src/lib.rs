@@ -491,6 +491,33 @@ impl<'a, 'src> Emitter<'a, 'src> {
         })
     }
 
+    /// A closure's body, with the destructures a TUPLE PARAMETER owes in front
+    /// of it (F18).
+    ///
+    /// `|(value, factor)| value * factor` has one parameter — an unnamed tuple —
+    /// and the analyzer records a destructure per pattern in
+    /// `Closure::parameter_destructures`, to run before the body. The emitter
+    /// rendered the parameter and the body and dropped the destructures, so the
+    /// body referred to bindings nothing declared; `destructuring.vl` was
+    /// refused for the `let` form before this slice and became a rustc refusal
+    /// the moment that form was admitted, which is how it was found.
+    fn closure_body(
+        &mut self,
+        closure: &vilan_core::analyzer::Closure,
+        depth: usize,
+    ) -> Result<String, Error> {
+        let body = self.expression(closure.return_, depth)?;
+        if closure.parameter_destructures.is_empty() {
+            return Ok(body);
+        }
+        let mut prefix = String::new();
+        for destructure in &closure.parameter_destructures {
+            let rendered = self.expression(*destructure, depth)?;
+            let _ = write!(prefix, "{rendered}; ");
+        }
+        Ok(format!("{{ {prefix}{body} }}"))
+    }
+
     /// Walks a closure body, collecting the bindings it DECLARES and the
     /// bindings it READS. The difference is what it captured.
     fn scan_closure(
@@ -519,19 +546,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 referenced.insert(*binding);
             }
             Some(other) => {
-                // A `let` is not the only way a body introduces a name (F20).
-                // A match leg's pattern, an `is` test's capture, a `for`
-                // binder and a nested closure's parameters all declare INSIDE,
-                // and a walk that missed them called them captures: the
-                // capture prelude then emitted `let live = live.clone();` for a
-                // binding that only exists inside the leg it is bound in.
+                // A `let` is not the only way a body introduces a name (F20, and
+                // F18's destructuring `let`). A match leg's pattern, an `is`
+                // test's capture, a destructure's pattern, a `for` binder and a
+                // nested closure's parameters all declare INSIDE, and a walk
+                // that missed them called them captures: the capture prelude
+                // then emitted `let live = live.clone();` for a binding that
+                // only exists inside the leg it is bound in, and
+                // `future_closure_argument` — which emits one clone per capture
+                // — did the same for the three `match` captures and the two
+                // destructured names in `std::http`'s response loop.
                 match other {
                     Expr::Match(_, legs) => {
                         for leg in legs {
                             collect_pattern_bindings_into(&leg.pattern, declared);
                         }
                     }
-                    Expr::Is(_, pattern) => collect_pattern_bindings_into(pattern, declared),
+                    Expr::Is(_, pattern) | Expr::Destructure(_, pattern) => {
+                        collect_pattern_bindings_into(pattern, declared);
+                    }
                     Expr::ForEach(_, item, _) => declared.extend(item.iter().copied()),
                     Expr::Closure(closure_id) => {
                         if let Some(closure) = self.program.closures.get(closure_id) {
@@ -1254,6 +1287,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             "Nursery" => Ok("vilan_rt::executor::Nursery".to_string()),
             "CancelSignal" => Ok("vilan_rt::executor::CancelSignal".to_string()),
             "TimerHandle" => Ok("vilan_rt::executor::TimerHandle".to_string()),
+            // F18: the host types `vilan_rt::http` IS. `std::http` declares its
+            // node handles as `external struct`s, exactly as `std::task`
+            // declares `Task`, so they arrive here for the same reason and are
+            // answered the same way. The `external` gate is above, so this arm
+            // cannot claim a vilan struct that merely shares one of the names.
+            _ if let Some(native) = http_host_type(name) => Ok(native.to_string()),
             _ => {
                 let what = format!("the host type `{name}`");
                 self.host_gap(what, span).map(|_| "()".to_string())
@@ -2459,6 +2498,28 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Expr::Await(awaited) => self.await_of(awaited, depth)?,
             Expr::Closure(closure_id) => self.closure(closure_id, depth, span)?,
             Expr::Is(subject, pattern) => self.is_test(subject, &pattern, depth, span)?,
+            // A destructuring `let` — `let (name, value) = pair;`. The pattern
+            // renderer is `match`'s: a destructure's pattern is IRREFUTABLE by
+            // construction (spec §3.10 — a refutable one is a `match` or an
+            // `is` test), so there is nothing to test and nothing to fall
+            // through to, which is exactly what makes a `let` pattern legal
+            // Rust too. `std::http`'s response loop is the customer:
+            // `for header in response.headers { let (name, value) = header; .. }`.
+            Expr::Destructure(subject, pattern) => {
+                let subject_type = self.type_of(subject);
+                let bound = self.pattern(&pattern, subject_type, span)?;
+                // A destructure CONSUMES what it binds, so a destructure of a
+                // PLACE is a copy by rule 1 and has to be written as one:
+                // `clone_sites` does not mark the read (on the JS backend the
+                // pattern reads the elements out of the array and moves
+                // nothing), and two destructures of the same binding were a
+                // use-after-move. `copy_a_consumed_place_read` is the rule a
+                // by-value ARGUMENT takes, so there is one of it — and it knows
+                // not to copy a binding that holds a view.
+                let value = self.expression(subject, depth)?;
+                let value = self.copy_a_consumed_place_read(subject, value);
+                format!("let {bound} = {value}")
+            }
             Expr::EnumVariant(enum_id, index) => {
                 let arguments = self.enum_arguments_at(id, enum_id);
                 self.variant_path(enum_id, index, &arguments, span)?
@@ -4129,7 +4190,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .collect();
         captures.sort_by_key(|binding| binding.0);
         self.closure_captures.push(captured);
-        let body = self.expression(closure.return_, depth);
+        let body = self.closure_body(&closure, depth);
         self.closure_captures.pop();
         let body = body?;
         let prelude: String = captures
@@ -4411,6 +4472,222 @@ impl<'a, 'src> Emitter<'a, 'src> {
             _ => return Ok(None),
         };
         Ok(Some(rendered))
+    }
+
+    /// The host bindings `vilan-rt`'s HTTP server answers (F18 slice 1).
+    ///
+    /// `std::http`'s raw `node:http` layer is nineteen bindings over five
+    /// `external struct`s, and `vilan_rt::http` was written against those
+    /// declarations, so — as with the executor — the mapping is a rename rather
+    /// than a reimplementation.
+    ///
+    /// **The dispatch is keyed on the RECEIVER's host type, not on the symbol.**
+    /// The executor's four method symbols were unique in std and could be
+    /// matched by name alone; this surface is not remotely unique — `write`,
+    /// `end`, `on`, `close`, `destroy`, `url`, `method`, `listen` and `port` are
+    /// all names an unrelated `[extern(method)]` somewhere could carry, and two
+    /// of these bindings (`write_text`/`write_bytes`, `end`/`end_bytes`) SHARE a
+    /// host symbol and differ only in their vilan name. So the key is the pair
+    /// (the host type the `self` parameter is declared at, the vilan name), both
+    /// of which are static facts about the declaration.
+    ///
+    /// `Ok(None)` means "not one of ours" and the caller refuses by name, which
+    /// is what the two bindings answering a `JsonValue` still get: the request's
+    /// `headers` and the socket's `remoteAddress` need `std::json`'s host type,
+    /// which is Order 40's.
+    fn http_host_binding(
+        &mut self,
+        target: Id,
+        binding: Option<&ExternBinding<'src>>,
+        argument_ids: &[Id],
+        depth: usize,
+    ) -> Result<Option<String>, Error> {
+        let Some(binding) = binding else {
+            return Ok(None);
+        };
+        let Some(external) = self.program.external_functions.get(&target) else {
+            return Ok(None);
+        };
+        let name = external.name;
+        // The module-level entry points first: they have no receiver.
+        match binding {
+            ExternBinding::Function {
+                module: Some("node:http"),
+                symbol: "createServer",
+            } => {
+                // The handler answers a FUTURE: `std::http` declares this
+                // parameter `|NodeRequest, NodeResponse| void`, synchronously,
+                // and hands it a closure whose body awaits — it reads the
+                // request body and then the application's `async` handler. On
+                // the JS backend that is free (node ignores the promise its
+                // callback returns); natively the closure has to answer one, so
+                // the expectation is set HERE, at the one binding that takes
+                // one, rather than read off a declared type that does not say
+                // so. Cleared before the `?`, exactly as a call argument and a
+                // struct field set it.
+                self.expects_async_value = true;
+                let handler = self.value_argument(argument_ids, 0, depth);
+                self.expects_async_value = false;
+                return Ok(Some(format!("vilan_rt::http::create_server({})", handler?)));
+            }
+            ExternBinding::Function {
+                module: Some("node:stream/consumers"),
+                symbol: "buffer",
+            } => {
+                let request = self.value_argument(argument_ids, 0, depth)?;
+                return Ok(Some(format!(
+                    "vilan_rt::http::read_request_bytes({request})"
+                )));
+            }
+            ExternBinding::Function {
+                module: Some("node:stream/consumers"),
+                symbol: "text",
+            } => {
+                let request = self.value_argument(argument_ids, 0, depth)?;
+                return Ok(Some(format!(
+                    "vilan_rt::http::read_request_text({request})"
+                )));
+            }
+            _ => {}
+        }
+        let Some(receiver) = self.host_receiver_type(target) else {
+            return Ok(None);
+        };
+        let rendered = match (receiver, name) {
+            // --- NodeServer ---
+            ("NodeServer", "listen") => format!(
+                "({}).listen({}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?
+            ),
+            ("NodeServer", "address") => {
+                format!(
+                    "({}).address()",
+                    self.place_argument(argument_ids, 0, depth)?
+                )
+            }
+            ("NodeServer", "on_upgrade") => format!(
+                "({}).on_upgrade(&{}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?
+            ),
+            ("NodeServer", "close") => format!(
+                "({}).close({})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            // --- NodeAddress ---
+            ("NodeAddress", "port") => {
+                format!("({}).port()", self.place_argument(argument_ids, 0, depth)?)
+            }
+            // --- NodeRequest ---
+            ("NodeRequest", "url") => {
+                format!("({}).url()", self.place_argument(argument_ids, 0, depth)?)
+            }
+            ("NodeRequest", "method") => {
+                format!(
+                    "({}).method()",
+                    self.place_argument(argument_ids, 0, depth)?
+                )
+            }
+            // --- NodeResponse ---
+            ("NodeResponse", "set_status_code") => format!(
+                "({}).set_status_code({})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            ("NodeResponse", "set_header_raw") => format!(
+                "({}).set_header(&{}, &{})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?
+            ),
+            ("NodeResponse", "end") => format!(
+                "({}).end(&{})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            ("NodeResponse", "end_bytes") => format!(
+                "({}).end_bytes(&{})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            ("NodeResponse", "write") => format!(
+                "({}).write(&{})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            ("NodeResponse", "on_event") => format!(
+                "({}).on_event(&{}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?
+            ),
+            // --- NodeSocket ---
+            ("NodeSocket", "write_text") => format!(
+                "({}).write_text(&{})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            ("NodeSocket", "write_bytes") => format!(
+                "({}).write_bytes(&{})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            ("NodeSocket", "on_bytes") => format!(
+                "({}).on_bytes(&{}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?
+            ),
+            ("NodeSocket", "on_signal") => format!(
+                "({}).on_signal(&{}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?
+            ),
+            ("NodeSocket", "set_timeout") => format!(
+                "({}).set_timeout({})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            ("NodeSocket", "destroy") => {
+                format!(
+                    "({}).destroy()",
+                    self.place_argument(argument_ids, 0, depth)?
+                )
+            }
+            ("NodeSocket", "destroyed") => format!(
+                "({}).destroyed()",
+                self.place_argument(argument_ids, 0, depth)?
+            ),
+            _ => return Ok(None),
+        };
+        Ok(Some(rendered))
+    }
+
+    /// The host type an `[extern(method|get|set)]`'s RECEIVER is declared at —
+    /// the discriminator [`Emitter::http_host_binding`] keys on.
+    ///
+    /// Read off the declaration's own `self` parameter rather than off the
+    /// receiver EXPRESSION at the call site, so it is a static fact about the
+    /// binding and cannot be confused by a generic call or by an inference that
+    /// has not landed.
+    fn host_receiver_type(&self, target: Id) -> Option<&'src str> {
+        let external = self.program.external_functions.get(&target)?;
+        let first = external.parameters.first()?;
+        let parameter = self.program.parameters.get(first)?;
+        match self.resolve(parameter.type_id)? {
+            Type::Struct(id, _) => self
+                .program
+                .structs
+                .get(id)
+                .filter(|declaration| declaration.external)
+                .map(|declaration| declaration.name),
+            _ => None,
+        }
     }
 
     /// An `async || T` argument as a pinned future — the shape the executor's
@@ -4761,6 +5038,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 &function_call.argument_ids,
                 depth,
                 span,
+            )? {
+                return Ok(rendered);
+            }
+            // F18: and the HTTP surface has native bodies in `vilan_rt::http`.
+            if let Some(rendered) = self.http_host_binding(
+                target,
+                binding.as_ref(),
+                &function_call.argument_ids,
+                depth,
             )? {
                 return Ok(rendered);
             }
@@ -5452,6 +5738,27 @@ fn scalar_type(name: &str) -> Option<&'static str> {
         "f32" => "f32",
         "f64" => "f64",
         "str" => "vilan_rt::Str",
+        _ => return None,
+    })
+}
+
+/// F18: the `external struct`s `std::http` declares over `node:http`, and the
+/// `vilan_rt::http` type that IS each one.
+///
+/// A name table rather than a per-declaration marker, for the reason the
+/// executor's four handles are one: these are host types, so nothing in the
+/// source says what they are made of, and the mapping is the whole of what the
+/// backend knows about them. `NodeAddress` is `std::http`'s private
+/// `address()` result; `Bytes` is `std::bytes`'s, and it is here because the
+/// HTTP surface is the first thing that needs one.
+fn http_host_type(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "NodeServer" => "vilan_rt::http::Server",
+        "NodeAddress" => "vilan_rt::http::Address",
+        "NodeRequest" => "vilan_rt::http::Request",
+        "NodeResponse" => "vilan_rt::http::Response",
+        "NodeSocket" => "vilan_rt::http::Socket",
+        "Bytes" => "vilan_rt::http::Bytes",
         _ => return None,
     })
 }

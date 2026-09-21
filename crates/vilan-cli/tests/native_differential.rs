@@ -701,6 +701,142 @@ const CONTEXT_PROBE: &str = concat!(
     "}\n",
 );
 
+/// A destructuring `let` means the same thing on both backends (F18).
+///
+/// `std::http`'s response loop is what wanted it — `for header in
+/// response.headers { let (name, value) = header; .. }` — and the emitter
+/// refused the form by name. It is not an HTTP construct, so it is pinned as
+/// what it is: a tuple pattern in a `let`, nested, with a wildcard, over a
+/// binding and over a loop binder.
+#[test]
+fn a_destructuring_let_is_byte_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_destructure.vl"),
+        DESTRUCTURE_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_destructure.vl"),
+        Verdict::Identical,
+        "a destructuring `let` must mean the same thing on both backends"
+    );
+}
+
+const DESTRUCTURE_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet pair = (1, \"one\");\n",
+    "\tlet (number, word) = pair;\n",
+    "\tprint(number);\n",
+    "\tprint(word);\n",
+    "\tlet nested = ((2, 3), \"two\");\n",
+    "\tlet ((left, right), label) = nested;\n",
+    "\tprint(left + right);\n",
+    "\tprint(label);\n",
+    "\tlet (_, kept) = pair;\n",
+    "\tprint(kept);\n",
+    "\tlet rows = [(1, \"a\"), (2, \"b\")];\n",
+    "\tfor row in rows {\n",
+    "\t\tlet (index, name) = row;\n",
+    "\t\tprint(i\"{index}={name}\");\n",
+    "\t}\n",
+    "}\n",
+);
+
+/// F18 slice 1: the emitter reaches `vilan_rt::http`.
+///
+/// A `std::http` server program EMITS, and what comes out names the runtime's
+/// own calls rather than a refusal — `create_server`, the bound `listen`, the
+/// request body read, and the response's status/header/end. The exit this slice
+/// is measured against is a RUNNING native server, and it is not reached: four
+/// general emitter gaps stand between this source and rustc, each recorded in
+/// the lane's report and none of them about HTTP (an `async` closure TYPE at a
+/// struct field, a derived `PartialEq` over an `Option` of a closure, an enum
+/// payload holding a closure, and a non-`Copy` field read off a loaned
+/// receiver). So this pin holds what DOES stand: every one of the seventeen
+/// `node:http` bindings on this program's path is answered by
+/// `vilan_rt::http` and none is refused.
+///
+/// It asserts the CALLS and not merely that the emit succeeded, because an
+/// emitter that refused every binding under the census's `unimplemented!()`
+/// would also "succeed".
+#[test]
+fn a_std_http_server_emits_calls_into_the_native_runtime() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_http.vl"), HTTP_PROBE)
+        .expect("write the probe program");
+    let output = vilan(&staged)
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_http.vl",
+        ])
+        .output()
+        .expect("build the probe");
+    assert!(
+        output.status.success(),
+        "the http probe was refused:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let source = String::from_utf8_lossy(&output.stdout);
+    for needle in [
+        "vilan_rt::http::create_server",
+        "vilan_rt::http::read_request_bytes",
+        ").listen(",
+        ").address()",
+        ").port()",
+        ").set_status_code(",
+        ").set_header(",
+        ").end(",
+        ").end_bytes(",
+        "vilan_rt::http::Request",
+        "vilan_rt::http::Response",
+        "vilan_rt::http::Bytes",
+    ] {
+        assert!(
+            source.contains(needle),
+            "the emitted server must reach `{needle}`:\n{source}"
+        );
+    }
+    assert!(
+        !source.contains("unimplemented!()"),
+        "a build emit must never carry a census placeholder:\n{source}"
+    );
+}
+
+/// A `std::http` server built from the struct directly, which is the smallest
+/// program that reaches the whole `node:http` surface `Server::start` binds.
+///
+/// `Server::builder()` is the shipped spelling and it is NOT used here: its
+/// `build()` folds the rpc service list, which sorts (a backed enum plus the
+/// `ListSortBy` intrinsic, both other lanes' items) and reaches `serve_build`'s
+/// conditional-GET arm (`std::json`'s host type, Order 40's). The literal
+/// reaches the same server.
+const HTTP_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::http::{ Server, Response };\n",
+    "import std::option::Option::None;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet server = Server {\n",
+    "\t\tport = 0,\n",
+    "\t\trequest_handler = |request| Response::builder()\n",
+    "\t\t\t.set_header(\"Content-Type\", \"text/plain\")\n",
+    "\t\t\t.body(\"hello\\n\")\n",
+    "\t\t\t.build(),\n",
+    "\t\ton_start = |started| print(i\"vilan-test-port={started.port()}\"),\n",
+    "\t\ton_stop = |stopped| {},\n",
+    "\t\tupgrade_handler = None,\n",
+    "\t\tnode = None,\n",
+    "\t};\n",
+    "\tserver.start();\n",
+    "}\n",
+);
+
 /// S1b's monomorphisation, held to the shape rather than to one program: a
 /// generic function, a generic struct and a generic enum each emit ONE Rust
 /// item per instantiation, and two instantiations of one declaration are two
