@@ -4,9 +4,15 @@
 //! Nothing here is speculative. Every item is something `native-apps.md`'s probe
 //! either used or had to hand-write, and the scope is the one S1a was ruled to:
 //! structs, enums, `Option`/`Result`, `str`, `List`, `Map`/`Set`, closures,
-//! `impl`s, `print`, `panic`, and the counted cell. **No async, no UI, no rpc,
-//! no filesystem, no platform surface** — those are later slices, and the
-//! executor J6 needs is a design, not code, in this one.
+//! `impl`s, `print`, `panic`, and the counted cell. **No UI, no rpc, no
+//! filesystem, no platform surface** — those are later slices.
+//!
+//! Order 38 added the one exception to that list: [`executor`], the
+//! single-threaded executor `async` code runs on (tracker J6, designed in
+//! `native-apps.md` §10 and built against `transformer.rs::helper_source` as
+//! its contract). It is a module rather than a crate because it links the same
+//! way the rest of this runtime does and shares [`Str`], [`panic_with`] and the
+//! panic-payload reading with it.
 //!
 //! # The contract this crate actually has to keep
 //!
@@ -28,6 +34,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::rc;
 use std::rc::Rc;
+
+pub mod executor;
 
 // ---------------------------------------------------------------- strings ---
 
