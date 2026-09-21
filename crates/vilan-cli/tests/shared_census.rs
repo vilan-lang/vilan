@@ -36,7 +36,11 @@ use std::path::{Path, PathBuf};
 /// `rpc.vl` each construct two cells on one line in places.
 const CENSUS: &[(&str, usize, &str)] = &[
     ("browser/router.vl", 1, "R: the module-level `wired` latch"),
-    ("browser/ui.vl", 21, "O: per-boundary row/owner bookkeeping"),
+    (
+        "browser/ui.vl",
+        24,
+        "O: per-boundary row/owner bookkeeping (+3 at Order 39: `when_some`'s row, owner and payload cell — A119)",
+    ),
     (
         "memo.vl",
         1,
@@ -185,7 +189,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 125,
+        total, 128,
         "the total number of `Shared` construction sites in std changed"
     );
 
