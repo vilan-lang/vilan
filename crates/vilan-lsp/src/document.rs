@@ -13776,13 +13776,21 @@ pub(crate) mod tests {
     }
 
     // E9: a parameter's `context` clause renders in the hovered signature.
+    //
+    // The fixture takes `hover_at_marker` (below), not `hover_at_cursor`: the
+    // latter's `replace('|', "")` strips a closure type's own pipes too, so
+    // this pin used to analyze `fun with_owner(body: ( void) context
+    // owner_scope)` and assert a clause that could only have come from the
+    // stale per-parameter append E207 deleted — vacuous in exactly the shape it
+    // was built to guard (an E207 FIND).
     #[test]
     fn hover_renders_a_parameters_context_clause() {
-        let hover = hover_at_cursor(
-            "import std::reactive::{ owner_scope, Owner };\n\nfun with_o|wner(body: (|| void) context owner_scope) {\n\tlet _b = body;\n}\n\nfun main() {}\n",
+        let hover = hover_at_marker(
+            "import std::reactive::{ owner_scope, Owner };\n\nfun with_o¦wner(body: (|| void) context owner_scope) {\n\tlet _b = body;\n}\n\nfun main() {}\n",
+            '¦',
         )
         .expect("hover on the declaration");
-        assert!(hover.contains("context owner_scope"), "{hover}");
+        assert!(hover.contains("(|| void) context owner_scope"), "{hover}");
     }
 
     // B242: a `fun`'s DECLARED `context` clause renders in its hovered
@@ -13794,6 +13802,115 @@ pub(crate) mod tests {
         )
         .expect("hover on the declaration");
         assert!(hover.contains("context settings"), "{hover}");
+    }
+
+    // --- E207: a `context` clause renders EXACTLY ONCE ----------------------
+    //
+    // Why the two pins above did not catch the doubling: both assert
+    // `contains`, and a label reading `(|| void) context owner_scope context
+    // owner_scope` satisfies `contains("context owner_scope")` perfectly well.
+    // Every pin below COUNTS the clause instead. The defect (analyzer.rs's
+    // `function_signature_label_for`) appended
+    // `context_clause_label(parameter_contexts[parameter])` after a parameter's
+    // type label, which since B309 already prints the clause as part of the
+    // closure TYPE's own form — one written annotation, two channels.
+
+    /// [`hover_at_cursor`] with an explicit cursor marker, for the reason
+    /// [`completions_at_marker`] has one: these fixtures carry closure types,
+    /// whose `|` the default marker would claim (and `hover_at_cursor`'s
+    /// `replace('|', "")` would strip every one of them).
+    fn hover_at_marker(src: &str, marker: char) -> Option<String> {
+        let offset = src
+            .find(marker)
+            .unwrap_or_else(|| panic!("test source needs a `{marker}` cursor marker"));
+        let text = src.replace(marker, "");
+        let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
+        document.hover(offset)
+    }
+
+    /// How many times `needle` occurs in `haystack` — the assertion E207 owes,
+    /// where `contains` is what let the bug ship.
+    fn occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
+    #[test]
+    fn e207_a_parameters_context_clause_renders_exactly_once() {
+        let hover = hover_at_marker(
+            "import std::reactive::{ owner_scope, Owner };\n\nfun with_owner¦(body: (|| void) context owner_scope) {\n\tlet _b = body;\n}\n\nfun main() {}\n",
+            '¦',
+        )
+        .expect("hover on the declaration");
+        assert_eq!(
+            occurrences(&hover, "context owner_scope"),
+            1,
+            "the clause is a property of the TYPE (B309) and prints with it: {hover}"
+        );
+    }
+
+    #[test]
+    fn e207_a_multi_context_clause_renders_exactly_once() {
+        let hover = hover_at_marker(
+            "import std::context::Context;\n\nlet a_ctx: Context<i32> = Context::new();\nlet b_ctx: Context<i32> = Context::new();\n\nfun run_both¦(body: (|| void) context (a_ctx, b_ctx)) {\n\tlet _b = body;\n}\n\nfun main() {}\n",
+            '¦',
+        )
+        .expect("hover on the declaration");
+        assert_eq!(occurrences(&hover, "context (a_ctx, b_ctx)"), 1, "{hover}");
+    }
+
+    #[test]
+    fn e207_a_declared_function_context_clause_renders_exactly_once() {
+        // B242's channel — `declared_function_contexts`, not
+        // `parameter_contexts` — asserted by count for the same reason.
+        let hover = hover_at_cursor(
+            "import std::context::Context;\n\nlet settings: Context<i32> = Context::new();\n\nfun ren|der(x: i32): i32 context settings {\n\tsettings.get() + x\n}\n\nfun main() {}\n",
+        )
+        .expect("hover on the declaration");
+        assert_eq!(occurrences(&hover, "context settings"), 1, "{hover}");
+    }
+
+    #[test]
+    fn e207_a_binding_holding_an_injected_closure_renders_its_clause_once() {
+        // The OTHER `parameter_contexts` owner: a `let` with a clause-carrying
+        // closure type. Its hover has always gone through the type's printed
+        // form alone, and the pin holds that.
+        let hover = hover_at_marker(
+            "import std::reactive::{ owner_scope, Owner };\n\nfun main() {\n\tlet held¦: (|| void) context owner_scope = || {};\n\tlet _h = held;\n}\n",
+            '¦',
+        )
+        .expect("hover on the binding");
+        assert_eq!(occurrences(&hover, "context owner_scope"), 1, "{hover}");
+    }
+
+    #[test]
+    fn e207_a_struct_field_of_closure_type_renders_its_clause_once() {
+        // A field has no declaration id in `parameter_contexts` at all (B309's
+        // record moved onto the type precisely because a field, a return and a
+        // generic argument have no owner), so this is the channel the fix keeps.
+        let hover = hover_at_marker(
+            "import std::reactive::{ owner_scope, Owner };\n\nstruct Holder {\n\tbody¦: (|| void) context owner_scope,\n}\n\nfun main() {}\n",
+            '¦',
+        )
+        .expect("hover on the field declaration");
+        assert_eq!(occurrences(&hover, "context owner_scope"), 1, "{hover}");
+    }
+
+    #[test]
+    fn e207_a_completion_detail_renders_the_clause_once() {
+        // Completion's `detail` line is the other consumer of the same label
+        // (the server has no signature-help popup — `docs/appendix/editor.md`
+        // "What it does not have" — so hover and this line are the whole of
+        // where a signature reaches a reader).
+        let items = completion_items_at_marker(
+            "import std::reactive::{ owner_scope, Owner };\n\nfun with_owner(body: (|| void) context owner_scope) {\n\tlet _b = body;\n}\n\nfun main() {\n\twith_ow¦\n}\n",
+            '¦',
+        );
+        let detail = items
+            .iter()
+            .find(|item| item.label == "with_owner")
+            .and_then(|item| item.detail.clone())
+            .expect("the candidate carries a detail line");
+        assert_eq!(occurrences(&detail, "context owner_scope"), 1, "{detail}");
     }
 
     // std is documented with `///` (user decision): hovering a std function

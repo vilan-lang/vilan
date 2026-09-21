@@ -3962,7 +3962,12 @@ pub struct Analyzer<'src> {
     prepped_number_literals: Vec<Id>,
     // `context`-typed closure parameters (proposal/ambient-owner.md §5):
     // parameter entity -> the context bindings its clause names, in written
-    // order (the hidden-argument order). The context pass consumes this.
+    // order (the hidden-argument order). The CONTEXT PASS is its only consumer
+    // — it asks "does this parameter or binding hold an injected closure?",
+    // which is a question about an entity and not about a type. It is not a
+    // label channel: the clause's printed form belongs to the closure TYPE
+    // (B309), and the per-parameter hover append that read this index printed
+    // the clause a second time (E207).
     parameter_contexts: HashMap<Id, Vec<Id>>,
     // Clause sites awaiting post-import resolution: the names may be
     // IMPORTED bindings, which only resolve after the import fixpoint —
@@ -19125,18 +19130,22 @@ impl<'src> Analyzer<'src> {
                 // reason `...` does (lazy.md §5, "hover renders `lazy` in
                 // signatures like the other effect surface"): it tells a reader
                 // whether their argument runs here or inside the callee.
-                let mut label = format!(
+                let label = format!(
                     "{}{}{}: {}",
                     if parameter.lazy { "lazy " } else { "" },
                     if parameter.spread { "..." } else { "" },
                     parameter.name,
                     self.declaration_type_label_for(parameter.type_id, subject)
                 );
-                // A `context` clause is part of the signature's contract —
-                // render it (E9: hover shows clauses).
-                if let Some(contexts) = self.parameter_contexts.get(parameter_id) {
-                    label.push_str(&self.context_clause_label(contexts));
-                }
+                // A `context` clause is part of the signature's contract, and
+                // `declaration_type_label_for` has already rendered it: since
+                // B309 the clause is a property of the closure TYPE
+                // (`Type::Closure`'s third slot), so it prints wherever that
+                // type does. E9's original per-parameter append lived here and
+                // printed it a SECOND time, bare, after the parenthesized
+                // one — `body: (|| void) context owner_scope context
+                // owner_scope` (E207). Nothing is appended now; the entity-keyed
+                // `parameter_contexts` index answers the context pass alone.
                 parameters.push(label);
             }
         }
@@ -50681,6 +50690,10 @@ pub struct Program<'src> {
     pub division_generic_lhs: HashMap<Id, TypeId>,
     /// `context`-typed closure parameters (proposal/ambient-owner.md §5):
     /// parameter entity -> the named context bindings, in clause order.
+    ///
+    /// Read by the context pass (`context.rs`) and by nothing that renders: a
+    /// clause's printed form is the closure type's (B309), so a reader after a
+    /// LABEL wants `pretty_print_type_at`, not this (E207).
     pub parameter_contexts: HashMap<Id, Vec<Id>>,
     /// B242: the contexts each `fun` DECLARES (`fun f(x: f64) context settings`),
     /// keyed by the function's entity, in written order.
