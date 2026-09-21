@@ -23,10 +23,14 @@
 //! 1. **The index is well formed.** Rows ascend, none repeats, every key has a
 //!    literal fragment to search for (the two recorded exceptions below).
 //! 2. **Every row still lives** ([`every_indexed_row_still_lives_in_the_tree`]).
-//!    A key is split on its `{...}` slots and `...` elisions and its longest
-//!    literal fragment is searched, fixed-string, over the compiler sources and
-//!    `vilan/std`. A reworded or deleted message reds the row that keys on it.
-//!    This is the L13 re-key, run by the suite instead of by a lane.
+//!    A key is split on its `{...}` slots and `...` elisions and EVERY literal
+//!    fragment of [`MIN_FRAGMENT`] characters or more is searched,
+//!    fixed-string, over the compiler sources and `vilan/std`. A reworded or
+//!    deleted message reds the row that keys on it. This is the L13 re-key, run
+//!    by the suite instead of by a lane. It searched only the LONGEST fragment
+//!    until Order 38 (N100), which left the middle and the tail of 288 of the
+//!    532 rows held by nothing — see [`missing_fragments`] for the widening and
+//!    for why the needle is normalized.
 //! 3. **Every diagnostic is rowed**
 //!    ([`every_diagnostic_the_compiler_builds_is_indexed`]). Three anchor
 //!    families are enumerated in full — every `Error { .. msg: <literal> }` in
@@ -98,7 +102,9 @@
 //!   message))` — a variable, not a literal, so the walk reads nothing there,
 //!   exactly as it reads nothing at a helper-built `msg:`. The largest of those
 //!   is `asset::staged`'s "reads the registry AFTER evaluation has finished",
-//!   which is unrowed at this sha and is filed.
+//!   and N99 rowed it by hand through [`ROWS_THE_ENUMERATION_CANNOT_REACH`] —
+//!   with the one unrowed corner of the `[derive]` family, whose other five
+//!   corners had rows.
 //! - **The `unsupported` family is rowed on its SUBJECT, not on its sentence.**
 //!   `Failure::unsupported` composes `"{what} is not available at expansion
 //!   time"`, and the two halves live apart, so the envelope has a row of its
@@ -298,6 +304,37 @@ const ROWS_THE_ENUMERATION_CANNOT_REACH: &[(&str, &str)] = &[
     (
         "`-` negates a number, and `{label}` is a trait: no trait names",
         "`-`'s trait-typed arm",
+    ),
+    // N99's two, and they are the two OTHER shapes this walk cannot read —
+    // neither is a `let msg` ladder arm.
+    //
+    // The first is the family the header's "a `Failure` built from a
+    // `Result<_, String>`" paragraph describes, and the largest member of it: a
+    // const-channel helper returns `Err(String)` and the caller re-wraps it at
+    // `Err(message) => Err(Failure::new(.., message))`. `failure_messages`
+    // reads the literal written as `Failure::new`'s SECOND ARGUMENT, and there
+    // the second argument is a binding, so the sentence at
+    // `const_eval.rs`'s `staged` is read by nothing. It is the one a user
+    // actually reaches — an `asset::staged` call from a `const` expression
+    // rather than from `asset::schedule_at_end`'s callback — and it shipped
+    // unrowed.
+    (
+        "`asset::staged` reads the registry AFTER evaluation has finished, and \
+         this build is still evaluating",
+        "the const channel's staging-registry refusal, re-wrapped from a \
+         helper's `Err(String)` (`const_eval.rs`)",
+    ),
+    // The second is a `let msg = if … else …` handed over by field shorthand,
+    // like the ladders above — except that its SIBLING arm is rowed (434) and
+    // it was not, which is how it hid: the `[derive]` family looked covered.
+    // Both `[service]` arms (161, 418) and both `macro_std`-missing arms (542,
+    // 543) are rowed too, so this was the one unrowed corner of a family whose
+    // other five corners had rows.
+    (
+        "`[derive({name})]` expanded before std's `{module}` declared",
+        "the derive load-ordering arm — a std that HAS the module reaching the \
+         expansion unregistered, which is B21's class and a compiler bug \
+         (`macros.rs`)",
     ),
 ];
 
@@ -651,26 +688,78 @@ fn walk(directory: &Path, extension: &str, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Every source a diagnostic's text can live in: the compiler crates and the
+/// Every crate of the workspace, as the repository-relative path the root
+/// `Cargo.toml` lists — read from that file rather than copied (N104).
+///
+/// The list used to be four names written here, and a crate absent from it is
+/// INVISIBLE to the whole file: its messages are not enumerated by check (3),
+/// and check (2) cannot find a key that lives in it, so a row keyed on one of
+/// its sentences reads as stale. `vilan-rust` landed in Order 37 carrying
+/// user-facing refusals and was outside the walk until somebody noticed;
+/// `vilan-rt` and `vilan-ide` are still outside it as far as this list was
+/// concerned. Deriving it means the next crate is walked on the day it joins
+/// the workspace, and [`every_workspace_crate_is_walked`] holds the derivation
+/// to the manifest in case the manifest's shape changes under it.
+fn workspace_crates() -> Vec<PathBuf> {
+    let manifest = read("Cargo.toml");
+    let (_, after) = manifest
+        .split_once("members = [")
+        .expect("the root manifest declares `members = [`");
+    let (list, _) = after
+        .split_once(']')
+        .expect("the members list is closed on the same table");
+    let root = repository_root();
+    let mut crates = Vec::new();
+    for line in list.lines() {
+        let trimmed = line.trim();
+        // The list carries comments; a member is a quoted path.
+        let Some(opened) = trimmed.strip_prefix('"') else {
+            continue;
+        };
+        let Some((member, _)) = opened.split_once('"') else {
+            continue;
+        };
+        crates.push(root.join(member));
+    }
+    assert!(
+        crates.len() >= 8,
+        "the workspace members list read as {} crate(s), which is fewer than \
+         the workspace has ever had — the manifest's shape moved under \
+         `workspace_crates`",
+        crates.len()
+    );
+    crates
+}
+
+/// Every source a diagnostic's text can live in: the workspace's crates and the
 /// standard library (whose runtime refusals the ledger rows from 230 on).
 fn message_sources() -> Vec<PathBuf> {
     let root = repository_root();
     let mut paths = Vec::new();
-    for crate_directory in [
-        "vilan-core",
-        "vilan-cli",
-        "vilan-lsp",
-        "vilan-wasm",
-        "vilan-rust",
-    ] {
-        walk(
-            &root.join("crates").join(crate_directory).join("src"),
-            "rs",
-            &mut paths,
-        );
+    for crate_directory in workspace_crates() {
+        walk(&crate_directory.join("src"), "rs", &mut paths);
     }
     walk(&root.join("vilan/std/src"), "vl", &mut paths);
     walk(&root.join("vilan/macro_std"), "vl", &mut paths);
+    paths
+}
+
+/// Every Rust source the swallowed-continuation gate walks (N98): all eight
+/// workspace crates, `src/` AND `tests/`.
+///
+/// Wider than [`message_sources`] on purpose. The class this looks for is an
+/// artifact of EDITING a literal, not of printing one, so it does not care
+/// whether the literal is a diagnostic: the three sites that founded the item
+/// are a clippy `#[allow(.., reason = "…")]`, an assertion message and a `.vl`
+/// program const, and the last two are read by a maintainer rather than a user.
+/// `tests/` is where most of the class lives, because that is where the `.vl`
+/// program consts are.
+fn rust_sources() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for crate_directory in workspace_crates() {
+        walk(&crate_directory.join("src"), "rs", &mut paths);
+        walk(&crate_directory.join("tests"), "rs", &mut paths);
+    }
     paths
 }
 
@@ -836,6 +925,34 @@ fn fragments(key: &str) -> Vec<String> {
 
 fn longest_fragment(key: &str) -> Option<String> {
     fragments(key).into_iter().max_by_key(|f| f.chars().count())
+}
+
+/// The fragments of `key` that [`source_blob`] does not carry — check (2),
+/// widened by N100 from the LONGEST fragment to EVERY one of them.
+///
+/// Until this order the search took `longest_fragment` alone, so a reword
+/// inside any shorter run left its row green: 288 of the index's 532 rows carry
+/// more than one searchable fragment, which is 54 % of the ledger whose middle
+/// and tail were held by nothing. Widening costs nothing — the blob is built
+/// once and a `contains` is a scan — and it is the only half of check (2) that
+/// was ever weaker than its own doc comment claimed ("its literal runs appear
+/// in order").
+///
+/// The needle is [`normalized`] the same way the haystack was, and that is not
+/// cosmetic. A key is written in the FORMAT-STRING spelling of the message it
+/// records — `{name}` for a slot, `{{` for one literal brace — because check
+/// (3) matches it against the literal as WRITTEN at its site. `source_blob`
+/// collapses `{{` to `{`, so a needle carrying the doubled brace matches
+/// nothing. Exactly two rows spell one (494 and 499, the marked-import steer
+/// `import {module}::{{ #{leaf} }};`), and they were the only two rows the
+/// widening would have reddened: not a wrong key — a needle nobody had
+/// prepared. Normalizing AFTER [`pieces`] has split the key is what keeps the
+/// doubled brace from being read as a slot on the way in.
+fn missing_fragments(key: &str, blob: &str) -> Vec<String> {
+    fragments(key)
+        .into_iter()
+        .filter(|fragment| !blob.contains(&normalized(fragment)))
+        .collect()
 }
 
 /// Whether `key` describes `message`: its literal runs appear in order from the
@@ -1073,6 +1190,321 @@ fn failure_messages(path: &Path) -> Vec<Site> {
     sites
 }
 
+// --- The swallowed-continuation scan (N98) ---------------------------------
+
+/// A mid-sentence run this long inside one line of a literal is indentation
+/// that lost its `\`. Nothing in this tree writes eight spaces between two
+/// words on purpose.
+///
+/// Eight, measured rather than guessed. Every run of three or more spaces in
+/// every escaped literal of every crate was counted: the 3–7 band is 57 sites
+/// and every one of them is a COLUMN — `Fresh   {}`, `ok   - {claim}`,
+/// `input   {}`, a report table's label, a `.vl` program const's aligned
+/// trailing comment — while the 8-and-over band is the class, plus two sites
+/// that are not prose at all and are named in [`RUNS_THAT_ARE_DELIBERATE`].
+/// The residue is stated where the header states what a green does not say:
+/// a continuation swallowed from a two-level indent leaves four spaces, and
+/// four spaces is under the floor. Both thresholds here are a floor on a
+/// measured gap, exactly as N94's three is.
+const PROSE_RUN: usize = 8;
+
+/// A LINE-LEADING run this long, in a literal whose other lines start flush,
+/// is the same artifact seen from the other side (the `.vl` program consts).
+///
+/// Five, for the same kind of reason. A `.vl` program const written flush-left
+/// indents its bodies with tabs (AGENTS.md's rule) or with four spaces per
+/// level; the genuine sites run 5, 9, 13, 17, 18 and 27 — none of them a
+/// multiple of four, because a swallowed continuation carries the RUST file's
+/// indentation, not the program's. Four and below is left alone: it is where
+/// the legitimate four-space program bodies live (34 sites), and telling them
+/// apart would need a parse rather than a rule.
+const LEADING_RUN: usize = 5;
+
+/// One swallowed continuation: where it is, which rule caught it, and the line
+/// of the literal's own text that carries it.
+struct Swallow {
+    file: String,
+    line: usize,
+    rule: &'static str,
+    run: usize,
+    excerpt: String,
+}
+
+/// Whether a raw string literal opens at `index`, and (body start, hash count)
+/// if it does. `r"…"`, `r#"…"#`, `br"…"` — at a word boundary, so the `r` of
+/// `for` is not one.
+fn raw_string_opener(chars: &[char], index: usize) -> Option<(usize, usize)> {
+    if chars[index] != 'r' {
+        return None;
+    }
+    let mut boundary = index;
+    if boundary > 0 && chars[boundary - 1] == 'b' {
+        boundary -= 1;
+    }
+    if boundary > 0 && (chars[boundary - 1].is_alphanumeric() || chars[boundary - 1] == '_') {
+        return None;
+    }
+    let mut cursor = index + 1;
+    let mut hashes = 0usize;
+    while chars.get(cursor) == Some(&'#') {
+        hashes += 1;
+        cursor += 1;
+    }
+    if chars.get(cursor) != Some(&'"') {
+        return None;
+    }
+    Some((cursor + 1, hashes))
+}
+
+/// Every ESCAPED string literal in `text`, as `(line, value)`.
+///
+/// Raw strings are stepped over rather than read, and that is not a shortcut:
+/// a raw string has no escapes, so it never carried a `\`-continuation and the
+/// class cannot exist in one. (It is also where the tree's deliberately
+/// aligned `.vl` program consts live, which is why reading them would cost an
+/// exemption list of a hundred entries and buy nothing.) Comments and
+/// character literals are stepped over so that a `"` inside either does not
+/// open a literal — a lifetime (`&'a str`) is the shape that breaks a naive
+/// scan.
+fn escaped_string_literals(text: &str) -> Vec<(usize, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut line = 1usize;
+    let mut index = 0usize;
+    while index < chars.len() {
+        match chars[index] {
+            '\n' => {
+                line += 1;
+                index += 1;
+            }
+            '/' if chars.get(index + 1) == Some(&'/') => {
+                while index < chars.len() && chars[index] != '\n' {
+                    index += 1;
+                }
+            }
+            '/' if chars.get(index + 1) == Some(&'*') => {
+                let mut depth = 1usize;
+                index += 2;
+                while index < chars.len() && depth > 0 {
+                    if chars[index] == '\n' {
+                        line += 1;
+                    }
+                    if chars[index] == '/' && chars.get(index + 1) == Some(&'*') {
+                        depth += 1;
+                        index += 2;
+                    } else if chars[index] == '*' && chars.get(index + 1) == Some(&'/') {
+                        depth -= 1;
+                        index += 2;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            '\'' => {
+                // A character literal, or a lifetime. Either way nothing in it
+                // opens a string.
+                if chars.get(index + 1) == Some(&'\\') {
+                    index += 2;
+                    while index < chars.len() && chars[index] != '\'' {
+                        index += 1;
+                    }
+                    index += 1;
+                } else if chars.get(index + 2) == Some(&'\'') {
+                    index += 3;
+                } else {
+                    index += 1;
+                }
+            }
+            'r' if raw_string_opener(&chars, index).is_some() => {
+                let (body, hashes) = raw_string_opener(&chars, index).expect("just matched");
+                let close: String = std::iter::once('"')
+                    .chain(std::iter::repeat_n('#', hashes))
+                    .collect();
+                let closing: Vec<char> = close.chars().collect();
+                let mut cursor = body;
+                while cursor < chars.len() && !chars[cursor..].starts_with(closing.as_slice()) {
+                    if chars[cursor] == '\n' {
+                        line += 1;
+                    }
+                    cursor += 1;
+                }
+                index = (cursor + closing.len()).min(chars.len());
+            }
+            '"' => {
+                let start_line = line;
+                let mut cursor = index + 1;
+                // Count the source lines the literal spans, whether they are
+                // reached by a `\`-continuation or by a raw newline.
+                while cursor < chars.len() {
+                    match chars[cursor] {
+                        '\\' if cursor + 1 < chars.len() => {
+                            if chars[cursor + 1] == '\n' {
+                                line += 1;
+                            }
+                            cursor += 2;
+                        }
+                        '"' => break,
+                        '\n' => {
+                            line += 1;
+                            cursor += 1;
+                        }
+                        _ => cursor += 1,
+                    }
+                }
+                if let Some((value, end)) = string_literal(&chars, index) {
+                    out.push((start_line, value));
+                    index = end;
+                } else {
+                    index += 1;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    out
+}
+
+/// Whether `line` is a DRAWING rather than a sentence: it carries no ASCII
+/// letter at all.
+///
+/// `vilan upgrade`'s banner is eleven lines of box-drawing characters whose
+/// runs of spaces are the picture, and a gate that has to list them one by one
+/// is a gate with a list of pictures in it. "No letters, so no words, so no
+/// sentence to have swallowed anything" is the rule instead — narrow enough
+/// that every genuine site in the tree keeps its letters.
+fn is_a_drawing(line: &str) -> bool {
+    !line
+        .chars()
+        .any(|character| character.is_ascii_alphabetic())
+}
+
+/// `line` with its own indentation removed — where indentation counts a
+/// LEADING FORMAT SLOT as part of itself.
+///
+/// The slot is why. A `format!` that opens with a prelude and continues
+/// `"{PRELUDE}        fun main() { .. }"` is indenting its own text to the
+/// prelude's level: the newline that makes the run line-leading lives inside
+/// the interpolated value, so statically the run sits mid-line while at
+/// runtime it is the indentation of a fresh line. `generics.rs`'s
+/// `await_postfix_program` is that shape, and it was the mid-sentence rule's
+/// only false positive over the whole workspace. A slot in the MIDDLE of a
+/// line is not this: only a leading one can stand for a newline nothing can
+/// see.
+fn after_the_lines_own_indentation(line: &str) -> &str {
+    let mut rest = line.trim_start_matches([' ', '\t']);
+    while rest.starts_with('{') {
+        let Some(closed) = rest.find('}') else { break };
+        rest = rest[closed + 1..].trim_start_matches([' ', '\t']);
+    }
+    rest
+}
+
+/// Every swallowed continuation the two rules find, exemptions NOT applied —
+/// so [`every_deliberate_run_is_still_written`] can ask which entry suppresses
+/// what.
+fn swallowed_continuations() -> Vec<Swallow> {
+    let mut found = Vec::new();
+    for path in rust_sources() {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("?")
+            .to_string();
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        for (line, value) in escaped_string_literals(&text) {
+            let lines: Vec<&str> = value.split('\n').collect();
+            // Rule A: a run of spaces MID-SENTENCE. The line's own leading
+            // whitespace is not mid-sentence, and a run that opens a trailing
+            // `//` comment is a `.vl` program const's alignment.
+            for text_of_line in &lines {
+                let body = after_the_lines_own_indentation(text_of_line);
+                if is_a_drawing(body) {
+                    continue;
+                }
+                let mut offset = 0usize;
+                while let Some(at) = body[offset..].find(" ".repeat(PROSE_RUN).as_str()) {
+                    let start = offset + at;
+                    let run = body[start..].chars().take_while(|c| *c == ' ').count();
+                    if !body[start + run..].starts_with("//") {
+                        found.push(Swallow {
+                            file: name.clone(),
+                            line,
+                            rule: "mid-sentence",
+                            run,
+                            excerpt: body.trim().to_string(),
+                        });
+                        break;
+                    }
+                    offset = start + run;
+                }
+            }
+            // Rule B: a LINE-LEADING run, in a literal whose other lines start
+            // flush. A program const indented as a whole is not this; one
+            // line pushed inward while its neighbours sit at column zero is.
+            let substantial: Vec<&&str> = lines
+                .iter()
+                .filter(|text_of_line| !text_of_line.trim().is_empty())
+                .collect();
+            let flush_after_the_first = substantial
+                .iter()
+                .skip(1)
+                .any(|text_of_line| !text_of_line.starts_with([' ', '\t']));
+            if substantial.len() < 2 || !flush_after_the_first {
+                continue;
+            }
+            for text_of_line in &substantial {
+                let run = text_of_line.chars().take_while(|c| *c == ' ').count();
+                if run >= LEADING_RUN {
+                    found.push(Swallow {
+                        file: name.clone(),
+                        line,
+                        rule: "line-leading",
+                        run,
+                        excerpt: text_of_line.trim().to_string(),
+                    });
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The runs of spaces this tree writes ON PURPOSE that the two rules above
+/// cannot tell from an artifact, each by file and by a fragment of the line
+/// that carries it — with the reason.
+///
+/// Three entries, and each is a different kind of not-prose: a report COLUMN
+/// whose gap is its layout, a FIXTURE whose subject is the very shape this
+/// gate looks for, and an INPUT whose misindentation is what the test feeds
+/// the formatter. None of them is a sentence, which is why none of them can be
+/// reflowed into one.
+///
+/// [`every_deliberate_run_is_still_written`] holds each entry to a hit it
+/// actually suppresses, so an entry whose site was reflowed away reds instead
+/// of quietly subtracting a check (N42's rule, applied to this list).
+const RUNS_THAT_ARE_DELIBERATE: &[(&str, &str, &str)] = &[
+    (
+        "bindgen.rs",
+        "TODOs:",
+        "the bindgen report's own column, aligned under `members:` — the gap is \
+         the table, not a sentence",
+    ),
+    (
+        "ci_ignored_pins.rs",
+        "written across lines",
+        "the ignore-sweep FIXTURE: a `#[ignore = \"…\"]` whose reason is \
+         `\\`-continued, written as source text inside an outer literal, so the \
+         outer literal carries the continuation's indentation by construction — \
+         the scanner under test has to see exactly that",
+    ),
+    (
+        "compile.rs",
+        "let a = 1;",
+        "the misindented program `format_program` is asked to canonicalize — \
+         the six spaces beside a tab ARE the input",
+    ),
+];
+
 /// The message surface this file claims to enumerate — see the header for what
 /// it deliberately leaves out.
 fn enumerated_sites() -> Vec<Site> {
@@ -1243,20 +1675,78 @@ fn the_index_is_well_formed() {
     }
 }
 
+/// N104: every crate the workspace declares is inside this file's walks.
+///
+/// A crate the walks miss is invisible twice over — its messages escape check
+/// (3), and a row keyed on one of its sentences reads as stale in check (2) —
+/// and the miss is silent in both directions, which is how `vilan-rust`
+/// shipped user-facing refusals outside the ledger for an order. The list is
+/// derived from the root manifest now, so the question this asks is whether
+/// the DERIVATION still holds: that every member's `src/` was reached, and
+/// that the count is the count the manifest declares.
+#[test]
+fn every_workspace_crate_is_walked() {
+    let crates = workspace_crates();
+    let sources = message_sources();
+    let rust = rust_sources();
+
+    let unreached: Vec<String> = crates
+        .iter()
+        .filter(|crate_directory| {
+            let source_root = crate_directory.join("src");
+            !source_root.is_dir()
+                || !sources.iter().any(|path| path.starts_with(&source_root))
+                || !rust.iter().any(|path| path.starts_with(&source_root))
+        })
+        .map(|crate_directory| format!("  {}", crate_directory.display()))
+        .collect();
+    assert!(
+        unreached.is_empty(),
+        "{} workspace crate(s) contribute no source to the ledger's walks. A \
+         crate outside them is invisible to checks (2) and (3) both — its \
+         messages are never enumerated and a row keyed on one reads as \
+         stale:\n{}",
+        unreached.len(),
+        unreached.join("\n")
+    );
+
+    // And the derivation reaches all of them rather than the first few: the
+    // count is the manifest's, read independently of the parse above.
+    let declared = read("Cargo.toml")
+        .lines()
+        .skip_while(|line| !line.contains("members = ["))
+        .take_while(|line| !line.trim_start().starts_with(']'))
+        .filter(|line| line.trim_start().starts_with('"'))
+        .count();
+    assert_eq!(
+        crates.len(),
+        declared,
+        "`workspace_crates` read {} member(s) where the manifest declares {} — \
+         the members list's shape moved",
+        crates.len(),
+        declared
+    );
+}
+
 #[test]
 fn every_indexed_row_still_lives_in_the_tree() {
     let blob = source_blob();
     let mut stale = Vec::new();
     for row in index() {
-        let Some(fragment) = longest_fragment(&row.key) else {
+        let missing = missing_fragments(&row.key, &blob);
+        if missing.is_empty() {
             continue;
-        };
-        if !blob.contains(&fragment) {
-            stale.push(format!(
-                "  row {}: {:?}\n      not in the tree: {fragment:?}",
-                row.number, row.key
-            ));
         }
+        let named: Vec<String> = missing
+            .iter()
+            .map(|fragment| format!("{fragment:?}"))
+            .collect();
+        stale.push(format!(
+            "  row {}: {:?}\n      not in the tree: {}",
+            row.number,
+            row.key,
+            named.join(", ")
+        ));
     }
     assert!(
         stale.is_empty(),
@@ -1265,6 +1755,60 @@ fn every_indexed_row_still_lives_in_the_tree() {
          (diagnostics-standard.md §5's standing rule):\n{}",
         stale.len(),
         stale.join("\n")
+    );
+}
+
+/// N100: check (2) reds on a reword inside a fragment that is NOT the longest.
+///
+/// The fixture is built so the old search passes and the new one fails, which
+/// is the whole of what the widening bought: the long run is in the blob, the
+/// short one is not.
+#[test]
+fn n100_a_reword_of_a_fragment_that_is_not_the_longest_reds_its_row() {
+    let key = "{subject} alpha bravo charlie {member} delta echo foxtrot golf hotel";
+    let blob = "a tree that carries delta echo foxtrot golf hotel and nothing else";
+
+    let longest = longest_fragment(key).expect("the fixture key has a fragment");
+    assert_eq!(
+        longest, "delta echo foxtrot golf hotel",
+        "the fixture's longest fragment is the one the blob keeps"
+    );
+    assert!(
+        blob.contains(&longest),
+        "the fixture must keep the LONGEST fragment in the blob — otherwise the \
+         pin would red under the single-fragment search too and would prove \
+         nothing about the widening"
+    );
+    assert_eq!(
+        missing_fragments(key, blob),
+        vec!["alpha bravo charlie".to_string()],
+        "the widened search names the short run the blob does not carry"
+    );
+}
+
+/// N100's other half: a key spelling a LITERAL brace the way a format string
+/// does (`{{`) is searched as [`source_blob`] spells it (`{`).
+///
+/// Rows 494 and 499 are the two that do, both quoting B318's marked import.
+/// Without the normalization their tail fragments are needles no tree can ever
+/// hold, and the widening above would have reddened them on the day it landed.
+#[test]
+fn n100_a_key_written_with_a_doubled_brace_is_searched_as_the_blob_spells_it() {
+    let key = "reach it — `import {module}::{{ #(impl {subject}) }};` — or write `export`";
+    let blob = normalized(key);
+
+    assert!(
+        fragments(key)
+            .iter()
+            .any(|fragment| fragment.contains("}}") && !blob.contains(fragment.as_str())),
+        "the fixture must carry a doubled-brace fragment the normalized blob \
+         cannot match verbatim, or the pin proves nothing"
+    );
+    assert!(
+        missing_fragments(key, &blob).is_empty(),
+        "every fragment of a doubled-brace key is found once the needle is \
+         normalized the way the blob was: {:?}",
+        missing_fragments(key, &blob)
     );
 }
 
@@ -1375,6 +1919,80 @@ fn no_rowed_diagnostic_literal_swallows_a_line_continuation() {
          concatenated lines:\n{}",
         swallowed.len(),
         swallowed.join("\n")
+    );
+}
+
+/// N98: and the class OUTSIDE the rowed surface, which is where most of it
+/// was.
+///
+/// The gate above reaches the messages the enumeration reads and the keys the
+/// index carries. Everything else in the tree was uncovered, and three of the
+/// founding sites are exactly the everything else: a clippy
+/// `#[allow(.., reason = "…")]` whose four swallowed continuations a maintainer
+/// reads in `macros.rs`, an assertion message in `vilan-lsp`, and — the
+/// biggest family — `.vl` PROGRAM CONSTS, where the artifact is not a gap in a
+/// sentence but a line of the program pushed eighteen columns inward while its
+/// neighbours sit at column zero. Fifteen of those, across six test files and
+/// the language server's own `mod tests`, none of them noticed by anything
+/// because a program parses the same either way.
+///
+/// The gate's own doc used to argue that "every string literal in the
+/// compiler" was not a reachable target, because the aligned tables in
+/// `formatter.rs` and `bindgen.rs` are runs of spaces on purpose. That was
+/// true of a three-space threshold applied to every line of every literal. It
+/// is not true of these two rules: raw strings are out by construction, a
+/// drawing is out for having no letters, a trailing-comment alignment is out
+/// for opening a `//`, and what is left needs a list of THREE.
+#[test]
+fn no_prose_literal_swallows_a_line_continuation() {
+    let unexplained: Vec<String> = swallowed_continuations()
+        .into_iter()
+        .filter(|swallow| {
+            !RUNS_THAT_ARE_DELIBERATE.iter().any(|(file, fragment, _)| {
+                *file == swallow.file && swallow.excerpt.contains(fragment)
+            })
+        })
+        .map(|swallow| {
+            format!(
+                "  {}:{} [{}, {} spaces]\n      {:?}",
+                swallow.file, swallow.line, swallow.rule, swallow.run, swallow.excerpt
+            )
+        })
+        .collect();
+    assert!(
+        unexplained.is_empty(),
+        "{} string literal(s) carry a run of spaces that is a line continuation \
+         whose `\\` was lost — a tool joined the lines and the indentation stayed \
+         behind. Restore the backslashes, or write the literal as concatenated \
+         lines; if the run is deliberate, record it in RUNS_THAT_ARE_DELIBERATE \
+         with the reason:\n{}",
+        unexplained.len(),
+        unexplained.join("\n")
+    );
+}
+
+/// The inverse (N42's rule, and the seventh check's, applied to the list N98
+/// adds). An entry that names a site the tree no longer has subtracts a check
+/// for nothing and stays green forever, because a list that only ever
+/// subtracts work cannot red by being wrong.
+#[test]
+fn every_deliberate_run_is_still_written() {
+    let found = swallowed_continuations();
+    let idle: Vec<String> = RUNS_THAT_ARE_DELIBERATE
+        .iter()
+        .filter(|(file, fragment, _)| {
+            !found
+                .iter()
+                .any(|swallow| swallow.file == *file && swallow.excerpt.contains(fragment))
+        })
+        .map(|(file, fragment, reason)| format!("  {file}: {fragment:?} ({reason})"))
+        .collect();
+    assert!(
+        idle.is_empty(),
+        "entr(ies) in RUNS_THAT_ARE_DELIBERATE suppress nothing: no literal in \
+         the named file carries the fragment with a run either rule catches. The \
+         site was reflowed, moved or renamed — drop the entry:\n{}",
+        idle.join("\n")
     );
 }
 
@@ -1973,6 +2591,75 @@ fn every_curated_rule_statement_still_opens_as_recorded() {
         reworded.len(),
         reworded.join("\n")
     );
+}
+
+/// N99: the two messages the widened walk still cannot reach are each rowed,
+/// and rowed for the reason recorded — one pin per message, in both directions.
+///
+/// [`every_hand_rowed_row_is_still_out_of_the_enumerations_reach`] asks the
+/// general question of the whole list. What it cannot say is which SITE each
+/// entry stands for: it resolves an entry to a row and asks whether any
+/// enumerated site that row describes exists, so a message that moved to
+/// another file, or a second literal that happens to answer the same key,
+/// would keep the entry green. These two name their file, which is the half
+/// that goes stale silently.
+#[test]
+fn n99_the_two_unreachable_messages_are_rowed_at_the_files_that_build_them() {
+    /// The const channel's staging-registry refusal, at the run of its head
+    /// that is neither slot nor assembled.
+    const STAGING_REGISTRY: &str = "`asset::staged` reads the registry AFTER evaluation has finished, and this build is \
+         still evaluating";
+    /// The derive load-ordering arm, likewise.
+    const DERIVE_LOAD_ORDER: &str = "expanded before std's `{module}` declared its `{name}` macro";
+
+    for (relative, fragment, why) in [
+        (
+            "crates/vilan-core/src/const_eval.rs",
+            STAGING_REGISTRY,
+            "re-wrapped from a helper's `Err(String)`, so `Failure::new`'s second \
+             argument is a binding and the walk reads no literal",
+        ),
+        (
+            "crates/vilan-core/src/macros.rs",
+            DERIVE_LOAD_ORDER,
+            "a `let msg = if … else …` handed over by field shorthand, so there is \
+             no `msg:` anchor to read",
+        ),
+    ] {
+        // Forward: the file still builds the sentence.
+        let source = normalized(&read(relative));
+        assert!(
+            source.contains(fragment),
+            "{relative} no longer builds {fragment:?} ({why}) — re-key its row in \
+             `{INDEX}` and its prefix in ROWS_THE_ENUMERATION_CANNOT_REACH"
+        );
+        // Back: exactly one row is keyed on it. Without the row the message has
+        // no coverage at all, because the enumeration never reaches it.
+        let rowed: Vec<String> = index()
+            .into_iter()
+            .filter(|row| row.key.contains(fragment))
+            .map(|row| row.number)
+            .collect();
+        assert_eq!(
+            rowed.len(),
+            1,
+            "{fragment:?} is keyed by {} row(s) of `{INDEX}` ({}), and it must be \
+             one: {why}",
+            rowed.len(),
+            rowed.join(", ")
+        );
+        // And the reason the row exists: no enumerated site carries the
+        // sentence, so check (3) is not what holds it.
+        let enumerated = enumerated_sites()
+            .into_iter()
+            .any(|site| site.message.contains(fragment));
+        assert!(
+            !enumerated,
+            "the enumeration now reads {fragment:?} at its site — check (3) holds \
+             it, so drop its entry from ROWS_THE_ENUMERATION_CANNOT_REACH ({why} \
+             no longer describes the shape)"
+        );
+    }
 }
 
 #[test]

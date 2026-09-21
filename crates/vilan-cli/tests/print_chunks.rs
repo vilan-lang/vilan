@@ -10,12 +10,14 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 /// Copies `vilan/examples/<name>` into a fresh temp directory.
 fn stage_example(name: &str, tag: &str) -> PathBuf {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../vilan/examples")
         .join(name);
-    let staged = std::env::temp_dir().join(format!("vilan_chunks_{tag}_{}", std::process::id()));
+    let staged = support::scratch_root().join(format!("vilan_chunks_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staged);
     copy_tree(&source, &staged);
     staged

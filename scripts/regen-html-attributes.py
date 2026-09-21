@@ -19,21 +19,27 @@ to gate it"; a generated, gated extract is the answer the owner ruled for
 Usage, from the repo root:
 
     python3 scripts/regen-html-attributes.py --fetch   # network; rewrite the TSV
-    python3 scripts/regen-html-attributes.py           # TSV -> the Rust table
-    python3 scripts/regen-html-attributes.py --check   # derive and diff, write nothing
 
-Two arrows, one implementation each, and only the left one needs the network:
+ONE arrow, one implementation, and this script is the half that needs the
+network:
 
-    the spec indices  --`--fetch`-->  html-attributes.tsv  --default-->  html_attributes.rs
+    the spec indices  --`--fetch`-->  html-attributes.tsv  --the Rust gate-->  html_attributes.rs
 
-`--fetch` is a DELIBERATE commit (the TSV header records the fetch date, the
-source URLs and the sha256 of each page it read); the default mode and the gate
-`crates/vilan-ide/src/html_attributes_sync.rs` are offline, so no CI job ever
-touches the network. That gate is a SECOND implementation of the right arrow,
-in Rust: it re-renders the table from the vendored TSV and diffs it byte for
-byte, so this script and the gate are held equal by the suite. It is also what
-`VILAN_REGENERATE_HTML_ATTRIBUTES=1 cargo test -p vilan-ide html_attributes`
-rewrites the table instead of failing — the same entry point the mime table has.
+`--fetch` is a DELIBERATE commit: the TSV header records the fetch date, the
+source URLs and the sha256 of each page it read, and nothing else in the
+repository ever reaches the network.
+
+The right arrow is `crates/vilan-ide/src/html_attributes_sync.rs` and nothing
+else (tracker N107). This script used to carry a second implementation of it —
+a default mode that rendered the TSV into the Rust table, held equal to the
+gate by the suite. Held equal is not the same as not duplicated: two renderers
+of one table is two places to edit when a column moves, and the gate is the one
+that runs on every `cargo test`, so it is the one that stays. Regenerate the
+table with
+
+    VILAN_REGENERATE_HTML_ATTRIBUTES=1 cargo test -p vilan-ide html_attributes
+
+which is the same entry point the mime table has.
 """
 
 import argparse
@@ -50,7 +56,6 @@ HTML_INDEX_URL = "https://html.spec.whatwg.org/multipage/indices.html"
 SVG_INDEX_URL = "https://www.w3.org/TR/SVG2/attindex.html"
 
 DATASET = "crates/vilan-ide/src/html-attributes.tsv"
-TABLE = "crates/vilan-ide/src/html_attributes.rs"
 
 # The three keys the `element` column takes besides a literal tag name.
 HTML_GLOBAL = "*"
@@ -241,9 +246,11 @@ def render(rows: list[tuple[str, str, str]], provenance: list[str]) -> str:
         "# is generated from (tracker E69). GENERATED FILE -- do not hand-edit.",
         "#",
         "# refresh:   python3 scripts/regen-html-attributes.py --fetch   (network)",
-        "# consumer:  python3 scripts/regen-html-attributes.py           (TSV -> Rust)",
-        "#            crates/vilan-ide/src/html_attributes.rs is the checked-in table;",
-        "#            its own `mod tests` regenerates from these rows and diffs, offline.",
+        "# consumer:  crates/vilan-ide/src/html_attributes_sync.rs   (TSV -> Rust)",
+        "#            the ONE implementation of that arrow (N107). It renders",
+        "#            html_attributes.rs from these rows and diffs it byte for byte on",
+        "#            every `cargo test`, offline; VILAN_REGENERATE_HTML_ATTRIBUTES=1",
+        "#            rewrites the table instead of failing.",
         "#",
         "# `element` is a tag name, `*` (every element) or `svg:*` (every SVG-shaped",
         "# element). A row with an EMPTY attribute registers the tag and nothing else.",
@@ -259,179 +266,42 @@ def render(rows: list[tuple[str, str, str]], provenance: list[str]) -> str:
     return "\n".join(header + body) + "\n"
 
 
-def read_dataset(path: pathlib.Path) -> list[tuple[str, str, str]]:
-    rows = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.startswith("#") or not line.strip():
-            continue
-        element, attribute, source = line.split("\t")
-        rows.append((element, attribute, source))
-    return rows
-
-
-# --- The Rust table ---------------------------------------------------------
-
-
-def rust_list(name: str, doc: list[str], values: list[str]) -> list[str]:
-    out = [*doc, f"pub const {name}: &[&str] = &["]
-    out.extend(f'    "{value}",' for value in values)
-    out.append("];")
-    return out
-
-
-def render_table(rows: list[tuple[str, str, str]]) -> str:
-    globals_: set[str] = set()
-    events: set[str] = set()
-    svg_globals: set[str] = set()
-    svg_elements: set[str] = set()
-    per_element: dict[str, set[str]] = {}
-    for element, attribute, source in rows:
-        if source == SOURCE_SVG_ELEMENT:
-            svg_elements.add(element)
-            per_element.setdefault(element, set())
-        elif source == SOURCE_HTML_EVENT:
-            events.add(attribute)
-        elif element == HTML_GLOBAL:
-            globals_.add(attribute)
-        elif element == SVG_GLOBAL:
-            svg_globals.add(attribute)
-        else:
-            per_element.setdefault(element, set()).add(attribute)
-
-    # `onclick` is the CONTENT attribute; vilan writes `on:click(…)`, so the
-    # table holds what follows the colon.
-    events = {event.removeprefix("on") for event in events}
-
-    lines = [
-        "//! Every attribute name the HTML and SVG specifications define, by element",
-        "//! — the vocabulary vilan-ide's element-head completion offers at `<tag |>`",
-        "//! (tracker E69).",
-        "//!",
-        "//! GENERATED FILE -- do not hand-edit. The dataset is `html-attributes.tsv`",
-        "//! beside this file, vendored from the WHATWG HTML attribute index and the",
-        "//! SVG 2 attribute index by `scripts/regen-html-attributes.py --fetch`; this",
-        "//! file is what that script's DEFAULT mode makes of it. `html_attributes_sync`",
-        "//! beside it is the GATE: a second, independent implementation of the same",
-        "//! TSV -> table arrow, in Rust, which re-renders and diffs this file byte for",
-        "//! byte. It is OFFLINE, so no gate ever reaches the network and refreshing the",
-        "//! extract stays a deliberate commit.",
-        "//!",
-        "//! Rewrite after refreshing the dataset with",
-        "//! `VILAN_REGENERATE_HTML_ATTRIBUTES=1 cargo test -p vilan-ide html_attributes`,",
-        "//! or `python3 scripts/regen-html-attributes.py` — the two must agree, and the",
-        "//! gate is what says so.",
-        "//!",
-        "//! # What this table is NOT",
-        "//!",
-        "//! It is not a source of truth about vilan. The element desugar stays",
-        "//! NAME-BLIND (element-syntax.md §2, §9 item 3): `name(x)` lowers to",
-        "//! `.attr(\"name\", x)` whatever `name` is, nothing here is consulted by the",
-        "//! parser, the desugar, the analyzer or the formatter, and a `data-*` name",
-        "//! absent from it costs one completion entry and nothing else. That is the",
-        "//! disanalogy E67's refusal turned on — \"a second source of truth with",
-        "//! nothing to gate it\" — and the generator plus the gate are that gate.",
-        "",
-    ]
-    lines.extend(
-        rust_list(
-            "GLOBAL_ATTRIBUTES",
-            [
-                "/// The global attributes: every element takes them (the HTML attribute",
-                "/// index's `HTML elements` rows).",
-            ],
-            sorted(globals_),
-        )
-    )
-    lines.append("")
-    lines.extend(
-        rust_list(
-            "SVG_GLOBAL_ATTRIBUTES",
-            [
-                "/// The SVG-wide vocabulary — the attribute index's section G.2",
-                "/// presentation attributes — offered on every [`SVG_ELEMENTS`] tag.",
-            ],
-            sorted(svg_globals),
-        )
-    )
-    lines.append("")
-    lines.extend(
-        rust_list(
-            "EVENTS",
-            [
-                "/// The `GlobalEventHandlers` event names with `on` stripped: vilan spells",
-                "/// the content attribute `onclick` as `on:click(…)`, so the table holds",
-                "/// what follows the colon. The `body`/`Window` handlers are a different",
-                "/// mixin and are not here.",
-            ],
-            sorted(events),
-        )
-    )
-    lines.append("")
-    lines.extend(
-        rust_list(
-            "SVG_ELEMENTS",
-            [
-                "/// The SVG-shaped tags: every element the SVG index names that the HTML",
-                "/// index does not, plus the SVG root. These take",
-                "/// [`SVG_GLOBAL_ATTRIBUTES`] on top of their own.",
-            ],
-            sorted(svg_elements),
-        )
-    )
-    lines.append("")
-    lines.extend(
-        [
-            "/// Each tag's OWN attributes as `(tag, attribute)` pairs, ascending — the",
-            "/// globals above are not repeated, so a tag absent from this table takes",
-            "/// only the globals. Sorted, so a lookup is a binary search and a diff of",
-            "/// this file reads as a set difference; flat rather than nested so that",
-            "/// every line is short enough for `cargo fmt` to leave it exactly where the",
-            "/// generator put it (the gate compares the file BYTE for byte).",
-            "pub const ELEMENT_ATTRIBUTES: &[(&str, &str)] = &[",
-        ]
-    )
-    for element in sorted(per_element):
-        wide = svg_globals if element in svg_elements else set()
-        for attribute in sorted(per_element[element] - globals_ - wide):
-            lines.append(f'    ("{element}", "{attribute}"),')
-    lines.append("];")
-    lines.append("")
-    return "\n".join(lines)
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--fetch", action="store_true", help="refresh the vendored TSV (network)")
-    parser.add_argument("--check", action="store_true", help="derive and diff, write nothing")
-    arguments = parser.parse_args()
+    parser = argparse.ArgumentParser(
+        description="Refresh the vendored html-attributes.tsv from the spec indices.",
+        epilog=(
+            "The TSV -> Rust table arrow is `VILAN_REGENERATE_HTML_ATTRIBUTES=1 "
+            "cargo test -p vilan-ide html_attributes`, which is its one "
+            "implementation (tracker N107)."
+        ),
+    )
+    parser.add_argument(
+        "--fetch",
+        action="store_true",
+        required=True,
+        help="refresh the vendored TSV from the spec indices (network)",
+    )
+    parser.parse_args()
 
     root = pathlib.Path(__file__).resolve().parent.parent
     dataset = root / DATASET
-    table = root / TABLE
 
-    if arguments.fetch:
-        html, html_hash = fetch(HTML_INDEX_URL)
-        svg, svg_hash = fetch(SVG_INDEX_URL)
-        provenance = [
-            f"fetched:   {datetime.date.today().isoformat()}",
-            f"source:    {HTML_INDEX_URL}",
-            f"           sha256 {html_hash}",
-            f"source:    {SVG_INDEX_URL}",
-            f"           sha256 {svg_hash}",
-        ]
-        rendered = render(derive(html, svg), provenance)
-        dataset.write_text(rendered, encoding="utf-8")
-        print(f"wrote {DATASET} ({len(rendered.splitlines())} lines)")
-        return
-
-    rendered = render_table(read_dataset(dataset))
-    if arguments.check:
-        if table.read_text(encoding="utf-8") == rendered:
-            print(f"{TABLE} is current with {DATASET}")
-            return
-        sys.exit(f"{TABLE} is not what {DATASET} derives — rerun without --check")
-    table.write_text(rendered, encoding="utf-8")
-    print(f"wrote {TABLE} ({len(rendered.splitlines())} lines)")
+    html, html_hash = fetch(HTML_INDEX_URL)
+    svg, svg_hash = fetch(SVG_INDEX_URL)
+    provenance = [
+        f"fetched:   {datetime.date.today().isoformat()}",
+        f"source:    {HTML_INDEX_URL}",
+        f"           sha256 {html_hash}",
+        f"source:    {SVG_INDEX_URL}",
+        f"           sha256 {svg_hash}",
+    ]
+    rendered = render(derive(html, svg), provenance)
+    dataset.write_text(rendered, encoding="utf-8")
+    print(f"wrote {DATASET} ({len(rendered.splitlines())} lines)")
+    print(
+        "now rebuild the table: "
+        "VILAN_REGENERATE_HTML_ATTRIBUTES=1 cargo test -p vilan-ide html_attributes"
+    )
 
 
 if __name__ == "__main__":

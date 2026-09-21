@@ -30,6 +30,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 fn project_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/infer_preset/project")
 }
@@ -51,7 +53,7 @@ fn build_under(preset: &str) -> String {
     // one test deleting the tree another was mid-build in.
     static ROUND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let round = ROUND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let work = std::env::temp_dir().join(format!(
+    let work = support::scratch_root().join(format!(
         "vilan_infer_preset_{}_{preset}_{round}",
         std::process::id()
     ));
@@ -170,7 +172,7 @@ fn both_presets_run_identically_under_node() {
 
 /// Runs emitted JavaScript under node, returning `(stdout, exit code)`.
 fn run_under_node(label: &str, javascript: &str) -> (String, i32) {
-    let script = std::env::temp_dir().join(format!(
+    let script = support::scratch_root().join(format!(
         "vilan_infer_preset_run_{}_{label}.mjs",
         std::process::id()
     ));

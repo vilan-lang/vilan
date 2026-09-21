@@ -13730,12 +13730,12 @@ mod if_arm_layout {
     /// in `vilan/std/src/rpc.vl`, where the inline arm made a 175-column leg.
     #[test]
     fn a_leg_over_the_budget_expands_its_arms_again() {
-        let inline = "\t\tDialFailure::Refused(let status) => if status == \"401\"                       || status == \"403\" { RpcError::Unauthorized }                       else { RpcError::Transport(i\"refused by the server ({status})\") },";
+        let inline = "\t\tDialFailure::Refused(let status) => if status == \"401\" || status == \"403\" { RpcError::Unauthorized } else { RpcError::Transport(i\"refused by the server ({status})\") },";
         assert_over_budget(inline);
         assert_construct(
             "fun classify(status: str): RpcError {\n\
              \tmatch dial(status) {\n\
-             \t\tDialFailure::Refused(let status) => if status == \"401\" || status == \"403\"              { RpcError::Unauthorized }              else { RpcError::Transport(i\"refused by the server ({status})\") },\n\
+             \t\tDialFailure::Refused(let status) => if status == \"401\" || status == \"403\" { RpcError::Unauthorized } else { RpcError::Transport(i\"refused by the server ({status})\") },\n\
              \t\tDialFailure::Other => RpcError::Transport(\"other\"),\n\
              \t}\n\
              }\n",

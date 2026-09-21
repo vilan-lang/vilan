@@ -117,10 +117,32 @@ fn a_5000_deep_expression_is_refused_cleanly() {
     );
 }
 
-/// The PARSER is bounded too (B142), and it is the pipeline's deepest stack
-/// consumer: `VILAN_DEPTH_STATS`'s `parse` family measured it at ~71.8 KiB per
-/// level of source nesting unoptimized (~20.3 KiB optimized) — twice the
-/// bounded phase-1 walk's frame unoptimized, four times it optimized.
+/// The PARSER is bounded too (B142), and it recurses once per level of source
+/// nesting at **34,181 bytes (33.4 KiB) unoptimized, 8,315 bytes (8.1 KiB)
+/// optimized** — four fifths of the bounded phase-1 walk's frame unoptimized,
+/// about twice it optimized.
+///
+/// Re-measured for N101 with N97's method, because the figures this comment
+/// carried (~71.8 KiB and ~20.3 KiB per level) do not reproduce at this sha and
+/// are 2.2× what the instrument reads:
+/// `VILAN_DEPTH_STATS=1 vilan check` over chains of 34/134/434 parentheses,
+/// per-level figure taken as the DELTA between two depths so the analysis's own
+/// baseline falls out of it. The three deltas agree to two decimal places
+/// (33.38 KiB debug across 34→134, 34→434 and 134→434; 8.09/8.12/8.12 KiB
+/// release), and the `parse` counter advances exactly once per level of source
+/// nesting here — depth 38 at 34 parentheses, 138 at 134, 438 at 434. Which
+/// side of the 2.2× is the artifact is NOT settled: the old number was taken
+/// before the counter moved to `parse_nested_as`, so its denominator was a
+/// different quantity, and the frame may also have shrunk. What is settled is
+/// the number a reader can reproduce today, and the method that produced it.
+///
+/// The bounded WORST CASE is measured the same way and moves with it: this
+/// file's own 5000-parenthesis plant, refused at depth 501, peaks at **16.24
+/// MiB unoptimized and 3.93 MiB optimized** where the record said 35.2 MiB and
+/// ~10 MiB. `vilan check` and not `vilan build`, deliberately — on a plant the
+/// parse bound refuses, `build` exits before the instrument reports, so the
+/// only command that can read the bound's own worst case is the one that keeps
+/// going.
 ///
 /// It also runs FIRST, so before the bound it reached the stack cliff before
 /// either analyzer bound could refuse: `a_5000_deep_expression_is_refused_cleanly`
@@ -135,8 +157,8 @@ fn a_5000_deep_expression_is_refused_cleanly() {
 /// the whole pipeline and arrive as a diagnostic. `every_nesting_door_is_refused_cleanly`
 /// is the exhaustive per-door leg, and parses directly. Both share the 64 MiB
 /// worker, which must NOT grow — see the module comment; the bounded parse of
-/// this very plant measures 35.2 MiB unoptimized, so the margin is real but not
-/// large.
+/// this very plant measures 16.24 MiB unoptimized, so the margin is a factor of
+/// four rather than the not-quite-two the record claimed.
 #[test]
 fn a_5000_deep_parenthesized_expression_is_refused_cleanly() {
     let source = format!(
@@ -242,6 +264,52 @@ fn a_thirty_level_chain_still_fits_libtests_own_two_mib_thread() {
         "thirty levels of chain must analyze on a 2 MiB thread — that is \
          libtest's own worker, and the margin above it is what the Windows \
          shard spent at Order 36's seal"
+    );
+}
+
+/// The same canary for the PARSE frame, which had none (N101).
+///
+/// The walk's canary exists because a frame grew 15% while the comment that
+/// recorded its size did not notice. `parse`'s comment was off by 2.2×, for
+/// longer, and nothing anywhere would have said so — which is the same failure
+/// mode with a bigger number. So the parse frame gets a canary of its own, at
+/// the same tightness: **forty-five levels of parentheses spend 1.49 MiB of a
+/// 2 MiB thread, 73% of it**, which is what thirty levels of chain spend of the
+/// walk's. It reds when the parse frame grows by about a third, or when fifteen
+/// more levels of it are needed, and it reds here rather than on the shard that
+/// costs the most to read.
+///
+/// Forty-five and not thirty: the corpus sweep below measures a `parse` peak of
+/// 23 with a median of 14, so 45 is twice the deepest real file — the same
+/// ratio-to-reality the walk's thirty carries — and 34,181 bytes a level is
+/// what puts 45 at three quarters of the thread.
+///
+/// It PARSES and does not analyze, so the parse frame is the only consumer on
+/// the thread and the number above is the whole of what is spent. A red here is
+/// a SIGABRT and not an assertion, for the reason the walk's canary states.
+///
+/// Planted red at 1 MiB, where it aborts with
+/// `thread '<unknown>' has overflowed its stack`.
+#[test]
+fn a_forty_five_level_nesting_still_parses_on_libtests_own_two_mib_thread() {
+    let source = format!(
+        "fun main() {{\n\tlet x = {}1{};\n}}\n",
+        "(".repeat(45),
+        ")".repeat(45)
+    );
+    let produced = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            vilan_core::parsing::parse(leaked).0.is_some()
+        })
+        .expect("spawn the 2 MiB worker")
+        .join()
+        .expect("the worker panicked");
+    assert!(
+        produced,
+        "forty-five levels of parenthesis must parse on a 2 MiB thread — that \
+         is libtest's own worker, and 73% of it is what the frame spends today"
     );
 }
 

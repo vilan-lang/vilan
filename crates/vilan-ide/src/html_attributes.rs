@@ -4,17 +4,14 @@
 //!
 //! GENERATED FILE -- do not hand-edit. The dataset is `html-attributes.tsv`
 //! beside this file, vendored from the WHATWG HTML attribute index and the
-//! SVG 2 attribute index by `scripts/regen-html-attributes.py --fetch`; this
-//! file is what that script's DEFAULT mode makes of it. `html_attributes_sync`
-//! beside it is the GATE: a second, independent implementation of the same
-//! TSV -> table arrow, in Rust, which re-renders and diffs this file byte for
-//! byte. It is OFFLINE, so no gate ever reaches the network and refreshing the
-//! extract stays a deliberate commit.
+//! SVG 2 attribute index by `scripts/regen-html-attributes.py --fetch`.
+//! `html_attributes_sync` beside this file renders the TSV into it and diffs
+//! the result byte for byte on every `cargo test` — the ONE implementation of
+//! that arrow, and the gate (tracker N107). It is OFFLINE, so no gate ever
+//! reaches the network and refreshing the extract stays a deliberate commit.
 //!
 //! Rewrite after refreshing the dataset with
-//! `VILAN_REGENERATE_HTML_ATTRIBUTES=1 cargo test -p vilan-ide html_attributes`,
-//! or `python3 scripts/regen-html-attributes.py` — the two must agree, and the
-//! gate is what says so.
+//! `VILAN_REGENERATE_HTML_ATTRIBUTES=1 cargo test -p vilan-ide html_attributes`.
 //!
 //! # What this table is NOT
 //!

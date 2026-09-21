@@ -1698,9 +1698,47 @@ pub fn resolve_std(std_dir: &Path) -> PackageSpec {
 /// So the root is named once, here. [`split_toolchain`] is what a caller asks
 /// when the answer is that the root carries only half a toolchain.
 pub fn toolchain_root(std: &PackageSpec) -> Option<&Path> {
-    // `base_root` is the std package's SOURCE root (`<package>/src`), so the
-    // package directory is one level up and the toolchain root is two.
-    std.base_root.parent()?.parent()
+    std_package_dir(std)?.parent()
+}
+
+/// The directory holding the resolved `std`'s own `vilan.toml`.
+///
+/// Read from where the MANIFEST is, not by counting levels off the source root
+/// (tracker N105). `base_root` is `<package>/<the [library] root>`, and that
+/// root DEFAULTS to `src` but is declared: a std whose `[library]` says
+/// `root = "."` has its package directory as its own source root, and counting
+/// one level up from it lands above the package — so `toolchain_root` answered
+/// one directory too high, and `macro_std` was looked for beside the toolchain
+/// instead of inside it. Nothing in the estate declares it, so the bug was
+/// latent; what it would have produced is B346's refusal naming a `macro_std`
+/// path that was never the right one to look at, which is worse than no answer
+/// at all.
+///
+/// TWO candidates and no walk: the source root itself (`root = "."`) and its
+/// parent (`src`, and every other single-segment root). Bounded deliberately —
+/// an unbounded climb would find an enclosing PROJECT's `vilan.toml` for a std
+/// that has no manifest of its own and answer with a root holding no toolchain,
+/// which is exactly the second-root outcome B346 ruled out. A candidate whose
+/// `file_name` is `None` is skipped, which is how `dir.join(".")`'s trailing
+/// component is stepped over without normalizing the borrowed path.
+///
+/// When neither candidate carries a manifest the answer is the old formula, so
+/// a std resolved outside a package — [`resolve_std`]'s orphan case — is
+/// unchanged.
+fn std_package_dir(std: &PackageSpec) -> Option<&Path> {
+    std.base_root
+        .ancestors()
+        .filter(|candidate| candidate.file_name().is_some())
+        .take(2)
+        .find(|candidate| manifest_is_present(&candidate.join("vilan.toml")))
+        .or_else(|| std.base_root.parent())
+}
+
+/// Whether a `vilan.toml` is there to be read — on disk, or in the open-document
+/// overlay, which under wasm is the only place the toolchain exists at all
+/// (the same test [`split_toolchain`] makes of `macro_std`'s manifest).
+fn manifest_is_present(manifest: &Path) -> bool {
+    manifest.is_file() || crate::analyzer::document_overlay_contains(manifest)
 }
 
 /// This toolchain's `macro_std` package directory: `<root>/macro_std`, with
@@ -1720,14 +1758,13 @@ pub fn macro_std_dir(std: &PackageSpec) -> Option<PathBuf> {
 /// `macro_std`" names nothing a reader can act on, while "this `std`, that
 /// missing `macro_std`" names the mistake and the fix at once.
 pub fn split_toolchain(std: &PackageSpec) -> Option<(PathBuf, PathBuf)> {
-    let package = std.base_root.parent()?.to_path_buf();
+    let package = std_package_dir(std)?.to_path_buf();
     let macro_std = macro_std_dir(std)?;
     // Buffered counts as present, exactly as it does for a source file: with no
     // filesystem behind the compiler (the wasm build) the toolchain lives
     // entirely in the document overlay, and an `is_file()` gate alone would
     // report every wasm compile as a split toolchain.
-    let manifest = macro_std.join("vilan.toml");
-    let present = manifest.is_file() || crate::analyzer::document_overlay_contains(&manifest);
+    let present = manifest_is_present(&macro_std.join("vilan.toml"));
     (!present).then_some((package, macro_std))
 }
 
@@ -4872,5 +4909,80 @@ mod tests {
         assert!(!proper.layers.is_empty(), "the real std declares layers");
         assert_eq!(proper.base_root, forgiven.base_root);
         assert_eq!(proper.layers.len(), forgiven.layers.len());
+    }
+
+    /// N105: the toolchain root is read from where the MANIFEST is, so a std
+    /// whose `[library]` declares `root = "."` answers with the directory that
+    /// holds it rather than with the one above that.
+    ///
+    /// No std in the estate declares it, which is why this was latent rather
+    /// than broken: `toolchain_root` counted two levels up from the SOURCE
+    /// root, which is right only while the source root is `<package>/src`. A
+    /// source-root-less std put the answer one directory too high, and the one
+    /// thing that reads the answer is B346's refusal — so the failure mode was
+    /// a refusal naming a `macro_std` path that was never the right one to
+    /// look at, which is worse than no answer.
+    #[test]
+    fn n105_a_source_root_less_std_resolves_its_own_toolchain_root() {
+        let toolchain =
+            std::env::temp_dir().join(format!("vilan_manifest_flat_std_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&toolchain);
+        let package = toolchain.join("std");
+        std::fs::create_dir_all(&package).expect("stage the flat std");
+        std::fs::write(
+            package.join("vilan.toml"),
+            "[library]\nname = \"std\"\nroot = \".\"\n",
+        )
+        .expect("write the manifest");
+        std::fs::create_dir_all(toolchain.join("macro_std")).expect("stage macro_std");
+        std::fs::write(
+            toolchain.join("macro_std/vilan.toml"),
+            "[library]\nname = \"macro_std\"\n",
+        )
+        .expect("write macro_std's manifest");
+
+        let std = super::resolve_std(&package);
+        assert_eq!(
+            std.base_root, package,
+            "`root = \".\"` makes the package directory its own source root"
+        );
+        assert_eq!(
+            super::toolchain_root(&std),
+            Some(toolchain.as_path()),
+            "the toolchain root is the directory HOLDING the std package, \
+             whatever the `[library]` declares its source root to be"
+        );
+        assert_eq!(
+            super::macro_std_dir(&std),
+            Some(toolchain.join("macro_std")),
+            "and `macro_std` is looked for beside the std, not beside the \
+             toolchain"
+        );
+        assert!(
+            super::split_toolchain(&std).is_none(),
+            "this toolchain is whole — a split verdict here is the one-root \
+             rule answering off the wrong root"
+        );
+
+        let _ = std::fs::remove_dir_all(&toolchain);
+    }
+
+    /// The other half, so the fix cannot be a special case for one shape: the
+    /// ordinary `<package>/src` std still answers the same way it always did.
+    #[test]
+    fn n105_a_src_rooted_std_still_resolves_its_own_toolchain_root() {
+        let std_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std");
+        let std = super::resolve_std(&std_dir);
+        let root = super::toolchain_root(&std).expect("the real std has a toolchain root");
+        assert!(
+            root.join("macro_std/vilan.toml").is_file(),
+            "the tree's own std must resolve the root that carries its \
+             `macro_std`, got {}",
+            root.display()
+        );
+        assert!(
+            super::split_toolchain(&std).is_none(),
+            "the tree's own toolchain is whole"
+        );
     }
 }

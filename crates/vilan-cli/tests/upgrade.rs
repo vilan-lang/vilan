@@ -37,6 +37,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod support;
+
 /// A scratch install: a copied `vilan` in its own bin dir, plus a fake
 /// release tree for `$VILAN_UPGRADE_BASE`.
 struct Fixture {
@@ -49,7 +51,7 @@ struct Fixture {
 impl Fixture {
     fn new(name: &str) -> Fixture {
         let root =
-            std::env::temp_dir().join(format!("vilan-upgrade-{name}-{}", std::process::id()));
+            support::scratch_root().join(format!("vilan-upgrade-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let bin = root.join("bin");
         fs::create_dir_all(&bin).expect("create bin dir");

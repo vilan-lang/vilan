@@ -11,10 +11,18 @@
 //!
 //! The left arrow runs rarely (when a spec publishes) and needs the network;
 //! the right arrow is this file, runs on every `cargo test`, and needs nothing
-//! — which is what makes "generated AND gated" true offline. The python
-//! script's DEFAULT mode is a second implementation of the right arrow, for
-//! the convenience of refreshing both files in one command; this gate is what
-//! holds the two equal, byte for byte, so they cannot drift apart in silence.
+//! — which is what makes "generated AND gated" true offline.
+//!
+//! **One implementation each, and that is newer than the diagram** (tracker
+//! N107). The python script carried a second implementation of the right arrow
+//! — a default mode that rendered the TSV into the table, for the convenience
+//! of refreshing both files in one command — and this gate held the two equal
+//! byte for byte, so they could not drift in silence. Held equal is not the
+//! same as not duplicated: two renderers of one table is two places to edit
+//! when a column moves, and one of them runs on every `cargo test` while the
+//! other runs when somebody remembers. The convenience is kept without the
+//! twin: [`REGENERATE_ENV`] is the rewrite, and the script's last line points
+//! at it.
 //!
 //! Four checks:
 //!
@@ -116,8 +124,10 @@ fn rust_list(name: &str, doc: &[&str], values: &BTreeSet<String>) -> Vec<String>
 
 /// The whole of `html_attributes.rs`, rendered from the dataset.
 ///
-/// Mirrors `scripts/regen-html-attributes.py`'s `render_table` line for line;
-/// the byte comparison below is what keeps the two honest about that.
+/// The ONE implementation of the TSV -> table arrow (N107). It mirrored the
+/// python generator's `render_table` line for line, with the byte comparison
+/// below keeping the two honest about it; the python half is gone and this is
+/// what a refresh runs through.
 fn render_table(rows: &[(String, String, String)]) -> String {
     let mut globals = BTreeSet::new();
     let mut events = BTreeSet::new();
@@ -155,17 +165,14 @@ fn render_table(rows: &[(String, String, String)]) -> String {
         "//!",
         "//! GENERATED FILE -- do not hand-edit. The dataset is `html-attributes.tsv`",
         "//! beside this file, vendored from the WHATWG HTML attribute index and the",
-        "//! SVG 2 attribute index by `scripts/regen-html-attributes.py --fetch`; this",
-        "//! file is what that script's DEFAULT mode makes of it. `html_attributes_sync`",
-        "//! beside it is the GATE: a second, independent implementation of the same",
-        "//! TSV -> table arrow, in Rust, which re-renders and diffs this file byte for",
-        "//! byte. It is OFFLINE, so no gate ever reaches the network and refreshing the",
-        "//! extract stays a deliberate commit.",
+        "//! SVG 2 attribute index by `scripts/regen-html-attributes.py --fetch`.",
+        "//! `html_attributes_sync` beside this file renders the TSV into it and diffs",
+        "//! the result byte for byte on every `cargo test` — the ONE implementation of",
+        "//! that arrow, and the gate (tracker N107). It is OFFLINE, so no gate ever",
+        "//! reaches the network and refreshing the extract stays a deliberate commit.",
         "//!",
         "//! Rewrite after refreshing the dataset with",
-        "//! `VILAN_REGENERATE_HTML_ATTRIBUTES=1 cargo test -p vilan-ide html_attributes`,",
-        "//! or `python3 scripts/regen-html-attributes.py` — the two must agree, and the",
-        "//! gate is what says so.",
+        "//! `VILAN_REGENERATE_HTML_ATTRIBUTES=1 cargo test -p vilan-ide html_attributes`.",
         "//!",
         "//! # What this table is NOT",
         "//!",

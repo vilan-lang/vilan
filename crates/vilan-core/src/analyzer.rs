@@ -315,6 +315,13 @@ pub enum Expr<'src> {
     Match(Id, Vec<ExprMatchLeg>),
     Module(Id),
     Null,
+    /// A numeric literal, in THREE parts: `(whole, fraction, suffix)`.
+    ///
+    /// The order is the trap (N104). `3.5f` is `("3", Some("5"), Some("f"))`
+    /// and reading the second field as the suffix gives `3i32` — a wrong
+    /// emission that nothing in the suite catches, because the shape still
+    /// type-checks and only rustc's exhaustiveness ever looks at the arity. A
+    /// lane paid for that once; the field names are written down now.
     Number(&'src str, Option<&'src str>, Option<&'src str>),
     Parameter(Id),
     String(&'src str),
@@ -322,6 +329,18 @@ pub enum Expr<'src> {
     // the transformer trims it to the content value at emission.
     MultilineString(&'src str),
     Struct(Id),
+    /// A struct literal: the INITIALIZER's own id, and its assignments as
+    /// `field index -> value id`.
+    ///
+    /// The first field is the trap (N104), because it reads like the struct and
+    /// is not: it is the expression's id, and the JS emitter never resolves a
+    /// struct from it at all — it takes the struct from the expression's
+    /// resolved TYPE, and its `Expr::StructInitializer` arm emits a positional
+    /// array with the fields sorted by index. The commented-out
+    /// `self.program.structs.get(struct_id)` still sitting in that arm is the
+    /// shape a reader expects and the one the emitter deliberately does not
+    /// use; a lane that follows it resolves the wrong struct for a literal
+    /// reached through a generic instantiation.
     StructInitializer(Id, IndexMap<usize, Id>),
     Trait(Id),
     Tuple(Vec<Id>),

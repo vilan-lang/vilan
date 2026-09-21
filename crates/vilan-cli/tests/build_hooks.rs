@@ -1259,7 +1259,7 @@ fn wait_nudged(
     let log = std::fs::read_to_string(dir.join("watch.log")).unwrap_or_default();
     let trace = std::fs::read_to_string(dir.join("watch-trace.log")).unwrap_or_default();
     panic!(
-        "timed out waiting for {label}\nrounds.txt: {} lines, ran.txt: {} lines\n         --- watch.log ---\n{log}\n--- watch-trace.log (VILAN_WATCH_LOG, B208) ---\n{trace}",
+        "timed out waiting for {label}\nrounds.txt: {} lines, ran.txt: {} lines\n--- watch.log ---\n{log}\n--- watch-trace.log (VILAN_WATCH_LOG, B208) ---\n{trace}",
         runs(dir, "rounds.txt"),
         runs(dir, "ran.txt"),
     );

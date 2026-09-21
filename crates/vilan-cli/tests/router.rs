@@ -12,9 +12,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 /// A fresh temp directory for the test's project tree.
 fn temp_project(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("vilan_router_{tag}_{}", std::process::id()));
+    let dir = support::scratch_root().join(format!("vilan_router_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }

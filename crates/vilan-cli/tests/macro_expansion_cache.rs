@@ -34,6 +34,8 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 /// A package that defines its own macro and uses it. Package-local rather than
 /// leaning on a std derive, so a test can EDIT the macro's source and watch the
 /// key move — std belongs to the toolchain and is not a test's to change.
@@ -51,7 +53,7 @@ fn entry(tag: i32) -> String {
 }
 
 fn temp_package(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = support::scratch_root().join(format!(
         "vilan-m33-cache-{name}-{}-{:?}",
         std::process::id(),
         std::thread::current().id(),
@@ -64,6 +66,24 @@ fn temp_package(name: &str) -> PathBuf {
     )
     .expect("the manifest");
     std::fs::write(dir.join("src/main.vl"), entry(7)).expect("the entry");
+    dir
+}
+
+/// The same package with NO declared entry — the "lone package" shape, which is
+/// what `run_single` serves (tracker N103).
+///
+/// The shape matters and cost this pin a round: a `default-entry` plus an
+/// `[entry.main]` table is the DECLARED-entry project, and `vilan run` of one
+/// writes `dist/<entry>.mjs` — a real artifact in a real build directory,
+/// where `dist/.cache` beside it is exactly what N63 ruled for. Only the lone
+/// package and the bare file hand Node a temp script and write nothing there.
+fn temp_single_package(name: &str) -> PathBuf {
+    let dir = temp_package(name);
+    std::fs::write(
+        dir.join("vilan.toml"),
+        format!("[package]\nname = \"{name}\"\n"),
+    )
+    .expect("the manifest without a declared entry");
     dir
 }
 
@@ -113,6 +133,12 @@ fn worlds_compiled_by_build(dir: &Path) -> usize {
 /// row. Each call is its own PROCESS, which is the whole subject here.
 fn worlds_compiled(dir: &Path) -> usize {
     worlds_from(dir, &["check", "."])
+}
+
+/// The same probe for `vilan run` (tracker N103), which is the third goal and
+/// the one that emits TEXT while writing nothing into `dist/`.
+fn worlds_compiled_by_run(dir: &Path) -> usize {
+    worlds_from(dir, &["run", "."])
 }
 
 /// The phase-row probe, shared by the `check` and `build` spellings.
@@ -363,6 +389,61 @@ fn a_check_writes_nothing_at_all_into_the_package() {
         worlds_compiled(&dir),
         0,
         "and it is read back by the next process, which is the whole of M33"
+    );
+
+    let _ = std::fs::remove_dir_all(cache_dir(&dir).parent().expect("the entry directory"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_run_writes_no_build_directory_into_the_package() {
+    // Tracker N103, and N92's root one command further on. `run_single` hands
+    // Node a temp script and keeps its canonical sidecars beside the source,
+    // so it writes nothing into `dist/` — but it compiled under
+    // `CompileGoal::Emit`, and the goal is what chooses the table's root. So
+    // after `vilan run <package>` the tree held exactly
+    // `dist/.cache/macro-expansions` and nothing else: a build directory with
+    // no build in it. Milder than the check case, because `rm -rf dist` still
+    // means what it says — and the same root, so it is the same fix.
+    //
+    // The claim is the WHOLE tree, as it is for `check`: anything a run starts
+    // leaving behind reds here, named.
+    let dir = temp_single_package("run_writes_no_dist");
+    let before = tree_under(&dir);
+    assert_eq!(
+        worlds_compiled_by_run(&dir),
+        1,
+        "the fixture must compile a world, or the run under test did nothing"
+    );
+
+    assert!(
+        !dir.join("dist").exists(),
+        "`vilan run` emits no artifact into `dist/`, so it must create none"
+    );
+    assert_eq!(
+        tree_under(&dir),
+        before,
+        "a `vilan run` must leave the package byte-for-byte as it found it"
+    );
+
+    // And the table it DID write is out of the tree, and answers the next run.
+    assert!(
+        cache_file(&dir).is_file(),
+        "the run's table is under the user cache root, at {}",
+        cache_file(&dir).display()
+    );
+    assert_eq!(
+        worlds_compiled_by_run(&dir),
+        0,
+        "and it is read back by the next process, exactly as a check's is"
+    );
+
+    // One root for both, which is the point of keying on the package rather
+    // than on the command: a `run` warms the `check` that follows it.
+    assert_eq!(
+        worlds_compiled(&dir),
+        0,
+        "a run and a check of one package share the out-of-tree table"
     );
 
     let _ = std::fs::remove_dir_all(cache_dir(&dir).parent().expect("the entry directory"));

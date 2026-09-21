@@ -49,6 +49,8 @@ use std::process::Command;
 
 use vilan_core::formatter::{element_head_permutation, element_heads};
 
+mod support;
+
 /// The tracked sources that carry element markup. Each is built and run as
 /// tracked and again through the formatter, and the two must render the same
 /// document.
@@ -148,7 +150,7 @@ fn std_dir() -> PathBuf {
 fn scratch_directory(label: &str) -> PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let directory = std::env::temp_dir().join(format!(
+    let directory = support::scratch_root().join(format!(
         "{label}-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)

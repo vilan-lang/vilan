@@ -34,6 +34,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+mod support;
+
 /// A package whose entry `[derive]`s, so the expander dispatches into std's
 /// derive world and one world is compiled.
 const DERIVING: &str = "[derive(Debug)]\nstruct Point { x: i32, y: i32 }\n\n\
@@ -47,7 +49,7 @@ const PLAIN: &str = "struct Point { x: i32, y: i32 }\n\n\
      fun main() {\n\tlet p = Point { x = 1, y = 2 };\n\tlet moved = p.x;\n}\n";
 
 fn temp_package(name: &str, entry: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = support::scratch_root().join(format!(
         "vilan-m33-{name}-{}-{:?}",
         std::process::id(),
         std::thread::current().id(),

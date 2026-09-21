@@ -251,24 +251,32 @@ fn main() -> ExitCode {
     // it is BOUNDED now (B138/B139/B142, `VILAN_DEPTH_STATS`) — which is what
     // brought this number down from 256 MiB:
     //
-    //   * the PARSER, at 500 levels of nesting. The deepest consumer in the
-    //     pipeline and the one that runs first, so before B142 it reached the
-    //     cliff before either analyzer bound could refuse. Measured through
-    //     this binary on the worst plant (5000 nested parentheses): peak depth
-    //     501, 35.2 MiB unoptimized, ~10 MiB optimized.
-    //   * the phase-1 expression walk, ~36 KiB per level (500 levels, ~18 MiB).
+    //   * the PARSER, at 500 levels of nesting. It runs FIRST, so before B142
+    //     it reached the cliff before either analyzer bound could refuse.
+    //     Measured through this binary on the worst plant (5000 nested
+    //     parentheses): peak depth 501, 34,181 bytes (33.4 KiB) per level of
+    //     source nesting, 16.24 MiB unoptimized, 3.93 MiB optimized.
+    //   * the phase-1 expression walk, 42,464 bytes (41.5 KiB) per level
+    //     (500 levels, ~20.3 MiB) — the deepest consumer by bytes per level.
     //   * the return-inference chain, ~12.8 KiB per call link (500, ~6.4 MiB).
+    //
+    // The parse and walk figures are N101's re-measurement: the record had the
+    // parse frame at ~71.8 KiB a level and 35.2 MiB at the bound, and the walk
+    // at ~36 KiB, and neither reproduces (N97 re-keyed the walk; the parse
+    // numbers are 2.2x what `VILAN_DEPTH_STATS` reads). `deep_nesting.rs` holds
+    // both with the method that produced them, and a canary each.
     //
     // Each refuses with a diagnostic rather than overflowing, and the phases
     // run in SEQUENCE — the parse has unwound before analysis starts — so the
-    // worst case is the largest of them, not their sum: ~35 MiB unoptimized.
-    // Real code is nowhere near it: all 211 corpus entries peak at 23 parser
-    // levels against a bound of 500, and a realistic analysis peaks under 1 MiB.
+    // worst case is the largest of them, not their sum: ~20 MiB unoptimized,
+    // and it is the WALK now rather than the parse. Real code is nowhere near
+    // it: all 211 corpus entries peak at 23 parser levels against a bound of
+    // 500, and a realistic analysis peaks under 1 MiB.
     //
-    // 128 MiB is ~3.6x that measured worst case, and the headroom is not idle.
+    // 128 MiB is ~6.3x that measured worst case, and the headroom is not idle.
     // A macro-world compile NESTS a full pipeline inside the running analysis
     // (see `Document::analyze` in vilan-lsp), so a deep walk carrying a deep
-    // nested parse inside it composes to roughly 53 MiB; this covers that with
+    // nested parse inside it composes to roughly 37 MiB; this covers that with
     // room over. Bounding the parser is what made the number finite at all —
     // before B142 there was no worst case to size anything against, and the
     // margin was standing in for a bound that did not exist.
@@ -4050,6 +4058,21 @@ fn git_deps_cached() -> vilan_core::git_dep::GitDeps {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CompileGoal {
     Emit,
+    /// `vilan run` of a lone package or a bare file: the emission walk's TEXT
+    /// is wanted, and nothing is written into `dist/` (tracker N103).
+    ///
+    /// `Emit` in every respect but that one, and that one is the whole reason
+    /// the variant exists. `run_single` hands Node a temp script and keeps the
+    /// canonical `<entry>.<ext>` sidecars beside the source, so it has no
+    /// build directory — yet it compiled under `Emit`, which put its macro
+    /// expansion table in `dist/.cache/`. N92 moved `vilan check`'s table out
+    /// of the package for exactly this reason and stopped one command short:
+    /// after `vilan run <package>` the tree held a `dist/` containing
+    /// `.cache/macro-expansions` and NOTHING else — a build directory in a
+    /// tree nobody asked to build, with no build in it. Milder than the check
+    /// case, because `rm -rf dist` still means what it says; misleading all
+    /// the same, and it is the same root.
+    Run,
     Check,
     CheckModule,
 }
@@ -4061,9 +4084,11 @@ impl CompileGoal {
         matches!(self, CompileGoal::Check | CompileGoal::CheckModule)
     }
 
-    /// Whether this goal writes ARTIFACTS — which is what decides where its
-    /// macro expansion table lives (N92): `dist/` belongs to a build, and a
-    /// command that emits nothing has no business creating one.
+    /// Whether this goal writes artifacts INTO `dist/` — which is what decides
+    /// where its macro expansion table lives (N92, N103): `dist/` belongs to a
+    /// build, and a command that puts nothing there has no business creating
+    /// one. `Run` emits text and writes none, so it answers `false` with the
+    /// two checking goals.
     fn emits_artifacts(self) -> bool {
         matches!(self, CompileGoal::Emit)
     }
@@ -4081,7 +4106,7 @@ impl CompileGoal {
     /// 6.3% of a cold check's instructions spent producing names and text that
     /// this goal drops on the floor.
     fn emits_text(self) -> bool {
-        matches!(self, CompileGoal::Emit)
+        matches!(self, CompileGoal::Emit | CompileGoal::Run)
     }
 }
 
@@ -4200,15 +4225,20 @@ fn compile_unit(
 
 /// Where THIS compile keeps its cross-process macro expansion table (M33, N92).
 ///
-/// Two roots, chosen by what the compile writes. A goal that EMITS uses the
-/// package's own `dist/`, which is where its artifacts go and what `rm -rf
-/// dist` is about: one gesture, "recompile everything, macro worlds included".
-/// A CHECKING goal emits nothing, so it has no build directory of its own to
-/// put memory in — and creating one made `vilan check` mutate the package it
-/// was pointed at, which is the whole of N92. Its table lives under
-/// `~/.vilan/check-cache/<hash>` instead, keyed by the package's canonical
-/// path so two packages never share a table and one package's two spellings
-/// do.
+/// Two roots, chosen by what the compile writes INTO `dist/`. A goal that puts
+/// artifacts there uses the package's own `dist/`, which is what `rm -rf dist`
+/// is about: one gesture, "recompile everything, macro worlds included". A goal
+/// that puts nothing there has no build directory of its own to keep memory in
+/// — and creating one made `vilan check` mutate the package it was pointed at,
+/// which is the whole of N92. Its table lives under
+/// `~/.vilan/check-cache/<hash>` instead, keyed by the package's canonical path
+/// so two packages never share a table and one package's two spellings do.
+///
+/// N103: `vilan run` of a lone package or a bare file is on that side too. It
+/// hands Node a temp script and keeps its sidecars beside the source, so it
+/// writes nothing into `dist/` — but it compiled under `Emit` and so left a
+/// `dist/` holding `.cache/macro-expansions` and nothing else. See
+/// [`CompileGoal::Run`].
 ///
 /// The hash and not the path itself: a directory name has to be one path
 /// segment on every platform, and a project path is neither (it carries
@@ -4390,7 +4420,7 @@ fn run_single(unit: &Unit, args: &[String], backend: Backend) -> ExitCode {
         unit,
         platform,
         Backend::Js,
-        CompileGoal::Emit,
+        CompileGoal::Run,
         false,
         false,
         None,

@@ -35,6 +35,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use vilan_core::token::Token;
 
+mod support;
+
 /// The tracked sources that carry `style()` builder chains. Each is built as
 /// tracked and built again through the formatter, and the two must render the
 /// same style.
@@ -298,7 +300,7 @@ fn project_root(source: &Path, root: &Path) -> Option<PathBuf> {
 fn scratch_directory(label: &str) -> PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let directory = std::env::temp_dir().join(format!(
+    let directory = support::scratch_root().join(format!(
         "{label}-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
