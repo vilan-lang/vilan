@@ -20,7 +20,16 @@ trait FromJson {                                           // decode
 ```
 
 `[derive(Json)]` implements both from a struct/enum's shape; scalars,
-`List`, and `Option` nest.
+`List`, `Option` and `Result` nest.
+
+`Result<T, E>` is Json when both arms are, and it is spelled the way the
+codecs spell it: externally tagged by variant NAME, `Ok(7)` as
+`{"Ok":7}` and `Err("nope")` as `{"Err":"nope"}`. That is the same text
+`[derive(Json)]` gives a one-payload variant and the same text the wire
+layer's `Result` writes, so one value crosses `to_json`, `encode_json`
+and the binary codec under one encoding. Decoding checks the shape
+before the tag: a document that is not an object, and a tag the type
+does not declare, are both decode errors.
 
 Encoding (`to_json`) is total, but **decoding is fallible**: the input is
 untrusted, so a missing field, a wrong-shaped value, or text that isn't
@@ -195,8 +204,8 @@ types with a custom encoding.
 
 It gives you the wire codec and nothing else: a type that also needs
 `to_json`/`from_json` asks for both, `[derive(Json, Wire)]`. The two are
-separate trait families with separate field rules — `Map`, `Result` and
-any hand-written `impl … with Wire` type are Wire and are not Json — so a
+separate trait families with separate field rules — `Map` and any
+hand-written `impl … with Wire` type are Wire and are not Json — so a
 `Wire` derive that quietly emitted a JSON codec as well would refuse
 fields the wire boundary admits, in `to_json`'s vocabulary rather than
 Wire's.
@@ -213,7 +222,8 @@ tagged variant over the binary codec. That makes a fallible reply an
 ordinary payload — `[rpc] fun lookup(self, id: u53): Result<Row, str>`
 needs nothing hand-written. An unrecognized tag is a sticky decode
 failure, so `decode` answers `Err(reason)` rather than panicking on a
-malformed frame.
+malformed frame. `std::json`'s direct pair writes the same tags, so the
+two spellings of a `Result` are one encoding.
 
 `Map<K, V>` is Wire when both its key and its value are (the key is
 already `Hashable` by the type's own bound). It narrates as a list of

@@ -5522,6 +5522,121 @@ fn an_unknown_result_tag_is_a_sticky_decode_failure_not_a_panic() {
     );
 }
 
+/// A104 — the DIRECT `Json`/`FromJson` pair for `Result<T, E>`, which the
+/// module carried for `Option` from the start and for `Result` not at all. It
+/// is deliberately not a third encoding: the text is externally tagged by
+/// VARIANT NAME, which is both what `[derive(Json)]` gives a one-payload
+/// variant and what the wire codec's `Result` impl writes, so `to_json` and
+/// `encode_json` are byte-identical and either side reads the other's document.
+/// (kolt's `shared.vl:65/80` hand-wrote the pair as a `[kind, value]` array
+/// with integer kinds — the exhibit, and an encoding nothing else spoke.)
+#[test]
+fn a104_result_carries_the_direct_json_pair_in_the_codecs_own_spelling() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::{ decode_json, encode_json, FromJson, Json };
+        import std::result::Result::{ self, Err, Ok };
+        fun show(outcome: Result<Result<i53, str>, str>): str {
+            match outcome {
+                Ok(let inner) => match inner {
+                    Ok(let value) => i"ok:{value}",
+                    Err(let reason) => i"err:{reason}",
+                },
+                Err(let reason) => i"failed:{reason}",
+            }
+        }
+        fun main() {
+            let good: Result<i53, str> = Ok(7i53);
+            let bad: Result<i53, str> = Err("nope");
+            print(good.to_json());                 // {"Ok":7}
+            print(bad.to_json());                  // {"Err":"nope"}
+            // The visitor writes the same bytes the direct impl does.
+            print(i"same:{encode_json(good) == good.to_json()}");
+            print(i"same:{encode_json(bad) == bad.to_json()}");
+            // Both directions of the direct pair.
+            print(show(Result::from_json(good.to_json())));
+            print(show(Result::from_json(bad.to_json())));
+            // And across the two: the visitor reads what the direct impl wrote.
+            print(show(decode_json<Result<i53, str>>(good.to_json())));
+            print(show(Result::from_json(encode_json(bad))));
+        }
+        "#,
+        "{\"Ok\":7}\n{\"Err\":\"nope\"}\nsame:true\nsame:true\nok:7\nerr:nope\nok:7\nerr:nope\n",
+    );
+}
+
+/// A104 — the pair nests, because each side delegates to its payload's own
+/// impl: a container, an `Option` (whose `None` is a bare `null` inside the
+/// tag) and a `[derive(Json)]` struct all cross on either leg.
+#[test]
+fn a104_the_result_json_pair_nests_through_containers_and_a_derive() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::{ FromJson, Json };
+        import std::result::Result::{ self, Err, Ok };
+        [derive(Json)]
+        struct Row {
+            id: i32,
+            name: str,
+        }
+        fun main() {
+            let list: Result<List<i32>, str> = Ok([1, 2]);
+            print(list.to_json());
+            let absent: Result<Option<i32>, str> = Ok(None);
+            print(absent.to_json());
+            let row: Result<Row, str> = Ok(Row { id = 1, name = "Ada" });
+            print(row.to_json());
+            let read: Result<Result<Row, str>, str> = Result::from_json(row.to_json());
+            match read {
+                Ok(let inner) => match inner {
+                    Ok(let value) => print(i"row {value.id} {value.name}"),
+                    Err(let reason) => print(i"inner-err {reason}"),
+                },
+                Err(let reason) => print(i"failed {reason}"),
+            }
+            // The Err leg carries its own payload type just as well.
+            let failed: Result<i32, Row> = Err(Row { id = 9, name = "boom" });
+            print(failed.to_json());
+        }
+        "#,
+        "{\"Ok\":[1,2]}\n{\"Ok\":null}\n{\"Ok\":{\"id\":1,\"name\":\"Ada\"}}\nrow 1 Ada\n\
+         {\"Err\":{\"id\":9,\"name\":\"boom\"}}\n",
+    );
+}
+
+/// A104 — decoding is fallible and NEVER crashes (the rule `FromJson`'s own
+/// doc states). The SHAPE is checked before the tag is read, deliberately: a
+/// tag read is `Object.keys` over the value, and a JSON `null` has no keys, so
+/// reading the tag first would throw rather than report. A wrong shape, an
+/// unknown tag, and text that is not JSON at all are three decode errors.
+#[test]
+fn a104_a_malformed_result_document_is_a_decode_error_and_never_a_crash() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::FromJson;
+        import std::result::Result::{ self, Err, Ok };
+        fun show(outcome: Result<Result<i53, str>, str>): str {
+            match outcome {
+                Ok(let _decoded) => "decoded-garbage",
+                Err(let reason) => i"refused:{reason}",
+            }
+        }
+        fun main() {
+            print(show(Result::from_json("null")));          // no keys to read
+            print(show(Result::from_json("7")));             // a number is not a variant
+            print(show(Result::from_json("[0,7]")));         // kolt's old array shape
+            print(show(Result::from_json("{\"Nope\":1}")));  // a tag nothing declares
+            print(show(Result::from_json("not json")));      // not a document at all
+        }
+        "#,
+        "refused:expected an object\nrefused:expected an object\nrefused:expected an object\n\
+         refused:unknown variant in JSON for enum Result\nrefused:not valid JSON\n",
+    );
+}
+
 /// The sized numeric family (numeric-types.md §5) is Wire, each width riding
 /// the visitor lane that holds it exactly — `i8`/`i16` on `i32`, `u8`/`u16` on
 /// `u32`, `u53` on `i53`, `f32` on `f64` — so the round trip is exact at both
