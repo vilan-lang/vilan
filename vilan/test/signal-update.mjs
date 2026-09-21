@@ -69,7 +69,9 @@ function drain(turn) {
 				turn[0].v = [  ];
 				turn[1].v = new Map();
 				for (const subscriber of wave) {
-					subscriber[1]();
+					if (subscriber[2].v) {
+						subscriber[1]();
+					}
 					budget = budget - 1;
 				}
 			}
@@ -82,6 +84,7 @@ function drain(turn) {
 	}
 }
 function dispose(self, $N) {
+	self[2].v = false;
 	const $O = [ 0, self[0] ];
 	let $P = null;
 	if ($O[0] === 0) {
@@ -98,11 +101,19 @@ function dispose(self, $N) {
 		$P = undefined;
 	}
 	$P;
-	const ambient = $N;
-	const $Q = ambient;
+	const $Q = $N;
 	let $R = null;
 	if ($Q[0] === 0) {
-		const turn = $Q[1];
+		const established = $Q[1];
+		$R = [ 0, established ];
+	} else {
+		$R = $j(draining_turns.v);
+	}
+	const ambient = $R;
+	const $S = ambient;
+	let $T = null;
+	if ($S[0] === 0) {
+		const turn = $S[1];
 		let kept_pending = [  ];
 		for (const subscriber2 of turn[0].v) {
 			if (subscriber2[0] !== self[1]) {
@@ -111,26 +122,26 @@ function dispose(self, $N) {
 		}
 		turn[0].v = kept_pending;
 		turn[1].v.delete(hash2(self[1]));
-		$R = undefined;
+		$T = undefined;
 	} else {
-		$R = undefined;
+		$T = undefined;
 	}
-	$R;
-	const $S = self[2].v;
-	let $T = null;
-	if ($S[0] === 0) {
-		const release = $S[1];
-		self[2].v = [ 1 ];
+	$T;
+	const $U = self[3].v;
+	let $V = null;
+	if ($U[0] === 0) {
+		const release = $U[1];
+		self[3].v = [ 1 ];
 		releasing_turns.v.push(ambient);
 		__with_finally(release, () => {
 			__list_pop(releasing_turns.v);
 			return;
 		});
-		$T = undefined;
+		$V = undefined;
 	} else {
-		$T = undefined;
+		$V = undefined;
 	}
-	return $T;
+	return $V;
 }
 function new4() {
 	return [ __shared_new([  ]), __shared_new(false) ];
@@ -162,7 +173,9 @@ function $e(self, $f) {
 			$l = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
-				subscriber[1]();
+				if (subscriber[2].v) {
+					subscriber[1]();
+				}
 			}
 			$l = undefined;
 		}
@@ -197,7 +210,9 @@ function $r(self, $f) {
 			$v = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
-				subscriber[1]();
+				if (subscriber[2].v) {
+					subscriber[1]();
+				}
 			}
 			$v = undefined;
 		}
@@ -219,18 +234,19 @@ function $A(self, mutate, $d) {
 function $I(signal, observer) {
 	const id = fresh_id();
 	const cell = signal[0];
+	const live = __shared_new(true);
 	signal[1].v.push([ id, () => {
 		const $J = [ 0, cell ];
 		let $K = null;
 		if ($J[0] === 0) {
-			const live = $J[1];
-			$K = observer(live.v);
+			const live2 = $J[1];
+			$K = observer(live2.v);
 		} else {
 			$K = undefined;
 		}
 		return $K;
-	} ]);
-	return [ signal[1], id, __shared_new([ 1 ]) ];
+	}, live ]);
+	return [ signal[1], id, live, __shared_new([ 1 ]) ];
 }
 function $H(self, observer) {
 	const subscription = $I(self, observer);
@@ -248,27 +264,27 @@ function $L(self, item, $M) {
 	}
 	return __clone(item);
 }
-function $V(body, $W) {
-	const $X = $W;
-	let $Y = null;
-	if ($X[0] === 0) {
-		const current = $X[1];
-		$Y = body(current);
+function $X(body, $Y) {
+	const $Z = $Y;
+	let $aa = null;
+	if ($Z[0] === 0) {
+		const current = $Z[1];
+		$aa = body(current);
 	} else {
 		const fresh = new3();
 		const result = body(fresh);
 		drain(fresh);
 		fresh[3].v = true;
-		$Y = result;
+		$aa = result;
 	}
-	return $Y;
+	return $aa;
 }
-function $ab(self, value, $ac) {
+function $ad(self, value, $ae) {
 	self[0].v = __clone(value);
-	$r(self, $ac);
+	$r(self, $ae);
 }
-function $Z(self, transform, $aa) {
-	$ab(self, transform($m(self)), $aa);
+function $ab(self, transform, $ac) {
+	$ad(self, transform($m(self)), $ac);
 }
 const next_subscriber_id = __shared_new(0);
 const draining_turns = __shared_new([  ]);
@@ -306,15 +322,15 @@ $c(watched, (list) => {
 	return;
 }, [ 1 ]);
 console.log("---");
-$V(($U) => {
+$X(($W) => {
 	$c(watched, (list) => {
 		list.push(3);
 		return;
-	}, [ 0, $U ]);
+	}, [ 0, $W ]);
 	$c(watched, (list) => {
 		list.push(4);
 		return;
-	}, [ 0, $U ]);
+	}, [ 0, $W ]);
 	console.log("inside");
 	return;
 }, [ 1 ]);
@@ -323,7 +339,7 @@ $c(todos, (list) => {
 	console.log("reentrant " + $m(todos).length);
 	return;
 }, [ 1 ]);
-$Z(count, (n) => {
+$ab(count, (n) => {
 	return n + 4;
 }, [ 1 ]);
 console.log($m(count));

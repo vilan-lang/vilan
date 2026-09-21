@@ -29,7 +29,7 @@
 // Only available when building for a process platform (node).
 
 import pkg::compare::PartialEq;
-import pkg::option::Option::{ self, None };
+import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{
 	Draft,
 	Owner,
@@ -216,9 +216,14 @@ export impl View {
 		self
 	}
 
-	/// Reactive attribute, read once.
-	fun bind_attr<S: Source<str>>(self, name: str, source: S): View {
-		set_attribute(self.attributes, name, source.get());
+	/// Reactive attribute, read once — and `Option`-valued sources are read
+	/// once too (A105): `Some(text)` renders the attribute, `None` omits it
+	/// entirely. There is no server counterpart to the browser twin's
+	/// `remove_attribute` because nothing was written in the first place, which
+	/// is `toggle_attr`'s arrangement exactly.
+	/// KEEP IN STEP with the browser twin.
+	fun bind_attr<V: AttrBinding>(self, name: str, source: V): View {
+		source.bind_attribute(self, name);
 		self
 	}
 
@@ -644,6 +649,33 @@ export impl str with AttrValue {
 export impl type S: Source<str> with AttrValue {
 	fun apply(self, parent: View, name: str) {
 		set_attribute(parent.attributes, name, self.get());
+	}
+}
+
+/// What `View::bind_attr` accepts (A105) — the twin of the browser's
+/// `AttrBinding`, read once. `bind_attr` means "reactive attribute", so this
+/// vocabulary is sources only and does not admit a static `str`; `AttrValue`
+/// above is the element-syntax one and does.
+/// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
+export trait AttrBinding {
+	fun bind_attribute(self, parent: View, name: str);
+}
+
+/// Always present.
+export impl type S: Source<str> with AttrBinding {
+	fun bind_attribute(self, parent: View, name: str) {
+		set_attribute(parent.attributes, name, self.get());
+	}
+}
+
+/// Rendered only for a `Some`: a `None` omits the attribute, which is the
+/// server's whole answer to the browser twin's `remove_attribute`.
+export impl type S: Source<Option<str>> with AttrBinding {
+	fun bind_attribute(self, parent: View, name: str) {
+		match self.get() {
+			Some(let text) => set_attribute(parent.attributes, name, text),
+			None => {},
+		}
 	}
 }
 

@@ -2726,3 +2726,285 @@ fn a91_the_ssr_twin_renders_what_each_row_shape_renders() {
          value-form row as what they are, in place"
     );
 }
+
+// --- A110 door 1: nested `swap`s on one source ------------------------------
+
+/// The shape the item was filed from (kolt `views.vl:72`), minimized: an OUTER
+/// `swap` keyed on a PROJECTION of the route and an INNER `swap` keyed on the
+/// route itself, so both forms stand on one source and the outer reaches it one
+/// derivation — one wave — later than the inner.
+///
+/// Projecting the outer key is the right way to stop the outer form rebuilding
+/// on every navigation (`place_swap` dedups on `==`), and it is what the guide
+/// teaches. The cost, before door 1, was that the inner form's effect and the
+/// outer's owner disposal raced: the inner rendered under an `Owner` the outer's
+/// `defer` had already run, into a `Region` whose anchor `close()` had already
+/// removed — a subtree nothing would ever dispose, in no document.
+///
+/// Every inner build counts itself and registers a cleanup on its own ambient
+/// owner, so `builds` and `teardowns` are the creation/disposal pair the item
+/// asks to be equal.
+const NESTED_SWAP_ON_ONE_SOURCE: &str = r#"import std::io::print;
+import std::reactive::{ Disposable, FlushPolicy, Signal, SignalCell, Source, get_owner, turn };
+import std::ui::{ View, mount_root, swap, view };
+
+[derive(PartialEq)]
+enum Shell {
+	Login,
+	App,
+}
+
+let route: SignalCell<str> = Signal::new("/app/one");
+let builds: SignalCell<i32> = Signal::new(0);
+let teardowns: SignalCell<i32> = Signal::new(0);
+
+fun shell_of(path: str): Shell {
+	if path.starts_with("/app") { Shell::App } else { Shell::Login }
+}
+
+fun page(path: str): View {
+	builds.set_with(|count| count + 1);
+	get_owner().defer(|| {
+		teardowns.set_with(|count| count + 1);
+	});
+	view("p").text(path)
+}
+
+fun report(label: str) {
+	print(i"{label} builds={builds.get()} teardowns={teardowns.get()} tree={shape()}");
+}
+
+fun main() {
+	let _root = mount_root("app", || view("main").child(swap(route.map(shell_of), |shell: Shell| {
+		match shell {
+			Shell::Login => view("section").text("sign in"),
+			Shell::App => view("div").child(swap(route, |path: str| page(path))),
+		}
+	})));
+	report("mounted");
+
+	// Sign out with NO ambient turn: `SignalCell::notify` takes its inline arm
+	// and walks a snapshot of `route`'s subscriber list. The derivation runs
+	// first, the outer effect disposes the App shell depth-first, and the inner
+	// effect is still in the snapshot.
+	route.set("/login");
+	report("inline-signout");
+
+	// Back in, then out again inside a TURN — the cadence every `View.on`
+	// dispatch and `mount_root` establishes.
+	route.set("/app/two");
+	report("back-in");
+	turn(FlushPolicy::AtSuspension, || {
+		route.set("/login");
+	});
+	report("turn-signout");
+}
+
+/// The document as markup, so "it built into a closed region" is a fact about
+/// the tree rather than a count.
+[extern("__shape")]
+external fun shape(): str;
+
+main();
+"#;
+
+#[test]
+fn a110_nested_swaps_on_one_source_build_no_orphan_subtree_on_sign_out() {
+    let harness = format!(
+        "{DOM_STUB}\nglobal.__shape = () => documentRoot.render();\nrequire(\"./app.js\");\n"
+    );
+    let stdout = build_and_run("a110_nested_swap", NESTED_SWAP_ON_ONE_SOURCE, &harness);
+    let line = |prefix: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("the {prefix} line; got:\n{stdout}"))
+            .trim()
+            .to_string()
+    };
+
+    // The mount builds the App shell and one page under it.
+    assert_eq!(
+        line("mounted "),
+        "builds=1 teardowns=0 tree=<root><main><div><p>/app/one</p></div></main></root>",
+        "the mount must build the App shell and one page; got:\n{stdout}"
+    );
+
+    // The inline sign-out is the face door 1 closes. Before it, `builds` went
+    // to 2 here — a page rendered for `/login` under an owner the outer shell's
+    // disposal had already passed, into a region whose anchor was gone — and
+    // `teardowns` stayed at 1, so the creation/disposal pair did not balance
+    // and the orphan was in no document at all.
+    assert_eq!(
+        line("inline-signout "),
+        "builds=1 teardowns=1 tree=<root><main><section>sign in</section></main></root>",
+        "signing out inline must not build the inner page again, and every page \
+         owner built must have been disposed; got:\n{stdout}"
+    );
+
+    assert_eq!(
+        line("back-in "),
+        "builds=2 teardowns=1 tree=<root><main><div><p>/app/two</p></div></main></root>",
+        "navigating back in must build exactly one page; got:\n{stdout}"
+    );
+
+    // In a TURN the inner page is still built once and then torn down: the
+    // wave order is child-before-parent (A110 face 1), which is DOOR 2's
+    // ordering rule and not this fix. What door 1 guarantees here is the pair —
+    // every owner created was disposed, and the document holds only the Login
+    // shell — so the wasted build is a wasted build and not a leak.
+    assert_eq!(
+        line("turn-signout "),
+        "builds=3 teardowns=3 tree=<root><main><section>sign in</section></main></root>",
+        "signing out in a turn must leave no live page owner and no orphan \
+         subtree; got:\n{stdout}"
+    );
+}
+
+// --- A105: `bind_attr` over a `Source<Option<str>>` -------------------------
+
+/// `bind_attr` at both value types, on one element. The `str` arm is the
+/// control — it must behave exactly as it always did — and the `Option` arm is
+/// the new one: `Some` sets, `None` REMOVES. kolt hand-wrote this as
+/// `bind_attr_proper` (styles.vl:36) because std had no form for it, and its
+/// customer is `[data-dragging="row"] *`, a selector that reads PRESENCE, so
+/// writing "" between drags is the wrong answer rather than a tidier one.
+///
+/// The last two lines are the boundary: the effect is the nearest boundary's,
+/// like every binding's, so disposing the root stops both.
+const BIND_ATTR_OPTION: &str = r#"import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Disposable, Signal, SignalCell };
+import std::ui::{ View, mount_root, view };
+
+fun main() {
+	let dragging: SignalCell<Option<str>> = Signal::new(None);
+	let plain: SignalCell<str> = Signal::new("one");
+	let root = mount_root("app", || {
+		view("div")
+			.bind_attr("data-dragging", dragging)
+			.bind_attr("x-plain", plain)
+			.child(view("p").text("shell"))
+	});
+	print(i"initial={shell_attributes()}");
+	dragging.set(Some("row"));
+	print(i"dragging-row={shell_attributes()}");
+	dragging.set(Some("col"));
+	print(i"dragging-col={shell_attributes()}");
+	dragging.set(None);
+	print(i"released={shell_attributes()}");
+
+	// The empty string is a VALUE, not an absence — the distinction the
+	// `Option` bound exists to make.
+	dragging.set(Some(""));
+	print(i"empty-string={shell_attributes()}");
+	dragging.set(None);
+	print(i"released-again={shell_attributes()}");
+
+	// The `str` arm, unchanged.
+	plain.set("two");
+	print(i"plain={shell_attributes()}");
+
+	root.dispose();
+	dragging.set(Some("row"));
+	plain.set("three");
+	print(i"disposed={shell_attributes()}");
+}
+
+[extern("__shell_attributes")]
+external fun shell_attributes(): str;
+
+main();
+"#;
+
+#[test]
+fn a105_bind_attr_over_an_option_source_sets_and_removes_the_attribute() {
+    let harness = format!(
+        "{DOM_STUB}\nglobal.__shell_attributes = () => {{\n  \
+         const shell = documentRoot.children[0];\n  \
+         return JSON.stringify(shell.attributes);\n\
+         }};\nrequire(\"./app.js\");\n"
+    );
+    let stdout = build_and_run("bind_attr_option", BIND_ATTR_OPTION, &harness);
+    let line = |prefix: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("the {prefix} line; got:\n{stdout}"))
+            .to_string()
+    };
+    // A `None` at mount writes nothing at all — not `""`, not `"None"`.
+    assert_eq!(
+        line("initial="),
+        "{\"x-plain\":\"one\"}",
+        "a `None` must leave the attribute off entirely; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("dragging-row="),
+        "{\"x-plain\":\"one\",\"data-dragging\":\"row\"}",
+        "a `Some` must set the attribute to its text; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("dragging-col="),
+        "{\"x-plain\":\"one\",\"data-dragging\":\"col\"}",
+        "a second `Some` must replace the value; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("released="),
+        "{\"x-plain\":\"one\"}",
+        "a `None` must REMOVE the attribute, not write a value; got:\n{stdout}"
+    );
+    // The whole reason the bound is `Option<str>` and not `str`.
+    assert_eq!(
+        line("empty-string="),
+        "{\"x-plain\":\"one\",\"data-dragging\":\"\"}",
+        "`Some(\"\")` must write a present, empty attribute; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("released-again="),
+        "{\"x-plain\":\"one\"}",
+        "and the next `None` must remove it again; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("plain="),
+        "{\"x-plain\":\"two\"}",
+        "the `str` arm must still track; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("disposed="),
+        "{\"x-plain\":\"two\"}",
+        "both bindings are the boundary's, so disposing the root must stop \
+         them; got:\n{stdout}"
+    );
+}
+
+/// The SSR twin: read once, and a `None` renders nothing. There is no
+/// `remove_attribute` to mirror, because nothing was written — `toggle_attr`'s
+/// arrangement exactly.
+const BIND_ATTR_OPTION_SSR: &str = r#"import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ View, render, view };
+
+fun main() {
+	let held: SignalCell<Option<str>> = Signal::new(Some("row"));
+	let absent: SignalCell<Option<str>> = Signal::new(None);
+	let blank: SignalCell<Option<str>> = Signal::new(Some(""));
+	print(render(view("div").bind_attr("data-dragging", held).attr("id", "shell")));
+	print(render(view("section").bind_attr("data-dragging", absent)));
+	print(render(view("aside").bind_attr("data-dragging", blank)));
+}
+
+main();
+"#;
+
+#[test]
+fn a105_the_ssr_twin_renders_a_some_attribute_and_omits_a_none() {
+    let stdout = build_and_run_process("bind_attr_option_ssr", BIND_ATTR_OPTION_SSR);
+    assert_eq!(
+        stdout,
+        "<div data-dragging=\"row\" id=\"shell\"></div>\n<section></section>\n<aside data-dragging=\"\"></aside>\n",
+        "the server render must carry a `Some` attribute in insertion order, \
+         omit a `None` entirely, and keep `Some(\"\")` as a present empty one"
+    );
+}

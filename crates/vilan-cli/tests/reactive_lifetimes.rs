@@ -593,3 +593,274 @@ require("./app.js");
         "the reactive core's exception safety went differently:\n{stdout}"
     );
 }
+
+// --- A110 door 1: a disposed observer never fires ---------------------------
+
+/// The item's probe, inline: a `route` cell, a `shell` derived from it, an outer
+/// observer of `shell` that disposes a boundary, and an inner observer of
+/// `route` owned by that boundary. One `route.set`, no ambient turn.
+///
+/// `SignalCell::notify`'s inline arm walks a SNAPSHOT of the subscriber list.
+/// The derivation's subscriber runs first and cascades depth-first — derived
+/// `set` → the outer observer → the boundary disposed and the inner
+/// subscription detached from the LIST — but the snapshot the loop is walking
+/// still holds it, so it was called next. For a `swap` that is the leak the
+/// item names: `live_owner` (already disposed) no-ops, `render` runs under a
+/// fresh `Owner` the boundary's `defer` has already passed, and `open_row`
+/// inserts before an anchor `region.close()` removed.
+const A110_DISPOSED_OBSERVER_INLINE: &str = r#"import std::io::print;
+import std::reactive::{ Disposable, Owner, Signal, SignalCell, Source, owner_scope };
+
+fun main() {
+	let route: SignalCell<i32> = Signal::new(0);
+	let shell: SignalCell<i32> = route.map(|value| value / 10);
+	let boundary = Owner::new();
+	let fired: SignalCell<i32> = Signal::new(0);
+
+	owner_scope.run(boundary, || {
+		route.effect_on_change(|value: i32| {
+			print(i"INNER fired with {value} (boundary disposed: {boundary.is_disposed()})");
+			fired.set_with(|count| count + 1);
+		});
+	});
+	let _outer = shell.on_change(|_projected: i32| {
+		print("outer disposes the inner boundary");
+		boundary.dispose();
+	});
+
+	// No ambient turn: `notify` takes the inline arm.
+	route.set(10);
+	print(i"inline-fired={fired.get()}");
+	print(i"inline-subscribers={route.subscribers.read().len()}");
+}
+"#;
+
+#[test]
+fn a110_a_disposed_observer_does_not_fire_from_an_inline_notifys_snapshot() {
+    // Before door 1 this printed `INNER fired with 10 (boundary disposed:
+    // true)` and `inline-fired=1` — the scrub's own comment promises "a
+    // disposed observer never fires", and that held only under an ambient
+    // turn. The flag is `Subscriber.live`, lowered by `Subscription::dispose`
+    // and read by both notification loops.
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("a110_inline", A110_DISPOSED_OBSERVER_INLINE, &harness, &[]);
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "outer disposes the inner boundary",
+            // No `INNER fired` line at all: the inner observer is off.
+            "inline-fired=0",
+            // …and detached, which is what it always was.
+            "inline-subscribers=1",
+        ],
+        "a disposed observer must not fire from an inline notify's snapshot; got:\n{stdout}"
+    );
+}
+
+/// The same law inside a turn, at the two places the pending-queue scrub cannot
+/// reach.
+///
+/// **One wave.** `drain` takes a whole wave OUT of `pending` before running it,
+/// so a dispose from inside that wave scrubs a queue the remaining subscribers
+/// are no longer in. Both observers here stand directly on `route`, the
+/// disposing one registered first, so they land in one wave in subscription
+/// order.
+///
+/// **A later wave.** The disposer is a stored closure that captured no turn
+/// (spec §8.4), so `dispose`'s `turn_scope.get_safe()` answers `None` and the
+/// scrub does not run at all — while the inner subscriber sits in the DRAINING
+/// turn's queue waiting for wave 2. This is the face the scrub was blind to
+/// whatever the wave boundaries did.
+const A110_DISPOSED_OBSERVER_IN_A_TURN: &str = r#"import std::io::print;
+import std::reactive::{
+	Disposable, FlushPolicy, Owner, Signal, SignalCell, Source, owner_scope, turn,
+};
+
+fun main() {
+	// One wave: the outer is registered FIRST, so it runs before the inner.
+	let route: SignalCell<i32> = Signal::new(0);
+	let boundary = Owner::new();
+	let fired: SignalCell<i32> = Signal::new(0);
+	let _outer = route.on_change(|_value: i32| {
+		print("one-wave: outer disposes the inner boundary");
+		boundary.dispose();
+	});
+	owner_scope.run(boundary, || {
+		route.effect_on_change(|value: i32| {
+			print(i"one-wave: INNER fired with {value}");
+			fired.set_with(|count| count + 1);
+		});
+	});
+	turn(FlushPolicy::AtEnd, || {
+		route.set(10);
+	});
+	print(i"one-wave-fired={fired.get()}");
+
+	// A later wave: the inner observes a DERIVATION of the source, so it is
+	// enqueued for wave 2 while the outer disposes it in wave 1.
+	let path: SignalCell<i32> = Signal::new(0);
+	let gate: SignalCell<i32> = path.map(|value| value / 10);
+	let later_boundary = Owner::new();
+	let later_fired: SignalCell<i32> = Signal::new(0);
+	owner_scope.run(later_boundary, || {
+		gate.effect_on_change(|value: i32| {
+			print(i"later-wave: INNER fired with {value}");
+			later_fired.set_with(|count| count + 1);
+		});
+	});
+	let _later_outer = path.on_change(|_value: i32| {
+		print("later-wave: outer disposes the inner boundary");
+		later_boundary.dispose();
+	});
+	turn(FlushPolicy::AtEnd, || {
+		path.set(10);
+	});
+	print(i"later-wave-fired={later_fired.get()}");
+}
+"#;
+
+#[test]
+fn a110_a_disposed_observer_does_not_fire_from_a_wave_the_drain_already_took_out() {
+    // Both halves printed an `INNER fired` line and a `-fired=1` before door 1.
+    // The `later-wave` half is the one the item's "pending-queue scrub cannot
+    // help" sentence undercounts: the scrub is not merely too late there, it
+    // does not run — the disposer is an owner's cleanup closure whose captured
+    // turn is `None`, so `dispose` scrubs nothing while the subscriber sits in
+    // the draining turn's own queue.
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run(
+        "a110_in_a_turn",
+        A110_DISPOSED_OBSERVER_IN_A_TURN,
+        &harness,
+        &[],
+    );
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "one-wave: outer disposes the inner boundary",
+            "one-wave-fired=0",
+            "later-wave: outer disposes the inner boundary",
+            "later-wave-fired=0",
+        ],
+        "a disposed observer must not fire from a wave already taken out of the \
+         queue, nor from a queue the disposer's own turn cannot reach; got:\n{stdout}"
+    );
+}
+
+// --- FIND-2 (papers-38): the scrub resolves its turn the way `notify` does ---
+
+/// `Subscription::dispose` read its turn with `turn_scope.get_safe()` alone,
+/// while `SignalCell::notify` and `defer_to_turn` both read "the ambient turn,
+/// ELSE the currently DRAINING one". `turn` calls `drain(fresh)` AFTER
+/// `turn_scope.run(fresh, body)` has returned, so a drain runs OUTSIDE its own
+/// turn's context extent — and a dispose reached from inside a notify is every
+/// form's teardown, since a form's own effect is what disposes the previous
+/// instantiation. Those disposals read `None` and scrubbed nothing at all.
+///
+/// The shape, one cell and two waves: the derivation subscribes FIRST, so in
+/// wave 1 it runs first and enqueues the victim for wave 2; the disposer
+/// subscribes second, so it runs later in wave 1 while the victim is already
+/// sitting in the pending queue. That is the only arrangement in which the
+/// scrub has anything to do, and it is the arrangement a nested form has,
+/// because the enclosing form reaches its source through a projection (A110).
+///
+/// The program drives its OWN `Turn` rather than using `turn(..)`, because the
+/// queue length has to be read from INSIDE the drain — which is the only place
+/// the scrub's effect is visible now that the liveness flag stops the delivery
+/// either way. `pending-after-dispose` is that reading, and it is the
+/// assertion that belongs to this fix rather than to door 1.
+const FIND2_A_DISPOSE_FROM_INSIDE_A_DRAIN: &str = r#"import std::io::print;
+import std::reactive::{
+	Disposable, Owner, Signal, SignalCell, Source, Turn, drain, owner_scope, turn_scope,
+};
+import std::shared::Shared;
+
+fun main() {
+	let own_turn = Turn::new();
+	let trigger: SignalCell<i32> = Signal::new(0);
+	let derived: SignalCell<i32> = trigger.map(|value| value * 10);
+	let boundary = Owner::new();
+	let fired: Shared<i32> = Shared::new(0);
+
+	owner_scope.run(boundary, || {
+		derived.effect_on_change(|value: i32| {
+			fired.write() = fired.read() + 1;
+			print(i"VICTIM fired with {value} (boundary disposed: {boundary.is_disposed()})");
+		});
+	});
+	// Reached from inside the drain, with no ambient turn of its own — the
+	// position every form's teardown is in.
+	let _disposer = trigger.on_change(|_value: i32| {
+		boundary.dispose();
+		print(i"pending-after-dispose={own_turn.pending.read().len()}");
+	});
+
+	// `run` enqueues; `drain` settles, from OUTSIDE the context extent.
+	turn_scope.run(own_turn, || {
+		trigger.set(1);
+	});
+	drain(own_turn);
+	print(i"victim-fired={fired.read()}");
+
+	// The control: the same dispose made from the turn's BODY, where
+	// `turn_scope` IS established and the scrub always worked.
+	let second_turn = Turn::new();
+	let second_trigger: SignalCell<i32> = Signal::new(0);
+	let second_derived: SignalCell<i32> = second_trigger.map(|value| value * 10);
+	let second_boundary = Owner::new();
+	let second_fired: Shared<i32> = Shared::new(0);
+	owner_scope.run(second_boundary, || {
+		second_derived.effect_on_change(|value: i32| {
+			second_fired.write() = second_fired.read() + 1;
+			print(i"CONTROL fired with {value}");
+		});
+	});
+	turn_scope.run(second_turn, || {
+		second_trigger.set(1);
+		second_boundary.dispose();
+		print(i"control-pending-after-dispose={second_turn.pending.read().len()}");
+	});
+	drain(second_turn);
+	print(i"control-fired={second_fired.read()}");
+}
+"#;
+
+#[test]
+fn find2_a_dispose_reached_from_inside_a_drain_scrubs_the_draining_turns_queue() {
+    // TWO claims, red against two different plants.
+    //
+    // `victim-fired=0` is A110 door 1's (the liveness flag): on `0fa109eb` the
+    // victim fired once with its boundary already disposed.
+    //
+    // `pending-after-dispose=0` is THIS fix's: on the door-1 commit it still
+    // read 1, because `dispose` asked `turn_scope.get_safe()` and nothing
+    // else. A disposed subscriber left in the queue is a disposed subtree's
+    // notify closure — and everything it captured — held reachable until the
+    // drain ends, which for a `swap` tearing down a thousand rows inside one
+    // wave is a thousand of them.
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run(
+        "find2_scrub",
+        FIND2_A_DISPOSE_FROM_INSIDE_A_DRAIN,
+        &harness,
+        &[],
+    );
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec![
+            "pending-after-dispose=0",
+            "victim-fired=0",
+            // 1, and correctly: the dispose happens BEFORE the drain, so the
+            // only thing in the queue is the DERIVATION's own entry and the
+            // victim has not been enqueued yet. The control's claim is the
+            // line below it.
+            "control-pending-after-dispose=1",
+            "control-fired=0",
+        ],
+        "a dispose from inside a drain must scrub the draining turn's queue, and \
+         the victim must not fire either way; got:\n{stdout}"
+    );
+}

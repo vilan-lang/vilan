@@ -255,12 +255,26 @@ export impl View {
 		self
 	}
 
-	/// Reactive attribute.
-	fun bind_attr<S: Source<str>>(self, name: str, source: S): View {
-		let element = self.element;
-		source.effect(|value| {
-			element.set_attribute(name, value);
-		});
+	/// Reactive attribute — the value re-set whenever `source` changes.
+	///
+	/// TWO value types, and the difference between them is what an ABSENT
+	/// attribute means (A105). A `Source<str>` always has a value, so the
+	/// attribute is always there; a `Source<Option<str>>` says the ATTRIBUTE
+	/// itself comes and goes — `Some(text)` sets it, `None` REMOVES it.
+	/// `data-dragging` is the worked example: while a drag is in progress the
+	/// attribute names what is being dragged, and between drags it must not be
+	/// present at all, because `[data-dragging="row"] *` matches on PRESENCE.
+	/// Writing "" is a different thing, and `toggle_attr` is the form for an
+	/// attribute whose whole meaning is presence and which has no value to
+	/// carry.
+	///
+	/// vilan has neither overloading nor optional parameters, so the two value
+	/// types are two impls of `AttrBinding` and this method takes the trait.
+	/// There is nothing to disambiguate: a `Source<str>` is not a
+	/// `Source<Option<str>>` and vice versa, so a `SignalCell<str>` argument
+	/// selects the first arm and a `SignalCell<Option<str>>` the second.
+	fun bind_attr<V: AttrBinding>(self, name: str, source: V): View {
+		source.bind_attribute(self, name);
 		self
 	}
 
@@ -1638,6 +1652,49 @@ export impl type S: Source<str> with AttrValue {
 		let element = parent.element;
 		self.effect(|value| {
 			element.set_attribute(name, value);
+		});
+	}
+}
+
+/// What `View::bind_attr` accepts (A105) — the REACTIVE attribute vocabulary,
+/// as `AttrValue` above is the element-syntax one. The two are deliberately
+/// separate rather than one widened trait: element syntax desugars to `.attr`,
+/// which admits a STATIC value, and `bind_attr` means "reactive attribute", so
+/// admitting a bare `str` there would let a binding its author believed was
+/// live pass unremarked.
+///
+/// Two arms, and the second is the whole point: `None` REMOVES the attribute.
+/// A trait rather than two methods because vilan has no overloading, and a
+/// trait rather than a second NAME (`toggle_attr`'s shape) because this really
+/// is one operation — set the attribute from the source — carrying a removal
+/// case, where `toggle_attr` is a different question about a different value
+/// type.
+///
+/// KEEP IN STEP with the process twin's copy (process/ui.vl).
+export trait AttrBinding {
+	fun bind_attribute(self, parent: View, name: str);
+}
+
+/// Always present: every value the source holds is the attribute's value.
+export impl type S: Source<str> with AttrBinding {
+	fun bind_attribute(self, parent: View, name: str) {
+		let element = parent.element;
+		self.effect(|value| {
+			element.set_attribute(name, value);
+		});
+	}
+}
+
+/// Present exactly while the source says `Some`, and gone while it says
+/// `None` — the shape kolt hand-wrote as `bind_attr_proper` (A105).
+export impl type S: Source<Option<str>> with AttrBinding {
+	fun bind_attribute(self, parent: View, name: str) {
+		let element = parent.element;
+		self.effect(|value| {
+			match value {
+				Some(let text) => element.set_attribute(name, text),
+				None => element.remove_attribute(name),
+			}
 		});
 	}
 }

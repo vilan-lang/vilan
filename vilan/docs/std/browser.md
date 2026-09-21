@@ -268,7 +268,7 @@ too.
 | `bind_text` | `(source: S): View`; `S: Source<str>` | reactive text |
 | `bind_class` | `(source: S): View`; `S: Source<str>` | reactive class |
 | `bind_styled` | `(source: S): View`; `S: Source<Style>` | reactive compiled style — `styled`'s reactive twin |
-| `bind_attr` | `(name: str, source: S): View`; `S: Source<str>` | reactive attribute |
+| `bind_attr` | `(name: str, source: V): View`; `V: AttrBinding` | reactive attribute, at two value types: a `Source<str>` always has a value, a `Source<Option<str>>` says the ATTRIBUTE comes and goes — `Some(text)` sets it, `None` **removes** it (and `Some("")` is a present, empty attribute, which is a different thing) |
 | `toggle_attr` | `(name: str, source: S): View`; `S: Source<bool>` | reactive BOOLEAN attribute — presence, not value (`inert`, `disabled`, `hidden`, `open`): present when true, removed when false |
 | `bind_value` | `(signal: SignalCell<str>): View` | two-way input bind — **concrete `Signal`**: it writes back |
 | `bind_draft` | `(draft: Draft<str>): View` | local-first input bind ([drafts](reactive.md#draft--local-first-cells)) |
@@ -505,6 +505,7 @@ external struct Storage;
 impl Storage {
 	fun len(self): i32
 	fun key_at(self, index: i32): Option<str>   // None past the end
+	fun keys(self): List<str>                   // every name, collected
 	fun get(self, key: str): Option<str>        // None when ABSENT
 	fun has(self, key: str): bool
 	fun set(self, key: str, value: str)
@@ -536,6 +537,27 @@ every run when presence is spelled as non-emptiness.
 Counting **down** is the shape an enumerating sweep wants, because removing a
 key renumbers everything above it — and the host's key order is unspecified
 anyway, so a pass that both reads and removes must not assume it is stable.
+
+`keys()` is the other half, and the easier one when the pass **writes**: it
+collects every name first, so removing whichever you like in whatever order has
+neither problem. It is a snapshot — a removal after the call does not change the
+list already in hand — and a missing index is skipped rather than ending the
+walk, since `len` and `key_at` are two host calls and another tab may remove a
+key between them.
+
+```vilan,browser
+import std::dom::window;
+import std::storage;
+
+fun main() {
+	let store = window().local_storage();
+	for key in store.keys() {
+		if !key.starts_with("app.") {
+			store.remove(key);
+		}
+	}
+}
+```
 
 The two reader verbs live on `Window`, so a module that calls them imports
 **both** `std::dom`'s `window` and `std::storage` — the `impl Window` block is
