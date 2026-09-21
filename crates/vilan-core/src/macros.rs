@@ -1556,7 +1556,11 @@ struct Expander<'r, 'd> {
 /// generated code are chased to the depth cap.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the expander's inputs are each a distinct fact about the file being               expanded (its scope, its std, its budgets, its tree, its text) plus the               two out-parameters the walk threads and the package's cache directory;               bundling them into a struct would name the same seven things one level               further from the two call sites that build them"
+    reason = "the expander's inputs are each a distinct fact about the file being \
+              expanded (its scope, its std, its budgets, its tree, its text) plus the \
+              two out-parameters the walk threads and the package's cache directory; \
+              bundling them into a struct would name the same seven things one level \
+              further from the two call sites that build them"
 )]
 pub(crate) fn expand_source(
     scope: &MacroScope,

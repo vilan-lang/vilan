@@ -9543,7 +9543,7 @@ pub(crate) mod tests {
     #[test]
     fn refactor_splits_a_chain_at_a_link_with_no_block_spelling() {
         let conversion = css_conversion_of(
-            "import std::style::{ Color, Length, Style, space, style };\n\n             impl Style {\n\tfun select_off(self): Style {\n\t\tself.within(\"data-user-select\", Some(\"false\"), style().raw(\"user-select\", \"none\"))\n\t}\n}\n\n             fun icon_button(): Style {\n\tsty~le()\n\t\t.padding(space(4))\n\t\t.raw(\"outline\", \"none\")\n\t\t.radius(Length::px(4))\n\t\t.attribute(\"disabled\", None, style().color(Color::gray(300)))\n\t\t.select_off()\n\t\t.hover(style().background(Color::gray(100)))\n}\n",
+            "import std::style::{ Color, Length, Style, space, style };\n\nimpl Style {\n\tfun select_off(self): Style {\n\t\tself.within(\"data-user-select\", Some(\"false\"), style().raw(\"user-select\", \"none\"))\n\t}\n}\n\nfun icon_button(): Style {\n\tsty~le()\n\t\t.padding(space(4))\n\t\t.raw(\"outline\", \"none\")\n\t\t.radius(Length::px(4))\n\t\t.attribute(\"disabled\", None, style().color(Color::gray(300)))\n\t\t.select_off()\n\t\t.hover(style().background(Color::gray(100)))\n}\n",
         )
         .expect("a kolt-shaped chain converts");
         assert_eq!(
@@ -9563,7 +9563,7 @@ pub(crate) mod tests {
     #[test]
     fn refactor_inlines_an_impl_style_extension_declared_in_the_current_file() {
         let conversion = css_conversion_of(
-            "import std::style::{ AlignItems, Color, Display, FlexDirection, Length, Style, space, style };\n\n             impl Style {\n\tfun flex_row(self): Style {\n\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n\t}\n}\n\n             fun button_style(color: Color): Style {\n\tsty~le()\n\t\t.flex_row()\n\t\t.gap(space(2))\n\t\t.align_items(AlignItems::Center)\n\t\t.radius(Length::px(4))\n\t\t.color(color)\n}\n",
+            "import std::style::{ AlignItems, Color, Display, FlexDirection, Length, Style, space, style };\n\nimpl Style {\n\tfun flex_row(self): Style {\n\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n\t}\n}\n\nfun button_style(color: Color): Style {\n\tsty~le()\n\t\t.flex_row()\n\t\t.gap(space(2))\n\t\t.align_items(AlignItems::Center)\n\t\t.radius(Length::px(4))\n\t\t.color(color)\n}\n",
         )
         .expect("kolt's `button_style` shape converts");
         assert!(!conversion.0, "chain -> block");
@@ -9582,7 +9582,7 @@ pub(crate) mod tests {
     #[test]
     fn refactor_follows_one_current_file_extension_into_another_and_stops_at_a_statement() {
         let conversion = css_conversion_of(
-            "import std::style::{ Color, Display, FlexDirection, Length, Style, style };\n\n             impl Style {\n\tfun flex_row(self): Style {\n\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n\t}\n\n\tfun ghost(self): Style {\n\t\tself.raw(\"pointer-events\", \"none\").flex_row()\n\t}\n\n\tfun themed(self): Style {\n\t\tlet accent = Color::gray(900);\n\t\tself.color(accent)\n\t}\n}\n\n             fun card(): Style {\n\tsty~le()\n\t\t.ghost()\n\t\t.radius(Length::px(4))\n\t\t.themed()\n\t\t.raw(\"outline\", \"none\")\n}\n",
+            "import std::style::{ Color, Display, FlexDirection, Length, Style, style };\n\nimpl Style {\n\tfun flex_row(self): Style {\n\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n\t}\n\n\tfun ghost(self): Style {\n\t\tself.raw(\"pointer-events\", \"none\").flex_row()\n\t}\n\n\tfun themed(self): Style {\n\t\tlet accent = Color::gray(900);\n\t\tself.color(accent)\n\t}\n}\n\nfun card(): Style {\n\tsty~le()\n\t\t.ghost()\n\t\t.radius(Length::px(4))\n\t\t.themed()\n\t\t.raw(\"outline\", \"none\")\n}\n",
         )
         .expect("a delegating extension converts");
         assert_eq!(
@@ -9605,7 +9605,7 @@ pub(crate) mod tests {
     #[test]
     fn refactor_inlines_an_impl_style_extension_from_a_sibling_file() {
         let conversion = css_conversion_across(
-            "import std::style::{ Display, FlexDirection, Length, Style, style };\nimport pkg::theme;\n\n             impl Style {\n\tfun flex_row(self): Style {\n\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n\t}\n}\n\n             fun button_style(): Style {\n\tsty~le()\n\t\t.flex_row()\n\t\t.radius(Length::px(4))\n\t\t.script_label()\n\t\t.raw(\"outline\", \"none\")\n}\n",
+            "import std::style::{ Display, FlexDirection, Length, Style, style };\nimport pkg::theme;\n\nimpl Style {\n\tfun flex_row(self): Style {\n\t\tself.display(Display::Flex).flex_direction(FlexDirection::Row)\n\t}\n}\n\nfun button_style(): Style {\n\tsty~le()\n\t\t.flex_row()\n\t\t.radius(Length::px(4))\n\t\t.script_label()\n\t\t.raw(\"outline\", \"none\")\n}\n",
             &[(
                 "theme.vl",
                 "import std::style::{ Length, Style };\n\nimpl Style {\n\tfun script_label(self): Style {\n\t\tself.with_length(\"letter-spacing\", Length::px(1))\n\t}\n}\n",
@@ -9659,7 +9659,7 @@ pub(crate) mod tests {
     #[test]
     fn refactor_splits_at_a_sibling_extension_whose_body_is_not_a_chain() {
         let conversion = css_conversion_across(
-            "import std::style::{ Color, Length, Style, style };\nimport pkg::theme;\n\n             fun card(): Style {\n\tsty~le()\n\t\t.radius(Length::px(4))\n\t\t.themed()\n\t\t.raw(\"outline\", \"none\")\n}\n",
+            "import std::style::{ Color, Length, Style, style };\nimport pkg::theme;\n\nfun card(): Style {\n\tsty~le()\n\t\t.radius(Length::px(4))\n\t\t.themed()\n\t\t.raw(\"outline\", \"none\")\n}\n",
             &[(
                 "theme.vl",
                 "import std::style::{ Color, Style };\n\nimpl Style {\n\tfun themed(self): Style {\n\t\tlet accent = Color::gray(900);\n\t\tself.color(accent)\n\t}\n}\n",
@@ -9699,7 +9699,7 @@ pub(crate) mod tests {
         assert_eq!(css_conversion("\tsty~le()\n\t\t.class_list()\n"), None);
         assert_eq!(
             css_conversion_of(
-                "import std::style::{ Style, style };\n\n                 impl Style {\n\tfun select_off(self): Style {\n\t\tself.within(\"data-user-select\", Some(\"false\"), style().raw(\"user-select\", \"none\"))\n\t}\n}\n\n                 fun card(): Style {\n\tsty~le()\n\t\t.select_off()\n}\n",
+                "import std::style::{ Style, style };\n\nimpl Style {\n\tfun select_off(self): Style {\n\t\tself.within(\"data-user-select\", Some(\"false\"), style().raw(\"user-select\", \"none\"))\n\t}\n}\n\nfun card(): Style {\n\tsty~le()\n\t\t.select_off()\n}\n",
             ),
             None
         );
@@ -19439,7 +19439,8 @@ mod entry_reclaim {
             assert_eq!(
                 leak_tally::outstanding(LeakSite::LspEntryText),
                 0,
-                "the entry text is given back whether the analysis was cancelled                  (stopped_early={stopped_early}) or outran the cancel",
+                "the entry text is given back whether the analysis was cancelled \
+                 (stopped_early={stopped_early}) or outran the cancel",
             );
             assert_eq!(
                 leak_tally::outstanding(LeakSite::EntryAst),

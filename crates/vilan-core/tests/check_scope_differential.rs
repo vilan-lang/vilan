@@ -824,14 +824,14 @@ fn a_stale_restored_table_moves_the_emitted_javascript() {
     // owes one, and a `&mut` receiver whose `bumps` verdict is inferred.
     let (directory, entry) = write_module_package(
         "stale",
-        "struct Bag { items: List<i32> }\n\n         fun take(own bag: Bag): List<i32> {\n\tbag.items\n}\n\n         fun copy(items: List<i32>): List<i32> {\n\tlet held = items;\n\theld\n}\n\n         fun grow(bag: &mut Bag, value: i32) {\n\tbag.items.push(value);\n}\n",
+        "struct Bag { items: List<i32> }\n\nfun take(own bag: Bag): List<i32> {\n\tbag.items\n}\n\nfun copy(items: List<i32>): List<i32> {\n\tlet held = items;\n\theld\n}\n\nfun grow(bag: &mut Bag, value: i32) {\n\tbag.items.push(value);\n}\n",
     );
 
     // The entry has to REACH the module's functions or emission prunes them and
     // the comparison below is between two empty programs.
     let calling_entry = |revision: u32| {
         format!(
-            "import pkg::module::{{ Bag, take, copy, grow }};\n\n             fun main() {{\n\tlet revision = {revision};\n             \tmut bag = Bag {{ items = [revision] }};\n             \tgrow(&mut bag, 2);\n             \tlet held = copy([3]);\n             \tlet taken = take(bag);\n             \tprint(\"{{held.len()}} {{taken.len()}}\");\n}}\n"
+            "import pkg::module::{{ Bag, take, copy, grow }};\n\nfun main() {{\n\tlet revision = {revision};\n\tmut bag = Bag {{ items = [revision] }};\n\tgrow(&mut bag, 2);\n\tlet held = copy([3]);\n\tlet taken = take(bag);\n\tprint(\"{{held.len()}} {{taken.len()}}\");\n}}\n"
         )
     };
     let warm_calls = |directory: &Path, entry: &Path| -> ReuseObservation {

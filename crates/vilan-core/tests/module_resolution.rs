@@ -1342,7 +1342,7 @@ fn several_parse_errors_in_one_module_keep_distinct_spans() {
     // un-lexable byte is a second `@`, which is the one the `css` block still
     // refuses. The pin is about two errors keeping distinct spans, and it is
     // unchanged.
-    let helper = "fun a(): i32 { 1 }\nfun b(): i32 { 2 @ }\nfun c(): i32 { 3 }\n                  fun d(): i32 { 4 @ }\nfun e(): i32 { 5 }\n";
+    let helper = "fun a(): i32 { 1 }\nfun b(): i32 { 2 @ }\nfun c(): i32 { 3 }\nfun d(): i32 { 4 @ }\nfun e(): i32 { 5 }\n";
     let spanned = analyze_package_spanned(
         &[
             (
@@ -5598,7 +5598,7 @@ fn b318_the_export_bit_round_trips_through_module_importables() {
     // produced byte-identical rows. The bit is the whole of what S1 adds.
     let dir = write_module_tree(&[(
         "curated.vl",
-        "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n\n         export(in mod) fun narrowed(): i32 { 3 }\n",
+        "export fun shown(): i32 { 1 }\n\nfun hidden(): i32 { 2 }\n\nexport(in mod) fun narrowed(): i32 { 3 }\n",
     )]);
     let rows = module_importables(&dir.join("curated.vl"));
     let named = |name: &str| {
@@ -5747,7 +5747,7 @@ fn b318_the_import_steer_skips_a_private_item_of_a_curated_module() {
     //
     // The module has to be LOADED for the steer to see it at all, so every leg
     // imports one name from it and then reaches for a second.
-    const CURATED: &str = "export fun shown(): i32 { 1 }\n\n                           export fun other(): i32 { 3 }\n\n                           fun hidden(): i32 { 2 }\n";
+    const CURATED: &str = "export fun shown(): i32 { 1 }\n\nexport fun other(): i32 { 3 }\n\nfun hidden(): i32 { 2 }\n";
     let steers = |module: &'static str, reached: &str| -> Vec<String> {
         let entry =
             format!("import pkg::a::shown;\n\nfun main() {{ let _ = shown() + {reached}(); }}\n");
@@ -5889,7 +5889,7 @@ fn b318_an_uncurated_module_exposes_nothing() {
     let files = &[
         (
             "a.vl",
-            "struct Hidden {\n\tx: i32,\n}\n\nfun returns(): Hidden { Hidden { x = 1 } }\n\n             fun reachable(): i32 { 3 }\n",
+            "struct Hidden {\n\tx: i32,\n}\n\nfun returns(): Hidden { Hidden { x = 1 } }\n\nfun reachable(): i32 { 3 }\n",
         ),
         (
             "main.vl",
@@ -5912,7 +5912,7 @@ fn b318_an_exported_type_in_an_exported_signature_is_silent() {
     let files = &[
         (
             "a.vl",
-            "export struct Hidden {\n\tx: i32,\n}\n\n             export fun returns(): Hidden { Hidden { x = 1 } }\n",
+            "export struct Hidden {\n\tx: i32,\n}\n\nexport fun returns(): Hidden { Hidden { x = 1 } }\n",
         ),
         (
             "main.vl",

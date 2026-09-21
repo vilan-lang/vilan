@@ -711,6 +711,36 @@ fn message_sources() -> Vec<PathBuf> {
     paths
 }
 
+/// Every Rust source the swallowed-continuation gate walks (N98): all eight
+/// workspace crates, `src/` AND `tests/`.
+///
+/// Wider than [`message_sources`] on purpose. The class this looks for is an
+/// artifact of EDITING a literal, not of printing one, so it does not care
+/// whether the literal is a diagnostic: the three sites that founded the item
+/// are a clippy `#[allow(.., reason = "…")]`, an assertion message and a `.vl`
+/// program const, and the last two are read by a maintainer rather than a user.
+/// `tests/` is where most of the class lives, because that is where the `.vl`
+/// program consts are.
+fn rust_sources() -> Vec<PathBuf> {
+    let root = repository_root();
+    let mut paths = Vec::new();
+    for crate_directory in [
+        "vilan-core",
+        "vilan-cli",
+        "vilan-lsp",
+        "vilan-wasm",
+        "vilan-rust",
+        "vilan-rt",
+        "vilan-ide",
+        "vilan-embedded-std",
+    ] {
+        let base = root.join("crates").join(crate_directory);
+        walk(&base.join("src"), "rs", &mut paths);
+        walk(&base.join("tests"), "rs", &mut paths);
+    }
+    paths
+}
+
 /// A source, with the escapes that stand between a written literal and the
 /// string it denotes removed — so a fixed-string search finds a message that
 /// the source spells across several lines.
@@ -1138,6 +1168,321 @@ fn failure_messages(path: &Path) -> Vec<Site> {
     sites
 }
 
+// --- The swallowed-continuation scan (N98) ---------------------------------
+
+/// A mid-sentence run this long inside one line of a literal is indentation
+/// that lost its `\`. Nothing in this tree writes eight spaces between two
+/// words on purpose.
+///
+/// Eight, measured rather than guessed. Every run of three or more spaces in
+/// every escaped literal of every crate was counted: the 3–7 band is 57 sites
+/// and every one of them is a COLUMN — `Fresh   {}`, `ok   - {claim}`,
+/// `input   {}`, a report table's label, a `.vl` program const's aligned
+/// trailing comment — while the 8-and-over band is the class, plus two sites
+/// that are not prose at all and are named in [`RUNS_THAT_ARE_DELIBERATE`].
+/// The residue is stated where the header states what a green does not say:
+/// a continuation swallowed from a two-level indent leaves four spaces, and
+/// four spaces is under the floor. Both thresholds here are a floor on a
+/// measured gap, exactly as N94's three is.
+const PROSE_RUN: usize = 8;
+
+/// A LINE-LEADING run this long, in a literal whose other lines start flush,
+/// is the same artifact seen from the other side (the `.vl` program consts).
+///
+/// Five, for the same kind of reason. A `.vl` program const written flush-left
+/// indents its bodies with tabs (AGENTS.md's rule) or with four spaces per
+/// level; the genuine sites run 5, 9, 13, 17, 18 and 27 — none of them a
+/// multiple of four, because a swallowed continuation carries the RUST file's
+/// indentation, not the program's. Four and below is left alone: it is where
+/// the legitimate four-space program bodies live (34 sites), and telling them
+/// apart would need a parse rather than a rule.
+const LEADING_RUN: usize = 5;
+
+/// One swallowed continuation: where it is, which rule caught it, and the line
+/// of the literal's own text that carries it.
+struct Swallow {
+    file: String,
+    line: usize,
+    rule: &'static str,
+    run: usize,
+    excerpt: String,
+}
+
+/// Whether a raw string literal opens at `index`, and (body start, hash count)
+/// if it does. `r"…"`, `r#"…"#`, `br"…"` — at a word boundary, so the `r` of
+/// `for` is not one.
+fn raw_string_opener(chars: &[char], index: usize) -> Option<(usize, usize)> {
+    if chars[index] != 'r' {
+        return None;
+    }
+    let mut boundary = index;
+    if boundary > 0 && chars[boundary - 1] == 'b' {
+        boundary -= 1;
+    }
+    if boundary > 0 && (chars[boundary - 1].is_alphanumeric() || chars[boundary - 1] == '_') {
+        return None;
+    }
+    let mut cursor = index + 1;
+    let mut hashes = 0usize;
+    while chars.get(cursor) == Some(&'#') {
+        hashes += 1;
+        cursor += 1;
+    }
+    if chars.get(cursor) != Some(&'"') {
+        return None;
+    }
+    Some((cursor + 1, hashes))
+}
+
+/// Every ESCAPED string literal in `text`, as `(line, value)`.
+///
+/// Raw strings are stepped over rather than read, and that is not a shortcut:
+/// a raw string has no escapes, so it never carried a `\`-continuation and the
+/// class cannot exist in one. (It is also where the tree's deliberately
+/// aligned `.vl` program consts live, which is why reading them would cost an
+/// exemption list of a hundred entries and buy nothing.) Comments and
+/// character literals are stepped over so that a `"` inside either does not
+/// open a literal — a lifetime (`&'a str`) is the shape that breaks a naive
+/// scan.
+fn escaped_string_literals(text: &str) -> Vec<(usize, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut line = 1usize;
+    let mut index = 0usize;
+    while index < chars.len() {
+        match chars[index] {
+            '\n' => {
+                line += 1;
+                index += 1;
+            }
+            '/' if chars.get(index + 1) == Some(&'/') => {
+                while index < chars.len() && chars[index] != '\n' {
+                    index += 1;
+                }
+            }
+            '/' if chars.get(index + 1) == Some(&'*') => {
+                let mut depth = 1usize;
+                index += 2;
+                while index < chars.len() && depth > 0 {
+                    if chars[index] == '\n' {
+                        line += 1;
+                    }
+                    if chars[index] == '/' && chars.get(index + 1) == Some(&'*') {
+                        depth += 1;
+                        index += 2;
+                    } else if chars[index] == '*' && chars.get(index + 1) == Some(&'/') {
+                        depth -= 1;
+                        index += 2;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            '\'' => {
+                // A character literal, or a lifetime. Either way nothing in it
+                // opens a string.
+                if chars.get(index + 1) == Some(&'\\') {
+                    index += 2;
+                    while index < chars.len() && chars[index] != '\'' {
+                        index += 1;
+                    }
+                    index += 1;
+                } else if chars.get(index + 2) == Some(&'\'') {
+                    index += 3;
+                } else {
+                    index += 1;
+                }
+            }
+            'r' if raw_string_opener(&chars, index).is_some() => {
+                let (body, hashes) = raw_string_opener(&chars, index).expect("just matched");
+                let close: String = std::iter::once('"')
+                    .chain(std::iter::repeat_n('#', hashes))
+                    .collect();
+                let closing: Vec<char> = close.chars().collect();
+                let mut cursor = body;
+                while cursor < chars.len() && !chars[cursor..].starts_with(closing.as_slice()) {
+                    if chars[cursor] == '\n' {
+                        line += 1;
+                    }
+                    cursor += 1;
+                }
+                index = (cursor + closing.len()).min(chars.len());
+            }
+            '"' => {
+                let start_line = line;
+                let mut cursor = index + 1;
+                // Count the source lines the literal spans, whether they are
+                // reached by a `\`-continuation or by a raw newline.
+                while cursor < chars.len() {
+                    match chars[cursor] {
+                        '\\' if cursor + 1 < chars.len() => {
+                            if chars[cursor + 1] == '\n' {
+                                line += 1;
+                            }
+                            cursor += 2;
+                        }
+                        '"' => break,
+                        '\n' => {
+                            line += 1;
+                            cursor += 1;
+                        }
+                        _ => cursor += 1,
+                    }
+                }
+                if let Some((value, end)) = string_literal(&chars, index) {
+                    out.push((start_line, value));
+                    index = end;
+                } else {
+                    index += 1;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    out
+}
+
+/// Whether `line` is a DRAWING rather than a sentence: it carries no ASCII
+/// letter at all.
+///
+/// `vilan upgrade`'s banner is eleven lines of box-drawing characters whose
+/// runs of spaces are the picture, and a gate that has to list them one by one
+/// is a gate with a list of pictures in it. "No letters, so no words, so no
+/// sentence to have swallowed anything" is the rule instead — narrow enough
+/// that every genuine site in the tree keeps its letters.
+fn is_a_drawing(line: &str) -> bool {
+    !line
+        .chars()
+        .any(|character| character.is_ascii_alphabetic())
+}
+
+/// `line` with its own indentation removed — where indentation counts a
+/// LEADING FORMAT SLOT as part of itself.
+///
+/// The slot is why. A `format!` that opens with a prelude and continues
+/// `"{PRELUDE}        fun main() { .. }"` is indenting its own text to the
+/// prelude's level: the newline that makes the run line-leading lives inside
+/// the interpolated value, so statically the run sits mid-line while at
+/// runtime it is the indentation of a fresh line. `generics.rs`'s
+/// `await_postfix_program` is that shape, and it was the mid-sentence rule's
+/// only false positive over the whole workspace. A slot in the MIDDLE of a
+/// line is not this: only a leading one can stand for a newline nothing can
+/// see.
+fn after_the_lines_own_indentation(line: &str) -> &str {
+    let mut rest = line.trim_start_matches([' ', '\t']);
+    while rest.starts_with('{') {
+        let Some(closed) = rest.find('}') else { break };
+        rest = rest[closed + 1..].trim_start_matches([' ', '\t']);
+    }
+    rest
+}
+
+/// Every swallowed continuation the two rules find, exemptions NOT applied —
+/// so [`every_deliberate_run_is_still_written`] can ask which entry suppresses
+/// what.
+fn swallowed_continuations() -> Vec<Swallow> {
+    let mut found = Vec::new();
+    for path in rust_sources() {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("?")
+            .to_string();
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        for (line, value) in escaped_string_literals(&text) {
+            let lines: Vec<&str> = value.split('\n').collect();
+            // Rule A: a run of spaces MID-SENTENCE. The line's own leading
+            // whitespace is not mid-sentence, and a run that opens a trailing
+            // `//` comment is a `.vl` program const's alignment.
+            for text_of_line in &lines {
+                let body = after_the_lines_own_indentation(text_of_line);
+                if is_a_drawing(body) {
+                    continue;
+                }
+                let mut offset = 0usize;
+                while let Some(at) = body[offset..].find(" ".repeat(PROSE_RUN).as_str()) {
+                    let start = offset + at;
+                    let run = body[start..].chars().take_while(|c| *c == ' ').count();
+                    if !body[start + run..].starts_with("//") {
+                        found.push(Swallow {
+                            file: name.clone(),
+                            line,
+                            rule: "mid-sentence",
+                            run,
+                            excerpt: body.trim().to_string(),
+                        });
+                        break;
+                    }
+                    offset = start + run;
+                }
+            }
+            // Rule B: a LINE-LEADING run, in a literal whose other lines start
+            // flush. A program const indented as a whole is not this; one
+            // line pushed inward while its neighbours sit at column zero is.
+            let substantial: Vec<&&str> = lines
+                .iter()
+                .filter(|text_of_line| !text_of_line.trim().is_empty())
+                .collect();
+            let flush_after_the_first = substantial
+                .iter()
+                .skip(1)
+                .any(|text_of_line| !text_of_line.starts_with([' ', '\t']));
+            if substantial.len() < 2 || !flush_after_the_first {
+                continue;
+            }
+            for text_of_line in &substantial {
+                let run = text_of_line.chars().take_while(|c| *c == ' ').count();
+                if run >= LEADING_RUN {
+                    found.push(Swallow {
+                        file: name.clone(),
+                        line,
+                        rule: "line-leading",
+                        run,
+                        excerpt: text_of_line.trim().to_string(),
+                    });
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The runs of spaces this tree writes ON PURPOSE that the two rules above
+/// cannot tell from an artifact, each by file and by a fragment of the line
+/// that carries it — with the reason.
+///
+/// Three entries, and each is a different kind of not-prose: a report COLUMN
+/// whose gap is its layout, a FIXTURE whose subject is the very shape this
+/// gate looks for, and an INPUT whose misindentation is what the test feeds
+/// the formatter. None of them is a sentence, which is why none of them can be
+/// reflowed into one.
+///
+/// [`every_deliberate_run_is_still_written`] holds each entry to a hit it
+/// actually suppresses, so an entry whose site was reflowed away reds instead
+/// of quietly subtracting a check (N42's rule, applied to this list).
+const RUNS_THAT_ARE_DELIBERATE: &[(&str, &str, &str)] = &[
+    (
+        "bindgen.rs",
+        "TODOs:",
+        "the bindgen report's own column, aligned under `members:` — the gap is \
+         the table, not a sentence",
+    ),
+    (
+        "ci_ignored_pins.rs",
+        "written across lines",
+        "the ignore-sweep FIXTURE: a `#[ignore = \"…\"]` whose reason is \
+         `\\`-continued, written as source text inside an outer literal, so the \
+         outer literal carries the continuation's indentation by construction — \
+         the scanner under test has to see exactly that",
+    ),
+    (
+        "compile.rs",
+        "let a = 1;",
+        "the misindented program `format_program` is asked to canonicalize — \
+         the six spaces beside a tab ARE the input",
+    ),
+];
+
 /// The message surface this file claims to enumerate — see the header for what
 /// it deliberately leaves out.
 fn enumerated_sites() -> Vec<Site> {
@@ -1499,6 +1844,80 @@ fn no_rowed_diagnostic_literal_swallows_a_line_continuation() {
          concatenated lines:\n{}",
         swallowed.len(),
         swallowed.join("\n")
+    );
+}
+
+/// N98: and the class OUTSIDE the rowed surface, which is where most of it
+/// was.
+///
+/// The gate above reaches the messages the enumeration reads and the keys the
+/// index carries. Everything else in the tree was uncovered, and three of the
+/// founding sites are exactly the everything else: a clippy
+/// `#[allow(.., reason = "…")]` whose four swallowed continuations a maintainer
+/// reads in `macros.rs`, an assertion message in `vilan-lsp`, and — the
+/// biggest family — `.vl` PROGRAM CONSTS, where the artifact is not a gap in a
+/// sentence but a line of the program pushed eighteen columns inward while its
+/// neighbours sit at column zero. Fifteen of those, across six test files and
+/// the language server's own `mod tests`, none of them noticed by anything
+/// because a program parses the same either way.
+///
+/// The gate's own doc used to argue that "every string literal in the
+/// compiler" was not a reachable target, because the aligned tables in
+/// `formatter.rs` and `bindgen.rs` are runs of spaces on purpose. That was
+/// true of a three-space threshold applied to every line of every literal. It
+/// is not true of these two rules: raw strings are out by construction, a
+/// drawing is out for having no letters, a trailing-comment alignment is out
+/// for opening a `//`, and what is left needs a list of THREE.
+#[test]
+fn no_prose_literal_swallows_a_line_continuation() {
+    let unexplained: Vec<String> = swallowed_continuations()
+        .into_iter()
+        .filter(|swallow| {
+            !RUNS_THAT_ARE_DELIBERATE.iter().any(|(file, fragment, _)| {
+                *file == swallow.file && swallow.excerpt.contains(fragment)
+            })
+        })
+        .map(|swallow| {
+            format!(
+                "  {}:{} [{}, {} spaces]\n      {:?}",
+                swallow.file, swallow.line, swallow.rule, swallow.run, swallow.excerpt
+            )
+        })
+        .collect();
+    assert!(
+        unexplained.is_empty(),
+        "{} string literal(s) carry a run of spaces that is a line continuation \
+         whose `\\` was lost — a tool joined the lines and the indentation stayed \
+         behind. Restore the backslashes, or write the literal as concatenated \
+         lines; if the run is deliberate, record it in RUNS_THAT_ARE_DELIBERATE \
+         with the reason:\n{}",
+        unexplained.len(),
+        unexplained.join("\n")
+    );
+}
+
+/// The inverse (N42's rule, and the seventh check's, applied to the list N98
+/// adds). An entry that names a site the tree no longer has subtracts a check
+/// for nothing and stays green forever, because a list that only ever
+/// subtracts work cannot red by being wrong.
+#[test]
+fn every_deliberate_run_is_still_written() {
+    let found = swallowed_continuations();
+    let idle: Vec<String> = RUNS_THAT_ARE_DELIBERATE
+        .iter()
+        .filter(|(file, fragment, _)| {
+            !found
+                .iter()
+                .any(|swallow| swallow.file == *file && swallow.excerpt.contains(fragment))
+        })
+        .map(|(file, fragment, reason)| format!("  {file}: {fragment:?} ({reason})"))
+        .collect();
+    assert!(
+        idle.is_empty(),
+        "entr(ies) in RUNS_THAT_ARE_DELIBERATE suppress nothing: no literal in \
+         the named file carries the fragment with a run either rule catches. The \
+         site was reflowed, moved or renamed — drop the entry:\n{}",
+        idle.join("\n")
     );
 }
 

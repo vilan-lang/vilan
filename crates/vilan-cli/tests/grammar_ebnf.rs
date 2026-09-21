@@ -134,15 +134,18 @@ const UNREACHED_PRODUCTIONS: &[(&str, &str)] = &[("module", "the start symbol (�
 const TOKEN_CLASSES_NOT_IN_LEXICAL: &[(&str, &str)] = &[
     (
         "NAME",
-        "`an identifier or any keyword` — §3.6's element-name rule defines it          in its own fence comment, because it is a §3 concept",
+        "`an identifier or any keyword` — §3.6's element-name rule defines it \
+         in its own fence comment, because it is a §3 concept",
     ),
     (
         "TOKEN",
-        "`any token but \";\", \"{\", \"}\"` — the css-block value scanner's          meta-class, defined in §3.6's own fence comment",
+        "`any token but \";\", \"{\", \"}\"` — the css-block value scanner's \
+         meta-class, defined in §3.6's own fence comment",
     ),
     (
         "INTEGER",
-        "`NUMBER without a fractional part and without a SUFFIX` — declared in          §3.3's fixed-array fence, over §2's NUMBER",
+        "`NUMBER without a fractional part and without a SUFFIX` — declared in \
+         §3.3's fixed-array fence, over §2's NUMBER",
     ),
 ];
 
@@ -165,7 +168,8 @@ fn lexical_token_classes() -> BTreeSet<String> {
     }
     assert!(
         classes.len() >= 4,
-        "spec/lexical.md reads as {classes:?} token classes — the §2 scan has          stopped matching"
+        "spec/lexical.md reads as {classes:?} token classes — the §2 scan has \
+         stopped matching"
     );
     classes
 }
