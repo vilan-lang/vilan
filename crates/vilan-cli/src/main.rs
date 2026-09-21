@@ -6871,13 +6871,6 @@ fn compile_to_js(
                         })
                 }
                 Err(error) => {
-                    overlay_diagnostics.push(hmr::OverlayDiagnostic::located(
-                        &filename,
-                        source_ref,
-                        error.span.into_range(),
-                        error.msg.clone(),
-                        error.note.as_ref().map(|note| note.msg.clone()),
-                    ));
                     // The entry, and not as a fallback (E16's leftover, resolved
                     // by looking): `transform_entry_ast`'s missing `main`
                     // (`transformer.rs`) is STRUCTURAL. Its subject is the
@@ -6893,12 +6886,25 @@ fn compile_to_js(
                     // requirement's name in std, rendered against the entry, so
                     // the terminal printed one bare `Error:` line with no file
                     // and no line at all.
-                    let located = error
-                        .note
-                        .as_ref()
-                        .and_then(|note| note.source)
-                        .unwrap_or(SourceId(0));
+                    //
+                    // E196: computed ONCE and read by both consumers. E190
+                    // taught the terminal to follow the note and left the
+                    // overlay's push above it on the entry's own filename, so
+                    // the browser showed a module's refusal against the entry —
+                    // the file wrong and, since the span indexes the other
+                    // file's bytes, the line and column wrong with it. The
+                    // overlay and the terminal are two renderings of one fact,
+                    // and one expression is what keeps them from drifting again.
+                    let located = transformer_refusal_source(&error);
                     load_diagnostic_file(&mut diagnostic_files, &program, located);
+                    let (overlay_name, overlay_text) = diagnostic_file(&diagnostic_files, located);
+                    overlay_diagnostics.push(hmr::OverlayDiagnostic::located(
+                        overlay_name,
+                        overlay_text,
+                        error.span.into_range(),
+                        error.msg.clone(),
+                        error.note.as_ref().map(|note| note.msg.clone()),
+                    ));
                     analyzer_errors.push((located, error.span.into_range(), error.msg));
                 }
             }
@@ -7095,6 +7101,75 @@ fn diagnostic_config() -> ariadne::Config {
     ariadne::Config::new()
         .with_index_type(ariadne::IndexType::Char)
         .with_color(paint::stderr_enabled())
+}
+
+/// The file a TRANSFORMER refusal belongs to (E190, E196): the source its note
+/// carries, else the entry.
+///
+/// A transformer refusal is the one diagnostic class with no `Program`
+/// diagnostic index to attribute through — it is returned from `transform`, not
+/// pushed onto `program.diagnostics` — so the note IS the channel. A refusal
+/// whose subject is an ABSENCE has no span to take a file from and no note
+/// either, and the entry is its honest answer: `transform_entry_ast`'s missing
+/// `main` reports the entry's own missing definition. A refusal that does know
+/// where to point says so in the note (B55's body-less emission names the body
+/// that reached the requirement; B318 S4's admission miss names the module whose
+/// import decides it), and both the terminal report and the HMR overlay read
+/// that one answer here — which is E196: they used to read two, and the browser
+/// showed a module's refusal against the entry, at the entry's bytes.
+fn transformer_refusal_source(error: &vilan_core::Error) -> SourceId {
+    error
+        .note
+        .as_ref()
+        .and_then(|note| note.source)
+        .unwrap_or(SourceId(0))
+}
+
+#[cfg(test)]
+mod transformer_refusal_source_tests {
+    use super::transformer_refusal_source;
+    use vilan_core::Error;
+    use vilan_core::analyzer::SourceId;
+    use vilan_core::error::Note;
+
+    /// The message is deliberately EMPTY: `diagnostics_ledger.rs`'s enumeration
+    /// reads every `Error { .. msg: <literal> }` in the compiler crates, this
+    /// module included, and a fixture's message would read there as a shipped
+    /// diagnostic owing a ledger row. Nothing under test looks at it.
+    fn refusal(note: Option<Note>) -> Error {
+        Error {
+            msg: String::new(),
+            span: (12..19).into(),
+            note,
+            trace: Vec::new(),
+        }
+    }
+
+    /// A refusal that names a file is placed in THAT file — the case the
+    /// overlay got wrong.
+    #[test]
+    fn a_refusal_whose_note_names_a_file_is_placed_there() {
+        let error = refusal(Some(Note {
+            span: (30..37).into(),
+            msg: "`app_shell` is the body that reached the requirement".to_string(),
+            source: Some(SourceId(4)),
+        }));
+        assert_eq!(transformer_refusal_source(&error), SourceId(4));
+    }
+
+    /// A refusal with no note, and one whose note names no file, are both the
+    /// ENTRY's — a structural refusal about an absence has no other answer, and
+    /// guessing one would put a diagnostic in a file that does not mention it.
+    #[test]
+    fn a_refusal_with_no_file_to_name_is_the_entrys() {
+        assert_eq!(transformer_refusal_source(&refusal(None)), SourceId(0));
+        let no_source = refusal(Some(Note {
+            span: (0..0).into(),
+            msg: "the bound is declared here".to_string(),
+            source: None,
+        }));
+        assert_eq!(transformer_refusal_source(&no_source), SourceId(0));
+    }
 }
 
 /// Reads the file a diagnostic renders against into `files`, once per source.
