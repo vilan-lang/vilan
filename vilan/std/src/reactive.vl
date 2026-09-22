@@ -21,6 +21,7 @@ import pkg::time::Timer;
 // is the first consumer (A54's machinery, lifted).
 export import pkg::delta::{
 	DeltaCursor,
+	DeltaFeed,
 	DeltaLog,
 	DeltaSource,
 	ListCell,

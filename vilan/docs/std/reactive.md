@@ -37,6 +37,7 @@ import std::reactive::{
 | `draft`, `Draft<T>`, `DraftState` | fn/struct/enum | local-first editing cell |
 | `reconcile`, `ReconcilePlan`, `RowStep` | fn/structs | keyed list diffing engine (`K: PartialEq + Hashable`) |
 | `SeqOp`, `MapOp`, `SetOp`, `DeltaLog`, `DeltaCursor`, `DeltaSource` | enums/struct/trait | the change structure: a collection's change as a value, and its log |
+| `DeltaFeed<T>` | trait | a consumer's question "do you keep ops?" — answered by every `Source<List<T>>` |
 | `ListCell<T>` | struct | a `List` cell whose writes ARE its deltas |
 | `SequenceCell<T>`, `Sequence<T>`, `Tracked<T>` | traits/struct | twelve mutators over one `splice` primitive; the `&mut` twin and its recorder |
 | `map_each` | fn | `map g` element-wise and incrementally — one call of `g` per arriving element |
@@ -884,6 +885,23 @@ trait DeltaSource<C, O> with Source<C> {
 log does not know what a `Reset` is for its op type and the cell does, which is
 the only place the two layers need to know about each other.
 
+A consumer that can USE ops but must not REQUIRE them — `each` takes any
+`Source<List<T>>` — bounds on `DeltaFeed<T>` beside it:
+
+```vilan,fragment
+trait DeltaFeed<T> {
+	fun delta_cursor(self): Option<DeltaCursor>              // `None`: no log, take the whole value
+	fun delta_since(self, cursor: DeltaCursor): List<SeqOp<T>>
+	fun drop_delta_cursor(self, cursor: DeltaCursor)
+}
+impl type S: Source<List<type T>> with DeltaFeed<T>                 // every list source: `None`
+impl type S: DeltaSource<List<type T>, SeqOp<T>> with DeltaFeed<T>  // a logged one: its log
+```
+
+Both blankets match a `ListCell`, and the second is chosen because a subject
+bound by a subtrait is the more specific one. A consumer is written once and
+serves both kinds of source.
+
 Writes in one turn coalesce into ONE notification, and a consumer drains every
 op at the settle — so the log is as long as one turn's writes. Two behaviours
 are worth stating because they are easy to state wrongly:
@@ -924,7 +942,8 @@ impl ListCell<type T: PartialEq> { fun reconcile_to(self, items: List<T>) }
 
 `ListCell<T>` is an ordinary `Source<List<T>>` — `each` takes it, `map` takes
 it, an effect takes it — that also records what each write DID. Nothing that
-ignores the ops pays for them.
+ignores the ops pays for them, and `each` does not ignore them: over a
+`ListCell` it builds only the rows a write names.
 
 Its mutators are trait defaults over ONE primitive, so there is one place a
 write is recorded and no method can forget:

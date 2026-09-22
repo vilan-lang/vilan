@@ -359,6 +359,18 @@ The run is named `each` rather than `bind_each`: the `bind_` prefix means "one
 property kept in sync" everywhere else in the module, and a value that IS a
 child has no property to bind.
 
+**A source that knows what changed is followed by its changes.** Placing an
+`Each` asks one more thing of its source, `DeltaFeed<T>` (`std::reactive`), and
+every `Source<List<T>>` has it, so nothing that placed before is refused now.
+Over a plain `SignalCell<List<T>>` a change is a
+whole-list pass: every key read, a diff, the plan applied. Over a `ListCell<T>`
+or a `KeyedCell` — any `DeltaSource<List<T>, SeqOp<T>>` — `each` and
+`each_values` apply the recorded ops to the rows instead: one push into 1,000
+rows builds ONE row and reads one key, a removal cuts one row, and an element
+changed to an equal value costs nothing. A wholesale `set` and a `move_range`
+fall back to the pass. `each_by` and the server twin keep the pass (a server
+render reads the list once).
+
 **A row, a body or a branch can be any `Slot`.** A render closure returns
 `C: Slot`, not `View` — so a row may be a fragment, a text node, or another
 value form, and the run owns whatever the child placed:
