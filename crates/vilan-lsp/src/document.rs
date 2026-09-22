@@ -27019,18 +27019,18 @@ mod m85_field_hover_cost {
     /// The small open buffer: two structs of its own, one initializer, and one
     /// use of the workspace module so it is loaded. Held FIXED across both
     /// subject sizes, which is what isolates workspace size from file size.
-    const M85_ENTRY: &str = "import pkg::table::Shape0000;\n\n         struct Local {\n\tmark: i32,\n\tcount: i32,\n}\n\n         struct Other {\n\tlabel: str,\n}\n\n         fun main() {\n         \tlet _local = Local { mark = 1, count = 2 };\n         \tlet _other = Other { label = \"x\" };\n         \tlet _shape = Shape0000 { field_0 = 0, field_1 = 0, field_2 = 0, field_3 = 0,          field_4 = 0, field_5 = 0, field_6 = 0, field_7 = 0, field_8 = 0, field_9 = 0 };\n}\n";
+    const M85_ENTRY: &str = concat!(
+        "import pkg::table::Shape0000;\n\n",
+        "struct Local {\n\tmark: i32,\n\tcount: i32,\n}\n\n",
+        "struct Other {\n\tlabel: str,\n}\n\n",
+        "fun main() {\n",
+        "\tlet _local = Local { mark = 1, count = 2 };\n",
+        "\tlet _other = Other { label = \"x\" };\n",
+        "\tlet _shape = Shape0000 { field_0 = 0, field_1 = 0, field_2 = 0, field_3 = 0, ",
+        "field_4 = 0, field_5 = 0, field_6 = 0, field_7 = 0, field_8 = 0, field_9 = 0 };\n",
+        "}\n",
+    );
 
-    /// `(microseconds per field LOOKUP, microseconds per whole HOVER, field
-    /// count)` over `repetitions` requests on the entry's own field.
-    ///
-    /// The shape is the item's: a SMALL open buffer inside a LARGE workspace.
-    /// `structs` structs live in an imported `pkg::table`, and the entry that
-    /// is hovered declares two of its own — because the scan this measures
-    /// walks `program.structs`, which is every struct in the loaded WORLD, and
-    /// pays `source_of` on each before discovering it is not the entry's. An
-    /// exhibit that put the structs in the entry would measure a different and
-    /// much kinder loop.
     /// Write the exhibit to a fresh directory, land one analysis on the small
     /// entry, remove the directory, and answer the document with the
     /// workspace's total field count.
@@ -27059,6 +27059,16 @@ mod m85_field_hover_cost {
         (document, fields)
     }
 
+    /// `(microseconds per field LOOKUP, microseconds per whole HOVER, field
+    /// count)` over `repetitions` requests on the entry's own field.
+    ///
+    /// The shape is the item's: a SMALL open buffer inside a LARGE workspace.
+    /// `structs` structs live in an imported `pkg::table`, and the entry that
+    /// is hovered declares two of its own — because the scan this measured
+    /// walked `program.structs`, which is every struct in the loaded WORLD, and
+    /// paid `source_of` on each before discovering it was not the entry's. An
+    /// exhibit that put the structs in the entry would measure a different and
+    /// much kinder loop.
     fn microseconds_per_hover(structs: usize, repetitions: usize) -> Option<(f64, f64, usize)> {
         let (document, fields) = exhibit(structs);
         let program = document.program.as_ref().expect("the exhibit analyzes");
