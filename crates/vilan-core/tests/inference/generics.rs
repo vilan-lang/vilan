@@ -4103,10 +4103,15 @@ fn both_codecs_round_trip_derived_wire_values() {
 #[test]
 fn generated_decode_gate_rejects_a_garbled_request() {
     // The §4.1 validating decode, end to end through GENERATED code: a raw
-    // envelope calling `add` with no arguments makes the handler's arg pull
-    // fail (binary: out of bounds), and the generated `decode_failed` gate
-    // returns `RpcError::Decode` instead of running the impl on zero values —
-    // the server's counter must still be 0 afterwards.
+    // envelope calling `add` with no arguments is refused and the impl does
+    // not run — the server's counter must still be 0 afterwards.
+    //
+    // The SENTENCE moved with B383. It used to be the reader's ("unexpected
+    // end of frame": the arg pull ran off the end of the binary buffer), and
+    // it is now the arity gate's, which is ahead of the reader precisely
+    // because it can name the fault in the caller's vocabulary. What the pin
+    // is about — a `Decode` failure rather than an impl run on zero values —
+    // is unchanged, and the counter assertion is the half that says so.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -4142,7 +4147,7 @@ fn generated_decode_gate_rejects_a_garbled_request() {
             print(i"count still {untouched}");
         }
         "#,
-        "err: {\"Decode\":\"unexpected end of frame\"}\ncount still 0\n",
+        "err: {\"Decode\":\"expects 1 argument(s), got 0\"}\ncount still 0\n",
     );
 }
 
