@@ -3375,6 +3375,19 @@ fn doc_hidden_is_refused_and_names_export() {
         "[doc(hidden)]",
         "write `export` on the names consumers are meant to find",
     );
+    // E213: and the refusal names the OTHER thing someone reaching for this
+    // marker may have wanted — an item that IS the surface and is dangerous to
+    // reach for, which visibility cannot express at all.
+    assert_fails_spanning(
+        r#"
+        [doc(hidden)]
+        fun secret(): i32 { 9 }
+
+        fun main() { let _ = secret(); }
+        "#,
+        "[doc(hidden)]",
+        "`[internal(\"reason\")]` is the other thing this marker is reached for",
+    );
     // And the method is still callable with the attribute gone, which is what
     // says the retirement took the MARKER and not the member.
     assert_compiles_and_runs(

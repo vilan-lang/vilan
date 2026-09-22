@@ -241,6 +241,17 @@ fn to_completion_item(
         }]);
         item.sort_text = Some(format!("|{}{}", auto_import.origin_tier, item.label));
     }
+    // E213: an internal candidate survived the engine's prefix rule, so it is
+    // shown — LAST, and saying why it is one. `~~` sorts after every label
+    // (alphanumeric) and after a construct snippet's single `~`, which is the
+    // ordering the ruling asks for: present, and never in front of a name the
+    // author should be reaching for. The reason REPLACES the signature in
+    // `detail` for the reason an auto-import candidate's module does: what
+    // matters about this candidate is not its shape.
+    if let Some(reason) = completion.internal {
+        item.detail = Some(format!("internal — {reason}"));
+        item.sort_text = Some(format!("~~{}", item.label));
+    }
     // E211: state the prefix this candidate replaces, and the text to filter it
     // by. E194 fixed the hyphenated case from the CLIENT's side, in VS Code's
     // `wordPattern`; every other LSP client has its own word rules and no such
@@ -883,6 +894,7 @@ mod completion_item_tests {
             insert: None,
             filter_text: None,
             replace_span: None,
+            internal: None,
             needs_import: None,
         }
     }
@@ -1023,6 +1035,7 @@ mod completion_item_tests {
             insert: None,
             filter_text: None,
             replace_span: None,
+            internal: None,
             needs_import: None,
         }
     }
@@ -1042,6 +1055,7 @@ mod completion_item_tests {
             insert: None,
             filter_text: None,
             replace_span: None,
+            internal: None,
             needs_import: Some(AutoImport {
                 module_path: module_path.iter().map(|part| part.to_string()).collect(),
                 edit_span: vilan_core::Span { start: 0, end: 0 },
@@ -4038,8 +4052,9 @@ impl LanguageServer for Backend {
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
         let (answer, notice) = self.fenced("formatting", (Err(handler_panicked()), None), || {
             let uri = params.text_document.uri.clone();
-            if let Ok(path) = uri.to_file_path()
-                && formatting_declined(&path)
+            let path = uri.to_file_path().ok();
+            if let Some(path) = path.as_deref()
+                && formatting_declined(path)
             {
                 // Not a printer gap: a product under a declared `generated`
                 // root is deliberately not formatted, and saying so on every
@@ -4050,7 +4065,19 @@ impl LanguageServer for Backend {
                 return (Ok(None), None);
             };
             let source = document.line_index.text();
-            let formatted = match vilan_core::formatter::reprint(source) {
+            // E216: the package's own `[fmt]` knobs, from the same climb
+            // `vilan fmt` walks (E205) — without this, format-on-save was the
+            // one formatter in the toolchain that did not honour the key, so
+            // an opted-in package's comments wrapped from the command line and
+            // not from the editor. A buffer with no file path (an untitled
+            // document) keeps the defaults, which is what it had.
+            let options = match path.as_deref() {
+                Some(path) => vilan_core::formatter::FormatOptions {
+                    wrap_comments: vilan_core::manifest::wrap_comments_covering(path),
+                },
+                None => vilan_core::formatter::FormatOptions::default(),
+            };
+            let formatted = match vilan_core::formatter::reprint_with(source, options) {
                 Ok(formatted) => formatted,
                 Err(decline) => {
                     let notice =
@@ -4178,6 +4205,33 @@ impl LanguageServer for Backend {
                         edit,
                         ..Default::default()
                     }
+                }));
+            }
+            // E216: the comment run the caret is in, re-filled. A refactor
+            // rather than a source action for the css conversions' reason —
+            // it is offered on the construct the cursor is in — and, like
+            // them, it needs no `program`: a comment is trivia the lexer
+            // drops, so this reads the buffer's own text.
+            if wants_refactor
+                && let Some((span, replacement)) =
+                    document.comment_reflow(live_span(&document, params.range))
+            {
+                let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+                changes.insert(
+                    uri.clone(),
+                    vec![TextEdit {
+                        range: document.line_index.range(&span),
+                        new_text: replacement,
+                    }],
+                );
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: "Reflow this comment".to_string(),
+                    kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(changes),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
                 }));
             }
             if let Some(program) = document.program.as_ref() {
@@ -9197,5 +9251,254 @@ mod execute_command_tests {
             .await
             .expect("the command is answered");
         assert_eq!(answer, None, "the summary is a log line, not a result");
+    }
+}
+
+/// E216: the language server reads the package's own `[fmt]` knobs — the half
+/// E205 left undone, where `vilan fmt` honoured the key and format-on-save did
+/// not — and offers the reflow of ONE comment run as a refactor.
+#[cfg(test)]
+mod fmt_options_tests {
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+    use crate::document::tests::std_root;
+
+    /// A scratch package on disk: the manifest climb reads real files, so the
+    /// fixture has to be one. Returns the directory and the file's URI.
+    fn package(tag: &str, manifest: &str, source: &str) -> (PathBuf, Url) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("vilan_e216_{tag}_{}_{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).expect("create the scratch package");
+        std::fs::write(dir.join("vilan.toml"), manifest).expect("write the manifest");
+        let file = dir.join("src/main.vl");
+        std::fs::write(&file, source).expect("write the source");
+        let uri = Url::from_file_path(&file).expect("a file url");
+        (dir, uri)
+    }
+
+    /// One comment, well past the code width, over a canonical program.
+    const LONG_COMMENT: &str = "// the formatter has laid code out to a width since the day it existed and left every comment exactly as typed\nfun main() {}\n";
+
+    fn formatting_params(uri: &Url) -> DocumentFormattingParams {
+        DocumentFormattingParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            options: FormattingOptions {
+                tab_size: 4,
+                insert_spaces: false,
+                ..Default::default()
+            },
+            work_done_progress_params: Default::default(),
+        }
+    }
+
+    async fn formatted(manifest: &str, tag: &str) -> (PathBuf, Option<Vec<TextEdit>>) {
+        let (dir, uri) = package(tag, manifest, LONG_COMMENT);
+        let (service, _socket) = backend();
+        let server = service.inner();
+        server.documents.insert(
+            uri.clone(),
+            Document::analyze(
+                LONG_COMMENT,
+                &std_root(),
+                &uri.to_file_path().expect("a path"),
+            ),
+        );
+        let edits = server
+            .formatting(formatting_params(&uri))
+            .await
+            .expect("the formatting request is answered");
+        (dir, edits)
+    }
+
+    #[tokio::test]
+    async fn format_on_save_wraps_for_an_opted_in_package() {
+        let (dir, edits) = formatted(
+            "[package]\nname = \"wrapprobe\"\n\n[fmt]\nwrap_comments = true\n",
+            "optedin",
+        )
+        .await;
+        let edits = edits.expect("the opted-in package's comment is re-filled");
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert!(
+            edits[0].new_text.starts_with(
+                "// the formatter has laid code out to a width since the day it existed and left \
+                 every comment\n// exactly as typed\n"
+            ),
+            "the key must reach `reprint_with`: {:?}",
+            edits[0].new_text
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn format_on_save_leaves_a_silent_packages_comment_alone() {
+        // The other direction, and the one that makes the first mean something:
+        // with no key the file is already canonical, so there is nothing to
+        // edit at all.
+        let (dir, edits) = formatted("[package]\nname = \"wrapprobe\"\n", "silent").await;
+        assert_eq!(
+            edits, None,
+            "a package that declared nothing keeps today's formatter"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The actions the server offers with the caret on line 0, column 4.
+    async fn actions_at_the_first_comment(
+        manifest: &str,
+        source: &'static str,
+        tag: &str,
+    ) -> (PathBuf, Url, Vec<CodeActionOrCommand>) {
+        let (dir, uri) = package(tag, manifest, source);
+        let (service, _socket) = backend();
+        let server = service.inner();
+        server.documents.insert(
+            uri.clone(),
+            Document::analyze(source, &std_root(), &uri.to_file_path().expect("a path")),
+        );
+        let actions = server
+            .code_action(CodeActionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                range: Range::new(Position::new(0, 4), Position::new(0, 4)),
+                context: CodeActionContext {
+                    diagnostics: Vec::new(),
+                    only: None,
+                    trigger_kind: None,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .expect("the code-action request is answered")
+            .unwrap_or_default();
+        (dir, uri, actions)
+    }
+
+    fn reflow_edit(actions: &[CodeActionOrCommand], uri: &Url) -> Option<String> {
+        actions.iter().find_map(|action| match action {
+            CodeActionOrCommand::CodeAction(action) if action.title == "Reflow this comment" => {
+                Some(action.edit.clone()?.changes?[uri][0].new_text.clone())
+            }
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn the_reflow_refactor_is_not_offered_away_from_a_comment() {
+        // The action is about the run the caret is in, so the caret has to be
+        // in one — and this is also what keeps the two reprints off every
+        // other code-action request.
+        const RUN: &str = "// the formatter has laid code out to a width since the day it existed and left every comment exactly as typed\nfun main() {}\n";
+        let (dir, uri) = package("awayfromcomment", "[package]\nname = \"wrapprobe\"\n", RUN);
+        let (service, _socket) = backend();
+        let server = service.inner();
+        server.documents.insert(
+            uri.clone(),
+            Document::analyze(RUN, &std_root(), &uri.to_file_path().expect("a path")),
+        );
+        let actions = server
+            .code_action(CodeActionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                // Line 1 is `fun main() {}` — code, not a comment.
+                range: Range::new(Position::new(1, 2), Position::new(1, 2)),
+                context: CodeActionContext {
+                    diagnostics: Vec::new(),
+                    only: None,
+                    trigger_kind: None,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .expect("the code-action request is answered")
+            .unwrap_or_default();
+        assert_eq!(reflow_edit(&actions, &uri), None, "{actions:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_reflow_refactor_declines_a_never_reflow_class() {
+        // E205's ten classes are the filler's own, and this is the action
+        // asking the same function: a table row is structure, not prose, and
+        // is over the budget besides.
+        const TABLE: &str = "// | a column whose header runs well past the hundred-column budget all by itself | and a second one |
+fun main() {}
+";
+        let (dir, uri, actions) =
+            actions_at_the_first_comment("[package]\nname = \"wrapprobe\"\n", TABLE, "table").await;
+        assert_eq!(
+            reflow_edit(&actions, &uri),
+            None,
+            "a table row is never reflowed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_reflow_refactor_is_offered_on_an_over_budget_run() {
+        let (dir, uri) = package("action", "[package]\nname = \"wrapprobe\"\n", LONG_COMMENT);
+        let (service, _socket) = backend();
+        let server = service.inner();
+        server.documents.insert(
+            uri.clone(),
+            Document::analyze(
+                LONG_COMMENT,
+                &std_root(),
+                &uri.to_file_path().expect("a path"),
+            ),
+        );
+        let actions = server
+            .code_action(CodeActionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                range: Range::new(Position::new(0, 4), Position::new(0, 4)),
+                context: CodeActionContext {
+                    diagnostics: Vec::new(),
+                    only: None,
+                    trigger_kind: None,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .expect("the code-action request is answered")
+            .expect("a comment over the budget has one");
+        let reflow = actions
+            .iter()
+            .find_map(|action| match action {
+                CodeActionOrCommand::CodeAction(action)
+                    if action.title == "Reflow this comment" =>
+                {
+                    Some(action.clone())
+                }
+                _ => None,
+            })
+            .expect("`Reflow this comment` is offered");
+        // The action applies the FILLER, whatever the package's opt-in says —
+        // an explicit action is consent where a save is not. This package
+        // declares nothing, and the edit still arrives. The edit is the whole
+        // buffer, re-printed with the wrap forced on: the formatter has no
+        // public paragraph entry, and asking it the question it already
+        // answers is what keeps the action and format-on-save agreeing.
+        let changes = reflow.edit.expect("an edit").changes.expect("one file's");
+        let edits = &changes[&uri];
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert!(
+            edits[0].new_text.starts_with(
+                "// the formatter has laid code out to a width since the day it existed and left \
+                 every comment\n// exactly as typed\n"
+            ),
+            "{:?}",
+            edits[0].new_text
+        );
+        assert!(
+            edits[0].new_text.contains("fun main() {}"),
+            "the rest of the buffer rides with it: {:?}",
+            edits[0].new_text
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

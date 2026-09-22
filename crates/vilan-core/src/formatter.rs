@@ -4396,13 +4396,23 @@ impl<'src> Printer<'src> {
                         self.out.push_str(" {");
                         self.indent += 1;
                         let mut prev_end = fields.1.into_range().start + 1;
-                        for ((field_name, field_type, exposed), span) in &fields.0 {
+                        for ((field_name, field_type, exposed, internal), span) in &fields.0 {
                             let range = span.into_range();
                             let after_comments = self.flush_comments_before(range.start, prev_end);
                             if self.has_blank_between(after_comments, range.start) {
                                 self.blank_line();
                             }
                             self.line();
+                            // E213's label leads the field, as it leads a
+                            // function — and it is PRINTED, or `vilan fmt`
+                            // would drop an attribute the author wrote (the
+                            // token net would catch it and decline the file,
+                            // which is a worse way to find out).
+                            if let Some(reason) = internal {
+                                self.out.push_str("[internal(\"");
+                                self.out.push_str(reason);
+                                self.out.push_str("\")] ");
+                            }
                             match exposed {
                                 Exposure::None => {}
                                 Exposure::Whole => self.out.push_str("[expose] "),
@@ -5060,8 +5070,8 @@ impl<'src> Printer<'src> {
     }
 
     /// Prints a function declaration: its
-    /// `[deprecated]`/`[extern]`/`[must_use]`/`[rpc]` attributes (if any) each
-    /// on their own line, then
+    /// `[deprecated]`/`[internal]`/`[extern]`/`[must_use]`/`[rpc]` attributes
+    /// (if any) each on their own line, then
     /// `[async ][external ]fun name[<…>](…)[: T][ borrows p]` followed by the
     /// body block, or a `;` for a signature with no body.
     ///
@@ -5073,6 +5083,12 @@ impl<'src> Printer<'src> {
         if let Some(steer) = func.deprecated {
             self.out.push_str("[deprecated(\"");
             self.out.push_str(steer);
+            self.out.push_str("\")]");
+            self.line();
+        }
+        if let Some(reason) = func.internal {
+            self.out.push_str("[internal(\"");
+            self.out.push_str(reason);
             self.out.push_str("\")]");
             self.line();
         }
@@ -8473,6 +8489,34 @@ mod idempotency {
             "the ordered prefix puts `deprecated` first:\n{formatted}"
         );
         assert_fixed_point("deprecated", source);
+    }
+
+    /// E213's `[internal("reason")]`, on both positions it takes. A printer
+    /// arm is not optional for an attribute: the token net compares the
+    /// reprint's stream with the source's, so an attribute that is not printed
+    /// is a DECLINED file, and `vilan fmt` would refuse every file std's own
+    /// `Region` lives in.
+    #[test]
+    fn an_internal_attribute_survives_the_reprint_on_a_function_and_a_field() {
+        let source = "struct Region {\n\t[internal(\"the end marker\")] anchor: str,\n\
+                      \tlabel: str,\n}\n\
+                      [internal(\"row bookkeeping\")]\nfun cut_row() {}\n\
+                      impl Region {\n\t[internal(\"row bookkeeping\")]\n\t[must_use]\n\
+                      \tfun hold_rows(self): str {\n\t\tself.label\n\t}\n}\n";
+        let formatted = format(source);
+        assert!(
+            formatted.matches("[internal(").count() == 3,
+            "internal attribute lost:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("[internal(\"the end marker\")] anchor: str,"),
+            "a field's label rides on its line, as `[expose]` does:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("[internal(\"row bookkeeping\")]\n\t[must_use]"),
+            "and a function's leads the ordered prefix:\n{formatted}"
+        );
+        assert_fixed_point("internal", source);
     }
 }
 

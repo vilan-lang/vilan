@@ -84,6 +84,13 @@ pub struct Func<'src> {
     // convention the steer reads `use …`. Honored wherever the attribute
     // appears — std and user code alike.
     pub deprecated: Option<&'src str>,
+    // Declared `[internal("reason")]` (E213): this function is public on
+    // purpose and dangerous on purpose — reachable, and not a name a reader
+    // should reach for. Distinct from visibility, which answers whether a
+    // module may NAME it; this answers whether someone should. The reason is
+    // REQUIRED, and it is what hover leads with and completion shows in
+    // `detail`; a label with no reason is how these rot.
+    pub internal: Option<&'src str>,
     // A `[extern(..)]` host binding, lowering this external to a JS import/call,
     // method, or property access. `None` for a plain `external` (compiler
     // intrinsic) or an ordinary function.
@@ -1265,7 +1272,7 @@ impl<'src> Node<'src> {
             }
             Node::Struct(_, generic_parameters, _, _resource, fields) => {
                 visit_generic_parameters(generic_parameters.as_deref(), visit);
-                for (_, type_, _) in fields
+                for (_, type_, _, _) in fields
                     .iter()
                     .flat_map(|fields| &fields.0)
                     .map(|field| &field.0)
@@ -1450,12 +1457,17 @@ impl<'src> Exposure<'src> {
 }
 
 // One struct field: its name (with the name's own span), optional type
-// annotation, and whether (and how) it is `[expose]`d — observable by a
-// service's client as a mirrored `Source` (`proposal/transport-rpc.md` §4.2).
+// annotation, whether (and how) it is `[expose]`d — observable by a service's
+// client as a mirrored `Source` (`proposal/transport-rpc.md` §4.2) — and the
+// `[internal("reason")]` label (E213), which is the case declaration
+// visibility cannot serve at all: vilan has no per-field visibility, so a
+// field that is public on purpose and dangerous on purpose (`Region.anchor`)
+// had no way to say so.
 pub type StructField<'src> = (
     Spanned<&'src str>,
     Option<Spanned<Node<'src>>>,
     Exposure<'src>,
+    Option<&'src str>,
 );
 
 // One field of a struct LITERAL: its name, and the value assigned to it —

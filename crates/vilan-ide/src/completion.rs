@@ -100,6 +100,15 @@ pub struct Completion {
     /// prefix wherever the list is being shown. It is also what makes accepting
     /// one replace the prefix instead of doubling it.
     pub replace_span: Option<Span>,
+    /// The `[internal("reason")]` label on this candidate's declaration
+    /// (E213), or `None` for the overwhelming majority that carry none.
+    ///
+    /// It is a fact about the DECLARATION, carried here so one rule can be
+    /// applied in one place: [`Analysis::completion`] drops an internal
+    /// candidate unless the typed prefix is an exact prefix of three
+    /// characters or more, and the server sorts what survives last and shows
+    /// this reason as the candidate's `detail`.
+    pub internal: Option<String>,
     /// The import this candidate needs before it resolves (E54c) — `None` for
     /// a candidate already reachable without one (every candidate except the
     /// ones [`Analysis::auto_import_completions`] adds). The server
@@ -138,6 +147,7 @@ impl Completion {
             insert: None,
             filter_text: None,
             replace_span: None,
+            internal: None,
             needs_import: None,
         }
     }
@@ -160,6 +170,7 @@ impl Completion {
             insert: None,
             filter_text: None,
             replace_span: None,
+            internal: None,
             needs_import: None,
         }
     }
@@ -1739,6 +1750,22 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 candidate.call_parameters = None;
             }
         }
+        // E213: an `[internal("…")]` name is reachable and not a name to reach
+        // for, so it is not in the list somebody is scanning — it is in the
+        // list somebody has already half-typed. Three characters, matching
+        // exactly, is the line: shorter than that and the popup is a browse,
+        // and a name the author is spelling out is a name they mean.
+        //
+        // Applied HERE, once, rather than at each gatherer: every candidate
+        // carries the label, so one rule covers the scope position, the `.`
+        // position and the `::` one. The struct-INITIALIZER position returns
+        // before this deliberately — a literal must name every field, so
+        // hiding one there would hide the way to construct the value.
+        let typed = text.get(start..offset).unwrap_or_default();
+        candidates.retain(|candidate| match &candidate.internal {
+            Some(_) => typed.chars().count() >= 3 && candidate.label.starts_with(typed),
+            None => true,
+        });
         stamp_replacements(candidates, replaced)
     }
 
@@ -2136,6 +2163,10 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 completion.documentation = source.and_then(|source| {
                     self.doc_first_paragraph_at(source, field.name_span.into_range().start)
                 });
+                // E213: `Region.anchor` is the exhibit — public on purpose,
+                // dangerous on purpose, and the one case declaration
+                // visibility cannot serve at all.
+                completion.internal = field.internal.map(str::to_string);
                 items.push(completion);
             }
         }
@@ -3030,6 +3061,10 @@ impl<'a, 'src> Analysis<'a, 'src> {
                     call_parameters: None,
                     snippet: None,
                     insert: None,
+                    // An auto-import candidate is a name the file does not
+                    // have yet; E213's label rides on the declaration and is
+                    // read where the candidate is one the program knows.
+                    internal: None,
                     filter_text: None,
                     replace_span: None,
                     needs_import: Some(AutoImport {
@@ -3301,6 +3336,21 @@ impl<'a, 'src> Analysis<'a, 'src> {
                     completion.detail = signature_label(program, target);
                     completion.documentation = self.doc_first_paragraph(target);
                     completion.call_parameters = call_parameter_names(program, target);
+                    // E213: read off the DECLARATION the call would reach, so
+                    // a method and a free function answer alike and an
+                    // external (std's runtime seams are often externals) is
+                    // not a third answer.
+                    completion.internal = program
+                        .functions
+                        .get(&target)
+                        .and_then(|function| function.internal)
+                        .or_else(|| {
+                            program
+                                .external_functions
+                                .get(&target)
+                                .and_then(|external| external.internal)
+                        })
+                        .map(str::to_string);
                 }
             }
             CompletionKind::Variable => {

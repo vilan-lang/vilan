@@ -513,6 +513,13 @@ pub struct SymbolEntry {
     /// The parameter names a call-shaped insertion needs, `None` for a
     /// non-callable.
     pub call_parameters: Option<Vec<String>>,
+    /// The `[internal("reason")]` label on the declaration this entry stands
+    /// for (E213), where the source of the entry could see one. The SYNTACTIC
+    /// scan cannot — it reads a token stream for `fun name`, and the attribute
+    /// is two tokens back — so a mid-edit index answers `None` and the label
+    /// takes effect on the next landing, which is the same contract
+    /// `signature` already has.
+    pub internal: Option<String>,
     /// Which analysis filled this entry's resolution-derived fields. **Zero
     /// means purely syntactic** — read straight off a token stream, true of
     /// the buffer as it stands this instant. A consumer can therefore always
@@ -657,6 +664,8 @@ pub fn syntax_symbols(text: &str) -> Vec<SymbolEntry> {
                         kind,
                         signature,
                         call_parameters,
+                        // Syntactic: see the field's own doc.
+                        internal: None,
                         analysis_epoch: 0,
                     });
                 }
@@ -958,6 +967,11 @@ pub fn candidates(entries: &[SymbolEntry], prefix: &str) -> Vec<Completion> {
     entries
         .iter()
         .filter(|entry| prefix.is_empty() || entry.name.starts_with(prefix))
+        // E213, the same rule the analysis's own completion applies: an
+        // internal name is offered only to a prefix of three characters or
+        // more that matches it exactly. The prefix filter above has already
+        // settled the "matches" half.
+        .filter(|entry| entry.internal.is_none() || prefix.chars().count() >= 3)
         .map(|entry| Completion {
             label: entry.name.clone(),
             kind: entry.kind,
@@ -968,6 +982,7 @@ pub fn candidates(entries: &[SymbolEntry], prefix: &str) -> Vec<Completion> {
             insert: None,
             filter_text: None,
             replace_span: None,
+            internal: entry.internal.clone(),
             needs_import: None,
         })
         .collect()
@@ -1371,6 +1386,7 @@ mod tests {
                         kind: CompletionKind::Function,
                         signature: None,
                         call_parameters: Some(Vec::new()),
+                        internal: None,
                         analysis_epoch: 7,
                     }],
                 },

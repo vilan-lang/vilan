@@ -845,6 +845,11 @@ pub struct Function<'src> {
     /// std warns, non-fatally, carrying this replacement steer verbatim
     /// (proposal/deprecation.md §1–§2; `check_deprecated`).
     pub deprecated: Option<&'src str>,
+    /// Declared `[internal("reason")]` (E213): reachable on purpose and
+    /// dangerous on purpose. Read by the EDITOR only — completion hides it
+    /// below an exact prefix, the semantic tokens dim it, and hover leads with
+    /// this reason. Never a diagnostic: it is a label, not a lint.
+    pub internal: Option<&'src str>,
     /// Declared `[rpc]`: callable over the wire as part of a service's surface
     /// (its signature is Wire-checked; `[service(Client)]` generation reads it).
     pub rpc: bool,
@@ -900,6 +905,11 @@ pub struct ExternalFunction<'src> {
     /// std's retire-shaped items are often externals, and the use-site warning
     /// must not depend on which kind the callee is.
     pub deprecated: Option<&'src str>,
+    /// Declared `[internal("reason")]` (E213) — `Function`'s field of the same
+    /// name, here for the same reason `deprecated` is: std's runtime seams are
+    /// often externals, and the editor must not answer differently depending on
+    /// which kind the declaration is.
+    pub internal: Option<&'src str>,
 }
 
 #[derive(Debug, Clone)]
@@ -1407,6 +1417,12 @@ pub struct Field<'src> {
     /// rename). Derived from the start of the field declaration.
     pub name_span: Span,
     pub type_id: TypeId,
+    /// Declared `[internal("reason")]` (E213). A field is the case declaration
+    /// visibility cannot serve at all — vilan has no per-field visibility — and
+    /// it is the motivating one: `Region.anchor` is exported because `each` and
+    /// a user-written `Slot` need it, and moving a row through it without
+    /// `hold_rows` corrupts the reconciler's view.
+    pub internal: Option<&'src str>,
 }
 
 #[derive(Debug, Clone)]
@@ -3401,6 +3417,14 @@ pub struct Analyzer<'src> {
     /// module in the BASE root is not here: it is the same type under every
     /// platform and has no twin to name.
     std_layer_sources: HashMap<SourceId, String>,
+    /// F27 R6: for each overlaid std source above, the OTHER layers' files for
+    /// the same module — `(layer name, module label, path)`. A member miss on a
+    /// type from one twin asks these whether another twin declares a member by
+    /// that name, which is the fact that turns "struct 'Region' has no field
+    /// 'anchor'" from a contradiction into an answer ("the `browser` twin of
+    /// `std::ui` declares it"). Recorded at load time, where the layer roots
+    /// and the module's path are both in hand; read only at a diagnostic.
+    std_layer_twin_files: HashMap<SourceId, Vec<(String, String, PathBuf)>>,
     // E200: the lazy ARGUMENTS `check_lazy_arguments` refused in its own words
     // (ledger row 475, "this argument is the resource `T` …"). Recorded so R9's
     // thunk arm can stand down on exactly those — one diagnostic per root cause
@@ -5092,6 +5116,39 @@ fn type_head<'src>(node: &Node<'src>) -> Option<&'src str> {
     }
 }
 
+/// Whether `item` declares `member` ON `type_name` (F27 R6): a field of that
+/// struct, or a function in an `impl` block whose subject is that type. A
+/// syntactic question, asked of a twin file that is not part of this analysis —
+/// no ids, no types, nothing loaded.
+fn declares_member_on(item: &Node, type_name: &str, member: &str) -> bool {
+    match item {
+        Node::Struct(name, _, _, _, Some(fields)) if name.0 == type_name => {
+            fields.0.iter().any(|field| field.0.0.0 == member)
+        }
+        Node::Impl(subject, _, body) if type_head(&subject.0) == Some(type_name) => {
+            body.0.iter().any(|inner| {
+                matches!(unwrap_item(inner), Node::Func(function) if function.name.0 == member)
+            })
+        }
+        _ => false,
+    }
+}
+
+/// The module path a user writes for a std module file, from its path RELATIVE
+/// to the layer root it lives in: `ui.vl` -> `ui`, `nested/lib.vl` -> `nested`.
+fn module_label(relative: &Path) -> String {
+    if relative.file_name().is_some_and(|name| name == "lib.vl") {
+        return relative
+            .parent()
+            .map(|parent| parent.to_string_lossy().replace(['/', '\\'], "::"))
+            .unwrap_or_default();
+    }
+    relative
+        .with_extension("")
+        .to_string_lossy()
+        .replace(['/', '\\'], "::")
+}
+
 /// The bound names on an impl subject's own generic binders — the `Display` in
 /// `impl List<type T: Display>`. An inherent (trait-less) `impl` block still
 /// needs an import to be reachable, and its bound is the name that gets it.
@@ -5753,6 +5810,7 @@ impl<'src> Analyzer<'src> {
             std_sources: HashSet::default(),
             frozen_sources: HashSet::default(),
             std_layer_sources: HashMap::default(),
+            std_layer_twin_files: HashMap::default(),
             platform: Platform::default(),
             platform_reason: None,
             lazy_argument_resource_refusals: HashSet::default(),
@@ -25761,7 +25819,12 @@ impl<'src> Analyzer<'src> {
     /// touch. `platform_reason` is the front end's; without one (a bare file, a
     /// test harness) the note still names the overlay and the platform, which is
     /// the half that is always knowable here.
-    fn overlaid_std_type_note(&self, definition_id: Id, type_name: &str) -> Option<Note> {
+    fn overlaid_std_type_note(
+        &self,
+        definition_id: Id,
+        type_name: &str,
+        member_name: Option<&str>,
+    ) -> Option<Note> {
         let source = self.source_of_id(definition_id)?;
         let layer = self.std_layer_sources.get(&source)?;
         let span = **self.span_map.get(&definition_id)?;
@@ -25769,15 +25832,63 @@ impl<'src> Analyzer<'src> {
         let head = format!(
             "`{type_name}` here is std's {layer} twin — this file is analyzed under {platform}"
         );
-        let msg = match &self.platform_reason {
+        let mut msg = match &self.platform_reason {
             Some(reason) => format!("{head}: {reason}"),
             None => head,
         };
+        // F27 R6: the third fact. The reader now knows which twin this is and
+        // why the file is under it; what they asked for is a member, and the
+        // answer that settles it is that the OTHER twin has one by that name.
+        // Without this the note explains a colour and leaves the member looking
+        // like a typo.
+        if let Some(member_name) = member_name
+            && let Some((other_layer, module)) =
+                self.twin_declaring_member(source, type_name, member_name)
+        {
+            msg.push_str(&format!(
+                ". The `{other_layer}` twin of `std::{module}` declares `{member_name}` — an \
+                 entry of that platform (or `--platform`) is what puts this file under it"
+            ));
+        }
         Some(Note {
             span,
             msg,
             source: Some(source),
         })
+    }
+
+    /// F27 R6: the OTHER std twin that declares `member_name` on `type_name` —
+    /// its layer and the module both twins serve — for a type defined in an
+    /// overlaid std source. `None` when no other twin has such a member, which
+    /// is when the miss really is a miss.
+    ///
+    /// Reads and parses the twin file at the diagnostic site, which is the cold
+    /// path by construction: it runs only once a member lookup has already
+    /// failed on a std layer type. The parse goes through
+    /// [`crate::parse_clean_cached`], so the second question about the same twin
+    /// is a hash lookup.
+    fn twin_declaring_member(
+        &self,
+        source: SourceId,
+        type_name: &str,
+        member_name: &str,
+    ) -> Option<(String, String)> {
+        for (layer, module, path) in self.std_layer_twin_files.get(&source)? {
+            let Ok(text) = crate::util::read_source(path) else {
+                continue;
+            };
+            let Some((tree, _)) = crate::parse_clean_cached(&text) else {
+                continue;
+            };
+            if tree
+                .0
+                .iter()
+                .any(|item| declares_member_on(unwrap_item(item), type_name, member_name))
+            {
+                return Some((layer.clone(), module.clone()));
+            }
+        }
+        None
     }
 
     /// Element-syntax S4: `<div text("hi")>` — an undotted `text(…)` head item
@@ -29958,6 +30069,7 @@ impl<'src> Analyzer<'src> {
                             call_count: 0,
                             is_async: function.is_async,
                             deprecated: function.deprecated,
+                            internal: function.internal,
                         },
                     );
                     let function_type_id = self.new_type_id();
@@ -30121,6 +30233,7 @@ impl<'src> Analyzer<'src> {
                             ),
                             must_use: function.must_use,
                             deprecated: function.deprecated,
+                            internal: function.internal,
                             platform_fence: function
                                 .platform_fence
                                 .iter()
@@ -30753,6 +30866,7 @@ impl<'src> Analyzer<'src> {
                         name: field_name,
                         name_span: field_name_span,
                         type_id,
+                        internal: child.0.3,
                     });
                 }
                 self.structs.insert(
@@ -40980,9 +41094,28 @@ impl<'src> Analyzer<'src> {
                 let retired_slot_steer = self
                     .retired_slot_method_steer(&subject_type, member_name)
                     .unwrap_or_default();
+                // E119's method half, completed by F27 R6: a receiver from an
+                // overlaid std layer is missing METHODS as well as fields under
+                // the other twin (`region.cut_row()` beside `region.anchor`),
+                // and it is the same answer — which twin this is, why the file
+                // is under it, and that the other twin has the method. The
+                // NotCallable arm below has carried the first two since E119;
+                // this site had no note at all.
+                let note = match subject_type {
+                    Type::Struct(struct_id, _) => {
+                        let name = self
+                            .structs
+                            .get(&struct_id)
+                            .map(|struct_| struct_.name.to_string());
+                        name.and_then(|name| {
+                            self.overlaid_std_type_note(struct_id, &name, Some(member_name))
+                        })
+                    }
+                    _ => None,
+                };
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
-                    note: None,
+                    note,
                     span: self
                         .member_name_spans
                         .get(&id)
@@ -41138,7 +41271,9 @@ impl<'src> Analyzer<'src> {
                             .structs
                             .get(&struct_id)
                             .map(|struct_| struct_.name.to_string());
-                        name.and_then(|name| self.overlaid_std_type_note(struct_id, &name))
+                        name.and_then(|name| {
+                            self.overlaid_std_type_note(struct_id, &name, Some(member_name))
+                        })
                     }
                     _ => None,
                 };
@@ -44938,7 +45073,11 @@ impl<'src> Analyzer<'src> {
                             // E119: when the struct came from an overlaid std
                             // layer, the miss is usually about WHICH `View` this
                             // is, not about the field.
-                            note: self.overlaid_std_type_note(struct_id, struct_name),
+                            note: self.overlaid_std_type_note(
+                                struct_id,
+                                struct_name,
+                                Some(member_name),
+                            ),
                             span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
                             msg: format!("struct '{}' has no field '{}'", struct_name, member_name),
                         });
@@ -54851,9 +54990,13 @@ pub struct Workspace {
     pub entry_prelude: crate::manifest::PreludeSpec,
     /// WHY this analysis runs under the platform it does (E119), already
     /// rendered by [`crate::platform_color::PlatformReason::clause`] — "no entry
-    /// reaches it (default-entry is `server`)". `None` when the front end has no
-    /// project to answer from (a bare file, a test harness), and the diagnostic
-    /// that reads it then says only which platform it is under.
+    /// reaches it (default-entry is `server`)". Where the front end has no
+    /// project to answer from (a bare file, a `[library]` module, a test
+    /// harness), the INFERENCE that chose the platform fills it instead (F27
+    /// R6, `crate::infer_platform`) — "it reads `.anchor`, which only the
+    /// browser twin of `std::ui` declares". `None` only where neither spoke,
+    /// and the diagnostic that reads it then says only which platform it is
+    /// under.
     ///
     /// It lives here, on the resolved project context the front end hands to the
     /// analysis, for the same reason `entry_prelude` does: it is a fact about
@@ -58213,6 +58356,33 @@ fn analyze_inner<'src>(
                             analyzer
                                 .std_layer_sources
                                 .insert(SourceId(sources.len() as u32), layer.name.clone());
+                            // F27 R6: and the same module as the OTHER layers
+                            // serve it. The relative path is what identifies the
+                            // module inside a layer (`ui.vl`, `nested/lib.vl`),
+                            // so the twin is that same relative path under
+                            // another layer's root — and its label is the module
+                            // path a user writes (`ui`).
+                            let twins: Vec<(String, String, PathBuf)> = canonical
+                                .strip_prefix(crate::util::canonical_path(&layer.root))
+                                .ok()
+                                .map(|relative| {
+                                    let label = module_label(relative);
+                                    std.layers
+                                        .iter()
+                                        .filter(|other| other.name != layer.name)
+                                        .map(|other| (other, other.root.join(relative)))
+                                        .filter(|(_, path)| path.is_file())
+                                        .map(|(other, path)| {
+                                            (other.name.clone(), label.clone(), path)
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if !twins.is_empty() {
+                                analyzer
+                                    .std_layer_twin_files
+                                    .insert(SourceId(sources.len() as u32), twins);
+                            }
                         }
                     }
                     // A dependency package's module is code the user did not

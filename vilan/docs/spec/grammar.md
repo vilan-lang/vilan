@@ -113,6 +113,7 @@ together and leave a trailing separator where it was.
 
 ```text
 function = [ "[" "deprecated" "(" STRING ")" "]" ]
+           [ "[" "internal" "(" STRING ")" "]" ]
            [ extern-attr ] [ "[" "must_use" "]" ] [ "[" "rpc" "]" ]
            [ "[" "trait_only" "]" ]
            [ "[" "platform" "(" STRING { "," STRING } [ "," ] ")" "]" ]
@@ -201,12 +202,32 @@ when the function is removed, so is the mark. When the item goes away is
 the CHANGELOG's fact, not the source's — the removal comes no earlier
 than the minor release after the warning first shipped.
 
+`[internal("reason")]` follows it, and answers a different question.
+Visibility says whether a module may **name** an item; this says whether
+a reader should **reach for** one that is named — an item exported on
+purpose and dangerous on purpose, like `std::ui`'s `Region.anchor`,
+which `each` and a hand-written `Slot` legitimately need and which
+corrupts the reconciler's view when a row is moved through it without
+`hold_rows`. The one argument is the reason, and it is required: it is
+what the editor shows, and a label with no reason is how these rot.
+
+It is **not a diagnostic**. Nothing warns, nothing refuses, and the item
+stays exported and callable — the attribute changes what the editor
+does. Completion omits the name unless what is already typed is an exact
+prefix of three characters or more, and what survives that is sorted
+last with the reason as its detail; every use of the name, and the
+declaration itself, carries a semantic-token `internal` modifier that a
+theme dims; hover leads with the reason. A **field** is the case
+declaration visibility cannot serve at all, since vilan has no per-field
+visibility, and it is the case the attribute was asked for.
+
 ### Structs and enums
 
 ```text
 struct = [ "resource" ] [ "external" ] "struct" (IDENT | "null") [ generic-params ]
          ( "{" [ field { "," field } [ "," ] ] "}" | ";" ) ;
-field  = [ "[" "expose" [ "(" "keyed" [ "=" type ] ")" ] "]" ] IDENT [ ":" type ] ;
+field  = [ "[" "internal" "(" STRING ")" "]" ]
+         [ "[" "expose" [ "(" "keyed" [ "=" type ] ")" ] "]" ] IDENT [ ":" type ] ;
 
 enum          = [ "resource" ] "enum" IDENT [ generic-params ]
                 "{" [ variant { "," variant } [ "," ] ] "}" ;
@@ -327,7 +348,8 @@ A macro attribute's arguments are captured as **source spans**: the
 macro receives their text, not their values (§10). The built-in
 attribute names (`derive`, `service`, `client_service`, `extern`,
 `must_use`, `rpc`, `trait_only`, `doc`, `expose`, `platform`,
-`deprecated`) are not available as user macro-attribute names.
+`deprecated`, `internal`) are not available as user macro-attribute
+names.
 
 `[service(..)]` and `[client_service]` may be written in either order
 on one struct; a struct carrying both is peer-to-peer and expands

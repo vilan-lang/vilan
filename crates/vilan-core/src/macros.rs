@@ -2894,7 +2894,7 @@ fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
                 .iter()
                 .flat_map(|fields| &fields.0)
                 .map(|(field, _)| {
-                    let (field_name, field_type, exposed) = field;
+                    let (field_name, field_type, exposed, _internal) = field;
                     array(vec![
                         string_literal(field_name.0),
                         field_type
@@ -3039,7 +3039,7 @@ pub(crate) fn construct_service(
         .0
         .iter()
         .map(|(field, _)| {
-            let (field_name, field_type, exposed) = field;
+            let (field_name, field_type, exposed, _internal) = field;
             array(vec![
                 string_literal(field_name.0),
                 field_type

@@ -804,7 +804,22 @@ pub struct FormatOutcome {
 /// the printer cannot render, so pressing Format on a construct with no rule
 /// looked exactly like pressing it on a clean file.
 pub fn format_program(source: &str) -> FormatOutcome {
-    match vilan_core::formatter::reprint(source) {
+    format_program_with(source, vilan_core::formatter::FormatOptions::default())
+}
+
+/// [`format_program`] under an explicit set of `[fmt]` knobs (E216).
+///
+/// The page is the manifest here: a pasted buffer has no `vilan.toml`, so the
+/// option cannot be climbed to the way the CLI and the language server climb
+/// to it (`manifest::wrap_comments_covering`) — it is a toggle on the page,
+/// threaded through exactly as the prelude and platform toggles are
+/// (`compile_program_with`). [`format_program`] keeps the defaults, so the
+/// deployed glue's `format` export is byte-for-byte what it was.
+pub fn format_program_with(
+    source: &str,
+    options: vilan_core::formatter::FormatOptions,
+) -> FormatOutcome {
+    match vilan_core::formatter::reprint_with(source, options) {
         Ok(text) => FormatOutcome {
             text,
             declined: None,
@@ -1007,6 +1022,23 @@ mod bindings {
     #[wasm_bindgen]
     pub fn format_checked(source: String) -> FormatResult {
         let outcome = crate::format_program(&source);
+        FormatResult {
+            text: outcome.text,
+            declined: outcome.declined,
+        }
+    }
+
+    /// Formats Vilan source with `[fmt] wrap_comments` on or off (E216) — the
+    /// page's own toggle, since a pasted buffer has no manifest to read it
+    /// from. A separate export rather than a parameter on [`format_checked`]:
+    /// the deployed glue calls that one with one argument, and a page served
+    /// before this build must keep working against the next wasm module.
+    #[wasm_bindgen]
+    pub fn format_checked_with(source: String, wrap_comments: bool) -> FormatResult {
+        let outcome = crate::format_program_with(
+            &source,
+            vilan_core::formatter::FormatOptions { wrap_comments },
+        );
         FormatResult {
             text: outcome.text,
             declined: outcome.declined,
