@@ -6484,6 +6484,28 @@ impl Document {
         })
     }
 
+    /// E216 (R8's other half): the comment run under `range` re-filled to this
+    /// package's comment width — the "Reflow this comment" refactor.
+    ///
+    /// Offered REGARDLESS of `[fmt] wrap_comments`, because an explicit action
+    /// is consent where a format-on-save is not; offered only where something
+    /// changes, which is what [`vilan_core::formatter::reflow_comment_at`]
+    /// answers `None` for — a run no line of which is over the width, one
+    /// already filled, a trailing comment after code, and each of E205's ten
+    /// never-reflow classes.
+    ///
+    /// The width is the covering package's `[fmt] comment_width` (E215), read
+    /// from this document's own manifest directory — the same climb the
+    /// formatting path walks, so the action and the save cannot fill to two
+    /// different measures.
+    pub fn comment_reflow(&self, range: Span) -> Option<vilan_core::formatter::CommentReflowEdit> {
+        let width = self
+            .manifest_dir
+            .as_deref()
+            .and_then(vilan_core::manifest::comment_width_covering);
+        vilan_core::formatter::reflow_comment_at(&self.text, range.start, width)
+    }
+
     /// The `css`-spelling conversion offered over `range` (LIVE space, and the
     /// caller gates staleness first exactly as it does for [`Self::quickfixes`])
     /// — css-block.md §7.2's one refactor, and the estate's migration path.

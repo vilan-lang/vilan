@@ -560,6 +560,40 @@ fn a_program_that_does_not_parse_formats_to_itself_and_says_so() {
     assert_eq!(clean.declined, None);
 }
 
+/// E216: the page's own `[fmt] wrap_comments`. A pasted buffer has no manifest
+/// to climb to, so the toggle is threaded in — and the export the deployed
+/// glue calls keeps the default, which is what makes adding this safe.
+#[test]
+fn the_page_can_ask_for_wrapped_comments_and_the_old_export_cannot() {
+    const LONG: &str = "// the formatter has laid code out to a width since the day it existed and left every comment exactly as typed
+fun main() {}
+";
+    let default = vilan_wasm::format_program(LONG);
+    assert_eq!(
+        default.text, LONG,
+        "`format`'s answer is byte-for-byte what it was"
+    );
+    let wrapped = vilan_wasm::format_program_with(
+        LONG,
+        vilan_core::formatter::FormatOptions {
+            wrap_comments: true,
+        },
+    );
+    assert_eq!(
+        wrapped.declined, None,
+        "the fill must not decline: {:?}",
+        wrapped.declined
+    );
+    assert!(
+        wrapped.text.starts_with(
+            "// the formatter has laid code out to a width since the day it existed and left \
+             every comment\n// exactly as typed\n"
+        ),
+        "{:?}",
+        wrapped.text
+    );
+}
+
 /// The printer-gap face, which is the one the item is about: a construct the
 /// safety net throws away reports the construct, not just "no".
 #[test]

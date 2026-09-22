@@ -74,7 +74,11 @@ formatting. When the printer *declines* a file — it does not
 parse, or it carries a construct the printer has no rule for — the server
 says so in a message naming the line and the construct, rather than
 leaving a save that did nothing looking like a save that had nothing to
-do. Once per file per cause, so format-on-save does not repeat it.
+do. Once per file per cause, so format-on-save does not repeat it. It reads
+your package's `[fmt]` section — `wrap_comments`, and the `comment_width`
+that goes with it — from the nearest `vilan.toml` above the file, the same
+climb `vilan fmt` walks, so a save and a command-line format produce the
+same bytes.
 
 **Linked editing** for markup tag pairs: rename `<div>` and `</div>`
 follows.
@@ -266,6 +270,7 @@ diagnostic or on the file:
 | Action | Does |
 |---|---|
 | **Convert to a `style()` chain** | rewrites the `css { … }` block the cursor is in as the builder chain it lowers to — a declaration becomes a `.raw` link, a nested rule becomes a combinator link carrying the inner chain |
+| **Reflow this comment** | re-fills the comment run your cursor is in to the package's comment width (`[fmt] comment_width`, or the code width), whatever `[fmt] wrap_comments` says — an explicit action is consent where a format-on-save is not. Offered only where something changes: a run already filled, one no line of which is over the width, a trailing comment after code, and each of the ten never-reflow classes get no action |
 | **Convert to a `css` block** | the inverse, on a `style()` chain — seeded by any path ending in `style()`, so `style::style()` (what the web prelude publishes) reads as one. A typed property method is converted by *inlining its std body*: `.padding_x(space(4))` is `with_length("padding-left", value).with_length("padding-right", value)`, so it writes both declarations with the argument in each. A link with no block spelling — a user extension, a method whose body is not a chain (`.border(…)`), `.class_list()` — *splits* the chain instead of refusing it: everything before it becomes the block and the rest is written as a postfix chain on it (`css { … }.select_off()`). Not offered when no link converts |
 
 Both directions decline rather than guess. A **comment** inside the
