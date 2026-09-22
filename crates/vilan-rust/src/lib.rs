@@ -2888,7 +2888,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             Expr::Index(subject, index) => {
                 let subject_text = self.expression(subject, depth)?;
-                let index_text = self.expression(index, depth)?;
+                // An index is an index, whatever the surrounding position
+                // expects: `xs[1] = xs[1] + 2` on a `List<u53>` expects `u53`
+                // of the VALUE, and a literal subscript that inherited it came
+                // out `1u64`.
+                let index_text =
+                    self.expecting_nothing(|emitter| emitter.expression(index, depth))?;
                 format!("{subject_text}[({index_text}) as usize]")
             }
             Expr::List(elements) => {
@@ -3246,6 +3251,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let Some(hoisted) = self.hoist_compound_target(target, value, depth)? {
             return Ok(hoisted);
         }
+        // The TARGET's type is the value position's expectation (B370's law on
+        // the assignment path): a numeric literal takes its width from the
+        // position it lands in, and an assignment is a position. Without it
+        // `mut i: u53 = 5; i -= 1;` emitted `i - (1i32)` against a `u64`, which
+        // rustc refused — a `let` was right only because `declaration` was
+        // already passing the binding's type down.
+        let expecting = self.type_of(target);
         // A write THROUGH a counted cell — `*self.value = v`, which the
         // analyzer lowers to a deref of the cell's read intrinsic. The place
         // is not a Rust place at all (`Shared` hands out a value, not a
@@ -3254,8 +3266,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // rustc refused — the intrinsic's second argument had nowhere to come
         // from because the VALUE is the assignment's.
         if let Some(receiver) = self.cell_write_receiver(target) {
+            // The cell's ELEMENT type is the position's expectation: the target
+            // is a deref of the cell's own read intrinsic and carries no type of
+            // its own, so `cell.write() = cell.read() + 1` on a `Shared<u53>`
+            // wrote `(1i32)` against a `u64`.
+            let expecting = expecting.or_else(|| self.cell_element_type(receiver));
             let receiver_text = self.expression(receiver, depth)?;
-            let value_text = self.value_of(value, depth)?;
+            let value_text = self.value_of_expecting(value, expecting, depth)?;
             return Ok(format!("({receiver_text}).set({value_text})"));
         }
         let named = match self.program.entity_map.get(&target) {
@@ -3264,22 +3281,44 @@ impl<'a, 'src> Emitter<'a, 'src> {
         };
         if let Some(binding) = named {
             if self.boxed.contains(&binding) {
-                let value_text = self.value_of(value, depth)?;
+                let value_text = self.value_of_expecting(value, expecting, depth)?;
                 return Ok(format!("{}.set({value_text})", self.binding_name(binding)));
             }
             if self.module_bindings.contains(&binding) {
                 let cell = self.ensure_module_binding(binding, span)?;
-                let value_text = self.value_of(value, depth)?;
+                let value_text = self.value_of_expecting(value, expecting, depth)?;
                 return Ok(format!("{cell}.with(|cell| cell.set({value_text}))"));
             }
             if self.binding_holds_a_view(binding) {
-                let value_text = self.value_of(value, depth)?;
+                let value_text = self.value_of_expecting(value, expecting, depth)?;
                 return Ok(format!("*{} = {value_text}", self.binding_name(binding)));
             }
         }
         let target_text = self.mutable_place(target, depth)?;
-        let value_text = self.value_of(value, depth)?;
+        let value_text = self.value_of_expecting(value, expecting, depth)?;
         Ok(format!("{target_text} = {value_text}"))
+    }
+
+    /// Renders with NO expected type — the positions a surrounding
+    /// expectation must not reach (a subscript, whose type is an index's and
+    /// not the indexed value's).
+    fn expecting_nothing<T>(
+        &mut self,
+        render: impl FnOnce(&mut Self) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let saved = self.expected_type.take();
+        let rendered = render(self);
+        self.expected_type = saved;
+        rendered
+    }
+
+    /// The element type of a counted cell a write goes through — the single
+    /// argument of the `Shared` the receiver names.
+    fn cell_element_type(&self, receiver: Id) -> Option<TypeId> {
+        match self.resolve(self.type_of(receiver)?)? {
+            Type::Struct(_, arguments) => arguments.first().copied(),
+            _ => None,
+        }
     }
 
     /// The CELL an assignment writes through, when its target is a deref of a
@@ -3340,9 +3379,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let mut prelude = String::new();
         let saved = std::mem::take(&mut self.hoisted);
         let paired = self.pair_places(target, reread, &mut prelude, depth);
+        let expecting = self.type_of(target);
         let rendered = paired.and_then(|_| {
             let target_text = self.mutable_place(target, depth)?;
-            let value_text = self.value_of(value, depth)?;
+            let value_text = self.value_of_expecting(value, expecting, depth)?;
             Ok((target_text, value_text))
         });
         self.hoisted = saved;
@@ -3572,9 +3612,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // binding is outside every instantiation, and a generic it could not
         // ground would be a refusal there rather than a wrong grounding here.
         let saved = std::mem::take(&mut self.current_substitution);
-        let rendered = self
-            .rust_type(variable.type_id, span)
-            .and_then(|rendered| self.value_of(initial, 0).map(|value| (rendered, value)));
+        // The BINDING's type is the initializer's expectation, as it is for a
+        // local (B370's law): without it `mut level: u32 = 10` declared a
+        // `Shared<u32>` and handed it `(10i32)`.
+        let expecting = Some(variable.type_id);
+        let rendered = self.rust_type(variable.type_id, span).and_then(|rendered| {
+            self.value_of_expecting(initial, expecting, 0)
+                .map(|value| (rendered, value))
+        });
         self.current_substitution = saved;
         let (rendered, value) = rendered?;
         let mut out = String::new();
@@ -7207,7 +7252,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             Some(Expr::Index(subject, index)) => {
                 let subject_text = self.mutable_place(subject, depth)?;
-                let index_text = self.expression(index, depth)?;
+                let index_text =
+                    self.expecting_nothing(|emitter| emitter.expression(index, depth))?;
                 Ok(format!("{subject_text}[({index_text}) as usize]"))
             }
             Some(Expr::TupleIndex(subject, offset, 1)) => {

@@ -1903,6 +1903,66 @@ fn the_boxed_binding_count_is_reachable_and_counts_the_right_bindings() {
     );
 }
 
+/// A numeric literal in an ASSIGNMENT takes its width from the position, the
+/// way one in a `let` already did (B370's law, on the paths the native emitter
+/// had not carried it down).
+///
+/// `mut i: u53 = 5; i -= 1;` emitted `i - (1i32)` against a `u64` and rustc
+/// refused the program — a BACKEND defect, and one the byte gate could not see
+/// because no corpus program assigns a literal to a non-default width. Four
+/// positions are in here, because each carries the expectation down a
+/// different path: a plain binding, a subscript, a field, a counted cell's
+/// `write()`, and a module-level binding's own initializer. The subscripts are
+/// deliberately literal: an index is an index whatever the assignment expects,
+/// and a first fix made `xs[1]` come out `xs[(1u64)]`.
+const LITERAL_WIDTH_PROBE: &str = concat!(
+    "import std::shared::Shared;\n",
+    "\n",
+    "struct Counter { n: u53 }\n",
+    "\n",
+    "mut level: u32 = 10;\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut a: u53 = 5;\n",
+    "\ta -= 1;\n",
+    "\ta += 2;\n",
+    "\ta *= 3;\n",
+    "\tmut b: i53 = 9;\n",
+    "\tb = b - 1;\n",
+    "\tmut c: u32 = 7;\n",
+    "\tc /= 2;\n",
+    "\tmut d: u8 = 200;\n",
+    "\td -= 100;\n",
+    "\tmut e: i8 = -5;\n",
+    "\te += 3;\n",
+    "\tmut f: f64 = 1.5;\n",
+    "\tf *= 2;\n",
+    "\tmut xs: List<u53> = [5u53, 6u53];\n",
+    "\txs[0] -= 1;\n",
+    "\txs[1] = xs[1] + 2;\n",
+    "\tmut counter = Counter { n = 9 };\n",
+    "\tcounter.n -= 4;\n",
+    "\tlet cell: Shared<u53> = Shared::new(3u53);\n",
+    "\tcell.write() = cell.read() + 1;\n",
+    "\tlevel -= 3;\n",
+    "\tprint(xs);\n",
+    "\tprint(i\"{a} {b} {c} {d} {e} {f} {counter.n} {cell.read()} {level}\");\n",
+    "}\n",
+);
+
+#[test]
+fn a_literal_assigned_to_a_narrow_binding_takes_the_bindings_width() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_width.vl"), LITERAL_WIDTH_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_width.vl"),
+        Verdict::Identical,
+        "a literal assigned into a non-default width must take that width — a mismatch is a \
+         rustc refusal of the emitted Rust, which is a backend defect"
+    );
+}
+
 /// F31's trap, in one program: the read whose binding was declared OUTSIDE the
 /// loop keeps its copy, and the read whose binding the loop body itself
 /// declares moves.
