@@ -10789,6 +10789,7 @@ impl<'src> Analyzer<'src> {
     ) -> Option<ContainerResource<'src>> {
         let mut path = Vec::new();
         let mut visiting = HashSet::default();
+        let mut visiting_heads = HashSet::default();
         self.container_resource_in(
             type_id,
             containers,
@@ -10796,6 +10797,7 @@ impl<'src> Analyzer<'src> {
             memo,
             &mut path,
             &mut visiting,
+            &mut visiting_heads,
         )
     }
 
@@ -10825,6 +10827,7 @@ impl<'src> Analyzer<'src> {
         memo: &mut HashMap<TypeId, bool>,
         path: &mut Vec<&'src str>,
         visiting: &mut HashSet<TypeId>,
+        visiting_heads: &mut HashSet<Id>,
     ) -> Option<ContainerResource<'src>> {
         let (head_id, arguments) = match type_id.get_type(self) {
             Type::Struct(id, arguments) | Type::Enum(id, arguments) => (id, arguments),
@@ -10838,6 +10841,7 @@ impl<'src> Analyzer<'src> {
                     memo,
                     path,
                     visiting,
+                    visiting_heads,
                 );
             }
             Type::Array(element, _length) => {
@@ -10849,6 +10853,7 @@ impl<'src> Analyzer<'src> {
                     memo,
                     path,
                     visiting,
+                    visiting_heads,
                 );
             }
             _ => return None,
@@ -10880,11 +10885,25 @@ impl<'src> Analyzer<'src> {
                 memo,
                 path,
                 visiting,
+                visiting_heads,
             );
         }
         // A member can only hide a container behind a type ARGUMENT, and a
-        // recursive type would otherwise descend forever.
+        // recursive type would otherwise descend forever. Two guards, because
+        // a GENERIC recursive type defeats the first (B385): each member is
+        // descended as substituted in the head's own context, and substituting
+        // `M<T>`'s `Map(List<M<T>>)` mints a fresh `TypeId` for the inner `M<T>`
+        // every time, so the instantiation set never repeats and the walk
+        // overflowed the stack on a nine-line enum. The HEAD set catches it: a
+        // head already being descended is the declaration itself, and every
+        // instantiation of it that is written in the program is walked as a
+        // type in its own right (the same reason a concrete member is skipped
+        // below).
         if arguments.is_empty() || !visiting.insert(type_id) {
+            return None;
+        }
+        if !visiting_heads.insert(head_id) {
+            visiting.remove(&type_id);
             return None;
         }
         // A struct's fields, or an enum's variant payloads, with the name the
@@ -10916,6 +10935,7 @@ impl<'src> Analyzer<'src> {
                 )
             } else {
                 visiting.remove(&type_id);
+                visiting_heads.remove(&head_id);
                 return None;
             };
         let context = Self::instantiation_context(&parameters, &arguments);
@@ -10936,6 +10956,7 @@ impl<'src> Analyzer<'src> {
                 memo,
                 path,
                 visiting,
+                visiting_heads,
             );
             path.pop();
             if let Some(found) = found.as_mut() {
@@ -10946,6 +10967,7 @@ impl<'src> Analyzer<'src> {
             }
         }
         visiting.remove(&type_id);
+        visiting_heads.remove(&head_id);
         found
     }
 
@@ -10963,6 +10985,7 @@ impl<'src> Analyzer<'src> {
         memo: &mut HashMap<TypeId, bool>,
         path: &mut Vec<&'src str>,
         visiting: &mut HashSet<TypeId>,
+        visiting_heads: &mut HashSet<Id>,
     ) -> Option<ContainerResource<'src>> {
         if members.is_empty() || !visiting.insert(owner) {
             return None;
@@ -10976,6 +10999,7 @@ impl<'src> Analyzer<'src> {
                 memo,
                 path,
                 visiting,
+                visiting_heads,
             );
             if found.is_some() {
                 break;

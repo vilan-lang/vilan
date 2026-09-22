@@ -393,6 +393,82 @@ fn r10_refuses_a_signal_of_a_resource() {
     );
 }
 
+// --- B385: a GENERIC recursive type must not descend forever. The walk's
+// --- guard was keyed on the instantiation's `TypeId`, and substituting a
+// --- recursive member in the head's own context mints a fresh id for the inner
+// --- application every time, so a nine-line enum overflowed the stack (and took
+// --- the language server with it) whenever a resource type was in the world.
+
+#[test]
+fn b385_a_generic_recursive_enum_does_not_overflow_the_resource_walk() {
+    // The owner's report minimized: the wrapper, the parameter count and `any`
+    // are all irrelevant; GENERIC + recursive + a resource type loaded is the
+    // whole trigger. Before the head-keyed guard this aborted the process.
+    assert_compiles(
+        r#"
+        import std::reactive::SignalCell;
+        enum M<type T> {
+            Base(T),
+            Map(List<M<T>>),
+        }
+        fun main() {}
+        "#,
+    );
+}
+
+#[test]
+fn b385_the_owners_signal_mapper_shape_checks_clean() {
+    // Three parameters, permuted through `Shared`, an `any` argument, closure
+    // payloads — the shape as reported, kept whole so the fix is measured against
+    // the real thing and not only its minimization.
+    assert_compiles(
+        r#"
+        import std::reactive::SignalCell;
+        import std::shared::Shared;
+        enum SignalMapper<type T, type U, type O> {
+            Base(SignalCell<O>),
+            Map(Shared<SignalMapper<any, T, O>>, |T| U),
+            Filter(SignalCell<O>, |T| Option<U>),
+            And(SignalCell<O>, |T| SignalCell<U>),
+        }
+        fun main() {}
+        "#,
+    );
+}
+
+#[test]
+fn b385_a_mutually_recursive_generic_pair_checks_clean() {
+    // Two heads, each reached through the other: the head set must hold BOTH
+    // while the walk is inside them, or the pair alternates forever.
+    assert_compiles(
+        r#"
+        import std::reactive::SignalCell;
+        import std::shared::Shared;
+        struct A<type T> { value: T, next: Option<Shared<B<T>>> }
+        struct B<type T> { value: T, back: List<A<T>> }
+        fun main() {}
+        "#,
+    );
+}
+
+#[test]
+fn b385_a_resource_inside_a_recursive_generic_is_still_refused() {
+    // The guard must not hide the diagnostic the walk exists for: a resource
+    // argument reaching `Shared` through a recursive generic's OWN member is
+    // R10's, with the path, exactly as through a non-recursive one (A19).
+    assert_fails_spanning(
+        r#"
+        import std::shared::Shared;
+        resource struct Db { handle: i32 }
+        struct Node<T> { value: Shared<T>, children: List<Node<T>> }
+        fun sink(node: Node<Db>) {}
+        fun main() {}
+        "#,
+        "Node<Db>",
+        "`Shared` cannot hold the resource `Db`, reached through `Node.value`",
+    );
+}
+
 #[test]
 fn r10_leaves_a_signal_of_data_alone() {
     // The other direction: the descent looks at the INSTANTIATED member, so a
