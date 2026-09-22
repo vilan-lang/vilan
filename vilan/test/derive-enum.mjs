@@ -23,12 +23,29 @@ function __try_parse_json(text) {
 }
 function from_json_value(value) {
 	let $m = null;
-	if (__json_kind(value) === "number") {
-		$m = [ 0, Number(value) ];
-	} else {
-		$m = [ 1, "expected a number" ];
+	if (__json_kind(value) !== "number") {
+		return [ 1, "expected a number" ];
 	}
-	return $m;
+	$m;
+	const $n = integer_lane_failure(value, true);
+	let $o = null;
+	if ($n[0] === 0) {
+		const reason = $n[1];
+		$o = [ 1, reason ];
+	} else {
+		$o = [ 0, Number(value) ];
+	}
+	return $o;
+}
+function integer_lane_failure(value, signed) {
+	const number = Number(value);
+	if (number !== Math.floor(number)) {
+		return [ 0, "expected a whole number, found " + number ];
+	}
+	if (!(signed) && number < 0.0) {
+		return [ 0, "expected a non-negative number, found " + number ];
+	}
+	return [ 1 ];
 }
 function eq(self, other) {
 	const $a = [ self, other ];
@@ -91,21 +108,21 @@ function from_json_value2(value) {
 	const $k = __json_tag(value);
 	let $l = null;
 	if ($k === "Circle") {
-		const $n = from_json_value(value["Circle"]);
-		if ($n[0] === 1) {
-			return $n;
-		}
-		$l = [ 0, [ 0, $n[1] ] ];
-	} else if ($k === "Rect") {
-		const $o = from_json_value(value["Rect"]["0"]);
-		if ($o[0] === 1) {
-			return $o;
-		}
-		const $p = from_json_value(value["Rect"]["1"]);
+		const $p = from_json_value(value["Circle"]);
 		if ($p[0] === 1) {
 			return $p;
 		}
-		$l = [ 0, [ 1, $o[1], $p[1] ] ];
+		$l = [ 0, [ 0, $p[1] ] ];
+	} else if ($k === "Rect") {
+		const $q = from_json_value(value["Rect"]["0"]);
+		if ($q[0] === 1) {
+			return $q;
+		}
+		const $r = from_json_value(value["Rect"]["1"]);
+		if ($r[0] === 1) {
+			return $r;
+		}
+		$l = [ 0, [ 1, $q[1], $r[1] ] ];
 	} else if ($k === "Empty") {
 		$l = [ 0, [ 2 ] ];
 	} else {
@@ -137,14 +154,14 @@ console.log(debug(e));
 console.log(to_json(c));
 console.log(to_json(r));
 console.log(to_json(e));
-const $q = from_json(to_json(c));
-console.log($q[0] === 0 && eq($q[1], c));
-const $r = from_json(to_json(r));
-console.log($r[0] === 0 && eq($r[1], r));
-const $s = from_json(to_json(e));
-console.log($s[0] === 0 && eq($s[1], e));
-const $t = from_json("\"Hexagon\"");
-if ($t[0] === 1) {
+const $s = from_json(to_json(c));
+console.log($s[0] === 0 && eq($s[1], c));
+const $t = from_json(to_json(r));
+console.log($t[0] === 0 && eq($t[1], r));
+const $u = from_json(to_json(e));
+console.log($u[0] === 0 && eq($u[1], e));
+const $v = from_json("\"Hexagon\"");
+if ($v[0] === 1) {
 	console.log(true);
-	console.log($t[1]);
+	console.log($v[1]);
 }

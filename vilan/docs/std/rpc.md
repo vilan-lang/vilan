@@ -271,6 +271,58 @@ enum RpcError {
 Infrastructure failures only: an *application* "not found" belongs in the
 rpc's own return type (`Option<Task>`), not here.
 
+### The `POST {mount}rpc` leg's statuses
+
+A vilan client reads the ENVELOPE and has never read the status. The status is
+the contract for everything that is not a vilan client — curl, a `fetch` in a
+page, a proxy, a load balancer, a monitoring probe — and **the two never
+disagree**:
+
+| outcome | status |
+|---|---|
+| `Success(..)`, including an application `Err` arm | **200** |
+| `Failure(Decode(..))` | **400** |
+| `Failure(Unauthorized)` | **401** |
+| `Failure(Remote("unknown method: …"))` | **404** |
+| `Failure(Contract(..))` | **409** |
+| `Failure(Remote(..))` — a handler failed | **500** |
+| a `Service::factory` service on this leg | **501**, as an envelope |
+| `Failure(Unavailable)` | **503** |
+| a non-POST on `{mount}rpc` | **405**, `Allow: POST` |
+
+An application error is a **200**: `Result<Token, str>`'s `Err` arm is a value
+that crossed successfully, and a server answering 401 for "wrong password"
+would be claiming the CALL was unauthorized — a different fact, and the one
+`authorize` reports. The cost is worth stating: a dashboard reading statuses
+alone cannot see application errors, because they are not errors of the
+transport.
+
+The leg **requires** `Content-Type: application/json` or
+`application/octet-stream`, and answers 400 otherwise. That one check is the
+CSRF posture: a cross-site HTML form can produce only `text/plain`,
+`application/x-www-form-urlencoded` and `multipart/form-data`, so it is
+structurally unable to reach any `[service]` — whether or not the service's
+author thought about CSRF. `HttpTransport` sets the header; a hand-written
+caller must too. std does no CORS beyond this: `on_request` plus
+`Response::builder().set_header` is the whole mechanism, and an allowed-origin
+list is a decision std has no information for — the
+[services guide](../guide/services.md) carries the recipe.
+
+Every envelope carries one of those two media types whatever its status, and
+that is what `HttpTransport` reads to tell a reply from a stranger's document:
+an answer that is not an envelope is `Err(RpcError::Transport(..))` naming the
+status, not a `Decode` blaming the codec. A status cannot serve — the leg's 404
+for an unknown method and an app's 404 for an unclaimed path are the same
+number.
+
+A `Decode` on the SERVER's side of a call is what the generated route answers
+for a request it cannot read: an argument count the method does not declare
+(`expects 2 argument(s), got 3` — extra arguments are a disagreement, not
+something to drop), or an argument of the wrong type. A vilan client cannot
+provoke either, since both sides are generated from one surface and the
+contract hash refuses a client that disagrees; an arbitrary HTTP caller can,
+which is what the check is for.
+
 ## Connection state
 
 ```vilan,fragment
@@ -338,6 +390,38 @@ trait Transport {
 | `HttpTransport` | one POST per call | stateless calls, no mirrors, no handles |
 | `LocalTransport` | in-process | tests: client and service in one process; handles need a stamped connection |
 
+A `[service]` an HTTP client can hold gets a constructor for this leg:
+
+```vilan,fragment
+impl FooClient<HttpTransport> {
+	fun over_http(mount: str, codec: Codec): FooClient<HttpTransport>
+}
+```
+
+It takes the same `mount` string `connect` takes (`"/"`, `"/auth/"`) — the
+route is `{mount}rpc` — and it is SYNC and makes **no call**: over HTTP there
+is no connection, so there is no round trip to amortize, and an HTTP client is
+unversioned unless you call `verify()` yourself. There are no mirrors, no
+handles and no reverse direction, so it is generated only for a service that
+declares none: a service with an `[expose]`d field or a handle-returning
+method, or one declaring `client = H`, has no `over_http` and the call is
+refused by name.
+
+`[service(FooClient, http)]` says the same thing at the DECLARATION: the
+`http` marker generates nothing and moves no contract hash, and it refuses
+each of those three shapes at the field, the method or the attribute that
+declared it — in the attribute's own words, rather than as a missing
+`over_http` at a call site far away. It is opt-in, because which transports
+reach a service is a property of its mount and its methods; a service that
+wants both legs simply does not write it.
+
+A transport FAILING is `Err(reason)`, which `call` maps to
+`RpcError::Transport(..)`: an unreachable host, a DNS failure, a connection
+dropped while the body was still arriving. `HttpTransport` answers that for
+every rejection of the host `fetch`, so a call to a server that is not there is
+an arm of your `match` and not the end of the process. It does not retry —
+dialling again is `SocketTransport`'s job.
+
 Below `SocketTransport` sits `SocketDuplex` (the reconnect-surviving socket:
 pending-call registry, inbound dispatch, `on_reconnect` hooks) and the
 `DuplexTransport` machinery (`duplex_pair`, `bridge`, `connect_split` for
@@ -384,6 +468,7 @@ impl Service {
 	// the handshake gate and its limits
 	fun authorize(own self, check: async |Handshake| Result<Session, Reject>): Service
 	fun authorize_timeout(own self, millis: i32): Service   // 429 if the hook does not answer — std's limit, never the app's 503
+	fun authorize_request(own self, check: async |Request| Result<Session, Reject>): Service   // gates each POST {mount}rpc (A120 S4)
 	fun max_connections(own self, limit: i32): Service      // upgraded sockets on this mount only
 	fun handshake_rate(own self, attempts: i32, window_millis: f64): Service
 	fun handshake_timeout(own self, millis: i32): Service   // bounds the greeting, not idleness

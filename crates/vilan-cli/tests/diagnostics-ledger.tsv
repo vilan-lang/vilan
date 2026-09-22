@@ -573,3 +573,9 @@ row	flagship	key
 549	-	`external fun {name}` names no body: an external needs an `[extern(..)]` binding saying what the host calls it, or it is not external — give it a body. Without one, a call to it emits a name nothing in the program defines
 550	-	`{symbol}` is a host PROPERTY, not a function: the function form of `[extern]` emits a CALL, so this binding reaches the host as `{symbol}()` and fails there. Read it through a runtime helper (`std::dom`'s `__dom_active_element` and `__dom_window` are that shape), or, if the property hangs off a value the program holds rather than off a global, bind it with `[extern(get, "..")]` on a receiver
 551	-	`{}` is not a derivable trait: nothing declares a `{}` macro — not std, not this file, and nothing it imports. std derives {}; a derive of your own is a `macro fun {}` in this file or imported by name
+552	-	`guarded_async`
+553	-	`[service]` on `{name}` has an empty contract surface: it declares no `[rpc]` method, no `[expose]`d field and no `client = ..` handler, so the client it generates can call nothing and every call answers `unknown method` at runtime
+554	-	`response_header`
+555	-	an `http` service cannot name `client = {handler}`: the server calls a client back over the CONNECTION that client holds open, and the connectionless POST leg holds none
+556	-	an `http` service's field `{field}` is `[expose]`d, and a mirror is attached over a CONNECTION
+557	-	an `http` service's method `{method}` returns a signal handle (`{spelling}<..>`), and a handle's reply is a channel id minted in a CONNECTION's capability table

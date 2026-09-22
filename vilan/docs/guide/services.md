@@ -15,6 +15,13 @@ A **service** is that struct. Three attributes do the work:
 There are no REST endpoints, fetch calls, or JSON shapes to keep in
 sync by hand. The compiler knows both sides.
 
+The attribute reads the `[rpc]` methods off this module's inherent `impl`
+blocks, and `export impl` is one of them — `export` is visibility, not shape.
+A service that declares nothing at all — no `[rpc]` method, no `[expose]`d
+field, no `client = ..` handler — is refused: its client could call nothing,
+and because both generated sides would agree about that empty surface, even
+`verify()` would say they match.
+
 Here's a complete little server:
 
 ```vilan,norun
@@ -921,7 +928,9 @@ section is about.
 An authorized service answers **only** the WebSocket upgrade: the
 connectionless SSE and POST legs carry no handshake to authorize, so they
 answer `401` rather than standing open as the way around the gate — the
-rpc leg with a typed `RpcError::Unauthorized` envelope.
+rpc leg with a typed `RpcError::Unauthorized` envelope. The POST leg can be
+gated in its own vocabulary instead, with a second hook:
+[`authorize_request`](#gating-the-post-leg-authorize_request).
 
 ### A refused client is told, and stops
 
@@ -1339,6 +1348,114 @@ service route), and the connection lifecycle is the service's own knob —
 for the app's per-connection state (an app-written attach), and
 `Service::factory` is the same knob for CONSTRUCTION — without changing
 anything else about the chain.
+
+## Reaching a service over plain HTTP
+
+A service you can hold without a connection — no `[expose]`d field, no
+handle-returning method, no `client = ..` — gets a second constructor, for the
+connectionless `POST {mount}rpc` route the server already installs beside every
+mount:
+
+```vilan,fragment
+let auth = AuthClient::over_http("/auth/", json_codec());
+match auth.login(name.get(), password.get()) {
+	Ok(let outcome) => match outcome {
+		Ok(let token) => sign_in(token),
+		Err(let message) => show_error(message),
+	},
+	Err(let failure) => show_error(offline_text(failure)),
+}
+```
+
+This is the shape for a login door, and login is why it exists: the token a
+socket's `authorize` reads back is what login RETURNS, so login has to happen
+before there is a socket to authorize. The nesting is the point — the outer arm
+is "did the call happen", the inner is "what did the server decide".
+
+`over_http` takes the same `mount` string `connect` takes, and it makes no
+call: an HTTP client is unversioned unless you call `verify()`. There are no
+mirrors and no reverse direction over this leg, which is why the constructor
+exists only for a service that declares neither.
+
+A service that is MEANT to be an HTTP API can say so, and hear about a mistake
+where it made it:
+
+```vilan,fragment
+[service(AuthClient, http)]
+struct Auth {}
+```
+
+The `http` marker generates nothing. It refuses, at the member that declared
+it, each thing the connectionless leg cannot carry — a method returning a
+`SignalCell`/`KeyedCell` handle, an `[expose]`d field, a `client = ..`
+handler — so a handle added to the login door a month later is an error on
+that method, not a puzzle at the page that can no longer build its client.
+Leave it off a service that wants both legs.
+
+### Gating the POST leg: `authorize_request`
+
+A login door is open on purpose. The services after it are not, and a POST
+has no handshake for `authorize` to read — but it has headers, so it gets its
+own hook:
+
+```vilan,fragment
+Service::new(Billing {}.dispatcher().into_protocol(json_codec()))
+	.at("/billing/")
+	.authorize_request(|request: Request| match request.header("authorization") {
+		Some(let bearer) => match verify(bearer) {
+			Some(let subject) => Result::Ok(Session::of(subject)),
+			None => Result::Err(Reject::Forbidden),
+		},
+		None => Result::Err(Reject::Unauthorized),
+	})
+```
+
+It runs on every POST, after the leg's own method and content-type checks and
+before the frame is read. `Ok(session)` is stamped on that one request —
+`RpcRequest.session`, which a hand-written `Dispatcher` route reads — and
+`Err` answers the reject's status: `401`/`403` as an `Unauthorized` envelope
+and `503` as `Unavailable`, the arms a refused socket already gives a vilan
+client, and `429` as a bare status, which a client reads as `Transport(..)`.
+
+A second hook rather than `authorize` reading a request, because the
+credential lives somewhere else — a socket's in the `"token."` subprotocol, a
+POST's in a header or a cookie — and a `handshake.token()` that answered `None`
+for a request carrying a perfectly good `Authorization` header would be a trap.
+The two compose, and neither opens the other's leg:
+
+| installed | the socket upgrade | `POST {mount}rpc` |
+| --- | --- | --- |
+| neither | open | open |
+| `authorize` only | gated | `401` — no silent back door |
+| `authorize_request` only | open | gated per request |
+| both | gated | gated per request |
+
+The SSE pair is a connection, so it follows the upgrade's column. A
+`Service::factory` service stays `501` on the POST leg whatever the hook says:
+the instance, not the identity, is what a POST cannot supply.
+
+### CORS, and the credential
+
+std does no CORS. The mechanism is already on the builder, a service's mount is
+a string you wrote, and an allowed-origin list is a security decision std has
+no information for — so it is three lines of yours:
+
+```vilan,fragment
+.on_request(|request| match request.method() {
+	"OPTIONS" => Response::builder()
+		.code(204)
+		.set_header("Access-Control-Allow-Origin", "https://app.example.com")
+		.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		.build(),
+	_ => page(request),
+})
+```
+
+Two sentences are the whole posture. A credential in a HEADER is CSRF-immune by
+construction: a cross-site page cannot set one without a preflight, and the rpc
+leg requires `Content-Type: application/json`, which a cross-site HTML form
+cannot produce. A credential in a COOKIE needs `SameSite=Lax` *and* that
+content-type check — and std will not read a cookie for you.
 
 ## Traps
 

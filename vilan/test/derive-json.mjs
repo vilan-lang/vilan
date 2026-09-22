@@ -30,45 +30,62 @@ function from_json_value(value) {
 }
 function from_json_value2(value) {
 	let $k = null;
-	if (__json_kind(value) === "number") {
-		$k = [ 0, Number(value) ];
-	} else {
-		$k = [ 1, "expected a number" ];
+	if (__json_kind(value) !== "number") {
+		return [ 1, "expected a number" ];
 	}
-	return $k;
-}
-function from_json_value3(value) {
+	$k;
+	const $l = integer_lane_failure(value, true);
 	let $m = null;
-	if (__json_kind(value) === "boolean") {
-		$m = [ 0, Boolean(value) ];
+	if ($l[0] === 0) {
+		const reason = $l[1];
+		$m = [ 1, reason ];
 	} else {
-		$m = [ 1, "expected a boolean" ];
+		$m = [ 0, Number(value) ];
 	}
 	return $m;
+}
+function from_json_value3(value) {
+	let $o = null;
+	if (__json_kind(value) === "boolean") {
+		$o = [ 0, Boolean(value) ];
+	} else {
+		$o = [ 1, "expected a boolean" ];
+	}
+	return $o;
+}
+function integer_lane_failure(value, signed) {
+	const number = Number(value);
+	if (number !== Math.floor(number)) {
+		return [ 0, "expected a whole number, found " + number ];
+	}
+	if (!(signed) && number < 0.0) {
+		return [ 0, "expected a non-negative number, found " + number ];
+	}
+	return [ 1 ];
 }
 function to_json(self) {
 	return "{\"x\":" + JSON.stringify(self[0]) + "," + "\"y\":" + JSON.stringify(self[1]) + "}";
 }
 function from_json_value4(value) {
-	let $o = null;
+	let $q = null;
 	if (!(has_field(value, "x"))) {
 		return [ 1, "missing field x" ];
 	}
-	$o;
-	let $p = null;
+	$q;
+	let $r = null;
 	if (!(has_field(value, "y"))) {
 		return [ 1, "missing field y" ];
 	}
-	$p;
-	const $q = from_json_value2(value["x"]);
-	if ($q[0] === 1) {
-		return $q;
+	$r;
+	const $s = from_json_value2(value["x"]);
+	if ($s[0] === 1) {
+		return $s;
 	}
-	const $r = from_json_value2(value["y"]);
-	if ($r[0] === 1) {
-		return $r;
+	const $t = from_json_value2(value["y"]);
+	if ($t[0] === 1) {
+		return $t;
 	}
-	return [ 0, [ $q[1], $r[1] ] ];
+	return [ 0, [ $s[1], $t[1] ] ];
 }
 function to_json2(self) {
 	return "{\"name\":" + JSON.stringify(self[0]) + "," + "\"age\":" + JSON.stringify(self[1]) + "," + "\"active\":" + JSON.stringify(self[2]) + "," + "\"home\":" + to_json(self[3]) + "}";
@@ -105,19 +122,19 @@ function from_json_value5(value) {
 	if ($j[0] === 1) {
 		return $j;
 	}
-	const $l = from_json_value2(value["age"]);
-	if ($l[0] === 1) {
-		return $l;
-	}
-	const $n = from_json_value3(value["active"]);
+	const $n = from_json_value2(value["age"]);
 	if ($n[0] === 1) {
 		return $n;
 	}
-	const $s = from_json_value4(value["home"]);
-	if ($s[0] === 1) {
-		return $s;
+	const $p = from_json_value3(value["active"]);
+	if ($p[0] === 1) {
+		return $p;
 	}
-	return [ 0, [ $j[1], $l[1], $n[1], $s[1] ] ];
+	const $u = from_json_value4(value["home"]);
+	if ($u[0] === 1) {
+		return $u;
+	}
+	return [ 0, [ $j[1], $n[1], $p[1], $u[1] ] ];
 }
 function $a(self, err) {
 	const $b = self;
@@ -135,15 +152,15 @@ console.log(to_json(p));
 const person = [ "Ada \"A\"", 36, true, [ 3, 4 ] ];
 const text = to_json2(person);
 console.log(text);
-const $t = from_json(text);
-console.log($t[0] === 0 && to_json2($t[1]) === text && $t[1][3][1] === 4 && $t[1][0] === "Ada \"A\"");
-const $u = from_json("{\"name\":\"x\",\"age\":1,\"active\":true}");
-if ($u[0] === 1) {
+const $v = from_json(text);
+console.log($v[0] === 0 && to_json2($v[1]) === text && $v[1][3][1] === 4 && $v[1][0] === "Ada \"A\"");
+const $w = from_json("{\"name\":\"x\",\"age\":1,\"active\":true}");
+if ($w[0] === 1) {
 	console.log(true);
-	console.log($u[1]);
+	console.log($w[1]);
 }
-const $v = from_json("{\"name\":5,\"age\":1,\"active\":true,\"home\":{\"x\":0,\"y\":0}}");
-if ($v[0] === 1) {
+const $x = from_json("{\"name\":5,\"age\":1,\"active\":true,\"home\":{\"x\":0,\"y\":0}}");
+if ($x[0] === 1) {
 	console.log(true);
-	console.log($v[1]);
+	console.log($x[1]);
 }

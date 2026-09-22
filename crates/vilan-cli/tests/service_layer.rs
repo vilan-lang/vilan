@@ -705,8 +705,13 @@ fn the_builders_wire_matches_the_bytes_recorded_from_serve_service() {
         port,
         "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
     );
+    // The body is `{}` — an envelope with no `method` — so this is a DECODE
+    // failure, and A120 S3 gives a decode failure its own status (400). The
+    // recorded capture read 200, when every outcome the protocol decided was
+    // 200; the envelope below is the half that did not move, and it is the
+    // half a vilan client reads.
     assert!(
-        rpc_response.starts_with("HTTP/1.1 200 OK\r\n"),
+        rpc_response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
         "/rpc status line moved:\n{rpc_response}"
     );
     assert!(
@@ -825,10 +830,16 @@ fn the_segment_match_lets_rpcs_through_where_starts_with_swallowed_it() {
     // Sanity: the real route is untouched by the fix.
     let real = raw_http_closed(
         port,
-        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: 2\r\nConnection: close\r\n\r\n{}",
     );
+    // 400 because the body is `{}` (a decode failure, A120 S3's own status);
+    // what this pin is about is that the SERVICE answered rather than the
+    // fallback, which the rpc envelope is the evidence for.
     assert!(
-        real.starts_with("HTTP/1.1 200 OK\r\n") && real.contains("application/json"),
+        real.starts_with("HTTP/1.1 400 Bad Request\r\n")
+            && real.contains("application/json")
+            && real.contains("\"Failure\":{\"Decode\""),
         "the real /rpc route must still be answered by the service: {real}"
     );
 
@@ -1024,7 +1035,8 @@ fun main() {
 
     let refused = raw_http_closed(
         port,
-        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: 2\r\nConnection: close\r\n\r\n{}",
     );
     assert!(
         refused.starts_with("HTTP/1.1 501 "),
@@ -1034,14 +1046,27 @@ fun main() {
         refused.contains("Service::factory") && refused.contains("WebSocket"),
         "the refusal must name the cause and the way out: {refused}"
     );
+    // A120 S3: the 501 is an ENVELOPE now, so a vilan client meeting it reads
+    // a typed `Remote(..)` instead of `Decode("unrecognized reply envelope")`
+    // about a plain-text sentence — and the media type is what tells its
+    // transport that this IS a reply.
+    assert!(
+        refused.contains("application/json") && refused.contains("{\"Failure\":{\"Remote\":"),
+        "the 501 must be an rpc envelope: {refused}"
+    );
 
     let answered = raw_http_closed(
         port,
-        "POST /shared/rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: \
-         close\r\n\r\n{}",
+        "POST /shared/rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: 2\r\nConnection: close\r\n\r\n{}",
     );
+    // Same `{}` body, same decode failure, same 400 — the point being that
+    // this mount answered with an rpc envelope where the factory mount above
+    // refused with a 501 one.
     assert!(
-        answered.starts_with("HTTP/1.1 200 OK\r\n") && answered.contains("application/json"),
+        answered.starts_with("HTTP/1.1 400 Bad Request\r\n")
+            && answered.contains("application/json")
+            && answered.contains("\"Failure\":{\"Decode\""),
         "a stateless `Service::new` still answers its POST rpc leg: {answered}"
     );
 
@@ -1272,7 +1297,8 @@ fn an_unauthorized_handshake_is_refused_before_the_upgrade() {
     // gets its producer.
     let posted = raw_http_closed(
         port,
-        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: 2\r\nConnection: close\r\n\r\n{}",
     );
     assert!(
         posted.starts_with("HTTP/1.1 401 Unauthorized\r\n") && posted.contains("Unauthorized"),
@@ -5120,7 +5146,11 @@ fn a_service_over_a_std_without_rpc_is_refused_instead_of_falling_back_to_a_stal
     write(
         &dir,
         "src/main.vl",
-        "[service(EchoClient)]\nstruct Echo {\n\tseen: i32,\n}\n\nfun main() {}\n",
+        // The `[rpc]` method is not incidental: a `[service]` with an empty
+        // contract surface is refused in its own right (B375), and the control
+        // below has to reach the generator rather than that refusal.
+        "[service(EchoClient)]\nstruct Echo {\n\tseen: i32,\n}\n\nimpl Echo {\n\t[rpc]\n\t\
+         fun seen(self): i32 {\n\t\tself.seen\n\t}\n}\n\nfun main() {}\n",
     );
     let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .args(["check", dir.to_str().unwrap()])
@@ -5692,11 +5722,13 @@ fn a_malformed_rpc_argument_answers_a_decode_failure_rather_than_success() {
         .expect("the announced port is a number");
 
     for (body, expected) in [
-        // No argument at all: the read runs past the list into the request
-        // object. This is the row that answered `{"Success":NaN}`.
+        // No argument at all. This is the row that answered
+        // `{"Success":NaN}`; since B383 it is the ARITY gate that catches it,
+        // ahead of the reader, because the arity gate can name what is wrong
+        // in the caller's own vocabulary.
         (
             "{\"method\":\"add\",\"args\":[]}",
-            "{\"Failure\":{\"Decode\":\"expected a number, found an object\"}}",
+            "{\"Failure\":{\"Decode\":\"expects 1 argument(s), got 0\"}}",
         ),
         (
             "{\"method\":\"add\",\"args\":[\"x\"]}",
@@ -5730,14 +5762,1456 @@ fn a_malformed_rpc_argument_answers_a_decode_failure_rather_than_success() {
                 body.len()
             ),
         );
+        // A120 S3: a decode failure carries its own status (400) and the
+        // control row carries 200. The ENVELOPE is what a vilan client reads
+        // and it is the same envelope either way — the two never disagree,
+        // which is the property asserted here by checking both.
+        let status = if expected.contains("\"Failure\"") {
+            "HTTP/1.1 400 Bad Request\r\n"
+        } else {
+            "HTTP/1.1 200 OK\r\n"
+        };
         assert!(
-            response.starts_with("HTTP/1.1 200 OK\r\n"),
-            "`{body}` should still be answered with 200 (a decode failure is an \
-             envelope, not a status): {response}"
+            response.starts_with(status),
+            "`{body}` should be answered `{status}`: {response}"
         );
         assert!(
             response.ends_with(expected),
             "`{body}` should answer `{expected}`: {response}"
         );
     }
+}
+
+/// B375: `[service]` over an `export impl`.
+///
+/// The attribute's reflection walks the module's inherent impls for `[rpc]`
+/// methods, and it looked for a bare `Impl` node. `export impl Echo { .. }` is
+/// an `Impl` under an `Export` wrapper, so the walk found NOTHING: the
+/// dispatcher was generated with no routes, the contract surface was empty, and
+/// the hash was the empty-set hash `00001505`. Both generated sides agreed
+/// about that empty surface, so the service BUILT, a client CONNECTED, and
+/// every call answered `unknown method` at runtime with nothing said at compile
+/// time. `export` is visibility, not shape.
+///
+/// The pin asserts three things, and the third is what makes it a pin about the
+/// walker rather than about one program: the route answers, the hash is not the
+/// empty-set hash, and the hash is BYTE-IDENTICAL to the same surface written
+/// with a plain `impl`. A walker that read `export impl` as some other surface
+/// would pass the first two.
+#[test]
+fn a_service_over_an_export_impl_finds_its_methods() {
+    let dir = temp_project("export_impl_service");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::json::json_codec;
+import std::wire::Frame;
+
+[service(ExportedClient)]
+struct Exported {
+	seed: i32,
+}
+
+export impl Exported {
+	[rpc]
+	fun add(self, left: i32, right: i32): i32 {
+		left + right + self.seed
+	}
+}
+
+// The identical surface, written with a plain `impl` reached through the
+// module-level re-export: the control the hash is compared against, and the
+// exact pair the find was minimised to.
+export *;
+
+[service(PlainClient)]
+struct Plain {
+	seed: i32,
+}
+
+impl Plain {
+	[rpc]
+	fun add(self, left: i32, right: i32): i32 {
+		left + right + self.seed
+	}
+}
+
+async fun main() {
+	let exported = Exported { seed = 0 };
+	let protocol = exported.dispatcher().into_protocol(json_codec());
+	let body = "{\"method\":\"add\",\"args\":[1,2]}";
+	match protocol.respond(Frame::Text(body)) {
+		Frame::Text(let reply) => print(i"reply={reply}"),
+		Frame::Binary(let _bytes) => print("binary"),
+	}
+	let plain = Plain { seed = 0 };
+	print(i"exported_hash={exported.contract_hash()}");
+	print(i"plain_hash={plain.contract_hash()}");
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("reply={\"Success\":3}"),
+        "an `export impl`'s `[rpc]` method must route:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("00001505"),
+        "the contract hash must not be the empty-surface hash:\n{stdout}"
+    );
+    let hash_of = |label: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(label))
+            .unwrap_or_else(|| panic!("no `{label}` line:\n{stdout}"))
+            .trim()
+            .to_string()
+    };
+    assert_eq!(
+        hash_of("exported_hash="),
+        hash_of("plain_hash="),
+        "`export` is visibility, not shape: the two surfaces must hash the \
+         same:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B375's other half: a `[service]` whose contract surface is EMPTY is refused
+/// at the attribute.
+///
+/// The empty surface hashes to the empty-set hash on both generated sides, so
+/// the two AGREE — `verify()` answers `true` — and every call the client can
+/// make answers `unknown method` at runtime. Nothing said it at compile time,
+/// and it is never what anyone meant: the whole point of the attribute is the
+/// surface it generates.
+///
+/// Spanned on the STRUCT, because the struct is what carries the attribute, and
+/// naming the struct is what lets the sentence recommend an inherent `impl` for
+/// it.
+#[test]
+fn a_service_with_an_empty_contract_surface_is_refused_at_the_attribute() {
+    let dir = temp_project("empty_service_surface");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"[service(HollowClient)]
+struct Hollow {
+	seed: i32,
+}
+
+impl Hollow {
+	// Not `[rpc]`: an ordinary method contributes nothing to the surface.
+	fun helper(self): i32 {
+		self.seed
+	}
+}
+
+fun main() {}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["check", dir.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan check");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "a `[service]` with no surface must not compile:\n{report}"
+    );
+    for expected in [
+        "`[service]` on `Hollow` has an empty contract surface",
+        "no `[rpc]` method, no `[expose]`d field and no `client = ..` handler",
+        "Write an `[rpc]` method in an inherent `impl Hollow`",
+    ] {
+        assert!(
+            report.contains(expected),
+            "the refusal should contain `{expected}`:\n{report}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B383 (A120 S1's remaining half): the route checks the ARGUMENT LIST.
+///
+/// `open_request` opens the envelope's `args` list, records the arity it
+/// declares, and hands the deserializer to the route to pull from. Nothing read
+/// the arity and nothing closed the list, so a call carrying MORE arguments
+/// than the method takes decoded cleanly, the extras were dropped in silence,
+/// and the handler ran. `{"method":"add","args":[1,2,3]}` answered
+/// `{"Success":…}` on a one-argument method.
+///
+/// The gate is `rpc::decode_args_failed`, which does three things in order, and
+/// every generated route carries it — the NO-ARGUMENT routes included, which
+/// had no decode gate at all. Arity first, because it is the only one that can
+/// say what is wrong in the caller's vocabulary; then `end_list`, which is what
+/// makes a long list a failure rather than a tail nobody reads; then the
+/// reader's sticky error, which still catches everything about the argument
+/// VALUES.
+///
+/// vilan-to-vilan this cannot fire — both sides are generated from one surface
+/// and the contract hash refuses a client that disagrees. For an HTTP API the
+/// caller is arbitrary, which is the whole reason it exists.
+#[test]
+fn an_rpc_call_whose_argument_count_disagrees_with_the_method_is_a_decode_failure() {
+    const ARITY_SERVER: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::Service;
+
+[service(Client)]
+struct Counter {
+	seed: i32,
+}
+
+impl Counter {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.seed + by
+	}
+
+	[rpc]
+	fun ping(self): i32 {
+		self.seed
+	}
+}
+
+fun main() {
+	let counter = Counter { seed = 1 };
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(counter.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| print(i"ready {server.port()}"))
+		.build()
+		.start();
+}
+"#;
+    let (_server, port) = spawn_service_server("rpc_arity", ARITY_SERVER);
+
+    for (body, expected) in [
+        // TOO MANY: the row B383 is about. The extras were dropped silently.
+        (
+            "{\"method\":\"add\",\"args\":[2,3,4]}",
+            "{\"Failure\":{\"Decode\":\"expects 1 argument(s), got 3\"}}",
+        ),
+        // One too many is the same answer — nothing here is about magnitude.
+        (
+            "{\"method\":\"add\",\"args\":[2,3]}",
+            "{\"Failure\":{\"Decode\":\"expects 1 argument(s), got 2\"}}",
+        ),
+        // TOO FEW: caught before this by the reader running off the list into
+        // the enclosing object, with a sentence about kinds. The arity gate is
+        // ahead of it now, so the sentence is about the count.
+        (
+            "{\"method\":\"add\",\"args\":[]}",
+            "{\"Failure\":{\"Decode\":\"expects 1 argument(s), got 0\"}}",
+        ),
+        // A NO-ARGUMENT method is still a method an arbitrary caller can post
+        // arguments at, and its route had no decode gate whatsoever.
+        (
+            "{\"method\":\"ping\",\"args\":[9]}",
+            "{\"Failure\":{\"Decode\":\"expects 0 argument(s), got 1\"}}",
+        ),
+        // The VALUE gate is untouched: a right-sized list with a wrong-typed
+        // element still answers the reader's own sentence.
+        (
+            "{\"method\":\"add\",\"args\":[\"x\"]}",
+            "{\"Failure\":{\"Decode\":\"expected a number, found a string\"}}",
+        ),
+        // The controls, last: both methods still answer.
+        ("{\"method\":\"add\",\"args\":[2]}", "{\"Success\":3}"),
+        ("{\"method\":\"ping\",\"args\":[]}", "{\"Success\":1}"),
+    ] {
+        let response = raw_http_closed(
+            port,
+            &format!(
+                "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        // A120 S3: a decode failure carries its own status (400) and the
+        // control row carries 200. The ENVELOPE is what a vilan client reads
+        // and it is the same envelope either way — the two never disagree,
+        // which is the property asserted here by checking both.
+        let status = if expected.contains("\"Failure\"") {
+            "HTTP/1.1 400 Bad Request\r\n"
+        } else {
+            "HTTP/1.1 200 OK\r\n"
+        };
+        assert!(
+            response.starts_with(status),
+            "`{body}` should be answered `{status}`: {response}"
+        );
+        assert!(
+            response.ends_with(expected),
+            "`{body}` should answer `{expected}`: {response}"
+        );
+    }
+}
+
+/// A120 S2 (`transport-rpc.md` §9.7.4): `over_http` — the connectionless
+/// constructor.
+///
+/// The generated client already SPOKE the `POST {mount}rpc` leg: the transport
+/// is a type parameter, and every plain stub plus `verify()` and
+/// `contract_hash()` lives on the unconstrained impl, so a hand-written
+/// `AuthClient<HttpTransport> { transport = .., codec = .. }` worked on the
+/// shipped toolchain with no socket. What was missing was the constructor and
+/// the rule about which services get one. This is that constructor.
+///
+/// It takes the MOUNT, not the endpoint URL, so `connect("/auth/", codec)` and
+/// `over_http("/auth/", codec)` read the same and a service that moves mount
+/// moves one string on each side. It is SYNC and it makes NO CALL — over HTTP
+/// there is no connection, so "once per client value" is an arbitrary unit and
+/// a login form constructs one per mount; `verify()` is reachable for a caller
+/// who wants the check, which this asserts.
+///
+/// Four things are load-bearing here and each was measured in the paper: a
+/// `Result`-returning method round-trips BOTH arms (the outer arm is "did the
+/// call happen", the inner is "what did the server decide"); a plain method
+/// round-trips; an awaited `void` acks after its handler ran, over the POST
+/// leg; and `verify()` reaches `__contract`.
+#[test]
+fn a_service_client_reaches_the_post_leg_through_over_http() {
+    let dir = temp_project("over_http");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::Server;
+import std::rpc_server::Service;
+import std::wire::Wire;
+
+[derive(Wire)]
+struct AccountToken {
+	token: str,
+	user: str,
+}
+
+[service(AuthClient)]
+struct Auth {
+	seed: i32,
+}
+
+impl Auth {
+	[rpc]
+	fun login(self, user: str, password: str): Result<AccountToken, str> {
+		if password == "hunter2" {
+			Ok(AccountToken { token = "tok-ada", user })
+		} else {
+			Err("wrong password")
+		}
+	}
+
+	[rpc]
+	fun echo(self, value: i32): i32 {
+		value + self.seed
+	}
+
+	[rpc]
+	fun touch(self, tag: str) {
+		print(i"handler ran {tag}");
+	}
+}
+
+fun main() {
+	let auth = Auth { seed = 1 };
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(auth.dispatcher().into_protocol(json_codec())).at("/auth/"))
+		.on_start(|server| run_client(server.url()))
+		.build()
+		.start();
+}
+
+async fun run_client(base: str) {
+	// The MOUNT, exactly as `connect` takes it.
+	let client = AuthClient::over_http(base + "auth/", json_codec());
+	match client.login("ada", "hunter2") {
+		Ok(let outcome) => match outcome {
+			Ok(let token) => print(i"login {token.token} {token.user}"),
+			Err(let message) => print(i"login app error {message}"),
+		},
+		Err(let failure) => print(i"login failure {failure.to_json()}"),
+	}
+	match client.login("ada", "nope") {
+		Ok(let outcome) => match outcome {
+			Ok(let token) => print(i"login {token.token}"),
+			Err(let message) => print(i"login app error {message}"),
+		},
+		Err(let failure) => print(i"login failure {failure.to_json()}"),
+	}
+	match client.echo(40) {
+		Ok(let value) => print(i"echo {value}"),
+		Err(let failure) => print(i"echo failure {failure.to_json()}"),
+	}
+	match client.touch("via-stub") {
+		Ok(let _acked) => print("touch acked"),
+		Err(let failure) => print(i"touch failure {failure.to_json()}"),
+	}
+	match client.verify() {
+		Ok(let same) => print(i"verify {same}"),
+		Err(let failure) => print(i"verify failure {failure.to_json()}"),
+	}
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        "login tok-ada ada",
+        "login app error wrong password",
+        "echo 41",
+        "touch acked",
+        "verify true",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "`over_http` should have produced `{expected}`:\n{stdout}"
+        );
+    }
+    // The awaited `void` acks AFTER its handler ran, over the POST leg — the
+    // ordering is the claim, so the two lines are compared by position.
+    let handler = stdout
+        .find("handler ran via-stub")
+        .expect("the touch handler must have printed");
+    let acked = stdout.find("touch acked").expect("touch must have acked");
+    assert!(
+        handler < acked,
+        "an awaited void must ack after its handler ran:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The RULE `over_http` is emitted under (§9.7.5): the client struct has
+/// exactly its two base fields, and the service declares no `client = H`.
+///
+/// For an `[expose]`-bearing or handle-returning service the field list is
+/// already a total refusal — the mirror fields can only be filled by
+/// `connect`'s `__attach`, which over POST answers `unknown connection`. The
+/// `client = H` case is the one the field list does NOT catch, and it is the
+/// one that matters: `with_handlers` is `SocketTransport`-only and the server's
+/// `notify` on the connectionless leg finds no client channel, so a client that
+/// could be built would have a declared second direction that silently does
+/// nothing.
+///
+/// Three programs, one per shape, each refused by name at the call. The CONTROL
+/// is the test above: the same call on a plain service compiles and runs.
+#[test]
+fn over_http_is_not_generated_for_a_client_that_needs_a_connection() {
+    for (tag, source) in [
+        (
+            "expose",
+            r#"import std::reactive::{ Signal, SignalCell };
+import std::json::json_codec;
+
+[service(TallyClient)]
+struct Tally {
+	[expose] count: SignalCell<i32>,
+}
+
+impl Tally {
+	[rpc]
+	fun bump(self): i32 {
+		self.count.get()
+	}
+}
+
+fun main() {
+	let client = TallyClient::over_http("/", json_codec());
+}
+"#,
+        ),
+        (
+            "handle",
+            r#"import std::reactive::{ Signal, SignalCell };
+import std::json::json_codec;
+
+[service(WatchyClient)]
+struct Watchy {
+	seed: i32,
+}
+
+impl Watchy {
+	[rpc]
+	fun watch(self, id: str): SignalCell<i32> {
+		Signal::new(self.seed)
+	}
+}
+
+fun main() {
+	let client = WatchyClient::over_http("/", json_codec());
+}
+"#,
+        ),
+        (
+            "client_handler",
+            r#"import std::json::json_codec;
+
+[client_service]
+struct Peer {
+	seed: i32,
+}
+
+impl Peer {
+	[rpc]
+	fun ping(self, tag: str) {
+	}
+}
+
+[service(HubClient, client = Peer)]
+struct Hub {
+	seed: i32,
+}
+
+impl Hub {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.seed + by
+	}
+}
+
+fun main() {
+	let client = HubClient::over_http("/", json_codec());
+}
+"#,
+        ),
+    ] {
+        let dir = temp_project(&format!("over_http_refused_{tag}"));
+        write(
+            &dir,
+            "vilan.toml",
+            "[package]\nname = \"app\"\ntarget = \"node\"\n",
+        );
+        write(&dir, "src/main.vl", source);
+        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .args(["check", dir.to_str().unwrap()])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run vilan check");
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.status.success(),
+            "`over_http` must not exist on the `{tag}` client:\n{report}"
+        );
+        assert!(
+            report.contains("cannot find 'over_http'"),
+            "the `{tag}` client should be refused at the call by name:\n{report}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A120 S3 (`transport-rpc.md` §9.7.7): the STATUS table.
+///
+/// The leg answered 200 for everything the protocol decided, and the reason it
+/// survived is that `HttpTransport::call` never read `response.status()` — it
+/// read the body and handed it to the codec. So the statuses are the contract
+/// for everything that is NOT a vilan client (curl, a `fetch` in a page, a
+/// proxy, a load balancer, a monitoring probe), and moving them breaks no vilan
+/// client, which is what makes this non-breaking and what makes it worth doing.
+///
+/// **The rule: the ENVELOPE is the vilan client's contract, the STATUS is
+/// everyone else's, and the two never disagree.** Every row below asserts both
+/// halves, because the status alone would pass for a server that stopped
+/// answering and the envelope alone is what was already true.
+///
+/// The `Success` row carries an application `Err` arm on purpose (Q5, RULED
+/// NEVER): a value that crossed successfully is a 200 whatever the value says.
+/// A server answering 401 for "wrong password" would be claiming the CALL was
+/// unauthorized, which is a different fact and the one `authorize` reports.
+#[test]
+fn the_post_legs_status_says_what_the_envelope_says() {
+    const STATUS_SERVER: &str = r#"import std::io::print;
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::Service;
+
+[service(Client)]
+struct Door {
+	seed: i32,
+}
+
+impl Door {
+	[rpc]
+	fun login(self, password: str): Result<str, str> {
+		if password == "hunter2" {
+			Ok("tok-ada")
+		} else {
+			Err("wrong password")
+		}
+	}
+}
+
+fun main() {
+	let door = Door { seed = 1 };
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(door.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| print(i"ready {server.port()}"))
+		.build()
+		.start();
+}
+"#;
+    let (_server, port) = spawn_service_server("post_status", STATUS_SERVER);
+    let post = |body: &str| {
+        raw_http_closed(
+            port,
+            &format!(
+                "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    };
+
+    for (label, body, status, envelope) in [
+        (
+            "a call that happened",
+            "{\"method\":\"login\",\"args\":[\"hunter2\"]}",
+            "HTTP/1.1 200 OK\r\n",
+            "{\"Success\":{\"Ok\":\"tok-ada\"}}",
+        ),
+        (
+            "an APPLICATION error — still 200, because the value crossed",
+            "{\"method\":\"login\",\"args\":[\"nope\"]}",
+            "HTTP/1.1 200 OK\r\n",
+            "{\"Success\":{\"Err\":\"wrong password\"}}",
+        ),
+        (
+            "the caller's bytes were wrong",
+            "not json at all",
+            "HTTP/1.1 400 Bad Request\r\n",
+            "{\"Failure\":{\"Decode\":\"malformed JSON\"}}",
+        ),
+        (
+            "the method is the resource",
+            "{\"method\":\"nosuch\",\"args\":[]}",
+            "HTTP/1.1 404 Not Found\r\n",
+            "{\"Failure\":{\"Remote\":\"unknown method: nosuch\"}}",
+        ),
+    ] {
+        let response = post(body);
+        assert!(
+            response.starts_with(status),
+            "{label}: expected `{status}`, got:\n{response}"
+        );
+        assert!(
+            response.contains("Content-Type: application/json\r\n"),
+            "{label}: every envelope carries the rpc media type, whatever the \
+             status — it is what tells a transport this IS a reply:\n{response}"
+        );
+        assert!(
+            response.ends_with(envelope),
+            "{label}: the envelope must still read `{envelope}`:\n{response}"
+        );
+    }
+
+    // A non-POST on the rpc route. Measured before this: a GET was answered
+    // 200 with a `Decode` envelope, because nothing read `request.method()`.
+    let got = raw_http_closed(
+        port,
+        "GET /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        got.starts_with("HTTP/1.1 405 Method Not Allowed\r\n") && got.contains("Allow: POST\r\n"),
+        "a GET on the rpc route must be 405 with an `Allow`:\n{got}"
+    );
+
+    // §9.7.9: the content-type gate. `text/plain` is one of the three types a
+    // cross-site HTML form can produce, and it is what the host sends by
+    // default for a string body — so a form POST used to be indistinguishable
+    // on the wire from the shipped client. Refusing it is what makes a
+    // cross-site form structurally unable to reach ANY `[service]`.
+    let body = "{\"method\":\"login\",\"args\":[\"hunter2\"]}";
+    for (label, header) in [
+        ("no content type at all", ""),
+        (
+            "the host's default for a string body",
+            "Content-Type: text/plain;charset=UTF-8\r\n",
+        ),
+        (
+            "an HTML form's default",
+            "Content-Type: application/x-www-form-urlencoded\r\n",
+        ),
+    ] {
+        let response = raw_http_closed(
+            port,
+            &format!(
+                "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\n{header}Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "{label} must be refused 400:\n{response}"
+        );
+        assert!(
+            !response.contains("\"Success\""),
+            "{label} must not have reached the handler:\n{response}"
+        );
+    }
+    // The control: the same body with the media type set is answered.
+    let allowed = post(body);
+    assert!(
+        allowed.starts_with("HTTP/1.1 200 OK\r\n") && allowed.contains("\"Success\""),
+        "an `application/json` POST must still be answered:\n{allowed}"
+    );
+}
+
+/// A120 S3's client half: `HttpTransport` tells an rpc envelope from something
+/// else, and says `Transport(..)` rather than blaming the codec.
+///
+/// Measured before this, a stub pointed at four different answers: a 404 (the
+/// app's own fallback text) and a 501 (the factory refusal's plain text) both
+/// arrived as `Decode("unrecognized reply envelope")` — a sentence about the
+/// codec for an infrastructure failure the caller can act on, and the same
+/// sentence a proxy's HTML error page would produce. A 401 arrived correctly,
+/// and only because its body happened to be an envelope.
+///
+/// The discriminator is the reply's `Content-Type` and not its status, and the
+/// reason is in the table above: the leg's own statuses are ordinary ones — its
+/// 404 for an unknown METHOD and an app's 404 for an unclaimed path are the
+/// same number — so a status cannot tell an envelope from a stranger's
+/// document, where the media type can.
+#[test]
+fn an_answer_that_is_not_an_rpc_envelope_is_a_transport_failure() {
+    let dir = temp_project("not_an_envelope");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::Service;
+import std::rpc::RpcError;
+
+[service(Client)]
+struct Door {
+	seed: i32,
+}
+
+impl Door {
+	[rpc]
+	fun echo(self, value: i32): i32 {
+		value + self.seed
+	}
+}
+
+fun main() {
+	let door = Door { seed = 1 };
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(door.dispatcher().into_protocol(json_codec())).at("/api/"))
+		// Everything else is the app's, and it answers HTML — the shape a
+		// proxy or a load balancer answers with.
+		.on_request(|request| Response::builder()
+			.code(502)
+			.set_header("Content-Type", "text/html")
+			.body("<html>bad gateway</html>")
+			.build())
+		.on_start(|server| run_client(server.url()))
+		.build()
+		.start();
+}
+
+fun say(label: str, outcome: Result<i32, RpcError>) {
+	match outcome {
+		Ok(let value) => print(i"{label} ok {value}"),
+		Err(let error) => match error {
+			RpcError::Transport(let reason) => print(i"{label} transport {reason}"),
+			RpcError::Decode(let reason) => print(i"{label} decode {reason}"),
+			_ => print(i"{label} other {error.to_json()}"),
+		},
+	}
+}
+
+async fun run_client(base: str) {
+	// The real mount: an envelope, so the call answers.
+	say("real", Client::over_http(base + "api/", json_codec()).echo(41));
+	// A mount no service claims: the app's own HTML answer.
+	say("stray", Client::over_http(base + "nothing/", json_codec()).echo(41));
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("real ok 42"),
+        "the real mount must still answer:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "stray transport the server answered 502 with something \
+                         that is not an rpc reply"
+        ),
+        "a non-envelope answer must be a transport failure naming the status, \
+         not a decode failure blaming the codec:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A120 S4's server: one `Door` behind each of the four rows of §9.7.6's
+/// composition table, plus a hand-written route that answers the session it
+/// was stamped with, and a factory under `authorize_request`.
+///
+/// The hooks are the app's, so the pin's are the cheapest checks there are:
+/// a socket's `token.good` and a POST's `Bearer good` are `ada`; the other
+/// bearer spellings name the refusal they earn.
+const TWO_HOOK_SERVER: &str = r#"import std::io::print;
+import std::option::Option::{ self, Some, None };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Request, Response, Server };
+import std::rpc_server::{ Connection, Handshake, Reject, Service, Session };
+import std::rpc::{ Dispatcher, reply };
+
+[service(Client)]
+struct Door {
+	seed: i32,
+}
+
+impl Door {
+	[rpc]
+	fun echo(self, value: i32): i32 {
+		value + self.seed
+	}
+}
+
+fun by_token(handshake: Handshake): Result<Session, Reject> {
+	match handshake.token() {
+		Some(let token) => if token == "good" { Ok(Session::of("ada")) } else { Err(Reject::Forbidden) },
+		None => Err(Reject::Unauthorized),
+	}
+}
+
+fun by_bearer(request: Request): Result<Session, Reject> {
+	match request.header("authorization") {
+		Some(let value) => if value == "Bearer good" {
+			Ok(Session::of("ada").with_credential("good"))
+		} else if value == "Bearer busy" {
+			Err(Reject::Unavailable)
+		} else if value == "Bearer flood" {
+			Err(Reject::TooMany)
+		} else {
+			Err(Reject::Forbidden)
+		},
+		None => Err(Reject::Unauthorized),
+	}
+}
+
+fun door(): Service {
+	Service::new(Door { seed = 1 }.dispatcher().into_protocol(json_codec()))
+}
+
+fun main() {
+	let who = Dispatcher::new().on("whoami", |request| reply(request.session.identity));
+	Server::builder()
+		.port(0)
+		.with_service(door().at("/open/"))
+		.with_service(door().at("/sock/").authorize(|handshake| by_token(handshake)))
+		.with_service(door().at("/req/").authorize_request(|request| by_bearer(request)))
+		.with_service(door()
+			.at("/both/")
+			.authorize(|handshake| by_token(handshake))
+			.authorize_request(|request| by_bearer(request)))
+		.with_service(Service::new(who.into_protocol(json_codec()))
+			.at("/who/")
+			.authorize_request(|request| by_bearer(request)))
+		.with_service(Service::factory(|connection: Connection| Door { seed = 1 }, json_codec())
+			.at("/fac/")
+			.authorize_request(|request| by_bearer(request)))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| print(i"ready {server.port()}"))
+		.build()
+		.start();
+}
+"#;
+
+/// A120 S4: `authorize_request`, the second hook — §9.7.6's four-row table,
+/// per row, on both legs, with and without a credential.
+///
+/// The row that must NOT move is `authorize` alone: its POST leg answered 401
+/// before this and still does, a good bearer included, because a service that
+/// gated its sockets and said nothing about requests did not ask for its POST
+/// leg to open. That is the no-back-door property, and adding a second hook is
+/// exactly the change that could have weakened it.
+#[test]
+fn the_two_hooks_compose_per_the_table_and_neither_opens_the_others_leg() {
+    let (server, port) = spawn_service_server("two_hooks", TWO_HOOK_SERVER);
+    let post = |path: &str, credential: &str, body: &str| {
+        let authorization = if credential.is_empty() {
+            String::new()
+        } else {
+            format!("Authorization: Bearer {credential}\r\n")
+        };
+        raw_http_closed(
+            port,
+            &format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+                 {authorization}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    };
+    let echo = "{\"method\":\"echo\",\"args\":[41]}";
+    let answered = "{\"Success\":42}";
+    let refused = "{\"Failure\":\"Unauthorized\"}";
+
+    // (mount, upgrade with no credential, POST with no credential, POST with a good one)
+    for (mount, bare_upgrade, bare_post, good_post) in [
+        ("/open/", "101", "200", "200"),
+        ("/sock/", "401", "401", "401"),
+        ("/req/", "101", "401", "200"),
+        ("/both/", "401", "401", "200"),
+    ] {
+        let upgrade = raw_upgrade(port, mount, "");
+        assert!(
+            upgrade.starts_with(&format!("HTTP/1.1 {bare_upgrade} ")),
+            "{mount}: an upgrade with no credential must answer {bare_upgrade}:\n{upgrade}"
+        );
+        // The socket's own credential opens every row's socket: the request
+        // hook never gates the upgrade.
+        let admitted = raw_upgrade(
+            port,
+            mount,
+            "Sec-WebSocket-Protocol: vilan-rpc, token.good\r\n",
+        );
+        assert!(
+            admitted.starts_with("HTTP/1.1 101 "),
+            "{mount}: an upgrade carrying the socket's credential must be admitted:\n{admitted}"
+        );
+        for (label, credential, status) in [("no", "", bare_post), ("a good", "good", good_post)] {
+            let response = post(&format!("{mount}rpc"), credential, echo);
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{mount}: a POST with {label} credential must answer {status}:\n{response}"
+            );
+            let envelope = if status == "200" { answered } else { refused };
+            assert!(
+                response.contains("Content-Type: application/json\r\n")
+                    && response.ends_with(envelope),
+                "{mount}: a POST with {label} credential must carry `{envelope}` — the \
+                 envelope and the status say the same thing:\n{response}"
+            );
+        }
+    }
+
+    // The reject's own status, and the arm a refused SOCKET already reads:
+    // 403 is `Unauthorized` (one arm for both, as the socket client maps it),
+    // 503 is `Unavailable`, and 429 — a limit, not the app's judgement — is a
+    // bare status with no envelope, which a vilan client reads as a transport
+    // failure naming it.
+    for (credential, status, envelope) in [
+        ("nope", "403", Some(refused)),
+        ("busy", "503", Some("{\"Failure\":\"Unavailable\"}")),
+        ("flood", "429", None),
+    ] {
+        let response = post("/req/rpc", credential, echo);
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status} ")),
+            "`Bearer {credential}` must answer {status}:\n{response}"
+        );
+        match envelope {
+            Some(envelope) => assert!(
+                response.contains("Content-Type: application/json\r\n")
+                    && response.ends_with(envelope),
+                "`Bearer {credential}` must carry `{envelope}`:\n{response}"
+            ),
+            None => assert!(
+                !response.contains("Content-Type: application/json")
+                    && !response.contains("\"Failure\""),
+                "`Bearer {credential}` is a limit and must not be an envelope:\n{response}"
+            ),
+        }
+    }
+
+    // The session reaches the handler: on the `RpcRequest`, the only thing a
+    // connectionless request carries.
+    let whoami = "{\"method\":\"whoami\",\"args\":[]}";
+    let proved = post("/who/rpc", "good", whoami);
+    assert!(
+        proved.starts_with("HTTP/1.1 200 ") && proved.ends_with("{\"Success\":\"ada\"}"),
+        "the session `authorize_request` proved must be the request's:\n{proved}"
+    );
+
+    // A factory service stays 501 whatever the hook would say: the instance,
+    // not the identity, is what a POST cannot supply.
+    for credential in ["good", ""] {
+        let factory = post("/fac/rpc", credential, echo);
+        assert!(
+            factory.starts_with("HTTP/1.1 501 ") && factory.contains("Service::factory"),
+            "a factory service's POST leg must stay 501 under `authorize_request` \
+             (credential `{credential}`):\n{factory}"
+        );
+    }
+
+    drop(server);
+}
+
+/// A120 S4's client half: a vilan stub refused by `authorize_request` reads
+/// the SAME arm a refused socket reads — nothing new to match on. The pin runs
+/// the generated `over_http` client against the gate with no credential
+/// (`HttpTransport` carries none), so every call is refused, and each refusal
+/// must arrive typed.
+#[test]
+fn a_vilan_client_refused_per_request_reads_the_arm_a_refused_socket_reads() {
+    let dir = temp_project("request_refused_stub");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Request, Response, Server };
+import std::rpc_server::{ Reject, Service, Session };
+import std::rpc::RpcError;
+
+[service(Client)]
+struct Door {
+	seed: i32,
+}
+
+impl Door {
+	[rpc]
+	fun echo(self, value: i32): i32 {
+		value + self.seed
+	}
+}
+
+fun gated(reject: Reject): Service {
+	Service::new(Door { seed = 1 }.dispatcher().into_protocol(json_codec()))
+		.authorize_request(|request: Request| Result::Err(reject))
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(gated(Reject::Unauthorized).at("/who/"))
+		.with_service(gated(Reject::Unavailable).at("/busy/"))
+		.with_service(gated(Reject::TooMany).at("/flood/"))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run_client(server.url()))
+		.build()
+		.start();
+}
+
+fun say(label: str, outcome: Result<i32, RpcError>) {
+	match outcome {
+		Ok(let value) => print(i"{label} ok {value}"),
+		Err(let error) => match error {
+			RpcError::Transport(let reason) => print(i"{label} transport {reason}"),
+			_ => print(i"{label} {error.to_json()}"),
+		},
+	}
+}
+
+async fun run_client(base: str) {
+	say("who", Client::over_http(base + "who/", json_codec()).echo(41));
+	say("busy", Client::over_http(base + "busy/", json_codec()).echo(41));
+	say("flood", Client::over_http(base + "flood/", json_codec()).echo(41));
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        "who \"Unauthorized\"",
+        "busy \"Unavailable\"",
+        "flood transport the server answered 429 with something that is not an rpc reply",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "expected `{expected}` in:\n{stdout}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A120 S5 (`transport-rpc.md` §9.7.5, Q1 RULED: an opt-in MARKER): what
+/// `[service(.., http)]` refuses, each at the member that declared it.
+///
+/// Nothing here is needed for correctness — the generated client's field list
+/// already refuses the first three shapes and `over_http` is simply absent for
+/// the fourth (`over_http_is_not_generated_for_a_client_that_needs_a_connection`
+/// above is that half). What the marker buys is WHERE the author hears it: at
+/// the field, the method or the attribute, instead of at a call site that says
+/// `cannot find 'over_http'` about a client the author never wrote. So each row
+/// asserts the sentence AND its location, and the program calls `over_http`
+/// so that a marker which refused nothing would fail on the far-away message
+/// instead — the thing each row must NOT say.
+#[test]
+fn the_http_marker_refuses_what_the_post_leg_cannot_carry_at_the_member_that_declared_it() {
+    for (tag, source, head, location) in [
+        (
+            "expose",
+            r#"import std::reactive::{ Signal, SignalCell };
+import std::json::json_codec;
+
+[service(TallyClient, http)]
+struct Tally {
+	[expose] count: SignalCell<i32>,
+}
+
+impl Tally {
+	[rpc]
+	fun bump(self): i32 {
+		self.count.get()
+	}
+}
+
+fun main() {
+	let client = TallyClient::over_http("/", json_codec());
+}
+"#,
+            "an `http` service's field `count` is `[expose]`d",
+            "main.vl:6:11",
+        ),
+        (
+            "handle",
+            r#"import std::reactive::{ Signal, SignalCell };
+import std::json::json_codec;
+
+[service(WatchyClient, http)]
+struct Watchy {
+	seed: i32,
+}
+
+impl Watchy {
+	[rpc]
+	fun watch(self, id: str): SignalCell<i32> {
+		Signal::new(self.seed)
+	}
+}
+
+fun main() {
+	let client = WatchyClient::over_http("/", json_codec());
+}
+"#,
+            "an `http` service's method `watch` returns a signal handle (`SignalCell<..>`)",
+            "main.vl:11:6",
+        ),
+        (
+            "keyed_handle",
+            r#"import std::reactive::KeyedCell;
+import std::wire::Keyed;
+import std::json::json_codec;
+
+[derive(Wire)]
+struct Row {
+	id: str,
+	label: str,
+}
+
+impl Row with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+[service(RowsClient, http)]
+struct Rows {
+	seed: i32,
+}
+
+export impl Rows {
+	[rpc]
+	fun rows(self): KeyedCell<str, Row> {
+		KeyedCell::new([])
+	}
+}
+
+fun main() {
+	let client = RowsClient::over_http("/", json_codec());
+}
+"#,
+            "an `http` service's method `rows` returns a signal handle (`KeyedCell<..>`)",
+            "main.vl:24:6",
+        ),
+        (
+            "client_handler",
+            r#"import std::json::json_codec;
+
+[client_service]
+struct Peer {
+	seed: i32,
+}
+
+impl Peer {
+	[rpc]
+	fun ping(self, tag: str) {
+	}
+}
+
+[service(HubClient, http, client = Peer)]
+struct Hub {
+	seed: i32,
+}
+
+impl Hub {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.seed + by
+	}
+}
+
+fun main() {
+	let client = HubClient::over_http("/", json_codec());
+}
+"#,
+            "an `http` service cannot name `client = Peer`",
+            "main.vl:14:1",
+        ),
+    ] {
+        let dir = temp_project(&format!("http_marker_{tag}"));
+        write(
+            &dir,
+            "vilan.toml",
+            "[package]\nname = \"app\"\ntarget = \"node\"\n",
+        );
+        write(&dir, "src/main.vl", source);
+        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .args(["check", dir.to_str().unwrap()])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run vilan check");
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.status.success(),
+            "the `{tag}` service must be refused under `http`:\n{report}"
+        );
+        assert!(
+            report.contains(head),
+            "the `{tag}` row must be refused in the marker's words:\n{report}"
+        );
+        assert!(
+            report.contains(location),
+            "the `{tag}` refusal must be spanned on the member at {location}:\n{report}"
+        );
+        assert!(
+            !report.contains("cannot find 'over_http'"),
+            "the `{tag}` row must be answered at the member, not at the call:\n{report}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A120 S5's other half: the marker GENERATES nothing. A service that carries
+/// it hashes exactly as the same surface without it (so marking a shipped
+/// service is invisible to every client already talking to it), `http` is
+/// never read as a client NAME (`[service(http)]` keeps `<Struct>Client`), and
+/// the formatter prints the marker back rather than dropping it — a formatter
+/// that dropped it would silently delete the author's refusals.
+#[test]
+fn the_http_marker_generates_nothing_moves_no_hash_and_survives_the_formatter() {
+    let dir = temp_project("http_marker_inert");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::json::json_codec;
+
+[service(MarkedClient, http)]
+struct Marked {
+	seed: i32,
+}
+
+impl Marked {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.seed + by
+	}
+}
+
+[service(UnmarkedClient)]
+struct Unmarked {
+	seed: i32,
+}
+
+impl Unmarked {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.seed + by
+	}
+}
+
+[service(http)]
+struct Door {
+	seed: i32,
+}
+
+impl Door {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.seed + by
+	}
+}
+
+fun main() {
+	let marked = Marked { seed = 0 };
+	let unmarked = Unmarked { seed = 0 };
+	let client = MarkedClient::over_http("/", json_codec());
+	let door = DoorClient::over_http("/", json_codec());
+	print(i"marked={marked.contract_hash()}");
+	print(i"unmarked={unmarked.contract_hash()}");
+	print(i"client={client.contract_hash()}");
+	print(i"door={door.contract_hash()}");
+}
+"#,
+    );
+    let formatted = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["fmt", "--check", dir.join("src").to_str().unwrap()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan fmt --check");
+    assert!(
+        formatted.status.success(),
+        "the formatter must print `http` back where it was written:\n{}{}",
+        String::from_utf8_lossy(&formatted.stdout),
+        String::from_utf8_lossy(&formatted.stderr)
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    let hash_of = |label: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(label))
+            .unwrap_or_else(|| panic!("no `{label}` line:\n{stdout}"))
+            .trim()
+            .to_string()
+    };
+    let unmarked = hash_of("unmarked=");
+    for label in ["marked=", "client=", "door="] {
+        assert_eq!(
+            hash_of(label),
+            unmarked,
+            "`{label}` must hash as the unmarked surface — the marker generates nothing:\n{stdout}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B375's other walk. `gather_rpc_methods` learned to read through `export
+/// impl`, but the attribute's method REFUSALS (`service_method_refusals`:
+/// `mut self`, `async` beside `&mut self`, a `__` parameter, a generated
+/// member's name) walked only the bare `Impl` node — so writing `export` on the
+/// block dodged every one of them, and a `mut self` write was lost in silence
+/// again, the very third state B272 refused. Each refusal must fire through
+/// `export impl` exactly as it does through a plain one.
+#[test]
+fn the_service_method_refusals_read_through_export_impl() {
+    let dir = temp_project("export_impl_refusals");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"[service(DoorClient)]
+struct Door {
+	seed: i32,
+}
+
+export impl Door {
+	[rpc]
+	fun bump(mut self): i32 {
+		self.seed = self.seed + 1;
+		self.seed
+	}
+
+	[rpc]
+	fun tag(self, __request: str): str {
+		__request
+	}
+
+	[rpc]
+	fun verify(self): bool {
+		true
+	}
+}
+
+fun main() {
+}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["check", dir.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan check");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "an `export impl` must not dodge the service's method refusals:\n{report}"
+    );
+    for head in [
+        "`[rpc]` method `bump` takes `mut self`",
+        "parameter `__request` of `[rpc]` method `tag` starts with `__`",
+        "`[rpc]` method `verify` takes a name the `[service]` expansion generates",
+    ] {
+        assert!(
+            report.contains(head),
+            "`{head}` must be refused through `export impl`:\n{report}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

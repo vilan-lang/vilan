@@ -12,6 +12,7 @@ async, so callers implicitly await them:
 fun get(url: str): Request
 fun post(url: str, body: str): Request
 fun post_bytes(url: str, body: Bytes): Response   // one-shot binary POST
+fun post_bytes_typed(url: str, body: Bytes, media_type: str): Response
 
 impl Request {
 	fun header(own self, name: str, value: str): Request   // chainable
@@ -20,10 +21,16 @@ impl Request {
 
 impl Response {
 	fun status(self): i32
+	fun header(self, name: str): Option<str>   // case-insensitive
 	fun text(self): str        // async
 	fun bytes(self): Bytes     // async (whole body)
 }
 ```
+
+`post_bytes` sends no `Content-Type` (the host's default for a byte body is
+none); `post_bytes_typed` is the same call with one. `Response::header` reads
+one header back — a header present with an empty value reads `None`, which is
+the same fact to every caller.
 
 ```vilan,norun
 import std::fetch;

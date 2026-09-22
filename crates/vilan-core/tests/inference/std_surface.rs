@@ -6424,3 +6424,246 @@ fn the_json_reader_refuses_a_list_longer_than_the_reads_at_its_close() {
         "refused:a list had 1 element(s) left unread\n",
     );
 }
+
+// --- B373: the scalar `FromJson` impls take the integer lanes' value check ---
+//
+// 2321790e gave the typed READER a whole-number rule and a non-negative rule
+// (`JsonReader::expect_integer`), and the scalar `from_json`/`from_json_value`
+// entry points went on parsing the document and handing the number through:
+// `i32::from_json("1.5")` answered `Ok(1.5)` — a value typed `i32` that is not
+// an integer — and `u32::from_json("-1")` answered `Ok(-1)`. One lane read two
+// ways, which is the shape of every hole in this file's history; the two now
+// share one predicate (`integer_lane_failure`).
+//
+// The derives ride on this: a `[derive(Json)]` field of type `i32` decodes
+// through `i32::from_json_value`, so a struct field is gated by the same rule.
+
+/// A fraction where an `i32` is asked for.
+#[test]
+fn b373_the_scalar_i32_from_json_refuses_a_fraction() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::FromJson;
+        fun main() {
+            match i32::from_json("1.5") {
+                Ok(let value) => print(i"read:{value}"),
+                Err(let reason) => print(i"refused:{reason}"),
+            }
+        }
+        "#,
+        "refused:expected a whole number, found 1.5\n",
+    );
+}
+
+/// A negative where a `u32` is asked for.
+#[test]
+fn b373_the_scalar_u32_from_json_refuses_a_negative() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::FromJson;
+        fun main() {
+            match u32::from_json("-1") {
+                Ok(let value) => print(i"read:{value}"),
+                Err(let reason) => print(i"refused:{reason}"),
+            }
+        }
+        "#,
+        "refused:expected a non-negative number, found -1\n",
+    );
+}
+
+/// The kind gate that was already there still fires, and still says what it
+/// said: the lane check is an addition, not a replacement.
+#[test]
+fn b373_the_scalar_i32_from_json_still_refuses_a_string_by_kind() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::FromJson;
+        fun main() {
+            match i32::from_json("\"x\"") {
+                Ok(let value) => print(i"read:{value}"),
+                Err(let reason) => print(i"refused:{reason}"),
+            }
+        }
+        "#,
+        "refused:expected a number\n",
+    );
+}
+
+/// A DERIVED type's field takes the same rule, because the derive decodes each
+/// field through its type's `from_json_value` — which is the reason this is
+/// worth closing rather than a curiosity about a scalar entry point.
+#[test]
+fn b373_a_derived_json_field_refuses_a_fraction_in_an_integer_lane() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::{ FromJson, Json };
+        [derive(Json)]
+        struct Row {
+            count: i32,
+        }
+        fun main() {
+            match Row::from_json("{\"count\":1.5}") {
+                Ok(let row) => print(i"read:{row.count}"),
+                Err(let reason) => print(i"refused:{reason}"),
+            }
+        }
+        "#,
+        "refused:expected a whole number, found 1.5\n",
+    );
+}
+
+/// The controls, and they come last so a passing run proves the lanes still
+/// READ rather than that they stopped: a whole number, a negative one in the
+/// signed lane, and a fraction in the float lane, which has no such rule.
+#[test]
+fn b373_the_scalar_lanes_still_read_what_they_are_for() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::FromJson;
+        fun main() {
+            print(i"i32:{i32::from_json(\"42\").unwrap_or(0)}");
+            print(i"i32:{i32::from_json(\"-7\").unwrap_or(0)}");
+            print(i"u32:{u32::from_json(\"9\").unwrap_or(0u32)}");
+            print(i"f64:{f64::from_json(\"1.5\").unwrap_or(0.0)}");
+        }
+        "#,
+        "i32:42\ni32:-7\nu32:9\nf64:1.5\n",
+    );
+}
+
+// --- N117: the BINARY reader's kind-mismatch audit ---------------------------
+//
+// 2321790e closed the class on the JSON reader — a typed read that never
+// poisoned on the wrong kind or a short list. The binary codec is the other
+// codec, and the audit is the same one. Most of its shapes were already held:
+// the format is schema-ORDERED, so there is no kind on the wire to mismatch,
+// `expect(count)` refuses a read past the buffer, `read_length` refuses a
+// prefix longer than the frame (which is what bounds a hostile list COUNT — a
+// list cannot be read past its declared count, because the count is what the
+// generated rebuild loops on), and an unknown variant tag is poisoned by the
+// derive's own fallback arm, shared with JSON.
+//
+// Three were not, and each is a byte the writer never emits being read as
+// something the schema says is there: an `Option` marker that is neither 0 nor
+// 1 (any non-zero read as "present", so the value was taken one byte on — a
+// shifted read of whatever followed), a `bool` byte that is neither (read as
+// `true`), and a frame LONGER than the value it declares (a prefix read as the
+// whole, so a caller got a value that was never sent). Each answers a reason
+// naming both sides, as the JSON reader's do.
+
+/// The fixture: a two-field Wire type whose bytes are `[marker][i32][bool]`,
+/// with one byte of the encoding replaced. `at` is an index into the frame.
+fn binary_reader_program(mutation: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+        import std::binary::{{ decode_binary, encode_binary }};
+        import std::bytes::Bytes;
+        [derive(Wire)]
+        struct Flagged {{
+            tag: Option<i32>,
+            on: bool,
+        }}
+        fun show(bytes: Bytes): str {{
+            let back: Result<Flagged, str> = decode_binary(bytes);
+            match back {{
+                Ok(let value) => i"read:{{value.tag.is_some()}},{{value.on}}",
+                Err(let reason) => i"refused:{{reason}}",
+            }}
+        }}
+        fun with_byte(bytes: Bytes, at: i32, value: i32): Bytes {{
+            let copy = Bytes::alloc(bytes.len());
+            copy.copy_into(bytes, 0);
+            copy.set(at, value);
+            copy
+        }}
+        fun main() {{
+            let good = encode_binary(Flagged {{ tag = Some(7), on = true }});
+            {mutation}
+        }}
+        "#
+    )
+}
+
+/// The control, first: a well-formed frame still round-trips.
+#[test]
+fn n117_the_binary_reader_still_reads_a_well_formed_frame() {
+    assert_compiles_and_runs(
+        &binary_reader_program("print(show(good));"),
+        "read:true,true\n",
+    );
+}
+
+/// An `Option` marker byte that is neither 0 nor 1.
+#[test]
+fn n117_the_binary_reader_refuses_an_option_marker_that_is_neither_zero_nor_one() {
+    assert_compiles_and_runs(
+        &binary_reader_program("print(show(with_byte(good, 0, 7)));"),
+        "refused:expected an Option marker (0 or 1), found 7\n",
+    );
+}
+
+/// A `bool` byte that is neither 0 nor 1 — the last byte of this encoding.
+#[test]
+fn n117_the_binary_reader_refuses_a_boolean_byte_that_is_neither_zero_nor_one() {
+    assert_compiles_and_runs(
+        &binary_reader_program("print(show(with_byte(good, good.len() - 1, 5)));"),
+        "refused:expected a boolean (0 or 1), found 5\n",
+    );
+}
+
+/// A frame LONGER than the value it declares: the binary twin of the JSON
+/// reader's unread-element check.
+#[test]
+fn n117_the_binary_reader_refuses_a_frame_with_bytes_left_unread() {
+    assert_compiles_and_runs(
+        &binary_reader_program(
+            "let longer = Bytes::alloc(good.len() + 2);\n\
+             longer.copy_into(good, 0);\n\
+             print(show(longer));",
+        ),
+        "refused:frame has 2 byte(s) left unread\n",
+    );
+}
+
+/// And the shape that was already held, pinned so the audit's own claim is
+/// checked rather than asserted: a truncated frame is a decode failure.
+#[test]
+fn n117_the_binary_reader_refuses_a_truncated_frame() {
+    assert_compiles_and_runs(
+        &binary_reader_program("print(show(good.slice(0, good.len() - 1)));"),
+        "refused:unexpected end of frame\n",
+    );
+}
+
+/// A string whose length prefix claims more than the frame holds — the other
+/// shape the audit names, over a type whose encoding is a length-prefixed
+/// string. The prefix is the first four bytes, little-endian.
+#[test]
+fn n117_the_binary_reader_refuses_a_string_length_past_the_frame() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::binary::{ decode_binary, encode_binary };
+        import std::bytes::Bytes;
+        fun main() {
+            let good = encode_binary("ada");
+            let copy = Bytes::alloc(good.len());
+            copy.copy_into(good, 0);
+            copy.set(0, 200);
+            let back: Result<str, str> = decode_binary(copy);
+            match back {
+                Ok(let value) => print(i"read:{value}"),
+                Err(let reason) => print(i"refused:{reason}"),
+            }
+        }
+        "#,
+        "refused:length prefix exceeds frame\n",
+    );
+}

@@ -1694,6 +1694,13 @@ impl<'a> Interpreter<'a> {
             // outside what a macro may evaluate. Named here so the answer is
             // this sentence rather than "unknown host call".
             "__with_finally_async" => Err(Failure::unsupported("`with_finally_async`")),
+            // `__guarded_async` (B374) has no native form either, and for the
+            // same reason: it guards a body that SUSPENDS, and the expansion
+            // environment has no suspension at all.
+            "__guarded_async" => Err(Failure::unsupported("`guarded_async`")),
+            // A host `fetch` Response cannot exist in the expansion
+            // environment — there is no `fetch` here to have made one.
+            "__response_header" => Err(Failure::unsupported("`response_header`")),
             // proposal/lazy.md §5's memo cell and its forcing helper, mirroring
             // `helper_source`'s JS exactly — the equivalence gate the paper
             // names ("the helper needs its interpreter arm in the same commit").

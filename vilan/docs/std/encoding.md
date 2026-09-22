@@ -43,6 +43,14 @@ The two decode methods differ in what they take, not in what they answer:
 is the one to call when a value is nested inside another decode, and the
 one to write when implementing the trait by hand.
 
+The scalar lanes check the VALUE and not only the JSON kind, and it is the
+same rule the codec reader applies: an integer lane wants a whole number
+(`i32::from_json("1.5")` is `Err`), and an unsigned one wants a
+non-negative one (`u32::from_json("-1")` is `Err`). A derived type's field
+decodes through its own type's `from_json_value`, so a struct field gets
+the rule too. The magnitude is deliberately not checked: `i32`/`u32` are
+the runtime's numeric lanes rather than hardware widths.
+
 ```vilan
 import std::json::{ Json, FromJson, JsonValue, parse_json_value };
 import std::result::Result::{ self, Ok, Err };
@@ -379,6 +387,15 @@ Its writers take `&mut self` and keep their state in plain fields, like
 
 Same model as JSON, compact layout. `i53` values ride as f64 bit patterns,
 exact to 2^53.
+
+**The reader validates too**, and the format is schema-ORDERED, so what it
+validates is the bytes rather than a kind: a read past the buffer, a length
+prefix claiming more than the frame holds, an `Option` marker or a `bool` byte
+that is neither `0` nor `1`, and a frame LONGER than the value it declares —
+bytes left over are bytes the two sides disagree about, and reading a prefix as
+the whole is how a caller gets a value that was never sent. Each is a sticky
+failure naming what was expected and what was found, exactly as the JSON
+reader's are.
 
 ## Base64 (`std::base64`)
 

@@ -19,7 +19,7 @@
 
 import pkg::bytes::{ ByteBuffer, Bytes, bytes_of_buffer, new_text_decoder };
 import pkg::compare::PartialEq;
-import pkg::fetch::{ get, post, post_bytes };
+import pkg::fetch::{ Response as HostResponse, get, post, post_bytes, post_bytes_typed };
 import pkg::hash::{ Hash, Hashable };
 import pkg::io::panic;
 import pkg::json::JsonValue;
@@ -97,24 +97,102 @@ export struct HttpTransport {
 	url: str,
 }
 
+/// The runtime's `try`/`catch` for a body that SUSPENDS — `std::reactive`'s
+/// `guarded` is the sync twin, and it cannot serve here (tracker B374): a
+/// rejected host promise is not a throw on the calling stack, so a sync guard
+/// around a `fetch` catches nothing. `Ok(value)` when the body settled;
+/// `Err(reason)` carrying the host's own diagnosis — and the `cause` it hangs
+/// off it, which is where an unreachable host's `connect ECONNREFUSED ..`
+/// lives — when it rejected. The glue is `__guarded_async` in
+/// `transformer.rs`, the shape `std::db`'s `exec_guarded` already uses at this
+/// boundary.
+[extern("__guarded_async")]
+async external fun guarded_async<T>(body: async || T): Result<T, str>;
+
 export impl HttpTransport with Transport {
 	/// The reply is read in the request's format — both sides run one codec
-	/// (deployment-wide, Q6), so the kinds always match. (An unreachable host
-	/// still surfaces as the host fetch's rejection — HTTP-level robustness is
-	/// recorded beyond-v1; the reconnecting transport is `SocketTransport`.)
+	/// (deployment-wide, Q6), so the kinds always match.
+	///
+	/// An unreachable host, a DNS failure, a connection dropped mid-body: each
+	/// is a rejection of the host `fetch`, and each answers `Err(reason)` —
+	/// `Transport`'s own contract, which this used to break by letting the
+	/// rejection leave as an UNHANDLED one and take the process down with it
+	/// (tracker B374). The caller's `match` runs; `call` maps the `Err` to
+	/// `RpcError::Transport`. The retrying transport is still `SocketTransport`
+	/// — nothing here dials twice.
 	fun call(self, request: Frame): Task<Result<Frame, str>> {
 		async {
+			// The guard wraps the READ as well as the POST: a response whose
+			// body is still arriving when the connection drops rejects at
+			// `text()`/`bytes()`, not at `send()`.
 			match request {
 				Frame::Text(let body) => {
-					let response = post(self.url, body).send();
-					Ok(Frame::Text(response.text()))
+					match guarded_async(|| read_text_reply(self.url, body)) {
+						Ok(let reply) => reply,
+						Err(let reason) => Err(reason),
+					}
 				},
 				Frame::Binary(let body) => {
-					let response = post_bytes(self.url, body);
-					Ok(Frame::Binary(response.bytes()))
+					match guarded_async(|| read_binary_reply(self.url, body)) {
+						Ok(let reply) => reply,
+						Err(let reason) => Err(reason),
+					}
 				},
 			}
 		}
+	}
+}
+
+/// The media types the rpc leg answers an ENVELOPE in — and the ones it
+/// requires on a request (`transport-rpc.md` §9.7.9). Both directions name the
+/// same two, because both sides of this leg speak envelopes and nothing else.
+export let RPC_TEXT_MEDIA_TYPE: str = "application/json";
+export let RPC_BINARY_MEDIA_TYPE: str = "application/octet-stream";
+
+/// Whether a reply is an rpc ENVELOPE, read off its `Content-Type`
+/// (`transport-rpc.md` §9.7.7): the leg stamps one of the two media types on
+/// every envelope it answers, whatever the status, and nothing else that can
+/// answer this URL does.
+///
+/// This is why the check is the content type and not the status. The statuses
+/// the leg answers are ordinary ones — an app's own 404 for a path no service
+/// claims and the leg's 404 for an unknown METHOD are the same number — so a
+/// status cannot tell an envelope from a proxy's HTML error page, and reading
+/// a proxy's page through the codec blamed the codec (`Decode("unrecognized
+/// reply envelope")`) for an infrastructure failure the caller can do
+/// something about.
+fun reply_is_an_envelope(response: HostResponse): bool {
+	match response.header("content-type") {
+		Some(let media) => {
+			let lowered = media.to_lowercase_ascii();
+			lowered.starts_with(RPC_TEXT_MEDIA_TYPE) || lowered.starts_with(RPC_BINARY_MEDIA_TYPE)
+		},
+		None => false,
+	}
+}
+
+/// What a non-envelope answer says, naming the status rather than the bytes:
+/// the bytes are somebody else's document and quoting them here would put an
+/// HTML page in an error message.
+fun not_an_envelope(response: HostResponse): str {
+	i"the server answered {response.status()} with something that is not an rpc reply"
+}
+
+fun read_text_reply(url: str, body: str): Result<Frame, str> {
+	let response = post(url, body).header("Content-Type", RPC_TEXT_MEDIA_TYPE).send();
+	if reply_is_an_envelope(response) {
+		Ok(Frame::Text(response.text()))
+	} else {
+		Err(not_an_envelope(response))
+	}
+}
+
+fun read_binary_reply(url: str, body: Bytes): Result<Frame, str> {
+	let response = post_bytes_typed(url, body, RPC_BINARY_MEDIA_TYPE);
+	if reply_is_an_envelope(response) {
+		Ok(Frame::Binary(response.bytes()))
+	} else {
+		Err(not_an_envelope(response))
 	}
 }
 
@@ -1083,6 +1161,50 @@ export fun dial_socket(url: str, protocols: List<str>): Result<SocketDuplex, Dia
 
 // === Wire envelope (RPC) ====================================================
 
+/// What the app proved about a caller before a request was answered — the
+/// identity half of `transport-rpc.md` Q4. A socket's session is what the
+/// service's `authorize` hook proved at the upgrade, carried into the factory
+/// as `Connection.session`; a connectionless POST's is what `authorize_request`
+/// proved about THAT request (A120 S4, §9.7.6), and it has nowhere to live but
+/// the `RpcRequest` it arrived as. Where nothing authorized the caller it is
+/// `Session::anonymous()`; the app decides what more an identity means by
+/// looking `identity` up in its own state.
+///
+/// It lives here rather than in `std::rpc_server` because `RpcRequest` carries
+/// it and `RpcRequest` is platform-neutral; `std::rpc_server` re-exports it, so
+/// `import std::rpc_server::Session` still names it.
+export struct Session {
+	/// The app's name for whoever is on the other end — a user id, a subject
+	/// claim. Empty when nothing authorized this caller.
+	identity: str,
+	/// The credential the identity was proved with, kept for apps that must
+	/// re-present it downstream. Empty when there was none.
+	credential: str,
+}
+
+export impl Session {
+	/// A caller nothing authorized: no identity, no credential.
+	fun anonymous(): Session {
+		Session { identity = "", credential = "" }
+	}
+
+	/// The ordinary `authorize` result: this caller is `identity`.
+	fun of(identity: str): Session {
+		Session { identity, credential = "" }
+	}
+
+	/// `of`, keeping the credential the identity was proved with.
+	fun with_credential(own self, credential: str): Session {
+		self.credential = credential;
+		self
+	}
+
+	/// Whether anything authorized this caller.
+	fun is_anonymous(self): bool {
+		self.identity == ""
+	}
+}
+
 /// The request handle a dispatcher hands to handlers: the method that routed it
 /// plus the request's deserializer, positioned at the first argument. `arg`
 /// pulls the NEXT argument — arguments are read in declaration order, exactly
@@ -1101,6 +1223,17 @@ export struct RpcRequest {
 	/// service built this protocol for — the honest source — and never read
 	/// off the frame, which the caller writes.
 	connection: i32,
+	/// Who the app proved the caller to be (A120 S4, `transport-rpc.md`
+	/// §9.7.6): the connection's `authorize` session on a socket, the
+	/// request's own `authorize_request` session on the connectionless POST
+	/// leg, and `Session::anonymous()` wherever nothing authorized it. Stamped
+	/// by the protocol like `connection`, and never read off the frame.
+	///
+	/// A hand-written `Dispatcher` route reads it here. A generated `[rpc]`
+	/// method has no parameter it could arrive in; a method that must know
+	/// its caller is written on a `Service::factory` instance, whose fields
+	/// the connection's session built.
+	session: Session,
 }
 
 export impl RpcRequest {
@@ -1109,6 +1242,14 @@ export impl RpcRequest {
 	/// cannot know, because a frame carries no connection.
 	fun on_connection(own self, connection: i32): RpcRequest {
 		self.connection = connection;
+		self
+	}
+
+	/// The same request, carrying the session its caller was proved to be —
+	/// stamped by `RpcProtocol::respond` beside the connection, for the same
+	/// reason: a frame carries neither.
+	fun in_session(own self, session: Session): RpcRequest {
+		self.session = session;
 		self
 	}
 }
@@ -1184,7 +1325,7 @@ export fun open_request(codec: Codec, frame: Frame): RpcRequest {
 	let method = (deserializer.str_value)();
 	(deserializer.field)("args");
 	let arity = (deserializer.begin_list)();
-	RpcRequest { method, deserializer, arity, connection = 0 - 1 }
+	RpcRequest { method, deserializer, arity, connection = 0 - 1, session = Session::anonymous() }
 }
 
 /// One reply envelope: an externally-tagged `Success` carrying the described
@@ -1226,6 +1367,12 @@ export struct RpcProtocol {
 	/// connection at the upgrade, which is how a source-returning route
 	/// reaches THIS client's capability table and no other's (§9.2).
 	connection: i32,
+	/// The session every request through this protocol is stamped with —
+	/// the connection's under `Service` (what `authorize` proved at the
+	/// upgrade), or ONE request's on the connectionless POST leg (what
+	/// `authorize_request` proved, A120 S4). `Session::anonymous()` until
+	/// something stamps it.
+	session: Session,
 	/// The `[rpc]` methods whose reply is a signal HANDLE, read off the
 	/// dispatcher at `into_protocol` (tracker A78). What lets `local_rpc`
 	/// refuse a handle service it has no connection for at WIRING time,
@@ -1244,13 +1391,80 @@ export impl RpcProtocol {
 		self
 	}
 
+	/// The same protocol, answering for one proved caller — the copy a
+	/// `Service` makes per connection (its `authorize` session) and per POST
+	/// (its `authorize_request` session). Only the stamp differs.
+	fun in_session(own self, session: Session): RpcProtocol {
+		self.session = session;
+		self
+	}
+
 	fun respond(self, frame: Frame): Frame {
-		let request = open_request(self.codec, frame).on_connection(self.connection);
+		let (reply, _status) = self.respond_with_status(frame);
+		reply
+	}
+
+	/// The reply AND the HTTP status it earns (A120 S3, `transport-rpc.md`
+	/// §9.7.7). The connectionless `POST {mount}rpc` leg is the caller; every
+	/// other mount answers frames and has no status to carry.
+	///
+	/// **The ENVELOPE is the vilan client's contract; the STATUS is everyone
+	/// else's, and the two never disagree.** A vilan stub reads the envelope
+	/// and has always ignored the status, which is what makes moving the
+	/// statuses off 200 a non-breaking change — and what makes it worth doing,
+	/// because the status is the contract for everything that is not a vilan
+	/// client: curl, a `fetch` in a page, a proxy, a load balancer, a
+	/// monitoring probe.
+	fun respond_with_status(self, frame: Frame): (Frame, i32) {
+		let request = open_request(self.codec, frame)
+			.on_connection(self.connection)
+			.in_session(self.session);
 		let outcome = match (request.deserializer.failed)() {
 			Some(let reason) => RpcOutcome::Failure(RpcError::Decode(reason)),
 			None => (self.dispatch)(request),
 		};
-		encode_reply(self.codec, outcome)
+		let status = status_of_outcome(outcome);
+		(encode_reply(self.codec, outcome), status)
+	}
+}
+
+/// `unknown method: ` — the one `Remote` failure that is the CALLER's fault
+/// rather than the handler's, and the only thing telling the leg's 404 from
+/// its 500. It is a sentence rather than an `RpcError` arm because that is
+/// what it has always been on the wire, and giving it an arm now would move
+/// every client's decode of it.
+let UNKNOWN_METHOD_PREFIX: str = "unknown method: ";
+
+/// §9.7.7's arm-to-status map. The rule that generates it: an application
+/// error is a VALUE that crossed successfully, so `Success` is 200 even when
+/// the value it carries is an `Err` arm — a server answering 401 for "wrong
+/// password" would be claiming the CALL was unauthorized, which is a different
+/// fact and the one `authorize` reports. Everything else is the ordinary HTTP
+/// reading of whose fault it is.
+fun status_of_outcome(outcome: RpcOutcome): i32 {
+	match outcome {
+		RpcOutcome::Success(let _describe) => 200,
+		RpcOutcome::Failure(let error) => match error {
+			// The caller's bytes were wrong.
+			RpcError::Decode(let _reason) => 400,
+			RpcError::Unauthorized => 401,
+			// A52's arm, and its documented meaning: not now.
+			RpcError::Unavailable => 503,
+			// The two sides disagree about the surface.
+			RpcError::Contract(let _reason) => 409,
+			RpcError::Remote(let reason) => {
+				if reason.starts_with(UNKNOWN_METHOD_PREFIX) {
+					// The method is the resource.
+					404
+				} else {
+					500
+				}
+			},
+			// Never produced on this side — a transport failure is the
+			// CLIENT's reading of a call that did not arrive. If one is ever
+			// encoded into a reply, it is the server's own fault.
+			RpcError::Transport(let _reason) => 500,
+		},
 	}
 }
 
@@ -1375,6 +1589,43 @@ export fun arg<T: Wire>(request: RpcRequest, index: i32): T {
 /// `arg` pulls and the impl call, turning a garbled request into a clean
 /// `RpcError::Decode` instead of an impl run on zero values.
 export fun decode_failed(request: RpcRequest): Option<str> {
+	(request.deserializer.failed)()
+}
+
+/// The generated route's argument gate (tracker B383, A120 S1): the envelope's
+/// own declared arity against the method's, then the argument list CLOSED, then
+/// the reader's sticky error. `None` means "the arguments decoded"; a `Some` is
+/// the sentence the route answers as `RpcError::Decode`.
+///
+/// Three things are checked here and each closes a different door.
+///
+/// **Arity first**, because it is the only one that can name what went wrong in
+/// the caller's vocabulary: `expects 2 arguments, got 3` says more than the
+/// reader's "expected a number, found an object", which is what a SHORT list
+/// produces when the read runs off the end of the arguments and into the
+/// enclosing envelope. `open_request` has held the count since the day it was
+/// written and nothing read it.
+///
+/// **Then `end_list`**, which is what makes a LONG list a decode failure rather
+/// than a tail nobody reads: the count and the list can disagree (a hand-built
+/// binary frame declares its own count), and a JSON reader left holding unread
+/// elements hands the NEXT read one of them. `open_request` deliberately leaves
+/// the list open for the route to pull from, so this is the only place it can
+/// be closed.
+///
+/// **Then the sticky error**, which is the gate that was already here and still
+/// catches everything about the argument VALUES — the wrong kind, a fraction in
+/// an integer lane, a negative in an unsigned one.
+///
+/// For a vilan↔vilan socket none of this can fire: both sides were generated
+/// from one surface and the contract hash refuses a client that disagrees. For
+/// an HTTP API the caller is arbitrary, which is the whole reason it exists
+/// (`transport-rpc.md` §9.7.8).
+export fun decode_args_failed(request: RpcRequest, declared: i32): Option<str> {
+	if request.arity != declared {
+		ret Some(i"expects {declared} argument(s), got {request.arity}");
+	}
+	(request.deserializer.end_list)();
 	(request.deserializer.failed)()
 }
 
@@ -1613,6 +1864,7 @@ export impl Dispatcher {
 			codec,
 			dispatch = |request| self.handle(request),
 			connection = 0 - 1,
+			session = Session::anonymous(),
 			handle_methods = self.handle_methods.read(),
 		}
 	}
@@ -5444,15 +5696,23 @@ export macro fun service(item: Item): Source {
 		// inside the wire turn — a no-arg method's signal writes coalesce
 		// exactly like an arg-taking one's (a bare `.on(...)` fast path here
 		// once skipped the turn, leaking one update per write).
-		if arity == 0 {
-			statements.push(route_outcome(returns_void, replier, i"self.{method.name}()"));
+		//
+		// The gate is `decode_args_failed` and every route has one, the
+		// no-argument routes included (B383): a method that takes nothing is
+		// still a method an arbitrary caller can POST three arguments at, and
+		// before this they were read as `Success`. It carries the method's
+		// DECLARED count, which is the number the envelope's own `arity` is
+		// compared against.
+		let argument_list = join(arguments, ", ");
+		let called = if arity == 0 {
+			i"self.{method.name}()"
 		} else {
-			let argument_list = join(arguments, ", ");
-			statements.push(match_of("rpc::decode_failed(__request)")
-				.arm("Option::Some(let reason)", "RpcOutcome::Failure(RpcError::Decode(reason))")
-				.arm("Option::None", route_outcome(returns_void, replier, i"self.{method.name}({argument_list})"))
-				.render());
-		}
+			i"self.{method.name}({argument_list})"
+		};
+		statements.push(match_of(i"rpc::decode_args_failed(__request, {arity})")
+			.arm("Option::Some(let reason)", "RpcOutcome::Failure(RpcError::Decode(reason))")
+			.arm("Option::None", route_outcome(returns_void, replier, called))
+			.render());
 		routes.push(route_block(method.name, statements));
 	}
 	routes.push(".on(" + quote("__contract") + ", |_| rpc::reply(self.contract_hash()))");
@@ -5510,7 +5770,7 @@ export macro fun service(item: Item): Source {
 		.render();
 	mut attach_statements: List<str> = [];
 	attach_statements.push("let connection: i32 = rpc::arg(__request, 0);");
-	attach_statements.push(match_of("rpc::decode_failed(__request)")
+	attach_statements.push(match_of("rpc::decode_args_failed(__request, 1)")
 		.arm("Option::Some(let reason)", "RpcOutcome::Failure(RpcError::Decode(reason))")
 		.arm("Option::None", attach_reply)
 		.render());
@@ -5845,6 +6105,58 @@ export macro fun service(item: Item): Source {
 		.method(with_handlers)
 		.render();
 
+	// --- The connectionless constructor (A120 S2, `transport-rpc.md` §9.7.4).
+	//
+	// The client TYPE already speaks the `POST {mount}rpc` leg — the transport
+	// is a type parameter and every plain stub, `verify()` and
+	// `contract_hash()` live on the unconstrained impl — so nothing is
+	// generated here that has to be. What was missing is the constructor, and
+	// the RULE about which services get one.
+	//
+	// **The rule is the client struct's own field list**, which is already a
+	// total refusal and is measured as one: an `[expose]`d field puts a
+	// `RemoteSource`/`KeyedSource` on the client that only `connect`'s
+	// `__attach` can fill, and a handle-returning method puts a `reactive`
+	// field there that only `connect` mints. Neither can be built over
+	// `HttpTransport`, and the diagnostic an author meets is the field list's,
+	// which names the missing field and therefore the reason. So `over_http`
+	// is emitted when the struct has exactly its two base fields — and NOT for
+	// a `client = H` service, which is the one shape the field list does not
+	// catch: its reverse direction is dead over HTTP (`with_handlers` is
+	// `SocketTransport`-only, and the server's `notify` on the connectionless
+	// leg finds no client channel), so a client that could be built would have
+	// a declared second direction that silently does nothing.
+	//
+	// It is SYNC and it MAKES NO CALL, unlike `connect`, which verifies the
+	// contract in one round trip. Over HTTP there is no connection, so "once
+	// per client value" is an arbitrary unit — a login form constructs one per
+	// mount and may make exactly one call through it. `verify()` is on the
+	// generic impl and reachable, so a caller who wants the check asks for it:
+	// an HTTP client is unversioned unless you call `verify()`. A92's sync
+	// handle stub is the precedent.
+	//
+	// It takes the MOUNT and not the endpoint URL, so `connect("/admin/", c)`
+	// and `over_http("/admin/", c)` read the same and a service that moves
+	// mount moves one string on each side. `HttpTransport { url }` stays the
+	// raw door for a client pointed at another origin.
+	let http_client_is_holdable = !any_handle
+		&& exposed_names.len() == 0
+		&& target.handler_name == "";
+	let over_http_impl = if target.client_name != "" && http_client_is_holdable {
+		impl_of(target.client_name)
+			.generics("<HttpTransport>")
+			.method(fun_of("over_http")
+				.parameter("mount: str")
+				.parameter("codec: Codec")
+				.returns(i"{target.client_name}<HttpTransport>")
+				.expr(i"{target.client_name} \{ transport = HttpTransport \{ url = mount + "
+					+ quote("rpc")
+					+ " }, codec }"))
+			.render()
+	} else {
+		""
+	};
+
 	// --- The client-service half (§9.3, R1): `<Name>Proxy`, the typed value a
 	// --- server-side factory stores in a field and calls its notifications on.
 	mut proxy_source = "";
@@ -5886,7 +6198,7 @@ export macro fun service(item: Item): Source {
 	// the server half above described one nobody asked for; it is built either
 	// way (the builders are strings) and emitted only here.
 	let client_source = if target.client_name != "" {
-		client_struct.render() + client_impl.render() + connect_impl
+		client_struct.render() + client_impl.render() + connect_impl + over_http_impl
 	} else {
 		""
 	};
@@ -5904,7 +6216,7 @@ export macro fun service(item: Item): Source {
 	// so the service's vocabulary is the author's again.
 	let imports = "import std::rpc;\n"
 		+ "import std::reactive;\n"
-		+ "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, KeyedSource, RpcService, Origin, ClientProxy, SocketDuplex, SocketTransport, ReactiveClient };\n"
+		+ "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, KeyedSource, RpcService, Origin, ClientProxy, SocketDuplex, SocketTransport, HttpTransport, ReactiveClient };\n"
 		+ "import std::wire::{ Codec, Serializer, Frame, Keyed };\n"
 		+ "import std::result::Result;\n"
 		+ "import std::option::Option;\n"

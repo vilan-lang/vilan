@@ -202,11 +202,17 @@ export impl i32 with FromJson {
 			None => Err("not valid JSON"),
 		}
 	}
+	/// The kind gate, then the LANE gate (B373): a JSON number that is not a
+	/// whole number is not an `i32`, and answering `Ok(1.5)` typed `i32` is the
+	/// same defect as answering `Ok` for a string — a value outside its own
+	/// type, handed on as though it were inside it.
 	fun from_json_value(value: JsonValue): Result<i32, str> {
-		if value.kind() == JsonKind::Number {
-			Ok(coerce_i32(value))
-		} else {
-			Err("expected a number")
+		if value.kind() != JsonKind::Number {
+			ret Err("expected a number")
+		}
+		match integer_lane_failure(value, true) {
+			Some(let reason) => Err(reason),
+			None => Ok(coerce_i32(value)),
 		}
 	}
 }
@@ -218,11 +224,15 @@ export impl u32 with FromJson {
 			None => Err("not valid JSON"),
 		}
 	}
+	/// The kind gate, then the LANE gate (B373) — whole AND non-negative:
+	/// `u32::from_json("-1")` answered `Ok(-1)` typed `u32`.
 	fun from_json_value(value: JsonValue): Result<u32, str> {
-		if value.kind() == JsonKind::Number {
-			Ok(coerce_u32(value))
-		} else {
-			Err("expected a number")
+		if value.kind() != JsonKind::Number {
+			ret Err("expected a number")
+		}
+		match integer_lane_failure(value, false) {
+			Some(let reason) => Err(reason),
+			None => Ok(coerce_u32(value)),
 		}
 	}
 }
@@ -566,17 +576,40 @@ impl JsonReader {
 		if !self.expect(value, JsonKind::Number, "a number") {
 			ret false;
 		}
-		let number = coerce_f64(value);
-		if number != number.floor() {
-			self.report(i"expected a whole number, found {number}");
-			ret false;
+		match integer_lane_failure(value, signed) {
+			Some(let reason) => {
+				self.report(reason);
+				false
+			},
+			None => true,
 		}
-		if !signed && number < 0.0 {
-			self.report(i"expected a non-negative number, found {number}");
-			ret false;
-		}
-		true
 	}
+}
+
+/// The integer lanes' VALUE check, shared by the typed reader above and by the
+/// scalar `FromJson` impls (tracker B373): `None` when `value` is a number this
+/// lane can hold, `Some(reason)` naming why it is not.
+///
+/// It is a free function and not a method because the two callers report
+/// differently — the reader poisons, `from_json_value` answers `Err` — and the
+/// defect it closes was exactly that they did not share a predicate: the reader
+/// grew these two rules with 2321790e and `i32::from_json("1.5")` went on
+/// answering `Ok(1.5)`, an `i32`-typed value that is not an integer. One lane
+/// read two ways is the shape of every hole in this file's history.
+///
+/// The MAGNITUDE is deliberately not checked, for the reason `expect_integer`
+/// already gave: `i32`/`u32` are the JS numeric lanes rather than hardware
+/// widths, and refusing a large value is its own question with its own estate
+/// sweep (recorded on B373, waiting on I5's `usize`).
+fun integer_lane_failure(value: JsonValue, signed: bool): Option<str> {
+	let number = coerce_f64(value);
+	if number != number.floor() {
+		ret Some(i"expected a whole number, found {number}");
+	}
+	if !signed && number < 0.0 {
+		ret Some(i"expected a non-negative number, found {number}");
+	}
+	None
 }
 
 /// How a decode failure NAMES the kind it found, with its article, so the two
