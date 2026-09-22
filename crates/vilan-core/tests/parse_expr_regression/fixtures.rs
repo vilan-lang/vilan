@@ -335,7 +335,6 @@ const EXPRESSION_FIXTURES: &[&str] = &[
     "g<sync || T>()",
     "g<(A, B)>()",
     "g<(A)>()",
-    "g<()>()",
     "g<(A, B, C)>()",
     "g<(U in T: F<U>)>()",
     "g<Foo context bar>()",
@@ -517,6 +516,11 @@ const DECLINER_FIXTURES: &[&str] = &[
     "a::",       // a `::` with no member
     "match x {", // an unclosed match
     "(",         // an unclosed paren
+    // N113: the EMPTY tuple in type position. It parsed, and nothing could be
+    // written at it — the unit is `void`. The production it lives in is the
+    // ordinary tuple type's, so its neighbours above (`g<(A)>()`,
+    // `g<(A, B, C)>()`) stay in the accept list; only the arity-zero case moved.
+    "g<()>()",
     // --- Elements (element-syntax S2) --------------------------------------
     "<div>",             // an unclosed element
     "<div></span>",      // a mismatched closing tag

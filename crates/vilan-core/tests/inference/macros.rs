@@ -5464,3 +5464,132 @@ main();
         "#,
     );
 }
+
+// --- B376: a derive name nothing declares a macro for is refused AT THE
+// --- ATTRIBUTE ---------------------------------------------------------------
+//
+// `[derive(PartialOrd)]` was accepted and expanded to nothing. The reasoning
+// was recorded and is not wrong about the mechanism — an unknown derive is a
+// missing macro, and the missing impl does surface at the use site — but the
+// use site is the wrong place to learn it: forty lines later `a < b` reads
+// "type `P` does not implement the `PartialOrd` operator; add `impl P with
+// PartialOrd`", which is advice to write by hand the impl the author believed
+// the attribute had just asked for. A program that never compares says nothing
+// at all, and ships without the derive it declares.
+
+#[test]
+fn b376_a_derive_no_macro_backs_is_refused_by_name() {
+    assert_fails_with(
+        r#"
+        [derive(PartialOrd)]
+        struct P {
+            x: i32,
+        }
+
+        fun main() {}
+        "#,
+        "`PartialOrd` is not a derivable trait",
+    );
+}
+
+#[test]
+fn b376_the_refusal_names_what_is_derivable() {
+    // A "no" with no next step is half a diagnostic. The list is
+    // `STD_DERIVE_MACROS` itself, which `derives_are_the_macros_std_declares`
+    // holds to std's own `macro fun`s — so what this prints cannot drift into
+    // offering a name that expands to nothing.
+    assert_fails_with(
+        r#"
+        [derive(Ord)]
+        struct P {
+            x: i32,
+        }
+
+        fun main() {}
+        "#,
+        "std derives `PartialEq`, `Default`, `Debug`, `Json`, `Wire`, `Hashable`",
+    );
+}
+
+#[test]
+fn b376_a_typo_on_a_real_derive_is_refused_at_the_attribute() {
+    // The shape this actually costs people: one character out, and before
+    // this the program compiled with no `PartialEq` in it.
+    assert_fails_with(
+        r#"
+        [derive(PartialEQ)]
+        struct P {
+            x: i32,
+        }
+
+        fun main() {}
+        "#,
+        "`PartialEQ` is not a derivable trait",
+    );
+}
+
+#[test]
+fn b376_every_std_derive_still_expands() {
+    // The line the refusal must not cross: all six of the table's names, on
+    // the two item shapes they apply to, still expand and still compile.
+    assert_compiles(
+        r#"
+        import std::json::Json;
+        import std::wire::Wire;
+        import std::hash::Hashable;
+
+        [derive(PartialEq, Debug, Default, Json, Wire, Hashable)]
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+
+        [derive(PartialEq, Debug, Json, Wire)]
+        enum Shape {
+            Dot,
+            Line(i32),
+        }
+
+        fun main() {
+            let origin: Point = Point::default();
+            let _ = origin == Point { x = 0, y = 0 };
+            let _ = Shape::Line(1) == Shape::Dot;
+        }
+        "#,
+    );
+}
+
+#[test]
+fn b376_a_users_own_derive_macro_is_not_refused() {
+    // The refusal is "nothing declares a macro for this name", not "std does
+    // not". A `macro fun` in the file dispatches exactly as before.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        macro fun Greeter(item: Item): Source {
+            import macro_std::source;
+            import macro_std::meta::{ Item, Source, StructItem };
+            import macro_std::option::Option::{ self, Some, None };
+
+            let target = match item.as_struct() {
+                Some(let found) => found,
+                None => StructItem { name = "?", fields = [], generics = [] },
+            };
+            source("impl " + target.name + " {\nfun greet(self): str {\n\"hello\"\n}\n}\n")
+        }
+
+        [derive(Greeter)]
+        struct Host {
+            id: i32,
+        }
+
+        fun main() {
+            print(Host { id = 1 }.greet());
+        }
+
+        main();
+        "#,
+        "hello\n",
+    );
+}

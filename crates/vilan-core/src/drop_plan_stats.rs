@@ -22,32 +22,6 @@ thread_local! {
     static OFFERED: Cell<usize> = const { Cell::new(0) };
     static ASKED: Cell<usize> = const { Cell::new(0) };
     static NOMINALS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
-    static LITERAL_EVIDENCE: Cell<usize> = const { Cell::new(0) };
-}
-
-/// B365: how many times the enrolment gate's STRUCT-LITERAL arm was the thing
-/// that answered "this body reaches a resource".
-///
-/// The arm compared the literal's OWN expression id against the set of struct
-/// DEFINITION ids, so it answered `false` for every program ever compiled — a
-/// vacuous arm, invisible because the recorded-type check above it catches the
-/// common case. The live hole is a literal whose type the solver has not
-/// recorded at the gate, and the only honest way to pin the repair is to count
-/// the arm: a pin over a program where nothing else can supply the evidence
-/// reads zero before the fix and non-zero after.
-pub(crate) fn note_literal_evidence() {
-    LITERAL_EVIDENCE.with(|cell| cell.set(cell.get().saturating_add(1)));
-}
-
-/// [`note_literal_evidence`]'s count for the last analysis on this thread.
-pub fn literal_evidence() -> usize {
-    LITERAL_EVIDENCE.with(Cell::get)
-}
-
-/// Zero the literal-evidence counter — called where the planner starts, so the
-/// number a pin reads belongs to the analysis it just ran.
-pub(crate) fn reset_literal_evidence() {
-    LITERAL_EVIDENCE.with(|cell| cell.set(0));
 }
 
 /// Record one analysis's enrolment: `planned` roots walked out of `offered`

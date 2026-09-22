@@ -820,6 +820,19 @@ pub struct Document {
     /// `(start, end, id)` for every entry-file entity with a real span, used to
     /// find the innermost entity under a cursor.
     entity_spans: Vec<(usize, usize, Id)>,
+    /// M85: `(start, end, struct, field index)` for every entry-file struct
+    /// FIELD position a hover can land on — a field's declaration name span
+    /// and every struct-initializer KEY span — sorted by start, built with the
+    /// analysis.
+    ///
+    /// The same move `entity_spans` is, for the same reason. Hover fires on
+    /// MOVE, and the answer used to be a walk of `program.structs` — every
+    /// struct in the loaded world, with a `source_of` per struct — followed by
+    /// a walk of `program.struct_initializer_field_spans`, every key in the
+    /// world, per request. What that cost, and how it was measured, is
+    /// `m85_field_hover_cost` below: the lookup grew with the WORKSPACE's
+    /// field count and now does not.
+    field_spans: Vec<(usize, usize, Id, usize)>,
     /// Every identifier occurrence in the analyzed program, keyed by the
     /// definition it names — the one table find-references and rename both read
     /// (see `crate::references`). Computed with the analysis so a query is a
@@ -1515,6 +1528,7 @@ impl Document {
         let outer_text = text.clone();
         let std_dir = std_dir.to_path_buf();
         let entry_path = entry_path.to_path_buf();
+        let outer_entry_path = entry_path.clone();
         let cancel = cancel.clone();
         std::thread::Builder::new()
             .stack_size(128 * 1024 * 1024)
@@ -1523,9 +1537,11 @@ impl Document {
                 // the thread ends, so the token is exactly the analysis's.
                 let _scope = cancel.install();
                 let document = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    #[cfg(test)]
+                    analysis_fence_tests::maybe_inject(&entry_path);
                     Self::analyze_on_this_thread(&text, &std_dir, &entry_path)
                 }))
-                .unwrap_or_else(|_| Self::internal_error(&text));
+                .unwrap_or_else(|_| Self::internal_error(&text, &entry_path));
                 // Read AFTER the analysis, on the thread that ran it: a
                 // cancelled analysis's document is dropped here — which is what
                 // gives its entry text, tree and owned modules back
@@ -1537,7 +1553,7 @@ impl Document {
             .join()
             // Unreachable while the thread body catches unwinds (an abort
             // never returns here); kept graceful all the same.
-            .unwrap_or_else(|_| Some(Self::internal_error(&outer_text)))
+            .unwrap_or_else(|_| Some(Self::internal_error(&outer_text, &outer_entry_path)))
     }
 
     /// A document holding `text` and NOTHING an analysis produces: no program,
@@ -1575,6 +1591,7 @@ impl Document {
             text: text.to_string(),
             text_hash: hash_text(text),
             entity_spans: Vec::new(),
+            field_spans: Vec::new(),
             reference_index: ReferenceIndex::default(),
             retained_tail: Vec::new(),
             retained_tail_start: usize::MAX,
@@ -1600,14 +1617,22 @@ impl Document {
     /// the one honest diagnostic saying so.
     ///
     /// [`unanalyzed`]: Document::unanalyzed
-    fn internal_error(text: &str) -> Self {
+    fn internal_error(text: &str, entry_path: &Path) -> Self {
         let mut document = Self::unanalyzed(text);
         document.diagnostics = vec![Error {
             trace: Vec::new(),
             note: None,
             span: vilan_core::span::Span::new((), 0..0),
-            msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)"
-                .to_string(),
+            // N119: the file is NAMED. The diagnostic is published against
+            // this document's own uri, so the editor already shows it in the
+            // right buffer — but the same text also reaches the output
+            // channel and a `vilan-lsp` bug report, where "this file" names
+            // nothing, and a workspace-wide analysis sweep can land several
+            // of these at once.
+            msg: format!(
+                "internal error: the compiler panicked analyzing `{}` (this is a bug; the details are on stderr)",
+                entry_path.display()
+            ),
         }];
         document.diagnostic_sources = vec![SourceId(0)];
         document
@@ -1725,6 +1750,12 @@ impl Document {
             .map(vilan_ide::entity_spans)
             .unwrap_or_default();
 
+        // M85's field-position table, built here for `entity_spans`'s reason:
+        // the question is "which field is under this offset", it is asked once
+        // per hover-on-move, and answering it by walking the world's structs
+        // made the answer cost the codebase rather than the buffer.
+        let field_spans = program.as_ref().map(field_spans_of).unwrap_or_default();
+
         // The identifier-occurrence table the reference queries read.
         let reference_index = program
             .as_ref()
@@ -1806,6 +1837,7 @@ impl Document {
             text: text.to_string(),
             text_hash,
             entity_spans,
+            field_spans,
             reference_index,
             retained_tail: Vec::new(),
             retained_tail_start: usize::MAX,
@@ -2568,6 +2600,7 @@ impl Document {
             live_edits: _,
             text_hash,
             entity_spans,
+            field_spans,
             reference_index,
             platform_requirements,
             manifest_problem,
@@ -2607,6 +2640,7 @@ impl Document {
         self.warning_sources = warning_sources;
         self.text_hash = text_hash;
         self.entity_spans = entity_spans;
+        self.field_spans = field_spans;
         self.reference_index = reference_index;
         self.platform_requirements = platform_requirements;
         self.manifest_problem = manifest_problem;
@@ -3538,27 +3572,21 @@ impl Document {
     /// span, contains `offset` in this document (E204). Entry-file only, like
     /// every other span-containment answer here: `offset` is an analyzed-space
     /// offset into this buffer.
-    fn field_at_offset(&self, program: &Program, offset: usize) -> Option<(Id, usize)> {
-        let contains = |span: Span| {
-            let range = span.into_range();
-            range.start <= offset && offset < range.end
-        };
-        for (struct_id, structure) in &program.structs {
-            if program.source_of(*struct_id) != Some(SourceId(0)) {
-                continue;
-            }
-            for (index, field) in structure.fields.iter().enumerate() {
-                if contains(field.name_span) {
-                    return Some((*struct_id, index));
-                }
-            }
-        }
-        for (source, span, struct_id, index) in &program.struct_initializer_field_spans {
-            if *source == SourceId(0) && contains(*span) {
-                return Some((*struct_id, *index));
-            }
-        }
-        None
+    ///
+    /// M85: a lookup in [`field_spans`](Document::field_spans), not a walk of
+    /// the world's structs. The rows are DISJOINT — a field's declaration name
+    /// occurs once and an initializer key occurs once, and neither can be
+    /// inside the other — so the containing row, if there is one, is the last
+    /// row starting at or before `offset`, and one containment test settles
+    /// it. The walk this replaces took the declarations before the keys; with
+    /// disjoint rows nothing can tell the two orders apart.
+    fn field_at_offset(&self, _program: &Program, offset: usize) -> Option<(Id, usize)> {
+        let candidate = self
+            .field_spans
+            .partition_point(|(start, ..)| *start <= offset)
+            .checked_sub(1)?;
+        let (start, end, struct_id, index) = self.field_spans[candidate];
+        (start <= offset && offset < end).then_some((struct_id, index))
     }
 
     /// The struct/enum definition an entity names in VALUE position — a
@@ -8154,6 +8182,46 @@ fn spans_contain(outer: Span, inner: Span) -> bool {
     outer.start <= inner.start && inner.end <= outer.end
 }
 
+/// M85: every entry-file struct FIELD position a hover can land on, sorted by
+/// start — a field's declaration name span, and every struct-initializer key
+/// span, each with the `(struct, field index)` pair it resolves to.
+///
+/// Both halves come from records the analyzer already keeps, which is E204's
+/// design and the reason the declaration and the use site cannot drift apart:
+/// `Field::name_span` for a declaration, `struct_initializer_field_spans` for
+/// a key. This function is only the indexing.
+///
+/// Entry file only, like `entity_spans`: every span-containment answer in this
+/// file is about this buffer's coordinate space.
+fn field_spans_of(program: &Program) -> Vec<(usize, usize, Id, usize)> {
+    let mut rows: Vec<(usize, usize, Id, usize)> = Vec::new();
+    for (struct_id, structure) in &program.structs {
+        if program.source_of(*struct_id) != Some(SourceId(0)) {
+            continue;
+        }
+        for (index, field) in structure.fields.iter().enumerate() {
+            let range = field.name_span.into_range();
+            if range.start < range.end {
+                rows.push((range.start, range.end, *struct_id, index));
+            }
+        }
+    }
+    for (source, span, struct_id, index) in &program.struct_initializer_field_spans {
+        if *source != SourceId(0) {
+            continue;
+        }
+        let range = span.into_range();
+        if range.start < range.end {
+            rows.push((range.start, range.end, *struct_id, *index));
+        }
+    }
+    // `program.structs` is a hash map, so the rows arrive in an arbitrary
+    // order and the sort is what makes the bisect possible at all. Sorted by
+    // start alone: the rows are disjoint, so no two share one.
+    rows.sort_unstable_by_key(|(start, ..)| *start);
+    rows
+}
+
 /// Replaces the byte range `span` in `source` with `replacement`. The
 /// primitive [`Document::add_all_missing_imports_edit`] folds a SEQUENCE of
 /// `insert_import` edits through, each computed against the previous
@@ -12222,13 +12290,50 @@ pub(crate) mod tests {
     /// The hover text at the cursor marked `|` in `src` (a bare manifest-less
     /// file, like `completions_at_cursor` — keep the sources closure-free, the
     /// marker would collide with closure pipes).
+    ///
+    /// N114: the helper REFUSES a fixture with a second `|`, and that guard is
+    /// the point of it. `replace('|', "")` strips every pipe, not just the
+    /// marker, so a fixture carrying a closure type or a union-shaped comment
+    /// was analyzed as a DIFFERENT program from the one written in the test —
+    /// `fun with_owner(body: (|| void) context owner_scope)` became
+    /// `fun with_owner(body: ( void) context owner_scope)`, and E9's pin on the
+    /// rendered clause passed by asserting a string only the stale append E207
+    /// had deleted could produce. That is a pin that reads as coverage and is
+    /// not. A fixture that needs a pipe of its own takes
+    /// [`hover_at_marker`](hover_at_marker) and picks a marker character
+    /// instead; the panic below names the fixture so the swap is one edit.
     fn hover_at_cursor(src: &str) -> Option<String> {
+        let markers = src.matches('|').count();
+        assert_eq!(
+            markers, 1,
+            "a `hover_at_cursor` fixture carries EXACTLY ONE `|`, the cursor — \
+             this one carries {markers}, and every one of them is stripped \
+             before the analysis, so the program analyzed is not the program \
+             written. Use `hover_at_marker(src, '¦')` for a fixture with pipes \
+             of its own. The fixture: {src:?}"
+        );
         let offset = src
             .find('|')
             .expect("test source needs a `|` cursor marker");
         let text = src.replace('|', "");
         let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
         document.hover(offset)
+    }
+
+    /// N114's guard, shown to fire: the mangling fixture — E9's own, as it was
+    /// written before the pin moved to `hover_at_marker` — is refused by the
+    /// helper rather than silently analyzed with its closure type flattened.
+    ///
+    /// Non-vacuous by construction: the same fixture with its closure type
+    /// removed carries one pipe and passes through, which is the `assert_eq!`
+    /// above discriminating on the count rather than on the shape.
+    #[test]
+    #[should_panic(expected = "carries EXACTLY ONE `|`")]
+    fn n114_a_fixture_with_a_second_pipe_is_refused_by_the_helper() {
+        let _ = hover_at_cursor(
+            "import std::reactive::{ owner_scope, Owner };\n\nfun with_o|wner(body: (|| void) \
+             context owner_scope) {\n\tlet _b = body;\n}\n\nfun main() {}\n",
+        );
     }
 
     // --- E128: `Self` in a TRAIT declaration renders as `Self` ---------------
@@ -21017,7 +21122,7 @@ mod entry_reclaim {
     #[test]
     fn the_internal_error_document_owns_nothing_to_reclaim() {
         leak_tally::reset();
-        let document = Document::internal_error(FIRST);
+        let document = Document::internal_error(FIRST, Path::new("reclaim.vl"));
         assert!(!document.program.is_some());
         drop(document);
         assert_eq!(leak_tally::released_total(), 0);
@@ -26778,5 +26883,307 @@ mod dead_item_paint_tests {
             "with one entry, what the other entry used to reach grays too",
         );
         let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// N119: the analysis fence, and what it can and cannot contain.
+///
+/// [`Document::analyze_cancellable`] runs the whole pipeline on a dedicated
+/// 128 MiB-stack thread under `catch_unwind`, so an analyzer PANIC degrades to
+/// the internal-error document instead of unwinding through the join and out
+/// of whichever handler asked for the analysis (B40). The thread is what buys
+/// the depth; the fence is what buys the containment.
+///
+/// What the fence does NOT contain is a stack OVERFLOW, and the reason is the
+/// runtime's, not this server's: Rust's guard-page handler prints
+/// `thread '…' has overflowed its stack` and calls `abort()`, from ANY thread,
+/// so `join()` never returns and there is no `Err` to observe. Measured on
+/// this host: a 1 MiB-stack thread recursing without bound exits the process
+/// 134 (SIGABRT), and the line after the `join` never runs. That is what took
+/// the server down in B385, and it is why the guard that ends an unbounded
+/// walk has to live in the WALK — B385's own fix — rather than at this seam.
+/// A stack-remaining probe inside the analyzer's recursive descents (turning
+/// an overflow into a panic this fence already catches) is the general answer
+/// and is not this lane's file to write.
+#[cfg(test)]
+mod analysis_fence_tests {
+    use super::*;
+    use crate::document::tests::std_root;
+
+    /// The entry path whose analysis panics, once per call. Keyed on the file
+    /// rather than armed globally: the analysis runs on a thread this test
+    /// does not own, and the suite analyzes documents concurrently, so a
+    /// global flag would fire inside a stranger's analysis.
+    const PLANTED: &str = "n119-planted-panic.vl";
+
+    /// Called on the analysis thread, inside the fence.
+    pub(crate) fn maybe_inject(entry_path: &Path) {
+        if entry_path.file_name().is_some_and(|name| name == PLANTED) {
+            unreachable!("N119: planted analyzer abort");
+        }
+    }
+
+    const GOOD: &str = "fun main() {\n\tlet value = 1;\n\tlet _ = value;\n}\n";
+
+    /// A panicking analysis lands the internal-error document — which NAMES
+    /// the file — and the next analysis runs the normal path.
+    ///
+    /// Non-vacuous against the containment, which is TWO fences and not one:
+    /// the thread body's `catch_unwind` and the `join`'s own `Err` arm each
+    /// contain the planted `unreachable!()` on their own (removing either one
+    /// alone leaves this green — which is itself worth knowing). Remove BOTH
+    /// and the panic re-raises on this test's thread: measured red, with
+    /// `PROBE: outer fence removed: Any { .. }` in place of an assertion.
+    #[test]
+    fn a_panicked_analysis_answers_a_diagnostic_naming_the_file_and_the_next_analysis_works() {
+        let planted = Document::analyze(GOOD, &std_root(), Path::new(PLANTED));
+        assert!(
+            !planted.program.is_some(),
+            "a panicked analysis lands no program"
+        );
+        let published = planted.published_diagnostics();
+        let messages: Vec<&str> = published.iter().map(|one| one.message.as_str()).collect();
+        assert_eq!(published.len(), 1, "{messages:?}");
+        let message = &published[0].message;
+        assert!(
+            message.contains("internal error") && message.contains(PLANTED),
+            "the internal-error diagnostic names the file: {message}"
+        );
+        // The document is still a document: its line index is the live text's,
+        // so position mapping and the next re-analysis behave.
+        assert_eq!(planted.line_index.text(), GOOD);
+
+        // The next request — a fresh analysis of an ordinary file — runs the
+        // normal path. The injection is one file's, and the caught panic left
+        // nothing poisoned behind it.
+        let next = Document::analyze(GOOD, &std_root(), Path::new("n119-next.vl"));
+        assert!(
+            next.program.is_some(),
+            "the next analysis produces a program"
+        );
+        let after = next.published_diagnostics();
+        let after: Vec<&str> = after.iter().map(|one| one.message.as_str()).collect();
+        assert!(after.is_empty(), "{after:?}");
+        // And hover still answers on it.
+        let offset = GOOD.find("value").expect("the binding");
+        assert!(
+            next.hover(offset).is_some(),
+            "the request after a contained analyzer abort is answered normally"
+        );
+    }
+}
+
+/// M85: what a field hover costs on a workspace with many structs.
+///
+/// `Document::field_at_offset` — the answer behind a hover on a field's
+/// declaration or on a struct-initializer key (E204) — WALKED `program.structs`
+/// and then `program.struct_initializer_field_spans`, testing every span for
+/// containment. That was a linear scan per hover, and hover fires on MOVE, so
+/// the item asked whether it wants an offset -> field index built with the
+/// program. It got one (`Document::field_spans`); this measures the lookup
+/// that replaced the scan, and measured the scan before it landed.
+///
+/// Measured before building anything, which is what the item asks for. The
+/// instrument is the thread CPU clock (M15) around a batch of hovers, the
+/// subject is two generated entry files an order of magnitude apart in field
+/// count, and the claim is a RATIO: a scan follows the field count, an index
+/// does not.
+///
+/// `#[ignore]` for its cost, like every other gate in this tree that generates
+/// a workspace, and it asserts NOTHING — it is a measurement, and the number
+/// it prints is what the item is closed on. Run it with
+/// `cargo nextest run --release -p vilan-lsp --run-ignored all -E 'test(m85)'`.
+#[cfg(test)]
+mod m85_field_hover_cost {
+    use super::*;
+    use crate::document::tests::std_root;
+    use crate::keystroke::gate::{loadavg_1m, profile, thread_cpu_now};
+
+    /// The generated WORKSPACE module: `structs` exported structs of ten
+    /// fields each, mechanical, nothing copied from any application.
+    fn field_exhibit(structs: usize) -> String {
+        let mut text = String::from(
+            "// GENERATED by M85's measurement: structs of ten fields, mechanical.\n\n\
+             export *;\n\n",
+        );
+        for index in 0..structs {
+            text.push_str(&format!("struct Shape{index:04} {{\n"));
+            for field in 0..10 {
+                text.push_str(&format!("\tfield_{field}: i32,\n"));
+            }
+            text.push_str("}\n\n");
+        }
+        text
+    }
+
+    /// The small open buffer: two structs of its own, one initializer, and one
+    /// use of the workspace module so it is loaded. Held FIXED across both
+    /// subject sizes, which is what isolates workspace size from file size.
+    const M85_ENTRY: &str = concat!(
+        "import pkg::table::Shape0000;\n\n",
+        "struct Local {\n\tmark: i32,\n\tcount: i32,\n}\n\n",
+        "struct Other {\n\tlabel: str,\n}\n\n",
+        "fun main() {\n",
+        "\tlet _local = Local { mark = 1, count = 2 };\n",
+        "\tlet _other = Other { label = \"x\" };\n",
+        "\tlet _shape = Shape0000 { field_0 = 0, field_1 = 0, field_2 = 0, field_3 = 0, ",
+        "field_4 = 0, field_5 = 0, field_6 = 0, field_7 = 0, field_8 = 0, field_9 = 0 };\n",
+        "}\n",
+    );
+
+    /// Write the exhibit to a fresh directory, land one analysis on the small
+    /// entry, remove the directory, and answer the document with the
+    /// workspace's total field count.
+    fn exhibit(structs: usize) -> (Document, usize) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("vilan_m85_{}_{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create the exhibit directory");
+        std::fs::write(directory.join("table.vl"), field_exhibit(structs))
+            .expect("write the generated module");
+        let entry = directory.join("main.vl");
+        std::fs::write(&entry, M85_ENTRY).expect("write the entry");
+        let document = Document::analyze(M85_ENTRY, &std_root(), &entry);
+        let _ = std::fs::remove_dir_all(&directory);
+        let fields = document
+            .program
+            .as_ref()
+            .expect("the exhibit analyzes")
+            .structs
+            .values()
+            .map(|structure| structure.fields.len())
+            .sum::<usize>();
+        (document, fields)
+    }
+
+    /// `(microseconds per field LOOKUP, microseconds per whole HOVER, field
+    /// count)` over `repetitions` requests on the entry's own field.
+    ///
+    /// The shape is the item's: a SMALL open buffer inside a LARGE workspace.
+    /// `structs` structs live in an imported `pkg::table`, and the entry that
+    /// is hovered declares two of its own — because the scan this measured
+    /// walked `program.structs`, which is every struct in the loaded WORLD, and
+    /// paid `source_of` on each before discovering it was not the entry's. An
+    /// exhibit that put the structs in the entry would measure a different and
+    /// much kinder loop.
+    fn microseconds_per_hover(structs: usize, repetitions: usize) -> Option<(f64, f64, usize)> {
+        let (document, fields) = exhibit(structs);
+        let program = document.program.as_ref().expect("the exhibit analyzes");
+        // The declaration of the entry's own first field.
+        let needle = "struct Local {\n\tmark";
+        let offset =
+            M85_ENTRY.find(needle).expect("the entry's struct") + needle.len() - "mark".len();
+        // Warm the caches the way a session would, so the reading is the
+        // steady state and not the first touch.
+        for _ in 0..8 {
+            let _ = document.field_at_offset(program, offset);
+            let _ = document.hover(offset);
+        }
+        // The SUBJECT: the field lookup alone. Measured apart from `hover`
+        // deliberately — the first reading of this took the whole request and
+        // could not tell the lookup from everything else hover does, which is
+        // how a perf item closes on the wrong number.
+        let started = thread_cpu_now()?;
+        for _ in 0..repetitions {
+            let answer = document.field_at_offset(program, offset);
+            assert!(answer.is_some(), "the exhibit's field must be found");
+        }
+        let lookup = thread_cpu_now()? - started;
+        // The whole request beside it, for scale.
+        let started = thread_cpu_now()?;
+        for _ in 0..repetitions {
+            let answer = document.hover(offset);
+            assert!(answer.is_some(), "the exhibit's field must hover");
+        }
+        let whole = thread_cpu_now()? - started;
+        Some((
+            lookup.as_secs_f64() * 1_000_000.0 / repetitions as f64,
+            whole.as_secs_f64() * 1_000_000.0 / repetitions as f64,
+            fields,
+        ))
+    }
+
+    /// The property the index HAS and the scan does not: the field table is
+    /// the size of the BUFFER, not of the workspace.
+    ///
+    /// A count and not a clock (N116's rule, one file over): this runs in the
+    /// default suite beside eleven other binaries, and the microseconds are
+    /// measured in the `#[ignore]`d gate below where they can be read and not
+    /// failed on. What the count says is the whole claim — twenty workspace
+    /// structs and five hundred give the open buffer the same table, because
+    /// the rows are the entry's own field positions and nothing else.
+    ///
+    /// Non-vacuous: it is asserted over a table the scan does not build, and
+    /// the number is pinned exactly, so a filter that let the workspace's
+    /// 5,000 rows in reds by three orders of magnitude.
+    #[test]
+    fn m85_the_field_table_is_the_buffers_not_the_programs() {
+        let (small, _) = exhibit(20);
+        let (large, _) = exhibit(500);
+        // The entry's own positions: three field declarations (`Local`'s two,
+        // `Other`'s one) and thirteen initializer keys (2 + 1 + `Shape0000`'s
+        // ten, which are written HERE even though the struct is not).
+        assert_eq!(
+            small.field_spans.len(),
+            16,
+            "the rows are the entry's own field positions: {:?}",
+            small
+                .field_spans
+                .iter()
+                .take(20)
+                .map(|(start, end, ..)| (*start, *end))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            small.field_spans.len(),
+            large.field_spans.len(),
+            "a workspace twenty-five times the size gives the open buffer the \
+             same table"
+        );
+        // And it is sorted, which is what makes the bisect an answer.
+        assert!(
+            large
+                .field_spans
+                .windows(2)
+                .all(|pair| pair[0].0 <= pair[1].0),
+            "the rows ascend by start"
+        );
+        // The lookup still answers, at both ends of a row and not past it.
+        let program = large.program.as_ref().expect("the exhibit analyzes");
+        let needle = "struct Local {\n\tmark";
+        let start = M85_ENTRY.find(needle).expect("the entry's struct") + needle.len() - 4;
+        assert!(large.field_at_offset(program, start).is_some());
+        assert!(large.field_at_offset(program, start + 3).is_some());
+        assert!(large.field_at_offset(program, start + 4).is_none());
+    }
+
+    #[test]
+    #[ignore = "M85: a measurement, not a gate — it generates two workspaces and asserts no cost"]
+    fn m85_field_hover_cost_against_the_field_count() {
+        const REPETITIONS: usize = 50;
+        let load = loadavg_1m();
+        let Some((small, small_hover, small_fields)) = microseconds_per_hover(20, REPETITIONS)
+        else {
+            println!("M85: no thread CPU clock on this host; nothing measured");
+            return;
+        };
+        let Some((large, large_hover, large_fields)) = microseconds_per_hover(500, REPETITIONS)
+        else {
+            println!("M85: no thread CPU clock on this host; nothing measured");
+            return;
+        };
+        let ratio = large / small.max(f64::MIN_POSITIVE);
+        let hover_ratio = large_hover / small_hover.max(f64::MIN_POSITIVE);
+        let growth = large_fields as f64 / small_fields as f64;
+        println!(
+            "M85 profile={} · lookup: {small_fields} fields {small:.2} µs, \
+             {large_fields} fields {large:.2} µs, ratio {ratio:.1}× · whole hover: \
+             {small_hover:.1} µs, {large_hover:.1} µs, ratio {hover_ratio:.1}× · over \
+             {growth:.0}× the fields · load={load}",
+            profile()
+        );
     }
 }

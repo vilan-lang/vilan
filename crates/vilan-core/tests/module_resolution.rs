@@ -3,6 +3,27 @@
 //! both existing is an ambiguity error, and the `none` platform gates out the
 //! platform `std` layers. These need real files on disk (the loader reads them),
 //! so each writes a throwaway package directory and analyzes against it.
+//!
+//! # No assertion in this suite reads a clock (N116)
+//!
+//! The suite runs eleven ways at once, under `nextest -j 32` with other lanes
+//! building beside it, and a duration measured there is a measurement of the
+//! machine. That is true of a WALL reading and it is true of the two CPU
+//! clocks as well: `/proc/self/stat` is the whole PROCESS's CPU, so every
+//! other test thread's work lands in it, and a thread clock at eight
+//! microseconds is a handful of scheduler slices on caches somebody else owns.
+//! M75's own bound went NEGATIVE under a parallel lane (`-10 ms` for the
+//! delta a collision was supposed to cost), which is not a regression and not
+//! a pass — it is noise wearing a millisecond label.
+//!
+//! So a performance claim in this suite is asserted over a COUNT the pass
+//! itself produces — rows banked, bodies walked, candidates visited — which is
+//! the property an index has and a scan does not, and which does not move when
+//! the box is busy. The durations are still MEASURED and still PRINTED, tagged
+//! with the load average, because a number to look at is worth having; what
+//! they are not is a thing that can fail. A budget that genuinely must read a
+//! clock lives behind `#[ignore]` and is asserted in release only
+//! (`vilan-lsp`'s `keystroke::gate` is the worked example).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -7357,18 +7378,24 @@ fn m75_cpu_ms(
 /// two-package collision in a large program paid all of it.
 ///
 /// The bound is a SHAPE, not a budget: the same collision is measured with a
-/// tenth of the statements and with all of them, and the large leg may not cost
-/// materially more than the small one. A ratio survives the profile (every
-/// number here is a debug number under `cargo test`) and the load average in a
-/// way an absolute millisecond figure would not, and it is the exact property
-/// an index has and a scan does not.
+/// tenth of the statements and with all of them, and the large leg may not
+/// visit materially more rows than the small one — the exact property an index
+/// has and a scan does not.
+///
+/// **What is asserted is the COUNT** (N116). A ratio of two millisecond
+/// readings survives the profile and the load average better than an absolute
+/// figure does, and it does not survive them well enough: the clock here is
+/// `/proc/self/stat`, the whole PROCESS's CPU, and under a parallel lane the
+/// small leg's delta came back negative. The durations are measured and
+/// printed with the load average; the assertions are over `carried`.
 ///
 /// **The sizes are larger than the item's 500 statements**, and deliberately:
 /// the scan's cost is the PRODUCT `collisions x files x statements`, and at 50
 /// collisions and 500 statements the whole of it — about 3 million row visits —
-/// sits inside one 10 ms tick of the `/proc` clock, which makes for a pin that
-/// cannot tell the two implementations apart. 250 colliding members and 1,500
-/// statements lift it to 650 ms against the index's 60.
+/// sits inside one 10 ms tick of the `/proc` clock, which makes for a printed
+/// line that cannot tell the two implementations apart. 250 colliding members
+/// and 1,500 statements lift it to 650 ms against the index's 60, which is the
+/// gap a reader of the printed row is meant to see.
 // The reader is `/proc/self/stat`, so the pin exists only where that file does
 // (Order 37's seal: the Windows shard has no process CPU clock to read and the
 // bound would be a wall number wearing a CPU label — M15).
@@ -7443,20 +7470,26 @@ fn m75_a_collisions_refusal_does_not_scale_with_the_importers_statement_count() 
         "both colliding legs must bank rows ({small_carried}, {large_carried}), or the \
          bound above is asserted over two zeroes"
     );
-    // `carried` is still BUILT per statement (one `statement_sources` walk each,
-    // once, outside the product), so the large leg is allowed to cost more —
-    // just not in PROPORTION, which is the whole difference between an index
-    // and a scan. The allowance covers that one pass plus the /proc clock's own
-    // 10 ms tick: measured on this tree at these sizes, the index answers
-    // small=10 ms / large=60 ms and the scan it replaces answers 80 ms /
-    // 650 ms, so the bound sits between them with room on both sides.
-    let allowance = 120.0;
-    assert!(
-        large_delta <= small_delta.max(0.0) * 2.0 + allowance,
-        "a collision cost {large_delta:.0} ms with {LARGE} import statements in the \
-         entry and {small_delta:.0} ms with {SMALL} — it is following the statement \
-         count, which is the linear scan M75 removed"
-    );
+    // N116: the millisecond half of this pin is GONE, and the counts above are
+    // the whole claim.
+    //
+    // It read `/proc/self/stat` — the whole PROCESS's CPU — and asserted that
+    // the large leg's collision delta did not follow the statement count. Under
+    // `nextest -j 32` that number includes every sibling test thread, so the
+    // small leg's delta came back NEGATIVE (`-10 ms`) often enough to red the
+    // suite for reasons that had nothing to do with the refusal. A bound whose
+    // instrument can return a negative value for the quantity it measures is
+    // not measuring that quantity.
+    //
+    // Nothing is lost that the counts do not already hold. `carried` is the
+    // linear pass M77 narrowed, and it is bounded by the FILES rather than by
+    // the statements — which is the same sentence the milliseconds were trying
+    // to say, asserted over a number the pass produces instead of over the
+    // machine's mood. The durations are still measured and still printed above
+    // with the load average, and they remain the right thing to READ when
+    // somebody suspects this pass: on a quiet box the index answers
+    // small=10 ms / large=60 ms where the scan it replaced answered 80 ms /
+    // 650 ms, and that gap is visible in the printed line.
 }
 
 /// E185 — the S4 refusal names the importing module, and is PLACED.

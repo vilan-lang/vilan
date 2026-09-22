@@ -6837,3 +6837,89 @@ fn b310_a_generic_body_whose_parameter_stays_abstract_is_unchanged() {
         "1\n2\n1\n2\n",
     );
 }
+
+// --- N113: `()` is not the unit, and `void` is not a name -----------------------
+//
+// Two spellings the grammar took and the language has no meaning for.
+//
+// `()` parses as the EMPTY tuple type, and no expression produces one, so
+// every field, parameter or return written at it was uninhabited: the author
+// read "Expected (), but got void instead" about the body they had just
+// written, which names the mistake backwards. The unit type is `void`.
+//
+// `void` is the unit VALUE's spelling, read by the atom production
+// unconditionally (§2.2 lists it contextual, and everywhere else it is — a
+// struct field or a method may be called `void` and reads back through its
+// receiver). A BINDER is the position where "contextual" stops being true:
+// `let void = 3;` bound a name that no later `void` could ever mean, and the
+// read was refused with the unit's type, pointing at the read rather than at
+// the binding. One binder production serves `let`, `for`, a function parameter
+// and a match capture, so all four are the same refusal.
+
+#[test]
+fn n113_the_empty_tuple_type_is_refused_by_name_pointing_at_void() {
+    for source in [
+        "struct Box {\n    slot: (),\n}\n\nfun main() {}\n",
+        "fun nothing(): () {\n}\n\nfun main() {}\n",
+        "fun take(value: ()) {\n}\n\nfun main() {}\n",
+        "fun main() {\n    let held: () = void;\n}\n",
+    ] {
+        assert_fails_with(source, "the unit type is spelled `void`");
+    }
+}
+
+#[test]
+fn n113_a_written_tuple_type_of_two_or_more_still_parses() {
+    // The refusal is the EMPTY case only — the production it lives in is the
+    // ordinary tuple type's, and a one-tuple is deliberately a tuple too.
+    assert_compiles(
+        r#"
+        fun first(pair: (i32, str)): i32 {
+            pair.0
+        }
+
+        fun main() {
+            let _ = first((1, "a"));
+        }
+        "#,
+    );
+}
+
+#[test]
+fn n113_a_binder_named_void_is_refused_in_every_binding_position() {
+    for source in [
+        "fun main() {\n    let void = 3;\n    let _ = void;\n}\n",
+        "fun take(void: i32) {\n}\n\nfun main() {\n    take(1);\n}\n",
+        "fun main() {\n    for void in [1, 2] {\n    }\n}\n",
+        "fun main() {\n    let (void, other) = (1, 2);\n    let _ = other;\n}\n",
+    ] {
+        assert_fails_with(source, "`void` is the unit value's own spelling");
+    }
+}
+
+#[test]
+fn n113_a_field_named_void_is_not_a_binder_and_still_works() {
+    // The line the refusal must not cross: `void` reached through a receiver
+    // is a member name, not an atom, so it reads back exactly as written.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Holder {
+            void: i32,
+        }
+
+        impl Holder {
+            fun void(self): i32 {
+                self.void
+            }
+        }
+
+        fun main() {
+            let holder = Holder { void = 7 };
+            print(holder.void());
+        }
+        "#,
+        "7\n",
+    );
+}

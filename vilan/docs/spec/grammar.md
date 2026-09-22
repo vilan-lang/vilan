@@ -421,7 +421,7 @@ atom    = literal | IDENT | IDENT generic-args | struct-init
         | "(" expression ")" | tuple | list
         | tuple-comprehension | macro-invocation | macro-block
         | element | css-block ;
-literal = NUMBER | STRING | "true" | "false" | "null" ;
+literal = NUMBER | STRING | "true" | "false" | "null" | "void" ;
 tuple   = "(" ( spread | expression "," entry { "," entry } [ "," ] ) ")" ;
 entry   = spread | expression ;
 spread  = ".." expression ;

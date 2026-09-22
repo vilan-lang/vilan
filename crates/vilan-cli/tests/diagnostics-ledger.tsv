@@ -323,7 +323,7 @@ row	flagship	key
 289	flagship	{name} is compile-time-only; evaluate this call inside a `const` expression
 290	flagship	{subject} is compile-time-only; call it directly inside a `const` expression — a compile-time-only function has no runtime value form
 291	-	{headline}{subject}: {}{}
-292	-	internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)
+292	-	internal error: the compiler panicked analyzing `{}` (this is a bug; the details are on stderr)
 293	-	internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)
 294	-	the `macro_std` package was not found beside `std`
 295	-	the macro `{}` did not compile to a callable function
@@ -572,3 +572,4 @@ row	flagship	key
 548	-	{count} `context` {checks} did not run: this program does not type, so the call graph it would be checked over has holes in it — fix the errors above and check again
 549	-	`external fun {name}` names no body: an external needs an `[extern(..)]` binding saying what the host calls it, or it is not external — give it a body. Without one, a call to it emits a name nothing in the program defines
 550	-	`{symbol}` is a host PROPERTY, not a function: the function form of `[extern]` emits a CALL, so this binding reaches the host as `{symbol}()` and fails there. Read it through a runtime helper (`std::dom`'s `__dom_active_element` and `__dom_window` are that shape), or, if the property hangs off a value the program holds rather than off a global, bind it with `[extern(get, "..")]` on a receiver
+551	-	`{}` is not a derivable trait: nothing declares a `{}` macro — not std, not this file, and nothing it imports. std derives {}; a derive of your own is a `macro fun {}` in this file or imported by name

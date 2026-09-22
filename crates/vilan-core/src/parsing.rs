@@ -5038,6 +5038,27 @@ impl<'a, 'src> Parser<'a, 'src> {
         // span coincide here. They part company one level up, where the match/`is`
         // grammar's `let`/`mut` arm widens the pattern span over the keyword.
         let name_span = self.span_from(start);
+        // N113: `void` is the unit VALUE's spelling, and the atom production
+        // reads every `void` as `Node::Void` unconditionally (it is contextual,
+        // §2.2, but not contextual here). So a binder may take the name and
+        // nothing can ever read it back: `let void = 3; let x: i32 = void;` is
+        // refused `Expected i32, but got void`, about a binding the author is
+        // looking straight at. One binder production serves `let`, `for`, a
+        // function parameter and a match capture, so this is the one site.
+        // Only a BINDER — a struct field or a method named `void` is reached
+        // through a receiver and reads back perfectly well.
+        if name == "void" {
+            self.errors.push(ParseError {
+                span: name_span,
+                reason: ParseErrorReason::Rule(
+                    "`void` is the unit value's own spelling, so a binding cannot take \
+                     it: every later `void` still reads as the unit, not as this \
+                     binding — name it something else",
+                ),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
         Some((Pattern::Binding(name, false, name_span), name_span))
     }
 
@@ -5459,6 +5480,24 @@ impl<'a, 'src> Parser<'a, 'src> {
             let elements =
                 parser.comma_list(Self::parse_type, |parser| parser.peek_is_ctrl(')'))?;
             parser.expect_ctrl(')')?;
+            // N113: `()` reads as the EMPTY tuple, and nothing can produce one
+            // — a field, parameter or return written at it is uninhabited, so
+            // every program that touched it was refused somewhere else, with a
+            // message about the type it did not get. The unit is `void`, and
+            // that is the whole of what the author meant. Refused here rather
+            // than in the analyzer because the spelling is the mistake: the
+            // type is read, so the rest of the declaration still parses.
+            if elements.is_empty() {
+                parser.errors.push(ParseError {
+                    span: parser.span_from(start),
+                    reason: ParseErrorReason::Rule(
+                        "the unit type is spelled `void`: `()` is the empty tuple, \
+                         which no expression can produce",
+                    ),
+                    context: parser.context_stack.clone(),
+                    hint: None,
+                });
+            }
             Some((Node::Tuple(elements), parser.span_from(start)))
         })
     }

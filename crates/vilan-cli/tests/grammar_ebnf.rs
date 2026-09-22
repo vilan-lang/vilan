@@ -104,10 +104,38 @@ const NON_KEYWORD_TERMINALS: &[(&str, &str)] = &[
         "the contextual trailing modifier on an import statement (§3.2, B318)",
     ),
     ("_", "the wildcard pattern"),
+    (
+        "void",
+        "the unit VALUE, the sixth literal (§2.2 lists it contextual; N113 — \
+         the atom production read every `void` as the unit from the day it \
+         shipped, and §3's literal production did not say so)",
+    ),
 ];
 
 /// Nonterminals the document defines in PROSE rather than with a production,
 /// with where. Each is a token run the grammar deliberately does not shape.
+/// N113: `void` is a LITERAL, and §3's literal production must say so.
+///
+/// The atom production has read every `void` as the unit value since the day
+/// it shipped, and §2.2 lists the word; §3's `literal` rule offered five
+/// alternatives and not this one, so the normative grammar described a
+/// language in which the unit value cannot be written. Held by name rather
+/// than by the coverage check above, which only asks that the word appear
+/// SOMEWHERE — it appeared in two prose sentences, which is how this stayed
+/// invisible.
+#[test]
+fn n113_the_literal_production_offers_the_unit_value() {
+    let grammar = read("vilan/docs/spec/grammar.md");
+    let production = grammar
+        .lines()
+        .find(|line| line.starts_with("literal "))
+        .expect("§3 writes a `literal` production");
+    assert!(
+        production.contains("\"void\""),
+        "the literal production must offer `void`, the unit value: {production}"
+    );
+}
+
 const PROSE_DEFINED: &[(&str, &str)] = &[(
     "expr-span",
     "a raw balanced token run handed to a macro as source text — §3.3's \
