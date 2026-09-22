@@ -36,6 +36,7 @@ import pkg::reactive::{
 	SignalCell,
 	Source,
 	Subscription,
+	as_derivation,
 	at_release_settle,
 	at_settle,
 	batch,
@@ -3379,6 +3380,11 @@ export impl RemoteSource<type T> with Source<Option<T>> {
 	/// `T` belongs (`"Loading…"` from a `RemoteSource<i32>`).
 	fun map<U>(self, transform: sync |Option<T>| U): SignalCell<U> {
 		let derived = SignalCell::new(transform(self.get()));
+		// A DERIVATION (A110 door 2), exactly as `Source::map` is: `lease` bottoms
+		// out in `cache.sub`, and `acquire` mints no subscriber on the way, so the
+		// mark reaches that one attach. Without it the mapped cell is EFFECT-class
+		// and a lower-id effect on the same mirror reads it stale for one wave.
+		as_derivation();
 		get_owner().take(self.lease(|value| {
 			derived.set(transform(value));
 		}));
@@ -4224,6 +4230,11 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> with S
 	/// undefined owner.
 	fun map<U>(self, transform: sync |Option<List<T>>| U): SignalCell<U> {
 		let derived = SignalCell::new(transform(self.get()));
+		// A DERIVATION (A110 door 2), exactly as `Source::map` is: `lease` bottoms
+		// out in `cache.sub`, and `acquire` mints no subscriber on the way, so the
+		// mark reaches that one attach. Without it the mapped cell is EFFECT-class
+		// and a lower-id effect on the same mirror reads it stale for one wave.
+		as_derivation();
 		get_owner().take(self.lease(|value| {
 			derived.set(transform(value));
 		}));

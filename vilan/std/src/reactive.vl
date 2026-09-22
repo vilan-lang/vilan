@@ -132,7 +132,7 @@ let minting_derivation: Shared<bool> = Shared::new(false);
 /// reads better and costs a `__clone` of the source per derivation, because
 /// returning a value is a copy — nineteen new copy sites across the corpus.
 /// Nothing is passed and nothing is returned, so neither is bought.
-fun as_derivation() {
+export fun as_derivation() {
 	minting_derivation.write() = true;
 }
 
