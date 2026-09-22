@@ -1,20 +1,19 @@
-// `std::build` — what a browser leg's build emitted, as the build itself knows
-// it (`fullstack-dx.md` §5.2, RATIFIED 2026-08-11).
+// `std::build` — what a browser leg's build emitted, as the build itself knows it
+// (`fullstack-dx.md` §5.2, RATIFIED 2026-08-11).
 //
-// The compiler knows, at the moment it writes `dist/`, exactly what it wrote:
-// the bundle's file name, whether the leg compiled any styles, every route
-// chunk, and how the bundle must be loaded for chunk resolution to work.
-// Nothing carried that knowledge across the leg boundary, so every server in
-// this language restated it by hand — a `fs::read_file_to_str` per artifact
-// over a path typed from memory, and a `match request.path()` table nothing
-// checked against anything. Rename a leg and every one of those lines still
-// compiles.
+// The compiler knows, at the moment it writes `dist/`, exactly what it wrote: the
+// bundle's file name, whether the leg compiled any styles, every route chunk, and
+// how the bundle must be loaded for chunk resolution to work. Nothing carried that
+// knowledge across the leg boundary, so every server in this language restated it
+// by hand — a `fs::read_file_to_str` per artifact over a path typed from memory,
+// and a `match request.path()` table nothing checked against anything. Rename a leg
+// and every one of those lines still compiles.
 //
 // This module is the channel. `build_of(leg)` reads the leg's BUILD MANIFEST —
 // `dist/<leg>.chunks.json`, written on every build of a browser leg since
-// `fullstack-dx.md` §10.3 — and hands back the description.
-// `std::http`'s `ServerBuilder::serve_build` is its first consumer, and turns
-// the whole ceremony into one line.
+// `fullstack-dx.md` §10.3 — and hands back the description. `std::http`'s
+// `ServerBuilder::serve_build` is its first consumer, and turns the whole ceremony
+// into one line.
 
 import pkg::bytes::Bytes;
 import pkg::fs;
@@ -29,31 +28,30 @@ import pkg::watch::is_watching;
 export struct LegBuild {
 	/// The leg's name — `client` for `[entry.client]`.
 	leg: str,
-	/// The directory holding this build's artifacts, which is what their file
-	/// names are relative to.
+	/// The directory holding this build's artifacts, which is what their file names
+	/// are relative to.
 	dist: str,
 	/// The eager bundle's file name, e.g. `client.js`.
 	bundle: str,
-	/// The style sidecar's file name, when the build emitted one. `None` means
-	/// the leg compiled no styles — a fact a hand-written shell must respect
-	/// and cannot see, and one `fs::stat` probe can only half-answer (it
-	/// cannot tell a missing stylesheet from a stale one a previous build
-	/// left).
+	/// The style sidecar's file name, when the build emitted one. `None` means the
+	/// leg compiled no styles — a fact a hand-written shell must respect and cannot
+	/// see, and one `fs::stat` probe can only half-answer (it cannot tell a missing
+	/// stylesheet from a stale one a previous build left).
 	styles: Option<str>,
-	/// The route chunks' file names, in the build's own order. Empty for a leg
-	/// that does not `split` (`bundle-splitting.md` §4).
+	/// The route chunks' file names, in the build's own order. Empty for a leg that
+	/// does not `split` (`bundle-splitting.md` §4).
 	chunks: List<str>,
-	/// Whether the bundle must be loaded as a classic script — true exactly
-	/// when the leg splits, because chunk resolution reads
-	/// `document.currentScript`, which is `null` inside a module script.
+	/// Whether the bundle must be loaded as a classic script — true exactly when
+	/// the leg splits, because chunk resolution reads `document.currentScript`,
+	/// which is `null` inside a module script.
 	classic_script: bool,
 	/// The non-code resources `const asset::bundle` carried into this build,
 	/// as their package-relative names — `static/logo.png` (kolt.local 029).
 	/// Empty for a leg that bundled none.
 	///
 	/// These are what let a built app need nothing but `dist/`. Before them a
-	/// server read its own `src/` at runtime, so shipping the build alone
-	/// shipped a program that 404s its own icon.
+	/// server read its own `src/` at runtime, so shipping the build alone shipped a
+	/// program that 404s its own icon.
 	assets: List<str>,
 }
 
@@ -67,8 +65,8 @@ export impl LegBuild {
 	///
 	/// The file side is `path::join`ed rather than interpolated: a name may now
 	/// carry a subdirectory, and `join` normalizes the result where
-	/// `i"{dist}/{name}"` would have produced whatever the two sides happened
-	/// to spell (kolt.local 017/029).
+	/// `i"{dist}/{name}"` would have produced whatever the two sides happened to
+	/// spell (kolt.local 017/029).
 	fun artifacts(self): List<(str, str)> {
 		mut names = [self.bundle];
 		match self.styles {
@@ -89,13 +87,13 @@ export impl LegBuild {
 	}
 }
 
-/// Why a leg's build could not be described. Named, not a panic: a server that
-/// asks about a leg it never built has made a recoverable mistake, and the
-/// message says which one.
+/// Why a leg's build could not be described. Named, not a panic: a server that asks
+/// about a leg it never built has made a recoverable mistake, and the message says
+/// which one.
 export enum BuildError {
-	/// No build manifest where one was expected — the payload is the path.
-	/// The leg was never built, or the process is running from a directory
-	/// that is not the project root.
+	/// No build manifest where one was expected — the payload is the path. The leg
+	/// was never built, or the process is running from a directory that is not the
+	/// project root.
 	NotBuilt(str),
 	/// A manifest is there but does not read as one this toolchain wrote — the
 	/// payload is the path.
@@ -112,16 +110,17 @@ export impl BuildError {
 	}
 }
 
-/// The description of `leg`'s most recent build, read from `dist/<leg>.chunks.json`.
+/// The description of `leg`'s most recent build, read from
+/// `dist/<leg>.chunks.json`.
 ///
 /// A leg that was never built is `Err(BuildError::NotBuilt)` and not an empty
 /// build: since the manifest is written on EVERY build of a browser leg, its
 /// absence means one thing and `"chunks": []` means another, which is exactly
 /// the difference §5.9 argued the always-written manifest buys.
 export fun build_of(leg: str): Result<LegBuild, BuildError> {
-	// `dist/` is where every multi-entry build puts a leg, and a server runs
-	// from the project root — the two facts the hand-written `"dist/client.js"`
-	// already assumed, now assumed in exactly one place.
+	// `dist/` is where every multi-entry build puts a leg, and a server runs from
+	// the project root — the two facts the hand-written `"dist/client.js"` already
+	// assumed, now assumed in exactly one place.
 	let dist = "dist";
 	let manifest_path = path::join(dist, i"{leg}.chunks.json");
 	if fs::stat(manifest_path).is_none() {
@@ -135,11 +134,11 @@ export fun build_of(leg: str): Result<LegBuild, BuildError> {
 
 /// `build_of(leg)`'s value, or a stop naming the leg.
 ///
-/// The server-boot idiom, and the reason it is worth a name of its own: a
-/// server that cannot describe its own build has nothing to serve, so refusing
-/// to start beats 404ing every asset for the life of the process
-/// (`fullstack-dx.md` §5.4, §10.7). `!` cannot express this at a boot site —
-/// it asserts-or-RETURNS, and `main` returns no `Result` to carry the residual.
+/// The server-boot idiom, and the reason it is worth a name of its own: a server
+/// that cannot describe its own build has nothing to serve, so refusing to start
+/// beats 404ing every asset for the life of the process (`fullstack-dx.md` §5.4,
+/// §10.7). `!` cannot express this at a boot site — it asserts-or-RETURNS, and
+/// `main` returns no `Result` to carry the residual.
 export fun require_build(leg: str): LegBuild {
 	match build_of(leg) {
 		Ok(let build) => build,
@@ -148,8 +147,8 @@ export fun require_build(leg: str): LegBuild {
 }
 
 /// A parsed manifest, or `Unreadable` if it does not carry the fields this
-/// toolchain writes. Checked rather than coerced: `coerce_str` over an absent
-/// field yields the string `"undefined"`, which would become a route.
+/// toolchain writes. Checked rather than coerced: `coerce_str` over an absent field
+/// yields the string `"undefined"`, which would become a route.
 fun read_manifest(dist: str, path: str, manifest: JsonValue): Result<LegBuild, BuildError> {
 	if !manifest.has_field("leg")
 		|| !manifest.has_field("entry")
@@ -163,12 +162,12 @@ fun read_manifest(dist: str, path: str, manifest: JsonValue): Result<LegBuild, B
 	for chunk in manifest.field("chunks").elements() {
 		chunks.push(coerce_str(chunk.field("file")));
 	}
-	// `assets` is read where present and defaults to empty — the ONE field
-	// this function does not require. A manifest written before bundling
-	// existed (kolt.local 029) is not unreadable: it truthfully describes a
-	// build that carried no resources, because under that toolchain none
-	// could be carried. Every other field predates any manifest on disk, so
-	// its absence really does mean "not one this toolchain wrote".
+	// `assets` is read where present and defaults to empty — the ONE field this
+	// function does not require. A manifest written before bundling existed
+	// (kolt.local 029) is not unreadable: it truthfully describes a build that
+	// carried no resources, because under that toolchain none could be carried.
+	// Every other field predates any manifest on disk, so its absence really does
+	// mean "not one this toolchain wrote".
 	mut assets: List<str> = [];
 	if manifest.has_field("assets") {
 		for asset in manifest.field("assets").elements() {
@@ -202,20 +201,20 @@ export struct BuildAsset {
 	///
 	/// `Bytes`, not `str`: an artifact is whatever the build wrote, and a UTF-8
 	/// decode is lossy over every one of them that is not text. While this was a
-	/// `str` the content type was a promise the pipeline could not keep — the
-	/// table could name `image/png` for a file it had already destroyed. kolt
-	/// measured the damage on its own favicon: 483 bytes on disk, 853 after the
-	/// read (kolt.local 030).
+	/// `str` the content type was a promise the pipeline could not keep — the table
+	/// could name `image/png` for a file it had already destroyed. kolt measured
+	/// the damage on its own favicon: 483 bytes on disk, 853 after the read
+	/// (kolt.local 030).
 	content: Bytes,
 }
 
 /// Read every artifact `build` names, ONCE, at boot — the list
 /// `ServerBuilder::serve_build` installs in front of the app's own handler.
 ///
-/// A named artifact that is not on disk is a broken build, and it STOPS the
-/// server, naming the file and the leg (`fullstack-dx.md` §5.4). 404ing it per
-/// request would be the same silence this design exists to remove: the build
-/// said it wrote the file, so its absence is not a routing question.
+/// A named artifact that is not on disk is a broken build, and it STOPS the server,
+/// naming the file and the leg (`fullstack-dx.md` §5.4). 404ing it per request
+/// would be the same silence this design exists to remove: the build said it wrote
+/// the file, so its absence is not a routing question.
 export fun load_build(build: LegBuild): List<BuildAsset> {
 	mut assets: List<BuildAsset> = [];
 	for artifact in build.artifacts() {
@@ -239,9 +238,8 @@ export fun load_build(build: LegBuild): List<BuildAsset> {
 	assets
 }
 
-/// The artifact `path` asks for, if this build has one. A query string is
-/// ignored, so `/client.js?v=2` reaches the bundle — a cache-buster is not a
-/// different file.
+/// The artifact `path` asks for, if this build has one. A query string is ignored,
+/// so `/client.js?v=2` reaches the bundle — a cache-buster is not a different file.
 export fun asset_for(assets: List<BuildAsset>, path: str): Option<BuildAsset> {
 	let route = path.split("?")[0];
 	for asset in assets {
@@ -255,28 +253,28 @@ export fun asset_for(assets: List<BuildAsset>, path: str): Option<BuildAsset> {
 /// The bytes to serve for `asset` right now — the dev-mode freshness policy
 /// (`dev-refresh.md` §5, item 1).
 ///
-/// Under `run --watch`, re-read per request: every request is an opportunity to
-/// be fresh, and taking it needs no signalling protocol at all — which is the
-/// flaw that sank the re-run-on-round hook, since editing `app.html` produces
-/// no round to fire on. Outside a watch, serve the copy read at boot: the bytes
-/// cannot move under a running server that nobody is editing, and a release
-/// server should not pay a syscall per asset request.
+/// Under `run --watch`, re-read per request: every request is an opportunity to be
+/// fresh, and taking it needs no signalling protocol at all — which is the flaw
+/// that sank the re-run-on-round hook, since editing `app.html` produces no round
+/// to fire on. Outside a watch, serve the copy read at boot: the bytes cannot move
+/// under a running server that nobody is editing, and a release server should not
+/// pay a syscall per asset request.
 ///
-/// This makes the SERVER's copies fresh. The dev channel's push half (the css
-/// and js hot-swaps) is untouched and remains the way a browser is told.
+/// This makes the SERVER's copies fresh. The dev channel's push half (the css and
+/// js hot-swaps) is untouched and remains the way a browser is told.
 ///
-/// The re-read is the ordinary async `read_bytes`, awaited before the response
-/// is built. Nothing on this path forbids suspending: `serve_build`'s handler is
-/// reached from `respond_from_build`, which is `async` because it awaits the
-/// app's own handler, and the node callback in `Server::start` already suspends
-/// on `read_request_bytes` before a byte is written. A synchronous read here
-/// bought nothing, and it once justified its own existence in `std::fs` by
-/// claiming this caller could not suspend.
+/// The re-read is the ordinary async `read_bytes`, awaited before the response is
+/// built. Nothing on this path forbids suspending: `serve_build`'s handler is
+/// reached from `respond_from_build`, which is `async` because it awaits the app's
+/// own handler, and the node callback in `Server::start` already suspends on
+/// `read_request_bytes` before a byte is written. A synchronous read here bought
+/// nothing, and it once justified its own existence in `std::fs` by claiming this
+/// caller could not suspend.
 ///
 /// Both halves read the same way they store: `Bytes` out, decoded by nobody. A
-/// watch that re-read as text would have served a fresh CORRUPTION of every
-/// binary artifact, and differed from the boot copy in exactly the bytes a
-/// `.png` is made of.
+/// watch that re-read as text would have served a fresh CORRUPTION of every binary
+/// artifact, and differed from the boot copy in exactly the bytes a `.png` is made
+/// of.
 export fun asset_body(asset: BuildAsset): Bytes {
 	if is_watching() {
 		fs::read_bytes(asset.file)
@@ -311,8 +309,8 @@ export fun asset_body(asset: BuildAsset): Bytes {
 /// The rows are derived from `mime-db` — the IANA/Apache/nginx aggregate that
 /// vite's `mrmime` is generated from — via
 /// `crates/vilan-core/tests/mime-table.tsv`, and regenerated and gated by
-/// `crates/vilan-core/tests/mime_table_sync.rs`. Nothing here is typed from
-/// memory, which is the only way a table this shape does not rot.
+/// `crates/vilan-core/tests/mime_table_sync.rs`. Nothing here is typed from memory,
+/// which is the only way a table this shape does not rot.
 ///
 /// A `text/*` row spells `charset=utf-8`; nothing else carries a charset. Both
 /// halves are load-bearing. The body goes out as raw bytes (`asset_response`),

@@ -1,9 +1,9 @@
-// Typed atomic styles, compiled (proposal/ui-styling.md). A `Style` maps
-// property SLOTS to `(class name, declaration)` pairs; each property method
-// merges one property in — LAST WINS, a record update, never a cascade — and
-// emits the atomic rule through the const-only asset channel, so styles
-// construct inside `const` expressions and the whole stylesheet exists at
-// build time. `+` combines named styles (right side wins per property).
+// Typed atomic styles, compiled (proposal/ui-styling.md). A `Style` maps property
+// SLOTS to `(class name, declaration)` pairs; each property method merges one
+// property in — LAST WINS, a record update, never a cascade — and emits the atomic
+// rule through the const-only asset channel, so styles construct inside `const`
+// expressions and the whole stylesheet exists at build time. `+` combines named
+// styles (right side wins per property).
 //
 // Slot keys encode conditions as `media:condition:property`, where a CONDITION
 // is up to three optional tokens, space-joined outside-in: a RELATION token
@@ -50,8 +50,8 @@ import pkg::range::Range;
 
 // --- values -------------------------------------------------------------------
 
-/// A CSS length: a token's IDENTITY (`var(--space-4)`) or a literal unit.
-/// `root` carries the token's `:root` declaration ("" when none).
+/// A CSS length: a token's IDENTITY (`var(--space-4)`) or a literal unit. `root`
+/// carries the token's `:root` declaration ("" when none).
 export struct Length {
 	text: str,
 	root: str,
@@ -66,8 +66,8 @@ export impl Length {
 		Length { text = i"{value}rem", root = "" }
 	}
 
-	/// Relative to the element's own font size — the unit `letter_spacing`
-	/// and optical spacing are written in.
+	/// Relative to the element's own font size — the unit `letter_spacing` and
+	/// optical spacing are written in.
 	fun em(value: f64): Length {
 		Length { text = i"{value}em", root = "" }
 	}
@@ -76,8 +76,7 @@ export impl Length {
 		Length { text = i"{value}%", root = "" }
 	}
 
-	/// Viewport units. `min_height(Length::vh(100.0))` is the full-height
-	/// shell.
+	/// Viewport units. `min_height(Length::vh(100.0))` is the full-height shell.
 	fun vh(value: f64): Length {
 		Length { text = i"{value}vh", root = "" }
 	}
@@ -91,18 +90,18 @@ export impl Length {
 	}
 
 	/// Bare `0` — the unit-less zero CSS accepts for any length, and what the
-	/// `min-width:0` flex idiom and the `inset:0` fill-the-parent idiom are
-	/// written as. `space(0)` renders `var(--space-0)` and `Length::px(0.0)`
-	/// renders `0px`; all three compute the same, and this one is the spelling.
+	/// `min-width:0` flex idiom and the `inset:0` fill-the-parent idiom are written
+	/// as. `space(0)` renders `var(--space-0)` and `Length::px(0.0)` renders `0px`;
+	/// all three compute the same, and this one is the spelling.
 	fun zero(): Length {
 		Length { text = "0", root = "" }
 	}
 
 	/// A `calc()` expression, written WITHOUT the wrapper:
-	/// `Length::calc("100% - 2rem")`. The property stays typed while the
-	/// arithmetic — which the `Length` representation deliberately does not
-	/// model — rides a string. Composes with tokens through their rendered
-	/// form, e.g. `Length::calc("100vh - var(--space-16)")`.
+	/// `Length::calc("100% - 2rem")`. The property stays typed while the arithmetic
+	/// — which the `Length` representation deliberately does not model — rides a
+	/// string. Composes with tokens through their rendered form, e.g.
+	/// `Length::calc("100vh - var(--space-16)")`.
 	///
 	/// Sugar over `raw`: `Length::calc(e)` is `Length::raw("calc(" + e + ")")`.
 	fun calc(expression: str): Length {
@@ -117,26 +116,26 @@ export impl Length {
 	/// wrapper supplied; use this when the value is already whole, which is also
 	/// what lets one named expression be reused across properties.
 	///
-	/// (`clamp`/`min`/`max` also nest inside `calc()`, so `calc` reaches them
-	/// too — at the cost of a wrapper the author did not write.)
+	/// (`clamp`/`min`/`max` also nest inside `calc()`, so `calc` reaches them too —
+	/// at the cost of a wrapper the author did not write.)
 	fun raw(expression: str): Length {
 		check_not_blank("Length::raw", expression);
 		Length { text = expression, root = "" }
 	}
 
 	/// The typed end of the dynamic-value channel: pairs with
-	/// `view.style_var(name, signal)` writing the custom property at runtime.
-	/// The name is the custom property's own, dashes included — checked at const
-	/// time, because `var(w)` is a dropped declaration rather than an error
-	/// anywhere a browser can tell you about it.
+	/// `view.style_var(name, signal)` writing the custom property at runtime. The
+	/// name is the custom property's own, dashes included — checked at const time,
+	/// because `var(w)` is a dropped declaration rather than an error anywhere a
+	/// browser can tell you about it.
 	fun var(name: str): Length {
 		check_custom_property_name(name);
 		Length { text = i"var({name})", root = "" }
 	}
 }
 
-/// The spacing scale (Tailwind's, rem-based). The scale is data; the
-/// validation is const evaluation — an unknown step fails the build.
+/// The spacing scale (Tailwind's, rem-based). The scale is data; the validation is
+/// const evaluation — an unknown step fails the build.
 export fun space(step: i32): Length {
 	let value = match step {
 		0 => "0px",
@@ -181,11 +180,11 @@ export impl Color {
 	}
 
 	/// `currentColor` — the element's own `color`, used as a colour value: the
-	/// border, background or SVG fill that follows the text rather than
-	/// naming a token of its own. Declares nothing, like `hex` and `var`, and
-	/// `.alpha()` composes over it through the relative-colour form
-	/// (`rgb(from currentColor r g b / a)`), so a translucent tint of the
-	/// current text colour is one call.
+	/// border, background or SVG fill that follows the text rather than naming a
+	/// token of its own. Declares nothing, like `hex` and `var`, and `.alpha()`
+	/// composes over it through the relative-colour form
+	/// (`rgb(from currentColor r g b / a)`), so a translucent tint of the current
+	/// text colour is one call.
 	fun current(): Color {
 		Color { text = "currentColor", root = "" }
 	}
@@ -272,9 +271,9 @@ export impl Color {
 		})
 	}
 
-	/// A literal color WITH alpha — the `hex` escape's translucent twin, and
-	/// what a brand palette outside the ramps is written in. Channels are
-	/// validated at const time, like every other scale here.
+	/// A literal color WITH alpha — the `hex` escape's translucent twin, and what a
+	/// brand palette outside the ramps is written in. Channels are validated at
+	/// const time, like every other scale here.
 	fun rgba(red: i32, green: i32, blue: i32, alpha: f64): Color {
 		check_channel("red", red);
 		check_channel("green", green);
@@ -322,10 +321,10 @@ fun check_alpha(value: f64) {
 	}
 }
 
-/// What an attribute condition's name must avoid: the characters that
-/// delimit the machinery it rides — `:` (the slot key's fields), the space
-/// (the condition grammar's tokens), quotes (the selector's own), and the
-/// selector syntax an attribute NAME never contains anyway.
+/// What an attribute condition's name must avoid: the characters that delimit the
+/// machinery it rides — `:` (the slot key's fields), the space (the condition
+/// grammar's tokens), quotes (the selector's own), and the selector syntax an
+/// attribute NAME never contains anyway.
 fun check_attribute_name(name: str) {
 	if name.trim() == "" {
 		panic("attribute was given an empty name");
@@ -337,9 +336,9 @@ fun check_attribute_name(name: str) {
 	}
 }
 
-/// The value's fence is the name's minus the selector syntax: `[data-x="a=b"]`
-/// is legal CSS and breaks nothing here. An EMPTY value stays legal — CSS
-/// `[name=""]` matches an attribute explicitly set to the empty string.
+/// The value's fence is the name's minus the selector syntax: `[data-x="a=b"]` is
+/// legal CSS and breaks nothing here. An EMPTY value stays legal — CSS `[name=""]`
+/// matches an attribute explicitly set to the empty string.
 fun check_attribute_value(value: str) {
 	for banned in ["\"", "'", " ", ":"] {
 		if value.contains(banned) {
@@ -349,11 +348,11 @@ fun check_attribute_value(value: str) {
 }
 
 /// A CSS custom property is spelled with its two leading dashes — that is what
-/// makes it one (A90). `var(button-color)` is not a broken reference, it is not
-/// a reference at all: `button-color` parses as a keyword, the declaration is
+/// makes it one (A90). `var(button-color)` is not a broken reference, it is not a
+/// reference at all: `button-color` parses as a keyword, the declaration is
 /// dropped, and nothing says so until the page renders wrong. The fence is the
-/// attribute name's, plus the dashes: no space, quote or `:`, since those
-/// delimit the `var()` call and the declaration around it.
+/// attribute name's, plus the dashes: no space, quote or `:`, since those delimit
+/// the `var()` call and the declaration around it.
 fun check_custom_property_name(name: str) {
 	if !name.starts_with("--") || name.len() < 3 {
 		panic(i"a custom property is written with its dashes — var(\"--button-color\"), not var(\"{name}\")");
@@ -410,12 +409,12 @@ fun check_pseudo_name(name: str) {
 }
 
 /// A written PROPERTY's fence, shared by `Style::raw` and `Declarations::raw`
-/// (B322). `:` and `;` are the declaration's own delimiters — `raw("color:red",
-/// "x")` is a whole declaration smuggled into the property position — and `:`
-/// is also the slot key's, which is why `Style::raw` has to pay this and not
-/// only the declaration writer: the key joins `media:condition:property` for
-/// the content hash and for the map index, and a property carrying one would
-/// make that join stop naming exactly one triple.
+/// (B322). `:` and `;` are the declaration's own delimiters —
+/// `raw("color:red", "x")` is a whole declaration smuggled into the property
+/// position — and `:` is also the slot key's, which is why `Style::raw` has to pay
+/// this and not only the declaration writer: the key joins
+/// `media:condition:property` for the content hash and for the map index, and a
+/// property carrying one would make that join stop naming exactly one triple.
 fun check_property_name(property: str) {
 	for banned in [":", ";"] {
 		if property.contains(banned) {
@@ -430,9 +429,9 @@ fun check_not_blank(what: str, value: str) {
 	}
 }
 
-/// How far a radial gradient's ending shape reaches — the CSS extent
-/// keywords. Position (`at 20% 40%`) is deliberately not modelled: the sites
-/// that want it want it computed from custom properties, which is `raw`'s job.
+/// How far a radial gradient's ending shape reaches — the CSS extent keywords.
+/// Position (`at 20% 40%`) is deliberately not modelled: the sites that want it
+/// want it computed from custom properties, which is `raw`'s job.
 export enum RadialExtent {
 	ClosestSide = "closest-side",
 	ClosestCorner = "closest-corner",
@@ -440,23 +439,21 @@ export enum RadialExtent {
 	FarthestCorner = "farthest-corner",
 }
 
-/// A gradient — a `background-image` value, NOT a `Color` (CSS paints an
-/// image over a color, and `background` takes one color). Open one with
+/// A gradient — a `background-image` value, NOT a `Color` (CSS paints an image over
+/// a color, and `background` takes one color). Open one with
 /// `Gradient::linear`/`Gradient::radial`, add stops, and hand it to
 /// `background_gradient`.
 export struct Gradient {
-	// The CSS function and its geometry argument, kept apart so `render`
-	// composes them once: `linear-gradient` + `90deg`, `radial-gradient` +
-	// `closest-side`.
+	// The CSS function and its geometry argument, kept apart so `render` composes
+	// them once: `linear-gradient` + `90deg`, `radial-gradient` + `closest-side`.
 	function: str,
 	geometry: str,
-	// Stops as rendered CSS, comma-joined, plus the count the two-stop
-	// minimum is checked against.
+	// Stops as rendered CSS, comma-joined, plus the count the two-stop minimum is
+	// checked against.
 	stops: str,
 	stop_count: i32,
-	// The `:root` lines the stops' colors carry, emitted when the gradient
-	// reaches a `Style` — so a gradient of ramp tokens themes like everything
-	// else.
+	// The `:root` lines the stops' colors carry, emitted when the gradient reaches
+	// a `Style` — so a gradient of ramp tokens themes like everything else.
 	roots: List<str>,
 }
 
@@ -482,9 +479,9 @@ export impl Gradient {
 		}
 	}
 
-	/// One color stop at `percent` along the gradient line. Positions are
-	/// explicit rather than defaulted — the value type holds pairs, so both
-	/// halves are written.
+	/// One color stop at `percent` along the gradient line. Positions are explicit
+	/// rather than defaulted — the value type holds pairs, so both halves are
+	/// written.
 	fun stop(self, color: Color, percent: f64): Gradient {
 		mut roots = self.roots;
 		if color.root != "" {
@@ -505,28 +502,26 @@ export impl Gradient {
 	}
 }
 
-/// Something that can be the VALUE of a declaration
-/// (proposal/css-block.md §6) — the type-directed half of `raw`, the
-/// `Slot`/`AttrValue` precedent on the style side. A `str` is a complete CSS
-/// value written verbatim; a `Length` or a `Color` is a value that may be a
-/// THEME TOKEN, and a token carries a `:root` line the sheet needs beside the
-/// reference to it.
+/// Something that can be the VALUE of a declaration (proposal/css-block.md §6) —
+/// the type-directed half of `raw`, the `Slot`/`AttrValue` precedent on the style
+/// side. A `str` is a complete CSS value written verbatim; a `Length` or a `Color`
+/// is a value that may be a THEME TOKEN, and a token carries a `:root` line the
+/// sheet needs beside the reference to it.
 ///
-/// The trait only DESCRIBES a value — its text, and the `:root` line its
-/// token needs. Putting the line on the sheet belongs to the surface that
-/// writes the sheet (`Style::raw`, `Declarations::raw`), not to the impl.
-/// That is the honest split — `Length` and `Color` are plain data — and it is
-/// also the safe one: `emit` is the compile-time channel, and the const-only
-/// capability check follows CALL EDGES, which it cannot do through a bounded
-/// generic's trait dispatch. An `emit` inside an impl here would escape the
-/// check and reach the emitted JS as a live `__emit_asset` with no runtime
-/// binding.
+/// The trait only DESCRIBES a value — its text, and the `:root` line its token
+/// needs. Putting the line on the sheet belongs to the surface that writes the
+/// sheet (`Style::raw`, `Declarations::raw`), not to the impl. That is the honest
+/// split — `Length` and `Color` are plain data — and it is also the safe one:
+/// `emit` is the compile-time channel, and the const-only capability check follows
+/// CALL EDGES, which it cannot do through a bounded generic's trait dispatch. An
+/// `emit` inside an impl here would escape the check and reach the emitted JS as a
+/// live `__emit_asset` with no runtime binding.
 export trait CssValue {
 	/// The declaration's value text, exactly as it renders into CSS.
 	fun css_text(self): str;
 
-	/// The `:root` line declaring this value's theme token, or `""` when the
-	/// value declares nothing.
+	/// The `:root` line declaring this value's theme token, or `""` when the value
+	/// declares nothing.
 	fun css_root(self): str;
 }
 
@@ -567,20 +562,18 @@ export impl Color with CssValue {
 /// {Color::gray(500)}`, `calc({space(4)} + 2px)` — where a value is assembled
 /// from text and holes rather than being one value.
 ///
-/// `CssValue`'s twin, and deliberately a SECOND trait rather than the same
-/// one, because the two positions have different rules. A WHOLE value must
-/// carry its own unit, so `raw("padding", 4)` is refused and the author is
-/// steered to `space(4)` or `px(4)`; a PIECE sits inside text that supplies
-/// the unit (`{inset}rem`, `calc({a} + 2px)`), so a bare number is legal
-/// there and always has been — it rode through the string concatenation the
-/// mixed value used to lower to. Keeping one trait would have to give up one
-/// of those two rules.
+/// `CssValue`'s twin, and deliberately a SECOND trait rather than the same one,
+/// because the two positions have different rules. A WHOLE value must carry its own
+/// unit, so `raw("padding", 4)` is refused and the author is steered to `space(4)`
+/// or `px(4)`; a PIECE sits inside text that supplies the unit (`{inset}rem`,
+/// `calc({a} + 2px)`), so a bare number is legal there and always has been — it
+/// rode through the string concatenation the mixed value used to lower to. Keeping
+/// one trait would have to give up one of those two rules.
 ///
-/// What the concatenation could not do is carry a token's `:root` line: a
-/// `Length` or a `Color` mid-value emitted `var(--gray-500)` with nothing
-/// declaring it, which is exactly the hazard the single-hole path was built
-/// to close. A piece describes both halves, and [`piece`] puts the line on
-/// the sheet.
+/// What the concatenation could not do is carry a token's `:root` line: a `Length`
+/// or a `Color` mid-value emitted `var(--gray-500)` with nothing declaring it,
+/// which is exactly the hazard the single-hole path was built to close. A piece
+/// describes both halves, and [`piece`] puts the line on the sheet.
 export trait CssPiece {
 	/// The piece's text, exactly as it renders into the value.
 	fun piece_text(self): str;
@@ -669,15 +662,14 @@ export impl Color with CssPiece {
 	}
 }
 
-/// One piece of a multi-argument `css` value: its text, with its `:root` line
-/// put on the sheet on the way past.
+/// One piece of a multi-argument `css` value: its text, with its `:root` line put
+/// on the sheet on the way past.
 ///
 /// This is what a `css` declaration's arguments lower through when there are
-/// several of them (A101 R10), so `border("1px solid", Color::gray(500));`
-/// emits `1px solid var(--gray-500)` AND `:root{--gray-500:#6b7280}` — the
-/// token discipline the one-argument path has always had, reaching the position
-/// that had no correct spelling at all. Compile-time only, like every other
-/// emitter here.
+/// several of them (A101 R10), so `border("1px solid", Color::gray(500));` emits
+/// `1px solid var(--gray-500)` AND `:root{--gray-500:#6b7280}` — the token
+/// discipline the one-argument path has always had, reaching the position that had
+/// no correct spelling at all. Compile-time only, like every other emitter here.
 export fun piece<V: CssPiece>(value: V): str {
 	let root = value.piece_root();
 	if root != "" {
@@ -686,14 +678,14 @@ export fun piece<V: CssPiece>(value: V): str {
 	value.piece_text()
 }
 
-/// A CUSTOM PROPERTY read as a whole value — `color(var("--brand-ink"));`
-/// (A101 R12).
+/// A CUSTOM PROPERTY read as a whole value — `color(var("--brand-ink"));` (A101
+/// R12).
 ///
-/// A declaration's arguments are ordinary vilan expressions, and `--brand-ink`
-/// is not one: the dashes are operators and the name is a keyword or an
-/// identifier, so CSS's own `var(--x)` has no expression spelling. It is a
-/// STRING here, which is what CSS's grammar makes it anyway — `var()` takes a
-/// custom-property name, not a value.
+/// A declaration's arguments are ordinary vilan expressions, and `--brand-ink` is
+/// not one: the dashes are operators and the name is a keyword or an identifier, so
+/// CSS's own `var(--x)` has no expression spelling. It is a STRING here, which is
+/// what CSS's grammar makes it anyway — `var()` takes a custom-property name, not a
+/// value.
 ///
 /// A `str`, and deliberately not a `Length` or a `Color`: a reference declares
 /// no token (`root` would be `""` either way — see `Length::var`'s own note),
@@ -703,8 +695,8 @@ export fun piece<V: CssPiece>(value: V): str {
 /// call.
 ///
 /// The name carries its dashes, checked here as everywhere else (A90):
-/// `var("button-color")` is not a broken reference, it is not a reference at
-/// all, and nothing says so until the page renders wrong.
+/// `var("button-color")` is not a broken reference, it is not a reference at all,
+/// and nothing says so until the page renders wrong.
 export fun var(name: str): str {
 	check_custom_property_name(name);
 	i"var({name})"
@@ -788,21 +780,21 @@ export enum UserSelect {
 	Auto = "auto",
 	Text = "text",
 	All = "all",
-	// `user-select:none` — named to stay clear of `Option::None` at use
-	// sites, the `Display::Hidden` rule.
+	// `user-select:none` — named to stay clear of `Option::None` at use sites, the
+	// `Display::Hidden` rule.
 	Off = "none",
 }
 
 // --- the class-name hash --------------------------------------------------------
 
 /// djb2 over the slot key and declaration, base36, prefixed for CSS validity.
-/// Content-addressed — never a counter — so builds, caching, and reordering
-/// all agree on names (the determinism the asset channel's dedup relies on).
+/// Content-addressed — never a counter — so builds, caching, and reordering all
+/// agree on names (the determinism the asset channel's dedup relies on).
 fun class_hash(text: str): str {
 	mut hash = 5381u32;
 	for index in Range::new(0, text.len()) {
-		// hash * 33 + code, wrapped to 32 bits: the shift and mask are
-		// u32-wrapped; the additions stay exact in between.
+		// hash * 33 + code, wrapped to 32 bits: the shift and mask are u32-wrapped;
+		// the additions stay exact in between.
 		hash = ((hash << 5u32) + hash + text.code_at(index)) & 0xFFFFFFFFu32;
 	}
 	"s" + encode36(hash)
@@ -828,9 +820,8 @@ fun encode36(value: u32): str {
 
 // --- Style ----------------------------------------------------------------------
 
-/// ONE SLOT'S IDENTITY, as a RECORD: the breakpoint, the condition set's
-/// rendered token list, and the CSS property — the three fields a rule is
-/// keyed by.
+/// ONE SLOT'S IDENTITY, as a RECORD: the breakpoint, the condition set's rendered
+/// token list, and the CSS property — the three fields a rule is keyed by.
 ///
 /// **A slot is READ as a record and STORED as the joined key** (A95 S2, R3),
 /// and the split of those two jobs is the whole of B311's and B322's fix.
@@ -845,14 +836,14 @@ fun encode36(value: u32): str {
 /// invented yet, the reader asserts: a key that does not name exactly one
 /// triple fails the build instead of being mis-read.
 ///
-/// The key stays the JOINED spelling because the class name is a content hash
-/// of it — keeping those bytes is what keeps every already-minted class name
-/// exactly as it was — and because it is what a `Style` CARRIES: the record is
-/// const-time reading, and a slot's identity would otherwise be three strings
-/// per slot in the emitted bundle for facts the runtime never asks about
-/// (`class_list` reads the class, and nothing else survives to run). Measured
-/// on kolt before this shape was settled: storing the triple beside each slot
-/// cost 26,201 B of client bundle, 9.4 %.
+/// The key stays the JOINED spelling because the class name is a content hash of it
+/// — keeping those bytes is what keeps every already-minted class name exactly as
+/// it was — and because it is what a `Style` CARRIES: the record is const-time
+/// reading, and a slot's identity would otherwise be three strings per slot in the
+/// emitted bundle for facts the runtime never asks about (`class_list` reads the
+/// class, and nothing else survives to run). Measured on kolt before this shape was
+/// settled: storing the triple beside each slot cost 26,201 B of client bundle, 9.4
+/// %.
 struct Slot {
 	media: str,
 	condition: str,
@@ -871,11 +862,11 @@ fun slot_key(media: str, condition: str, property: str): str {
 /// The assertion is not defensive clutter, it is the fence that cannot be
 /// forgotten. `:` is banned from an attribute's name and value
 /// (`check_attribute_name`/`check_attribute_value`), from a pseudo-class name
-/// (`check_pseudo_name`, B311), from a breakpoint's width (`media_condition`)
-/// and from a written property (`check_property_name`, B322) — so today the
-/// join names exactly one triple. A condition token invented later has one
-/// place to get that wrong, and here it fails the build loudly rather than
-/// re-minting a weaker selector in silence, which is what B311 actually was.
+/// (`check_pseudo_name`, B311), from a breakpoint's width (`media_condition`) and
+/// from a written property (`check_property_name`, B322) — so today the join names
+/// exactly one triple. A condition token invented later has one place to get that
+/// wrong, and here it fails the build loudly rather than re-minting a weaker
+/// selector in silence, which is what B311 actually was.
 fun slot_of(key: str): Slot {
 	let parts = key.split(":");
 	if parts.len() != 3 {
@@ -891,17 +882,17 @@ export struct Style {
 	rules: Map<str, (str, str)>,
 }
 
-/// Opens a builder chain. Property methods reach the const-only asset
-/// channel, so construction belongs inside a `const` expression; selection
-/// and merging (`+`, `class_list`) are ordinary runtime code.
+/// Opens a builder chain. Property methods reach the const-only asset channel, so
+/// construction belongs inside a `const` expression; selection and merging (`+`,
+/// `class_list`) are ordinary runtime code.
 export fun style(): Style {
 	Style { rules = Map::new() }
 }
 
-/// The shorthand-to-longhand table (§0bis.4): the properties a property
-/// COVERS, `;`-delimited and `;`-terminated at both ends so membership is one
-/// `contains(";" + property + ";")`. Everything else maps to "" and is a
-/// longhand (or a property with no family at all).
+/// The shorthand-to-longhand table (§0bis.4): the properties a property COVERS,
+/// `;`-delimited and `;`-terminated at both ends so membership is one
+/// `contains(";" + property + ";")`. Everything else maps to "" and is a longhand
+/// (or a property with no family at all).
 ///
 /// One whole-box shorthand per family, and everything it covers is a longhand
 /// — which is what keeps `border` ahead of `border-top` while `border-top`
@@ -911,9 +902,9 @@ export fun style(): Style {
 /// sweep; a new property method that is a CSS shorthand over another writable
 /// property adds its row here in the same commit.
 ///
-/// `raw` writes slots like any other method, so its properties are placed by
-/// this table too — `border_none()` IS `raw("border", "none")`, and the two
-/// live instances of the hazard this fixes both had `raw` on one side.
+/// `raw` writes slots like any other method, so its properties are placed by this
+/// table too — `border_none()` IS `raw("border", "none")`, and the two live
+/// instances of the hazard this fixes both had `raw` on one side.
 fun family_longhands(property: str): str {
 	match property {
 		"padding" => ";padding-top;padding-right;padding-bottom;padding-left;",
@@ -926,9 +917,9 @@ fun family_longhands(property: str): str {
 	}
 }
 
-/// `border`'s longhands: the three part shorthands, the four edges, and the
-/// twelve `border-<edge>-<part>` leaves. Built rather than written out, so
-/// each edge and part name appears once.
+/// `border`'s longhands: the three part shorthands, the four edges, and the twelve
+/// `border-<edge>-<part>` leaves. Built rather than written out, so each edge and
+/// part name appears once.
 fun border_longhands(): str {
 	mut out = ";border-width;border-style;border-color;";
 	for edge in ["top", "right", "bottom", "left"] {
@@ -941,9 +932,9 @@ fun border_longhands(): str {
 }
 
 /// Drops every slot the incoming `property` covers, under the SAME media and
-/// condition — the ordinary last-wins rule widened from one property to its
-/// family. A map removal and nothing else: no emission, so `+` resolves a
-/// family exactly as a chain does even though it is runtime-legal.
+/// condition — the ordinary last-wins rule widened from one property to its family.
+/// A map removal and nothing else: no emission, so `+` resolves a family exactly as
+/// a chain does even though it is runtime-legal.
 fun without_covered(
 	rules: Map<str, (str, str)>,
 	media: str,
@@ -966,10 +957,10 @@ fun without_covered(
 	out
 }
 
-/// Whether a condition TOKEN carries an applied negation, and the token without
-/// it. Every token test below reads the BARE token, so an axis is recognized
-/// the same negated or not, and returns the token WITH its marker, so
-/// `render_rule` still sees the negation it has to render.
+/// Whether a condition TOKEN carries an applied negation, and the token without it.
+/// Every token test below reads the BARE token, so an axis is recognized the same
+/// negated or not, and returns the token WITH its marker, so `render_rule` still
+/// sees the negation it has to render.
 fun token_is_negated(token: str): bool {
 	token.starts_with("!")
 }
@@ -996,9 +987,9 @@ fun condition_relation(condition: str): str {
 	}
 }
 
-/// The condition's attribute token, if any: `[data-open="true"]` from any
-/// condition carrying one, `""` otherwise. The attribute token is the one
-/// bracketed form, so the scan is a prefix check per token.
+/// The condition's attribute token, if any: `[data-open="true"]` from any condition
+/// carrying one, `""` otherwise. The attribute token is the one bracketed form, so
+/// the scan is a prefix check per token.
 fun condition_attribute(condition: str): str {
 	for part in condition.split(" ") {
 		if token_bare(part).starts_with("[") {
@@ -1008,11 +999,10 @@ fun condition_attribute(condition: str): str {
 	""
 }
 
-/// The condition's pseudo-class, if any — always the LAST token, when that
-/// token is neither a relation token nor an attribute selector: `"hover"`
-/// from `"hover"`, from `^[data-theme="dark"] hover` and from the full
-/// three-token stack; `""` from `""`, from `^[data-theme="dark"]`, from
-/// `[data-open="true"]` and from `>*`.
+/// The condition's pseudo-class, if any — always the LAST token, when that token is
+/// neither a relation token nor an attribute selector: `"hover"` from `"hover"`,
+/// from `^[data-theme="dark"] hover` and from the full three-token stack; `""` from
+/// `""`, from `^[data-theme="dark"]`, from `[data-open="true"]` and from `>*`.
 fun condition_pseudo(condition: str): str {
 	let parts = condition.split(" ");
 	let last = parts[parts.len() - 1];
@@ -1026,11 +1016,10 @@ fun condition_pseudo(condition: str): str {
 
 // --- conditions as values (A95 S1) ----------------------------------------------
 //
-// A condition is a VALUE, and a set of them is the same value: `hover()` is a
-// set of one, `hover() + active().not()` is a set of two, and `Style::on`
-// takes either. Everything below builds the condition STRING this module has
-// always built, which is the whole of slice 1: the model changes, the
-// stylesheet does not.
+// A condition is a VALUE, and a set of them is the same value: `hover()` is a set
+// of one, `hover() + active().not()` is a set of two, and `Style::on` takes either.
+// Everything below builds the condition STRING this module has always built, which
+// is the whole of slice 1: the model changes, the stylesheet does not.
 //
 // **The five kinds travel in the TOKEN, not in the type,** and that is a
 // divergence from style-conditions.md §1's table forced by the shipped
@@ -1043,9 +1032,9 @@ fun condition_pseudo(condition: str): str {
 // can.
 
 /// One condition token's AXIS, read off its first byte exactly as the shipped
-/// condition grammar's accessors read it. The number IS the canonical slot
-/// order (§2.1) — the shipped order with the relation slot split in two and
-/// one new slot on the end:
+/// condition grammar's accessors read it. The number IS the canonical slot order
+/// (§2.1) — the shipped order with the relation slot split in two and one new slot
+/// on the end:
 ///
 /// | | | renders |
 /// |---|---|---|
@@ -1056,12 +1045,11 @@ fun condition_pseudo(condition: str): str {
 /// | 4 | a pseudo-class, `hover` | `.sX:hover` |
 /// | 5 | a pseudo-element, `%selection` | `.sX::selection`, always last |
 ///
-/// The guard and the child relation are ONE slot in the shipped grammar and
-/// two here, because they are not the same position: a guard is a prefix and a
-/// child relation a suffix, and `[data-theme="dark"] .sX > *` is an ordinary
-/// selector the relation axis has never been able to spell (§2.5). Splitting
-/// them is also what puts the guard first, which is the order a selector is
-/// written in.
+/// The guard and the child relation are ONE slot in the shipped grammar and two
+/// here, because they are not the same position: a guard is a prefix and a child
+/// relation a suffix, and `[data-theme="dark"] .sX > *` is an ordinary selector the
+/// relation axis has never been able to spell (§2.5). Splitting them is also what
+/// puts the guard first, which is the order a selector is written in.
 ///
 /// A leading `!` is the negation and is stripped first. `%` is the one byte
 /// new here, and it is a byte rather than the `::` it renders as for B311's
@@ -1090,24 +1078,24 @@ fun token_axis(token: str): i32 {
 /// [`canonical_condition`], so nothing downstream re-sorts, re-checks or
 /// wonders.
 ///
-/// **`PartialEq` is never derived here, and `.eq(..)` is the attribute
-/// condition's value** (A95 S2, R2). The two spellings would collide —
-/// `attribute("data-open").eq("true")` is "narrow this attribute condition to
-/// that value", and `PartialEq::eq` would be "are these two conditions the same
-/// value" — and of the two, only the first is a thing anyone writes. A
-/// condition is never compared by user code: the canonicaliser compares TOKENS
-/// internally (`compare_condition_tokens`, `List::contains` over `str`), which
-/// is where equality actually lives and is exactly why the type does not need
-/// it. So the rule is written here rather than discovered later: if `Condition`
-/// ever needs structural equality it gets a named method, and `.eq(..)` keeps
-/// the meaning the surface was learned with.
+/// **`PartialEq` is never derived here, and `.eq(..)` is the attribute condition's
+/// value** (A95 S2, R2). The two spellings would collide —
+/// `attribute("data-open").eq("true")` is "narrow this attribute condition to that
+/// value", and `PartialEq::eq` would be "are these two conditions the same value" —
+/// and of the two, only the first is a thing anyone writes. A condition is never
+/// compared by user code: the canonicaliser compares TOKENS internally
+/// (`compare_condition_tokens`, `List::contains` over `str`), which is where
+/// equality actually lives and is exactly why the type does not need it. So the
+/// rule is written here rather than discovered later: if `Condition` ever needs
+/// structural equality it gets a named method, and `.eq(..)` keeps the meaning the
+/// surface was learned with.
 export struct Condition {
 	tokens: List<str>,
 }
 
 /// The bound `Style::on` takes, `Style::raw<V: CssValue>`'s own shape. One
-/// implementor today — a condition set is already what every constructor
-/// returns — and the seam the new surface's own types land on.
+/// implementor today — a condition set is already what every constructor returns —
+/// and the seam the new surface's own types land on.
 trait IntoConditions {
 	fun conditions(self): Condition;
 }
@@ -1131,8 +1119,8 @@ export impl Condition with Add {
 	}
 }
 
-/// How two condition tokens order: by AXIS first (the shipped slot order), then
-/// by the BARE token lexically, then plain before negated.
+/// How two condition tokens order: by AXIS first (the shipped slot order), then by
+/// the BARE token lexically, then plain before negated.
 ///
 /// Lexical rather than a curated table, and §2.1's argument is the one that
 /// decides: `pseudo(name)` admits arbitrary names, so a table could never be
@@ -1144,8 +1132,7 @@ export impl Condition with Add {
 /// specificity), so the order costs nothing.
 ///
 /// A negated token sitting immediately after its plain twin is what makes the
-/// contradiction check a scan of adjacent pairs rather than a quadratic
-/// comparison.
+/// contradiction check a scan of adjacent pairs rather than a quadratic comparison.
 fun compare_condition_tokens(a: str, b: str): Ordering {
 	let axis_a = token_axis(a);
 	let axis_b = token_axis(b);
@@ -1166,15 +1153,15 @@ fun compare_condition_tokens(a: str, b: str): Ordering {
 	}
 }
 
-/// The CANONICALISER (§2): sort into the slot order, merge duplicates, and
-/// refuse the four sets that can never mean anything.
+/// The CANONICALISER (§2): sort into the slot order, merge duplicates, and refuse
+/// the four sets that can never mean anything.
 fun canonical_condition(tokens: List<str>): Condition {
 	let sorted = tokens.sort_by(|a, b| compare_condition_tokens(a, b));
 	mut out = List::new();
 	for token in sorted {
 		// Equal conditions MERGE — set semantics. Adjacent after the sort, but
-		// asked of the whole list so the rule is the rule and not a
-		// consequence of the sort.
+		// asked of the whole list so the rule is the rule and not a consequence of
+		// the sort.
 		if !out.contains(token) {
 			out.push(token);
 		}
@@ -1183,12 +1170,12 @@ fun canonical_condition(tokens: List<str>): Condition {
 	Condition { tokens = out }
 }
 
-/// The canonicaliser's refusals. Each is a set that CANNOT match anything, or
-/// a selector CSS does not admit — never a set that is merely unusual, which
-/// is why two different values of one attribute (`[x="a"][x="b"]`, which also
-/// matches nothing) is deliberately NOT here: catching it needs the
-/// canonicaliser to reason about attribute VALUE equality, a larger claim than
-/// "this exact token and its negation", and the narrow rule is the ruled one.
+/// The canonicaliser's refusals. Each is a set that CANNOT match anything, or a
+/// selector CSS does not admit — never a set that is merely unusual, which is why
+/// two different values of one attribute (`[x="a"][x="b"]`, which also matches
+/// nothing) is deliberately NOT here: catching it needs the canonicaliser to reason
+/// about attribute VALUE equality, a larger claim than "this exact token and its
+/// negation", and the narrow rule is the ruled one.
 fun check_condition_set(tokens: List<str>) {
 	mut media = "";
 	mut guard = "";
@@ -1229,8 +1216,8 @@ fun check_condition_set(tokens: List<str>) {
 	}
 }
 
-/// A token with its negation flipped ON — the form the contradiction check
-/// looks for, and the form `Condition::not` applies.
+/// A token with its negation flipped ON — the form the contradiction check looks
+/// for, and the form `Condition::not` applies.
 fun negated_token(token: str): str {
 	if token_is_negated(token) {
 		token
@@ -1241,9 +1228,9 @@ fun negated_token(token: str): str {
 
 // --- the constructors ---
 //
-// Each returns a set of ONE. The free spelling and the `Style` method of the
-// same name coexist: `hover()` is the condition, `style().hover(inner)` is the
-// sugar that puts a style under it.
+// Each returns a set of ONE. The free spelling and the `Style` method of the same
+// name coexist: `hover()` is the condition, `style().hover(inner)` is the sugar
+// that puts a style under it.
 
 fun condition_of(token: str): Condition {
 	canonical_condition([token])
@@ -1273,17 +1260,17 @@ fun within_condition(condition: Condition): Condition {
 	}
 	let token = condition.tokens[0];
 	let axis = token_axis(token);
-	// A guard holds a condition that selects an ELEMENT: an attribute on it, or
-	// a pseudo-class it is in. The other three axes are not element selectors at
-	// all — a breakpoint conditions the VIEWPORT, a relation says where a rule
-	// reaches rather than what it matches, and a pseudo-element is a piece of a
-	// box no ancestor can be.
+	// A guard holds a condition that selects an ELEMENT: an attribute on it, or a
+	// pseudo-class it is in. The other three axes are not element selectors at all
+	// — a breakpoint conditions the VIEWPORT, a relation says where a rule reaches
+	// rather than what it matches, and a pseudo-element is a piece of a box no
+	// ancestor can be.
 	//
 	// The guard carries the inner TOKEN and not its rendered selector, which is
 	// what makes `within(hover())` land (A95 S2, R3): `^hover` holds no `:`, and
 	// `render_rule` renders it through the same per-axis rendering every other
-	// token gets. Storing `^:hover` was S1's shape and was refused for exactly
-	// that byte.
+	// token gets. Storing `^:hover` was S1's shape and was refused for exactly that
+	// byte.
 	if axis == 0 {
 		panic("within(..) guards on an ANCESTOR and was given a breakpoint — a media query conditions the viewport, not an element, so it belongs beside the guard in the set rather than inside it: .on(md() + within(attribute(name)), ..)");
 	}
@@ -1299,10 +1286,10 @@ fun within_condition(condition: Condition): Condition {
 	condition_of(i"^{token}")
 }
 
-/// The ANCESTOR's own selector, rendered from the token a guard carries — the
-/// same per-axis rendering `render_rule` gives the element's own compound, one
-/// level out. An attribute token is already selector syntax; a pseudo-class
-/// token takes its `:`.
+/// The ANCESTOR's own selector, rendered from the token a guard carries — the same
+/// per-axis rendering `render_rule` gives the element's own compound, one level
+/// out. An attribute token is already selector syntax; a pseudo-class token takes
+/// its `:`.
 fun guard_selector(token: str): str {
 	let bare = token_bare(token);
 	let negated = token_is_negated(token);
@@ -1316,8 +1303,8 @@ fun guard_selector(token: str): str {
 
 fun media_condition(min_width: str): Condition {
 	check_not_blank("a breakpoint", min_width);
-	// B322's other latent half: the width is field 0 of the joined slot key, so
-	// a `:` in it would make the join stop naming one triple. `sm`/`md`/`lg`/`xl`
+	// B322's other latent half: the width is field 0 of the joined slot key, so a
+	// `:` in it would make the join stop naming one triple. `sm`/`md`/`lg`/`xl`
 	// could never reach this; `media(min_width)` takes whatever it is given.
 	if min_width.contains(":") {
 		panic(i"a breakpoint's min-width cannot contain ':' (got \"{min_width}\") — it is the slot key's own field separator, and a width is a CSS length (media(\"768px\"), or the named sm/md/lg/xl)");
@@ -1355,33 +1342,33 @@ export fun last(): Condition {
 	condition_of("last-child")
 }
 
-/// A pseudo-ELEMENT — `element("selection")` is `::selection`. Its own kind
-/// rather than another pseudo-class, for two reasons that are facts about CSS
-/// and not preferences: it must come LAST in a compound selector with nothing
-/// after it, and at most one may appear. Both are canonicaliser rules; neither
-/// is statable if `::selection` is just another pseudo token.
+/// A pseudo-ELEMENT — `element("selection")` is `::selection`. Its own kind rather
+/// than another pseudo-class, for two reasons that are facts about CSS and not
+/// preferences: it must come LAST in a compound selector with nothing after it, and
+/// at most one may appear. Both are canonicaliser rules; neither is statable if
+/// `::selection` is just another pseudo token.
 export fun element(name: str): Condition {
 	check_not_blank("a pseudo-element name", name);
 	check_attribute_name(name);
 	condition_of("%" + name)
 }
 
-/// An attribute on the element itself — PRESENCE (`[name]`). `.eq(value)`
-/// narrows it to the exact form (`[name="value"]`).
+/// An attribute on the element itself — PRESENCE (`[name]`). `.eq(value)` narrows
+/// it to the exact form (`[name="value"]`).
 export fun attribute(name: str): Condition {
 	attribute_condition(name)
 }
 
 /// The ancestor GUARD — the element's own slots, conditioned on an ANCESTOR
-/// matching `condition`. `within(attribute("data-theme").eq("dark"))` is the
-/// theme condition.
+/// matching `condition`. `within(attribute("data-theme").eq("dark"))` is the theme
+/// condition.
 export fun within(condition: Condition): Condition {
 	within_condition(condition)
 }
 
-/// Every direct CHILD of the element — `.sX > *`, the parent-owned spacing
-/// idiom. Its rule emits inside `@layer vilan`, so a child's own `Style`
-/// always wins against a rule reaching in from an ancestor.
+/// Every direct CHILD of the element — `.sX > *`, the parent-owned spacing idiom.
+/// Its rule emits inside `@layer vilan`, so a child's own `Style` always wins
+/// against a rule reaching in from an ancestor.
 export fun children(): Condition {
 	children_condition()
 }
@@ -1390,9 +1377,9 @@ fun children_condition(): Condition {
 	condition_of(">*")
 }
 
-/// Every direct child BUT THE FIRST — `> :not(:first-child)`, which carries
-/// its argument's specificity so divide outranks children on a property both
-/// touch, whatever the authoring order.
+/// Every direct child BUT THE FIRST — `> :not(:first-child)`, which carries its
+/// argument's specificity so divide outranks children on a property both touch,
+/// whatever the authoring order.
 export fun divide(): Condition {
 	divide_condition()
 }
@@ -1423,10 +1410,10 @@ export fun xl(): Condition {
 }
 
 export impl Condition {
-	/// NEGATION, on the value it negates (A95's whole argument): `.not()`
-	/// belongs where the negated thing is written, so `hover() +
-	/// active().not()` says `:hover:not(:active)` and nothing has to reason
-	/// about which condition is "immediately outside" it.
+	/// NEGATION, on the value it negates (A95's whole argument): `.not()` belongs
+	/// where the negated thing is written, so `hover() + active().not()` says
+	/// `:hover:not(:active)` and nothing has to reason about which condition is
+	/// "immediately outside" it.
 	fun not(self): Condition {
 		let held = self.tokens.len();
 		if held != 1 {
@@ -1446,9 +1433,9 @@ export impl Condition {
 		condition_of(negated_token(token))
 	}
 
-	/// An attribute condition's EXACT value — `attribute("data-selected").eq("true")`
-	/// is `[data-selected="true"]`, where `attribute("data-selected")` alone is
-	/// presence.
+	/// An attribute condition's EXACT value —
+	/// `attribute("data-selected").eq("true")` is `[data-selected="true"]`, where
+	/// `attribute("data-selected")` alone is presence.
 	fun eq(self, value: str): Condition {
 		let held = self.tokens.len();
 		if held != 1 {
@@ -1480,10 +1467,10 @@ fun condition_set_media(set: Condition): str {
 	""
 }
 
-/// The set rendered as the shipped CONDITION STRING — the tokens that are not
-/// the breakpoint, space-joined in the canonical order. Every set expressible
-/// through the shipped combinators renders to the string those combinators
-/// built, which is slice 1's whole acceptance gate.
+/// The set rendered as the shipped CONDITION STRING — the tokens that are not the
+/// breakpoint, space-joined in the canonical order. Every set expressible through
+/// the shipped combinators renders to the string those combinators built, which is
+/// slice 1's whole acceptance gate.
 fun condition_set_text(set: Condition): str {
 	mut out = "";
 	for token in set.tokens {
@@ -1498,8 +1485,8 @@ fun condition_set_text(set: Condition): str {
 	out
 }
 
-/// The condition string read back as a set — the inner half of an
-/// intersection, since a `Style`'s slots carry strings and not values.
+/// The condition string read back as a set — the inner half of an intersection,
+/// since a `Style`'s slots carry strings and not values.
 fun condition_from_slot(media: str, condition: str): Condition {
 	mut tokens = List::new();
 	if media != "" {
@@ -1523,10 +1510,10 @@ fun condition_from_slot(media: str, condition: str): Condition {
 // compile with nothing to steer to; keeping them costs one message that now
 // names the spelling which HAS no order to get wrong.
 //
-// Every one of them therefore ends the same way: write the set. `.on(md() +
-// within(attribute("data-theme").eq("dark")) + hover(), ..)` is one rule, in
-// any written order, and `md(within(attribute(.., hover(..))))` is the only
-// nesting that spells it.
+// Every one of them therefore ends the same way: write the set.
+// `.on(md() + within(attribute("data-theme").eq("dark")) + hover(), ..)` is one
+// rule, in any written order, and `md(within(attribute(.., hover(..))))` is the
+// only nesting that spells it.
 //
 // Each runs as a PASS over the inner style's slots before any rule is minted,
 // so the message an author meets is the message the interleaved form gave: the
@@ -1598,11 +1585,11 @@ fun fence_media(inner: Style) {
 	}
 }
 
-/// There is no pending MARK to consume here any more, and that is A95 S2's
-/// whole argument made mechanical. A89's `not(inner)` had to leave a `!` on the
-/// inner condition for the combinator OUTSIDE it to apply, because a wrapper
-/// cannot say which of its selectors is negated; a value can, so `.not()` is
-/// written on the condition it negates and the composition is a plain union.
+/// There is no pending MARK to consume here any more, and that is A95 S2's whole
+/// argument made mechanical. A89's `not(inner)` had to leave a `!` on the inner
+/// condition for the combinator OUTSIDE it to apply, because a wrapper cannot say
+/// which of its selectors is negated; a value can, so `.not()` is written on the
+/// condition it negates and the composition is a plain union.
 fun compose_condition(outer: Condition, media: str, condition: str): Condition {
 	mut tokens = List::new();
 	for token in outer.tokens {
@@ -1615,11 +1602,11 @@ fun compose_condition(outer: Condition, media: str, condition: str): Condition {
 	canonical_condition(tokens)
 }
 
-/// One atomic rule as CSS text. The four condition axes nest the way CSS
-/// nests them — media outermost, then the relation (the ancestor guard's
-/// prefix, or the child combinator's suffix), then the attribute suffix on
-/// the element itself, then the pseudo-class suffix — which is exactly the
-/// outside-in order the condition combinators require at the call site.
+/// One atomic rule as CSS text. The four condition axes nest the way CSS nests them
+/// — media outermost, then the relation (the ancestor guard's prefix, or the child
+/// combinator's suffix), then the attribute suffix on the element itself, then the
+/// pseudo-class suffix — which is exactly the outside-in order the condition
+/// combinators require at the call site.
 ///
 /// The leading byte is load-bearing (B35): `assemble_assets` has no
 /// "base < pseudo < media" comparator, it sorts lines lexically with a numeric
@@ -1651,12 +1638,12 @@ fun compose_condition(outer: Condition, media: str, condition: str): Condition {
 /// universal selector contributes nothing), so the condition axis — which is
 /// also specificity — is exactly as it was.
 fun render_rule(media: str, condition: str, property: str, class: str, declaration: str): str {
-	// One walk over the condition's tokens, which the canonicaliser has already
-	// put in the order a selector is written in (§2.1) — so this is the
-	// rendering and never a second sort. Four pieces come out of it: the
-	// ancestor guard's PREFIX, the element's own compound SUFFIXES (attributes
-	// then pseudo-classes), the one pseudo-ELEMENT that must come last, and the
-	// child relation's SUFFIX, which also decides the layer.
+	// One walk over the condition's tokens, which the canonicaliser has already put
+	// in the order a selector is written in (§2.1) — so this is the rendering and
+	// never a second sort. Four pieces come out of it: the ancestor guard's PREFIX,
+	// the element's own compound SUFFIXES (attributes then pseudo-classes), the one
+	// pseudo-ELEMENT that must come last, and the child relation's SUFFIX, which
+	// also decides the layer.
 	mut prefix = "";
 	mut compound = "";
 	mut element = "";
@@ -1687,9 +1674,8 @@ fun render_rule(media: str, condition: str, property: str, class: str, declarati
 				child = if bare == ">*" { " > *" } else { " > :not(:first-child)" };
 			}
 			// An attribute token is already selector syntax, appended to the
-			// element's own compound selector — an attribute-conditioned base
-			// rule still starts with '.', so it stays in the base cascade band
-			// (B35).
+			// element's own compound selector — an attribute-conditioned base rule
+			// still starts with '.', so it stays in the base cascade band (B35).
 			if axis == 3 {
 				compound = compound + (if negated { i":not({bare})" } else { bare });
 			}
@@ -1704,10 +1690,10 @@ fun render_rule(media: str, condition: str, property: str, class: str, declarati
 	let base = if family_longhands(property) == "" { "." + class } else { "*." + class };
 	let selector = prefix + base + compound + element + child;
 	mut rule = selector + "{" + declaration + "}";
-	// A rule carrying a child relation REACHES IN — it styles elements other
-	// than the one wearing the class — so it emits inside `@layer vilan`
-	// whatever else conditions it (§2.5). A guard's rules dress the element
-	// itself and stay unlayered, which is what lets a theme beat a base rule.
+	// A rule carrying a child relation REACHES IN — it styles elements other than
+	// the one wearing the class — so it emits inside `@layer vilan` whatever else
+	// conditions it (§2.5). A guard's rules dress the element itself and stay
+	// unlayered, which is what lets a theme beat a base rule.
 	if child != "" {
 		rule = "@layer vilan{" + rule + "}";
 	}
@@ -1717,18 +1703,17 @@ fun render_rule(media: str, condition: str, property: str, class: str, declarati
 	rule
 }
 
-/// The end-of-evaluation finaliser (G23) that WRITES the stylesheet — the one
-/// place a class rule reaches the sheet (B308).
+/// The end-of-evaluation finaliser (G23) that WRITES the stylesheet — the one place
+/// a class rule reaches the sheet (B308).
 ///
-/// `staged("css")` hands back the rules whose CLASS the build still names: a
-/// class is minted by `rule` below and lives in the `Style` that minted it, so
-/// a class no surviving style carries is a class no element can ever wear.
-/// Every condition combinator re-mints its inner style's rules under the
-/// composed condition and drops the inner, which is exactly how an
-/// intermediate's classes stop being named — `attribute(.., hover(inner))`
-/// leaves `inner`'s own `.sY:hover{..}` staged and unreferenced, and it is
-/// dropped here instead of shipping beside the composed rule it was only ever
-/// scaffolding for.
+/// `staged("css")` hands back the rules whose CLASS the build still names: a class
+/// is minted by `rule` below and lives in the `Style` that minted it, so a class no
+/// surviving style carries is a class no element can ever wear. Every condition
+/// combinator re-mints its inner style's rules under the composed condition and
+/// drops the inner, which is exactly how an intermediate's classes stop being named
+/// — `attribute(.., hover(inner))` leaves `inner`'s own `.sY:hover{..}` staged and
+/// unreferenced, and it is dropped here instead of shipping beside the composed
+/// rule it was only ever scaffolding for.
 ///
 /// The band order is `assemble_assets`' and is untouched: these lines go onto
 /// the channel exactly as they did when `rule` emitted them, and the sheet
@@ -1740,29 +1725,28 @@ fun flush_stylesheet() {
 	}
 }
 
-/// Records one rendered rule against its class, and makes sure the finaliser
-/// that writes them exists. Scheduling is idempotent on the function's
-/// identity, so asking once per rule costs a set membership test and keeps the
-/// request where the contribution is — nothing has to remember to register the
-/// styling system, and a program with no styles schedules nothing.
+/// Records one rendered rule against its class, and makes sure the finaliser that
+/// writes them exists. Scheduling is idempotent on the function's identity, so
+/// asking once per rule costs a set membership test and keeps the request where the
+/// contribution is — nothing has to remember to register the styling system, and a
+/// program with no styles schedules nothing.
 fun stage_rule(class: str, line: str) {
 	schedule_at_end(flush_stylesheet);
 	stage("css", class, line);
 }
 
 export impl Style {
-	/// The one chokepoint: hash the slot, STAGE the atomic rule against its
-	/// class, insert last-wins — across the property's whole FAMILY, so a
-	/// shorthand set here clears the longhands it covers under this condition
-	/// (§0bis.4).
+	/// The one chokepoint: hash the slot, STAGE the atomic rule against its class,
+	/// insert last-wins — across the property's whole FAMILY, so a shorthand set
+	/// here clears the longhands it covers under this condition (§0bis.4).
 	///
-	/// The rule is staged rather than emitted (B308). Emission at construction
-	/// put every `Style` ever built on the sheet, including every intermediate
-	/// a condition combinator wraps and then drops — one dead rule set per
-	/// nesting level per leaf declaration, 27.6% of the corpus stylesheet's
-	/// class-rule bytes. A rule cannot be un-emitted, so the fix is not to emit
-	/// it yet: `flush_stylesheet` above writes the staged rules whose class
-	/// survived, once, at the end of const evaluation.
+	/// The rule is staged rather than emitted (B308). Emission at construction put
+	/// every `Style` ever built on the sheet, including every intermediate a
+	/// condition combinator wraps and then drops — one dead rule set per nesting
+	/// level per leaf declaration, 27.6% of the corpus stylesheet's class-rule
+	/// bytes. A rule cannot be un-emitted, so the fix is not to emit it yet:
+	/// `flush_stylesheet` above writes the staged rules whose class survived, once,
+	/// at the end of const evaluation.
 	fun rule(self, media: str, condition: str, property: str, declaration: str): Style {
 		let key = slot_key(media, condition, property);
 		let class = class_hash(key + "|" + declaration);
@@ -1772,9 +1756,9 @@ export impl Style {
 		Style { rules }
 	}
 
-	/// The escape hatch: any property, any value, atomic like the rest. The
-	/// value is any `CssValue` — a verbatim `str`, or a `Length`/`Color`
-	/// whose theme token carries its own `:root` line onto the sheet, so
+	/// The escape hatch: any property, any value, atomic like the rest. The value
+	/// is any `CssValue` — a verbatim `str`, or a `Length`/`Color` whose theme
+	/// token carries its own `:root` line onto the sheet, so
 	/// `.raw("padding", space(4))` is never a dangling `var()`.
 	fun raw<V: CssValue>(self, property: str, value: V): Style {
 		check_property_name(property);
@@ -1822,10 +1806,9 @@ export impl Style {
 		self.with_length("gap", value)
 	}
 
-	/// The `flex` shorthand — grow, shrink and basis in one value
-	/// (`"1 1 auto"`, `"1"`, `"0 0 12rem"`). A string because the three parts
-	/// have three different value kinds; the alternative is three methods
-	/// nobody writes separately.
+	/// The `flex` shorthand — grow, shrink and basis in one value (`"1 1 auto"`,
+	/// `"1"`, `"0 0 12rem"`). A string because the three parts have three different
+	/// value kinds; the alternative is three methods nobody writes separately.
 	fun flex(self, value: str): Style {
 		self.raw("flex", value)
 	}
@@ -1838,8 +1821,8 @@ export impl Style {
 		self.raw("flex-shrink", i"{value}")
 	}
 
-	/// The grid track list (`"repeat(3, 1fr)"`, `"12rem 1fr"`). `fr` is a grid
-	/// unit rather than a length, so the track list stays a string.
+	/// The grid track list (`"repeat(3, 1fr)"`, `"12rem 1fr"`). `fr` is a grid unit
+	/// rather than a length, so the track list stays a string.
 	fun grid_template_columns(self, value: str): Style {
 		self.raw("grid-template-columns", value)
 	}
@@ -1858,13 +1841,13 @@ export impl Style {
 		self.with_length("padding-top", value).with_length("padding-bottom", value)
 	}
 
-	// One edge at a time. The four come in as a FAMILY (§0bis.3): the sweep
-	// wanted `padding-left`, `padding-right` and `padding-top`, and splitting
-	// one CSS concept by a count is the cut the inset family already refused.
-	// `padding_x`/`padding_y` write these same slots, so mixing them with an
-	// edge is an ordinary last-wins override; mixing an edge with the `padding`
-	// SHORTHAND resolves by authoring order too, through the family rules in
-	// `rule` and `render_rule` (§0bis.4).
+	// One edge at a time. The four come in as a FAMILY (§0bis.3): the sweep wanted
+	// `padding-left`, `padding-right` and `padding-top`, and splitting one CSS
+	// concept by a count is the cut the inset family already refused.
+	// `padding_x`/`padding_y` write these same slots, so mixing them with an edge
+	// is an ordinary last-wins override; mixing an edge with the `padding`
+	// SHORTHAND resolves by authoring order too, through the family rules in `rule`
+	// and `render_rule` (§0bis.4).
 
 	fun padding_top(self, value: Length): Style {
 		self.with_length("padding-top", value)
@@ -1906,8 +1889,8 @@ export impl Style {
 		self.with_length("margin-bottom", value)
 	}
 
-	/// `margin_left(Length::auto())` is the flex-push idiom, and was five of
-	/// the nine single-edge sites in the demand sweep on its own.
+	/// `margin_left(Length::auto())` is the flex-push idiom, and was five of the
+	/// nine single-edge sites in the demand sweep on its own.
 	fun margin_left(self, value: Length): Style {
 		self.with_length("margin-left", value)
 	}
@@ -1966,8 +1949,8 @@ export impl Style {
 		self.with_length("left", value)
 	}
 
-	/// All four offsets at once — `inset(space(0))` is the fill-the-parent
-	/// idiom under `position(Position::Absolute)`.
+	/// All four offsets at once — `inset(space(0))` is the fill-the-parent idiom
+	/// under `position(Position::Absolute)`.
 	fun inset(self, value: Length): Style {
 		self.with_length("inset", value)
 	}
@@ -1976,11 +1959,10 @@ export impl Style {
 		self.with_length("border-radius", value)
 	}
 
-	/// The one border body: `<width> solid <color>` on whichever edge the
-	/// property names. `solid` is baked in because the demand sweep found
-	/// ZERO non-`solid` borders across every line of styling written in the
-	/// language — a `BorderStyle` enum's other variants would be speculation
-	/// (§0bis.3).
+	/// The one border body: `<width> solid <color>` on whichever edge the property
+	/// names. `solid` is baked in because the demand sweep found ZERO non-`solid`
+	/// borders across every line of styling written in the language — a
+	/// `BorderStyle` enum's other variants would be speculation (§0bis.3).
 	fun with_border(self, property: str, width: Length, color: Color): Style {
 		if width.root != "" {
 			emit("css", width.root);
@@ -2011,17 +1993,17 @@ export impl Style {
 		self.with_border("border-left", width, color)
 	}
 
-	/// No border. Written as a method rather than a `BorderStyle::None` so it
-	/// fills the SAME slot `border` does — removing a border a base style set
-	/// is then the ordinary last-wins override, not a second rule racing the
-	/// first through the cascade.
+	/// No border. Written as a method rather than a `BorderStyle::None` so it fills
+	/// the SAME slot `border` does — removing a border a base style set is then the
+	/// ordinary last-wins override, not a second rule racing the first through the
+	/// cascade.
 	fun border_none(self): Style {
 		self.raw("border", "none")
 	}
 
-	/// Just the colour, its own slot — so a `hover`/`focus` variant can
-	/// recolour a border without restating its width, which is what four of
-	/// the five real `border-color` sites were doing by hand.
+	/// Just the colour, its own slot — so a `hover`/`focus` variant can recolour a
+	/// border without restating its width, which is what four of the five real
+	/// `border-color` sites were doing by hand.
 	fun border_color(self, value: Color): Style {
 		self.with_color("border-color", value)
 	}
@@ -2043,10 +2025,10 @@ export impl Style {
 	}
 
 	/// A gradient, on the `background-image` slot — a DIFFERENT slot from
-	/// `background`, because a gradient is an image in CSS and paints over
-	/// the background colour rather than replacing it. Each stop's colour
-	/// carries its `:root` line out here, so a gradient of ramp tokens themes
-	/// like any other value.
+	/// `background`, because a gradient is an image in CSS and paints over the
+	/// background colour rather than replacing it. Each stop's colour carries its
+	/// `:root` line out here, so a gradient of ramp tokens themes like any other
+	/// value.
 	fun background_gradient(self, value: Gradient): Style {
 		if value.stop_count < 2 {
 			panic(i"a gradient needs at least two stops, got {value.stop_count} — add .stop(color, percent)");
@@ -2057,13 +2039,12 @@ export impl Style {
 		self.rule("", "", "background-image", "background-image:" + value.render())
 	}
 
-	/// The SAME slot `background_gradient` writes, as CSS text — the escape for
-	/// the image values a `Gradient` cannot hold: a `url()` or data URI, a
-	/// multi-layer list, a positioned or `repeating-*` gradient. One slot and
-	/// two methods is deliberate, the `border`/`border_none` shape: they
-	/// override each other under the ordinary last-wins rule, where two
-	/// different slots would race in the cascade. Reach for
-	/// `background_gradient` when a `Gradient` holds the value.
+	/// The SAME slot `background_gradient` writes, as CSS text — the escape for the
+	/// image values a `Gradient` cannot hold: a `url()` or data URI, a multi-layer
+	/// list, a positioned or `repeating-*` gradient. One slot and two methods is
+	/// deliberate, the `border`/`border_none` shape: they override each other under
+	/// the ordinary last-wins rule, where two different slots would race in the
+	/// cascade. Reach for `background_gradient` when a `Gradient` holds the value.
 	fun background_image(self, value: str): Style {
 		check_not_blank("background_image", value);
 		self.raw("background-image", value)
@@ -2083,8 +2064,8 @@ export impl Style {
 		self.with_color("color", value)
 	}
 
-	/// A font stack (`"system-ui, sans-serif"`). A string: the value is an
-	/// ordered fallback list of names the compiler has nothing to check.
+	/// A font stack (`"system-ui, sans-serif"`). A string: the value is an ordered
+	/// fallback list of names the compiler has nothing to check.
 	fun font_family(self, value: str): Style {
 		self.raw("font-family", value)
 	}
@@ -2116,17 +2097,17 @@ export impl Style {
 		self.raw("user-select", value.value())
 	}
 
-	/// The unitless form, and the one to prefer: a number inherits as a RATIO
-	/// and re-computes against each descendant's own font size.
+	/// The unitless form, and the one to prefer: a number inherits as a RATIO and
+	/// re-computes against each descendant's own font size.
 	fun line_height(self, value: f64): Style {
 		self.raw("line-height", i"{value}")
 	}
 
-	/// A line height WITH a unit, on the same slot `line_height` writes — a
-	/// sibling rather than a widened `line_height`, since the language has no
-	/// overloading and the `f64` form keeps its name and its callers. A length
-	/// inherits as a COMPUTED LENGTH, so it will not track a descendant that
-	/// resizes its text; reach for it when the design specifies a leading in px.
+	/// A line height WITH a unit, on the same slot `line_height` writes — a sibling
+	/// rather than a widened `line_height`, since the language has no overloading
+	/// and the `f64` form keeps its name and its callers. A length inherits as a
+	/// COMPUTED LENGTH, so it will not track a descendant that resizes its text;
+	/// reach for it when the design specifies a leading in px.
 	fun line_height_length(self, value: Length): Style {
 		self.with_length("line-height", value)
 	}
@@ -2147,23 +2128,23 @@ export impl Style {
 		self.raw("transition", value)
 	}
 
-	/// A transform list (`"translateY(-2px)"`, `"rotate(45deg) scale(1.1)"`).
-	/// A string: the functions take angles, ratios and lengths in one value.
+	/// A transform list (`"translateY(-2px)"`, `"rotate(45deg) scale(1.1)"`). A
+	/// string: the functions take angles, ratios and lengths in one value.
 	fun transform(self, value: str): Style {
 		self.raw("transform", value)
 	}
 
 	/// **The one condition combinator** (A95): put `inner` under `conditions`.
 	///
-	/// `inner`'s base declarations become rules under `conditions`, and
-	/// `inner`'s own rules carry `conditions` too — INTERSECTED, which is what
-	/// makes nesting mean anything: `a.on(X, b.on(Y, s))` gives `s` the set
-	/// `X ∪ Y`, and there is no order to get wrong because a set has none.
+	/// `inner`'s base declarations become rules under `conditions`, and `inner`'s
+	/// own rules carry `conditions` too — INTERSECTED, which is what makes nesting
+	/// mean anything: `a.on(X, b.on(Y, s))` gives `s` the set `X ∪ Y`, and there is
+	/// no order to get wrong because a set has none.
 	///
 	/// Every named combinator below is one line over this. They keep their own
-	/// nesting fences for now — this slice changes the model and not the
-	/// surface — but the composition underneath them is this method's, so
-	/// there is one place a condition is composed instead of five.
+	/// nesting fences for now — this slice changes the model and not the surface —
+	/// but the composition underneath them is this method's, so there is one place
+	/// a condition is composed instead of five.
 	fun on<C: IntoConditions>(self, conditions: C, inner: Style): Style {
 		let set = conditions.conditions();
 		mut out = self;
@@ -2187,25 +2168,25 @@ export impl Style {
 	// rules also emit — deduplicated, possibly unused: the recorded
 	// over-approximation, shared with unused styles generally.)
 	//
-	// The four axes nest OUTSIDE-IN in the order the selector nests them:
-	// media, then the relation, then the attribute, then the pseudo-class —
+	// The four axes nest OUTSIDE-IN in the order the selector nests them: media,
+	// then the relation, then the attribute, then the pseudo-class —
 	// `md(within(.., attribute(.., hover(..))))`. Every other order is a build
-	// error naming the fix, so there is exactly one spelling per combination
-	// and one slot key per combination with it. One relation per slot, and
-	// the child-side relations (`children`, `divide`) take an unconditioned
-	// inner in v1: a pseudo or attribute under them would bind to the CHILD's
-	// compound, which is semantics nobody has ruled yet.
+	// error naming the fix, so there is exactly one spelling per combination and
+	// one slot key per combination with it. One relation per slot, and the
+	// child-side relations (`children`, `divide`) take an unconditioned inner in
+	// v1: a pseudo or attribute under them would bind to the CHILD's compound,
+	// which is semantics nobody has ruled yet.
 	//
-	// `not` (A89) is the one combinator that is NOT an axis: it marks its inner
-	// and the enclosing condition negates ITS OWN selector. It therefore adds
-	// no nesting order of its own — it sits directly inside the condition it
-	// negates, on whichever axis that is.
+	// `not` (A89) is the one combinator that is NOT an axis: it marks its inner and
+	// the enclosing condition negates ITS OWN selector. It therefore adds no
+	// nesting order of its own — it sits directly inside the condition it negates,
+	// on whichever axis that is.
 	//
-	// Every combinator here WRAPS: it re-reads the inner style's slots and
-	// re-mints each under its own condition. That re-read is a FIELD read of
-	// the `Slot` record, so a condition holding the joined key's separator
-	// cannot mis-align it (B311, closed structurally by A95 S2's record). `+`
-	// is not a wrap and never was.
+	// Every combinator here WRAPS: it re-reads the inner style's slots and re-mints
+	// each under its own condition. That re-read is a FIELD read of the `Slot`
+	// record, so a condition holding the joined key's separator cannot mis-align it
+	// (B311, closed structurally by A95 S2's record). `+` is not a wrap and never
+	// was.
 
 	fun hover(self, inner: Style): Style {
 		self.pseudo("hover", inner)
@@ -2244,20 +2225,19 @@ export impl Style {
 	/// §0bis.6's ledger).
 	///
 	/// Takes dark's grammar seat: an attribute and a pseudo-class nest INSIDE
-	/// (`within(.., attribute(.., hover(..)))` — the composed rule outranks
-	/// its parts on specificity), media nests outside, and no relation wraps
-	/// a relation. Name and value are fenced at const time like `attribute`'s
-	/// — one token, no quotes, spaces or `:`.
+	/// (`within(.., attribute(.., hover(..)))` — the composed rule outranks its
+	/// parts on specificity), media nests outside, and no relation wraps a
+	/// relation. Name and value are fenced at const time like `attribute`'s — one
+	/// token, no quotes, spaces or `:`.
 	///
-	/// The value is `attribute`'s `Option` for the same reason and with the
-	/// same reading (A89): `Some(v)` guards on the exact value
-	/// (`[name="v"] .sX`), `None` on the ancestor merely CARRYING the attribute
-	/// (`[name] .sX`) — a `[data-collapsed]` sidebar, a `[data-print]` root.
+	/// The value is `attribute`'s `Option` for the same reason and with the same
+	/// reading (A89): `Some(v)` guards on the exact value (`[name="v"] .sX`),
+	/// `None` on the ancestor merely CARRYING the attribute (`[name] .sX`) — a
+	/// `[data-collapsed]` sidebar, a `[data-print]` root.
 	///
-	/// This SUGAR guards on an attribute and nothing else, which is the
-	/// signature's whole limit. The condition value takes any condition an
-	/// ancestor can match, a pseudo-class included:
-	/// `.on(within(hover()), inner)`.
+	/// This SUGAR guards on an attribute and nothing else, which is the signature's
+	/// whole limit. The condition value takes any condition an ancestor can match,
+	/// a pseudo-class included: `.on(within(hover()), inner)`.
 	///
 	/// **Deprecated for one release** (A95 S5, style-conditions.md §12 (iv)).
 	/// The `Option<str>` A89 gave it is the thing a condition VALUE spells
@@ -2291,20 +2271,20 @@ export impl Style {
 
 	/// Styles every direct child BUT THE FIRST — the between-children slot
 	/// (Tailwind's `divide-*`), rendered `> :not(:first-child)` rather than
-	/// `> * + *`: the same element set, but carrying the argument's (0,1,0)
-	/// so the whole selector is (0,2,0) — on a property `children` also
-	/// touches, divide outranks it by SPECIFICITY, whatever the authoring
-	/// order, instead of tying and falling to the class-hash line order
-	/// (§0bis.6). Layered like `children`, with the same standing.
+	/// `> * + *`: the same element set, but carrying the argument's (0,1,0) so the
+	/// whole selector is (0,2,0) — on a property `children` also touches, divide
+	/// outranks it by SPECIFICITY, whatever the authoring order, instead of tying
+	/// and falling to the class-hash line order (§0bis.6). Layered like `children`,
+	/// with the same standing.
 	fun divide(self, inner: Style): Style {
 		fence_child_relation(inner, "divide");
 		self.on(divide_condition(), inner)
 	}
 
-	/// An attribute condition on the element ITSELF — `.sX[data-open="true"]`
-	/// — where `within` is the ancestor form. The general spelling of state
-	/// carried in markup: `data-state`, `data-open`, `aria-expanded` — any
-	/// attribute rides, `aria-*` included.
+	/// An attribute condition on the element ITSELF — `.sX[data-open="true"]` —
+	/// where `within` is the ancestor form. The general spelling of state carried
+	/// in markup: `data-state`, `data-open`, `aria-expanded` — any attribute rides,
+	/// `aria-*` included.
 	///
 	/// The value says WHICH of the two attribute conditions CSS has (A89):
 	/// `Some(v)` is the exact match `[name="v"]`, and `None` is PRESENCE,
@@ -2349,14 +2329,13 @@ export impl Style {
 	/// position: a relation, an attribute and a breakpoint may wrap it, and it
 	/// may wrap none of them (nor another pseudo-class).
 	///
-	/// The name is free-form and reaches all of CSS, including a compound
-	/// nothing else here can spell (`"hover:not(:active)"`, `":selection"`):
-	/// the condition is RENDERED verbatim, so the rule it emits says exactly
-	/// what was written, and a wrapping combinator now re-reads the slot's
-	/// FIELDS rather than splitting its key, so the compound survives being
-	/// wrapped (B311's miscompile, closed structurally). Two conditions on one
-	/// rule is what A95's condition values spell properly —
-	/// `.on(hover() + active().not(), ..)`.
+	/// The name is free-form and reaches all of CSS, including a compound nothing
+	/// else here can spell (`"hover:not(:active)"`, `":selection"`): the condition
+	/// is RENDERED verbatim, so the rule it emits says exactly what was written,
+	/// and a wrapping combinator now re-reads the slot's FIELDS rather than
+	/// splitting its key, so the compound survives being wrapped (B311's
+	/// miscompile, closed structurally). Two conditions on one rule is what A95's
+	/// condition values spell properly — `.on(hover() + active().not(), ..)`.
 	fun pseudo(self, name: str, inner: Style): Style {
 		check_pseudo_name(name);
 		fence_pseudo(inner, name);
@@ -2393,18 +2372,18 @@ export impl Style {
 	/// `self` untouched when it does not (backlog A36, style-variants.md §8
 	/// Q3).
 	///
-	/// It never CONSTRUCTS a style: both sides were built, and emitted their
-	/// rules, inside their own `const` expressions, so the construct-in-const
-	/// rule is untouched with a runtime flag in the middle. `when` only
-	/// selects between two styles that already exist.
+	/// It never CONSTRUCTS a style: both sides were built, and emitted their rules,
+	/// inside their own `const` expressions, so the construct-in-const rule is
+	/// untouched with a runtime flag in the middle. `when` only selects between two
+	/// styles that already exist.
 	///
 	///     button_base
 	///         .when(selected, button_selected)
 	///         .when(disabled, button_disabled)
 	///
-	/// Chain order is PRECEDENCE, exactly as with `+`: when two `when`s both
-	/// fire, the later delta wins whatever properties they share (and clears a
-	/// longhand its own shorthand covers, per family).
+	/// Chain order is PRECEDENCE, exactly as with `+`: when two `when`s both fire,
+	/// the later delta wins whatever properties they share (and clears a longhand
+	/// its own shorthand covers, per family).
 	///
 	/// The chain reads best when each condition mentions its OWN flag —
 	/// independent state axes, one link each. When one condition has to
@@ -2423,13 +2402,12 @@ export impl Style {
 	/// The rendered class attribute: every slot's class, space-joined.
 	/// Runtime-legal (no emission) — selection and merging stay ordinary code.
 	///
-	/// It used to be where an UNWRAPPED `not(..)` was caught (A89): a marked
-	/// slot emitted no rule, so its class named nothing on the sheet and
-	/// applying the style was silence rather than a wrong colour. A95 S2
-	/// retires the marker for `Condition::not`, and with it that whole class of
-	/// mistake — a negation is applied to the condition it negates at the
-	/// moment it is written, so no slot can reach application half-built and
-	/// nothing has to be tested for here.
+	/// It used to be where an UNWRAPPED `not(..)` was caught (A89): a marked slot
+	/// emitted no rule, so its class named nothing on the sheet and applying the
+	/// style was silence rather than a wrong colour. A95 S2 retires the marker for
+	/// `Condition::not`, and with it that whole class of mistake — a negation is
+	/// applied to the condition it negates at the moment it is written, so no slot
+	/// can reach application half-built and nothing has to be tested for here.
 	fun class_list(self): str {
 		mut out = "";
 		for entry in self.rules.values() {
@@ -2473,18 +2451,18 @@ export impl Style with Add {
 
 // --- declaration blocks -----------------------------------------------------------
 
-/// A set of CSS declarations carrying NO slot key, no class name and no
-/// `Style` — the body `declare` puts under an author-chosen selector. Built
-/// like a style chain, but each link appends TEXT: nothing here is hashed, so
-/// nothing here can mint a class name or move one.
+/// A set of CSS declarations carrying NO slot key, no class name and no `Style` —
+/// the body `declare` puts under an author-chosen selector. Built like a style
+/// chain, but each link appends TEXT: nothing here is hashed, so nothing here can
+/// mint a class name or move one.
 ///
-/// This is the other door into the const-only CSS channel, and it is
-/// deliberately narrow. `Style` is how you dress an ELEMENT — atomic, merged
-/// by record update, cascade-free by construction. A declaration block is how
-/// you declare something the element model cannot reach: a theme's custom
-/// properties under `[data-theme="…"]`, a `:root` token table, a reset's
-/// `box-sizing`. Reach for `Style` first; reach for this when the thing being
-/// styled is a selector rather than a view.
+/// This is the other door into the const-only CSS channel, and it is deliberately
+/// narrow. `Style` is how you dress an ELEMENT — atomic, merged by record update,
+/// cascade-free by construction. A declaration block is how you declare something
+/// the element model cannot reach: a theme's custom properties under
+/// `[data-theme="…"]`, a `:root` token table, a reset's `box-sizing`. Reach for
+/// `Style` first; reach for this when the thing being styled is a selector rather
+/// than a view.
 export struct Declarations {
 	// `property:value` pairs, `;`-joined; "" while empty.
 	text: str,
@@ -2495,20 +2473,20 @@ export struct Declarations {
 	roots: List<str>,
 }
 
-/// Opens a declaration chain — `style()`'s counterpart on the text side of
-/// the channel. Nothing reaches the stylesheet until `declare` puts the chain
-/// under a selector — a token's `:root` line included: the chain accumulates
-/// the lines it owes and `declare` puts them there with the block.
+/// Opens a declaration chain — `style()`'s counterpart on the text side of the
+/// channel. Nothing reaches the stylesheet until `declare` puts the chain under a
+/// selector — a token's `:root` line included: the chain accumulates the lines it
+/// owes and `declare` puts them there with the block.
 export fun declarations(): Declarations {
 	Declarations { text = "", roots = [] }
 }
 
 export impl Declarations {
-	/// Any property, any `CssValue` — `Style::raw`'s counterpart, and the
-	/// spelling for the two things this surface exists for: a custom property
-	/// (`--color-ink`) and a plain CSS property under a selector no class
-	/// names. A `Length` or `Color` value carries its own `:root` token line
-	/// onto the sheet, so a token spent here is never a dangling `var()`.
+	/// Any property, any `CssValue` — `Style::raw`'s counterpart, and the spelling
+	/// for the two things this surface exists for: a custom property
+	/// (`--color-ink`) and a plain CSS property under a selector no class names. A
+	/// `Length` or `Color` value carries its own `:root` token line onto the sheet,
+	/// so a token spent here is never a dangling `var()`.
 	fun raw<V: CssValue>(self, property: str, value: V): Declarations {
 		let text = value.css_text();
 		check_declaration(property, text);
@@ -2533,15 +2511,15 @@ export impl Declarations {
 	}
 }
 
-/// Puts `body`'s declarations under `selector`, as one line of CSS text in
-/// the build's stylesheet. It mints NO class, produces no `Style`, touches no
-/// slot key and rehashes nothing — the atomic system is untouched, and a
-/// build that never calls `declare` emits a byte-identical sheet.
+/// Puts `body`'s declarations under `selector`, as one line of CSS text in the
+/// build's stylesheet. It mints NO class, produces no `Style`, touches no slot key
+/// and rehashes nothing — the atomic system is untouched, and a build that never
+/// calls `declare` emits a byte-identical sheet.
 ///
-/// It is the escape hatch apps were hand-rolling through `asset::emit`, with
-/// the line surgery removed: the channel appends a LINE, dedups by line and
-/// sorts by line, so a hand-rolled block had to flatten its own declarations
-/// with a string `replace`. `declare` builds the one line itself.
+/// It is the escape hatch apps were hand-rolling through `asset::emit`, with the
+/// line surgery removed: the channel appends a LINE, dedups by line and sorts by
+/// line, so a hand-rolled block had to flatten its own declarations with a string
+/// `replace`. `declare` builds the one line itself.
 ///
 /// **Ordering.** The block emits inside one cascade layer, `@layer vilan`,
 /// and that IS the ordering rule — there is no band to reason about and no
@@ -2571,17 +2549,17 @@ export fun declare(selector: str, body: Declarations) {
 	if body.text == "" {
 		panic(i"the declaration block for \"{selector}\" declares nothing — add a declaration with .raw(..), .color(..) or .length(..), or drop the block");
 	}
-	// The tokens the block spent, declared beside it — a ramp step or a
-	// spacing step used here is never a dangling `var()`. The channel dedups
-	// by line, so a token the styles already emitted costs nothing.
+	// The tokens the block spent, declared beside it — a ramp step or a spacing
+	// step used here is never a dangling `var()`. The channel dedups by line, so a
+	// token the styles already emitted costs nothing.
 	for root in body.roots {
 		emit("css", root);
 	}
 	emit("css", "@layer vilan{" + selector + "{" + body.text + "}}");
 }
 
-/// A base stylesheet — the opinionated reset (kolt.local 008) an app opts
-/// into with one `const preflight()` and opts out of by deleting the line.
+/// A base stylesheet — the opinionated reset (kolt.local 008) an app opts into with
+/// one `const preflight()` and opts out of by deleting the line.
 ///
 /// **What it is.** Tailwind's preflight scope, adapted: `box-sizing:
 /// border-box` everywhere, the UA's margins zeroed, its form-control chrome
@@ -2593,21 +2571,19 @@ export fun declare(selector: str, body: Declarations) {
 /// page that wants inline links styles them back. It is a deliberate,
 /// opinionated default, not a normalization.
 ///
-/// **Why it is opt-in.** A reset baked into every build would be a breaking
-/// change for anyone styling against UA defaults, and there is no way to
-/// unsend one. So it is a std style asset the app EMITS, like `declare` — the
-/// only door into the stylesheet is a `const` expression, and a build that
-/// never calls this emits a byte-identical sheet. It deliberately is NOT a
-/// `Document::of` option: `Document` reads a build's manifest and writes one
-/// `<link>`, it has no channel into the sheet at all, and a browser-only
-/// project — the one that most wants a reset — has no server leg to call it
-/// from.
+/// **Why it is opt-in.** A reset baked into every build would be a breaking change
+/// for anyone styling against UA defaults, and there is no way to unsend one. So it
+/// is a std style asset the app EMITS, like `declare` — the only door into the
+/// stylesheet is a `const` expression, and a build that never calls this emits a
+/// byte-identical sheet. It deliberately is NOT a `Document::of` option: `Document`
+/// reads a build's manifest and writes one `<link>`, it has no channel into the
+/// sheet at all, and a browser-only project — the one that most wants a reset — has
+/// no server leg to call it from.
 ///
 /// **Ordering, which is the whole design.** Every rule here goes in
-/// `@layer vilan.preflight`, a SUB-layer of the layer `declare` and the
-/// child-side relations use. That settles precedence by the cascade rather
-/// than by where a line lands in the sheet's sort, twice over and in the same
-/// direction each time:
+/// `@layer vilan.preflight`, a SUB-layer of the layer `declare` and the child-side
+/// relations use. That settles precedence by the cascade rather than by where a
+/// line lands in the sheet's sort, twice over and in the same direction each time:
 ///
 /// - unlayered beats layered, so **every `Style` wins against every reset
 ///   rule**, whatever either one's specificity — the same guarantee `declare`
@@ -2616,12 +2592,11 @@ export fun declare(selector: str, body: Declarations) {
 ///   against every reset rule** too, and an app that resets `button` further
 ///   does not have to out-specify std to do it.
 ///
-/// The reset is therefore the weakest author-origin thing in the sheet, which
-/// is exactly what a reset should be — and it is still stronger than every UA
-/// default, because layers order AUTHOR declarations and the UA origin loses
-/// to all of them. Nothing above depends on the sheet's byte order, which
-/// matters because that order is a lexical sort with no notion of a reset
-/// (`const-eval.md` §3).
+/// The reset is therefore the weakest author-origin thing in the sheet, which is
+/// exactly what a reset should be — and it is still stronger than every UA default,
+/// because layers order AUTHOR declarations and the UA origin loses to all of them.
+/// Nothing above depends on the sheet's byte order, which matters because that
+/// order is a lexical sort with no notion of a reset (`const-eval.md` §3).
 ///
 /// ```vilan,fragment
 /// let _reset = const preflight();
@@ -2629,9 +2604,8 @@ export fun declare(selector: str, body: Declarations) {
 /// // …and one line per rule below, deduped and sorted with everything else
 /// ```
 export fun preflight() {
-	// Structure. The universal box model is the one rule the whole system
-	// leans on: `width(px(200)).padding(space(4))` measures 200 under it and
-	// 232 without.
+	// Structure. The universal box model is the one rule the whole system leans on:
+	// `width(px(200)).padding(space(4))` measures 200 under it and 232 without.
 	preflight_rule("*,::before,::after", declarations().raw("box-sizing", "border-box"));
 	preflight_rule("html", declarations()
 		.raw("line-height", "1.5")
@@ -2649,8 +2623,8 @@ export fun preflight() {
 		.raw("margin", "0")
 		.raw("padding", "0"));
 
-	// Typography: headings and small print stop having sizes of their own, so
-	// a type scale is the app's to state.
+	// Typography: headings and small print stop having sizes of their own, so a
+	// type scale is the app's to state.
 	preflight_rule("h1,h2,h3,h4,h5,h6", declarations()
 		.raw("font-size", "inherit")
 		.raw("font-weight", "inherit"));
@@ -2705,9 +2679,9 @@ export fun preflight() {
 		.raw("vertical-align", "middle"));
 	preflight_rule("img,video", declarations().raw("max-width", "100%").raw("height", "auto"));
 
-	// The ruling's own addition, stated on its own line so it reads as the
-	// decision it is: an anchor, a button and a select are BLOCKS here, where
-	// every reset this one is adapted from leaves them inline.
+	// The ruling's own addition, stated on its own line so it reads as the decision
+	// it is: an anchor, a button and a select are BLOCKS here, where every reset
+	// this one is adapted from leaves them inline.
 	preflight_rule("a,button,select", declarations().raw("display", "block"));
 
 	// `[hidden]` last in reading order and strongest in the cascade — (0,1,0)
@@ -2715,31 +2689,31 @@ export fun preflight() {
 	preflight_rule("[hidden]", declarations().raw("display", "none"));
 }
 
-/// One [`preflight`] rule, in the reset's own sub-layer. Internal to this
-/// module by the same convention `render_rule` and `check_selector` keep — the
-/// language has no privacy modifier here, so what makes it internal is that it
-/// is absent from the reference surface: `@layer vilan.preflight` is std's
-/// floor, not a third place an app puts declarations. `declare` is the app's
-/// door, and it deliberately lands one layer ABOVE this one.
+/// One [`preflight`] rule, in the reset's own sub-layer. Internal to this module by
+/// the same convention `render_rule` and `check_selector` keep — the language has
+/// no privacy modifier here, so what makes it internal is that it is absent from
+/// the reference surface: `@layer vilan.preflight` is std's floor, not a third
+/// place an app puts declarations. `declare` is the app's door, and it deliberately
+/// lands one layer ABOVE this one.
 fun preflight_rule(selector: str, body: Declarations) {
 	check_selector(selector);
-	// Tokens spent in a rule declare themselves beside it, exactly as
-	// `declare` does. Nothing in the reset above spends one today; the loop
-	// is here so a later rule that does cannot leave a dangling `var()`.
+	// Tokens spent in a rule declare themselves beside it, exactly as `declare`
+	// does. Nothing in the reset above spends one today; the loop is here so a
+	// later rule that does cannot leave a dangling `var()`.
 	for root in body.roots {
 		emit("css", root);
 	}
 	emit("css", "@layer vilan.preflight{" + selector + "{" + body.text + "}}");
 }
 
-/// What a declaration block's SELECTOR must avoid, in the const-time-refusal
-/// style the rest of this module validates in.
+/// What a declaration block's SELECTOR must avoid, in the const-time-refusal style
+/// the rest of this module validates in.
 ///
 /// A NEWLINE is the structural one: the asset channel is line-granular, so a
-/// newline does not indent the rule, it SPLITS it into two lines that then
-/// dedup and sort independently of each other — which is exactly the tax the
-/// hand-rolled hatch paid with `.replace(";\n--", ";--")`, and refusing it
-/// here is what lets the tax be deleted rather than moved.
+/// newline does not indent the rule, it SPLITS it into two lines that then dedup
+/// and sort independently of each other — which is exactly the tax the hand-rolled
+/// hatch paid with `.replace(";\n--", ";--")`, and refusing it here is what lets
+/// the tax be deleted rather than moved.
 ///
 /// A BRACE is the other: the block's braces are `declare`'s to write, and a
 /// selector carrying one either closes the rule early or opens a nested one.
@@ -2772,10 +2746,10 @@ fun check_selector(selector: str) {
 	}
 }
 
-/// What one declaration must avoid. The property name owns the `:` that
-/// separates it from its value and the `;` that separates it from the next
-/// declaration, so it may carry neither; both halves refuse newlines (the
-/// line-granular channel) and braces (the block's own).
+/// What one declaration must avoid. The property name owns the `:` that separates
+/// it from its value and the `;` that separates it from the next declaration, so it
+/// may carry neither; both halves refuse newlines (the line-granular channel) and
+/// braces (the block's own).
 ///
 /// A `;` in the VALUE stays legal, deliberately: a data URI carries one
 /// (`url("data:image/svg+xml;base64,…")`), and refusing it would refuse the

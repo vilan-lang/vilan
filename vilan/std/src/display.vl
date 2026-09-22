@@ -8,9 +8,9 @@ trait Display {
 	fun to_string(self): str;
 }
 
-/// Render any `Display` value to its string form. Handy for logging a complex
-/// value readably: `print(format(id))` shows however `Id` implements `Display`
-/// (e.g. `Id { n = 0 }`), where `print(id)` alone shows the raw runtime form.
+/// Render any `Display` value to its string form. Handy for logging a complex value
+/// readably: `print(format(id))` shows however `Id` implements `Display` (e.g.
+/// `Id { n = 0 }`), where `print(id)` alone shows the raw runtime form.
 fun format<T: Display>(value: T): str {
 	value.to_string()
 }
@@ -24,8 +24,8 @@ fun format<T: Display>(value: T): str {
 // `str`'s own `Display` is the identity below, so `List<str>.join` costs
 // nothing extra.
 impl List<type T: Display> {
-	/// The elements' `to_string()` forms concatenated with `separator` between
-	/// them (no leading or trailing separator; an empty list joins to `""`).
+	/// The elements' `to_string()` forms concatenated with `separator` between them
+	/// (no leading or trailing separator; an empty list joins to `""`).
 	fun join(self, separator: str): str {
 		mut result = "";
 		mut first = true;

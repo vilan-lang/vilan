@@ -22,8 +22,8 @@ export async fun sign_hs512<C: Wire>(secret: Bytes, claims: C): str {
 	signing_input + "." + encode_url(signature)
 }
 
-/// Verifies `token` under `secret`: the signature must match (constant-time)
-/// and the payload must decode as `C`. Anything else is `None`.
+/// Verifies `token` under `secret`: the signature must match (constant-time) and
+/// the payload must decode as `C`. Anything else is `None`.
 export async fun verify_hs512<C: Wire>(secret: Bytes, token: str): Option<C> {
 	let parts = token.split(".");
 	if parts.len() != 3 || parts[0] != header_segment {

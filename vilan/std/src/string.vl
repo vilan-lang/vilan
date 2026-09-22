@@ -21,24 +21,24 @@ impl str {
 
 	/// The host's **full Unicode** lowercase mapping, locale-independent.
 	///
-	/// The mirror of `to_uppercase`: non-ASCII letters map (`"Ǳ"` lowers to
-	/// `"ǳ"`, `"É"` to `"é"`) and one-to-many mappings apply, so the result
-	/// can be LONGER than the receiver — `"İ"` lowers to `"i̇"`, two code
-	/// units — and indices do not survive the call. For a length-preserving
-	/// fold over the 26 ASCII letters alone, reach for `to_lowercase_ascii`.
+	/// The mirror of `to_uppercase`: non-ASCII letters map (`"Ǳ"` lowers to `"ǳ"`,
+	/// `"É"` to `"é"`) and one-to-many mappings apply, so the result can be LONGER
+	/// than the receiver — `"İ"` lowers to `"i̇"`, two code units — and indices do
+	/// not survive the call. For a length-preserving fold over the 26 ASCII letters
+	/// alone, reach for `to_lowercase_ascii`.
 	external fun to_lowercase(self): str;
 
 	/// `A`–`Z` shifted to `a`–`z`, and **nothing else touched**.
 	///
-	/// Exactly the 26 ASCII letters: `ß`, `Ǳ`, `İ`, `É` and every other code
-	/// unit passes through unchanged, so the result always has the same
-	/// length as the receiver and an index into one is an index into the
-	/// other. That is what makes it the tool for protocol text — file
-	/// extensions, mime rows, HTTP header names, HTML tag names, hex — where
-	/// "case-insensitive" is defined over ASCII and a Unicode fold would
-	/// rewrite data instead: U+212A KELVIN SIGN lowers to a plain `k` under
-	/// `to_lowercase`, so a full fold makes a character that is not an ASCII
-	/// letter read as one. For human text, `to_lowercase` is the one you want.
+	/// Exactly the 26 ASCII letters: `ß`, `Ǳ`, `İ`, `É` and every other code unit
+	/// passes through unchanged, so the result always has the same length as the
+	/// receiver and an index into one is an index into the other. That is what
+	/// makes it the tool for protocol text — file extensions, mime rows, HTTP
+	/// header names, HTML tag names, hex — where "case-insensitive" is defined over
+	/// ASCII and a Unicode fold would rewrite data instead: U+212A KELVIN SIGN
+	/// lowers to a plain `k` under `to_lowercase`, so a full fold makes a character
+	/// that is not an ASCII letter read as one. For human text, `to_lowercase` is
+	/// the one you want.
 	fun to_lowercase_ascii(self): str {
 		let lowercase = "abcdefghijklmnopqrstuvwxyz";
 		let length = self.len();
@@ -62,9 +62,9 @@ impl str {
 	///
 	/// The mirror of `to_lowercase_ascii`: exactly the 26 ASCII letters, every
 	/// other code unit unchanged, the length preserved. `"Straße"` comes back
-	/// `"STRAßE"` — where `to_uppercase` would expand the ß to `SS` and change
-	/// the length. The right tool wherever an identifier is ASCII by
-	/// specification; for human text, `to_uppercase`.
+	/// `"STRAßE"` — where `to_uppercase` would expand the ß to `SS` and change the
+	/// length. The right tool wherever an identifier is ASCII by specification; for
+	/// human text, `to_uppercase`.
 	fun to_uppercase_ascii(self): str {
 		let uppercase = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 		let length = self.len();
@@ -102,15 +102,15 @@ impl str {
 	///
 	/// REFUSES anything but `0 <= start <= end <= len()`: a negative bound, an
 	/// inverted pair, or an `end` past the length is a panic, not a correction.
-	/// (The host's own `substring` clamps and SWAPS, so `s.substring(k, -1)`
-	/// would quietly return `s[0..k]` — the complement of the request.) A caller
-	/// who means "to the end" writes `s.len()`; to drop a known affix, reach for
+	/// (The host's own `substring` clamps and SWAPS, so `s.substring(k, -1)` would
+	/// quietly return `s[0..k]` — the complement of the request.) A caller who
+	/// means "to the end" writes `s.len()`; to drop a known affix, reach for
 	/// `strip_prefix`/`strip_suffix`, which return `Option<str>`.
 	external fun substring(self, start: i32, end: i32): str;
 
 	/// The UTF-16 code unit at `index` (0..len), as its integer value — the
-	/// primitive under checksums and parsers. Out of range is NaN-shaped in
-	/// the host; index within `len()` is the caller's contract.
+	/// primitive under checksums and parsers. Out of range is NaN-shaped in the
+	/// host; index within `len()` is the caller's contract.
 	[extern(method, "charCodeAt")]
 	external fun code_at(self, index: i32): u32;
 
@@ -120,8 +120,8 @@ impl str {
 }
 
 // `+` on strings is native concatenation; this impl admits `str` to generic
-// `T: Add` code. (`operators` pulls only `io` — string.vl stays off the
-// `option` chain, the constraint recorded in option.vl's `parse_i32` note.)
+// `T: Add` code. (`operators` pulls only `io` — string.vl stays off the `option`
+// chain, the constraint recorded in option.vl's `parse_i32` note.)
 impl str with Add {
 	fun add(self, b: str): str {
 		self + b

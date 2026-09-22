@@ -1,17 +1,15 @@
-// `std::wire` — the codec-neutral serialization vocabulary (transport-rpc.md
-// §6.1): a `Wire` value *describes itself* to a `Serializer` and *rebuilds
-// itself* from a `Deserializer`; a codec (JSON today, binary next) owns the
-// actual bytes behind the record. `[derive(Wire)]` will emit these impls; the
-// scalar/`List`/`Option` impls here are the leaves the derived code bottoms
-// out in.
+// `std::wire` — the codec-neutral serialization vocabulary (transport-rpc.md §6.1):
+// a `Wire` value *describes itself* to a `Serializer` and *rebuilds itself* from a
+// `Deserializer`; a codec (JSON today, binary next) owns the actual bytes behind
+// the record. `[derive(Wire)]` will emit these impls; the scalar/`List`/`Option`
+// impls here are the leaves the derived code bottoms out in.
 //
 // The visitor surface is a pair of TRAITS (`Serialize`/`Deserialize`), so
 // `describe`/`rebuild` monomorphize to direct calls against each codec's
-// writer/reader. The closure RECORDS below remain as the codec-as-a-VALUE
-// erasure only (`Codec` must hand back one concrete type) — they implement
-// the traits by delegating to their fields, so the RPC seam rides them
-// unchanged while direct entry points (`encode_json`, `encode_binary`) skip
-// them entirely.
+// writer/reader. The closure RECORDS below remain as the codec-as-a-VALUE erasure
+// only (`Codec` must hand back one concrete type) — they implement the traits by
+// delegating to their fields, so the RPC seam rides them unchanged while direct
+// entry points (`encode_json`, `encode_binary`) skip them entirely.
 //
 // A visitor is MUTATED as a value narrates itself to it, and the receivers say
 // so: every `Serialize`/`Deserialize` method takes `&mut self`, and
@@ -79,10 +77,10 @@ trait Deserialize {
 /// calls monomorphize with no indirection. The two must mirror each other
 /// exactly: the derive guarantees it; hand-written impls promise it.
 ///
-/// The visitor arrives as a `&mut` view, and a nested `describe`/`rebuild`
-/// forwards the parameter BARE (`self.field.describe(serializer)`) — it is
-/// already a view, so `&mut serializer` would be re-taking one. The VALUE
-/// being narrated is still by-value `self`: describing reads it.
+/// The visitor arrives as a `&mut` view, and a nested `describe`/`rebuild` forwards
+/// the parameter BARE (`self.field.describe(serializer)`) — it is already a view,
+/// so `&mut serializer` would be re-taking one. The VALUE being narrated is still
+/// by-value `self`: describing reads it.
 trait Wire {
 	fun describe<S: Serialize>(self, serializer: &mut S);
 	fun rebuild<D: Deserialize>(deserializer: &mut D): Self;
@@ -110,9 +108,8 @@ struct Serializer {
 	str_value: |str| void,
 	i32_value: |i32| void,
 	u32_value: |u32| void,
-	// i53 rides its own channel; on the JS runtime its values are exact
-	// integers to 2^53 (the representation), which epoch millis and row ids
-	// fit comfortably.
+	// i53 rides its own channel; on the JS runtime its values are exact integers to
+	// 2^53 (the representation), which epoch millis and row ids fit comfortably.
 	i53_value: |i53| void,
 	f64_value: |f64| void,
 	bool_value: |bool| void,
@@ -125,9 +122,9 @@ struct Serializer {
 /// returns the element count; `is_null` peeks and `null_value` consumes a null.
 ///
 /// Errors are STICKY: a missing field, wrong shape, or unknown variant calls
-/// `fail(reason)` once; every later read returns a zero value without side
-/// effects, so rebuild code stays straight-line. The top-level decode checks
-/// `failed()` and discards the half-built value on `Some(reason)`.
+/// `fail(reason)` once; every later read returns a zero value without side effects,
+/// so rebuild code stays straight-line. The top-level decode checks `failed()` and
+/// discards the half-built value on `Some(reason)`.
 struct Deserializer {
 	begin_struct: || void,
 	field: |str| void,
@@ -149,10 +146,10 @@ struct Deserializer {
 	failed: || Option<str>,
 }
 
-// The records implement the visitor traits by delegating to their fields, so
-// a `Codec`-supplied record IS a `Serialize`/`Deserialize` and rides the same
-// generic `describe`/`rebuild` as a direct writer (one extra call per
-// operation — the price of the erasure, paid only on the codec path).
+// The records implement the visitor traits by delegating to their fields, so a
+// `Codec`-supplied record IS a `Serialize`/`Deserialize` and rides the same generic
+// `describe`/`rebuild` as a direct writer (one extra call per operation — the price
+// of the erasure, paid only on the codec path).
 impl Serializer with Serialize {
 	fun begin_struct(&mut self, fields: i32) {
 		(self.begin_struct)(fields);
@@ -456,8 +453,8 @@ impl List<type T: Wire> with Wire {
 	}
 }
 
-// An absent option is a null; a present one announces itself (`some_value` —
-// a no-op in JSON, a marker byte in binary) and describes its value.
+// An absent option is a null; a present one announces itself (`some_value` — a
+// no-op in JSON, a marker byte in binary) and describes its value.
 impl Option<type T: Wire> with Wire {
 	fun describe<S: Serialize>(self, serializer: &mut S) {
 		match self {
@@ -480,14 +477,14 @@ impl Option<type T: Wire> with Wire {
 }
 
 // A `Result` narrates as a tagged variant, exactly as an enum payload does:
-// `Ok`/`Err` plus the value bare. Backlog A82's gap — a fallible reply is the
-// most ordinary payload an `[rpc]` method has, and every app that wanted one
-// wrote this impl itself (kolt's `store.vl:27`, forty lines, verbatim this).
+// `Ok`/`Err` plus the value bare. Backlog A82's gap — a fallible reply is the most
+// ordinary payload an `[rpc]` method has, and every app that wanted one wrote this
+// impl itself (kolt's `store.vl:27`, forty lines, verbatim this).
 //
-// The tags are the VARIANT NAMES, which is what makes the encoding hash-stable:
-// the JSON object is keyed by them and the binary codec's `begin_variant`
-// matches on them, so neither side depends on declaration order or on a
-// discriminant that a later edit could renumber.
+// The tags are the VARIANT NAMES, which is what makes the encoding hash-stable: the
+// JSON object is keyed by them and the binary codec's `begin_variant` matches on
+// them, so neither side depends on declaration order or on a discriminant that a
+// later edit could renumber.
 //
 // An unrecognized tag is a structural failure, not a panic. The deserializer is
 // failed FIRST, which poisons every later read — the `Err` payload below then
@@ -541,9 +538,9 @@ impl Result<type T: Wire, type E: Wire> with Wire {
 /// instead of replaced wholesale, because `key()` says which element is which
 /// across the change. A message keys by its id, a row by its primary key.
 ///
-/// The key must be stable for the value's lifetime and unique within the
-/// collection — a duplicate key makes the diff ambiguous, and the keyed
-/// exposure treats the FIRST occurrence as the element (`std::rpc`).
+/// The key must be stable for the value's lifetime and unique within the collection
+/// — a duplicate key makes the diff ambiguous, and the keyed exposure treats the
+/// FIRST occurrence as the element (`std::rpc`).
 trait Keyed<K> {
 	fun key(self): K;
 }
@@ -568,8 +565,8 @@ trait Keyed<K> {
 /// - `Remove(key)` — the element under `key` is gone. The key must be present;
 ///   an absent one is a protocol error.
 ///
-/// `K` and `T` are both `Wire` on the impl, so a patch of deltas encodes with
-/// the connection's codec exactly like any other payload.
+/// `K` and `T` are both `Wire` on the impl, so a patch of deltas encodes with the
+/// connection's codec exactly like any other payload.
 enum Delta<K, T> {
 	Reset(List<T>),
 	Insert(K, T, i32),
@@ -644,10 +641,10 @@ impl Delta<type K: Wire, type T: Wire> with Wire {
 	}
 }
 
-// A map narrates as a list of `{key, value}` pairs — codec-neutral (a binary
-// codec reads the two positionally and ignores the names) and readable in
-// JSON. Backlog I1's gap: Q8 launched without it because no payload needed
-// one, and A39's keyed exposure is the payload that does.
+// A map narrates as a list of `{key, value}` pairs — codec-neutral (a binary codec
+// reads the two positionally and ignores the names) and readable in JSON. Backlog
+// I1's gap: Q8 launched without it because no payload needed one, and A39's keyed
+// exposure is the payload that does.
 //
 // Insertion order is what `entries()` reports and what rebuild replays, so a
 // round trip preserves it. A duplicate key on the wire keeps the LAST pair,
@@ -705,10 +702,10 @@ struct Codec {
 	reader: |Frame| Deserializer,
 }
 
-/// One value to one frame. The record is re-bound `mut` so `describe` can take
-/// the `&mut` view its signature asks for: the record itself holds no state
-/// (its closures do), so the re-binding costs a copy of a closure bag and the
-/// writer behind it is the one the codec minted.
+/// One value to one frame. The record is re-bound `mut` so `describe` can take the
+/// `&mut` view its signature asks for: the record itself holds no state (its
+/// closures do), so the re-binding costs a copy of a closure bag and the writer
+/// behind it is the one the codec minted.
 fun encode<T: Wire>(codec: Codec, value: T): Frame {
 	let (serializer, finish) = (codec.writer)();
 	mut sink = serializer;

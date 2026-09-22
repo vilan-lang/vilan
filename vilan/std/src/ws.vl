@@ -59,8 +59,8 @@ fun close_frame(): Bytes {
 // --- Parsing (client → server) ------------------------------------------------
 
 /// What one `feed` can surface. Pongs are consumed silently; a `Ping` asks the
-/// caller to write `pong_frame(payload)` back; `Closed` ends the connection
-/// (sent close, or a protocol violation).
+/// caller to write `pong_frame(payload)` back; `Closed` ends the connection (sent
+/// close, or a protocol violation).
 enum WsEvent {
 	Text(str),
 	Binary(Bytes),
@@ -68,9 +68,9 @@ enum WsEvent {
 	Closed,
 }
 
-/// A stateful frame parser: feed it raw socket chunks, get complete events.
-/// Partial frames wait in `buffer`; fragmented messages accumulate in
-/// `fragment_*` until their FIN.
+/// A stateful frame parser: feed it raw socket chunks, get complete events. Partial
+/// frames wait in `buffer`; fragmented messages accumulate in `fragment_*` until
+/// their FIN.
 struct WsParser {
 	buffer: Shared<Bytes>,
 	fragment_opcode: Shared<i32>,
@@ -123,8 +123,8 @@ impl WsParser {
 						valid = false;
 						scanning = false;
 					} else {
-						// The high 5 bytes must be zero AND the low 31 bits
-						// must not carry the sign — anything larger is hostile.
+						// The high 5 bytes must be zero AND the low 31 bits must
+						// not carry the sign — anything larger is hostile.
 						let oversized = buffer.get(2) != 0
 							|| buffer.get(3) != 0
 							|| buffer.get(4) != 0

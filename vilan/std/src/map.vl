@@ -69,9 +69,9 @@ impl Map<type K: Hashable, type V> {
 		result
 	}
 
-	/// A `List` snapshot of `(key, value)` pairs, in insertion order — the
-	/// paired counterpart to `keys()`/`values()`, for walking both together
-	/// without zipping two separate snapshots by hand:
+	/// A `List` snapshot of `(key, value)` pairs, in insertion order — the paired
+	/// counterpart to `keys()`/`values()`, for walking both together without
+	/// zipping two separate snapshots by hand:
 	/// `for entry in map.entries() { entry.0; entry.1 }`.
 	fun entries(self): List<(K, V)> {
 		self.table.values()
@@ -99,11 +99,11 @@ impl Map<type K: Hashable, type V: PartialEq> {
 /// `xs.iter().map(|w| (w, w.len())).to_list().to_map()`. A repeated key keeps
 /// the LAST pair, matching `insert`.
 ///
-/// The impl subject binds the element structurally — `List<(K, V)>` — which is
-/// how the two bounds a `Map` needs (`K: Hashable`, and the element being a
-/// pair at all) are stated. It lives here rather than on `Iterator` for the
-/// same reason `to_set` lives on `List`: a trait default may not require a
-/// bound its trait does not declare.
+/// The impl subject binds the element structurally — `List<(K, V)>` — which is how
+/// the two bounds a `Map` needs (`K: Hashable`, and the element being a pair at
+/// all) are stated. It lives here rather than on `Iterator` for the same reason
+/// `to_set` lives on `List`: a trait default may not require a bound its trait does
+/// not declare.
 impl List<(type K: Hashable, type V)> {
 	fun to_map(self): Map<K, V> {
 		mut result: Map<K, V> = Map::new();
@@ -114,12 +114,11 @@ impl List<(type K: Hashable, type V)> {
 	}
 }
 
-/// The empty map is a `Map`'s default (I4) — `Default`'s only implementors were
-/// the numeric family, so a `T: Default` bound could not be met by a container
-/// and kolt wrote this impl itself (`prefs.vl:100`, under a
-/// `// FIXME: Implement with std.`). The binder carries `Hashable` because the
-/// TYPE does: a `Map` whose key is not hashable does not exist to have a
-/// default.
+/// The empty map is a `Map`'s default (I4) — `Default`'s only implementors were the
+/// numeric family, so a `T: Default` bound could not be met by a container and kolt
+/// wrote this impl itself (`prefs.vl:100`, under a
+/// `// FIXME: Implement with std.`). The binder carries `Hashable` because the TYPE
+/// does: a `Map` whose key is not hashable does not exist to have a default.
 impl Map<type K: Hashable, type V> with Default {
 	fun default(): Map<K, V> {
 		Map::new()

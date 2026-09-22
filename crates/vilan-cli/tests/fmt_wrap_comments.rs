@@ -125,3 +125,80 @@ fn the_nearest_manifest_wins_over_the_workspace_above_it() {
     assert_eq!(read(&dir, "wrapped/src/main.vl"), WRAPPED);
     assert_eq!(read(&dir, "kept/src/main.vl"), LONG_COMMENT);
 }
+
+// --- E215: `[fmt] comment_width` ----------------------------------------
+// The key the default flip waits on. E205 filled to the CODE width, which is
+// a width nobody chose for prose: std writes its comments to ~84 columns, so
+// opting in at 100 would have moved 6,719 comment lines. These pin the half
+// only the CLI can answer — the key reaching the printer from a manifest, and
+// each key taking its OWN nearest declaration.
+
+/// Opted in at the width std opts in at (E215's R2).
+const AT_84: &str =
+    "[package]\nname = \"wrapprobe\"\n\n[fmt]\nwrap_comments = true\ncomment_width = 84\n";
+
+/// What the fill answers for [`LONG_COMMENT`] at 84 columns — narrower than
+/// [`WRAPPED`], which is the point of the key.
+const WRAPPED_AT_84: &str = "// the formatter has laid code out to a width since the day it existed and left\n// every comment exactly as typed\nfun main() {}\n";
+
+#[test]
+fn a_width_other_than_the_code_width_is_the_one_the_fill_uses() {
+    let dir = tree(
+        "width-84",
+        &[("vilan.toml", AT_84), ("src/main.vl", LONG_COMMENT)],
+    );
+    let first = vilan_fmt(&dir);
+    assert!(first.status.success(), "{first:?}");
+    assert_eq!(read(&dir, "src/main.vl"), WRAPPED_AT_84);
+    assert_ne!(
+        WRAPPED_AT_84, WRAPPED,
+        "the declared width must differ from the code width's answer"
+    );
+    for line in WRAPPED_AT_84.lines().filter(|line| line.starts_with("//")) {
+        assert!(
+            line.chars().count() <= 84,
+            "over the declared width: {line}"
+        );
+    }
+    let second = vilan_fmt(&dir);
+    assert!(second.status.success(), "{second:?}");
+    assert_eq!(read(&dir, "src/main.vl"), WRAPPED_AT_84);
+}
+
+#[test]
+fn the_width_alone_wraps_nothing() {
+    // `comment_width` is read only when `wrap_comments` is on: a package that
+    // declares a width and nothing else keeps today's formatter exactly.
+    let width_only = "[package]\nname = \"wrapprobe\"\n\n[fmt]\ncomment_width = 84\n";
+    let dir = tree(
+        "width-only",
+        &[("vilan.toml", width_only), ("src/main.vl", LONG_COMMENT)],
+    );
+    assert!(vilan_fmt(&dir).status.success());
+    assert_eq!(read(&dir, "src/main.vl"), LONG_COMMENT);
+}
+
+#[test]
+fn each_key_takes_its_own_nearest_declaration() {
+    // A workspace sets the width once; one member turns the wrapping on and
+    // one leaves it off. The member that wraps must do it at the WORKSPACE's
+    // width — the climb resolves the two keys independently, so a member
+    // declaring one of them does not shadow the other.
+    let workspace = "[project]\npackages = [\"wrapped\", \"kept\"]\n\n[fmt]\ncomment_width = 84\n";
+    let dir = tree(
+        "split-keys",
+        &[
+            ("vilan.toml", workspace),
+            (
+                "wrapped/vilan.toml",
+                "[package]\nname = \"wrapped\"\n\n[fmt]\nwrap_comments = true\n",
+            ),
+            ("wrapped/src/main.vl", LONG_COMMENT),
+            ("kept/vilan.toml", "[package]\nname = \"kept\"\n"),
+            ("kept/src/main.vl", LONG_COMMENT),
+        ],
+    );
+    assert!(vilan_fmt(&dir).status.success());
+    assert_eq!(read(&dir, "wrapped/src/main.vl"), WRAPPED_AT_84);
+    assert_eq!(read(&dir, "kept/src/main.vl"), LONG_COMMENT);
+}

@@ -1,38 +1,37 @@
-// The css block's hole vocabulary (tracker A70): free-function aliases of the
-// typed style tokens, so a hole reads as the CSS it stands for.
+// The css block's hole vocabulary (tracker A70): free-function aliases of the typed
+// style tokens, so a hole reads as the CSS it stands for.
 //
-// A block's holes are where the type system lives (css-block.md §10), and the
-// price of that was `{Length::rem(4.0)}` and `{Color::gray(500)}` inside a
-// value that is otherwise plain CSS: the qualifying segment is noise at every
-// hole, and under the web prelude — where `style` is an ambient MODULE — it is
-// `{style::Length::rem(4.0)}`. These are the same values under the names CSS
-// itself uses, and nothing else: every function here is one line, and the
-// `Length`/`Color` constructors stay exactly where they are.
+// A block's holes are where the type system lives (css-block.md §10), and the price
+// of that was `{Length::rem(4.0)}` and `{Color::gray(500)}` inside a value that is
+// otherwise plain CSS: the qualifying segment is noise at every hole, and under the
+// web prelude — where `style` is an ambient MODULE — it is
+// `{style::Length::rem(4.0)}`. These are the same values under the names CSS itself
+// uses, and nothing else: every function here is one line, and the `Length`/`Color`
+// constructors stay exactly where they are.
 //
-// The module is AMBIENT INSIDE A CSS HOLE (names.md §4.7's ambient-module
-// rule, applied to one syntactic position): the lowering resolves a hole's
-// bare names against the site's scope FIRST and against this module only if
-// nothing there answers, so an explicit local binding always wins and no file
-// can be broken by a name added here. Outside a block it is an ordinary
-// module, and there is no wildcard import in vilan: the two idioms are the
-// brace list (`import std::style::prelude::{ rem, gray };`) and the qualifying
-// alias (`import std::style::prelude as tokens;`), ONE statement at the top of
-// a file whose `fun` bodies build chains — a chain written outside a hole gets
-// no ambient scope, so before A106 such a file imported one name per token it
-// used (kolt's `styles.vl:54/103` imported nine, per function).
+// The module is AMBIENT INSIDE A CSS HOLE (names.md §4.7's ambient-module rule,
+// applied to one syntactic position): the lowering resolves a hole's bare names
+// against the site's scope FIRST and against this module only if nothing there
+// answers, so an explicit local binding always wins and no file can be broken by a
+// name added here. Outside a block it is an ordinary module, and there is no
+// wildcard import in vilan: the two idioms are the brace list
+// (`import std::style::prelude::{ rem, gray };`) and the qualifying alias
+// (`import std::style::prelude as tokens;`), ONE statement at the top of a file
+// whose `fun` bodies build chains — a chain written outside a hole gets no ambient
+// scope, so before A106 such a file imported one name per token it used (kolt's
+// `styles.vl:54/103` imported nine, per function).
 //
-// THE SURFACE IS THE 46 NAMES BELOW (A117): the 38 one-line functions and the
-// 8 types the import above brings in. `export *;` re-exports what a module
-// BINDS, an aliased import included, so the aliases this file needs on the way
-// in — `open_style`, `scale_step`, `value_piece`, `custom_property` and
-// seventeen `*_condition` spellings — used to resolve from outside as 21 more
-// exports nobody designed, which is a vocabulary with two spellings for
-// everything and A106 door 2's largest objection. They now live INSIDE the one
-// body each is for: a function-scoped import binds in the function's scope and
-// nothing reaches it from another module, which is the whole mechanism. The
-// aliases exist at all because the free name and the local one collide —
-// `hover()` here is the condition and `style::hover` is what it calls — and
-// that is why they cannot simply be dropped.
+// THE SURFACE IS THE 46 NAMES BELOW (A117): the 38 one-line functions and the 8
+// types the import above brings in. `export *;` re-exports what a module BINDS, an
+// aliased import included, so the aliases this file needs on the way in —
+// `open_style`, `scale_step`, `value_piece`, `custom_property` and seventeen
+// `*_condition` spellings — used to resolve from outside as 21 more exports nobody
+// designed, which is a vocabulary with two spellings for everything and A106 door
+// 2's largest objection. They now live INSIDE the one body each is for: a
+// function-scoped import binds in the function's scope and nothing reaches it from
+// another module, which is the whole mechanism. The aliases exist at all because
+// the free name and the local one collide — `hover()` here is the condition and
+// `style::hover` is what it calls — and that is why they cannot simply be dropped.
 //
 // The keyword-property TYPES ride along for that reason (A106): a chain reads
 // `.cursor(Cursor::Pointer)` whether it is inside a hole or not, so `Cursor`,
@@ -81,8 +80,8 @@ fun auto(): Length {
 	Length::auto()
 }
 
-/// The spacing scale, by step — `{space(4)}` is the token, not a copied
-/// `1rem`, and it carries its own `:root` line onto the sheet.
+/// The spacing scale, by step — `{space(4)}` is the token, not a copied `1rem`, and
+/// it carries its own `:root` line onto the sheet.
 fun space(step: i32): Length {
 	import pkg::style::space as scale_step;
 	scale_step(step)
@@ -131,9 +130,9 @@ fun oklch(lightness: f64, chroma: f64, hue: f64): Color {
 }
 
 /// A CUSTOM PROPERTY as a value — `color(var("--brand-ink"));` (A101 R12).
-/// `--brand-ink` is not an expression, so CSS's `var(--x)` is spelled with the
-/// name as a string; the dashes are checked, because a name without them is not
-/// a reference at all.
+/// `--brand-ink` is not an expression, so CSS's `var(--x)` is spelled with the name
+/// as a string; the dashes are checked, because a name without them is not a
+/// reference at all.
 fun var(name: str): str {
 	import pkg::style::var as custom_property;
 	custom_property(name)
@@ -163,17 +162,17 @@ fun s(): Style {
 // --- the conditions ------------------------------------------------------------
 
 /// The condition VALUES (A95), under the names a `css` block head wants:
-/// `.on(hover() + active().not()) { … }` needs no import, because this module
-/// is ambient inside a block and a head is an ordinary expression list the
-/// lowering passes through.
+/// `.on(hover() + active().not()) { … }` needs no import, because this module is
+/// ambient inside a block and a head is an ordinary expression list the lowering
+/// passes through.
 ///
-/// Each is one line over `std::style`'s own constructor, aliased because the
-/// free name and the `Style` METHOD of the same name coexist (`hover()` is the
-/// condition, `style().hover(inner)` is the sugar that puts a style under it)
-/// and a file declaring `fun hover()` cannot also call the import of that
-/// name. The alias is imported INSIDE the body (A117): at file level `export *;`
-/// would publish the alias spelling as a second surface name for the same
-/// value, and a function-scoped import is reachable from nowhere else.
+/// Each is one line over `std::style`'s own constructor, aliased because the free
+/// name and the `Style` METHOD of the same name coexist (`hover()` is the
+/// condition, `style().hover(inner)` is the sugar that puts a style under it) and a
+/// file declaring `fun hover()` cannot also call the import of that name. The alias
+/// is imported INSIDE the body (A117): at file level `export *;` would publish the
+/// alias spelling as a second surface name for the same value, and a
+/// function-scoped import is reachable from nowhere else.
 
 fun hover(): Condition {
 	import pkg::style::hover as hover_condition;
@@ -212,8 +211,8 @@ fun pseudo(name: str): Condition {
 	pseudo_condition(name)
 }
 
-/// A pseudo-ELEMENT — `element("selection")` is `::selection`, and it comes
-/// last in the compound with nothing after it.
+/// A pseudo-ELEMENT — `element("selection")` is `::selection`, and it comes last in
+/// the compound with nothing after it.
 fun element(name: str): Condition {
 	import pkg::style::element as element_condition;
 	element_condition(name)
@@ -226,8 +225,8 @@ fun attribute(name: str): Condition {
 	attribute_condition(name)
 }
 
-/// The ancestor GUARD: the element's own rule, conditioned on an ANCESTOR
-/// matching `condition` — `within(attribute("data-theme").eq("dark"))`.
+/// The ancestor GUARD: the element's own rule, conditioned on an ANCESTOR matching
+/// `condition` — `within(attribute("data-theme").eq("dark"))`.
 fun within(condition: Condition): Condition {
 	import pkg::style::within as within_condition;
 	within_condition(condition)

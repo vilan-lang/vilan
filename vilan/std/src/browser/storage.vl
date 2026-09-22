@@ -1,7 +1,7 @@
-// Web Storage (proposal/kolt-migration.md §2.4): `localStorage` /
-// `sessionStorage` on the browser layer. Values are strings; encode structured
-// data through a codec (`std::json`'s `Json`/`FromJson` for a scalar, or
-// `encode_json`/`decode_json` for a `Wire` type).
+// Web Storage (proposal/kolt-migration.md §2.4): `localStorage` / `sessionStorage`
+// on the browser layer. Values are strings; encode structured data through a codec
+// (`std::json`'s `Json`/`FromJson` for a scalar, or `encode_json`/`decode_json` for
+// a `Wire` type).
 //
 // TWO FORMS, and which one a call site wants is a real question. The six FREE
 // functions below are the ONE-KEY form — read a session token, write a
@@ -53,8 +53,7 @@ external fun session_remove(key: str): void;
 // --- The handle ---------------------------------------------------------------
 
 /// One of the host's two Web Storage areas, as a value you hold: a string→string
-/// map, scoped to the origin, that can be counted, enumerated, tested and
-/// cleared.
+/// map, scoped to the origin, that can be counted, enumerated, tested and cleared.
 ///
 /// An opaque handle like `Element` — a reference to the ONE live store, not a
 /// snapshot of it, so copying it (binding it, passing it, keeping it in a field)
@@ -74,8 +73,8 @@ export impl Window {
 	[extern(get, "localStorage")]
 	external fun local_storage(self): Storage;
 
-	/// `window.sessionStorage` — the tab-scoped store, cleared when the tab
-	/// closes. The same surface, a shorter life.
+	/// `window.sessionStorage` — the tab-scoped store, cleared when the tab closes.
+	/// The same surface, a shorter life.
 	[extern(get, "sessionStorage")]
 	external fun session_storage(self): Storage;
 }
@@ -89,12 +88,12 @@ export impl Storage {
 	/// `index` is out of range.
 	///
 	/// This is the enumeration half: `len()` down to 0 calling `key_at(i - 1)`
-	/// visits every key, and counting DOWN is the shape to write, because
-	/// removing a key while walking renumbers everything above it.
+	/// visits every key, and counting DOWN is the shape to write, because removing
+	/// a key while walking renumbers everything above it.
 	///
-	/// The host's key ORDER is unspecified and may change between visits, so a
-	/// pass that both reads and removes must not assume it is stable — walk
-	/// downward and decide per key, or collect the names first.
+	/// The host's key ORDER is unspecified and may change between visits, so a pass
+	/// that both reads and removes must not assume it is stable — walk downward and
+	/// decide per key, or collect the names first.
 	fun key_at(self, index: i32): Option<str> {
 		let key = self.raw_key_at(index);
 		if is_null(key) {
@@ -106,11 +105,11 @@ export impl Storage {
 
 	/// The value stored under `key`, or `None` when the key is ABSENT.
 	///
-	/// This is the whole reason the handle exists. The free `get` above flattens
-	/// a missing key to "", which is right for a one-key read and wrong for
-	/// anything that has to tell "" apart from nothing: a key whose stored value
-	/// is legitimately the empty string reads back `Some("")` here and `""`
-	/// there, and only one of those two answers is a fact about the store.
+	/// This is the whole reason the handle exists. The free `get` above flattens a
+	/// missing key to "", which is right for a one-key read and wrong for anything
+	/// that has to tell "" apart from nothing: a key whose stored value is
+	/// legitimately the empty string reads back `Some("")` here and `""` there, and
+	/// only one of those two answers is a fact about the store.
 	fun get(self, key: str): Option<str> {
 		let value = self.raw_get(key);
 		if is_null(value) {
@@ -164,17 +163,17 @@ export impl Storage {
 	[extern(method, "removeItem")]
 	external fun remove(self, key: str): void;
 
-	/// Empties the store (`storage.clear()`) — EVERY key on this origin, not
-	/// only the ones this app wrote. An app that shares its origin with anything
-	/// else deletes its own keys by name instead.
+	/// Empties the store (`storage.clear()`) — EVERY key on this origin, not only
+	/// the ones this app wrote. An app that shares its origin with anything else
+	/// deletes its own keys by name instead.
 	[extern(method, "clear")]
 	external fun clear(self): void;
 
 	// The host forms the three wrappers above are built from. They are declared
-	// last because they are not the surface: `key` and `getItem` return null for
-	// an absent key or an out-of-range index, typed here as `str` because the
-	// binding has no `Option` return, and turning that null into an `Option` is
-	// the whole job of the wrappers. Call the wrappers.
+	// last because they are not the surface: `key` and `getItem` return null for an
+	// absent key or an out-of-range index, typed here as `str` because the binding
+	// has no `Option` return, and turning that null into an `Option` is the whole
+	// job of the wrappers. Call the wrappers.
 	[extern(method, "key")]
 	external fun raw_key_at(self, index: i32): str;
 

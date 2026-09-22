@@ -303,16 +303,27 @@ fn context_clause_end(tokens: &[Token<'_>], index: usize) -> Option<usize> {
     }
 }
 
-/// Drops every comma that sits immediately before a closing `}`, `)`, or `]`.
-/// Vilan treats such a trailing comma as insignificant (tuples need two or more
-/// elements, so there is no `(a,)` one-tuple to confuse it with), which lets the
-/// safety check accept the formatter normalizing trailing commas in or out.
+/// Drops every comma that sits immediately before a closing `}`, `)`, `]`, or
+/// `>`. Vilan treats such a trailing comma as insignificant (tuples need two or
+/// more elements, so there is no `(a,)` one-tuple to confuse it with), which
+/// lets the safety check accept the formatter normalizing trailing commas in or
+/// out.
+///
+/// `>` is here for E217. A generic argument list is allow-trailing in the
+/// grammar, so `DeltaSource<List<T>, SeqOp<T>,>` is a spelling an author may
+/// write — and a HAND-WRAPPED `impl` header is exactly how one gets written.
+/// Without this the printer's answer (one line if it fits, and a trailing comma
+/// on every argument when it does not) token-drifted from the source and the
+/// whole FILE declined, so a header past the width had no formatted spelling at
+/// all. The comma and the `>` are adjacent in no other production: everywhere
+/// else a comma is followed by another argument, and a comparison's `>` follows
+/// an operand.
 fn drop_trailing_commas(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
     for token in tokens {
         if matches!(
             token,
-            Token::Ctrl('}') | Token::Ctrl(')') | Token::Ctrl(']')
+            Token::Ctrl('}') | Token::Ctrl(')') | Token::Ctrl(']') | Token::Ctrl('>')
         ) {
             while let Some(Token::Ctrl(',')) = result.last() {
                 result.pop();
@@ -2999,21 +3010,44 @@ struct DeclinedAt {
 
 /// The per-package knobs `vilan fmt` reads from a manifest's `[fmt]` section.
 ///
-/// Deliberately tiny, and deliberately not a width: the formatter has ONE
-/// canonical layout for code (see [`LINE_BUDGET`]), and a width knob would
-/// fork the shape of every file in every project. What is here is the one
-/// thing that cannot be settled globally — whether the formatter is allowed to
-/// rewrite the author's prose.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Deliberately tiny, and deliberately not a width for CODE: the formatter has
+/// ONE canonical layout for code (see [`LINE_BUDGET`]), and a code-width knob
+/// would fork the shape of every file in every project. What is here is what
+/// cannot be settled globally, and both of them are about PROSE — whether the
+/// formatter is allowed to rewrite the author's comments, and how wide the
+/// author writes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FormatOptions {
     /// `[fmt] wrap_comments` (E205): re-fill a paragraph of `//` / `///` lines
-    /// to the line width, the way the printer already lays out code.
+    /// to [`comment_width`](Self::comment_width), the way the printer already
+    /// lays out code.
     ///
-    /// **Default OFF, for one release** (R8 at Order 39's GO). Rewrapping
-    /// somebody's comments is the one thing the formatter does that no token
-    /// comparison can check, so it earns its default by being asked for first.
-    /// With the key off, `vilan fmt` is byte-for-byte what it was.
+    /// **Default OFF, for one release** (R8 at Order 39's GO, held by E215's
+    /// R3 until std has run under it for one order). Rewrapping somebody's
+    /// comments is the one thing the formatter does that no token comparison
+    /// can check, so it earns its default by being asked for first. With the
+    /// key off, `vilan fmt` is byte-for-byte what it was.
     pub wrap_comments: bool,
+    /// `[fmt] comment_width` (E215's R1): the column budget one re-filled
+    /// comment line is laid out to, at that comment's own indentation.
+    ///
+    /// **Default [`DEFAULT_COMMENT_WIDTH`], the code width** — which is what
+    /// E205 shipped and what a package that says nothing keeps. It is a
+    /// separate width because prose is not code: std's comments are written to
+    /// ~84 columns, so re-filling them to the code width would move 6,719
+    /// comment lines to a width nobody chose. Read only when
+    /// [`wrap_comments`](Self::wrap_comments) is on — with the knob off no
+    /// comment is re-laid-out at any width.
+    pub comment_width: usize,
+}
+
+impl Default for FormatOptions {
+    fn default() -> Self {
+        Self {
+            wrap_comments: false,
+            comment_width: DEFAULT_COMMENT_WIDTH,
+        }
+    }
 }
 
 /// Formats `original`, returning the reprinted text — or the [`Decline`] that
@@ -3354,6 +3388,11 @@ pub fn format(original: &str) -> String {
 /// and a width knob would fork every file's shape.
 const LINE_BUDGET: usize = 100;
 
+/// What [`FormatOptions::comment_width`] is when a package does not say: the
+/// CODE width (E215's R1). A comment budget defaulting to anything else would
+/// make E205's shipped behavior depend on a key nobody had written.
+pub const DEFAULT_COMMENT_WIDTH: usize = LINE_BUDGET;
+
 /// The columns a tab occupies when measuring a line. Vilan indents with tabs,
 /// so the measurement has to agree with what an editor shows.
 const TAB_COLUMNS: usize = 4;
@@ -3565,10 +3604,16 @@ impl<'src> Printer<'src> {
     /// Shared by the two places a standalone comment reaches the output: the
     /// comment stream, and E181's comments riding with an `export *;` marker.
     fn emit_comment_paragraph(&mut self, lines: &[&'src str], at: Option<Span>) {
-        // The budget is the line's, at the indentation this paragraph is being
-        // printed at — not the one it was written at, since the printer may
-        // have re-indented the block around it.
-        let budget = LINE_BUDGET.saturating_sub(self.indent * TAB_COLUMNS);
+        // The budget is the COMMENT width's, at the indentation this paragraph
+        // is being printed at — not the one it was written at, since the
+        // printer may have re-indented the block around it. It is the comment
+        // width and not [`LINE_BUDGET`] because prose has its own measure
+        // (E215): a package writing 84-column comments beside 100-column code
+        // says so once, and every paragraph in it is laid out to that.
+        let budget = self
+            .options
+            .comment_width
+            .saturating_sub(self.indent * TAB_COLUMNS);
         let filled = match self.options.wrap_comments {
             true => comment_reflow::reflow(lines, budget),
             false => comment_reflow::Reflow::AsWritten,
@@ -4511,10 +4556,23 @@ impl<'src> Printer<'src> {
             }
             Node::Func(func) => self.print_func(func),
             // `impl Subject[ with A + B] { items }`.
+            //
+            // E217: the header is a DECLARATION line and takes the declaration
+            // width rule. Over the budget it breaks the generic-argument list
+            // at its TAIL — the last trait of a `with` clause, else the
+            // subject — one argument per line with a trailing comma, exactly
+            // the shape `fun`'s parameter list takes. Before this the header
+            // had no split form at all, so a hand-wrapped one reprinted to a
+            // different token stream and the file declined.
             Node::Impl(subject, traits, body) => {
+                let split = std::mem::take(&mut self.split);
                 self.out.push_str("impl ");
-                self.print_type(&subject.0);
-                self.print_with_clause(traits);
+                if traits.is_empty() {
+                    self.print_type_splitting_the_tail(&subject.0, split);
+                } else {
+                    self.print_type(&subject.0);
+                    self.print_with_clause_splitting_the_tail(traits, split);
+                }
                 self.out.push(' ');
                 self.print_braced_items(body);
             }
@@ -4978,6 +5036,85 @@ impl<'src> Printer<'src> {
         }
     }
 
+    /// [`Self::print_type`] with a [`Split`] carried to the type's TAIL generic
+    /// argument list — the one an over-wide `impl` header breaks (E217).
+    ///
+    /// Only the forms an `impl` subject or a trait bound can take are walked,
+    /// and only through their tail: a nominal type's own argument list, and a
+    /// binder's LAST bound (`impl type S: Base + DeltaSource<…>`). Every other
+    /// type form has no list of its own to break and prints as it always did.
+    ///
+    /// The split is threaded rather than read from `self.split` so that
+    /// [`Self::print_type`] — reached from parameter types, return types and a
+    /// dozen other positions — keeps exactly the output it has.
+    fn print_type_splitting_the_tail(&mut self, node: &Node<'src>, split: Split) {
+        if split == Split::Off {
+            self.print_type(node);
+            return;
+        }
+        match node {
+            Node::AccessorWithGenerics(name, arguments) if !arguments.0.is_empty() => {
+                self.out.push_str(name);
+                self.print_split_type_arguments(arguments);
+            }
+            Node::StaticAccessor(namespace, name, Some(arguments)) if !arguments.0.is_empty() => {
+                self.print_type(&namespace.0);
+                self.out.push_str("::");
+                self.out.push_str(name);
+                self.print_split_type_arguments(arguments);
+            }
+            Node::TypeBinder((name, _name_span), bounds) if !bounds.is_empty() => {
+                if *name != ANONYMOUS_TYPE_BINDER {
+                    self.out.push_str("type ");
+                }
+                self.out.push_str(name);
+                self.out.push_str(": ");
+                self.print_bounds_splitting_the_tail(bounds, split);
+            }
+            // An empty list never breaks — `<⏎>` buys a line and no clarity —
+            // and a form with no argument list has nothing to break, so the
+            // header simply stays long. The same answer the empty parameter
+            // list gives.
+            _ => self.print_type(node),
+        }
+    }
+
+    /// The bounds of a binder, with `split` carried to the LAST one — the only
+    /// one whose argument list ends the header's line.
+    fn print_bounds_splitting_the_tail(&mut self, bounds: &[Spanned<Node<'src>>], split: Split) {
+        for (index, (bound, _)) in bounds.iter().enumerate() {
+            if index > 0 {
+                self.out.push_str(" + ");
+            }
+            if index + 1 == bounds.len() {
+                self.print_type_splitting_the_tail(bound, split);
+            } else {
+                self.print_type(bound);
+            }
+        }
+    }
+
+    /// The split form of a generic argument list: `<` closes the header's line,
+    /// every argument takes its own line one level in with a trailing comma —
+    /// the last included, so adding an argument is a one-line diff — and `>`
+    /// returns to the header's indent. `fun`'s parameter list, exactly.
+    ///
+    /// No line is re-measured here: a generic argument is a type, and a type
+    /// has no layout of its own, so an argument too wide for its line has
+    /// nowhere to break and simply stays wide.
+    fn print_split_type_arguments(&mut self, arguments: &GenericArguments<'src>) {
+        self.out.push('<');
+        self.indent += 1;
+        for (argument, _) in &arguments.0 {
+            self.line();
+            self.print_type(argument);
+            self.out.push(',');
+        }
+        self.indent -= 1;
+        self.line();
+        self.out.push('>');
+    }
+
     /// Prints a `<A, B>` generic-argument list on a nominal type.
     fn print_type_arguments(&mut self, arguments: &GenericArguments<'src>) {
         self.out.push('<');
@@ -5002,6 +5139,20 @@ impl<'src> Printer<'src> {
             }
             self.print_type(bound);
         }
+    }
+
+    /// [`Self::print_with_clause`] with a [`Split`] carried to the clause's LAST
+    /// trait — the one whose argument list ends an `impl` header's line (E217).
+    fn print_with_clause_splitting_the_tail(
+        &mut self,
+        traits: &[Spanned<Node<'src>>],
+        split: Split,
+    ) {
+        if traits.is_empty() {
+            return;
+        }
+        self.out.push_str(" with ");
+        self.print_bounds_splitting_the_tail(traits, split);
     }
 
     /// Prints a `with A + B` clause (the traits of an `impl`/`trait`), or nothing
@@ -11654,6 +11805,129 @@ mod signature_layout {
 }
 
 #[cfg(test)]
+mod impl_header_layout {
+    //! E217 — the `impl` header is a declaration line and takes the
+    //! declaration width rule.
+    //!
+    //! It had no split form at all, so a header past the budget had no
+    //! formatted spelling: written on one line it stayed over, and written
+    //! HAND-WRAPPED (the shape a reader reaches for) the reprint's single line
+    //! carried different tokens from the source's trailing comma and the whole
+    //! FILE declined — `vilan fmt` left every other construct in it unformatted
+    //! too.
+    //!
+    //! The rule is `fun`'s: one argument per line, trailing comma on every one,
+    //! `>` back at the header's indent — applied to the TAIL argument list,
+    //! which is the last trait of a `with` clause, else the subject's own.
+
+    use super::LINE_BUDGET;
+    use super::bailing_constructs::{assert_construct, code_tokens};
+    use super::chain_splitting::{assert_over_budget, columns};
+    use super::reprint;
+
+    /// The item's own fixture: collections-39 hand-wrapped this header and
+    /// `vilan fmt` declined the file.
+    const HAND_WRAPPED: &str = concat!(
+        "impl type S: DeltaSource<\n\tList<T>,\n\tSeqOp<T>,\n> {\n",
+        "\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+    );
+
+    /// Its canonical spelling: the header FITS, so it is one line.
+    const ONE_LINE: &str = concat!(
+        "impl type S: DeltaSource<List<T>, SeqOp<T>> {\n",
+        "\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+    );
+
+    /// The same header with names long enough to run past the budget.
+    const OVER_BUDGET: &str = concat!(
+        "impl type S: DeltaSource<List<ReconciledRowOfAnExtremelyLongName>, ",
+        "SeqOp<ReconciledRowOfAnExtremelyLongName>> {\n\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+    );
+
+    /// And its canonical spelling: one argument per line, trailing comma on
+    /// every one, `>` back at the header's own indent.
+    const SPLIT: &str = concat!(
+        "impl type S: DeltaSource<\n",
+        "\tList<ReconciledRowOfAnExtremelyLongName>,\n",
+        "\tSeqOp<ReconciledRowOfAnExtremelyLongName>,\n",
+        "> {\n\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+    );
+
+    #[test]
+    fn a_hand_wrapped_header_that_fits_is_printed_on_one_line() {
+        assert!(
+            columns(ONE_LINE.lines().next().expect("the header")) <= LINE_BUDGET,
+            "the fixture's canonical header must fit"
+        );
+        // Not a decline: the honest half says so, ahead of the byte claim.
+        assert_eq!(reprint(HAND_WRAPPED).as_deref(), Ok(ONE_LINE));
+        assert_construct(HAND_WRAPPED, ONE_LINE);
+    }
+
+    #[test]
+    fn an_over_budget_header_breaks_one_argument_per_line() {
+        assert_over_budget(OVER_BUDGET.lines().next().expect("the header"));
+        assert_construct(OVER_BUDGET, SPLIT);
+    }
+
+    #[test]
+    fn the_split_header_is_canonical_and_round_trips_unchanged() {
+        assert_eq!(reprint(SPLIT).as_deref(), Ok(SPLIT));
+    }
+
+    #[test]
+    fn a_with_clause_breaks_at_its_last_trait() {
+        // The tail of the header is the clause's last trait, so that is the
+        // list that breaks — the subject's own arguments stay inline, exactly
+        // as a call's earlier arguments do.
+        let source = concat!(
+            "export impl KeyedCell<type K: Hashable, type T: Keyed<K>> ",
+            "with DeltaSource<List<TableRowOfAVeryLongName>, SeqOp<TableRowOfAVeryLongName>> {\n",
+            "\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+        );
+        assert_over_budget(source.lines().next().expect("the header"));
+        assert_construct(
+            source,
+            concat!(
+                "export impl KeyedCell<type K: Hashable, type T: Keyed<K>> with DeltaSource<\n",
+                "\tList<TableRowOfAVeryLongName>,\n",
+                "\tSeqOp<TableRowOfAVeryLongName>,\n",
+                "> {\n\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+            ),
+        );
+    }
+
+    #[test]
+    fn a_header_with_no_argument_list_to_break_stays_long() {
+        // The empty-parameter-list answer: there is nothing to break, so the
+        // line simply stays wide rather than growing a `<⏎>` that buys nothing.
+        let source = concat!(
+            "impl AnImplementationSubjectWhoseBareNameAloneRunsWellPastTheHundredColumn",
+            "BudgetWithNoGenericsAtAll {\n\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+        );
+        assert_over_budget(source.lines().next().expect("the header"));
+        assert_construct(source, source);
+    }
+
+    #[test]
+    fn the_net_forgives_the_trailing_comma_and_nothing_more() {
+        // The net's new latitude is one comma before a `>`: the printer's own
+        // split form carries one and the source may too. Dropping an ARGUMENT
+        // still drifts, so the forgiveness cannot hide a printer bug.
+        assert_eq!(
+            code_tokens("impl type S: DeltaSource<List<T>, SeqOp<T>,> {}\n"),
+            code_tokens("impl type S: DeltaSource<List<T>, SeqOp<T>> {}\n"),
+            "the net must forgive a trailing comma before `>`"
+        );
+        assert_ne!(
+            code_tokens("impl type S: DeltaSource<List<T>, SeqOp<T>> {}\n"),
+            code_tokens("impl type S: DeltaSource<List<T>> {}\n"),
+            "the net went blind to a lost generic argument"
+        );
+    }
+}
+
+#[cfg(test)]
 mod element_layout {
     use super::bailing_constructs::assert_construct;
     use super::chain_splitting::assert_over_budget;
@@ -15553,11 +15827,14 @@ mod comment_wrapping {
     //! source unchanged), so "byte-identical under the knob" cannot be
     //! satisfied by a fixture that was going to be rewritten anyway.
 
-    use super::{Decline, DeclineReason, FormatOptions, decline, reprint, reprint_with};
+    use super::{
+        Decline, DeclineReason, FormatOptions, LINE_BUDGET, decline, reprint, reprint_with,
+    };
 
     /// The knob on.
     const ON: FormatOptions = FormatOptions {
         wrap_comments: true,
+        comment_width: super::DEFAULT_COMMENT_WIDTH,
     };
 
     /// Formats `source` with the knob on, asserting first that the fixture is
@@ -15635,6 +15912,109 @@ mod comment_wrapping {
                 <= 100),
             "{filled}"
         );
+    }
+
+    #[test]
+    fn a_narrower_comment_width_is_the_one_the_fill_uses() {
+        // E215's R1, and the whole point of the key: the SAME paragraph, the
+        // same knob, two widths — and the answers differ. The default is the
+        // code width, so `AT_84` is what a package that writes prose narrower
+        // than its code gets, and nothing else moves with it.
+        const AT_84: FormatOptions = FormatOptions {
+            wrap_comments: true,
+            comment_width: 84,
+        };
+        let source = concat!(
+            "// the formatter has laid code out to a width since the day it existed and ",
+            "left every comment exactly as typed\n",
+            "// which is the asymmetry this closes\nfun main() {}\n"
+        );
+        let at_default = reprint_with(source, ON).expect("the fixture reprints");
+        let at_84 = reprint_with(source, AT_84).expect("the fixture reprints");
+        assert_ne!(
+            at_84, at_default,
+            "a width other than the code width must reach the output"
+        );
+        assert_eq!(
+            at_84,
+            concat!(
+                "// the formatter has laid code out to a width since the day it existed and left\n",
+                "// every comment exactly as typed which is the asymmetry this closes\n",
+                "fun main() {}\n"
+            )
+        );
+        assert!(
+            at_84
+                .lines()
+                .filter(|line| line.starts_with("//"))
+                .all(|line| line.chars().count() <= 84),
+            "{at_84}"
+        );
+        // Wider than 84 somewhere, or the two widths would be the same claim.
+        assert!(
+            at_default
+                .lines()
+                .filter(|line| line.starts_with("//"))
+                .any(|line| line.chars().count() > 84),
+            "{at_default}"
+        );
+        assert_eq!(
+            reprint_with(&at_84, AT_84).as_deref(),
+            Ok(at_84.as_str()),
+            "the fill at a declared width must be idempotent"
+        );
+    }
+
+    #[test]
+    fn the_declared_width_is_measured_at_the_comment_s_own_indentation() {
+        // The indentation comes off the COMMENT width, not off the code
+        // width — otherwise a nested paragraph in an 84-column package would
+        // be filled to 96.
+        const AT_84: FormatOptions = FormatOptions {
+            wrap_comments: true,
+            comment_width: 84,
+        };
+        let source = concat!(
+            "fun main() {\n\t// a comment inside a block has four fewer columns to work ",
+            "with than one at the top level, and the fill has to know that\n\tlet x = 1;\n}\n"
+        );
+        let filled = reprint_with(source, AT_84).expect("the fixture reprints");
+        assert!(
+            filled
+                .lines()
+                .filter(|line| line.trim_start().starts_with("//"))
+                .all(|line| line.chars().count()
+                    + 3 * line.chars().take_while(|c| *c == '\t').count()
+                    <= 84),
+            "{filled}"
+        );
+        assert_ne!(
+            filled,
+            reprint_with(source, ON).expect("the fixture reprints"),
+            "the nested paragraph must move with the declared width too"
+        );
+    }
+
+    #[test]
+    fn the_default_width_is_the_code_width_and_the_knob_still_gates_it() {
+        // R1's default, pinned as an identity rather than as a number that
+        // happens to match: the options a package with no `comment_width` gets
+        // fill exactly as E205 shipped. And the width alone changes nothing —
+        // `wrap_comments` is still the gate.
+        assert_eq!(
+            FormatOptions::default().comment_width,
+            LINE_BUDGET,
+            "the default comment width is the code width"
+        );
+        let source = concat!(
+            "// this comment runs a very long way past the eighty-four-column width std ",
+            "writes its prose to, and stays exactly as written\nfun main() {}\n"
+        );
+        let narrow_but_off = FormatOptions {
+            wrap_comments: false,
+            comment_width: 84,
+        };
+        assert_eq!(reprint_with(source, narrow_but_off).as_deref(), Ok(source));
     }
 
     #[test]

@@ -13,9 +13,9 @@ enum Option<T> {
 
 use Option::{ None, Some };
 
-// `!` on an `Option`: `Some` is good; `None` is bad, its residual `void` (the
-// unit — the absence carries no information), rebuilt as `None` at the
-// enclosing function's element type (proposal/try-and-lift.md).
+// `!` on an `Option`: `Some` is good; `None` is bad, its residual `void` (the unit
+// — the absence carries no information), rebuilt as `None` at the enclosing
+// function's element type (proposal/try-and-lift.md).
 impl Option<type T> with Try<T, void> {
 	fun verdict(self): Verdict<T, void> {
 		match self {
@@ -81,9 +81,9 @@ impl Option<type T> {
 		}
 	}
 
-	/// Panic with `message` when there is no value. The message is `lazy`, so
-	/// the text is BUILT only on the `None` path — `opt.expect(i"no row for
-	/// {key}")` costs nothing when the row is there (proposal/lazy.md §6b).
+	/// Panic with `message` when there is no value. The message is `lazy`, so the
+	/// text is BUILT only on the `None` path — `opt.expect(i"no row for {key}")`
+	/// costs nothing when the row is there (proposal/lazy.md §6b).
 	fun expect(own self, lazy message: str): T {
 		match self {
 			Some(let x) => x,
@@ -91,10 +91,10 @@ impl Option<type T> {
 		}
 	}
 
-	/// `fallback` is `lazy` (proposal/lazy.md §6b): it is evaluated on the
-	/// `None` path only, at most once — `opt.unwrap_or(expensive())` no longer
-	/// runs `expensive()` when `opt` is `Some`. `unwrap_or_else` remains the
-	/// explicit spelling for a fallback you want to write as a closure.
+	/// `fallback` is `lazy` (proposal/lazy.md §6b): it is evaluated on the `None`
+	/// path only, at most once — `opt.unwrap_or(expensive())` no longer runs
+	/// `expensive()` when `opt` is `Some`. `unwrap_or_else` remains the explicit
+	/// spelling for a fallback you want to write as a closure.
 	///
 	/// `fallback` is still a LOAN (R3), so at a resource instantiation this
 	/// rejects: `Some(v).unwrap_or(f)` has to destroy `f`, and a generic body
@@ -186,9 +186,9 @@ impl Option<type T> {
 	}
 
 	/// `b` is a LOAN (R3), so at a resource instantiation this rejects:
-	/// `Some(a).or(Some(b))` has to destroy `b`, and a generic body cannot
-	/// destroy a `T`. Declaring `own b` would NOT fix it — it would leak the
-	/// discarded value silently (`affine-moves.md` §6).
+	/// `Some(a).or(Some(b))` has to destroy `b`, and a generic body cannot destroy
+	/// a `T`. Declaring `own b` would NOT fix it — it would leak the discarded
+	/// value silently (`affine-moves.md` §6).
 	fun or(own self, b: Option<T>): Option<T> {
 		if self is Some(_) {
 			self
@@ -197,9 +197,9 @@ impl Option<type T> {
 		}
 	}
 
-	/// Resource-clean, unlike `or`: the fallback is PRODUCED on the `None`
-	/// path, never discarded, and a `self` that reaches that path is `None` —
-	/// it carries no payload to destroy.
+	/// Resource-clean, unlike `or`: the fallback is PRODUCED on the `None` path,
+	/// never discarded, and a `self` that reaches that path is `None` — it carries
+	/// no payload to destroy.
 	fun or_else(own self, fn: || Option<T>): Option<T> {
 		if self is Some(_) {
 			self
@@ -208,9 +208,9 @@ impl Option<type T> {
 		}
 	}
 
-	/// Rejects at a resource instantiation, correctly: `Some(a).xor(Some(b))`
-	/// is `None`, which destroys BOTH payloads, and a generic body cannot
-	/// destroy a `T`.
+	/// Rejects at a resource instantiation, correctly: `Some(a).xor(Some(b))` is
+	/// `None`, which destroys BOTH payloads, and a generic body cannot destroy a
+	/// `T`.
 	fun xor(own self, own b: Option<T>): Option<T> {
 		if self is Some(_) {
 			if b is Some(_) {
@@ -292,10 +292,9 @@ impl Option<type T: PartialEq> with PartialEq {
 	}
 }
 
-// `then_some` lives here rather than in `boolean.vl` so that the always-loaded
-// core `bool` module stays dependency-free (it would otherwise have to import
-// `Option`). An `impl` block does not need to share a module with the type it
-// extends.
+// `then_some` lives here rather than in `boolean.vl` so that the always-loaded core
+// `bool` module stays dependency-free (it would otherwise have to import `Option`).
+// An `impl` block does not need to share a module with the type it extends.
 impl bool {
 	fun then_some<T>(self, own value: T): Option<T> {
 		if self {
@@ -306,26 +305,26 @@ impl bool {
 	}
 }
 
-// `parse_i32` lives here (not in the always-loaded `string.vl`) because its
-// result is an `Option`, which the core `str` module must not depend on. An
-// `impl` block does not need to share a module with the type it extends.
+// `parse_i32` lives here (not in the always-loaded `string.vl`) because its result
+// is an `Option`, which the core `str` module must not depend on. An `impl` block
+// does not need to share a module with the type it extends.
 impl str {
 	/// STRICT: the whole (whitespace-trimmed) text must be a decimal integer in
 	/// i32 range — `"1.5"`, `"12x"`, `""`, and out-of-range values are `None`,
 	/// never a truncation.
 	external fun parse_i32(self): Option<i32>;
 
-	/// STRICT on shape (`"3.14x"` is `None`, unlike a liberal parseFloat), but
-	/// any full numeric text the host accepts — including `"1e3"` and
-	/// `"Infinity"` — parses.
+	/// STRICT on shape (`"3.14x"` is `None`, unlike a liberal parseFloat), but any
+	/// full numeric text the host accepts — including `"1e3"` and `"Infinity"` —
+	/// parses.
 	external fun parse_f64(self): Option<f64>;
 
 	/// STRICT: `"true"` and `"false"`, nothing else — the exact inverse of
 	/// `Display::to_string` on a `bool` (`display.vl`, which renders those two
 	/// words), and the same set `std::json`'s bool `FromJson` accepts.
-	/// Whitespace-trimmed, exactly as `parse_i32` and `parse_f64` are: a
-	/// `parse_*` family that trims in two cases of three is a trap, and the
-	/// JSON reader tolerates the same padding.
+	/// Whitespace-trimmed, exactly as `parse_i32` and `parse_f64` are: a `parse_*`
+	/// family that trims in two cases of three is a trap, and the JSON reader
+	/// tolerates the same padding.
 	///
 	/// `"1"`/`"0"` are deliberately NOT admitted, and neither are `"True"`,
 	/// `"yes"` or `""`. A parse whose accepted set is wider than its writer's
@@ -337,12 +336,11 @@ impl str {
 	/// itself, in one line at its own decoder, where the compatibility claim is
 	/// visible: `if text == "1" { Some(true) } else { text.parse_bool() }`.
 	///
-	/// The three-way idiom, so nothing here has to be hand-written: values go
-	/// OUT through `Display::to_string` (`import std::display::Display` — it is
-	/// a TRAIT method, so a module that has not imported the trait is told "no
-	/// method to_string"), come BACK through `str::parse_*`, and anything
-	/// structured rides `std::json`'s `Json`/`FromJson` instead of a pair of
-	/// hand-rolled closures.
+	/// The three-way idiom, so nothing here has to be hand-written: values go OUT
+	/// through `Display::to_string` (`import std::display::Display` — it is a TRAIT
+	/// method, so a module that has not imported the trait is told "no method
+	/// to_string"), come BACK through `str::parse_*`, and anything structured rides
+	/// `std::json`'s `Json`/`FromJson` instead of a pair of hand-rolled closures.
 	fun parse_bool(self): Option<bool> {
 		match self.trim() {
 			"true" => Some(true),
@@ -351,10 +349,10 @@ impl str {
 		}
 	}
 
-	/// The text with `prefix` removed, or `None` when it does not start with it
-	/// — `starts_with` tests, this one cuts. Distinguishing "absent" from
-	/// "present but empty" is why it is an `Option`: `"ab".strip_prefix("ab")`
-	/// is `Some("")`, `"ab".strip_prefix("c")` is `None`.
+	/// The text with `prefix` removed, or `None` when it does not start with it —
+	/// `starts_with` tests, this one cuts. Distinguishing "absent" from "present
+	/// but empty" is why it is an `Option`: `"ab".strip_prefix("ab")` is
+	/// `Some("")`, `"ab".strip_prefix("c")` is `None`.
 	fun strip_prefix(self, prefix: str): Option<str> {
 		if self.starts_with(prefix) {
 			Some(self.substring(prefix.len(), self.len()))
@@ -363,10 +361,10 @@ impl str {
 		}
 	}
 
-	/// The text with `suffix` removed, or `None` when it does not end with it.
-	/// The verb `substring` cannot spell safely without arithmetic: cutting a
-	/// trailing affix by hand is what invited `substring(offset, -1)`, whose
-	/// negative end JS silently reinterpreted into the PREFIX.
+	/// The text with `suffix` removed, or `None` when it does not end with it. The
+	/// verb `substring` cannot spell safely without arithmetic: cutting a trailing
+	/// affix by hand is what invited `substring(offset, -1)`, whose negative end JS
+	/// silently reinterpreted into the PREFIX.
 	fun strip_suffix(self, suffix: str): Option<str> {
 		if self.ends_with(suffix) {
 			Some(self.substring(0, self.len() - suffix.len()))
@@ -375,29 +373,28 @@ impl str {
 		}
 	}
 
-	/// The host's `indexOf` / `lastIndexOf`, which report absence as `-1`.
-	/// Internal and opaque, exactly like `fs`'s `raw_read`: `-1` is a sentinel
-	/// index — arithmetic on it is silently wrong, and `substring` would refuse
-	/// it one call later — so nothing outside this module sees the raw form.
+	/// The host's `indexOf` / `lastIndexOf`, which report absence as `-1`. Internal
+	/// and opaque, exactly like `fs`'s `raw_read`: `-1` is a sentinel index —
+	/// arithmetic on it is silently wrong, and `substring` would refuse it one call
+	/// later — so nothing outside this module sees the raw form.
 	[extern(method, "indexOf")]
 	external fun raw_index_of(self, needle: str): i32;
 
 	[extern(method, "lastIndexOf")]
 	external fun raw_last_index_of(self, needle: str): i32;
 
-	/// The index of the FIRST occurrence of `needle`, or `None` when the text
-	/// does not contain it — `contains` tests, this one locates. It is the
-	/// missing half of the `substring` pair: `substring` needs bounds and until
-	/// now nothing computed them, so text was taken apart with `split` and
-	/// reassembled.
+	/// The index of the FIRST occurrence of `needle`, or `None` when the text does
+	/// not contain it — `contains` tests, this one locates. It is the missing half
+	/// of the `substring` pair: `substring` needs bounds and until now nothing
+	/// computed them, so text was taken apart with `split` and reassembled.
 	///
-	/// Absence is `None`, never `-1`. That is the whole reason this is not just
-	/// the host method renamed: `-1` is an index the type system cannot tell
-	/// from a real one, and `substring` — which refuses a negative bound rather
-	/// than clamping it — would report the mistake one call later, at the wrong
-	/// place. An empty needle is at `0`, as everywhere else. The index is
-	/// zero-based and counts UTF-16 code units — `substring`'s own unit, so the
-	/// bound feeds it directly.
+	/// Absence is `None`, never `-1`. That is the whole reason this is not just the
+	/// host method renamed: `-1` is an index the type system cannot tell from a
+	/// real one, and `substring` — which refuses a negative bound rather than
+	/// clamping it — would report the mistake one call later, at the wrong place.
+	/// An empty needle is at `0`, as everywhere else. The index is zero-based and
+	/// counts UTF-16 code units — `substring`'s own unit, so the bound feeds it
+	/// directly.
 	fun index_of(self, needle: str): Option<i32> {
 		let at = self.raw_index_of(needle);
 		if at < 0 {
@@ -407,10 +404,10 @@ impl str {
 		}
 	}
 
-	/// The index of the LAST occurrence of `needle`, or `None` when the text
-	/// does not contain it — `index_of` read from the other end, for cutting at
-	/// the final separator (a file extension, the last path segment). An empty
-	/// needle is at `len()`, which is where the host puts it.
+	/// The index of the LAST occurrence of `needle`, or `None` when the text does
+	/// not contain it — `index_of` read from the other end, for cutting at the
+	/// final separator (a file extension, the last path segment). An empty needle
+	/// is at `len()`, which is where the host puts it.
 	fun last_index_of(self, needle: str): Option<i32> {
 		let at = self.raw_last_index_of(needle);
 		if at < 0 {
@@ -449,16 +446,15 @@ impl List<type T> {
 	}
 
 	/// `map` and `filter` in one pass: `fn` answers `Some(value)` to keep that
-	/// value and `None` to drop the element, so a partial or fallible
-	/// projection needs neither a two-stage chain nor an `Option` to unwrap
-	/// afterwards (I3; the shape kolt hand-wrote as `List::map_filter` at
-	/// `server.vl:92`).
+	/// value and `None` to drop the element, so a partial or fallible projection
+	/// needs neither a two-stage chain nor an `Option` to unwrap afterwards (I3;
+	/// the shape kolt hand-wrote as `List::map_filter` at `server.vl:92`).
 	///
 	/// The eager twin of `Iterator::filter_map`, and it is here rather than in
 	/// `list.vl` beside `map`/`filter` for this block's own reason: it reads the
 	/// `Option` vocabulary, and the always-loaded core stays off that chain. It
-	/// does not route through `iter()` either — that would cost a copy of the
-	/// list for a single pass.
+	/// does not route through `iter()` either — that would cost a copy of the list
+	/// for a single pass.
 	fun filter_map<U>(self, fn: |T| Option<U>): List<U> {
 		mut result: List<U> = [];
 		for item in self {

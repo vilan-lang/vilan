@@ -1,7 +1,7 @@
 // `std::debug` — `[derive(Debug)]` synthesizes `debug(self): str`, a developer
-// representation `Type { field = value, … }` built from the fields. Scalars
-// format via the host `JSON.stringify` (numbers/bools raw, strings quoted and
-// escaped); nested derived structs recurse through their own `debug`.
+// representation `Type { field = value, … }` built from the fields. Scalars format
+// via the host `JSON.stringify` (numbers/bools raw, strings quoted and escaped);
+// nested derived structs recurse through their own `debug`.
 
 export *;
 
@@ -40,13 +40,13 @@ macro fun Debug(item: Item): Source {
 	import macro_std::option::Option::{ self, Some, None };
 	import macro_std::build::{ impl_of, fun_of, match_of, quote, join };
 
-	// Debug output glues text fragments around each `.debug()` call, so the
-	// pieces join on ` + ", " + ` — a quoted separator between quoted labels.
+	// Debug output glues text fragments around each `.debug()` call, so the pieces
+	// join on ` + ", " + ` — a quoted separator between quoted labels.
 	let glued_comma = " + " + quote(", ") + " + ";
 
 	if item.as_struct() is Some(let target) {
-		// `"T { " + "a = " + self.a.debug() + ", " + … + " }"`; a
-		// field-less struct is just its name.
+		// `"T { " + "a = " + self.a.debug() + ", " + … + " }"`; a field-less struct
+		// is just its name.
 		mut body = "";
 		if target.fields.len() == 0 {
 			body = quote(target.name);

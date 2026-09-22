@@ -5,8 +5,8 @@
 // `fetch(url)` is a GET shorthand. For another method, a request body, or headers,
 // build a request with `get`/`post`, chain `.header(..)`, and `.send()` it.
 //
-// `fetch`/`send` and `Response::text` are async (the host returns promises), so calls
-// to them are implicitly awaited.
+// `fetch`/`send` and `Response::text` are async (the host returns promises), so
+// calls to them are implicitly awaited.
 
 import pkg::bytes::{ ByteBuffer, Bytes, bytes_of_buffer };
 import pkg::option::Option::{ self, None, Some };
@@ -14,17 +14,17 @@ import pkg::task::{ CancelSignal, ambient_signal };
 
 export external struct Response;
 
-/// GET `url` and await the response. Inside a nursery's dynamic extent the
-/// request carries the ambient cancel signal (the structural bridge), so
-/// cancellation aborts it in flight.
+/// GET `url` and await the response. Inside a nursery's dynamic extent the request
+/// carries the ambient cancel signal (the structural bridge), so cancellation
+/// aborts it in flight.
 export fun fetch(url: str): Response {
 	let options = new_request_init();
 	attach_ambient_signal(options);
 	fetch_with(url, options)
 }
 
-/// Attach the ambient nursery's cancel signal to a request init, if there is
-/// one — every request built by this module goes through here.
+/// Attach the ambient nursery's cancel signal to a request init, if there is one —
+/// every request built by this module goes through here.
 fun attach_ambient_signal(options: RequestInit) {
 	match ambient_signal() {
 		Some(let signal) => options.set_signal(signal),
@@ -50,8 +50,8 @@ export impl Response {
 		bytes_of_buffer(self.raw_body())
 	}
 
-	/// One response header, case-insensitively, or `None` when the response
-	/// does not carry it.
+	/// One response header, case-insensitively, or `None` when the response does
+	/// not carry it.
 	///
 	/// The host `Headers` object is not a plain object — its entries are not
 	/// own properties — so this is glue (`__response_header`,
@@ -60,10 +60,10 @@ export impl Response {
 	/// already lowercases what it is asked for, which is why nothing is done
 	/// to `name` here.
 	///
-	/// A header that is PRESENT with an empty value reads back as `None`, and
-	/// that is deliberate rather than a rounding: the two are the same fact to
-	/// a caller deciding what a body is, and distinguishing them would cost a
-	/// second host call for a case no HTTP header meaningfully has.
+	/// A header that is PRESENT with an empty value reads back as `None`, and that
+	/// is deliberate rather than a rounding: the two are the same fact to a caller
+	/// deciding what a body is, and distinguishing them would cost a second host
+	/// call for a case no HTTP header meaningfully has.
 	fun header(self, name: str): Option<str> {
 		let value = raw_response_header(self, name);
 		if value == "" {
@@ -127,8 +127,8 @@ export struct Header {
 	value: str,
 }
 
-/// The host `fetch` init object — `{ method, headers, body }` — built up via setters.
-/// It's an opaque host value (like a DOM node), not a vilan struct.
+/// The host `fetch` init object — `{ method, headers, body }` — built up via
+/// setters. It's an opaque host value (like a DOM node), not a vilan struct.
 external struct RequestInit;
 
 /// `Object()` returns a fresh empty `{}` to fill in.
@@ -176,12 +176,12 @@ export fun post(url: str, body: str): Request {
 	Request { url, method = "POST", body, headers = [] }
 }
 
-/// A one-shot binary POST (no header chaining): send `body` as bytes and await
-/// the response — the byte-capable leg of the RPC transport (§6.2).
+/// A one-shot binary POST (no header chaining): send `body` as bytes and await the
+/// response — the byte-capable leg of the RPC transport (§6.2).
 ///
-/// It sends no `Content-Type`, and the host's default for a `Uint8Array` body
-/// is none at all. `post_bytes_typed` is the same call with one, which is what
-/// a server that requires a media type needs (`transport-rpc.md` §9.7.9).
+/// It sends no `Content-Type`, and the host's default for a `Uint8Array` body is
+/// none at all. `post_bytes_typed` is the same call with one, which is what a
+/// server that requires a media type needs (`transport-rpc.md` §9.7.9).
 export fun post_bytes(url: str, body: Bytes): Response {
 	post_bytes_with(url, body, "")
 }

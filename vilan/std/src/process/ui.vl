@@ -1,10 +1,10 @@
-// `std::ui` for `@process` — the server (SSR) view layer (proposal/ssr.md, A7).
-// The exact public surface of the browser `std::ui`, but building an HTML
-// STRING TREE instead of live DOM. A route handler calls the app's own
-// view-building code — the same component functions the client runs — against
-// this layer, `render(view)` serializes the tree to markup, and the handler
-// splices it into its HTML shell. Create-serialize-discard: no effects, no
-// subscriptions, no owner survives the request.
+// `std::ui` for `@process` — the server (SSR) view layer (proposal/ssr.md, A7). The
+// exact public surface of the browser `std::ui`, but building an HTML STRING TREE
+// instead of live DOM. A route handler calls the app's own view-building code — the
+// same component functions the client runs — against this layer, `render(view)`
+// serializes the tree to markup, and the handler splices it into its HTML shell.
+// Create-serialize-discard: no effects, no subscriptions, no owner survives the
+// request.
 //
 // READ-ONCE BINDINGS: `bind_text`/`bind_attr`/`bind_class`/`bind_value` embed
 // the source's value AT RENDER TIME — no subscription is created (the value
@@ -22,9 +22,9 @@
 //
 // OMITTED (proposal/ssr.md §2, §6a): `mount`/`mount_root` do not exist here — a
 // component that mounts is a client entry, not a renderable view; the natural
-// factoring is a shared `fun app(): View` and a per-leg `main`.
-// `std::dom` stays browser-only; a component importing it fails a process build
-// at the `import` with the standard cross-platform error — the correct boundary.
+// factoring is a shared `fun app(): View` and a per-leg `main`. `std::dom` stays
+// browser-only; a component importing it fails a process build at the `import` with
+// the standard cross-platform error — the correct boundary.
 //
 // Only available when building for a process platform (node).
 
@@ -52,9 +52,9 @@ export struct Attribute {
 	value: str,
 }
 
-/// One child in an element's ordered child list — an element or a TEXT NODE.
-/// Text children make mixed content real: prose interleaves with inline
-/// elements as siblings, never through wrapper spans.
+/// One child in an element's ordered child list — an element or a TEXT NODE. Text
+/// children make mixed content real: prose interleaves with inline elements as
+/// siblings, never through wrapper spans.
 export enum Child {
 	Element(View),
 	Text(str),
@@ -108,9 +108,9 @@ export fun set_attribute(attributes: Shared<List<Attribute>>, name: str, value: 
 	attributes.write() = updated;
 }
 
-/// Append one declaration to the element's `style` attribute, keeping whatever
-/// is already there — the server end of writing an inline style, shared by
-/// `style_var` and `show`.
+/// Append one declaration to the element's `style` attribute, keeping whatever is
+/// already there — the server end of writing an inline style, shared by `style_var`
+/// and `show`.
 fun add_style_declaration(attributes: Shared<List<Attribute>>, declaration: str) {
 	mut current = "";
 	for attribute in attributes.read() {
@@ -137,24 +137,24 @@ export impl View {
 		self
 	}
 
-	/// Classes from a compiled `Style` (`class_list` is runtime-legal — the
-	/// rules were emitted when the style was constructed).
+	/// Classes from a compiled `Style` (`class_list` is runtime-legal — the rules
+	/// were emitted when the style was constructed).
 	fun styled(self, style: Style): View {
 		set_attribute(self.attributes, "class", style.class_list());
 		self
 	}
 
-	/// A CSS custom property, read once and folded into the `style` attribute —
-	/// the server end of `width(Length::var("--w"))`. (No subscription: the
-	/// value at render time is the value served.)
+	/// A CSS custom property, read once and folded into the `style` attribute — the
+	/// server end of `width(Length::var("--w"))`. (No subscription: the value at
+	/// render time is the value served.)
 	fun style_var<S: Source<str>>(self, name: str, source: S): View {
 		add_style_declaration(self.attributes, name + ":" + source.get());
 		self
 	}
 
-	/// An attribute. The value's TYPE decides its life
-	/// (proposal/element-syntax.md §5): a `str` sets once; a `SignalCell<str>` is
-	/// read once, exactly `bind_attr`. Anything `AttrValue` fills the slot.
+	/// An attribute. The value's TYPE decides its life (proposal/element-syntax.md
+	/// §5): a `str` sets once; a `SignalCell<str>` is read once, exactly
+	/// `bind_attr`. Anything `AttrValue` fills the slot.
 	fun attr<V: AttrValue>(self, name: str, value: V): View {
 		value.apply(self, name);
 		self
@@ -180,9 +180,9 @@ export impl View {
 
 	/// Append content. Anything `Slot` fills a child position
 	/// (proposal/element-syntax.md §5) — the CHILD CONTRACT (B268): a `View`
-	/// appends as an element, a `str` as a text node, a `List<View>` appends
-	/// each, and a `Source` of any of those three is READ ONCE, the value at
-	/// render time being the value served.
+	/// appends as an element, a `str` as a text node, a `List<View>` appends each,
+	/// and a `Source` of any of those three is READ ONCE, the value at render time
+	/// being the value served.
 	fun child<C: Slot>(self, content: C): View {
 		content.place(self);
 		self
@@ -196,8 +196,8 @@ export impl View {
 		self
 	}
 
-	/// Reactive text content, READ ONCE: embeds `source`'s current value as
-	/// text. No subscription — nothing to notify at serve time.
+	/// Reactive text content, READ ONCE: embeds `source`'s current value as text.
+	/// No subscription — nothing to notify at serve time.
 	fun bind_text<S: Source<str>>(self, source: S): View {
 		self.text.write() = source.get();
 		self.children.write() = [];
@@ -210,29 +210,28 @@ export impl View {
 		self
 	}
 
-	/// Reactive `Style`, read once: the style the signal holds at render time
-	/// is the one served.
+	/// Reactive `Style`, read once: the style the signal holds at render time is
+	/// the one served.
 	fun bind_styled<S: Source<Style>>(self, source: S): View {
 		set_attribute(self.attributes, "class", source.get().class_list());
 		self
 	}
 
-	/// Reactive attribute, read once — and `Option`-valued sources are read
-	/// once too (A105): `Some(text)` renders the attribute, `None` omits it
-	/// entirely. There is no server counterpart to the browser twin's
-	/// `remove_attribute` because nothing was written in the first place, which
-	/// is `toggle_attr`'s arrangement exactly.
-	/// KEEP IN STEP with the browser twin.
+	/// Reactive attribute, read once — and `Option`-valued sources are read once
+	/// too (A105): `Some(text)` renders the attribute, `None` omits it entirely.
+	/// There is no server counterpart to the browser twin's `remove_attribute`
+	/// because nothing was written in the first place, which is `toggle_attr`'s
+	/// arrangement exactly. KEEP IN STEP with the browser twin.
 	fun bind_attr<V: AttrBinding>(self, name: str, source: V): View {
 		source.bind_attribute(self, name);
 		self
 	}
 
-	/// A boolean attribute, read once: rendered when `source` is currently true
-	/// and absent when it is false (A66). Presence is the whole meaning, so
-	/// there is nothing to render for the false case — the browser twin's
-	/// `remove_attribute` has no server counterpart because the attribute was
-	/// never written. KEEP IN STEP with the browser twin.
+	/// A boolean attribute, read once: rendered when `source` is currently true and
+	/// absent when it is false (A66). Presence is the whole meaning, so there is
+	/// nothing to render for the false case — the browser twin's `remove_attribute`
+	/// has no server counterpart because the attribute was never written. KEEP IN
+	/// STEP with the browser twin.
 	fun toggle_attr<S: Source<bool>>(self, name: str, source: S): View {
 		if source.get() {
 			set_attribute(self.attributes, name, "");
@@ -240,10 +239,10 @@ export impl View {
 		self
 	}
 
-	/// A two-way input bind, server side: the input renders with its current
-	/// value. The write-back listener is client business — accepted and dropped.
-	/// Bounded on `Signal<str>`, matching the browser twin's write-back half
-	/// (A32): it writes on the client, so it asks for the writable trait.
+	/// A two-way input bind, server side: the input renders with its current value.
+	/// The write-back listener is client business — accepted and dropped. Bounded
+	/// on `Signal<str>`, matching the browser twin's write-back half (A32): it
+	/// writes on the client, so it asks for the writable trait.
 	fun bind_value<S: Signal<str>>(self, signal: S): View {
 		set_attribute(self.attributes, "value", signal.get());
 		self
@@ -281,20 +280,20 @@ export impl View {
 		self
 	}
 
-	/// Make this element a focus scope, server side: nothing is trapped and
-	/// nothing is focused. Dropped like `autofocus` above, whose clock it
-	/// shares on the browser twin. KEEP IN STEP.
+	/// Make this element a focus scope, server side: nothing is trapped and nothing
+	/// is focused. Dropped like `autofocus` above, whose clock it shares on the
+	/// browser twin. KEEP IN STEP.
 	fun focus_scope(self, containment: FocusContainment): View {
 		self
 	}
 
-	/// Show or hide on a condition, read once: a hidden element renders with
-	/// the `hidden` attribute AND an inline `display:none`, exactly the two
-	/// writes the browser twin makes (A60). The attribute alone does not hide
-	/// anything an app styled, because the preflight's `[hidden]` rule is
-	/// layered and a compiled `Style`'s rules are not — so serving the
-	/// attribute alone would paint the element until the client's first toggle
-	/// took it away. KEEP IN STEP with the browser twin.
+	/// Show or hide on a condition, read once: a hidden element renders with the
+	/// `hidden` attribute AND an inline `display:none`, exactly the two writes the
+	/// browser twin makes (A60). The attribute alone does not hide anything an app
+	/// styled, because the preflight's `[hidden]` rule is layered and a compiled
+	/// `Style`'s rules are not — so serving the attribute alone would paint the
+	/// element until the client's first toggle took it away. KEEP IN STEP with the
+	/// browser twin.
 	fun show<S: Source<bool>>(self, condition: S): View {
 		if !condition.get() {
 			set_attribute(self.attributes, "hidden", "");
@@ -308,23 +307,21 @@ export impl View {
 /// ANCHOR — the marker node the browser twin plants renders as nothing here,
 /// which is the whole of the SSR story for A71.
 ///
-/// It reads as a no-op and is not one: it is the SERVER'S ANSWER to the
-/// browser twin's anchor. The browser has to plant a node because its content
-/// arrives LATER, after siblings the chain added further down; a server render
-/// is one synchronous pass in source order, so the position a region opens at
-/// is still the end of the parent when the content is written — appending IS
-/// inserting before the anchor, and the served markup carries no marker for a
-/// client to trip over.
+/// It reads as a no-op and is not one: it is the SERVER'S ANSWER to the browser
+/// twin's anchor. The browser has to plant a node because its content arrives
+/// LATER, after siblings the chain added further down; a server render is one
+/// synchronous pass in source order, so the position a region opens at is still the
+/// end of the parent when the content is written — appending IS inserting before
+/// the anchor, and the served markup carries no marker for a client to trip over.
 ///
-/// It is DECLARED here and not called from the methods below, deliberately.
-/// The twin-surface gate (E34, `std_twin_parity.rs`) holds the two halves to
-/// one set of names, so a `Region` in the browser twin is a `Region` here; and
-/// routing this file's `when`/`swap`/`each` through it would change the
-/// bytes they emit — a corpus golden — to say in a second way exactly what
-/// `self.children.write().push(..)` already says. A85 (positional slots) is
-/// where the server side grows a reason to call it: its value forms `place`
-/// into a region on both twins.
-/// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
+/// It is DECLARED here and not called from the methods below, deliberately. The
+/// twin-surface gate (E34, `std_twin_parity.rs`) holds the two halves to one set of
+/// names, so a `Region` in the browser twin is a `Region` here; and routing this
+/// file's `when`/`swap`/`each` through it would change the bytes they emit — a
+/// corpus golden — to say in a second way exactly what
+/// `self.children.write().push(..)` already says. A85 (positional slots) is where
+/// the server side grows a reason to call it: its value forms `place` into a region
+/// on both twins. KEEP IN STEP with the browser twin's copy (browser/ui.vl).
 export struct Region {
 	parent: View,
 }
@@ -332,9 +329,9 @@ export struct Region {
 /// One row of a run, server side: NOTHING. The browser twin's row is a leading
 /// marker, because a row's content can be any `Slot` and can grow after it was
 /// placed, so "move this row" has to be a span between markers (A91). A server
-/// render is one pass in source order and nothing ever moves, so a row here is
-/// its own position and the struct carries no state at all.
-/// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
+/// render is one pass in source order and nothing ever moves, so a row here is its
+/// own position and the struct carries no state at all. KEEP IN STEP with the
+/// browser twin's copy (browser/ui.vl).
 export struct Row {}
 
 export impl Region {
@@ -350,18 +347,18 @@ export impl Region {
 
 	/// Places `content` as a new ROW (A91) — which, on this twin, is exactly
 	/// placing it: a server render is one pass in source order, so a row IS
-	/// wherever it was written and needs no marker to keep that place. The
-	/// browser twin plants one, and `Row` is empty here for the same reason
-	/// `Region` plants no anchor. KEEP IN STEP with the browser twin.
+	/// wherever it was written and needs no marker to keep that place. The browser
+	/// twin plants one, and `Row` is empty here for the same reason `Region` plants
+	/// no anchor. KEEP IN STEP with the browser twin.
 	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
 	fun open_row<C: Slot>(self, content: C): Row {
 		content.place(self.parent);
 		Row {}
 	}
 
-	/// Places a row before another one — a server render writes in source
-	/// order and never moves anything, so the position is `open_row`'s and the
-	/// bound is dropped (A98). KEEP IN STEP with the browser twin.
+	/// Places a row before another one — a server render writes in source order and
+	/// never moves anything, so the position is `open_row`'s and the bound is
+	/// dropped (A98). KEEP IN STEP with the browser twin.
 	fun open_row_before<C: Slot>(self, content: C, end: Row): Row {
 		self.open_row(content)
 	}
@@ -373,8 +370,8 @@ export impl Region {
 		row
 	}
 
-	/// Puts a cut row back — see `cut_row`: nothing was ever taken out, and
-	/// A98's `end` bound has nothing to bound. KEEP IN STEP.
+	/// Puts a cut row back — see `cut_row`: nothing was ever taken out, and A98's
+	/// `end` bound has nothing to bound. KEEP IN STEP.
 	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
 	fun insert_row(self, row: Row, content: Row, end: Row) {}
 
@@ -383,30 +380,30 @@ export impl Region {
 	fun drop_row(self, row: Row) {}
 
 	/// Records the live run — accepted and dropped, like the event binders'
-	/// handlers. A88 exists because a browser boundary can be disposed while
-	/// its parent survives; a server render has no disposal and no later
-	/// change to survive, so there is nothing to remember. KEEP IN STEP with
-	/// the browser twin (browser/ui.vl).
+	/// handlers. A88 exists because a browser boundary can be disposed while its
+	/// parent survives; a server render has no disposal and no later change to
+	/// survive, so there is nothing to remember. KEEP IN STEP with the browser twin
+	/// (browser/ui.vl).
 	fun hold(self, live: List<View>) {}
 
 	/// Records the live ROWS — accepted and dropped, with `hold`. KEEP IN STEP.
 	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
 	fun hold_rows(self, rows: List<Row>) {}
 
-	/// Drops the anchor — there is none to drop, and no live content to take
-	/// out of a document that does not exist yet (A88). KEEP IN STEP.
+	/// Drops the anchor — there is none to drop, and no live content to take out of
+	/// a document that does not exist yet (A88). KEEP IN STEP.
 	fun close(self) {}
 }
 
-/// Something that can fill a child position (proposal/element-syntax.md §5) —
-/// the type-directed half of `child`: the value's type carries the
-/// static-vs-tracked distinction; on this twin every arm reads once.
+/// Something that can fill a child position (proposal/element-syntax.md §5) — the
+/// type-directed half of `child`: the value's type carries the static-vs-tracked
+/// distinction; on this twin every arm reads once.
 ///
 /// THE CHILD CONTRACT (B268), the same six arms the browser twin declares — a
-/// `str`, a `View`, a `List<View>`, and a `Source` of each. The name stays
-/// `Slot` and not `Child` for the reason this file makes plainest: `Child` is
-/// the ENUM `render` walks, three declarations above.
-/// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
+/// `str`, a `View`, a `List<View>`, and a `Source` of each. The name stays `Slot`
+/// and not `Child` for the reason this file makes plainest: `Child` is the ENUM
+/// `render` walks, three declarations above. KEEP IN STEP with the browser twin's
+/// copy (browser/ui.vl).
 export trait Slot {
 	fun place(self, parent: View);
 }
@@ -425,16 +422,15 @@ export impl str with Slot {
 	}
 }
 
-/// A text node, read once — the value at render time is the value served.
-/// A BLANKET over the read trait (B158/B165), like the browser twin.
+/// A text node, read once — the value at render time is the value served. A BLANKET
+/// over the read trait (B158/B165), like the browser twin.
 export impl type S: Source<str> with Slot {
 	fun place(self, parent: View) {
 		parent.children.write().push(Child::Text(self.get()));
 	}
 }
 
-/// Several child elements, in order — the static run A46's fragment would
-/// lower to.
+/// Several child elements, in order — the static run A46's fragment would lower to.
 export impl List<View> with Slot {
 	fun place(self, parent: View) {
 		for item in self {
@@ -443,21 +439,21 @@ export impl List<View> with Slot {
 	}
 }
 
-/// A reactive element child, READ ONCE: the view the source holds at render
-/// time is the one served (B268). The browser twin replaces it on every
-/// change — through a `Region`, so the replacement keeps the hole's position
-/// (A71) — and here there is no later change to follow, so the value is
-/// written at its position directly and no anchor is served.
+/// A reactive element child, READ ONCE: the view the source holds at render time is
+/// the one served (B268). The browser twin replaces it on every change — through a
+/// `Region`, so the replacement keeps the hole's position (A71) — and here there is
+/// no later change to follow, so the value is written at its position directly and
+/// no anchor is served.
 export impl type S: Source<View> with Slot {
 	fun place(self, parent: View) {
 		parent.children.write().push(Child::Element(self.get()));
 	}
 }
 
-/// A reactive run of element children, read once — the `List<View>` arm's
-/// server end, with the single-view arm's story above: the browser twin keeps
-/// the run in place through a `Region`, and a one-pass render needs no anchor
-/// to do the same. KEEP IN STEP with the browser twin.
+/// A reactive run of element children, read once — the `List<View>` arm's server
+/// end, with the single-view arm's story above: the browser twin keeps the run in
+/// place through a `Region`, and a one-pass render needs no anchor to do the same.
+/// KEEP IN STEP with the browser twin.
 export impl type S: Source<List<View>> with Slot {
 	fun place(self, parent: View) {
 		let items: List<View> = self.get();
@@ -477,10 +473,10 @@ export impl type S: Source<List<View>> with Slot {
 // below has always said about the anchor the browser twin has to plant, and
 // what A85 finally gives it a reason to be CALLED for.
 //
-// The closure FIELDS carry their `context` clause (B309) and not the `sync`
-// marker (parameter-only), in lockstep with the browser twin: the same
-// component source constructs these on both legs.
-// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
+// The closure FIELDS carry their `context` clause (B309) and not the `sync` marker
+// (parameter-only), in lockstep with the browser twin: the same component source
+// constructs these on both legs. KEEP IN STEP with the browser twin's copy
+// (browser/ui.vl).
 
 /// Conditional content as a child — the `when` slot value (A85/A99).
 export struct Conditional<S: Source<bool>, C: Slot> {
@@ -627,11 +623,10 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slo
 	}
 }
 
-/// `each_by`'s body, server side: one child per element of the CURRENT
-/// list, each built against a fresh `SignalCell<T>` holding that element. No
-/// reconciliation and no later change to follow, so the cell is written once
-/// and never again — but it must exist, because `render` is the same closure
-/// the client runs.
+/// `each_by`'s body, server side: one child per element of the CURRENT list, each
+/// built against a fresh `SignalCell<T>` holding that element. No reconciliation
+/// and no later change to follow, so the cell is written once and never again — but
+/// it must exist, because `render` is the same closure the client runs.
 fun place_each_by<T, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
 	parent: View,
 	source: S,
@@ -640,9 +635,9 @@ fun place_each_by<T, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
 ) {
 	let region = Region::open(parent);
 	let items: List<T> = source.get();
-	// The key is client business — it decides which row survives a change, and
-	// no row here outlives the request. Accepted and dropped, like the event
-	// binders' handlers.
+	// The key is client business — it decides which row survives a change, and no
+	// row here outlives the request. Accepted and dropped, like the event binders'
+	// handlers.
 	let _keyed = key;
 	for item in items {
 		let cell: SignalCell<T> = SignalCell::new(item);
@@ -652,9 +647,9 @@ fun place_each_by<T, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
 }
 
 /// Something that can fill an attribute value (proposal/element-syntax.md §5) —
-/// what `<div name(value)>` desugars through (`.attr`, never `.bind_attr`).
-/// The tracked arm is a BLANKET over `Source<str>` (B158/B165).
-/// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
+/// what `<div name(value)>` desugars through (`.attr`, never `.bind_attr`). The
+/// tracked arm is a BLANKET over `Source<str>` (B158/B165). KEEP IN STEP with the
+/// browser twin's copy (browser/ui.vl).
 export trait AttrValue {
 	fun apply(self, parent: View, name: str);
 }
@@ -673,8 +668,8 @@ export impl type S: Source<str> with AttrValue {
 	}
 }
 
-/// Rendered only for a `Some` (A115): a `None` omits the attribute, which is
-/// the server's whole answer to the browser twin's "write nothing".
+/// Rendered only for a `Some` (A115): a `None` omits the attribute, which is the
+/// server's whole answer to the browser twin's "write nothing".
 export impl Option<str> with AttrValue {
 	fun apply(self, parent: View, name: str) {
 		match self {
@@ -685,8 +680,8 @@ export impl Option<str> with AttrValue {
 }
 
 /// Read once, rendered only for a `Some` (A115) — the twin of the browser's
-/// removing arm. Nothing was written, so there is no `remove_attribute` to
-/// mirror, which is `AttrBinding`'s arrangement exactly.
+/// removing arm. Nothing was written, so there is no `remove_attribute` to mirror,
+/// which is `AttrBinding`'s arrangement exactly.
 export impl type S: Source<Option<str>> with AttrValue {
 	fun apply(self, parent: View, name: str) {
 		match self.get() {
@@ -712,8 +707,8 @@ export impl type S: Source<str> with AttrBinding {
 	}
 }
 
-/// Rendered only for a `Some`: a `None` omits the attribute, which is the
-/// server's whole answer to the browser twin's `remove_attribute`.
+/// Rendered only for a `Some`: a `None` omits the attribute, which is the server's
+/// whole answer to the browser twin's `remove_attribute`.
 export impl type S: Source<Option<str>> with AttrBinding {
 	fun bind_attribute(self, parent: View, name: str) {
 		match self.get() {
@@ -723,9 +718,9 @@ export impl type S: Source<Option<str>> with AttrBinding {
 	}
 }
 
-/// The HTML void elements: they render `<tag …>` with no closing tag, and
-/// children are illegal — so any children of a void are dropped (a documented
-/// no-op; components don't give voids children).
+/// The HTML void elements: they render `<tag …>` with no closing tag, and children
+/// are illegal — so any children of a void are dropped (a documented no-op;
+/// components don't give voids children).
 fun is_void_element(tag: str): bool {
 	match tag {
 		"area" => true,
@@ -745,8 +740,8 @@ fun is_void_element(tag: str): bool {
 	}
 }
 
-/// Escape a text node: `&`, `<`, `>` become entities (`&` FIRST so entities
-/// aren't double-escaped). Renders `<script>` inert.
+/// Escape a text node: `&`, `<`, `>` become entities (`&` FIRST so entities aren't
+/// double-escaped). Renders `<script>` inert.
 export fun escape_text(value: str): str {
 	value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 }
@@ -802,11 +797,11 @@ export fun chunk_failure(): SignalCell<Option<str>> {
 
 // === `when_some`: the conditional form that BINDS the value (A119) ==========
 //
-// The server twin: read once, and the body is handed a `SignalCell<T>` holding
-// the current payload, so the SAME component source compiles on both legs (R6
-// at Order 39's GO — the browser twin's row survives a payload change through
-// that cell, and there is nothing here for it to survive).
-// KEEP IN STEP with the browser twin's copy (browser/ui.vl).
+// The server twin: read once, and the body is handed a `SignalCell<T>` holding the
+// current payload, so the SAME component source compiles on both legs (R6 at Order
+// 39's GO — the browser twin's row survives a payload change through that cell, and
+// there is nothing here for it to survive). KEEP IN STEP with the browser twin's
+// copy (browser/ui.vl).
 
 /// Content that exists while `source` is `Some`, with the payload bound — the
 /// `when_some` slot value (A119).
@@ -815,9 +810,9 @@ export struct WhenSome<T, S: Source<Option<T>>, C: Slot> {
 	render: (|SignalCell<T>| C) context owner_scope,
 }
 
-/// `Some`-conditional content at THIS position, read once: the body renders
-/// when `source` currently holds a value and nothing when it is `None`. The
-/// body takes a `SignalCell<T>` for the browser twin's reason (R6).
+/// `Some`-conditional content at THIS position, read once: the body renders when
+/// `source` currently holds a value and nothing when it is `None`. The body takes a
+/// `SignalCell<T>` for the browser twin's reason (R6).
 export fun when_some<T, S: Source<Option<T>>, C: Slot>(
 	source: S,
 	render: (sync |SignalCell<T>| C) context owner_scope,
@@ -831,10 +826,9 @@ export impl WhenSome<type T, type S: Source<Option<T>>, type C: Slot> with Slot 
 	}
 }
 
-/// `when_some`'s body, server side — the body for the CURRENT payload, in
-/// position, or nothing at all. A named helper beside `place_swap`'s and
-/// `place_each`'s, which is also what keeps the two twins' surfaces in parity
-/// (`std_twin_parity`).
+/// `when_some`'s body, server side — the body for the CURRENT payload, in position,
+/// or nothing at all. A named helper beside `place_swap`'s and `place_each`'s,
+/// which is also what keeps the two twins' surfaces in parity (`std_twin_parity`).
 fun place_when_some<T, S: Source<Option<T>>, C: Slot>(
 	parent: View,
 	source: S,
@@ -853,15 +847,14 @@ fun place_when_some<T, S: Source<Option<T>>, C: Slot>(
 
 // === A121: focus scopes, server side (proposal/focus-scope.md) ===============
 //
-// ACCEPTED AND DROPPED, exactly as `on_mount` and `autofocus` are: a server
-// render has no focus to trap and no document to trap it in — the request
-// creates, serializes and discards. The surface is declared name for name so
-// the same component source compiles through both layers; the browser twin
-// (browser/ui.vl) carries the mechanism and its reasoning. KEEP IN STEP.
+// ACCEPTED AND DROPPED, exactly as `on_mount` and `autofocus` are: a server render
+// has no focus to trap and no document to trap it in — the request creates,
+// serializes and discards. The surface is declared name for name so the same
+// component source compiles through both layers; the browser twin (browser/ui.vl)
+// carries the mechanism and its reasoning. KEEP IN STEP.
 
-/// What a focus scope does with a Tab that would leave it — the browser
-/// twin's enum, declared here so a component that names an arm compiles on
-/// both legs.
+/// What a focus scope does with a Tab that would leave it — the browser twin's
+/// enum, declared here so a component that names an arm compiles on both legs.
 export enum FocusContainment {
 	/// A modal: Tab cycles, and focus that arrives elsewhere is pulled back.
 	Contain,
@@ -870,36 +863,34 @@ export enum FocusContainment {
 }
 
 /// An installed focus scope, server side: an id and a latch, both inert. The
-/// browser twin's handle also carries its root element, which a server layer
-/// cannot name — a FIELD may differ between twins where a member may not, and
-/// nothing here ever reads one.
+/// browser twin's handle also carries its root element, which a server layer cannot
+/// name — a FIELD may differ between twins where a member may not, and nothing here
+/// ever reads one.
 export struct FocusScope {
 	id: i32,
 	focused: Shared<bool>,
 }
 
 export impl FocusScope {
-	/// Take the initial focus, server side: there is none to take. `false` is
-	/// also what the browser answers for a scope whose subtree holds nothing
-	/// focusable, so a driver that retries on the next frame behaves the same
-	/// on both legs — it simply has no next frame here. KEEP IN STEP.
+	/// Take the initial focus, server side: there is none to take. `false` is also
+	/// what the browser answers for a scope whose subtree holds nothing focusable,
+	/// so a driver that retries on the next frame behaves the same on both legs —
+	/// it simply has no next frame here. KEEP IN STEP.
 	fun focus_initial(self): bool {
 		false
 	}
 }
 
-/// The scope stack, server side: nothing is ever pushed onto it. It is
-/// declared rather than omitted because the twin surfaces are held name for
-/// name, and a name that exists on one side only is the drift that gate
-/// exists to catch.
+/// The scope stack, server side: nothing is ever pushed onto it. It is declared
+/// rather than omitted because the twin surfaces are held name for name, and a name
+/// that exists on one side only is the drift that gate exists to catch.
 let focus_scopes: Shared<List<i32>> = Shared::new([]);
 
 /// The id source, inert with the stack above.
 let next_focus_scope: Shared<i32> = Shared::new(0);
 
-/// The stack's two readers, answering the empty stack. They are what the
-/// browser twin's two window listeners consult at event time; there are no
-/// events here.
+/// The stack's two readers, answering the empty stack. They are what the browser
+/// twin's two window listeners consult at event time; there are no events here.
 fun focus_reaches_from(id: i32, target: i32): bool {
 	false
 }
@@ -908,11 +899,11 @@ fun topmost_contain_scope(): Option<i32> {
 	None
 }
 
-/// Install a focus scope, server side: nothing is installed and nothing is
-/// focused. The root is GENERIC for `on_mount`'s reason — a server layer
-/// cannot name the browser-only `std::dom::Element` — and the handle it
-/// hands back answers `false` from `focus_initial`, which is the same answer
-/// the browser gives for a scope whose subtree holds nothing focusable.
+/// Install a focus scope, server side: nothing is installed and nothing is focused.
+/// The root is GENERIC for `on_mount`'s reason — a server layer cannot name the
+/// browser-only `std::dom::Element` — and the handle it hands back answers `false`
+/// from `focus_initial`, which is the same answer the browser gives for a scope
+/// whose subtree holds nothing focusable.
 export fun focus_scope<E>(root: E, containment: FocusContainment): FocusScope {
 	let id = next_focus_scope.read() + 1;
 	next_focus_scope.write() = id;

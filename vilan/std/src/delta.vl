@@ -8,9 +8,8 @@
 //
 // read at the only place it is observable, the settle of a turn:
 // `derived.get() == source.get().map(g)`. For `map g` the derivative of "three
-// elements arrived at position 4" is "three MAPPED elements arrived at
-// position 4": `g` runs three times and nothing else is looked at — not N
-// cache checks, zero.
+// elements arrived at position 4" is "three MAPPED elements arrived at position 4":
+// `g` runs three times and nothing else is looked at — not N cache checks, zero.
 //
 // This module is the LOG half of that: an op vocabulary per collection SHAPE
 // (not per method), a bounded op log with per-consumer cursors, and the thin
@@ -21,16 +20,16 @@
 // keys because its consumer is a wire protocol that addresses elements by key,
 // and a local derivation addresses them by position.
 //
-// **Why a file of its own, and why the names read as `std::reactive`'s.** The
-// log belongs to the reactive layer — `std::reactive` imports nothing from
-// `std::wire`, and that stays true: `SeqOp` is a reactive type, `Delta` a wire
-// one, and the edge between them lives in `std::rpc`, where it lives today.
-// `reactive.vl` re-exports everything below, so the designed spelling
-// `std::reactive::DeltaCursor` resolves; this file is where the bodies sit.
+// **Why a file of its own, and why the names read as `std::reactive`'s.** The log
+// belongs to the reactive layer — `std::reactive` imports nothing from `std::wire`,
+// and that stays true: `SeqOp` is a reactive type, `Delta` a wire one, and the edge
+// between them lives in `std::rpc`, where it lives today. `reactive.vl` re-exports
+// everything below, so the designed spelling `std::reactive::DeltaCursor` resolves;
+// this file is where the bodies sit.
 //
-// Coalescing is free and is already how the turn scheduler behaves: writes in
-// one turn produce ONE notification and the consumer drains every op at the
-// settle, so the log is as long as one turn's writes.
+// Coalescing is free and is already how the turn scheduler behaves: writes in one
+// turn produce ONE notification and the consumer drains every op at the settle, so
+// the log is as long as one turn's writes.
 import pkg::compare::PartialEq;
 import pkg::hash::Hashable;
 import pkg::map::Map;
@@ -58,12 +57,12 @@ import pkg::shared::Shared;
 /// `keyed_log_limit` before the lift (A54), with its sentence unchanged.
 export let delta_log_limit: i32 = 1024;
 
-/// One consumer's place in a log: the sequence number it has been told
-/// through. Identified rather than compared, because two consumers may
-/// legitimately sit at the same sequence.
+/// One consumer's place in a log: the sequence number it has been told through.
+/// Identified rather than compared, because two consumers may legitimately sit at
+/// the same sequence.
 ///
-/// `KeyedCursor` before the lift (A54) — the cursor is shape-neutral, so it
-/// is spelled once here instead of once per collection.
+/// `KeyedCursor` before the lift (A54) — the cursor is shape-neutral, so it is
+/// spelled once here instead of once per collection.
 export struct DeltaCursor {
 	id: i32,
 	at: Shared<i32>,
@@ -80,45 +79,43 @@ export struct DeltaCursor {
 // translation to `Delta<K, T>` needs: `Delta::Remove(key)` wants the key of
 // the element that WENT, and only the value carries it.
 
-/// A sequence's change — the primitive shape. Positional: keyed addressing is
-/// a position index on top of it, which is exactly what `KeyedCell` keeps.
+/// A sequence's change — the primitive shape. Positional: keyed addressing is a
+/// position index on top of it, which is exactly what `KeyedCell` keeps.
 export enum SeqOp<T> {
 	/// `removed` left and `inserted` arrived, both at `at`.
 	Splice(i32, List<T>, List<T>),
 	/// The element at `at` was the first value and is now the second.
 	///
-	/// Deliberately NOT `Splice(at, [old], [new])`, though it means the same
-	/// thing to the collection: for `each` and for a per-element derivation
-	/// the two are different events — an element changed in place, versus one
-	/// left and another arrived — and the difference is whether the
-	/// per-element owner survives.
+	/// Deliberately NOT `Splice(at, [old], [new])`, though it means the same thing
+	/// to the collection: for `each` and for a per-element derivation the two are
+	/// different events — an element changed in place, versus one left and another
+	/// arrived — and the difference is whether the per-element owner survives.
 	SetAt(i32, T, T),
-	/// The collection BECAME this list. The honest escape hatch: a wholesale
-	/// write, a lagging cursor's fallback, and the compat path for a source
-	/// that keeps no log at all.
+	/// The collection BECAME this list. The honest escape hatch: a wholesale write,
+	/// a lagging cursor's fallback, and the compat path for a source that keeps no
+	/// log at all.
 	Reset(List<T>),
 	/// `count` elements moved from `from` to `to`, unchanged.
 	///
-	/// In the vocabulary from S1 although nothing in std EMITS one yet:
-	/// adding an arm to a public op enum later is a breaking change to every
-	/// `match` in every consumer, and a reorder is exactly where the
-	/// splice-pair encoding loses information a consumer needs — a `Splice`
-	/// that removes an element and a `Splice` that re-inserts it are, to a
-	/// per-element owner, a disposal and a rebuild, where a `Move` says "same
-	/// element, new place". A consumer that does not care may treat it as the
-	/// splice pair; `std::rpc`'s wire translation lowers it to
-	/// `Delta::Reset`, which is what a reorder sends today.
+	/// In the vocabulary from S1 although nothing in std EMITS one yet: adding an
+	/// arm to a public op enum later is a breaking change to every `match` in every
+	/// consumer, and a reorder is exactly where the splice-pair encoding loses
+	/// information a consumer needs — a `Splice` that removes an element and a
+	/// `Splice` that re-inserts it are, to a per-element owner, a disposal and a
+	/// rebuild, where a `Move` says "same element, new place". A consumer that does
+	/// not care may treat it as the splice pair; `std::rpc`'s wire translation
+	/// lowers it to `Delta::Reset`, which is what a reorder sends today.
 	Move(i32, i32, i32),
 }
 
-/// A map's change. `Put`'s `Option<V>` is the difference between an insert and
-/// an overwrite, which a group fold over the values needs.
+/// A map's change. `Put`'s `Option<V>` is the difference between an insert and an
+/// overwrite, which a group fold over the values needs.
 ///
-/// Recorded, not slated: nothing asks for a reactive `Map` cell yet. It is
-/// written here so the log's shape is chosen against more than one collection.
+/// Recorded, not slated: nothing asks for a reactive `Map` cell yet. It is written
+/// here so the log's shape is chosen against more than one collection.
 ///
-/// `K: Hashable` is the `Reset` arm's bound, not the op's: `Map<K, V>` demands
-/// it, and an op that carries the whole collection carries its bounds with it.
+/// `K: Hashable` is the `Reset` arm's bound, not the op's: `Map<K, V>` demands it,
+/// and an op that carries the whole collection carries its bounds with it.
 export enum MapOp<K: Hashable, V> {
 	/// The key, what was there, and what is there now.
 	Put(K, Option<V>, V),
@@ -140,24 +137,24 @@ export enum SetOp<T: Hashable> {
 /// A bounded op log with per-consumer cursors — `KeyedCell`'s machinery,
 /// lifted and made generic in the OP rather than in the collection.
 ///
-/// Three cell kinds want it (a local sequence cell, the keyed cell, an
-/// optimistic or remote cell) and copying it three times is the anti-DRY
-/// failure one layer up from the one A112 complains about, so it is a value
-/// type a cell HOLDS rather than a shape a cell repeats.
+/// Three cell kinds want it (a local sequence cell, the keyed cell, an optimistic
+/// or remote cell) and copying it three times is the anti-DRY failure one layer up
+/// from the one A112 complains about, so it is a value type a cell HOLDS rather
+/// than a shape a cell repeats.
 export struct DeltaLog<O> {
 	/// The ops still worth keeping, oldest first: sequence numbers
 	/// `base + 1 ..= version`.
 	ops: Shared<List<O>>,
 	/// The sequence number of the newest op the log has been told.
 	version: Shared<i32>,
-	/// The sequence number BEFORE the oldest op the log still holds. A cursor
-	/// left behind it has lost history and is answered with `None`.
+	/// The sequence number BEFORE the oldest op the log still holds. A cursor left
+	/// behind it has lost history and is answered with `None`.
 	base: Shared<i32>,
 	/// One per live consumer. The log trims to the laggiest of them, so a log
 	/// nobody is watching keeps no history at all.
 	cursors: Shared<List<DeltaCursor>>,
-	/// This log's ceiling, `delta_log_limit` unless a cell asked for another.
-	/// A plain field rather than a cell: it is written once, at construction.
+	/// This log's ceiling, `delta_log_limit` unless a cell asked for another. A
+	/// plain field rather than a cell: it is written once, at construction.
 	limit: i32,
 }
 
@@ -173,8 +170,8 @@ export impl DeltaLog<type O> {
 		}
 	}
 
-	/// An empty log at a ceiling of its caller's choosing — what a test that
-	/// wants to reach the lag path without writing a thousand ops asks for.
+	/// An empty log at a ceiling of its caller's choosing — what a test that wants
+	/// to reach the lag path without writing a thousand ops asks for.
 	fun with_limit(limit: i32): DeltaLog<O> {
 		DeltaLog {
 			ops = Shared::new([]),
@@ -185,11 +182,11 @@ export impl DeltaLog<type O> {
 		}
 	}
 
-	/// Append one op and bump the sequence. The trim comes FIRST, so a log
-	/// whose consumers are all current holds one op and a log with no
-	/// consumers holds exactly the op just recorded — ONE, not zero, because
-	/// the trim happened before the push. Harmless, and stated here because it
-	/// is easy to state wrongly.
+	/// Append one op and bump the sequence. The trim comes FIRST, so a log whose
+	/// consumers are all current holds one op and a log with no consumers holds
+	/// exactly the op just recorded — ONE, not zero, because the trim happened
+	/// before the push. Harmless, and stated here because it is easy to state
+	/// wrongly.
 	///
 	/// Past `limit` the history is dropped instead of appended and `base`
 	/// jumps to the new sequence: every cursor behind it now reads as lagging
@@ -208,14 +205,13 @@ export impl DeltaLog<type O> {
 		}
 	}
 
-	/// Drop the ops every live cursor has already been told. With no cursors
-	/// the whole log goes: nothing is watching, so nothing is owed.
+	/// Drop the ops every live cursor has already been told. With no cursors the
+	/// whole log goes: nothing is watching, so nothing is owed.
 	///
-	/// The log is trimmed at the next WRITE, not at the drain: after a lone
-	/// cursor has drained four ops the log still holds four, and they go on
-	/// the next `record`. A cell written once and then read for ever holds one
-	/// op's worth of history for ever. Also harmless, and also easy to state
-	/// wrongly.
+	/// The log is trimmed at the next WRITE, not at the drain: after a lone cursor
+	/// has drained four ops the log still holds four, and they go on the next
+	/// `record`. A cell written once and then read for ever holds one op's worth of
+	/// history for ever. Also harmless, and also easy to state wrongly.
 	fun trim(self) {
 		mut lowest = self.version.read();
 		for cursor in self.cursors.read() {
@@ -244,8 +240,8 @@ export impl DeltaLog<type O> {
 	}
 
 	/// Register a consumer's cursor, at the sequence the log is at NOW — the
-	/// consumer is about to seed from the current collection, so it is owed
-	/// nothing before this point.
+	/// consumer is about to seed from the current collection, so it is owed nothing
+	/// before this point.
 	fun cursor(self): DeltaCursor {
 		let minted = DeltaCursor { id = fresh_id(), at = Shared::new(self.version.read()) };
 		self.cursors.write().push(minted);
@@ -267,9 +263,9 @@ export impl DeltaLog<type O> {
 	/// Everything `cursor` has not been told, and advance it. A cursor behind
 	/// `base` has lost history and is answered with `None`.
 	///
-	/// `None` rather than a `Reset` because the LOG does not know what a
-	/// `Reset` is for its op type and the CELL does — the one place the two
-	/// layers have to know about each other, and three lines in each cell.
+	/// `None` rather than a `Reset` because the LOG does not know what a `Reset` is
+	/// for its op type and the CELL does — the one place the two layers have to
+	/// know about each other, and three lines in each cell.
 	fun since(self, cursor: DeltaCursor): Option<List<O>> {
 		let at = cursor.at.read();
 		let version = self.version.read();
@@ -313,42 +309,41 @@ export impl DeltaLog<type O> {
 
 /// A source whose WRITES are its deltas. `C` is the collection, `O` its op.
 ///
-/// The bound is what makes an operator generic in the CELL rather than in one
-/// cell type: a derivation takes an `S: DeltaSource<List<T>, SeqOp<T>>`, so it
-/// serves a local sequence cell, `KeyedCell`, and anything an app writes.
+/// The bound is what makes an operator generic in the CELL rather than in one cell
+/// type: a derivation takes an `S: DeltaSource<List<T>, SeqOp<T>>`, so it serves a
+/// local sequence cell, `KeyedCell`, and anything an app writes.
 ///
-/// vilan has no associated types, so both the collection and its op are
-/// parameters.
+/// vilan has no associated types, so both the collection and its op are parameters.
 export trait DeltaSource<C, O> with Source<C> {
 	/// A cursor into this source's log, at the sequence it is at now.
 	fun cursor(self): DeltaCursor;
 
-	/// Retire a cursor. A derivation calls it on disposal, so a dead consumer
-	/// stops pinning history.
+	/// Retire a cursor. A derivation calls it on disposal, so a dead consumer stops
+	/// pinning history.
 	fun drop_cursor(self, cursor: DeltaCursor);
 
-	/// Everything `cursor` has not been told. Unlike the LOG's `since` this
-	/// never fails: a cursor that lost history is answered with the shape's
-	/// `Reset`, carrying the collection.
+	/// Everything `cursor` has not been told. Unlike the LOG's `since` this never
+	/// fails: a cursor that lost history is answered with the shape's `Reset`,
+	/// carrying the collection.
 	fun since(self, cursor: DeltaCursor): List<O>;
 }
 
 // === The sequence cell, and the first operator (A112 S2) =====================
 //
-// S1 built the LOG half. This is the CELL half: a collection whose writes are
-// its ops, a surface over it that is written ONCE per receiver kind, and the
-// first derivative — `map g`, whose `Splice(at, removed, arrived)` becomes
-// `Splice(at, removed, arrived.map(g))`, so `g` runs once per arriving element
-// and nothing else is looked at. Not N cache checks: zero.
+// S1 built the LOG half. This is the CELL half: a collection whose writes are its
+// ops, a surface over it that is written ONCE per receiver kind, and the first
+// derivative — `map g`, whose `Splice(at, removed, arrived)` becomes
+// `Splice(at, removed, arrived.map(g))`, so `g` runs once per arriving element and
+// nothing else is looked at. Not N cache checks: zero.
 //
 // **Why two traits and not one.** `List`'s mutators take `&mut self`; a cell
-// handle's take `self` — a `ListCell<T>` is two `Shared`s, so a copy of the
-// handle is the same cell and `my_list.push(x)` on a plain `let` is right.
-// One trait cannot have both receivers, and it does not need to: `SequenceCell`
-// is the everyday surface and `Sequence` is the one a BODY is written against
+// handle's take `self` — a `ListCell<T>` is two `Shared`s, so a copy of the handle
+// is the same cell and `my_list.push(x)` on a plain `let` is right. One trait
+// cannot have both receivers, and it does not need to: `SequenceCell` is the
+// everyday surface and `Sequence` is the one a BODY is written against
 // (`fun fill<S: Sequence<str>>(target: &mut S)`), reached through `edit`. Both
-// stand on the same single primitive — `splice` — so the twelve method names
-// each of them offers are defaults, written twice and implemented never
+// stand on the same single primitive — `splice` — so the twelve method names each
+// of them offers are defaults, written twice and implemented never
 // (incremental-collections.md §6, §13 Q2: two hand lists, no macro).
 //
 // **I5.** Every position and count below is `i32` and is marked `// I5`: the
@@ -366,8 +361,8 @@ export trait SequenceCell<T> {
 	/// How many elements the sequence holds.
 	fun size(self): i32; // I5
 
-	/// THE primitive: `removed` elements leave at `at` and `inserted` arrive
-	/// there, as ONE op and ONE notification.
+	/// THE primitive: `removed` elements leave at `at` and `inserted` arrive there,
+	/// as ONE op and ONE notification.
 	fun splice(self, at: i32, removed: i32, inserted: List<T>); // I5 (at, removed)
 
 	/// Nothing held.
@@ -427,9 +422,9 @@ export trait SequenceCell<T> {
 		self.splice(0, self.size(), []) // I5
 	}
 
-	/// Everything leaves and `values` arrive — the wholesale write expressed
-	/// as ONE op, which is what makes it cheaper than `set`: a consumer sees a
-	/// `Splice` it can apply rather than a `Reset` it has to rebuild from.
+	/// Everything leaves and `values` arrive — the wholesale write expressed as ONE
+	/// op, which is what makes it cheaper than `set`: a consumer sees a `Splice` it
+	/// can apply rather than a `Reset` it has to rebuild from.
 	fun set_all(self, values: List<T>) {
 		self.splice(0, self.size(), values) // I5
 	}
@@ -447,22 +442,21 @@ export trait SequenceCell<T> {
 /// The same sequence surface with `&mut self` receivers — the shape a BODY is
 /// written against, and the one `ListCell::edit` hands out.
 ///
-/// Its implementor is `Tracked<T>`, the recorder: a plain list plus the ops
-/// that produced it. What this buys over `SequenceCell` is that an algorithm
-/// bounded on it (`fun fill<S: Sequence<str>>(target: &mut S)`) is not tied to
-/// the reactive graph at all — the same body fills a recorder inside an `edit`
-/// and, once B359's fix admits `List<T>` among the implementors, a plain list
-/// outside one.
+/// Its implementor is `Tracked<T>`, the recorder: a plain list plus the ops that
+/// produced it. What this buys over `SequenceCell` is that an algorithm bounded on
+/// it (`fun fill<S: Sequence<str>>(target: &mut S)`) is not tied to the reactive
+/// graph at all — the same body fills a recorder inside an `edit` and, once B359's
+/// fix admits `List<T>` among the implementors, a plain list outside one.
 ///
-/// `size` takes `self` and the mutators take `&mut self`, deliberately: asking
-/// for a writable view to answer a question would refuse a read on a shared
-/// value for no reason.
+/// `size` takes `self` and the mutators take `&mut self`, deliberately: asking for
+/// a writable view to answer a question would refuse a read on a shared value for
+/// no reason.
 export trait Sequence<T> {
 	/// How many elements the sequence holds.
 	fun size(self): i32; // I5
 
-	/// THE primitive, as in `SequenceCell` — `removed` leave at `at` and
-	/// `inserted` arrive there.
+	/// THE primitive, as in `SequenceCell` — `removed` leave at `at` and `inserted`
+	/// arrive there.
 	fun splice(&mut self, at: i32, removed: i32, inserted: List<T>); // I5
 
 	/// Nothing held.
@@ -539,17 +533,17 @@ export trait Sequence<T> {
 
 // === The one splice ==========================================================
 //
-// Both surfaces run THIS — `Tracked` on its own list, `ListCell` inside its
-// cell's `update` — so the two cannot disagree about what an out-of-range ask
-// means or about what the op records.
+// Both surfaces run THIS — `Tracked` on its own list, `ListCell` inside its cell's
+// `update` — so the two cannot disagree about what an out-of-range ask means or
+// about what the op records.
 //
-// Out-of-range asks are CLAMPED, where `List::insert` and `List::remove` panic.
-// The difference is deliberate: `List`'s index is a caller's claim about a list
-// it holds, while a sequence surface is reached through a dozen defaults over
-// ONE primitive, and `remove_range(at, 99)` asking for "the rest" or a
-// `truncate` past the end should mean what it says rather than abort the turn.
-// A clamped splice that takes nothing and inserts nothing is no op at all, and
-// both callers check for it before they record or publish anything.
+// Out-of-range asks are CLAMPED, where `List::insert` and `List::remove` panic. The
+// difference is deliberate: `List`'s index is a caller's claim about a list it
+// holds, while a sequence surface is reached through a dozen defaults over ONE
+// primitive, and `remove_range(at, 99)` asking for "the rest" or a `truncate` past
+// the end should mean what it says rather than abort the turn. A clamped splice
+// that takes nothing and inserts nothing is no op at all, and both callers check
+// for it before they record or publish anything.
 
 /// Where a splice at `at` starts in a sequence of `held` elements: `at`, pulled
 /// into `0..=held`.
@@ -599,12 +593,12 @@ fun splice_in_place<T>(list: &mut List<T>, start: i32, taking: i32, inserted: Li
 	SeqOp::Splice(start, left, inserted)
 }
 
-/// A plain list plus the ops that produced it — what `ListCell::edit` hands a
-/// body, and the only implementor of `Sequence<T>` std ships.
+/// A plain list plus the ops that produced it — what `ListCell::edit` hands a body,
+/// and the only implementor of `Sequence<T>` std ships.
 ///
-/// It is NOT reactive and holds no cell: the whole point is that a body may
-/// make a dozen mutations on it at no notification cost, and the cell publishes
-/// the result once when the body returns.
+/// It is NOT reactive and holds no cell: the whole point is that a body may make a
+/// dozen mutations on it at no notification cost, and the cell publishes the result
+/// once when the body returns.
 export struct Tracked<T> {
 	/// The elements, mutated in place.
 	elements: List<T>,
@@ -637,8 +631,8 @@ export impl Tracked<type T> with Sequence<T> {
 	}
 }
 
-/// A `List<T>` whose WRITES ARE ITS DELTAS: a signal cell over the list plus
-/// the op log that says what each write did.
+/// A `List<T>` whose WRITES ARE ITS DELTAS: a signal cell over the list plus the op
+/// log that says what each write did.
 ///
 /// This is the cell A112 exists for. `list.push(x)` is one op, so a derivation
 /// over it (`map_each`) runs its function once — for `x` — rather than once per
@@ -647,8 +641,8 @@ export impl Tracked<type T> with Sequence<T> {
 /// `map` takes it, an effect takes it, and a consumer that knows nothing about
 /// ops pays nothing for them.
 ///
-/// `set(whole_list)` records a `Reset` and costs what a `SignalCell` costs —
-/// the honest compat path. `reconcile_to(whole_list)` is the door that turns a
+/// `set(whole_list)` records a `Reset` and costs what a `SignalCell` costs — the
+/// honest compat path. `reconcile_to(whole_list)` is the door that turns a
 /// wholesale write back into ops.
 export struct ListCell<T> {
 	elements: SignalCell<List<T>>,
@@ -661,15 +655,14 @@ export impl ListCell<type T> {
 		ListCell { elements = SignalCell::new([]), log = DeltaLog<SeqOp<T>>::new() }
 	}
 
-	/// A cell holding `elements`. Nothing is recorded: a cursor minted after
-	/// this reads the collection as its own starting point.
+	/// A cell holding `elements`. Nothing is recorded: a cursor minted after this
+	/// reads the collection as its own starting point.
 	fun of(elements: List<T>): ListCell<T> {
 		ListCell { elements = SignalCell::new(elements), log = DeltaLog<SeqOp<T>>::new() }
 	}
 
-	/// A cell whose log has a ceiling other than `delta_log_limit` — what a
-	/// test that wants to reach the lag path without writing a thousand ops
-	/// asks for.
+	/// A cell whose log has a ceiling other than `delta_log_limit` — what a test
+	/// that wants to reach the lag path without writing a thousand ops asks for.
 	fun with_limit(elements: List<T>, limit: i32): ListCell<T> {
 		// I5
 		ListCell {
@@ -726,12 +719,12 @@ export impl ListCell<type T> {
 		});
 	}
 
-	/// The BATCH door: hand `body` a recorder, then publish its whole run as
-	/// ONE value write and one op per mutation it made.
+	/// The BATCH door: hand `body` a recorder, then publish its whole run as ONE
+	/// value write and one op per mutation it made.
 	///
-	/// Four mutations inside one `edit` are one notification and four ops —
-	/// which is the point: a consumer wakes once and learns everything that
-	/// happened, instead of waking four times.
+	/// Four mutations inside one `edit` are one notification and four ops — which
+	/// is the point: a consumer wakes once and learns everything that happened,
+	/// instead of waking four times.
 	fun edit(self, body: sync |&mut Tracked<T>| void) {
 		mut recorder = Tracked::new(self.elements.get());
 		body(&mut recorder);
@@ -762,10 +755,10 @@ export impl ListCell<type T: PartialEq> {
 	/// elements they actually touch and nothing more. It is O(N) compares and
 	/// zero derivations for every retained element.
 	///
-	/// What it does NOT do is find a REORDER: a rotated list shares no prefix
-	/// and no suffix, so it is one `Splice` over the whole run, which is
-	/// honest (every element really did move) and is what `each`'s keyed pass
-	/// is for. A source that knows it reordered says `move_range`.
+	/// What it does NOT do is find a REORDER: a rotated list shares no prefix and
+	/// no suffix, so it is one `Splice` over the whole run, which is honest (every
+	/// element really did move) and is what `each`'s keyed pass is for. A source
+	/// that knows it reordered says `move_range`.
 	fun reconcile_to(self, items: List<T>) {
 		let held = self.elements.get();
 		let old_length = held.len(); // I5
@@ -794,8 +787,8 @@ export impl ListCell<type T: PartialEq> {
 			}
 			index += 1;
 		}
-		// Identical lists: no op, no notification. `set` would publish anyway
-		// (it never compares); this door exists precisely to compare.
+		// Identical lists: no op, no notification. `set` would publish anyway (it
+		// never compares); this door exists precisely to compare.
 		if removed == 0 && arriving.len() == 0 {
 			ret;
 		}
@@ -816,8 +809,8 @@ export impl ListCell<type T> with Source<List<T>> {
 
 export impl ListCell<type T> with Signal<List<T>> {
 	/// The wholesale write: the collection BECAME this list, and the log says
-	/// exactly that. Every delta consumer falls back to a rebuild, which is
-	/// what `Reset` means and why `reconcile_to` exists beside it.
+	/// exactly that. Every delta consumer falls back to a rebuild, which is what
+	/// `Reset` means and why `reconcile_to` exists beside it.
 	fun set(self, value: List<T>) {
 		self.elements.update(|&mut list| {
 			list = value;
@@ -869,8 +862,8 @@ export impl ListCell<type T> with DeltaSource<List<T>, SeqOp<T>> {
 
 	fun since(self, cursor: DeltaCursor): List<SeqOp<T>> {
 		match self.log.since(cursor) {
-			// A cursor that lost history is told the collection: the cell
-			// knows what a `Reset` is for its shape and the log does not.
+			// A cursor that lost history is told the collection: the cell knows
+			// what a `Reset` is for its shape and the log does not.
 			None => {
 				mut lost: List<SeqOp<T>> = [];
 				lost.push(SeqOp::Reset(self.elements.get()));
@@ -883,27 +876,27 @@ export impl ListCell<type T> with DeltaSource<List<T>, SeqOp<T>> {
 
 /// THE FIRST DERIVATIVE: `map g`, element-wise and incrementally.
 ///
-/// `map_each(source, g)` is `source.get().map(g)` kept up to date by running
-/// `g` once per element that ARRIVES or CHANGES, and zero times for anything
-/// else. Three pushes are three calls; a removal is none; a `Reset` — a
-/// wholesale `set`, or a cursor that fell behind the log — is the honest N.
+/// `map_each(source, g)` is `source.get().map(g)` kept up to date by running `g`
+/// once per element that ARRIVES or CHANGES, and zero times for anything else.
+/// Three pushes are three calls; a removal is none; a `Reset` — a wholesale `set`,
+/// or a cursor that fell behind the log — is the honest N.
 ///
 ///     let raw: ListCell<str> = ListCell<str>::new();
 ///     let parsed = map_each(raw, |text| text.parse_f64().unwrap_or(0f));
 ///     raw.push("10.5");   // `g` runs ONCE
 ///
-/// It takes any `S: DeltaSource<List<T>, SeqOp<T>>`, not a `ListCell`, so it
-/// serves a local cell, `std::rpc`'s `KeyedCell` and anything an app writes.
+/// It takes any `S: DeltaSource<List<T>, SeqOp<T>>`, not a `ListCell`, so it serves
+/// a local cell, `std::rpc`'s `KeyedCell` and anything an app writes.
 ///
-/// **Ownership.** A DERIVATION (A110 door 2): it publishes rather than acts, so
-/// an effect on the result reads it settled. The subscription is the ambient
-/// owner's like every other combinator's (A28), and the cursor goes with it —
-/// a disposed derivation stops pinning the source's history.
+/// **Ownership.** A DERIVATION (A110 door 2): it publishes rather than acts, so an
+/// effect on the result reads it settled. The subscription is the ambient owner's
+/// like every other combinator's (A28), and the cursor goes with it — a disposed
+/// derivation stops pinning the source's history.
 ///
-/// **Purity.** `g` runs once per element and its result is kept, so it must be
-/// pure IN THE ELEMENT: a `g` that reads another signal will not re-run when
-/// that signal changes. That is the same contract `map` has always had, made
-/// sharper by the fact that nothing re-runs it.
+/// **Purity.** `g` runs once per element and its result is kept, so it must be pure
+/// IN THE ELEMENT: a `g` that reads another signal will not re-run when that signal
+/// changes. That is the same contract `map` has always had, made sharper by the
+/// fact that nothing re-runs it.
 export fun map_each<T, U, S: DeltaSource<List<T>, SeqOp<T>>>(
 	source: S,
 	g: sync |T| U,
@@ -916,8 +909,8 @@ export fun map_each<T, U, S: DeltaSource<List<T>, SeqOp<T>>>(
 	let _owned = register_with_owner(source.on_change(|_published| {
 		for op in source.since(cursor) {
 			match op {
-				// The derivative of `map g`: what arrived, mapped. Nothing
-				// else is read, and `g` runs exactly `inserted.len()` times.
+				// The derivative of `map g`: what arrived, mapped. Nothing else is
+				// read, and `g` runs exactly `inserted.len()` times.
 				SeqOp::Splice(let at, let removed, let inserted) => {
 					out.splice(at, removed.len(), inserted.map(g)); // I5
 				},
@@ -925,8 +918,8 @@ export fun map_each<T, U, S: DeltaSource<List<T>, SeqOp<T>>>(
 				// The honest N: the collection became something else, so the
 				// derived collection does too.
 				SeqOp::Reset(let items) => out.set(items.map(g)),
-				// A reorder maps to a reorder — no element changed, so `g`
-				// runs zero times.
+				// A reorder maps to a reorder — no element changed, so `g` runs
+				// zero times.
 				SeqOp::Move(let from, let count, let to) => out.move_range(from, count, to),
 			}
 		}

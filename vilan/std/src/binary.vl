@@ -1,10 +1,10 @@
-// `std::binary` — the compact codec pair (transport-rpc.md §6.2): schema-
-// ordered, length-prefixed bytes over `std::bytes`. The shared Wire type IS
-// the schema, so structs write no field names or counts; lists write a `u32`
-// count then bare elements; enum variants write their tag as a length-prefixed
-// name (a numeric-index compaction is a later step); `Option` is one marker
-// byte. Little-endian throughout. A truncated or over-declared frame fails
-// sticky (`unexpected end of frame`) — validating decode, same as JSON's.
+// `std::binary` — the compact codec pair (transport-rpc.md §6.2): schema- ordered,
+// length-prefixed bytes over `std::bytes`. The shared Wire type IS the schema, so
+// structs write no field names or counts; lists write a `u32` count then bare
+// elements; enum variants write their tag as a length-prefixed name (a
+// numeric-index compaction is a later step); `Option` is one marker byte.
+// Little-endian throughout. A truncated or over-declared frame fails sticky
+// (`unexpected end of frame`) — validating decode, same as JSON's.
 
 import pkg::bytes::{ Bytes, data_view, decode_utf8, encode_utf8 };
 import pkg::option::Option::{ self, None, Some };
@@ -13,11 +13,11 @@ import pkg::wire::{ Codec, Deserialize, Deserializer, Frame, Serialize, Serializ
 
 // --- The write side ----------------------------------------------------------
 
-/// A growable byte sink: amortized-doubling buffer, `finish` slices to the
-/// written length.
+/// A growable byte sink: amortized-doubling buffer, `finish` slices to the written
+/// length.
 ///
-/// PLAIN FIELDS behind `&mut self` (A108) — see `json.vl`'s `JsonWriter` for
-/// why these two were `Shared` cells until the visitor's receivers moved.
+/// PLAIN FIELDS behind `&mut self` (A108) — see `json.vl`'s `JsonWriter` for why
+/// these two were `Shared` cells until the visitor's receivers moved.
 export struct BinaryWriter {
 	buffer: Bytes,
 	used: i32,
@@ -48,8 +48,8 @@ export impl BinaryWriter {
 		self.used = self.used + 1;
 	}
 
-	/// 4 bytes little-endian (i32 and u32 share the two's-complement bit
-	/// pattern; `set` stores `& 0xFF`, so bare shifts suffice).
+	/// 4 bytes little-endian (i32 and u32 share the two's-complement bit pattern;
+	/// `set` stores `& 0xFF`, so bare shifts suffice).
 	fun write_i32(&mut self, value: i32) {
 		self.write_byte(value);
 		self.write_byte(value >> 8);
@@ -93,8 +93,8 @@ export impl BinaryWriter {
 	}
 }
 
-// The visitor's write half, natively. Structure calls the schema already
-// carries (struct shape, list/variant ends) write nothing.
+// The visitor's write half, natively. Structure calls the schema already carries
+// (struct shape, list/variant ends) write nothing.
 export impl BinaryWriter with Serialize {
 	fun begin_struct(&mut self, fields: i32) {}
 
@@ -134,9 +134,9 @@ export impl BinaryWriter with Serialize {
 		self.write_u32(value);
 	}
 
-	/// Eight bytes, as the f64 bit pattern — the runtime's i53 IS an integral
-	/// f64 (exact to 2^53), so the round-trip is lossless for every
-	/// representable value.
+	/// Eight bytes, as the f64 bit pattern — the runtime's i53 IS an integral f64
+	/// (exact to 2^53), so the round-trip is lossless for every representable
+	/// value.
 	fun i53_value(&mut self, value: i53) {
 		self.write_f64(value.as_f64());
 	}
@@ -241,8 +241,8 @@ impl BinaryReader {
 		data_view(scratch.buffer()).read_f64(0, true)
 	}
 
-	/// A length prefix that must fit the remaining frame (each prefixed item is
-	/// at least one byte, so a larger claim is hostile or truncated).
+	/// A length prefix that must fit the remaining frame (each prefixed item is at
+	/// least one byte, so a larger claim is hostile or truncated).
 	fun read_length(&mut self): i32 {
 		let length = self.read_i32();
 		if length < 0 || self.cursor + length > self.bytes.len() {
@@ -265,15 +265,15 @@ impl BinaryReader {
 }
 
 // The visitor's read half, natively. `variant_tag` consumes the tag (so
-// `begin_variant` is a no-op — the mirror of the write side, where
-// `begin_variant` writes it); `is_null` peeks the Option marker and consumes
-// it only for `Some`, leaving `None`'s `0x00` for `null_value`.
-// EXPORTED deliberately, and B354 is the reason: a `[derive(Wire)]` visitor is
-// generated code, and its admitting file is the file the ATTRIBUTE was written
-// in - a USER's file, which cannot reach a private std block and cannot be asked
-// to write `#(impl BinaryReader)` for one. The Order 36 sweep exported these under
-// the sentinel rule; they stay exported under the right one. The plain blocks
-// above/below need no export: a derived body only ever calls the VISITOR methods.
+// `begin_variant` is a no-op — the mirror of the write side, where `begin_variant`
+// writes it); `is_null` peeks the Option marker and consumes it only for `Some`,
+// leaving `None`'s `0x00` for `null_value`. EXPORTED deliberately, and B354 is the
+// reason: a `[derive(Wire)]` visitor is generated code, and its admitting file is
+// the file the ATTRIBUTE was written in - a USER's file, which cannot reach a
+// private std block and cannot be asked to write `#(impl BinaryReader)` for one.
+// The Order 36 sweep exported these under the sentinel rule; they stay exported
+// under the right one. The plain blocks above/below need no export: a derived body
+// only ever calls the VISITOR methods.
 export impl BinaryReader with Deserialize {
 	fun begin_struct(&mut self) {}
 
@@ -295,12 +295,12 @@ export impl BinaryReader with Deserialize {
 
 	fun end_variant(&mut self) {}
 
-	/// The `Option` marker is `0x00` or `0x01` and NOTHING ELSE (N117): every
-	/// other byte used to read as "present", so a frame whose marker is `0x07`
-	/// decoded as a `Some` whose value starts one byte later — a shifted read
-	/// of whatever followed, silently, with `failed()` answering `None`. This
-	/// is the binary twin of the JSON reader's kind gate: a frame is not
-	/// trusted just because the schema says what should be at this offset.
+	/// The `Option` marker is `0x00` or `0x01` and NOTHING ELSE (N117): every other
+	/// byte used to read as "present", so a frame whose marker is `0x07` decoded as
+	/// a `Some` whose value starts one byte later — a shifted read of whatever
+	/// followed, silently, with `failed()` answering `None`. This is the binary
+	/// twin of the JSON reader's kind gate: a frame is not trusted just because the
+	/// schema says what should be at this offset.
 	fun is_null(&mut self): bool {
 		if !self.expect(1) {
 			ret false;
@@ -343,9 +343,9 @@ export impl BinaryReader with Deserialize {
 	}
 
 	/// A `bool` is `0x00` or `0x01` (N117), for `is_null`'s reason: the writer
-	/// emits exactly those two, so any other byte is a frame that disagrees
-	/// with the schema, and reading it as `true` is a coercion where the
-	/// contract asks for a refusal.
+	/// emits exactly those two, so any other byte is a frame that disagrees with
+	/// the schema, and reading it as `true` is a coercion where the contract asks
+	/// for a refusal.
 	fun bool_value(&mut self): bool {
 		let byte = self.read_byte();
 		if byte > 1 {
@@ -371,15 +371,15 @@ export fun encode_binary<T: Wire>(value: T): Bytes {
 	writer.finish()
 }
 
-/// Decode compact bytes as a `Wire` value; `Err(reason)` names the first
-/// structural failure (truncation, an over-declared length, unknown variant).
+/// Decode compact bytes as a `Wire` value; `Err(reason)` names the first structural
+/// failure (truncation, an over-declared length, unknown variant).
 ///
-/// A frame LONGER than the value it declares is a failure too (N117), and it is
-/// the binary twin of the JSON reader's unread-element check: the schema says
-/// how many bytes this type occupies, so bytes left over are bytes the two
-/// sides disagree about. Nothing legitimate produces them — `encode_binary`
-/// writes exactly one value — and reading a prefix of a frame as the whole of
-/// it is how a caller gets a value that was never sent.
+/// A frame LONGER than the value it declares is a failure too (N117), and it is the
+/// binary twin of the JSON reader's unread-element check: the schema says how many
+/// bytes this type occupies, so bytes left over are bytes the two sides disagree
+/// about. Nothing legitimate produces them — `encode_binary` writes exactly one
+/// value — and reading a prefix of a frame as the whole of it is how a caller gets
+/// a value that was never sent.
 export fun decode_binary<T: Wire>(bytes: Bytes): Result<T, str> {
 	mut reader = BinaryReader::new(bytes);
 	let value: T = T::rebuild(&mut reader);
@@ -393,12 +393,12 @@ export fun decode_binary<T: Wire>(bytes: Bytes): Result<T, str> {
 	}
 }
 
-/// The binary codec (§6.2): byte frames over the writer/reader pair. A text
-/// frame poisons the reader — a sticky decode error, never a crash.
+/// The binary codec (§6.2): byte frames over the writer/reader pair. A text frame
+/// poisons the reader — a sticky decode error, never a crash.
 ///
-/// The records are built here, over the `mut` local each arm mints, for the
-/// reason `json_codec` states: the visitor's state is in plain fields now, so
-/// the closures must capture the BINDING of the frame that owns it.
+/// The records are built here, over the `mut` local each arm mints, for the reason
+/// `json_codec` states: the visitor's state is in plain fields now, so the closures
+/// must capture the BINDING of the frame that owns it.
 export fun binary_codec(): Codec {
 	Codec {
 		writer = || {

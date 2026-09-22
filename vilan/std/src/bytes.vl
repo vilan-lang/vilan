@@ -1,7 +1,7 @@
 // `std::bytes` — byte buffers over the host `Uint8Array`
-// (proposal/bits-and-bytes.md §3): the binary codec's output/input and the
-// future WebSocket frame unit. `Uint8Array`, `TextEncoder`, and `TextDecoder`
-// exist in the browser, node, deno, and bun alike, so this is a core module.
+// (proposal/bits-and-bytes.md §3): the binary codec's output/input and the future
+// WebSocket frame unit. `Uint8Array`, `TextEncoder`, and `TextDecoder` exist in the
+// browser, node, deno, and bun alike, so this is a core module.
 
 // A byte buffer (the host `Uint8Array`). Fixed-length; build incrementally by
 // writing into an allocation, growing with `concat` when needed.
@@ -40,8 +40,8 @@ export impl Bytes {
 		out
 	}
 
-	/// Overwrite `from..to` (exclusive) with `value` — host semantics: the
-	/// stored byte is `value & 0xFF`.
+	/// Overwrite `from..to` (exclusive) with `value` — host semantics: the stored
+	/// byte is `value & 0xFF`.
 	[extern(method, "fill")]
 	external fun fill(self, value: i32, from: i32, to: i32): Bytes;
 
@@ -59,8 +59,8 @@ export impl Bytes {
 		let _ = self.fill(value, index, index + 1);
 	}
 
-	/// The same store `u32`-typed (the host coerces `& 0xFF` either way) — for
-	/// byte extraction done in `u32` arithmetic, mirroring `get_u32`.
+	/// The same store `u32`-typed (the host coerces `& 0xFF` either way) — for byte
+	/// extraction done in `u32` arithmetic, mirroring `get_u32`.
 	[extern(method, "fill")]
 	external fun fill_u32(self, value: u32, from: i32, to: i32): Bytes;
 
@@ -79,10 +79,10 @@ export impl Bytes {
 
 // --- Float access -----------------------------------------------------------
 
-/// The buffer under a `Bytes` (the host `ArrayBuffer`) and a `DataView` over it
-/// — the standard route to IEEE-754 bytes, used by the binary codec for `f64`.
-/// A `Bytes` produced by `slice`/`alloc` owns its whole buffer, so offset 0 of
-/// the view is offset 0 of the bytes.
+/// The buffer under a `Bytes` (the host `ArrayBuffer`) and a `DataView` over it —
+/// the standard route to IEEE-754 bytes, used by the binary codec for `f64`. A
+/// `Bytes` produced by `slice`/`alloc` owns its whole buffer, so offset 0 of the
+/// view is offset 0 of the bytes.
 export external struct ByteBuffer;
 
 export impl Bytes {
@@ -90,8 +90,8 @@ export impl Bytes {
 	external fun buffer(self): ByteBuffer;
 }
 
-/// A whole `ArrayBuffer` viewed as bytes (`new Uint8Array(buffer)`) — how a
-/// binary fetch response body becomes a `Bytes`.
+/// A whole `ArrayBuffer` viewed as bytes (`new Uint8Array(buffer)`) — how a binary
+/// fetch response body becomes a `Bytes`.
 export [extern(new, "Uint8Array")]
 external fun bytes_of_buffer(buffer: ByteBuffer): Bytes;
 
@@ -101,8 +101,8 @@ export [extern(new, "DataView")]
 external fun data_view(buffer: ByteBuffer): DataView;
 
 export impl DataView {
-	/// Read/write an IEEE-754 double at `offset`; `little_endian` selects the
-	/// byte order.
+	/// Read/write an IEEE-754 double at `offset`; `little_endian` selects the byte
+	/// order.
 	[extern(method, "getFloat64")]
 	external fun read_f64(self, offset: i32, little_endian: bool): f64;
 
@@ -113,8 +113,8 @@ export impl DataView {
 // --- UTF-8 ----------------------------------------------------------------
 
 /// The host `TextEncoder`/`TextDecoder` classes. The struct + constructor are
-/// exposed (not just the `encode_utf8`/`decode_utf8` shorthands) for streaming
-/// use — `std::fetch`'s chunked body reads decode with a long-lived decoder.
+/// exposed (not just the `encode_utf8`/`decode_utf8` shorthands) for streaming use
+/// — `std::fetch`'s chunked body reads decode with a long-lived decoder.
 external struct TextEncoder;
 
 [extern(new, "TextEncoder")]

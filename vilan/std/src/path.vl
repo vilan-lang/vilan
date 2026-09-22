@@ -1,6 +1,6 @@
-// `std::path` — path arithmetic over plain `str`, in pure vilan (kolt.local
-// 017). Three forks were open when this module was filed; each is settled
-// here, with the argument, because the answers shape every signature below.
+// `std::path` — path arithmetic over plain `str`, in pure vilan (kolt.local 017).
+// Three forks were open when this module was filed; each is settled here, with the
+// argument, because the answers shape every signature below.
 //
 // **Free functions over `str`, not a `Path` type.** `proposal/filesystem.md`
 // §9 states the seam this module lands against: `std::fs` "produces and
@@ -36,12 +36,12 @@
 // was given.
 //
 // **URL paths are out, and the seam is the query string.** They share the
-// `/`-separated core and nothing else: `extname("/app.js?v=2")` is `.js?v=2`
-// under a file rule and `.js` under a URL rule, `%2F` is not a separator, and
-// a URL's root is an origin rather than a filesystem root. So the split is
-// that a URL parser owns scheme/authority/query/fragment and hands its PATH
-// COMPONENT to the functions here — which is precisely what
-// `std::document`'s `file_name_of` does today, and why it can be two lines.
+// `/`-separated core and nothing else: `extname("/app.js?v=2")` is `.js?v=2` under
+// a file rule and `.js` under a URL rule, `%2F` is not a separator, and a URL's
+// root is an origin rather than a filesystem root. So the split is that a URL
+// parser owns scheme/authority/query/fragment and hands its PATH COMPONENT to the
+// functions here — which is precisely what `std::document`'s `file_name_of` does
+// today, and why it can be two lines.
 //
 // **Color: none.** This module is in std's base `root` layer, not
 // `src/process`, so it is seeded no platform (`std/vilan.toml`); every
@@ -57,10 +57,9 @@ export *;
 
 // --- the shape of a path ------------------------------------------------------
 
-/// Whether `path` starts at the root — the only structural distinction this
-/// module draws, and the one every other function branches on. A drive letter
-/// is NOT a root here (see the module header): `is_absolute("C:/x")` is
-/// `false`.
+/// Whether `path` starts at the root — the only structural distinction this module
+/// draws, and the one every other function branches on. A drive letter is NOT a
+/// root here (see the module header): `is_absolute("C:/x")` is `false`.
 fun is_absolute(path: str): bool {
 	path.starts_with("/")
 }
@@ -70,9 +69,9 @@ fun is_absolute(path: str): bool {
 /// `relative` and `starts_with`, kept in one place so those three cannot
 /// disagree about what a path IS.
 ///
-/// A leading `..` survives on a RELATIVE path (`../a` names something real
-/// and nothing here knows what) and is dropped on an ABSOLUTE one (the root's
-/// parent is the root — POSIX, and `/../a` is `/a`).
+/// A leading `..` survives on a RELATIVE path (`../a` names something real and
+/// nothing here knows what) and is dropped on an ABSOLUTE one (the root's parent is
+/// the root — POSIX, and `/../a` is `/a`).
 fun components(path: str): List<str> {
 	let rooted = is_absolute(path);
 	mut parts: List<str> = [];
@@ -95,8 +94,8 @@ fun components(path: str): List<str> {
 }
 
 /// The components concatenated with `/` between them — no leading or trailing
-/// separator. (`std::display`'s `List::join` would do this; taking it would
-/// put this module on the `display` chain for one loop, so it does not.)
+/// separator. (`std::display`'s `List::join` would do this; taking it would put
+/// this module on the `display` chain for one loop, so it does not.)
 fun joined(parts: List<str>): str {
 	mut result = "";
 	mut first = true;
@@ -118,9 +117,9 @@ fun joined(parts: List<str>): str {
 /// so a `..` is cancelled against the name before it even when that name is a
 /// symlink pointing elsewhere.
 ///
-/// `""` normalizes to `"."`, and `"/"` to `"/"`. A `..` that would climb above
-/// an absolute root is dropped, because the root's parent is the root; a
-/// leading `..` on a relative path is kept, because it means something.
+/// `""` normalizes to `"."`, and `"/"` to `"/"`. A `..` that would climb above an
+/// absolute root is dropped, because the root's parent is the root; a leading `..`
+/// on a relative path is kept, because it means something.
 ///
 /// **Trailing separators go, and node's `path.normalize` keeps them.** That is
 /// the one deliberate divergence in this module and it is the point of the
@@ -141,15 +140,14 @@ fun normalize(path: str): str {
 }
 
 /// `base` and `part` joined with a separator and normalized. An empty side
-/// contributes nothing, so `join("", "a")` is `"a"` — it does NOT become
-/// absolute.
+/// contributes nothing, so `join("", "a")` is `"a"` — it does NOT become absolute.
 ///
 /// **An absolute `part` does not reset the result** — `join("/a", "/b")` is
-/// `"/a/b"`. That is node's split between `join` and `resolve` and it is the
-/// right one: `join` is textual, the caller who wants "…unless the second one
-/// is already absolute" is asking a question about REFERENCES and wants
-/// `resolve`, and a `join` that silently discarded its first argument would
-/// be a directory-traversal primitive wearing a concatenation's name.
+/// `"/a/b"`. That is node's split between `join` and `resolve` and it is the right
+/// one: `join` is textual, the caller who wants "…unless the second one is already
+/// absolute" is asking a question about REFERENCES and wants `resolve`, and a
+/// `join` that silently discarded its first argument would be a directory-traversal
+/// primitive wearing a concatenation's name.
 fun join(base: str, part: str): str {
 	if base.is_empty() {
 		normalize(part)
@@ -160,9 +158,8 @@ fun join(base: str, part: str): str {
 	}
 }
 
-/// Every element of `parts` joined left to right — `join`'s n-ary form, since
-/// vilan has no variadics. An empty list joins to `"."`, matching
-/// `normalize("")`.
+/// Every element of `parts` joined left to right — `join`'s n-ary form, since vilan
+/// has no variadics. An empty list joins to `"."`, matching `normalize("")`.
 fun join_all(parts: List<str>): str {
 	mut result = "";
 	for part in parts {
@@ -175,17 +172,16 @@ fun join_all(parts: List<str>): str {
 	}
 }
 
-/// The path `path` names when read as a reference relative to `base`: `base`
-/// joined with it, unless `path` is already absolute, in which case `base` is
-/// not consulted at all.
+/// The path `path` names when read as a reference relative to `base`: `base` joined
+/// with it, unless `path` is already absolute, in which case `base` is not
+/// consulted at all.
 ///
 /// **`base` is explicit and there is no default**, which is where this parts
-/// company with node's `path.resolve`: that one falls back to
-/// `process.cwd()`, and a working directory is a host fact — taking it would
-/// have colored this whole module `@process` for one function's convenience.
-/// The result is absolute exactly when `base` is (or `path` is). A caller who
-/// means "against the working directory" reaches for the cwd itself and
-/// passes it.
+/// company with node's `path.resolve`: that one falls back to `process.cwd()`, and
+/// a working directory is a host fact — taking it would have colored this whole
+/// module `@process` for one function's convenience. The result is absolute exactly
+/// when `base` is (or `path` is). A caller who means "against the working
+/// directory" reaches for the cwd itself and passes it.
 fun resolve(base: str, path: str): str {
 	if is_absolute(path) {
 		normalize(path)
@@ -195,10 +191,9 @@ fun resolve(base: str, path: str): str {
 }
 
 /// The last component of `path`, with any trailing separators ignored:
-/// `basename("/a/b.txt")` is `"b.txt"` and `basename("/a/b/")` is `"b"`.
-/// Lexical, like the rest of the module — `basename("a/..")` is `".."`, not
-/// `"a"`'s parent. The root and the empty path have no last component, so
-/// both give `""`.
+/// `basename("/a/b.txt")` is `"b.txt"` and `basename("/a/b/")` is `"b"`. Lexical,
+/// like the rest of the module — `basename("a/..")` is `".."`, not `"a"`'s parent.
+/// The root and the empty path have no last component, so both give `""`.
 fun basename(path: str): str {
 	mut end = path.len();
 	for end > 0 && path.substring(end - 1, end) == "/" {
@@ -211,20 +206,20 @@ fun basename(path: str): str {
 	path.substring(start, end)
 }
 
-/// Everything before `path`'s last component: `dirname("/a/b.txt")` is
-/// `"/a"`, `dirname("/a")` and `dirname("/")` are both `"/"`, and a path with
-/// no separator at all has parent `"."` (`dirname("a")`, `dirname("")`).
-/// Trailing separators are ignored first, so `dirname("a/b/")` is `"a"`.
-/// Lexical: `dirname("/../a")` is `"/.."`, the text before the last
-/// component, not the directory that path would resolve to.
+/// Everything before `path`'s last component: `dirname("/a/b.txt")` is `"/a"`,
+/// `dirname("/a")` and `dirname("/")` are both `"/"`, and a path with no separator
+/// at all has parent `"."` (`dirname("a")`, `dirname("")`). Trailing separators are
+/// ignored first, so `dirname("a/b/")` is `"a"`. Lexical: `dirname("/../a")` is
+/// `"/.."`, the text before the last component, not the directory that path would
+/// resolve to.
 fun dirname(path: str): str {
 	mut end = path.len();
 	for end > 0 && path.substring(end - 1, end) == "/" {
 		end -= 1;
 	}
 	if end == 0 {
-		// Empty, or nothing but separators — the two cases with no last
-		// component to remove, and they answer differently.
+		// Empty, or nothing but separators — the two cases with no last component
+		// to remove, and they answer differently.
 		ret if path.is_empty() { "." } else { "/" };
 	}
 	mut cut = end;
@@ -251,15 +246,14 @@ fun dirname(path: str): str {
 /// `extname("index.html")` is `".html"` — or `""` when it has none.
 ///
 /// **A dotfile has no extension.** `extname(".gitignore")` is `""`, not
-/// `".gitignore"`: the leading dot marks the file as hidden, it does not name
-/// a type, and the wrong answer here is the single most common bug in
-/// hand-rolled path code. `"."` and `".."` likewise have none. Only the LAST
-/// dot counts (`extname("a.b.c")` is `".c"`), a trailing dot is an empty
-/// extension spelled `"."` (`extname("file.")`), and a dot in a DIRECTORY
-/// name is invisible from here (`extname("a.b/c")` is `""`) because the
-/// question is about the file. These are node's `path.extname` answers, case
-/// by case; the divergences in this module are elsewhere and deliberate, and
-/// this is not a place to be original.
+/// `".gitignore"`: the leading dot marks the file as hidden, it does not name a
+/// type, and the wrong answer here is the single most common bug in hand-rolled
+/// path code. `"."` and `".."` likewise have none. Only the LAST dot counts
+/// (`extname("a.b.c")` is `".c"`), a trailing dot is an empty extension spelled
+/// `"."` (`extname("file.")`), and a dot in a DIRECTORY name is invisible from here
+/// (`extname("a.b/c")` is `""`) because the question is about the file. These are
+/// node's `path.extname` answers, case by case; the divergences in this module are
+/// elsewhere and deliberate, and this is not a place to be original.
 fun extname(path: str): str {
 	let name = basename(path);
 	if name == "." || name == ".." {
@@ -275,9 +269,9 @@ fun extname(path: str): str {
 	""
 }
 
-/// `basename` without `extname` — the file's name with its type suffix
-/// removed. `stem("/a/b.txt")` is `"b"`, and `stem(".gitignore")` is
-/// `".gitignore"` because that file has no extension to remove.
+/// `basename` without `extname` — the file's name with its type suffix removed.
+/// `stem("/a/b.txt")` is `"b"`, and `stem(".gitignore")` is `".gitignore"` because
+/// that file has no extension to remove.
 ///
 /// `stem(p) + extname(p) == basename(p)` holds for every `p`, by
 /// construction: the two functions cut one string at one index.
@@ -287,15 +281,15 @@ fun stem(path: str): str {
 	name.substring(0, name.len() - extension.len())
 }
 
-/// Whether `path` is `prefix` or lies under it, compared **component by
-/// component** on the normalized forms.
+/// Whether `path` is `prefix` or lies under it, compared **component by component**
+/// on the normalized forms.
 ///
-/// This is the path-aware sibling of `str::starts_with`, and it exists
-/// because the `str` one is wrong for paths in a way that is easy to ship:
+/// This is the path-aware sibling of `str::starts_with`, and it exists because the
+/// `str` one is wrong for paths in a way that is easy to ship:
 /// `"/a/bc".starts_with("/a/b")` is `true` on the text and false about the
-/// filesystem — `/a/bc` is not inside `/a/b`. Deriving a key or an asset URL
-/// by cutting a textual prefix is the same mistake in the other direction.
-/// Comparison is exact, never case-folded (module header).
+/// filesystem — `/a/bc` is not inside `/a/b`. Deriving a key or an asset URL by
+/// cutting a textual prefix is the same mistake in the other direction. Comparison
+/// is exact, never case-folded (module header).
 fun starts_with(path: str, prefix: str): bool {
 	if is_absolute(path) != is_absolute(prefix) {
 		ret false;
@@ -315,22 +309,21 @@ fun starts_with(path: str, prefix: str): bool {
 	true
 }
 
-/// The part of `path` that lies under `prefix`, or `None` when it does not
-/// lie under it at all — `starts_with` tests, this one cuts, exactly as
-/// `str::starts_with` and `str::strip_prefix` divide the same work on text.
-/// A path stripped of the whole of itself is `Some(".")`, the same answer
-/// `relative` gives for a path to itself.
+/// The part of `path` that lies under `prefix`, or `None` when it does not lie
+/// under it at all — `starts_with` tests, this one cuts, exactly as
+/// `str::starts_with` and `str::strip_prefix` divide the same work on text. A path
+/// stripped of the whole of itself is `Some(".")`, the same answer `relative` gives
+/// for a path to itself.
 ///
-/// This is the verb that derives a key or a URL from a file and a root, and
-/// it is a distinct function from `relative` on purpose: `relative` always
-/// has an answer for two paths under one root and will happily climb with
-/// `..` to reach it, which is the wrong shape for "is this mine, and if so
-/// what do I call it". `str::strip_prefix` is the wrong tool for either —
-/// `"/a/bc".strip_prefix("/a/b")` is `Some("c")` and `/a/bc` is not inside
-/// `/a/b`.
+/// This is the verb that derives a key or a URL from a file and a root, and it is a
+/// distinct function from `relative` on purpose: `relative` always has an answer
+/// for two paths under one root and will happily climb with `..` to reach it, which
+/// is the wrong shape for "is this mine, and if so what do I call it".
+/// `str::strip_prefix` is the wrong tool for either —
+/// `"/a/bc".strip_prefix("/a/b")` is `Some("c")` and `/a/bc` is not inside `/a/b`.
 ///
-/// There is deliberately no path `strip_suffix`: the only trailing affix a
-/// path commonly carries is a file extension, and removing that is `stem`.
+/// There is deliberately no path `strip_suffix`: the only trailing affix a path
+/// commonly carries is a file extension, and removing that is `stem`.
 fun strip_prefix(path: str, prefix: str): Option<str> {
 	if !starts_with(path, prefix) {
 		ret None;
@@ -350,17 +343,17 @@ fun strip_prefix(path: str, prefix: str): Option<str> {
 	}
 }
 
-/// The relative path that reaches `to` when read from the directory `from` —
-/// the inverse of `resolve`, so `resolve(from, relative(from, to))` is
-/// `normalize(to)`. A path to itself is `"."`.
+/// The relative path that reaches `to` when read from the directory `from` — the
+/// inverse of `resolve`, so `resolve(from, relative(from, to))` is `normalize(to)`.
+/// A path to itself is `"."`.
 ///
-/// `None` when the question has no lexical answer, which is two cases and
-/// both are real: `from` and `to` disagree about being absolute (nothing here
-/// knows a working directory to bridge them with), or `from` still begins
-/// with `..` after the common prefix is removed (climbing out of an unknown
-/// place, so what is above it is unknown too). An `Option` rather than a
-/// best-effort string for `str::strip_prefix`'s reason — "there is no answer"
-/// and "the answer is `.`" are different, and a bare `str` cannot say both.
+/// `None` when the question has no lexical answer, which is two cases and both are
+/// real: `from` and `to` disagree about being absolute (nothing here knows a
+/// working directory to bridge them with), or `from` still begins with `..` after
+/// the common prefix is removed (climbing out of an unknown place, so what is above
+/// it is unknown too). An `Option` rather than a best-effort string for
+/// `str::strip_prefix`'s reason — "there is no answer" and "the answer is `.`" are
+/// different, and a bare `str` cannot say both.
 fun relative(from: str, to: str): Option<str> {
 	if is_absolute(from) != is_absolute(to) {
 		ret None;

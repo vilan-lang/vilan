@@ -29,8 +29,8 @@ impl Result<type T, type E> with Try<T, E> {
 	}
 }
 
-// `?.` on a `Result` maps `Ok` (or flattens a `Result`-yielding chain, same
-// error type); `Err` short-circuits.
+// `?.` on a `Result` maps `Ok` (or flattens a `Result`-yielding chain, same error
+// type); `Err` short-circuits.
 impl Result<type T, type E> with Lift {}
 
 impl Result<type T, type E> {
@@ -86,9 +86,9 @@ impl Result<type T, type E> {
 		}
 	}
 
-	/// `fallback` is `lazy` (proposal/lazy.md §6b): it is evaluated on the
-	/// `Err` path only, at most once. `unwrap_or_else` remains the explicit
-	/// spelling, and is the one that sees the error.
+	/// `fallback` is `lazy` (proposal/lazy.md §6b): it is evaluated on the `Err`
+	/// path only, at most once. `unwrap_or_else` remains the explicit spelling, and
+	/// is the one that sees the error.
 	fun unwrap_or(self, lazy fallback: T): T {
 		match self {
 			Ok(let x) => x,
@@ -103,9 +103,9 @@ impl Result<type T, type E> {
 		}
 	}
 
-	/// `message` is `lazy` (proposal/lazy.md §6b): the text is BUILT on the
-	/// `Err` path only, so `res.expect(i"no row for {key}")` costs nothing when
-	/// the row is there.
+	/// `message` is `lazy` (proposal/lazy.md §6b): the text is BUILT on the `Err`
+	/// path only, so `res.expect(i"no row for {key}")` costs nothing when the row
+	/// is there.
 	fun expect(self, lazy message: str): T {
 		match self {
 			Ok(let x) => x,
@@ -113,12 +113,12 @@ impl Result<type T, type E> {
 		}
 	}
 
-	/// `message` is `lazy` (proposal/lazy.md §6b), the same position and the
-	/// same argument shape `expect` carries — here the text is BUILT on the
-	/// `Ok` path only, because that is the path that panics. The asymmetry this
-	/// closes was a trap: `expect`, `unwrap_or` and both of `Option`'s twins
-	/// were retrofitted and this one was not, so the cost of the message
-	/// depended on which of two neighbouring methods you reached for (A109).
+	/// `message` is `lazy` (proposal/lazy.md §6b), the same position and the same
+	/// argument shape `expect` carries — here the text is BUILT on the `Ok` path
+	/// only, because that is the path that panics. The asymmetry this closes was a
+	/// trap: `expect`, `unwrap_or` and both of `Option`'s twins were retrofitted
+	/// and this one was not, so the cost of the message depended on which of two
+	/// neighbouring methods you reached for (A109).
 	fun expect_err(self, lazy message: str): E {
 		match self {
 			Err(let e) => e,

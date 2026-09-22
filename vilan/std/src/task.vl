@@ -5,11 +5,11 @@
 /// copying it refers to the same task — there are no Vilan-level fields or
 /// constructors; a task only ever arises from `async`.
 ///
-/// Every task absorbs its own failure at construction: a task whose
-/// computation panics never becomes a host "unhandled rejection". A later
-/// `await` still receives the failure; if nothing ever observes the task —
-/// no `await`, no enclosing nursery — the error is reported to the host
-/// console with the task's spawn origin, and the program continues.
+/// Every task absorbs its own failure at construction: a task whose computation
+/// panics never becomes a host "unhandled rejection". A later `await` still
+/// receives the failure; if nothing ever observes the task — no `await`, no
+/// enclosing nursery — the error is reported to the host console with the task's
+/// spawn origin, and the program continues.
 
 import pkg::context::Context;
 import pkg::drop::Drop;
@@ -27,47 +27,47 @@ export impl Task<type T> {
 	[extern("Promise.all")]
 	async external fun settle_all(tasks: List<Task<T>>): List<T>;
 
-	/// First settled wins: yields the first task to settle — its value, or
-	/// its failure. The losers keep running; inside a nursery, follow with
-	/// `n.cancel()` to abort their in-flight work (the race idiom).
+	/// First settled wins: yields the first task to settle — its value, or its
+	/// failure. The losers keep running; inside a nursery, follow with `n.cancel()`
+	/// to abort their in-flight work (the race idiom).
 	[extern("Promise.race")]
 	async external fun race(tasks: List<Task<T>>): T;
 }
 
 // === Nurseries (structured concurrency) =====================================
 
-/// The handle a `nursery` body receives: cancel the whole extent, or check
-/// for cancellation from a compute loop.
+/// The handle a `nursery` body receives: cancel the whole extent, or check for
+/// cancellation from a compute loop.
 export external struct Nursery;
 
 /// A host `AbortSignal` that fires when a nursery cancels. std's IO wrappers
-/// (`sleep`, `fetch`) pass the ambient one to the host operation, so
-/// cancellation genuinely aborts in-flight IO — the structural bridge.
+/// (`sleep`, `fetch`) pass the ambient one to the host operation, so cancellation
+/// genuinely aborts in-flight IO — the structural bridge.
 export external struct CancelSignal;
 
 export impl Nursery {
-	/// Cancel the nursery: aborts its signal, so every in-flight host
-	/// operation in the extent rejects promptly and pending children die at
-	/// their next IO. Cancellation is absorbed at the join — it never wins
-	/// as the nursery's error. The body's own execution is not preempted:
-	/// code after `cancel()` runs, and the body's value is still returned.
+	/// Cancel the nursery: aborts its signal, so every in-flight host operation in
+	/// the extent rejects promptly and pending children die at their next IO.
+	/// Cancellation is absorbed at the join — it never wins as the nursery's error.
+	/// The body's own execution is not preempted: code after `cancel()` runs, and
+	/// the body's value is still returned.
 	[extern(method, "cancel")]
 	external fun cancel(self);
 
 	/// Whether this nursery has been cancelled (its own `cancel`, a parent
-	/// nursery's, or the first error's abort) — the check for pure-compute
-	/// loops that never touch IO.
+	/// nursery's, or the first error's abort) — the check for pure-compute loops
+	/// that never touch IO.
 	[extern(method, "is_cancelled")]
 	external fun is_cancelled(self): bool;
 
-	/// The nursery's cancel signal, for handing to abortable host APIs
-	/// directly. std's IO wrappers already do (`ambient_signal`).
+	/// The nursery's cancel signal, for handing to abortable host APIs directly.
+	/// std's IO wrappers already do (`ambient_signal`).
 	[extern(method, "signal_of")]
 	external fun signal(self): CancelSignal;
 }
 
-/// The ambient nursery's cancel signal, if any — read this to bridge an
-/// abortable host API that std doesn't wrap.
+/// The ambient nursery's cancel signal, if any — read this to bridge an abortable
+/// host API that std doesn't wrap.
 export fun ambient_signal(): Option<CancelSignal> {
 	match ambient_nursery.get_safe() {
 		Some(let n) => Some(n.signal()),
@@ -82,28 +82,27 @@ export fun ambient_signal(): Option<CancelSignal> {
 /// the name exists for the compiler and the IO wrappers, not for user code.
 export let ambient_nursery: Context<Nursery> = Context::new();
 
-/// Creation chains cancellation: a child nursery's signal fires when its
-/// parent's does, so cancelling an outer nursery reaches the IO of every
-/// nursery nested in its extent.
+/// Creation chains cancellation: a child nursery's signal fires when its parent's
+/// does, so cancelling an outer nursery reaches the IO of every nursery nested in
+/// its extent.
 [extern("__nursery_new")]
 external fun __nursery_new(parent: Option<Nursery>): Nursery;
 
 /// The join machinery (a runtime helper): runs the body, then waits for every
-/// registered task — the list may keep growing while it drains (children may
-/// spawn grandchildren). On a failure it applies the first-observed rule: a
-/// body throw wins; otherwise the earliest-settled child rejection. The
-/// remaining children are absorbed (observed, results discarded — no late
-/// reports), and the winner re-raises here with its spawn origin.
+/// registered task — the list may keep growing while it drains (children may spawn
+/// grandchildren). On a failure it applies the first-observed rule: a body throw
+/// wins; otherwise the earliest-settled child rejection. The remaining children are
+/// absorbed (observed, results discarded — no late reports), and the winner
+/// re-raises here with its spawn origin.
 [extern("__nursery_run")]
 async external fun __nursery_run<T>(n: Nursery, body: async || T): T;
 
-/// Run `body` with a nursery: every task spawned in its dynamic extent —
-/// directly or by anything it calls — is joined before `nursery` returns.
-/// The nursery's value is the body's value; it returns only when the body
-/// AND every spawned task have settled. If the body throws, or any task
-/// fails, the first-observed failure re-raises from the `nursery` call once
-/// the rest are absorbed. Free-floating spawns outside any nursery keep
-/// their unstructured behavior.
+/// Run `body` with a nursery: every task spawned in its dynamic extent — directly
+/// or by anything it calls — is joined before `nursery` returns. The nursery's
+/// value is the body's value; it returns only when the body AND every spawned task
+/// have settled. If the body throws, or any task fails, the first-observed failure
+/// re-raises from the `nursery` call once the rest are absorbed. Free-floating
+/// spawns outside any nursery keep their unstructured behavior.
 export fun nursery<T>(body: (|Nursery| T) context ambient_nursery): T {
 	let n = __nursery_new(ambient_nursery.get_safe());
 	ambient_nursery.run(n, || __nursery_run(n, || body(n)))
@@ -120,13 +119,12 @@ export fun nursery<T>(body: (|Nursery| T) context ambient_nursery): T {
 [extern("__nursery_new_detached")]
 external fun __nursery_new_detached(): Nursery;
 
-/// `OwnedNursery` — the resource-owner story for background work. It owns the
-/// tasks spawned inside `enter` for as long as it lives; dropping it (at scope
-/// end, or via `drop(owner)`) cancels them, so in-flight bridged IO aborts and
-/// pending children die at their next suspension. This is the owner for
-/// object-lifetime spawns that no function-scoped `nursery` can hold. The
-/// wrapped `Nursery` stays data (it is the ambient handle); ownership lives
-/// only in this wrapper.
+/// `OwnedNursery` — the resource-owner story for background work. It owns the tasks
+/// spawned inside `enter` for as long as it lives; dropping it (at scope end, or
+/// via `drop(owner)`) cancels them, so in-flight bridged IO aborts and pending
+/// children die at their next suspension. This is the owner for object-lifetime
+/// spawns that no function-scoped `nursery` can hold. The wrapped `Nursery` stays
+/// data (it is the ambient handle); ownership lives only in this wrapper.
 export resource struct OwnedNursery {
 	nursery: Nursery,
 }
@@ -147,9 +145,9 @@ export impl OwnedNursery {
 		ambient_nursery.run(self.nursery, body)
 	}
 
-	/// Cancel every in-flight owned task now — early, idempotent teardown.
-	/// `drop` does the same at scope end; calling both is safe (the second
-	/// abort is a no-op).
+	/// Cancel every in-flight owned task now — early, idempotent teardown. `drop`
+	/// does the same at scope end; calling both is safe (the second abort is a
+	/// no-op).
 	fun cancel(&self) {
 		self.nursery.cancel();
 	}

@@ -363,27 +363,43 @@ lines. A package can opt into re-filling them:
 ```toml
 [fmt]
 wrap_comments = true
+comment_width = 84
 ```
 
 It re-fills a *paragraph* — a run of `//` (or `///`) lines with nothing but a
-newline between them — to the same width the code is laid out to, at that
-comment's own indentation. A blank `//` line is a paragraph break and stays
-one. The key is read from the nearest `vilan.toml` above the file, so a
-workspace can set it once and a member override it; unset means off, and with
-it off `vilan fmt` is byte-for-byte what it was.
+newline between them — to `comment_width` columns, at that comment's own
+indentation. A blank `//` line is a paragraph break and stays one. Both keys
+are read from the nearest `vilan.toml` above the file, each on its own, so a
+workspace can set the width once and a member turn the wrapping off; unset
+means off, and with it off `vilan fmt` is byte-for-byte what it was.
 
-What it never touches, because re-wrapping these destroys something: fenced
-code blocks; list items (an item is a line, and joining two makes
-one); tables; headings; block quotes; a line with an interior run of two or
-more spaces (aligned columns, an ASCII drawing); section banners and
+**`comment_width` is prose's own width, and it defaults to the code width**
+(100). Code has one canonical layout and no knob; comments are yours, and a
+tree whose prose is written narrower than its code — std's is written to 84 —
+would otherwise be re-filled to a width nobody chose the day it opted in. The
+key is read only when `wrap_comments` is on: with the knob off nothing is
+re-laid-out at any width.
+
+**Ten classes are never re-filled**, because re-wrapping them destroys
+something: fenced code blocks; list items (an item is a line, and joining two
+makes one); tables; headings; block quotes; a line with an interior run of two
+or more spaces (aligned columns, an ASCII drawing); section banners and
 horizontal rules (`// --- Placement ---`); toolchain directives such as
-`// witness:`; commented-out code; license headers; and a trailing comment
-after code. A URL or a `` `code span` `` longer than the width is never
-*broken* — it takes a line of its own and runs over, the way any unbreakable
-word does. No character is ever substituted: the fill moves whitespace between
-words and does nothing else, and it checks that afterwards. If a re-fill ever
-came out with different words, `vilan fmt` declines the file (exit 2) and
-names the comment rather than writing it.
+`// witness:`; commented-out code; and license headers. A trailing comment
+after code is not re-filled either — it is not a paragraph, it is a note on a
+line. A URL or a `` `code span` `` longer than the width is never *broken* —
+it takes a line of its own and runs over, the way any unbreakable word does.
+No character is ever substituted: the fill moves whitespace between words and
+does nothing else, and it checks that afterwards. If a re-fill ever came out
+with different words, `vilan fmt` declines the file (exit 2) and names the
+comment rather than writing it.
+
+**So `wrap_comments = true` does not mean "no comment over the budget."** A
+paragraph in any of those ten classes keeps every column its author gave it, a
+hanging-indent list stays as deep and as long as it was written, and an
+unbreakable word runs past the width on a line of its own. The key says the
+formatter *may* re-fill ordinary prose, not that a grep for long lines will
+come back empty.
 
 **Three outcomes, three exit codes.** `0` is clean. `1` is "this tree is not
 formatted" — `--check` found files that would change, or a write failed. `2` is

@@ -1,18 +1,17 @@
-// `std::document` — the HTML document a browser leg is loaded by, held against
-// what that leg's build emitted (`fullstack-dx.md` §5.5–§5.6, RATIFIED
-// 2026-08-11).
+// `std::document` — the HTML document a browser leg is loaded by, held against what
+// that leg's build emitted (`fullstack-dx.md` §5.5–§5.6, RATIFIED 2026-08-11).
 //
 // The founding bug: a shell that linked no stylesheet, over a build that emitted
 // one. Nothing failed. The page rendered — unstyled, and correct-looking — and
-// shipped. It is one of a family (§5.1's F1–F6) that share a single root, *a
-// fact the build knew, restated by hand in an HTML file, with nothing comparing
-// the two copies*: a `<link>` for a stylesheet that no longer exists, a
-// `<script src>` naming a leg that was renamed, a mount `<div id>` that drifted
-// from `mount_root(id, …)`, a `type="module"` over a leg that splits. Every one
-// of them is silent today, and the loudest of them costs one console line.
+// shipped. It is one of a family (§5.1's F1–F6) that share a single root, *a fact
+// the build knew, restated by hand in an HTML file, with nothing comparing the two
+// copies*: a `<link>` for a stylesheet that no longer exists, a `<script src>`
+// naming a leg that was renamed, a mount `<div id>` that drifted from
+// `mount_root(id, …)`, a `type="module"` over a leg that splits. Every one of them
+// is silent today, and the loudest of them costs one console line.
 //
-// `std::build` made the build's own knowledge reachable (`LegBuild`). This
-// module compares a document against it.
+// `std::build` made the build's own knowledge reachable (`LegBuild`). This module
+// compares a document against it.
 //
 // **Validation is the primitive; generation is sugar over it** (§5.6). A
 // generator only protects documents it generated, and the person who most needs
@@ -42,39 +41,37 @@ import pkg::result::Result::{ self, Err, Ok };
 import pkg::ui;
 import pkg::ui::{ View, escape_attribute, escape_text };
 
-/// The mount element's id when nothing says otherwise — what every shell in
-/// this tree uses, and the other end of `mount_root("app", …)`.
+/// The mount element's id when nothing says otherwise — what every shell in this
+/// tree uses, and the other end of `mount_root("app", …)`.
 let default_mount: str = "app";
 
-/// What is wrong between a document and the build it loads. Each variant is one
-/// of `fullstack-dx.md` §5.1's failures, and each was silent before this check
+/// What is wrong between a document and the build it loads. Each variant is one of
+/// `fullstack-dx.md` §5.1's failures, and each was silent before this check
 /// existed.
 ///
-/// The payload is always the thing the fault is ABOUT — the file the build
-/// emitted, or the url the document named — so a report can quote it back.
+/// The payload is always the thing the fault is ABOUT — the file the build emitted,
+/// or the url the document named — so a report can quote it back.
 export enum ShellFault {
 	/// The build emitted styles and the document links no stylesheet (F1) — the
 	/// owner's own bug, and the reason this module exists. The payload is the
 	/// sidecar the build wrote.
 	StylesNotLinked(str),
-	/// The document links a stylesheet in this leg's namespace that the build
-	/// did not emit (F2) — what deleting the last `const style()` leaves
-	/// behind. The payload is the `href`.
+	/// The document links a stylesheet in this leg's namespace that the build did
+	/// not emit (F2) — what deleting the last `const style()` leaves behind. The
+	/// payload is the `href`.
 	LinkedStyleMissing(str),
-	/// The document loads a script in this leg's namespace that the build did
-	/// not emit (F3) — a chunk that stopped being written, a bundle under an
-	/// old name. The payload is the `src`.
+	/// The document loads a script in this leg's namespace that the build did not
+	/// emit (F3) — a chunk that stopped being written, a bundle under an old name.
+	/// The payload is the `src`.
 	ScriptNotEmitted(str),
 	/// This build's bundle is loaded by no `<script>` in the document (F3): the
 	/// page ships without its own application. The payload is the bundle.
 	BundleNotLoaded(str),
 	/// No element carries the id the client mounts into (F4) — the failure that
-	/// reads as `Cannot read properties of null` at boot. The payload is the
-	/// id.
+	/// reads as `Cannot read properties of null` at boot. The payload is the id.
 	MountMissing(str),
-	/// The leg splits and its bundle is loaded as a module script (F6), so
-	/// chunk resolution will miss on every nested route. The payload is the
-	/// bundle.
+	/// The leg splits and its bundle is loaded as a module script (F6), so chunk
+	/// resolution will miss on every nested route. The payload is the bundle.
 	ModuleScriptWithChunks(str),
 }
 
@@ -82,9 +79,8 @@ export impl ShellFault {
 	/// One line: what is wrong, and what to do about it.
 	///
 	/// The document's own name is deliberately not in here — a fault is about
-	/// MARKUP, and markup arrives from anywhere — so a caller that knows where
-	/// its markup came from says so itself (`require_shell` names the file it
-	/// read).
+	/// MARKUP, and markup arrives from anywhere — so a caller that knows where its
+	/// markup came from says so itself (`require_shell` names the file it read).
 	fun message(self): str {
 		match self {
 			ShellFault::StylesNotLinked(let file) => i"the build emitted the stylesheet {file} and this document links no stylesheet — add `<link rel=\"stylesheet\" href=\"/{file}\" />` inside <head>",
@@ -104,14 +100,13 @@ export impl ShellFault {
 /// order is fixed (styles, scripts, mount), so two runs over the same shell
 /// report the same list.
 ///
-/// What it checks is what a build KNOWS, which is also what bounds it. This
-/// leg's artifacts are `<leg>.js`, `<leg>.css` and `<leg>.<Arm>.js`: the leg's
-/// last build owns that namespace (`bundle-splitting.md` Appendix A), so a
-/// document loading `<leg>.…` files this build did not emit is loading its own
-/// stale output and is told so. A `/theme.css` the application serves itself is
-/// outside the namespace and outside this check's knowledge — it says nothing
-/// about it, which is the only honest answer and the one that keeps a refusal
-/// to boot sound.
+/// What it checks is what a build KNOWS, which is also what bounds it. This leg's
+/// artifacts are `<leg>.js`, `<leg>.css` and `<leg>.<Arm>.js`: the leg's last build
+/// owns that namespace (`bundle-splitting.md` Appendix A), so a document loading
+/// `<leg>.…` files this build did not emit is loading its own stale output and is
+/// told so. A `/theme.css` the application serves itself is outside the namespace
+/// and outside this check's knowledge — it says nothing about it, which is the only
+/// honest answer and the one that keeps a refusal to boot sound.
 export fun check_shell(shell: str, build: LegBuild, mount: str): Result<void, List<ShellFault>> {
 	mut stylesheets: List<str> = [];
 	mut scripts: List<Tag> = [];
@@ -154,8 +149,8 @@ export fun check_shell(shell: str, build: LegBuild, mount: str): Result<void, Li
 		}
 	}
 
-	// F3 — the scripts: what is loaded that was not emitted, and whether the
-	// bundle is loaded at all. F6 rides on the bundle's own tag.
+	// F3 — the scripts: what is loaded that was not emitted, and whether the bundle
+	// is loaded at all. F6 rides on the bundle's own tag.
 	mut loads_bundle = false;
 	for script in scripts {
 		let src = attribute(script, "src");
@@ -188,32 +183,32 @@ export fun check_shell(shell: str, build: LegBuild, mount: str): Result<void, Li
 	}
 }
 
-/// The HTML document a browser leg is loaded by, built from what that leg's
-/// build emitted — so the `<script>`, the `<link>` and the mount element cannot
-/// disagree with the artifacts they name.
+/// The HTML document a browser leg is loaded by, built from what that leg's build
+/// emitted — so the `<script>`, the `<link>` and the mount element cannot disagree
+/// with the artifacts they name.
 ///
-/// A string builder, not a `View`, and that is a decision (§5.5): a document is
-/// not a reactive tree, nothing binds to it, and it is serialized once per
-/// request — while a `View`-shaped document would reopen `ssr.md` §6(a)'s
-/// ratified fragment-only process layer for no gain.
+/// A string builder, not a `View`, and that is a decision (§5.5): a document is not
+/// a reactive tree, nothing binds to it, and it is serialized once per request —
+/// while a `View`-shaped document would reopen `ssr.md` §6(a)'s ratified
+/// fragment-only process layer for no gain.
 export struct Document {
 	/// The build this document loads: every generated tag is derived from it,
 	/// and a supplied shell was checked against it.
 	build: LegBuild,
-	/// The markup, when it was supplied (`from_shell`) rather than generated
-	/// (`of`) — and checked before this value existed.
+	/// The markup, when it was supplied (`from_shell`) rather than generated (`of`)
+	/// — and checked before this value existed.
 	shell: Option<str>,
 	/// Where a SUPPLIED shell's markup came from, for the composed page's own
-	/// report (E77): `require_shell`'s file path, or `from_shell`'s generic
-	/// name for markup that arrived as a value. Empty for a generated
-	/// document, whose report names the document itself.
+	/// report (E77): `require_shell`'s file path, or `from_shell`'s generic name
+	/// for markup that arrived as a value. Empty for a generated document, whose
+	/// report names the document itself.
 	source: str,
-	/// The `<title>`'s text. Empty until `title()` says otherwise: a document
-	/// that was not given one has no title rather than an invented one.
+	/// The `<title>`'s text. Empty until `title()` says otherwise: a document that
+	/// was not given one has no title rather than an invented one.
 	title: str,
-	/// The `<meta name="description">`'s text (E85) — `title`'s twin. Empty
-	/// until `description()` says otherwise, and an empty description emits
-	/// no meta at all: absent beats an empty identity line.
+	/// The `<meta name="description">`'s text (E85) — `title`'s twin. Empty until
+	/// `description()` says otherwise, and an empty description emits no meta at
+	/// all: absent beats an empty identity line.
 	description: str,
 	/// `<html lang>`.
 	lang: str,
@@ -226,9 +221,9 @@ export struct Document {
 	/// Server-rendered markup for the mount element (`render`), empty for a
 	/// document that ships unrendered.
 	rendered: str,
-	/// For a SUPPLIED shell, where that markup goes: the index just past the
-	/// mount element's start tag, located by the check itself (§5.8) — so
-	/// nothing later can move the splice somewhere the check never looked.
+	/// For a SUPPLIED shell, where that markup goes: the index just past the mount
+	/// element's start tag, located by the check itself (§5.8) — so nothing later
+	/// can move the splice somewhere the check never looked.
 	splice: i32,
 }
 
@@ -239,14 +234,13 @@ export impl Document {
 	/// form the build requires — a module script, or a classic one for a leg
 	/// that splits (§3.5, F6).
 	///
-	/// Opinionated and small, and bounded by §10.1's ruling: the intersection
-	/// of the shells this repository ships, each of which is reconstructible
-	/// from it plus the `head`/`body` escape hatches. Everything it emits
-	/// itself is derived from the build, which is what makes the guarantee
-	/// true by construction — every document this can produce passes
-	/// `check_shell`. The hatches take raw markup that could break that
-	/// guarantee, so `html()` holds a page carrying any to the same rules
-	/// (E70) rather than trusting it.
+	/// Opinionated and small, and bounded by §10.1's ruling: the intersection of
+	/// the shells this repository ships, each of which is reconstructible from it
+	/// plus the `head`/`body` escape hatches. Everything it emits itself is derived
+	/// from the build, which is what makes the guarantee true by construction —
+	/// every document this can produce passes `check_shell`. The hatches take raw
+	/// markup that could break that guarantee, so `html()` holds a page carrying
+	/// any to the same rules (E70) rather than trusting it.
 	fun of(build: LegBuild): Document {
 		Document {
 			build,
@@ -263,16 +257,15 @@ export impl Document {
 		}
 	}
 
-	/// A hand-authored shell, CHECKED: the rung-0 escape hatch made safe — the
-	/// same `Document` value, its markup supplied rather than generated. The
+	/// A hand-authored shell, CHECKED: the rung-0 escape hatch made safe — the same
+	/// `Document` value, its markup supplied rather than generated. The
 	/// `head`/`body` hatches compose into it too, spliced in before its
-	/// `</head>`/`</body>` when `html()` writes the page — and checked there
-	/// (E77).
+	/// `</head>`/`</body>` when `html()` writes the page — and checked there (E77).
 	///
-	/// The mount element is `"app"`, which is what every shell in this tree
-	/// uses. A shell that mounts elsewhere calls `check_shell(shell, build,
-	/// id)` directly and serves its own string: the primitive is public
-	/// precisely so that dropping a rung never drops the check.
+	/// The mount element is `"app"`, which is what every shell in this tree uses. A
+	/// shell that mounts elsewhere calls `check_shell(shell, build, id)` directly
+	/// and serves its own string: the primitive is public precisely so that
+	/// dropping a rung never drops the check.
 	fun from_shell(shell: str, build: LegBuild): Result<Document, List<ShellFault>> {
 		match check_shell(shell, build, default_mount) {
 			Ok(let _checked) => Ok(Document {
@@ -306,10 +299,10 @@ export impl Document {
 	/// host, an address, a palette) stays a `head()` hatch. A document not
 	/// given a description carries no description meta at all.
 	///
-	/// Like `title`, this shapes the GENERATED document only. A supplied
-	/// shell's `<head>` already has an author, so its identity lines are the
-	/// shell's to write — the document is not their sole author there, and
-	/// splicing a second copy in would make two.
+	/// Like `title`, this shapes the GENERATED document only. A supplied shell's
+	/// `<head>` already has an author, so its identity lines are the shell's to
+	/// write — the document is not their sole author there, and splicing a second
+	/// copy in would make two.
 	fun description(own self, text: str): Document {
 		self.description = text;
 		self
@@ -321,26 +314,25 @@ export impl Document {
 		self
 	}
 
-	/// The mount element's id — the other end of `mount_root(id, …)`. Defaults
-	/// to `"app"`, which is what every shell in this tree uses.
+	/// The mount element's id — the other end of `mount_root(id, …)`. Defaults to
+	/// `"app"`, which is what every shell in this tree uses.
 	///
-	/// This is about a GENERATED document. A supplied shell's mount element is
-	/// the one `from_shell`'s check located, and nothing here moves it — a
-	/// splice into an element the check never saw is exactly the silence this
-	/// module exists to remove.
+	/// This is about a GENERATED document. A supplied shell's mount element is the
+	/// one `from_shell`'s check located, and nothing here moves it — a splice into
+	/// an element the check never saw is exactly the silence this module exists to
+	/// remove.
 	fun mount(own self, id: str): Document {
 		self.mount = id;
 		self
 	}
 
 	/// Raw markup appended inside `<head>`: a favicon, an `og:` tag, a CSP, an
-	/// inline `<style>` for the page frame. Repeatable — each call appends on
-	/// its own line (E86), so the hatch is usable per item and the written
-	/// page still reads in View Source (§15.1). On a generated document it
-	/// lands inside the `<head>` the document writes; on a supplied shell it
-	/// splices in immediately before the shell's own `</head>` (E77) — a
-	/// shell that carries no `</head>` stops at `html()` rather than having
-	/// the markup guessed into it.
+	/// inline `<style>` for the page frame. Repeatable — each call appends on its
+	/// own line (E86), so the hatch is usable per item and the written page still
+	/// reads in View Source (§15.1). On a generated document it lands inside the
+	/// `<head>` the document writes; on a supplied shell it splices in immediately
+	/// before the shell's own `</head>` (E77) — a shell that carries no `</head>`
+	/// stops at `html()` rather than having the markup guessed into it.
 	///
 	/// It is raw on purpose (that is what an escape hatch is), and it is not an
 	/// exemption: when the page is written, `html()` runs the assembled markup
@@ -352,11 +344,10 @@ export impl Document {
 		self
 	}
 
-	/// Raw markup appended inside `<body>` — before the script tag on a
-	/// generated document, immediately before the shell's own `</body>` on a
-	/// supplied one (E77). Repeatable, each call on its own line, like `head`
-	/// (E86). An escape hatch like `head`, and checked at `html()` like it
-	/// too.
+	/// Raw markup appended inside `<body>` — before the script tag on a generated
+	/// document, immediately before the shell's own `</body>` on a supplied one
+	/// (E77). Repeatable, each call on its own line, like `head` (E86). An escape
+	/// hatch like `head`, and checked at `html()` like it too.
 	fun body(own self, markup: str): Document {
 		self.body = joined_hatch(self.body, markup);
 		self
@@ -367,14 +358,14 @@ export impl Document {
 	///
 	/// The document already knows where the mount element is, so the markup goes
 	/// INSIDE it by construction and there is nothing to spell wrong: the
-	/// `<!--ssr-->` convention it replaces was a string literal in `.vl` that
-	/// had to equal a string literal in `.html`, whose mismatch was a silent
-	/// no-op observed only by a crawler.
+	/// `<!--ssr-->` convention it replaces was a string literal in `.vl` that had
+	/// to equal a string literal in `.html`, whose mismatch was a silent no-op
+	/// observed only by a crawler.
 	///
-	/// The one method here that takes `self` rather than `own self`, because it
-	/// is the one called PER REQUEST: a handler builds the document once at
-	/// boot and renders a fresh view into a copy of it for each response —
-	/// create, serialize, discard.
+	/// The one method here that takes `self` rather than `own self`, because it is
+	/// the one called PER REQUEST: a handler builds the document once at boot and
+	/// renders a fresh view into a copy of it for each response — create,
+	/// serialize, discard.
 	fun render(self, view: View): Document {
 		mut rendered = self;
 		rendered.rendered = ui::render(view);
@@ -386,22 +377,21 @@ export impl Document {
 	/// it. A document that knew about HTTP would have to know about routing,
 	/// and then it is a framework.
 	///
-	/// This is also where the `head`/`body` escape hatches meet the rules
-	/// (E70, §16.10; E77, §16.12): a page carrying hatch markup runs through
-	/// `check_shell` before it is handed back, and a fault stops the boot —
-	/// every fault and its fix, exactly as a hand-written shell's would. That
-	/// holds at both rungs: a generated page is checked as assembled, and a
-	/// supplied shell as COMPOSED — its own bytes plus the spliced hatch
-	/// markup — because `from_shell`'s check covered the shell alone. A page
-	/// with no hatch markup runs no check at all: the generated one is
-	/// derived from the build and cannot fail, and the supplied one is the
-	/// shell `from_shell` already accepted, byte for byte (plus the render
-	/// splice).
+	/// This is also where the `head`/`body` escape hatches meet the rules (E70,
+	/// §16.10; E77, §16.12): a page carrying hatch markup runs through
+	/// `check_shell` before it is handed back, and a fault stops the boot — every
+	/// fault and its fix, exactly as a hand-written shell's would. That holds at
+	/// both rungs: a generated page is checked as assembled, and a supplied shell
+	/// as COMPOSED — its own bytes plus the spliced hatch markup — because
+	/// `from_shell`'s check covered the shell alone. A page with no hatch markup
+	/// runs no check at all: the generated one is derived from the build and cannot
+	/// fail, and the supplied one is the shell `from_shell` already accepted, byte
+	/// for byte (plus the render splice).
 	fun html(self): str {
 		match self.shell {
-			// Supplied: its own bytes, composed — the render spliced into the
-			// mount element the check located, and any hatch markup spliced
-			// in before the closing tag it aims at (E77).
+			// Supplied: its own bytes, composed — the render spliced into the mount
+			// element the check located, and any hatch markup spliced in before the
+			// closing tag it aims at (E77).
 			Some(let markup) => {
 				let composed = self.composed(markup);
 				// The same rule as the generated arm below, at the same
@@ -449,8 +439,8 @@ export impl Document {
 		if self.description != "" {
 			markup = markup + i"\t\t<meta name=\"description\" content=\"{escape_attribute(self.description)}\" />\n";
 		}
-		// If and only if the build emitted styles — the whole of F1 and F2, on
-		// the generating side.
+		// If and only if the build emitted styles — the whole of F1 and F2, on the
+		// generating side.
 		match self.build.styles {
 			Some(let sidecar) => markup = markup + i"\t\t<link rel=\"stylesheet\" href=\"/{sidecar}\" />\n",
 			None => {},
@@ -513,8 +503,8 @@ export impl Document {
 	}
 }
 
-/// The bundle's script tag, in the form the build requires (§3.5): a classic
-/// script exactly when the leg splits, because chunk resolution reads
+/// The bundle's script tag, in the form the build requires (§3.5): a classic script
+/// exactly when the leg splits, because chunk resolution reads
 /// `document.currentScript` and a module script has none.
 fun script_tag(build: LegBuild): str {
 	if build.classic_script {
@@ -549,19 +539,19 @@ fun closing_point(shell: str, name: str): Option<i32> {
 	None
 }
 
-/// A used hatch with no closing tag to land before — the compose-time
-/// refusal's one line per missing tag (E77). Both fixes are real: give the
-/// shell the tag, or give the markup to the shell.
+/// A used hatch with no closing tag to land before — the compose-time refusal's one
+/// line per missing tag (E77). Both fixes are real: give the shell the tag, or give
+/// the markup to the shell.
 fun missing_closing_tag(source: str, name: str): str {
 	i"{source} has no </{name}> for this document's {name}() markup to splice before — add </{name}> to the shell, or write the markup into the shell itself"
 }
 
-/// Consecutive `head()`/`body()` calls, joined: a newline at the hatch's
-/// indent (two tabs — where the generated document writes hatch markup)
-/// between one call's markup and the next, so a hatch used PER ITEM puts each
-/// item on its own line of the written page (E86, fullstack-dx.md §16.13)
-/// instead of running them together on one. Empty markup joins as nothing:
-/// `head("")` was a no-op before this and stays one.
+/// Consecutive `head()`/`body()` calls, joined: a newline at the hatch's indent
+/// (two tabs — where the generated document writes hatch markup) between one call's
+/// markup and the next, so a hatch used PER ITEM puts each item on its own line of
+/// the written page (E86, fullstack-dx.md §16.13) instead of running them together
+/// on one. Empty markup joins as nothing: `head("")` was a no-op before this and
+/// stays one.
 fun joined_hatch(existing: str, markup: str): str {
 	if existing == "" {
 		markup
@@ -572,9 +562,9 @@ fun joined_hatch(existing: str, markup: str): str {
 	}
 }
 
-/// `text` with each insertion's markup spliced in at its index. The indices
-/// are into the ORIGINAL text; insertions apply in ascending index order, and
-/// two at the same index keep their list order.
+/// `text` with each insertion's markup spliced in at its index. The indices are
+/// into the ORIGINAL text; insertions apply in ascending index order, and two at
+/// the same index keep their list order.
 export fun spliced(text: str, insertions: List<(i32, str)>): str {
 	// A stable sort by index — at most three insertions ever arrive, so the
 	// quadratic count is fine and the clarity is not.
@@ -613,8 +603,8 @@ export fun spliced(text: str, insertions: List<(i32, str)>): str {
 export fun require_shell(path: str, build: LegBuild): Document {
 	match Document::from_shell(fs::read_file_to_str(path), build) {
 		Ok(let document) => {
-			// The document knows where its markup came from, so the composed
-			// page's own report (E77) can say the file's name first too.
+			// The document knows where its markup came from, so the composed page's
+			// own report (E77) can say the file's name first too.
 			mut named = document;
 			named.source = path;
 			named
@@ -624,11 +614,10 @@ export fun require_shell(path: str, build: LegBuild): Document {
 }
 
 /// The markup from `source` does not match `build`, spelled for a person: the
-/// source, the leg, and one line per fault. `source` is where the markup came
-/// from — `require_shell`'s file path, or `html()`'s name for the hatch
-/// markup it checked (the generated document's own, or the supplied shell
-/// composed with it) — because a `ShellFault` is about markup and cannot
-/// know that itself.
+/// source, the leg, and one line per fault. `source` is where the markup came from
+/// — `require_shell`'s file path, or `html()`'s name for the hatch markup it
+/// checked (the generated document's own, or the supplied shell composed with it) —
+/// because a `ShellFault` is about markup and cannot know that itself.
 fun fault_report(source: str, build: LegBuild, faults: List<ShellFault>): str {
 	mut report = i"{source} does not match the `{build.leg}` build:";
 	for fault in faults {
@@ -641,16 +630,15 @@ fun fault_report(source: str, build: LegBuild, faults: List<ShellFault>): str {
 
 /// One tag, as the scanner found it — opening or closing.
 export struct Tag {
-	/// The tag name, lowercased — `link`, `script`, `div`. A closing tag's
-	/// name has its `/` stripped: `</head>` scans as `head` with `closing`
-	/// set.
+	/// The tag name, lowercased — `link`, `script`, `div`. A closing tag's name has
+	/// its `/` stripped: `</head>` scans as `head` with `closing` set.
 	name: str,
 	/// Its attributes in source order, as `(lowercased name, raw value)`.
 	/// Always empty for a closing tag — which is also what keeps the checks,
 	/// every one attribute-keyed, reading opening tags only.
 	attributes: List<(str, str)>,
-	/// The index of its `<`. For a closing tag, the last position still
-	/// inside the element — the splice point hatch markup wants (E77).
+	/// The index of its `<`. For a closing tag, the last position still inside the
+	/// element — the splice point hatch markup wants (E77).
 	start: i32,
 	/// One past its `>`, i.e. where its content begins — the splice point a
 	/// server-rendered document needs (§5.8).
@@ -685,9 +673,9 @@ fun is_stylesheet_rel(rel: str): bool {
 }
 
 /// Whether `url` addresses something this build could have emitted — i.e. not
-/// another origin. An absolute url, a protocol-relative one and a data url are
-/// all somebody else's business, and a check that guessed otherwise would
-/// refuse to boot over a font CDN.
+/// another origin. An absolute url, a protocol-relative one and a data url are all
+/// somebody else's business, and a check that guessed otherwise would refuse to
+/// boot over a font CDN.
 fun is_local(url: str): bool {
 	!url.contains("://") && !url.starts_with("//") && !url.starts_with("data:")
 }
@@ -696,21 +684,20 @@ fun is_local(url: str): bool {
 /// string or fragment a cache-buster adds (`/client.js?v=2` is `client.js`,
 /// which is also how `serve_build` routes it).
 ///
-/// This is `std::path`'s URL seam in two lines: the query and the fragment are
-/// URL grammar and get cut here, and what is left is an ordinary `/`-separated
-/// path that `basename` already knows how to read. It used to index the last
-/// element of a `split("/")`, which differs on a trailing separator —
-/// `"/assets/"` was `""` and is now `"assets"` — the answer a directory URL
-/// deserves either way, since neither can name a file this build emitted.
+/// This is `std::path`'s URL seam in two lines: the query and the fragment are URL
+/// grammar and get cut here, and what is left is an ordinary `/`-separated path
+/// that `basename` already knows how to read. It used to index the last element of
+/// a `split("/")`, which differs on a trailing separator — `"/assets/"` was `""`
+/// and is now `"assets"` — the answer a directory URL deserves either way, since
+/// neither can name a file this build emitted.
 export fun file_name_of(url: str): str {
 	path::basename(url.split("?")[0].split("#")[0])
 }
 
-/// Whether `file` is in this leg's own namespace — the `<leg>.` prefix its
-/// build writes and its last build owns (`bundle-splitting.md` Appendix A).
-/// This is the boundary of what a fault may be reported about: inside it, a
-/// file the build did not emit is this leg's stale output; outside it, the
-/// application's own.
+/// Whether `file` is in this leg's own namespace — the `<leg>.` prefix its build
+/// writes and its last build owns (`bundle-splitting.md` Appendix A). This is the
+/// boundary of what a fault may be reported about: inside it, a file the build did
+/// not emit is this leg's stale output; outside it, the application's own.
 fun leg_owns(build: LegBuild, file: str): bool {
 	file.starts_with(build.leg + ".")
 }
@@ -756,22 +743,22 @@ fun tags_of(markup: str): List<Tag> {
 			index = past(index_of(markup, "-->", index + 4), 3, length);
 			jump continue;
 		}
-		// A trailing `<` opens nothing: there is no character after it to
-		// classify. (The length guards here and above were implicit while
-		// `substring` clamped; they are the rule now.)
+		// A trailing `<` opens nothing: there is no character after it to classify.
+		// (The length guards here and above were implicit while `substring`
+		// clamped; they are the rule now.)
 		if index + 1 >= length {
 			index = index + 1;
 			jump continue;
 		}
 		let after = markup.substring(index + 1, index + 2);
-		// A doctype or a processing instruction: nothing to read off it, so
-		// skip to its `>`.
+		// A doctype or a processing instruction: nothing to read off it, so skip to
+		// its `>`.
 		if after == "!" || after == "?" {
 			index = past(index_of(markup, ">", index + 1), 1, length);
 			jump continue;
 		}
-		// A closing tag: no attributes to read, but its position matters —
-		// it is where the compose splice aims (E77).
+		// A closing tag: no attributes to read, but its position matters — it is
+		// where the compose splice aims (E77).
 		if after == "/" {
 			mut cursor = index + 2;
 			for cursor < length && is_name_char(markup.substring(cursor, cursor + 1)) {
@@ -804,9 +791,9 @@ fun tags_of(markup: str): List<Tag> {
 	tags
 }
 
-/// A found index plus `offset`, or `fallback` when the search came up empty —
-/// the "skip past this delimiter, or give up on the rest of the document" step
-/// the scanner takes four times.
+/// A found index plus `offset`, or `fallback` when the search came up empty — the
+/// "skip past this delimiter, or give up on the rest of the document" step the
+/// scanner takes four times.
 export fun past(found: Option<i32>, offset: i32, fallback: i32): i32 {
 	match found {
 		Some(let at) => at + offset,
@@ -814,8 +801,8 @@ export fun past(found: Option<i32>, offset: i32, fallback: i32): i32 {
 	}
 }
 
-/// The attributes of the tag whose name ends at `from`, and the index one past
-/// its `>`.
+/// The attributes of the tag whose name ends at `from`, and the index one past its
+/// `>`.
 fun attributes_of(markup: str, from: i32): (List<(str, str)>, i32) {
 	let length = markup.len();
 	mut attributes: List<(str, str)> = [];
@@ -825,8 +812,8 @@ fun attributes_of(markup: str, from: i32): (List<(str, str)>, i32) {
 		if character == ">" {
 			ret (attributes, index + 1);
 		}
-		// Whitespace between attributes, and the `/` of a self-closing tag —
-		// whose `>` ends the tag on the next turn.
+		// Whitespace between attributes, and the `/` of a self-closing tag — whose
+		// `>` ends the tag on the next turn.
 		if is_space(character) || character == "/" {
 			index = index + 1;
 			jump continue;
@@ -839,8 +826,8 @@ fun attributes_of(markup: str, from: i32): (List<(str, str)>, i32) {
 		index = skip_spaces(markup, cursor);
 		mut value = "";
 		// `skip_spaces` returns `length` when it runs off the end — its normal
-		// result on an unterminated tag, not an edge case. Both reads below
-		// have to admit that, now that an `end` past the length is refused.
+		// result on an unterminated tag, not an edge case. Both reads below have to
+		// admit that, now that an `end` past the length is refused.
 		if index < length && markup.substring(index, index + 1) == "=" {
 			index = skip_spaces(markup, index + 1);
 			let quote = if index < length { markup.substring(index, index + 1) } else { "" };
@@ -892,8 +879,8 @@ fun skip_raw_text(markup: str, from: i32, name: str): i32 {
 	length
 }
 
-/// Whether `markup` carries `needle` at `at`, reading `A`–`Z` and `a`–`z` as
-/// equal and every other code unit exactly.
+/// Whether `markup` carries `needle` at `at`, reading `A`–`Z` and `a`–`z` as equal
+/// and every other code unit exactly.
 ///
 /// `at + needle.len() <= markup.len()` is the caller's contract, and it is what
 /// puts every `code_at` below in range.
@@ -909,9 +896,8 @@ fun matches_ascii_insensitive(markup: str, at: i32, needle: str): bool {
 	true
 }
 
-/// One code unit with `A` (65) through `Z` (90) shifted to `a`–`z` and every
-/// other unit untouched — `to_lowercase_ascii`'s rule, per unit, minting no
-/// string.
+/// One code unit with `A` (65) through `Z` (90) shifted to `a`–`z` and every other
+/// unit untouched — `to_lowercase_ascii`'s rule, per unit, minting no string.
 fun lowered_unit(unit: u32): u32 {
 	if unit >= 65 && unit <= 90 {
 		unit + 32
@@ -930,8 +916,8 @@ fun skip_spaces(markup: str, from: i32): i32 {
 	index
 }
 
-/// The index of `needle` in `text` at or after `from`, or `None`. (`str` can
-/// answer whether it `contains` something, but not where.)
+/// The index of `needle` in `text` at or after `from`, or `None`. (`str` can answer
+/// whether it `contains` something, but not where.)
 fun index_of(text: str, needle: str, from: i32): Option<i32> {
 	let limit = text.len() - needle.len();
 	mut index = if from < 0 { 0 } else { from };

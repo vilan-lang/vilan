@@ -7,6 +7,6 @@
 // brevity, and the prelude serves it properly now (`prelude.md` §10.2), so the
 // aliases are gone and each name is spelled at its real home.
 //
-// The prelude modules are `prelude.vl` (the base set) and `web.vl` (the web
-// set). They are ordinary modules; std itself declares `prelude = false` and
-// compiles under neither.
+// The prelude modules are `prelude.vl` (the base set) and `web.vl` (the web set).
+// They are ordinary modules; std itself declares `prelude = false` and compiles
+// under neither.

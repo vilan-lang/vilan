@@ -7,8 +7,8 @@
 //
 // A connected service rides `Server`'s public surface: the SSE stream is a
 // STREAMING response (`ResponseBuilder::streaming` — partial writes over a
-// held-open response), the binary RPC reply is a bytes body, and the
-// WebSocket handshake mounts through `ServerBuilder::on_upgrade`.
+// held-open response), the binary RPC reply is a bytes body, and the WebSocket
+// handshake mounts through `ServerBuilder::on_upgrade`.
 
 import pkg::bytes::Bytes;
 import pkg::compare::Ordering;
@@ -79,11 +79,11 @@ export fun ws_accept_key(key: str): str {
 
 // --- Service: an rpc mount installed on a `ServerBuilder` (fullstack-dx.md §4) -
 
-/// One connected client, as the factory sees it: the connection id the rest of
-/// the layer keys by (the same id `on_connect`/`on_disconnect` carry and the
-/// generated `__attach` is called with), the session `authorize` proved, and
-/// the peer's address (`""` when the host does not report one — and the
-/// PROXY's address behind a proxy).
+/// One connected client, as the factory sees it: the connection id the rest of the
+/// layer keys by (the same id `on_connect`/`on_disconnect` carry and the generated
+/// `__attach` is called with), the session `authorize` proved, and the peer's
+/// address (`""` when the host does not report one — and the PROXY's address behind
+/// a proxy).
 export struct Connection {
 	id: i32,
 	session: Session,
@@ -91,9 +91,9 @@ export struct Connection {
 }
 
 export impl Connection {
-	/// The typed proxy for the `[client_service]` this connection's server may
-	/// call back into (`transport-rpc.md` §9.3, R1) — the value a service struct
-	/// holds as a field and reaches as `self.client`:
+	/// The typed proxy for the `[client_service]` this connection's server may call
+	/// back into (`transport-rpc.md` §9.3, R1) — the value a service struct holds
+	/// as a field and reaches as `self.client`:
 	///
 	/// ```text
 	/// [service(KoltClient, client = KoltHandlers)]
@@ -111,20 +111,20 @@ export impl Connection {
 	/// `Connection` itself, collides the moment a program runs two services with
 	/// different handler types, and teaches a std type members from user code.
 	///
-	/// Nothing is sent here: the proxy is this connection's id, and it is dead
-	/// (a silent drop) once the connection is.
+	/// Nothing is sent here: the proxy is this connection's id, and it is dead (a
+	/// silent drop) once the connection is.
 	fun client<P: ClientProxy>(self): P {
 		P::for_connection(self.id)
 	}
 }
 
-/// The upgrade request, as `authorize` sees it — everything the client could
-/// say about itself before a socket exists (`transport-rpc.md` §4.2's upgrade
+/// The upgrade request, as `authorize` sees it — everything the client could say
+/// about itself before a socket exists (`transport-rpc.md` §4.2's upgrade
 /// mechanics, A40).
 ///
-/// `protocols` is the load-bearing field: the browser's `WebSocket` API sends
-/// no headers, and the subprotocol list is the only thing it lets a page put
-/// on the handshake. The convention (`std::rpc::rpc_protocols`) is
+/// `protocols` is the load-bearing field: the browser's `WebSocket` API sends no
+/// headers, and the subprotocol list is the only thing it lets a page put on the
+/// handshake. The convention (`std::rpc::rpc_protocols`) is
 /// `["vilan-rpc", "token." + credential]` — the real protocol name the server
 /// selects and echoes, and the credential riding beside it.
 export struct Handshake {
@@ -134,10 +134,10 @@ export struct Handshake {
 	remote_addr: str,
 }
 
-/// One header off a raw handshake's header object. `JsonValue` is the
-/// documented accessor for a dynamic host object (there is no plain extern
-/// shape for named property access), and the string check is what keeps a
-/// non-string value from coercing to `"undefined"`.
+/// One header off a raw handshake's header object. `JsonValue` is the documented
+/// accessor for a dynamic host object (there is no plain extern shape for named
+/// property access), and the string check is what keeps a non-string value from
+/// coercing to `"undefined"`.
 fun header_text(headers: JsonValue, name: str): Option<str> {
 	if has_json_field(headers, name) {
 		let value = headers.field(name);
@@ -149,14 +149,14 @@ fun header_text(headers: JsonValue, name: str): Option<str> {
 }
 
 export impl Handshake {
-	/// A named request header, or `None` when the handshake did not carry it.
-	/// Node lowercases every name it parses, so `name` is lowered to match.
+	/// A named request header, or `None` when the handshake did not carry it. Node
+	/// lowercases every name it parses, so `name` is lowered to match.
 	fun header(self, name: str): Option<str> {
 		header_text(self.headers, name.to_lowercase())
 	}
 
-	/// The credential offered by the `"token."` convention, if the client
-	/// offered one.
+	/// The credential offered by the `"token."` convention, if the client offered
+	/// one.
 	fun token(self): Option<str> {
 		for offered in self.protocols {
 			if offered.starts_with("token.") {
@@ -177,18 +177,18 @@ export impl Handshake {
 	}
 }
 
-/// Why a handshake was refused. Each arm names the HTTP status the raw socket
-/// is answered with before it is destroyed — no socket, no session, no
-/// `ReactiveServer`, which is the whole point of gating BEFORE the upgrade
-/// rather than inside a method.
+/// Why a handshake was refused. Each arm names the HTTP status the raw socket is
+/// answered with before it is destroyed — no socket, no session, no
+/// `ReactiveServer`, which is the whole point of gating BEFORE the upgrade rather
+/// than inside a method.
 export [derive(PartialEq, Debug)]
 enum Reject {
 	/// 401 — no credential, or one that did not verify.
 	Unauthorized,
 	/// 403 — a good credential for someone who may not have this.
 	Forbidden,
-	/// 429 — a limit, not a judgement: `max_connections`, the per-IP
-	/// handshake rate, or the app's own.
+	/// 429 — a limit, not a judgement: `max_connections`, the per-IP handshake
+	/// rate, or the app's own.
 	TooMany,
 	/// 503 — the infrastructure behind this service is not ready to serve
 	/// this client (tracker A52). A judgement about NEITHER the credential
@@ -196,12 +196,11 @@ enum Reject {
 	/// one asking, and the answer is still no, because the database is down,
 	/// the migration is mid-flight, or the node is draining for a deploy.
 	///
-	/// A48 named the gap and declined to fill it, because the refusal it
-	/// needed (a verifier that timed out) is not one an app gives; this arm
-	/// is one an app gives, from its own `authorize`, and it is the only
-	/// honest word for the case. `TooMany` would tell a client to slow down
-	/// when its rate was never the problem, and `Forbidden` would tell it to
-	/// fix a credential that is fine.
+	/// A48 named the gap and declined to fill it, because the refusal it needed (a
+	/// verifier that timed out) is not one an app gives; this arm is one an app
+	/// gives, from its own `authorize`, and it is the only honest word for the
+	/// case. `TooMany` would tell a client to slow down when its rate was never the
+	/// problem, and `Forbidden` would tell it to fix a credential that is fine.
 	Unavailable,
 }
 
@@ -216,20 +215,20 @@ fun reject_status(reject: Reject): str {
 }
 
 /// The frame a refused vilan client is told its refusal with (A47) — the
-/// `__conn:<id>` announcement's negative twin, carrying the status the socket
-/// API will not show it. `__reject:401` / `__reject:403`.
+/// `__conn:<id>` announcement's negative twin, carrying the status the socket API
+/// will not show it. `__reject:401` / `__reject:403`.
 fun reject_announcement(reject: Reject): str {
 	"__reject:" + reject_code(reject)
 }
 
-/// The status NUMBER, as text — the announcement's payload and the first token
-/// of the status line, named once so the two cannot drift.
+/// The status NUMBER, as text — the announcement's payload and the first token of
+/// the status line, named once so the two cannot drift.
 fun reject_code(reject: Reject): str {
 	i"{reject_number(reject)}"
 }
 
-/// The status number itself — what the POST leg's refusal is answered with
-/// (A120 S4), and what `reject_code` spells.
+/// The status number itself — what the POST leg's refusal is answered with (A120
+/// S4), and what `reject_code` spells.
 fun reject_number(reject: Reject): i32 {
 	match reject {
 		Reject::Unauthorized => 401,
@@ -240,8 +239,8 @@ fun reject_number(reject: Reject): i32 {
 }
 
 /// Whether this refusal is one the server TELLS the client about, as the typed
-/// `__reject:<status>` frame on an upgraded socket, rather than a status line
-/// on a raw one (A47, widened by A52).
+/// `__reject:<status>` frame on an upgraded socket, rather than a status line on a
+/// raw one (A47, widened by A52).
 ///
 /// The line is not "is this a judgement about the credential" — it is "did the
 /// APP decide this". `Unauthorized`, `Forbidden` and `Unavailable` are the
@@ -263,8 +262,8 @@ fun tells_the_client(reject: Reject): bool {
 	}
 }
 
-/// Refuse an upgrade. Two shapes, and which one a client gets is decided by
-/// what it is and what it did (A47).
+/// Refuse an upgrade. Two shapes, and which one a client gets is decided by what it
+/// is and what it did (A47).
 ///
 /// **The status line** — a minimal HTTP response, then destroy — is the
 /// default and stays exactly what A40 shipped. It is what a browser, a probe,
@@ -273,28 +272,27 @@ fun tells_the_client(reject: Reject): bool {
 /// HTTP and not this protocol.
 ///
 /// **The typed refusal frame** is for a vilan rpc client refused by JUDGEMENT:
-/// complete the upgrade, write one `__reject:<status>` frame, close, destroy.
-/// It exists because neither host WebSocket implementation shows a client the
-/// status of a failed handshake — measured on node 24 (undici's global
-/// `WebSocket`), a 401, a 403, a 429, a socket destroyed mid-handshake, a
-/// connection refused and a server with no upgrade handler at all produce the
-/// SAME error message and the same close code (1002), and the browser API
-/// exposes even less by design. A refused client therefore could not tell "my
-/// token is wrong" from "the server is down", so it did what an unreachable
-/// server deserves: ten redials over about 24 seconds of backoff, and then
-/// `Transport("could not reach …")`.
+/// complete the upgrade, write one `__reject:<status>` frame, close, destroy. It
+/// exists because neither host WebSocket implementation shows a client the status
+/// of a failed handshake — measured on node 24 (undici's global `WebSocket`), a
+/// 401, a 403, a 429, a socket destroyed mid-handshake, a connection refused and a
+/// server with no upgrade handler at all produce the SAME error message and the
+/// same close code (1002), and the browser API exposes even less by design. A
+/// refused client therefore could not tell "my token is wrong" from "the server is
+/// down", so it did what an unreachable server deserves: ten redials over about 24
+/// seconds of backoff, and then `Transport("could not reach …")`.
 ///
-/// **The DoS trade, and why it is bounded.** A refusal that upgrades costs one
-/// 101, one small frame and a close where a status line costs one write — and
-/// the socket is destroyed in the same turn either way, so nothing is HELD.
-/// The bound is which refusals are eligible: `TooMany` never is, and `TooMany`
-/// is exactly what `max_connections` and `handshake_rate` produce. A flood is
-/// therefore refused by the cheap path by construction, and an attacker cannot
-/// reach the expensive one more often than the rate limit admits.
+/// **The DoS trade, and why it is bounded.** A refusal that upgrades costs one 101,
+/// one small frame and a close where a status line costs one write — and the socket
+/// is destroyed in the same turn either way, so nothing is HELD. The bound is which
+/// refusals are eligible: `TooMany` never is, and `TooMany` is exactly what
+/// `max_connections` and `handshake_rate` produce. A flood is therefore refused by
+/// the cheap path by construction, and an attacker cannot reach the expensive one
+/// more often than the rate limit admits.
 ///
-/// A refusal only upgrades when the client offered the `vilan-rpc`
-/// subprotocol — this protocol's own clients, and nothing else — and when the
-/// handshake carries the key an upgrade needs.
+/// A refusal only upgrades when the client offered the `vilan-rpc` subprotocol —
+/// this protocol's own clients, and nothing else — and when the handshake carries
+/// the key an upgrade needs.
 fun refuse_upgrade(request: NodeRequest, socket: NodeSocket, reject: Reject) {
 	// An `authorize` that ran out of time destroyed the socket already (A48);
 	// there is nothing left to answer on.
@@ -302,8 +300,8 @@ fun refuse_upgrade(request: NodeRequest, socket: NodeSocket, reject: Reject) {
 		ret;
 	}
 	let headers = request.headers();
-	// "the client offered `vilan-rpc`", asked through the selection itself:
-	// the selection IS that name exactly when it was offered.
+	// "the client offered `vilan-rpc`", asked through the selection itself: the
+	// selection IS that name exactly when it was offered.
 	let speaks_rpc = selected_protocol(offered_protocols(headers)) == rpc_subprotocol();
 	if tells_the_client(reject) && speaks_rpc && has_json_field(headers, "sec-websocket-key") {
 		write_upgrade_101(socket, headers);
@@ -317,13 +315,13 @@ fun refuse_upgrade(request: NodeRequest, socket: NodeSocket, reject: Reject) {
 	socket.destroy();
 }
 
-/// Write the 101, subprotocol selection echoed (RFC 6455 §4.2.2). Shared by
-/// the accepting path and the typed refusal, so a refused client's handshake
-/// is byte-identical to an accepted one up to the first frame — which is what
-/// makes the host WebSocket deliver that frame at all.
+/// Write the 101, subprotocol selection echoed (RFC 6455 §4.2.2). Shared by the
+/// accepting path and the typed refusal, so a refused client's handshake is
+/// byte-identical to an accepted one up to the first frame — which is what makes
+/// the host WebSocket deliver that frame at all.
 ///
-/// The caller has already checked `sec-websocket-key` is present; it is a
-/// string by the handshake, so `unwrap_or` keeps the read total.
+/// The caller has already checked `sec-websocket-key` is present; it is a string by
+/// the handshake, so `unwrap_or` keeps the read total.
 fun write_upgrade_101(socket: NodeSocket, headers: JsonValue) {
 	let key: str = str::from_json_value(headers.field("sec-websocket-key")).unwrap_or("");
 	let selected = selected_protocol(offered_protocols(headers));
@@ -334,8 +332,8 @@ fun write_upgrade_101(socket: NodeSocket, headers: JsonValue) {
 		+ "\r\n\r\n");
 }
 
-/// The subprotocols the client offered, in order. One header, comma-separated
-/// (RFC 6455 §4.1); a client that offered none gives an empty list.
+/// The subprotocols the client offered, in order. One header, comma-separated (RFC
+/// 6455 §4.1); a client that offered none gives an empty list.
 fun offered_protocols(headers: JsonValue): List<str> {
 	mut offered: List<str> = [];
 	match header_text(headers, "sec-websocket-protocol") {
@@ -352,22 +350,21 @@ fun offered_protocols(headers: JsonValue): List<str> {
 	offered
 }
 
-/// The one the server selects out of what was offered: `vilan-rpc` when it is
-/// there (which is what every vilan client offers), else the client's first
-/// choice, else nothing. RFC 6455 §4.2.2 requires the selection to be ECHOED
-/// in the 101 — a browser that offered a subprotocol and hears none back
-/// closes the connection immediately — and this server echoed nothing at all
-/// until A40.
+/// The one the server selects out of what was offered: `vilan-rpc` when it is there
+/// (which is what every vilan client offers), else the client's first choice, else
+/// nothing. RFC 6455 §4.2.2 requires the selection to be ECHOED in the 101 — a
+/// browser that offered a subprotocol and hears none back closes the connection
+/// immediately — and this server echoed nothing at all until A40.
 fun selected_protocol(offered: List<str>): str {
 	for name in offered {
 		if name == rpc_subprotocol() {
 			ret name;
 		}
 	}
-	// The client's first choice otherwise — but never a `"token."` offer.
-	// Those are not protocols anybody speaks; they are what a browser
-	// handshake carries instead of a header, and selecting one would both
-	// misreport the protocol and write the credential back out in the reply.
+	// The client's first choice otherwise — but never a `"token."` offer. Those are
+	// not protocols anybody speaks; they are what a browser handshake carries
+	// instead of a header, and selecting one would both misreport the protocol and
+	// write the credential back out in the reply.
 	for name in offered {
 		if !name.starts_with("token.") {
 			ret name;
@@ -376,68 +373,65 @@ fun selected_protocol(offered: List<str>): str {
 	""
 }
 
-/// One rpc service mounted on a `Server`: the protocol, where its routes
-/// live, and what happens to a connection's per-connection state. The routes
-/// (`{mount}events`, `{mount}send`, `{mount}rpc`) and the upgrade handshake
-/// are installed together, because a duplex service is both —
+/// One rpc service mounted on a `Server`: the protocol, where its routes live, and
+/// what happens to a connection's per-connection state. The routes
+/// (`{mount}events`, `{mount}send`, `{mount}rpc`) and the upgrade handshake are
+/// installed together, because a duplex service is both —
 /// `ServerBuilder::with_service` folds both in at `build()`, in front of
 /// `on_request`/`on_upgrade` (§4.3).
 ///
-/// A connection ends when its stream closes (tab closed, network gone): the
-/// wire is forgotten here, and `on_disconnect(id)` tells the app to drop its
-/// own per-connection state (dispose a `ReactiveServer` session, say) —
-/// otherwise a long-running server leaks a session per ever-connected client.
+/// A connection ends when its stream closes (tab closed, network gone): the wire is
+/// forgotten here, and `on_disconnect(id)` tells the app to drop its own
+/// per-connection state (dispose a `ReactiveServer` session, say) — otherwise a
+/// long-running server leaks a session per ever-connected client.
 export struct Service {
 	/// The protocol THIS connection is answered by. `Service::new` hands every
-	/// connection the same one; `Service::factory` builds a fresh service
-	/// instance per connection and returns its dispatcher's protocol (Q9).
+	/// connection the same one; `Service::factory` builds a fresh service instance
+	/// per connection and returns its dispatcher's protocol (Q9).
 	build_protocol: |Connection| RpcProtocol,
 	/// The one protocol, for a service that HAS one without a connection —
-	/// `Service::new` only. It is what the connectionless `{mount}rpc` POST
-	/// leg answers from; `None` under `factory`, which has no instance to
-	/// answer with until a connection exists.
+	/// `Service::new` only. It is what the connectionless `{mount}rpc` POST leg
+	/// answers from; `None` under `factory`, which has no instance to answer with
+	/// until a connection exists.
 	shared: Option<RpcProtocol>,
 	codec: Codec,
 	mount: str,
 	on_connect: |i32, DuplexEnd| void,
 	on_disconnect: |i32| void,
-	/// The pre-upgrade gate (A40), when the app installed one. `Ok(session)`
-	/// feeds the factory; `Err(reject)` answers the raw socket and destroys
-	/// it, before any of this service's state exists for that client.
+	/// The pre-upgrade gate (A40), when the app installed one. `Ok(session)` feeds
+	/// the factory; `Err(reject)` answers the raw socket and destroys it, before
+	/// any of this service's state exists for that client.
 	///
-	/// Stored plain and re-marked `async` at a `let` where it is called (J2
-	/// v1: an `async` closure TYPE lives only at parameter/`let`/field/return
-	/// seams, and never nested inside a `Option<…>`) — which is what makes the
-	/// call await, so a hook that verifies a signature settles before the
-	/// handshake is answered.
+	/// Stored plain and re-marked `async` at a `let` where it is called (J2 v1: an
+	/// `async` closure TYPE lives only at parameter/`let`/field/return seams, and
+	/// never nested inside a `Option<…>`) — which is what makes the call await, so
+	/// a hook that verifies a signature settles before the handshake is answered.
 	authorize: Option<|Handshake| Result<Session, Reject>>,
-	/// The per-request gate on the connectionless `{mount}rpc` POST leg
-	/// (A120 S4, `transport-rpc.md` §9.7.6), when the app installed one.
-	/// `authorize`'s twin for the leg that has no handshake: `Ok(session)`
-	/// is stamped on that one request's `RpcRequest`, `Err(reject)` answers
-	/// the POST. Stored plain for `authorize`'s reason.
+	/// The per-request gate on the connectionless `{mount}rpc` POST leg (A120 S4,
+	/// `transport-rpc.md` §9.7.6), when the app installed one. `authorize`'s twin
+	/// for the leg that has no handshake: `Ok(session)` is stamped on that one
+	/// request's `RpcRequest`, `Err(reject)` answers the POST. Stored plain for
+	/// `authorize`'s reason.
 	authorize_request: Option<|Request| Result<Session, Reject>>,
-	/// Live upgraded connections on this mount, and the ceiling `0` means
-	/// none. A cell, so every copy of this `Service` value counts into one
-	/// total.
+	/// Live upgraded connections on this mount, and the ceiling `0` means none. A
+	/// cell, so every copy of this `Service` value counts into one total.
 	live: Shared<i32>,
 	max_connections: i32,
-	/// Handshakes admitted per remote address per `handshake_window`
-	/// milliseconds; `0` is unlimited.
+	/// Handshakes admitted per remote address per `handshake_window` milliseconds;
+	/// `0` is unlimited.
 	handshake_rate: i32,
 	handshake_window: f64,
 	/// The recent handshakes the rate is measured over: `(remote, at)`.
 	handshakes: Shared<List<(str, f64)>>,
-	/// Milliseconds a connection may stay silent after the upgrade before it
-	/// is destroyed; `0` is unlimited. Armed at the handshake and DISARMED by
-	/// the first inbound byte, so it bounds the greeting and never a
-	/// legitimately idle connection.
+	/// Milliseconds a connection may stay silent after the upgrade before it is
+	/// destroyed; `0` is unlimited. Armed at the handshake and DISARMED by the
+	/// first inbound byte, so it bounds the greeting and never a legitimately idle
+	/// connection.
 	handshake_timeout: i32,
-	/// Milliseconds the `authorize` hook may take before the handshake is
-	/// refused and the socket destroyed; `0` — the default — waits forever
-	/// (A48). `handshake_timeout`'s twin on the OTHER side of the upgrade:
-	/// that one bounds a client that says nothing, this one bounds a VERIFIER
-	/// that answers nothing.
+	/// Milliseconds the `authorize` hook may take before the handshake is refused
+	/// and the socket destroyed; `0` — the default — waits forever (A48).
+	/// `handshake_timeout`'s twin on the OTHER side of the upgrade: that one bounds
+	/// a client that says nothing, this one bounds a VERIFIER that answers nothing.
 	authorize_timeout: i32,
 	/// Whether this server sits behind a proxy it trusts (A48). When it does,
 	/// a client's address is the first entry of `X-Forwarded-For` rather than
@@ -461,11 +455,11 @@ export impl Service {
 	/// moment a method needs to know who called.
 	fun new(protocol: RpcProtocol): Service {
 		Service {
-			// One protocol for every client (the stateless shorthand), stamped
-			// per connection: a source-returning route exports through THIS
+			// One protocol for every client (the stateless shorthand), stamped per
+			// connection: a source-returning route exports through THIS
 			// connection's capability table, and the stamp is how it finds it
-			// (`transport-rpc.md` §9.2). The dispatcher is still shared —
-			// only the connection id differs between the copies.
+			// (`transport-rpc.md` §9.2). The dispatcher is still shared — only the
+			// connection id differs between the copies.
 			build_protocol = |connection| protocol
 				.for_connection(connection.id)
 				.in_session(connection.session),
@@ -503,14 +497,13 @@ export impl Service {
 	/// become per-client for free: each instance has its own cells, so each
 	/// connection's `__attach` mints channels over that client's own sources.
 	///
-	/// The instance is dropped with the connection: `on_disconnect` releases
-	/// the reactive session, and the dispatcher (with the instance every route
+	/// The instance is dropped with the connection: `on_disconnect` releases the
+	/// reactive session, and the dispatcher (with the instance every route
 	/// captured) goes with the socket that held it.
 	///
-	/// The connectionless `{mount}rpc` POST leg has no connection to build
-	/// for, so a factory service refuses it (501) — a factory service is
-	/// reached over the WebSocket transport, which every generated
-	/// `Client::connect` uses.
+	/// The connectionless `{mount}rpc` POST leg has no connection to build for, so
+	/// a factory service refuses it (501) — a factory service is reached over the
+	/// WebSocket transport, which every generated `Client::connect` uses.
 	fun factory<S: RpcService>(build: |Connection| S, codec: Codec): Service {
 		Service {
 			build_protocol = |connection| build(connection)
@@ -545,8 +538,8 @@ export impl Service {
 		self
 	}
 
-	/// Replace the connection lifecycle, for apps holding custom
-	/// per-connection state (an auth identity, an app-written attach).
+	/// Replace the connection lifecycle, for apps holding custom per-connection
+	/// state (an auth identity, an app-written attach).
 	fun on_connect(own self, handler: |i32, DuplexEnd| void): Service {
 		self.on_connect = handler;
 		self
@@ -558,22 +551,20 @@ export impl Service {
 	}
 
 	/// Decide whether a client may connect AT ALL, before the socket exists
-	/// (`transport-rpc.md` Q4's transport half, A40). `check` runs on the
-	/// upgrade request; `Err(reject)` answers 401/403/429/503 on the raw socket
-	/// and destroys it — no connection id, no reactive session, no service
-	/// instance — and `Ok(session)` becomes `Connection.session`, which
-	/// `Service::factory`'s `build` reads to construct that client's instance.
+	/// (`transport-rpc.md` Q4's transport half, A40). `check` runs on the upgrade
+	/// request; `Err(reject)` answers 401/403/429/503 on the raw socket and
+	/// destroys it — no connection id, no reactive session, no service instance —
+	/// and `Ok(session)` becomes `Connection.session`, which `Service::factory`'s
+	/// `build` reads to construct that client's instance.
 	///
-	/// The mechanism is the app's: std verifies nothing and knows no token
-	/// format. What std provides is the seam and the transport convention —
-	/// a browser cannot put a header on a WebSocket handshake, so the
-	/// credential rides in the subprotocol list as `"token.<credential>"`
-	/// (`Handshake::token`), which `std::rpc::rpc_protocols` writes on the
-	/// client side.
+	/// The mechanism is the app's: std verifies nothing and knows no token format.
+	/// What std provides is the seam and the transport convention — a browser
+	/// cannot put a header on a WebSocket handshake, so the credential rides in the
+	/// subprotocol list as `"token.<credential>"` (`Handshake::token`), which
+	/// `std::rpc::rpc_protocols` writes on the client side.
 	///
-	/// The check may await: verifying a signature is a WebCrypto call
-	/// everywhere, so this hook is async and the upgrade handler waits for it
-	/// before answering.
+	/// The check may await: verifying a signature is a WebCrypto call everywhere,
+	/// so this hook is async and the upgrade handler waits for it before answering.
 	///
 	/// ```text
 	/// Service::factory(build, json_codec())
@@ -618,8 +609,8 @@ export impl Service {
 	///     })
 	/// ```
 	///
-	/// How the two hooks compose — each gates its own leg, and neither opens
-	/// the other's:
+	/// How the two hooks compose — each gates its own leg, and neither opens the
+	/// other's:
 	///
 	/// | installed | the socket upgrade | `POST {mount}rpc` |
 	/// |---|---|---|
@@ -628,66 +619,65 @@ export impl Service {
 	/// | `authorize_request` only | open | gated per request |
 	/// | both | gated | gated per request |
 	///
-	/// The SSE `{mount}events`/`{mount}send` pair is a CONNECTION, not a
-	/// request, so it follows the upgrade's column. A `Service::factory`
-	/// service stays 501 on the POST leg whatever this hook would say: the
-	/// instance, not the identity, is what a POST cannot supply.
+	/// The SSE `{mount}events`/`{mount}send` pair is a CONNECTION, not a request,
+	/// so it follows the upgrade's column. A `Service::factory` service stays 501
+	/// on the POST leg whatever this hook would say: the instance, not the
+	/// identity, is what a POST cannot supply.
 	///
-	/// A credential read from a COOKIE is only as safe as the leg's
-	/// content-type gate, which is what keeps a cross-site form from reaching
-	/// this hook at all; a credential a script puts in a header is CSRF-immune
-	/// by construction. std reads no cookie for you.
+	/// A credential read from a COOKIE is only as safe as the leg's content-type
+	/// gate, which is what keeps a cross-site form from reaching this hook at all;
+	/// a credential a script puts in a header is CSRF-immune by construction. std
+	/// reads no cookie for you.
 	fun authorize_request(own self, check: async |Request| Result<Session, Reject>): Service {
 		self.authorize_request = Some(check);
 		self
 	}
 
 	/// Refuse an upgrade (429) once this mount already holds `limit` live
-	/// connections. `0` — the default — is unlimited. The cheapest of the
-	/// limits on this seam, and one of the three that work with no
-	/// `authorize` at all.
+	/// connections. `0` — the default — is unlimited. The cheapest of the limits on
+	/// this seam, and one of the three that work with no `authorize` at all.
 	///
-	/// It counts UPGRADED SOCKETS on this mount and nothing else (A48): the
-	/// counter moves in `accept_socket`, one up per 101 and one down per
-	/// teardown. The SSE/POST legs are not counted — they hold no connection
-	/// to count — and neither is a handshake still inside `authorize`, which
-	/// is what `authorize_timeout` and `handshake_rate` are for. So a service
-	/// whose clients arrive over `{mount}events` is not limited by this at
-	/// all, and a flood that never finishes its handshake is not either.
+	/// It counts UPGRADED SOCKETS on this mount and nothing else (A48): the counter
+	/// moves in `accept_socket`, one up per 101 and one down per teardown. The
+	/// SSE/POST legs are not counted — they hold no connection to count — and
+	/// neither is a handshake still inside `authorize`, which is what
+	/// `authorize_timeout` and `handshake_rate` are for. So a service whose clients
+	/// arrive over `{mount}events` is not limited by this at all, and a flood that
+	/// never finishes its handshake is not either.
 	fun max_connections(own self, limit: i32): Service {
 		self.max_connections = limit;
 		self
 	}
 
-	/// Refuse an upgrade (429) once one client address has attempted
-	/// `attempts` handshakes inside `window_millis`. `0` attempts — the
-	/// default — is unlimited.
+	/// Refuse an upgrade (429) once one client address has attempted `attempts`
+	/// handshakes inside `window_millis`. `0` attempts — the default — is
+	/// unlimited.
 	///
-	/// The address is the socket's peer unless `trust_forwarded_for(true)`
-	/// says otherwise: behind a proxy every client shares the proxy's address
-	/// and a per-address limit becomes a global one, refusing everybody as
-	/// soon as one client is noisy.
+	/// The address is the socket's peer unless `trust_forwarded_for(true)` says
+	/// otherwise: behind a proxy every client shares the proxy's address and a
+	/// per-address limit becomes a global one, refusing everybody as soon as one
+	/// client is noisy.
 	fun handshake_rate(own self, attempts: i32, window_millis: f64): Service {
 		self.handshake_rate = attempts;
 		self.handshake_window = window_millis;
 		self
 	}
 
-	/// Read a client's address from the first entry of `X-Forwarded-For`
-	/// instead of the socket peer (A48) — what `handshake_rate` keys on, what
-	/// `authorize` sees in `Handshake.remote_addr`, and what a connection
-	/// reports as `Connection.remote_addr`. One switch for all three, because
-	/// a deployment either sits behind a proxy or it does not.
+	/// Read a client's address from the first entry of `X-Forwarded-For` instead of
+	/// the socket peer (A48) — what `handshake_rate` keys on, what `authorize` sees
+	/// in `Handshake.remote_addr`, and what a connection reports as
+	/// `Connection.remote_addr`. One switch for all three, because a deployment
+	/// either sits behind a proxy or it does not.
 	///
-	/// OFF by default and it must stay off unless a proxy you control is the
-	/// ONLY way to reach this server: the header is written by whoever spoke
-	/// last, so a directly-exposed server that trusts it lets any client pick
-	/// its own rate-limit bucket — and its own audit trail — by writing one
-	/// line. A trusted proxy overwrites (or appends to) the header, which is
-	/// what makes the first entry the real client.
+	/// OFF by default and it must stay off unless a proxy you control is the ONLY
+	/// way to reach this server: the header is written by whoever spoke last, so a
+	/// directly-exposed server that trusts it lets any client pick its own
+	/// rate-limit bucket — and its own audit trail — by writing one line. A trusted
+	/// proxy overwrites (or appends to) the header, which is what makes the first
+	/// entry the real client.
 	///
-	/// Falls back to the socket peer when the header is absent or empty, so
-	/// turning it on never leaves an address blank.
+	/// Falls back to the socket peer when the header is absent or empty, so turning
+	/// it on never leaves an address blank.
 	fun trust_forwarded_for(own self, trusted: bool): Service {
 		self.trust_forwarded_for = trusted;
 		self
@@ -702,49 +692,47 @@ export impl Service {
 		self
 	}
 
-	/// Refuse a handshake whose `authorize` hook has not answered `millis`
-	/// after it was called, and destroy the socket (A48). `0` — the default —
-	/// waits forever, which is what the hook got before this existed.
+	/// Refuse a handshake whose `authorize` hook has not answered `millis` after it
+	/// was called, and destroy the socket (A48). `0` — the default — waits forever,
+	/// which is what the hook got before this existed.
 	///
-	/// `authorize` is AWAITED inside the upgrade handler, so a verifier that
-	/// hangs — a token endpoint that stopped answering, a database that is
-	/// gone — holds an unanswered socket for as long as it hangs, and one per
-	/// client trying to connect. That is a denial of service the server
-	/// inflicts on itself, reached without a single malformed byte from
-	/// anyone. `handshake_rate` caps how fast the pile grows; only a bound on
-	/// the verifier caps how big it gets.
+	/// `authorize` is AWAITED inside the upgrade handler, so a verifier that hangs
+	/// — a token endpoint that stopped answering, a database that is gone — holds
+	/// an unanswered socket for as long as it hangs, and one per client trying to
+	/// connect. That is a denial of service the server inflicts on itself, reached
+	/// without a single malformed byte from anyone. `handshake_rate` caps how fast
+	/// the pile grows; only a bound on the verifier caps how big it gets.
 	///
 	/// The refusal is `Reject::TooMany` — 429, and still not 503 now that
 	/// `Reject::Unavailable` exists (A52). The distinction the enum draws is
 	/// judgement (401/403) against LIMIT (429) against the app's own "not now"
 	/// (503), and a verifier that did not answer in time is a limit: it says
-	/// nothing about the credential, and it is exactly the case a client
-	/// should retry. `Unavailable` is a refusal an APP gives from its own
-	/// `authorize`; this one is std refusing on the app's behalf because the
-	/// app said nothing at all, and reporting it as the app's judgement would
-	/// be a claim std cannot make.
+	/// nothing about the credential, and it is exactly the case a client should
+	/// retry. `Unavailable` is a refusal an APP gives from its own `authorize`;
+	/// this one is std refusing on the app's behalf because the app said nothing at
+	/// all, and reporting it as the app's judgement would be a claim std cannot
+	/// make.
 	///
-	/// A48 chose 429 before `Unavailable` existed, when "a limit, not a
-	/// judgement" was the whole argument and there was no other arm to weigh
-	/// it against. A52 built the arm, and the question was re-asked of it
-	/// (A56): the eligibility rule A52 landed is `tells_the_client` = did the
-	/// APP decide, and by that rule the timeout is not the app's to report.
-	/// So the answer is unchanged and no longer merely chosen — the
-	/// distinction A52 drew is what keeps 429 correct here. **RULED: keep 429**
-	/// (owner, R6, `transport-rpc.md` §9.2, 2026-09-09).
+	/// A48 chose 429 before `Unavailable` existed, when "a limit, not a judgement"
+	/// was the whole argument and there was no other arm to weigh it against. A52
+	/// built the arm, and the question was re-asked of it (A56): the eligibility
+	/// rule A52 landed is `tells_the_client` = did the APP decide, and by that rule
+	/// the timeout is not the app's to report. So the answer is unchanged and no
+	/// longer merely chosen — the distinction A52 drew is what keeps 429 correct
+	/// here. **RULED: keep 429** (owner, R6, `transport-rpc.md` §9.2, 2026-09-09).
 	///
 	/// A hook that answers LATE is not raced back in: the socket is already
-	/// destroyed and the timeout is one-way, so a straggling verifier's reply
-	/// is discarded rather than written to a socket that is gone.
+	/// destroyed and the timeout is one-way, so a straggling verifier's reply is
+	/// discarded rather than written to a socket that is gone.
 	fun authorize_timeout(own self, millis: i32): Service {
 		self.authorize_timeout = millis;
 		self
 	}
 }
 
-/// Whether this handshake is inside the per-address rate, recording it when it
-/// is. Prunes the window on the way through, so the table holds one window's
-/// worth of handshakes and not a row per address ever seen.
+/// Whether this handshake is inside the per-address rate, recording it when it is.
+/// Prunes the window on the way through, so the table holds one window's worth of
+/// handshakes and not a row per address ever seen.
 fun admit_handshake(service: Service, remote: str): bool {
 	let cutoff = now_millis() - service.handshake_window;
 	mut kept: List<(str, f64)> = [];
@@ -767,12 +755,12 @@ fun admit_handshake(service: Service, remote: str): bool {
 	true
 }
 
-/// A client's address: the socket peer, or — when the service is configured
-/// behind a proxy it trusts (A48) — the first entry of `X-Forwarded-For`.
+/// A client's address: the socket peer, or — when the service is configured behind
+/// a proxy it trusts (A48) — the first entry of `X-Forwarded-For`.
 ///
-/// The FIRST entry, because a proxy chain appends: `client, proxy1, proxy2`.
-/// Empty entries are skipped and the socket peer is the fallback, so a missing
-/// or blank header never yields a blank address.
+/// The FIRST entry, because a proxy chain appends: `client, proxy1, proxy2`. Empty
+/// entries are skipped and the socket peer is the fallback, so a missing or blank
+/// header never yields a blank address.
 fun client_address(service: Service, request: NodeRequest, socket: NodeSocket): str {
 	let peer = socket.remote_address();
 	if !service.trust_forwarded_for {
@@ -792,14 +780,14 @@ fun client_address(service: Service, request: NodeRequest, socket: NodeSocket): 
 	}
 }
 
-/// The pre-upgrade gate: the limits that work with no auth at all, then the
-/// app's own check. The order is deliberate — a flood is refused without
-/// running (or paying for) a signature verification.
+/// The pre-upgrade gate: the limits that work with no auth at all, then the app's
+/// own check. The order is deliberate — a flood is refused without running (or
+/// paying for) a signature verification.
 ///
-/// `Err(Reject)` here means the socket has NOT been written to and is still
-/// open, with one exception the caller must respect: an `authorize` that ran
-/// out of time has already destroyed it (`refuse_upgrade` checks, and writes
-/// nothing to a destroyed socket).
+/// `Err(Reject)` here means the socket has NOT been written to and is still open,
+/// with one exception the caller must respect: an `authorize` that ran out of time
+/// has already destroyed it (`refuse_upgrade` checks, and writes nothing to a
+/// destroyed socket).
 fun gate_upgrade(
 	service: Service,
 	request: NodeRequest,
@@ -815,16 +803,16 @@ fun gate_upgrade(
 	match service.authorize {
 		None => Ok(Session::anonymous()),
 		Some(let check) => {
-			// Re-marked at the `let` so the call awaits (J2's typed channel):
-			// the hook may verify a signature, and nothing may be written to
-			// the socket until it has.
+			// Re-marked at the `let` so the call awaits (J2's typed channel): the
+			// hook may verify a signature, and nothing may be written to the socket
+			// until it has.
 			let gate: async |Handshake| Result<Session, Reject> = check;
-			// The verification bound (A48): armed before the hook is called
-			// and disarmed the moment it answers. `settled` is what makes the
-			// listener one-way — node's `"timeout"` handler stays attached for
-			// the life of the socket, and `accept_socket` re-arms the same
-			// timer for the greeting bound, so an authorized connection must
-			// not be destroyed later by the listener this arm left behind.
+			// The verification bound (A48): armed before the hook is called and
+			// disarmed the moment it answers. `settled` is what makes the listener
+			// one-way — node's `"timeout"` handler stays attached for the life of
+			// the socket, and `accept_socket` re-arms the same timer for the
+			// greeting bound, so an authorized connection must not be destroyed
+			// later by the listener this arm left behind.
 			mut settled = false;
 			mut expired = false;
 			if service.authorize_timeout > 0 {
@@ -833,10 +821,10 @@ fun gate_upgrade(
 					if !settled {
 						settled = true;
 						expired = true;
-						// Answered HERE and not by the caller: the point of
-						// the bound is to release the socket now, and the
-						// caller does not run again until the hook returns —
-						// which is the thing that may never happen.
+						// Answered HERE and not by the caller: the point of the
+						// bound is to release the socket now, and the caller does
+						// not run again until the hook returns — which is the thing
+						// that may never happen.
 						refuse_upgrade(request, socket, Reject::TooMany);
 					}
 				});
@@ -851,8 +839,8 @@ fun gate_upgrade(
 				socket.set_timeout(0);
 			}
 			if expired {
-				// The socket is already gone; the hook's answer, whenever it
-				// came, is discarded rather than written to it.
+				// The socket is already gone; the hook's answer, whenever it came,
+				// is discarded rather than written to it.
 				ret Err(Reject::TooMany);
 			}
 			settled = true;
@@ -862,9 +850,9 @@ fun gate_upgrade(
 }
 
 export impl ServerBuilder {
-	/// Install an rpc service. Repeatable. Its routes answer before
-	/// `on_request`, independently of the order these calls were written —
-	/// longest mount first, computed at `build()` (§4.3).
+	/// Install an rpc service. Repeatable. Its routes answer before `on_request`,
+	/// independently of the order these calls were written — longest mount first,
+	/// computed at `build()` (§4.3).
 	fun with_service(own self, service: Service): ServerBuilder {
 		self.services.push(service);
 		self
@@ -888,18 +876,17 @@ fun fresh_connection(): i32 {
 
 // --- The fold: `Service`s answer before `on_request`/`on_upgrade` (§4.3) -------
 
-/// A path targets exactly `route`: itself, or `route` followed by a query
-/// string — a path-SEGMENT match, not a prefix one, so a mount's `…/rpc`
-/// route does not also claim `…/rpcs` (§10.8's fix for the old
-/// `path.starts_with(…)` collision).
+/// A path targets exactly `route`: itself, or `route` followed by a query string —
+/// a path-SEGMENT match, not a prefix one, so a mount's `…/rpc` route does not also
+/// claim `…/rpcs` (§10.8's fix for the old `path.starts_with(…)` collision).
 fun path_matches_route(path: str, route: str): bool {
 	path == route || path.starts_with(route + "?")
 }
 
 /// Longest mount first — the tiebreak §4.3 gives so two services (`/` and
-/// `/admin/`, say) are checked in the same order whichever order
-/// `.with_service` was called in. Stable, so services sharing a mount length
-/// keep their registration order.
+/// `/admin/`, say) are checked in the same order whichever order `.with_service`
+/// was called in. Stable, so services sharing a mount length keep their
+/// registration order.
 fun services_by_mount(services: List<Service>): List<Service> {
 	services.sort_by(|a, b| {
 		if a.mount.len() > b.mount.len() {
@@ -912,8 +899,8 @@ fun services_by_mount(services: List<Service>): List<Service> {
 	})
 }
 
-/// One connected service's SSE route: announce the connection, hand the app
-/// its `DuplexEnd`, and forward inbound wire frames to the stream.
+/// One connected service's SSE route: announce the connection, hand the app its
+/// `DuplexEnd`, and forward inbound wire frames to the stream.
 fun events_response(service: Service): Response {
 	let id = fresh_connection();
 	let on_connect = service.on_connect;
@@ -927,9 +914,9 @@ fun events_response(service: Service): Response {
 			wire_end.on_frame(|frame| {
 				match frame {
 					Frame::Text(let body) => stream.send(i"data: {body}\n\n"),
-					// SSE can't carry bytes. Unreachable when both sides
-					// run one codec: a binary codec's client panics on its
-					// first send, before the server ever pushes.
+					// SSE can't carry bytes. Unreachable when both sides run one
+					// codec: a binary codec's client panics on its first send,
+					// before the server ever pushes.
 					Frame::Binary(let _bytes) => {},
 				}
 			});
@@ -944,8 +931,8 @@ fun events_response(service: Service): Response {
 }
 
 /// One connected service's send route: forward the body to the addressed
-/// connection's wire (§4.4 — the connection id space is process-wide, shared
-/// by every mounted service, so this needs no service-specific state at all).
+/// connection's wire (§4.4 — the connection id space is process-wide, shared by
+/// every mounted service, so this needs no service-specific state at all).
 fun send_response(request: Request): Response {
 	let content = request.body();
 	// A garbled id parses to -1, which matches no connection — the frame is
@@ -963,18 +950,17 @@ fun send_response(request: Request): Response {
 	Response::builder().code(204).body("").build()
 }
 
-/// One connected service's rpc route: the body as bytes, no sniffing — the
-/// JSON codec's reader accepts a binary frame as UTF-8 (both sides run one
-/// codec, Q6).
+/// One connected service's rpc route: the body as bytes, no sniffing — the JSON
+/// codec's reader accepts a binary frame as UTF-8 (both sides run one codec, Q6).
 ///
 /// A POST carries no connection, so a service that builds one instance per
-/// connection (`Service::factory`) has nothing to answer it with — no
-/// instance, no session, no identity. That is refused in as many words rather
-/// than silently answered by some other client's instance.
+/// connection (`Service::factory`) has nothing to answer it with — no instance, no
+/// session, no identity. That is refused in as many words rather than silently
+/// answered by some other client's instance.
 fun rpc_frame_response(service: Service, request: Request): Response {
-	// §9.7.7's 405, and §9.7.9's content-type gate — both before the body is
-	// read, because both are statements about the REQUEST rather than about
-	// what it carries.
+	// §9.7.7's 405, and §9.7.9's content-type gate — both before the body is read,
+	// because both are statements about the REQUEST rather than about what it
+	// carries.
 	if request.method() != "POST" {
 		ret Response::builder()
 			.code(405)
@@ -988,15 +974,15 @@ fun rpc_frame_response(service: Service, request: Request): Response {
 	}
 	match service.shared {
 		Some(let protocol) => {
-			// A120 S4: the per-request gate, after the two statements about
-			// the request's SHAPE — so a cross-site form, which cannot pass
-			// the content-type gate, never reaches a hook that might read a
-			// cookie — and before the frame is read.
+			// A120 S4: the per-request gate, after the two statements about the
+			// request's SHAPE — so a cross-site form, which cannot pass the
+			// content-type gate, never reaches a hook that might read a cookie —
+			// and before the frame is read.
 			let session = match service.authorize_request {
 				None => Session::anonymous(),
 				Some(let check) => {
-					// Re-marked at the `let` so the call awaits, as
-					// `gate_upgrade` does for `authorize`.
+					// Re-marked at the `let` so the call awaits, as `gate_upgrade`
+					// does for `authorize`.
 					let gate: async |Request| Result<Session, Reject> = check;
 					match gate(request) {
 						Ok(let proved) => proved,
@@ -1008,22 +994,21 @@ fun rpc_frame_response(service: Service, request: Request): Response {
 			let (reply, status) = turn(FlushPolicy::AtEnd, || answering.respond_with_status(Frame::Binary(request.bytes())));
 			envelope_response(reply, status)
 		},
-		// §9.7.7: as an ENVELOPE now, so a vilan client meeting it reads a
-		// typed `Remote(..)` rather than `Decode("unrecognized reply
-		// envelope")` about a plain-text sentence.
+		// §9.7.7: as an ENVELOPE now, so a vilan client meeting it reads a typed
+		// `Remote(..)` rather than `Decode("unrecognized reply envelope")` about a
+		// plain-text sentence.
 		None => envelope_response(encode_reply(service.codec, RpcOutcome::Failure(RpcError::Remote(FACTORY_REFUSAL))), 501),
 	}
 }
 
-/// `authorize_request`'s `Err(reject)`, answered on the POST leg with the
-/// reject's own status (A120 S4). The arms a vilan client can be TOLD about
-/// travel as an envelope, in the vocabulary a refused socket already reads —
-/// 401 and 403 as `Unauthorized` (`RpcError` has one arm for both, as the
-/// socket client's mapping does), 503 as `Unavailable` — so the envelope and
-/// the status say the same thing. `TooMany` is a limit rather than the app's
-/// judgement (`tells_the_client`), and a limit is answered as a bare status
-/// on this leg as on the socket, which a vilan client reads as
-/// `Transport(..)` naming it.
+/// `authorize_request`'s `Err(reject)`, answered on the POST leg with the reject's
+/// own status (A120 S4). The arms a vilan client can be TOLD about travel as an
+/// envelope, in the vocabulary a refused socket already reads — 401 and 403 as
+/// `Unauthorized` (`RpcError` has one arm for both, as the socket client's mapping
+/// does), 503 as `Unavailable` — so the envelope and the status say the same thing.
+/// `TooMany` is a limit rather than the app's judgement (`tells_the_client`), and a
+/// limit is answered as a bare status on this leg as on the socket, which a vilan
+/// client reads as `Transport(..)` naming it.
 fun request_refusal(service: Service, reject: Reject): Response {
 	let status = reject_number(reject);
 	if !tells_the_client(reject) {
@@ -1071,8 +1056,8 @@ fun envelope_response(reply: Frame, status: i32): Response {
 /// the one who needs it.
 ///
 /// std does no CORS beyond this (Q3, RULED): `on_request` plus `set_header` is
-/// already the whole mechanism, and an allowed-origin list is a security
-/// decision std has no information for. The guide carries the recipe.
+/// already the whole mechanism, and an allowed-origin list is a security decision
+/// std has no information for. The guide carries the recipe.
 fun content_type_refusal(request: Request): Option<Response> {
 	let declared = match request.header("content-type") {
 		Some(let value) => value.to_lowercase_ascii(),
@@ -1123,14 +1108,14 @@ fun unauthorized_response(service: Service, route: str): Response {
 	}
 }
 
-/// `service`'s answer to `request`, if its routes claim the path — `None`
-/// when the path is not this service's.
+/// `service`'s answer to `request`, if its routes claim the path — `None` when the
+/// path is not this service's.
 fun service_response(service: Service, request: Request): Option<Response> {
 	let path = request.path();
-	// The two CONNECTION legs follow the upgrade's gate. The rpc leg is
-	// refused outright only when the upgrade is gated and nothing gates the
-	// request itself — `authorize_request` is that gate (A120 S4), and with
-	// it the leg answers per request instead.
+	// The two CONNECTION legs follow the upgrade's gate. The rpc leg is refused
+	// outright only when the upgrade is gated and nothing gates the request itself
+	// — `authorize_request` is that gate (A120 S4), and with it the leg answers per
+	// request instead.
 	let gated = service.authorize.is_some();
 	let post_refused = gated && service.authorize_request.is_none();
 	if path_matches_route(path, service.mount + "events") {
@@ -1167,9 +1152,9 @@ fun services_answer(services: List<Service>, request: Request): Option<Response>
 	answer
 }
 
-/// Compose `services`' routing in front of `fallback`: rule 1's "services
-/// first, then `on_request`, always" (§4.3), independent of the order
-/// `.with_service` was called in.
+/// Compose `services`' routing in front of `fallback`: rule 1's "services first,
+/// then `on_request`, always" (§4.3), independent of the order `.with_service` was
+/// called in.
 export fun fold_service_requests(
 	services: List<Service>,
 	fallback: async |Request| Response,
@@ -1184,8 +1169,8 @@ export fun fold_service_requests(
 }
 
 /// The first (longest-mount) service whose mount the upgrade request's path
-/// targets, if any (§4.4: one multiplexed socket per connection, so the
-/// upgrade path — not a per-route suffix — is what a mount claims).
+/// targets, if any (§4.4: one multiplexed socket per connection, so the upgrade
+/// path — not a per-route suffix — is what a mount claims).
 fun service_for_upgrade(services: List<Service>, request: NodeRequest): Option<Service> {
 	let path = request.url();
 	mut answer: Option<Service> = None;
@@ -1216,9 +1201,8 @@ export fun fold_service_upgrades(
 		Some(|request, socket, head| {
 			match service_for_upgrade(sorted, request) {
 				// A40: the gate runs BEFORE the handshake, so a refused client
-				// never reaches a connection id, a reactive session or a
-				// service instance — it gets a status line and a destroyed
-				// socket.
+				// never reaches a connection id, a reactive session or a service
+				// instance — it gets a status line and a destroyed socket.
 				Some(let service) => match gate_upgrade(service, request, socket) {
 					Ok(let session) => accept_socket(request, socket, head, service, session),
 					Err(let reject) => refuse_upgrade(request, socket, reject),
@@ -1232,12 +1216,11 @@ export fun fold_service_upgrades(
 	}
 }
 
-/// Perform the RFC 6455 handshake and wire the socket into the connection
-/// registry. Client→server text frames route by channel prefix (§5's
-/// multiplex): `r:<id>:<frame>` is an RPC turn answered on the same socket
-/// with the same id, `d:<frame>` is a duplex/reactive wire turn. Pings are
-/// answered; close (or a protocol violation) tears the session down like an
-/// SSE close.
+/// Perform the RFC 6455 handshake and wire the socket into the connection registry.
+/// Client→server text frames route by channel prefix (§5's multiplex):
+/// `r:<id>:<frame>` is an RPC turn answered on the same socket with the same id,
+/// `d:<frame>` is a duplex/reactive wire turn. Pings are answered; close (or a
+/// protocol violation) tears the session down like an SSE close.
 fun accept_socket(
 	request: NodeRequest,
 	socket: NodeSocket,
@@ -1250,16 +1233,16 @@ fun accept_socket(
 		socket.destroy();
 		ret;
 	}
-	// RFC 6455 §4.2.2: a client that offered subprotocols must hear the
-	// server's selection back, or it closes the connection — which is what a
-	// browser does, silently, and what this handshake gave every such client
-	// before A40 because it echoed nothing at all.
+	// RFC 6455 §4.2.2: a client that offered subprotocols must hear the server's
+	// selection back, or it closes the connection — which is what a browser does,
+	// silently, and what this handshake gave every such client before A40 because
+	// it echoed nothing at all.
 	write_upgrade_101(socket, headers);
 	let id = fresh_connection();
-	// The reverse lane (§9.3), registered BEFORE the instance is built: the
-	// factory closure calls `connection.client()`, and a proxy minted against an
-	// unregistered id would be a silent no-op for the life of the connection.
-	// It rides here rather than through `service.on_connect` because an app that
+	// The reverse lane (§9.3), registered BEFORE the instance is built: the factory
+	// closure calls `connection.client()`, and a proxy minted against an
+	// unregistered id would be a silent no-op for the life of the connection. It
+	// rides here rather than through `service.on_connect` because an app that
 	// replaces the connection lifecycle must not thereby lose the ability to be
 	// called back — `on_connect` is the app's seam, and this is the transport's.
 	//
@@ -1273,8 +1256,8 @@ fun accept_socket(
 	});
 	// The connection's OWN protocol: under `Service::factory` this builds the
 	// instance that answers for this client and nothing else (A38), and every
-	// `respond` below routes through it. `session` is what `authorize` proved
-	// about this client (A40) — anonymous when the service gates nothing.
+	// `respond` below routes through it. `session` is what `authorize` proved about
+	// this client (A40) — anonymous when the service gates nothing.
 	let protocol = (service.build_protocol)(Connection {
 		id,
 		session,
@@ -1302,9 +1285,9 @@ fun accept_socket(
 			on_disconnect(id);
 		}
 	};
-	// The greeting bound (A40): armed here, disarmed by the first inbound
-	// byte, so a socket that upgrades and then says nothing costs one timer
-	// rather than a connection slot for the life of the process.
+	// The greeting bound (A40): armed here, disarmed by the first inbound byte, so
+	// a socket that upgrades and then says nothing costs one timer rather than a
+	// connection slot for the life of the process.
 	mut greeted = false;
 	if service.handshake_timeout > 0 {
 		socket.set_timeout(service.handshake_timeout);
@@ -1341,15 +1324,15 @@ fun accept_socket(
 							// next event of the same chunk.
 							//
 							// Awaiting it inline serialized every frame TCP
-							// coalesced into one read — which on a fast local
-							// link is the common case, not the rare one — so a
-							// handler that suspended on anything the NEXT frame
-							// of the same chunk would have delivered waited for
-							// a message the loop was holding. Per-handler turns
-							// settle independently (`turn` establishes a fresh
-							// one per call), and the REPLY ORDER within a chunk
-							// is not promised: replies carry their request id
-							// and arrive when their handler is done.
+							// coalesced into one read — which on a fast local link
+							// is the common case, not the rare one — so a handler
+							// that suspended on anything the NEXT frame of the same
+							// chunk would have delivered waited for a message the
+							// loop was holding. Per-handler turns settle
+							// independently (`turn` establishes a fresh one per
+							// call), and the REPLY ORDER within a chunk is not
+							// promised: replies carry their request id and arrive
+							// when their handler is done.
 							let _running = async {
 								let reply = turn(FlushPolicy::AtEnd, || protocol.respond(Frame::Text(payload)));
 								match reply {
@@ -1389,8 +1372,8 @@ fun accept_socket(
 							| bytes.get(3) << 16
 							| bytes.get(4) << 24;
 						let payload = bytes.slice(5, bytes.len());
-						// Started, not awaited — the text lane's rule, and for
-						// the same reason (a chunk is not a queue).
+						// Started, not awaited — the text lane's rule, and for the
+						// same reason (a chunk is not a queue).
 						let _running = async {
 							let reply = turn(FlushPolicy::AtEnd, || protocol.respond(Frame::Binary(payload)));
 							match reply {
@@ -1429,8 +1412,8 @@ fun accept_socket(
 	on_connect(id, app_end);
 }
 
-/// Forget a closed connection's wire (frames already in flight to it are
-/// silently dropped by the host — see `NodeResponse.write`).
+/// Forget a closed connection's wire (frames already in flight to it are silently
+/// dropped by the host — see `NodeResponse.write`).
 fun drop_connection(target: i32) {
 	mut kept: List<(i32, DuplexEnd)> = [];
 	for entry in connections.read() {

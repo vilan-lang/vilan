@@ -58,21 +58,32 @@ pub const KNOWN_SECTIONS: &[&str] = &[
     "package", "library", "project", "build", "fmt", "macro", "entry", "server", "client",
 ];
 
-/// The `[fmt]` section: `vilan fmt`'s per-package knobs (E205).
+/// The `[fmt]` section: `vilan fmt`'s per-package knobs (E205, E215).
 ///
-/// Deliberately not a WIDTH. The formatter has one canonical layout for code
-/// and a width knob would fork the shape of every file in every project; what
-/// belongs here is the one thing that cannot be settled globally, which is
-/// whether the formatter may rewrite the author's own prose.
+/// Still not a knob for CODE. The formatter has one canonical layout and a
+/// code-width knob would fork the shape of every file in every project. What
+/// belongs here is the pair that cannot be settled globally, and both are
+/// about PROSE: whether the formatter may rewrite the author's comments at
+/// all, and — once it may — how wide the author writes them.
 #[derive(Debug, Default, Deserialize)]
 pub struct Fmt {
-    /// Re-fill a paragraph of `//` / `///` lines to the line width, the way
+    /// Re-fill a paragraph of `//` / `///` lines to the comment width, the way
     /// the printer already lays out code. Default OFF for one release (E205's
     /// R8): rewrapping somebody's comments is the one thing the formatter does
     /// that no token comparison can check, so it is asked for rather than
     /// arriving with an upgrade.
     #[serde(rename = "wrap_comments")]
     pub wrap_comments: Option<bool>,
+    /// The column budget a comment paragraph is re-filled to (E215's R1).
+    /// Default: the code width, which is what E205 shipped and what a package
+    /// that says nothing keeps.
+    ///
+    /// It is a SEPARATE width from the code's because prose is not code: std's
+    /// own comments are written to ~84 columns, so re-filling them to the code
+    /// width moved 6,719 lines to a width nobody had chosen. A package that
+    /// writes narrower prose than it writes code says so here, once.
+    #[serde(rename = "comment_width")]
+    pub comment_width: Option<usize>,
 }
 
 /// The `[macro]` section: per-package expansion budgets.
@@ -869,40 +880,79 @@ pub fn generated_root_in(directory: &Path) -> Option<PathBuf> {
 /// link. Resolving the deepest ancestor that does exist puts both sides in the
 /// same spelling; where nothing exists at all, both degrade lexically together,
 /// which is the spelled ladder and not a mixed comparison.
-/// Whether `[fmt] wrap_comments` is on for the package covering `path` (a
-/// file or a directory) — E205's opt-in, and the ONE predicate behind it.
+/// What a package's manifests say about `vilan fmt`'s prose knobs — each key
+/// `None` when nothing above the file declared it, so a caller can tell "not
+/// asked for" from "asked for, and false".
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FmtOpinions {
+    /// `[fmt] wrap_comments` (E205).
+    pub wrap_comments: Option<bool>,
+    /// `[fmt] comment_width` (E215).
+    pub comment_width: Option<usize>,
+}
+
+impl FmtOpinions {
+    /// Whether every key already has an answer, so the climb can stop.
+    fn settled(&self) -> bool {
+        self.wrap_comments.is_some() && self.comment_width.is_some()
+    }
+
+    /// Fills in the keys still unanswered from a manifest lower in the climb's
+    /// path — which is what makes the NEAREST declaration of each key win
+    /// INDEPENDENTLY: a workspace may set the width while a member turns the
+    /// wrapping off.
+    fn take_from(&mut self, declared: &Fmt) {
+        self.wrap_comments = self.wrap_comments.or(declared.wrap_comments);
+        self.comment_width = self.comment_width.or(declared.comment_width);
+    }
+}
+
+/// The `[fmt]` opinions covering `path` (a file or a directory) — E205's
+/// opt-in and E215's width, resolved in ONE climb.
 ///
 /// It lives here, over a path, for exactly [`generated_root_covering`]'s
 /// reason: the CLI walks directories while an editor is handed one buffer by
 /// its exact path, and the two must answer identically or a file would be
 /// wrapped by `vilan fmt` and unwrapped by format-on-save. The search climbs
-/// to the filesystem root and takes the NEAREST manifest that declares the
-/// key, so a workspace can set it once and a member override it; a manifest
-/// that declares nothing is climbed past rather than read as `false`.
+/// to the filesystem root and takes, PER KEY, the NEAREST manifest that
+/// declares it, so a workspace can set one once and a member override it; a
+/// manifest that declares nothing is climbed past rather than read as a
+/// default.
 ///
-/// Every failure answers `false`: no manifest, a manifest that does not parse,
+/// Every failure answers `None`: no manifest, a manifest that does not parse,
 /// a manifest declaring nothing. That is the safe direction and the only one
 /// available here — an unreadable tree gets today's formatter, never a
 /// silently different one.
-pub fn wrap_comments_covering(path: &Path) -> bool {
+pub fn fmt_opinions_covering(path: &Path) -> FmtOpinions {
+    let mut opinions = FmtOpinions::default();
     let mut current = Some(crate::util::spelled_path(path));
     while let Some(directory) = current {
-        if let Some(declared) = wrap_comments_in(&directory) {
-            return declared;
+        if let Some(declared) = fmt_section_in(&directory) {
+            opinions.take_from(&declared);
+            if opinions.settled() {
+                break;
+            }
         }
         current = directory.parent().map(Path::to_path_buf);
     }
-    false
+    opinions
 }
 
-/// The `[fmt] wrap_comments` `directory`'s own `vilan.toml` declares, or
-/// `None` when there is no manifest, it does not parse, or it is silent —
-/// which is what makes the climb in [`wrap_comments_covering`] pass through a
+/// Whether `[fmt] wrap_comments` is on for the package covering `path` — the
+/// ONE predicate behind E205's opt-in, and [`fmt_opinions_covering`]'s
+/// `wrap_comments` half with the default (off) applied.
+pub fn wrap_comments_covering(path: &Path) -> bool {
+    fmt_opinions_covering(path).wrap_comments.unwrap_or(false)
+}
+
+/// The `[fmt]` section `directory`'s own `vilan.toml` declares, or `None` when
+/// there is no manifest, it does not parse, or it has no `[fmt]` at all —
+/// which is what makes the climb in [`fmt_opinions_covering`] pass through a
 /// manifest that has no opinion.
-fn wrap_comments_in(directory: &Path) -> Option<bool> {
+fn fmt_section_in(directory: &Path) -> Option<Fmt> {
     let text = std::fs::read_to_string(directory.join("vilan.toml")).ok()?;
     let (manifest, _warnings) = Manifest::parse(&text).ok()?;
-    manifest.fmt?.wrap_comments
+    manifest.fmt
 }
 
 pub fn generated_root_covering(path: &Path) -> Option<PathBuf> {

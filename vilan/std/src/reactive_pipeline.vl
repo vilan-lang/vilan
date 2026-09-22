@@ -40,9 +40,9 @@ import pkg::shared::Shared;
 /// away, once per hop. The requirement lets each node say how it forwards, and
 /// the root says how it mints.
 export trait Cold<T> with Source<T> {
-	/// Attach WITHOUT a payload and without an immediate call. The observer is
-	/// told that this source may have changed; it reads `get()` if it wants to
-	/// know what to.
+	/// Attach WITHOUT a payload and without an immediate call. The observer is told
+	/// that this source may have changed; it reads `get()` if it wants to know what
+	/// to.
 	[must_use]
 	fun on_settle(self, observer: || void): Subscription;
 }
@@ -66,8 +66,8 @@ export struct Map<S, T, U> {
 }
 
 export impl Map<type S: Cold<type T>, T, type U> with Source<U> {
-	/// The PULL: one call up the chain, one application of the transform. A
-	/// cold node's whole cost, paid by the reader.
+	/// The PULL: one call up the chain, one application of the transform. A cold
+	/// node's whole cost, paid by the reader.
 	fun get(self): U {
 		(self.transform)(self.up.get())
 	}
@@ -86,8 +86,8 @@ export impl Map<type S: Cold<type T>, T, type U> with Cold<U> {
 	}
 }
 
-/// `switch` as a NODE (A123's dynamic dependency, cold): the inner source is
-/// chosen by the current value of the upstream at every read.
+/// `switch` as a NODE (A123's dynamic dependency, cold): the inner source is chosen
+/// by the current value of the upstream at every read.
 ///
 /// The rolling registration is the one thing a cold `Switch` cannot avoid
 /// keeping: a downstream told "something settled" must be told again when the
@@ -127,9 +127,9 @@ export impl Switch<type S: Cold<type T>, T, type I: Cold<type U>> with Cold<U> {
 	}
 }
 
-/// `combine` as a NODE over a PAIR. The paper writes the family over a tuple
-/// bound; the pair is what S1 needs to measure a diamond, and the n-ary shape
-/// is the same body with one more field.
+/// `combine` as a NODE over a PAIR. The paper writes the family over a tuple bound;
+/// the pair is what S1 needs to measure a diamond, and the n-ary shape is the same
+/// body with one more field.
 export struct Combine<A, B> {
 	left: A,
 	right: B,
@@ -164,10 +164,10 @@ export impl Combine<type A: Cold<type X>, type B: Cold<type Y>> with Cold<(X, Y)
 	}
 }
 
-/// The combinators — blanket methods over the cold trait, each returning a
-/// concrete node. Named with a `_node`/`_cold` suffix ONLY so this file can
-/// live beside today's `map`/`switch`/`combine` in one program; the surface S2
-/// would ship keeps the plain names (R4).
+/// The combinators — blanket methods over the cold trait, each returning a concrete
+/// node. Named with a `_node`/`_cold` suffix ONLY so this file can live beside
+/// today's `map`/`switch`/`combine` in one program; the surface S2 would ship keeps
+/// the plain names (R4).
 export impl type S: Cold<type T> {
 	fun map_node<U>(self, transform: sync |T| U): Map<S, T, U> {
 		Map<S, T, U> { up = self, transform }
@@ -181,11 +181,11 @@ export impl type S: Cold<type T> {
 		Combine<S, B> { left = self, right = other }
 	}
 
-	/// `.cell()` (R2, the owner's name) — the ONE stateful node: materialise
-	/// what is above into a cached cell with an ambient-owner-tied
-	/// registration, marked a DERIVATION so door 2 settles it before any
-	/// effect. Composable anywhere: the result is a `SignalCell`, which is a
-	/// `Cold` again, so a chain continues through it.
+	/// `.cell()` (R2, the owner's name) — the ONE stateful node: materialise what
+	/// is above into a cached cell with an ambient-owner-tied registration, marked
+	/// a DERIVATION so door 2 settles it before any effect. Composable anywhere:
+	/// the result is a `SignalCell`, which is a `Cold` again, so a chain continues
+	/// through it.
 	fun cell(self): SignalCell<T> {
 		let cached = SignalCell::new(self.get());
 		as_derivation();

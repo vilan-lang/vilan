@@ -48,3 +48,14 @@ platform = ["@process"]    # fs, http, process
 
 [library.layer.browser]
 platform = ["browser"]     # dom, ui, storage
+
+# std's prose is re-filled by `vilan fmt` (E205's `wrap_comments`), to 84
+# columns rather than to the 100 the printer lays CODE out to (E215's R1/R2).
+# The width is std's own, measured over its 11,495 comment lines: the
+# distribution's knee is at 79-80 and its 99th percentile is 82, so a fill to
+# 100 would have rewritten every paragraph in the library to a margin nobody
+# had chosen. This is the first package in the tree to opt in, and R3 holds
+# `wrap_comments` off by default until std has run under it for one order.
+[fmt]
+wrap_comments = true
+comment_width = 84
