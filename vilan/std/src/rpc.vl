@@ -4170,7 +4170,9 @@ export struct KeyedSource<K, T> {
 /// sentence `RemoteSource`'s impl carries: `or([])` is the binding SAYING what
 /// an unseeded list renders as. What the impl buys is everything that reads a
 /// source without flattening it.
-export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> with Source<Option<List<T>>> {
+export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> with Source<
+	Option<List<T>>,
+> {
 	/// The mirror's current contents: `None` until the first patch lands.
 	/// Passive — no lease, no frame.
 	fun get(self): Option<List<T>> {

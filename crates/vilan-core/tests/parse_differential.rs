@@ -318,12 +318,14 @@ fn normalized_tokens(source: &str) -> Option<Vec<Token<'_>>> {
     }
     let tokens: Vec<Token<'_>> = spanned.into_iter().map(|(token, _span)| token).collect();
     // A trailing comma before a closer is insignificant in vilan — the formatter
-    // may normalize it in or out, so the safety check ignores it.
+    // may normalize it in or out, so the safety check ignores it. `>` closes a
+    // generic argument list, which is allow-trailing in the grammar and which
+    // E217's split `impl` header writes a trailing comma into.
     let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
     for token in tokens {
         if matches!(
             token,
-            Token::Ctrl('}') | Token::Ctrl(')') | Token::Ctrl(']')
+            Token::Ctrl('}') | Token::Ctrl(')') | Token::Ctrl(']') | Token::Ctrl('>')
         ) {
             while let Some(Token::Ctrl(',')) = result.last() {
                 result.pop();

@@ -303,16 +303,27 @@ fn context_clause_end(tokens: &[Token<'_>], index: usize) -> Option<usize> {
     }
 }
 
-/// Drops every comma that sits immediately before a closing `}`, `)`, or `]`.
-/// Vilan treats such a trailing comma as insignificant (tuples need two or more
-/// elements, so there is no `(a,)` one-tuple to confuse it with), which lets the
-/// safety check accept the formatter normalizing trailing commas in or out.
+/// Drops every comma that sits immediately before a closing `}`, `)`, `]`, or
+/// `>`. Vilan treats such a trailing comma as insignificant (tuples need two or
+/// more elements, so there is no `(a,)` one-tuple to confuse it with), which
+/// lets the safety check accept the formatter normalizing trailing commas in or
+/// out.
+///
+/// `>` is here for E217. A generic argument list is allow-trailing in the
+/// grammar, so `DeltaSource<List<T>, SeqOp<T>,>` is a spelling an author may
+/// write — and a HAND-WRAPPED `impl` header is exactly how one gets written.
+/// Without this the printer's answer (one line if it fits, and a trailing comma
+/// on every argument when it does not) token-drifted from the source and the
+/// whole FILE declined, so a header past the width had no formatted spelling at
+/// all. The comma and the `>` are adjacent in no other production: everywhere
+/// else a comma is followed by another argument, and a comparison's `>` follows
+/// an operand.
 fn drop_trailing_commas(tokens: Vec<Token<'_>>) -> Vec<Token<'_>> {
     let mut result: Vec<Token<'_>> = Vec::with_capacity(tokens.len());
     for token in tokens {
         if matches!(
             token,
-            Token::Ctrl('}') | Token::Ctrl(')') | Token::Ctrl(']')
+            Token::Ctrl('}') | Token::Ctrl(')') | Token::Ctrl(']') | Token::Ctrl('>')
         ) {
             while let Some(Token::Ctrl(',')) = result.last() {
                 result.pop();
@@ -4535,10 +4546,23 @@ impl<'src> Printer<'src> {
             }
             Node::Func(func) => self.print_func(func),
             // `impl Subject[ with A + B] { items }`.
+            //
+            // E217: the header is a DECLARATION line and takes the declaration
+            // width rule. Over the budget it breaks the generic-argument list
+            // at its TAIL — the last trait of a `with` clause, else the
+            // subject — one argument per line with a trailing comma, exactly
+            // the shape `fun`'s parameter list takes. Before this the header
+            // had no split form at all, so a hand-wrapped one reprinted to a
+            // different token stream and the file declined.
             Node::Impl(subject, traits, body) => {
+                let split = std::mem::take(&mut self.split);
                 self.out.push_str("impl ");
-                self.print_type(&subject.0);
-                self.print_with_clause(traits);
+                if traits.is_empty() {
+                    self.print_type_splitting_the_tail(&subject.0, split);
+                } else {
+                    self.print_type(&subject.0);
+                    self.print_with_clause_splitting_the_tail(traits, split);
+                }
                 self.out.push(' ');
                 self.print_braced_items(body);
             }
@@ -4991,6 +5015,85 @@ impl<'src> Printer<'src> {
         }
     }
 
+    /// [`Self::print_type`] with a [`Split`] carried to the type's TAIL generic
+    /// argument list — the one an over-wide `impl` header breaks (E217).
+    ///
+    /// Only the forms an `impl` subject or a trait bound can take are walked,
+    /// and only through their tail: a nominal type's own argument list, and a
+    /// binder's LAST bound (`impl type S: Base + DeltaSource<…>`). Every other
+    /// type form has no list of its own to break and prints as it always did.
+    ///
+    /// The split is threaded rather than read from `self.split` so that
+    /// [`Self::print_type`] — reached from parameter types, return types and a
+    /// dozen other positions — keeps exactly the output it has.
+    fn print_type_splitting_the_tail(&mut self, node: &Node<'src>, split: Split) {
+        if split == Split::Off {
+            self.print_type(node);
+            return;
+        }
+        match node {
+            Node::AccessorWithGenerics(name, arguments) if !arguments.0.is_empty() => {
+                self.out.push_str(name);
+                self.print_split_type_arguments(arguments);
+            }
+            Node::StaticAccessor(namespace, name, Some(arguments)) if !arguments.0.is_empty() => {
+                self.print_type(&namespace.0);
+                self.out.push_str("::");
+                self.out.push_str(name);
+                self.print_split_type_arguments(arguments);
+            }
+            Node::TypeBinder((name, _name_span), bounds) if !bounds.is_empty() => {
+                if *name != ANONYMOUS_TYPE_BINDER {
+                    self.out.push_str("type ");
+                }
+                self.out.push_str(name);
+                self.out.push_str(": ");
+                self.print_bounds_splitting_the_tail(bounds, split);
+            }
+            // An empty list never breaks — `<⏎>` buys a line and no clarity —
+            // and a form with no argument list has nothing to break, so the
+            // header simply stays long. The same answer the empty parameter
+            // list gives.
+            _ => self.print_type(node),
+        }
+    }
+
+    /// The bounds of a binder, with `split` carried to the LAST one — the only
+    /// one whose argument list ends the header's line.
+    fn print_bounds_splitting_the_tail(&mut self, bounds: &[Spanned<Node<'src>>], split: Split) {
+        for (index, (bound, _)) in bounds.iter().enumerate() {
+            if index > 0 {
+                self.out.push_str(" + ");
+            }
+            if index + 1 == bounds.len() {
+                self.print_type_splitting_the_tail(bound, split);
+            } else {
+                self.print_type(bound);
+            }
+        }
+    }
+
+    /// The split form of a generic argument list: `<` closes the header's line,
+    /// every argument takes its own line one level in with a trailing comma —
+    /// the last included, so adding an argument is a one-line diff — and `>`
+    /// returns to the header's indent. `fun`'s parameter list, exactly.
+    ///
+    /// No line is re-measured here: a generic argument is a type, and a type
+    /// has no layout of its own, so an argument too wide for its line has
+    /// nowhere to break and simply stays wide.
+    fn print_split_type_arguments(&mut self, arguments: &GenericArguments<'src>) {
+        self.out.push('<');
+        self.indent += 1;
+        for (argument, _) in &arguments.0 {
+            self.line();
+            self.print_type(argument);
+            self.out.push(',');
+        }
+        self.indent -= 1;
+        self.line();
+        self.out.push('>');
+    }
+
     /// Prints a `<A, B>` generic-argument list on a nominal type.
     fn print_type_arguments(&mut self, arguments: &GenericArguments<'src>) {
         self.out.push('<');
@@ -5015,6 +5118,20 @@ impl<'src> Printer<'src> {
             }
             self.print_type(bound);
         }
+    }
+
+    /// [`Self::print_with_clause`] with a [`Split`] carried to the clause's LAST
+    /// trait — the one whose argument list ends an `impl` header's line (E217).
+    fn print_with_clause_splitting_the_tail(
+        &mut self,
+        traits: &[Spanned<Node<'src>>],
+        split: Split,
+    ) {
+        if traits.is_empty() {
+            return;
+        }
+        self.out.push_str(" with ");
+        self.print_bounds_splitting_the_tail(traits, split);
     }
 
     /// Prints a `with A + B` clause (the traits of an `impl`/`trait`), or nothing
@@ -11629,6 +11746,129 @@ mod signature_layout {
                       }\n";
         assert_over_budget(source.lines().nth(1).unwrap());
         assert_construct(source, source);
+    }
+}
+
+#[cfg(test)]
+mod impl_header_layout {
+    //! E217 — the `impl` header is a declaration line and takes the
+    //! declaration width rule.
+    //!
+    //! It had no split form at all, so a header past the budget had no
+    //! formatted spelling: written on one line it stayed over, and written
+    //! HAND-WRAPPED (the shape a reader reaches for) the reprint's single line
+    //! carried different tokens from the source's trailing comma and the whole
+    //! FILE declined — `vilan fmt` left every other construct in it unformatted
+    //! too.
+    //!
+    //! The rule is `fun`'s: one argument per line, trailing comma on every one,
+    //! `>` back at the header's indent — applied to the TAIL argument list,
+    //! which is the last trait of a `with` clause, else the subject's own.
+
+    use super::LINE_BUDGET;
+    use super::bailing_constructs::{assert_construct, code_tokens};
+    use super::chain_splitting::{assert_over_budget, columns};
+    use super::reprint;
+
+    /// The item's own fixture: collections-39 hand-wrapped this header and
+    /// `vilan fmt` declined the file.
+    const HAND_WRAPPED: &str = concat!(
+        "impl type S: DeltaSource<\n\tList<T>,\n\tSeqOp<T>,\n> {\n",
+        "\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+    );
+
+    /// Its canonical spelling: the header FITS, so it is one line.
+    const ONE_LINE: &str = concat!(
+        "impl type S: DeltaSource<List<T>, SeqOp<T>> {\n",
+        "\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+    );
+
+    /// The same header with names long enough to run past the budget.
+    const OVER_BUDGET: &str = concat!(
+        "impl type S: DeltaSource<List<ReconciledRowOfAnExtremelyLongName>, ",
+        "SeqOp<ReconciledRowOfAnExtremelyLongName>> {\n\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+    );
+
+    /// And its canonical spelling: one argument per line, trailing comma on
+    /// every one, `>` back at the header's own indent.
+    const SPLIT: &str = concat!(
+        "impl type S: DeltaSource<\n",
+        "\tList<ReconciledRowOfAnExtremelyLongName>,\n",
+        "\tSeqOp<ReconciledRowOfAnExtremelyLongName>,\n",
+        "> {\n\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+    );
+
+    #[test]
+    fn a_hand_wrapped_header_that_fits_is_printed_on_one_line() {
+        assert!(
+            columns(ONE_LINE.lines().next().expect("the header")) <= LINE_BUDGET,
+            "the fixture's canonical header must fit"
+        );
+        // Not a decline: the honest half says so, ahead of the byte claim.
+        assert_eq!(reprint(HAND_WRAPPED).as_deref(), Ok(ONE_LINE));
+        assert_construct(HAND_WRAPPED, ONE_LINE);
+    }
+
+    #[test]
+    fn an_over_budget_header_breaks_one_argument_per_line() {
+        assert_over_budget(OVER_BUDGET.lines().next().expect("the header"));
+        assert_construct(OVER_BUDGET, SPLIT);
+    }
+
+    #[test]
+    fn the_split_header_is_canonical_and_round_trips_unchanged() {
+        assert_eq!(reprint(SPLIT).as_deref(), Ok(SPLIT));
+    }
+
+    #[test]
+    fn a_with_clause_breaks_at_its_last_trait() {
+        // The tail of the header is the clause's last trait, so that is the
+        // list that breaks — the subject's own arguments stay inline, exactly
+        // as a call's earlier arguments do.
+        let source = concat!(
+            "export impl KeyedCell<type K: Hashable, type T: Keyed<K>> ",
+            "with DeltaSource<List<TableRowOfAVeryLongName>, SeqOp<TableRowOfAVeryLongName>> {\n",
+            "\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+        );
+        assert_over_budget(source.lines().next().expect("the header"));
+        assert_construct(
+            source,
+            concat!(
+                "export impl KeyedCell<type K: Hashable, type T: Keyed<K>> with DeltaSource<\n",
+                "\tList<TableRowOfAVeryLongName>,\n",
+                "\tSeqOp<TableRowOfAVeryLongName>,\n",
+                "> {\n\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+            ),
+        );
+    }
+
+    #[test]
+    fn a_header_with_no_argument_list_to_break_stays_long() {
+        // The empty-parameter-list answer: there is nothing to break, so the
+        // line simply stays wide rather than growing a `<⏎>` that buys nothing.
+        let source = concat!(
+            "impl AnImplementationSubjectWhoseBareNameAloneRunsWellPastTheHundredColumn",
+            "BudgetWithNoGenericsAtAll {\n\tfun get(): i32 {\n\t\t1\n\t}\n}\n"
+        );
+        assert_over_budget(source.lines().next().expect("the header"));
+        assert_construct(source, source);
+    }
+
+    #[test]
+    fn the_net_forgives_the_trailing_comma_and_nothing_more() {
+        // The net's new latitude is one comma before a `>`: the printer's own
+        // split form carries one and the source may too. Dropping an ARGUMENT
+        // still drifts, so the forgiveness cannot hide a printer bug.
+        assert_eq!(
+            code_tokens("impl type S: DeltaSource<List<T>, SeqOp<T>,> {}\n"),
+            code_tokens("impl type S: DeltaSource<List<T>, SeqOp<T>> {}\n"),
+            "the net must forgive a trailing comma before `>`"
+        );
+        assert_ne!(
+            code_tokens("impl type S: DeltaSource<List<T>, SeqOp<T>> {}\n"),
+            code_tokens("impl type S: DeltaSource<List<T>> {}\n"),
+            "the net went blind to a lost generic argument"
+        );
     }
 }
 
