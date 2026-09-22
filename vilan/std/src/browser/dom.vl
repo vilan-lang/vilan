@@ -345,11 +345,20 @@ impl Element {
 	/// `View::autofocus` calls.
 	///
 	/// It is a REQUEST with a precondition, not a command: the platform focuses
-	/// only a target that is connected, rendered, visible and not inert AT THE
-	/// CALL, and silently does nothing otherwise. `visibility: hidden` refuses;
-	/// so does a `display: none` ancestor, and so does an `inert` subtree. "Just
-	/// created" is never the problem — `View::on_mount` already guarantees the
-	/// element is in the document — "still hidden" is.
+	/// only a target that is a FOCUSABLE AREA and is connected, rendered,
+	/// visible and not inert AT THE CALL, and silently does nothing otherwise.
+	/// `visibility: hidden` refuses; so does a `display: none` ancestor, and so
+	/// does an `inert` subtree. "Just created" is never the problem —
+	/// `View::on_mount` already guarantees the element is in the document —
+	/// "still hidden" is.
+	///
+	/// FOCUSABLE is the word that gets left out, and leaving it out is how the
+	/// dead fallback gets written (A121 §1): a bare `<div>` is not a focusable
+	/// area at all, so `focus()` on one does nothing whatever the timing, and
+	/// no retry will ever help. `tabindex="-1"` is what makes an ordinary
+	/// element programmatically focusable without putting it in the tab order,
+	/// and writing it is what `focus_first` does before it falls back to a
+	/// panel.
 	[extern(method, "focus")]
 	external fun focus(self): void;
 

@@ -3848,36 +3848,40 @@ fun main() {
 main();
 "#;
 
+/// The steps, in a raw string and at one indentation: a nested `setTimeout`
+/// ladder puts JS lines eight columns inward inside a Rust literal, which is
+/// what N98's prose gate reads as a lost line continuation. One `await` per
+/// wave says the same thing flat.
+const CONTAIN_STEPS: &str = r##"
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+(async () => {
+  window.fire("menu", {});
+  await tick();
+  console.log("siblings=" + findByName("menu").contains(findByName("outside")));
+  findByName("outside").focus();
+  console.log("pulled=" + at());
+  window.fire("sub", {});
+  await tick();
+  console.log("nested=" + findByName("menu").contains(findByName("sub")));
+  findByName("sub-item").focus();
+  console.log("inSub=" + at());
+  findByName("outside").focus();
+  console.log("pulledBySub=" + at());
+  window.fire("sub", {});
+  await tick();
+  console.log("subGone=" + !!findByName("sub"));
+  findByName("outside").focus();
+  console.log("handedBack=" + at());
+  window.fire("menu", {});
+  await tick();
+  findByName("outside").focus();
+  console.log("released=" + at());
+})();
+"##;
+
 #[test]
 fn a121_contain_pulls_focus_back_and_the_nested_scope_takes_over() {
-    let harness = format!(
-        "{DOM_STUB}{FOCUS_STUB_EXTRAS}\nrequire(\"./app.js\");\n\
-         window.fire(\"menu\", {{}});\n\
-         setTimeout(() => {{\n  \
-         console.log(\"siblings=\" + findByName(\"menu\").contains(findByName(\"outside\")));\n  \
-         findByName(\"outside\").focus();\n  \
-         console.log(\"pulled=\" + at());\n  \
-         window.fire(\"sub\", {{}});\n  \
-         setTimeout(() => {{\n    \
-         console.log(\"nested=\" + findByName(\"menu\").contains(findByName(\"sub\")));\n    \
-         findByName(\"sub-item\").focus();\n    \
-         console.log(\"inSub=\" + at());\n    \
-         findByName(\"outside\").focus();\n    \
-         console.log(\"pulledBySub=\" + at());\n    \
-         window.fire(\"sub\", {{}});\n    \
-         setTimeout(() => {{\n      \
-         console.log(\"subGone=\" + !!findByName(\"sub\"));\n      \
-         findByName(\"outside\").focus();\n      \
-         console.log(\"handedBack=\" + at());\n      \
-         window.fire(\"menu\", {{}});\n      \
-         setTimeout(() => {{\n        \
-         findByName(\"outside\").focus();\n        \
-         console.log(\"released=\" + at());\n      \
-         }}, 0);\n    \
-         }}, 0);\n  \
-         }}, 0);\n\
-         }}, 0);\n"
-    );
+    let harness = format!("{DOM_STUB}{FOCUS_STUB_EXTRAS}\nrequire(\"./app.js\");\n{CONTAIN_STEPS}");
     let stdout = build_and_run("a121_contain", CONTAIN_SCOPE, &harness);
     let line = |key: &str| -> String {
         stdout
@@ -3963,32 +3967,32 @@ fun main() {
 main();
 "#;
 
+/// The steps, flat for `CONTAIN_STEPS`' reason.
+const RESTORE_STEPS: &str = r##"
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+(async () => {
+  await tick();
+  findByName("opener").focus();
+  window.fire("toggle", {});
+  await tick();
+  findByName("inside").focus();
+  console.log("taken=" + at());
+  window.fire("toggle", {});
+  await tick();
+  console.log("restored=" + at());
+  findByName("opener").focus();
+  window.fire("toggle", {});
+  await tick();
+  findByName("elsewhere").focus();
+  window.fire("toggle", {});
+  await tick();
+  console.log("kept=" + at());
+})();
+"##;
+
 #[test]
 fn a121_a_scope_restores_the_focus_it_took_and_not_the_focus_it_was_given() {
-    let harness = format!(
-        "{DOM_STUB}{FOCUS_STUB_EXTRAS}\nrequire(\"./app.js\");\n\
-         setTimeout(() => {{\n  \
-         findByName(\"opener\").focus();\n  \
-         window.fire(\"toggle\", {{}});\n  \
-         setTimeout(() => {{\n    \
-         findByName(\"inside\").focus();\n    \
-         console.log(\"taken=\" + at());\n    \
-         window.fire(\"toggle\", {{}});\n    \
-         setTimeout(() => {{\n      \
-         console.log(\"restored=\" + at());\n      \
-         findByName(\"opener\").focus();\n      \
-         window.fire(\"toggle\", {{}});\n      \
-         setTimeout(() => {{\n        \
-         findByName(\"elsewhere\").focus();\n        \
-         window.fire(\"toggle\", {{}});\n        \
-         setTimeout(() => {{\n          \
-         console.log(\"kept=\" + at());\n        \
-         }}, 0);\n      \
-         }}, 0);\n    \
-         }}, 0);\n  \
-         }}, 0);\n\
-         }}, 0);\n"
-    );
+    let harness = format!("{DOM_STUB}{FOCUS_STUB_EXTRAS}\nrequire(\"./app.js\");\n{RESTORE_STEPS}");
     let stdout = build_and_run("a121_restore", RESTORE_SCOPE, &harness);
     let line = |key: &str| -> String {
         stdout
