@@ -6594,9 +6594,10 @@ impl Document {
     /// is exactly the drift that would make the action and the save disagree
     /// about one comment. So the action asks the formatter the question it
     /// already answers — `reprint_with`, the entry point format-on-save takes
-    /// — and hands back what it said. The width is the formatter's own; a
-    /// package's `[fmt] comment_width` reaches it through `FormatOptions` when
-    /// that key lands (E215), with no second reader here.
+    /// — and hands back what it said. `comment_width` is the package's own
+    /// `[fmt] comment_width` (E215), read by the caller through the same
+    /// manifest walk format-on-save uses (a document holds no path of its
+    /// own); the formatter's default when there is nothing to climb from.
     ///
     /// Two reprints, and the comparison is the point: with the wrap on and
     /// with it off, the CODE renders identically, so a difference between them
@@ -6607,7 +6608,7 @@ impl Document {
     /// those the two reprints are the same text. Both are skipped entirely
     /// unless the caret is in a comment, which is a scan of the buffer's
     /// comment spans.
-    pub fn comment_reflow(&self, range: Span) -> Option<(Span, String)> {
+    pub fn comment_reflow(&self, range: Span, comment_width: usize) -> Option<(Span, String)> {
         let source = self.text.as_str();
         let offset = range.start;
         let in_a_comment =
@@ -6624,6 +6625,7 @@ impl Document {
             source,
             vilan_core::formatter::FormatOptions {
                 wrap_comments: false,
+                comment_width,
             },
         )
         .ok()?;
@@ -6631,6 +6633,7 @@ impl Document {
             source,
             vilan_core::formatter::FormatOptions {
                 wrap_comments: true,
+                comment_width,
             },
         )
         .ok()?;

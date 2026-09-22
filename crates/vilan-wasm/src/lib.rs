@@ -1037,7 +1037,12 @@ mod bindings {
     pub fn format_checked_with(source: String, wrap_comments: bool) -> FormatResult {
         let outcome = crate::format_program_with(
             &source,
-            vilan_core::formatter::FormatOptions { wrap_comments },
+            vilan_core::formatter::FormatOptions {
+                wrap_comments,
+                // The playground has no manifest to climb: the formatter's own
+                // width (E215's default = the code width).
+                comment_width: vilan_core::formatter::DEFAULT_COMMENT_WIDTH,
+            },
         );
         FormatResult {
             text: outcome.text,

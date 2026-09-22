@@ -577,6 +577,7 @@ fun main() {}
         LONG,
         vilan_core::formatter::FormatOptions {
             wrap_comments: true,
+            comment_width: vilan_core::formatter::DEFAULT_COMMENT_WIDTH,
         },
     );
     assert_eq!(

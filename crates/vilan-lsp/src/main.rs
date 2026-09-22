@@ -4072,9 +4072,18 @@ impl LanguageServer for Backend {
             // not from the editor. A buffer with no file path (an untitled
             // document) keeps the defaults, which is what it had.
             let options = match path.as_deref() {
-                Some(path) => vilan_core::formatter::FormatOptions {
-                    wrap_comments: vilan_core::manifest::wrap_comments_covering(path),
-                },
+                Some(path) => {
+                    // E215 + E216 met at the merge: one walk answers both
+                    // `[fmt]` keys, so format-on-save fills at the package's
+                    // own width and not only when it opted in.
+                    let opinions = vilan_core::manifest::fmt_opinions_covering(path);
+                    vilan_core::formatter::FormatOptions {
+                        wrap_comments: opinions.wrap_comments.unwrap_or(false),
+                        comment_width: opinions
+                            .comment_width
+                            .unwrap_or(vilan_core::formatter::DEFAULT_COMMENT_WIDTH),
+                    }
+                }
                 None => vilan_core::formatter::FormatOptions::default(),
             };
             let formatted = match vilan_core::formatter::reprint_with(source, options) {
@@ -4212,9 +4221,17 @@ impl LanguageServer for Backend {
             // it is offered on the construct the cursor is in — and, like
             // them, it needs no `program`: a comment is trivia the lexer
             // drops, so this reads the buffer's own text.
+            // The fill width is the package's `[fmt] comment_width` (E215),
+            // climbed from the buffer's path; the formatter's default for an
+            // untitled buffer.
+            let comment_width = uri
+                .to_file_path()
+                .ok()
+                .and_then(|path| vilan_core::manifest::fmt_opinions_covering(&path).comment_width)
+                .unwrap_or(vilan_core::formatter::DEFAULT_COMMENT_WIDTH);
             if wants_refactor
                 && let Some((span, replacement)) =
-                    document.comment_reflow(live_span(&document, params.range))
+                    document.comment_reflow(live_span(&document, params.range), comment_width)
             {
                 let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
                 changes.insert(
