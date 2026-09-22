@@ -14,12 +14,40 @@
 //! `std::router` uncompilable there (`proposal/bundle-splitting.md`, closing
 //! note). The pins that caught it were incidental. This is the standing gate.
 //!
+//! # The contract: what "surface" means here (N118)
+//!
+//! **The EXPORTED surface, and the members of the types it names.** A twin's
+//! private helper is that twin's implementation choice: nothing outside the
+//! file can name it, so it cannot be the thing that breaks a build on the
+//! other platform, which is the whole failure class this gate exists for
+//! (`std::router` re-exports `ui::chunk_pending`, a name a process build must
+//! resolve). Counting private declarations made the gate ask a second
+//! question it was never built to ask — "do the two files read alike" — and
+//! that question has a wrong answer: the browser twin does its SVG routing
+//! through a `createElementNS` helper and the process twin seeds an `xmlns`
+//! attribute inline, and neither is a divergence anyone can observe. It cost
+//! real work: a std lane had to NAME the process twin's inlined body
+//! `place_when_some` so the two lists would match, and **fourteen of this
+//! file's twenty-six recorded divergences existed only to excuse a private
+//! helper** — more than half the allowlist was paperwork, and every one of
+//! them was a standing exemption that would have covered whatever took the
+//! name later.
+//!
+//! So: the module scope's EXPORTED bindings, plus every member of every type
+//! declared in the file. MEMBERS are not filtered — a method reached through a
+//! receiver is part of the type's surface wherever the type is — and that is
+//! the deliberate asymmetry, not an oversight. `Region.host` is a real
+//! divergence and it is the member half that sees it.
+//!
 //! **The mechanism is the compiler's own answer, not a scan of the text.** Each
 //! twin is ANALYZED on its platform, and the surface is read off the resulting
 //! `Program`: the module scope's bindings filtered to those DECLARED in that
 //! twin's own file (so the two halves' differing `import`s never read as
-//! divergence), plus the members of every type declared there — `Region.host`
-//! is a real divergence that only the member half sees.
+//! divergence) AND exported from it, plus the members of every type declared
+//! there. The export predicate is the analyzer's own `is_exported_in`, read
+//! through the two sets `Program` publishes — a module that has curated
+//! nothing offers everything, which keeps the gate meaningful for a twin that
+//! writes no `export` at all.
 //!
 //! **What it does not compare:** signatures. `on_event` is
 //! `|Event| void` in the browser and generic `|E| void` on the process side,
@@ -96,16 +124,6 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
     ),
     (
         "ui",
-        "mount_target",
-        Side::BrowserOnly,
-        "A24 (fullstack-dx.md §9.5): the lookup `mount`/`mount_root` share, \
-         failing loud and naming the id instead of leaving `element.clear()` to \
-         throw a bare null-dereference. It exists only to guard THEM — see their \
-         own entries above — and the process twin calls `get_element_by_id` \
-         nowhere at all.",
-    ),
-    (
-        "ui",
         "is_null",
         Side::BrowserOnly,
         "With `mount_target`: the one host-null peek its guard needs. Same \
@@ -114,84 +132,11 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
     ),
     (
         "ui",
-        "is_svg_tag",
-        Side::BrowserOnly,
-        "A private helper, not a surface: the browser routes SVG tags through \
-         `createElementNS`, while the process twin seeds the `xmlns` attribute on \
-         an `svg` root inside `view` and lets descendants inherit it. The SVG \
-         STORY is mirrored (both files carry KEEP-IN-STEP notes); the mechanism \
-         differs, so the helper does not exist on both sides.",
-    ),
-    (
-        "ui",
-        "write_back_value",
-        Side::BrowserOnly,
-        "A private helper, not a surface, and the SHAPE is the fix \
-         (proposal/lifetimes.md §5, V3): `bind_value`'s write-back listener has \
-         to be born in a scope that never held an element, because a JS closure \
-         captures its whole enclosing scope and a listener written inline beside \
-         the effect would reach the element the effect captured — the one cycle \
-         that straddles the language/host boundary. The process twin renders an \
-         input's value and drops the listener (its `bind_value` documents that), \
-         so there is no listener to place.",
-    ),
-    (
-        "ui",
-        "write_back_draft",
-        Side::BrowserOnly,
-        "With `write_back_value`: the same scope split for `bind_draft`, whose \
-         effect captures the element to compare before writing it.",
-    ),
-    (
-        "ui",
-        "chunk_arm",
-        Side::BrowserOnly,
-        "A route-chunk host intrinsic. Splitting is opt-in per BROWSER entry \
-         (proposal/bundle-splitting.md §2/§4), so a process build has no chunk \
-         map to select an arm from.",
-    ),
-    (
-        "ui",
         "chunk_preload",
         Side::BrowserOnly,
         "With `chunk_arm`: the S3 initial-route preload. Emitter-planted \
          before the swap mount — never written by user code — and a server \
          render has nothing to prefetch.",
-    ),
-    (
-        "ui",
-        "chunk_preload_arm",
-        Side::BrowserOnly,
-        "With `chunk_preload`: its per-arm half, same emitter-selected \
-         reasoning.",
-    ),
-    (
-        "ui",
-        "clear_chunk_error",
-        Side::BrowserOnly,
-        "With `chunk_load`: lowers the S3 error signal on the next \
-         navigation. The error state only exists where fetches do.",
-    ),
-    (
-        "ui",
-        "set_chunk_pending",
-        Side::BrowserOnly,
-        "With `chunk_load`: the S3 generation guard's write half for the \
-         pending signal. Same fetch-side-only reasoning.",
-    ),
-    (
-        "ui",
-        "chunk_ready",
-        Side::BrowserOnly,
-        "With `chunk_arm`: a browser-only chunk-presence test. A server render \
-         runs against code that is already loaded.",
-    ),
-    (
-        "ui",
-        "chunk_load",
-        Side::BrowserOnly,
-        "With `chunk_arm`: fetches a chunk. Nothing is ever in flight on the \
-         server.",
     ),
     (
         "ui",
@@ -208,23 +153,6 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
          `chunk_pending`, the one chunk-machinery name user code DOES bind \
          (through `std::router::pending`) — it is mirrored on both sides, and \
          its absence is exactly what E34 was filed for.",
-    ),
-    (
-        "ui",
-        "settled_steps",
-        Side::BrowserOnly,
-        "A98: which rows of a reconcile plan the ORDER PASS can leave where they \
-         are. The process twin has no order pass — a server render is one pass \
-         in source order and nothing it places ever moves — so there is no \
-         order for a row to be already in.",
-    ),
-    (
-        "ui",
-        "row_references",
-        Side::BrowserOnly,
-        "A98, with `settled_steps`: the marker each moved row is threaded in \
-         before. Browser-only for the same reason, and for the reason `Row` is \
-         empty on the process twin — there are no markers there to point at.",
     ),
     (
         "ui",
@@ -268,22 +196,6 @@ const ALLOWED_DIVERGENCES: &[(&str, &str, Side, &str)] = &[
         "The set-or-replace-by-name helper that makes the string tree match the \
          DOM's own `setAttribute` semantics (repeat updates in place, new \
          appends). The browser twin calls the DOM for this.",
-    ),
-    (
-        "ui",
-        "add_style_declaration",
-        Side::ProcessOnly,
-        "The append-one-declaration-to-the-`style`-attribute helper `style_var` \
-         and `show` share. Inline style on this twin is a STRING the serializer \
-         emits, so writing one means reading the attribute back and appending; \
-         the browser twin calls `style.setProperty`, which is that operation.",
-    ),
-    (
-        "ui",
-        "is_void_element",
-        Side::ProcessOnly,
-        "A serialization detail behind `render`: void elements take no closing \
-         tag. Meaningless against a live DOM.",
     ),
     (
         "ui",
@@ -362,13 +274,22 @@ fn surface(module_name: &str, platform: Platform) -> BTreeSet<String> {
     collected
 }
 
-/// The names `module_name` contributes, as the analyzer resolved them: module
-/// scope bindings DECLARED in that module's own file, plus the members of every
-/// type declared there (`View.text`, `Slot.place`, ...).
+/// The names `module_name` contributes, as the analyzer resolved them: the
+/// module scope's EXPORTED bindings declared in that module's own file, plus
+/// the members of every type declared there (`View.text`, `Slot.place`, ...).
 ///
 /// The source filter is what keeps the comparison honest — a module scope also
 /// holds its `import`s, and the twins import different things (`std::dom` on one
 /// side, nothing like it on the other), which is not surface divergence.
+///
+/// The EXPORT filter is N118's, and it is the contract this file's head
+/// states: a private helper is one twin's implementation choice, and the gate
+/// asks about the surface a third file can reach. The predicate is the
+/// analyzer's own (`is_exported_in`, read through the two sets it publishes):
+/// a name is exported when `exported_entities` holds it, or when its module
+/// has curated nothing at all and therefore offers everything. Both ui twins
+/// carry explicit `export` markers, so both are curated and the filter bites
+/// on both sides.
 fn declared_surface(program: &Program<'_>, module_name: &str) -> BTreeSet<String> {
     let file_name = format!("{module_name}.vl");
     let source_id = program
@@ -396,11 +317,16 @@ fn declared_surface(program: &Program<'_>, module_name: &str) -> BTreeSet<String
         .get(&module.body.1)
         .expect("the module's own scope");
 
+    let curated = program.curated_modules.contains(&module.body.1);
     let mut names = BTreeSet::new();
     for (name, id) in &scope.name_to_id_map {
-        if program.source_of(*id) == Some(source_id) {
-            names.insert((*name).to_string());
+        if program.source_of(*id) != Some(source_id) {
+            continue;
         }
+        if curated && !program.exported_entities.contains(id) {
+            continue;
+        }
+        names.insert((*name).to_string());
     }
 
     for implementation in &program.implementations {
@@ -503,6 +429,7 @@ fn every_allowed_divergence_is_real() {
     for module in TWINNED_MODULES {
         let browser = surface(module, Platform::Browser);
         let process = surface(module, Platform::default());
+        let mut stale: Vec<String> = Vec::new();
         for (allowed_module, name, side, _) in ALLOWED_DIVERGENCES {
             if allowed_module != module {
                 continue;
@@ -511,20 +438,29 @@ fn every_allowed_divergence_is_real() {
                 Side::BrowserOnly => (&browser, &process, "browser", "process"),
                 Side::ProcessOnly => (&process, &browser, "process", "browser"),
             };
-            assert!(
-                declaring.contains(*name),
-                "`ALLOWED_DIVERGENCES` claims `std::{module}::{name}` is \
-                 {declaring_label}-only, but the {declaring_label} twin does not \
-                 declare it — drop the stale entry."
-            );
-            assert!(
-                !other.contains(*name),
-                "`ALLOWED_DIVERGENCES` exempts `std::{module}::{name}` as \
-                 {declaring_label}-only, but the {other_label} twin declares it \
-                 too — the twins agree here, so drop the exemption and let the \
-                 gate hold the name."
-            );
+            if !declaring.contains(*name) {
+                stale.push(format!(
+                    "`std::{module}::{name}` is claimed {declaring_label}-only, but \
+                     the {declaring_label} twin does not offer it — drop the entry."
+                ));
+            } else if other.contains(*name) {
+                stale.push(format!(
+                    "`std::{module}::{name}` is exempted as {declaring_label}-only, \
+                     but the {other_label} twin offers it too — the twins agree \
+                     here, so drop the exemption and let the gate hold the name."
+                ));
+            }
         }
+        // N118: every stale entry, not the first. The list is pruned in batches
+        // (a visibility change, a helper inlined), and being told about them
+        // one per run costs one whole analysis of both twins each time.
+        assert!(
+            stale.is_empty(),
+            "`ALLOWED_DIVERGENCES` has {} stale entr{}:\n  {}",
+            stale.len(),
+            if stale.len() == 1 { "y" } else { "ies" },
+            stale.join("\n  ")
+        );
     }
 }
 
@@ -539,4 +475,44 @@ fn every_allowed_divergence_states_why() {
             "`std::{module}::{name}`'s allowlist entry needs a real reason, not {reason:?}"
         );
     }
+}
+
+/// N118's contract, shown rather than only stated: the gate reads the EXPORTED
+/// surface, and the members of the types it names.
+///
+/// Three facts over the real twins, which is what makes this a pin and not a
+/// restatement. `mount` is exported from the browser twin and is IN the
+/// surface. `mount_target` is that twin's private helper — one of the fourteen
+/// allowlist entries the export filter retired — and is NOT, although it is
+/// declared in the same file and the source filter admits it. And
+/// `place_when_some`, the name a std lane had to invent on the process side so
+/// the two lists would match, is in neither surface now, which is the friction
+/// this contract removes.
+///
+/// Non-vacuous: drop the `exported_entities` test from `declared_surface` and
+/// the second and third assertions red together — that is the pre-N118 gate.
+#[test]
+fn n118_the_surface_is_the_exported_one() {
+    let browser = surface("ui", Platform::Browser);
+    let process = surface("ui", Platform::default());
+    assert!(
+        browser.contains("mount"),
+        "`mount` is exported from the browser twin"
+    );
+    assert!(
+        !browser.contains("mount_target"),
+        "`mount_target` is a private helper of the same file, and the gate does \
+         not ask about it"
+    );
+    assert!(
+        !browser.contains("place_when_some") && !process.contains("place_when_some"),
+        "neither twin's private placement helper is surface"
+    );
+    // And the member half is NOT filtered, which is the asymmetry the head
+    // states: a method is reached through a receiver, so it belongs to the
+    // type's surface wherever the type does.
+    assert!(
+        browser.iter().any(|name| name.starts_with("View.")),
+        "the members of a declared type are still read: {browser:?}"
+    );
 }
