@@ -1966,6 +1966,116 @@ fn a_single_entry_package_names_its_target() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ── F27 R6: and WHICH twin has the member the reader asked for ───────────
+//
+// E119 tells the reader which twin this type is and why the file is under it.
+// The owner's question was the one fact left: `region.anchor` is not a typo and
+// not a missing field — the OTHER twin has it. Three facts, all already known
+// to the analyzer at the point it refuses: the platform in force, the reason it
+// was chosen, and the twin that does declare the member.
+
+#[test]
+fn a_field_the_other_twin_declares_is_named_as_such() {
+    // The owner's `conditional_value.vl` shape: a module nothing imports, a
+    // `Region` that exists in both twins, and a field only the browser one has.
+    let dir = temp_project("f27_twin_field");
+    let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+    write_fullstack_package(
+        &dir,
+        "server",
+        &[
+            (
+                "src/slot.vl",
+                "import std::ui::Region;\n\n                 export fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n",
+            ),
+            ("src/client.vl", entry),
+            ("src/server.vl", entry),
+        ],
+    );
+    let output = vilan_plain(&["check", dir.join("src/slot.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("`Region` here is std's process twin")
+            && text.contains("no entry reaches it (default-entry is `server`)"),
+        "E119's two facts are unchanged:\n{text}"
+    );
+    assert!(
+        text.contains("The `browser` twin of `std::ui` declares `anchor`"),
+        "and the third one answers the question the reader actually asked:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_method_the_other_twin_declares_is_named_too() {
+    // The METHOD half. `has no method` carried no overlay note at all before
+    // F27 — only the un-callable-receiver arm beside it did — so a
+    // browser-only method on an overlaid type refused with nothing to read.
+    let dir = temp_project("f27_twin_method");
+    let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+    write_fullstack_package(
+        &dir,
+        "server",
+        &[
+            (
+                "src/slot.vl",
+                "import std::ui::Region;\n\n                 export fun host_of(region: Region) {\n\tregion.host();\n}\n",
+            ),
+            ("src/client.vl", entry),
+            ("src/server.vl", entry),
+        ],
+    );
+    let output = vilan_plain(&["check", dir.join("src/slot.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        !output.status.success() && text.contains("has no method 'host'"),
+        "{text}"
+    );
+    assert!(
+        text.contains("`Region` here is std's process twin")
+            && text.contains("The `browser` twin of `std::ui` declares `host`"),
+        "the method miss gets the same three facts:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_member_neither_twin_declares_is_still_just_a_miss() {
+    // The control: the third fact is only stated when it is a fact. A field no
+    // twin has is a plain miss, and telling the reader about twins there would
+    // be noise on top of a typo.
+    let dir = temp_project("f27_twin_absent");
+    let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+    write_fullstack_package(
+        &dir,
+        "server",
+        &[
+            (
+                "src/slot.vl",
+                "import std::ui::Region;\n\n                 export fun anchor_of(region: Region) {\n\tregion.anchorr;\n}\n",
+            ),
+            ("src/client.vl", entry),
+            ("src/server.vl", entry),
+        ],
+    );
+    let output = vilan_plain(&["check", dir.join("src/slot.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        !output.status.success() && text.contains("has no field 'anchorr'"),
+        "{text}"
+    );
+    assert!(
+        text.contains("`Region` here is std's process twin"),
+        "the overlay is still named:\n{text}"
+    );
+    assert!(
+        !text.contains("twin of `std::ui` declares"),
+        "but no twin is claimed to have it:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_users_own_type_gets_no_overlay_note() {
     // The control the note rests on: the overlay touches `std`'s LAYER modules

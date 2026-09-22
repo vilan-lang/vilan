@@ -72,32 +72,55 @@ use std::path::Path;
 use node::{Func, ImportBranch, ImportTail, Node, NodeList};
 use target::PlatformPattern as Pattern;
 
-/// Infers a build platform for editor analysis (which has no `--platform`) from a
-/// file's top-level imports. Evidence, per `import std::<module>` reference:
+/// What [`infer_platform`] concluded, and WHY: the platform this file is
+/// analyzed under plus the reason clause E119's overlay note prints after it
+/// (F27 R6). The reason is written in [`target::PlatformReason::clause`]'s
+/// voice — it lands in the same sentence, one surface over.
+struct InferredPlatform {
+    platform: Platform,
+    reason: String,
+}
+
+/// Infers a build platform for editor analysis (which has no `--platform`) from
+/// a file's own text. Evidence, per `import std::<module>` reference:
 ///
 /// - a module served ONLY by a browser layer (`std::dom`) is browser evidence —
 ///   the file cannot mean anything else;
 /// - a module served by a browser layer AND another root — a platform TWIN,
-///   like `std::ui` — is evidence only through the NAMES imported from it: a
+///   like `std::ui` — is evidence through the NAMES imported from it: a
 ///   name declared by just the browser twin (`mount`) says browser, one
 ///   declared by just the other side (`render`) says process, and a name both
 ///   declare says nothing. B36: the old rule read *any* `std::ui` import as
 ///   browser evidence, so a two-entry package's shared file importing the
 ///   process twin's `render` analyzed as browser in the editor and its import
 ///   red-flagged, while `vilan build` was clean on every entry.
+/// - and, when no import settles it, the MEMBERS the file reads off those twins
+///   (F27 R2). `region.anchor` and `region.cut_row()` are declared by the
+///   browser `ui` and by nothing on the process side, so a file that writes
+///   them is a browser file as surely as one that imports `mount` — and that is
+///   the case B36's name rule cannot see, because every name such a file
+///   imports (`Region`, `Row`, `Slot`) exists in BOTH twins. The evidence is
+///   syntactic and untyped, as the name rule is: the member names the file
+///   uses, matched against the members each twin file DECLARES (struct fields,
+///   `impl` methods, trait members), counting only a name one twin declares and
+///   the other does not. A name both declare, or neither, says nothing.
 ///
 /// Any browser evidence wins (the old bias, kept for a file whose imports
 /// contradict each other); otherwise Node, whose layer set serves the process
 /// twins. Layer directories are read from `std`'s manifest, not a hardcoded
 /// list.
-fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
+fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
+    let defaulted = |reason: &str| InferredPlatform {
+        platform: Platform::default(),
+        reason: reason.to_string(),
+    };
     let Some(browser_root) = std
         .layers
         .iter()
         .find(|layer| layer.patterns.iter().any(|p| matches!(p, Pattern::Browser)))
         .map(|layer| layer.root.as_path())
     else {
-        return Platform::default();
+        return defaulted("no project sets its platform and std declares no browser layer");
     };
     // Every root that could serve a module to a NON-browser build: the other
     // layers, then the base.
@@ -146,6 +169,56 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
         };
         tree.0.iter().any(|node| node_declares(&node.0, name))
     }
+    /// The MEMBER names the module at `path` declares (F27 R2): a struct's
+    /// fields, an `impl` block's functions, a trait's members — the names that
+    /// can follow a dot on one of this module's values. Free functions are not
+    /// members and are not here; the name rule above is what weighs those. A
+    /// file that fails to read or parse declares nothing, as above.
+    fn declared_members(path: &Path) -> HashSet<String> {
+        fn walk(node: &Node, in_member_position: bool, into: &mut HashSet<String>) {
+            match node {
+                Node::Export(_, inner)
+                | Node::Derive(_, inner)
+                | Node::Service(_, inner)
+                | Node::Const(inner) => walk(&inner.0, in_member_position, into),
+                Node::Struct(_, _, _, _, Some(fields)) => {
+                    for field in &fields.0 {
+                        into.insert(field.0.0.0.to_string());
+                    }
+                }
+                Node::Impl(_, _, body) => {
+                    for item in body.0.iter() {
+                        walk(&item.0, true, into);
+                    }
+                }
+                Node::Trait(_, _, _, body) => {
+                    for item in body.0.iter() {
+                        walk(&item.0, true, into);
+                    }
+                }
+                Node::Module(_, body) => {
+                    for item in body.0.iter() {
+                        walk(&item.0, false, into);
+                    }
+                }
+                Node::Func(function) if in_member_position => {
+                    into.insert(function.name.0.to_string());
+                }
+                _ => {}
+            }
+        }
+        let mut members = HashSet::new();
+        let Ok(source) = util::read_source(path) else {
+            return members;
+        };
+        let Some((tree, _)) = parse_clean_cached(&source) else {
+            return members;
+        };
+        for node in tree.0.iter() {
+            walk(&node.0, false, &mut members);
+        }
+        members
+    }
     // The names an import branch takes from its module: the immediate segment
     // of each leaf path (`render`, or `Option` of `Option::{ self, Some }`) —
     // the identifier the module must declare at its top level.
@@ -165,52 +238,89 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
             }
         }
     }
-    // Browser evidence for one `std::<module>` reference (see the doc comment).
+    // Browser evidence for one `std::<module>` reference, as the reason clause
+    // it justifies (see the doc comment).
     fn child_is_browser_evidence(
         branch: &ImportBranch,
         browser_root: &Path,
         other_roots: &[&Path],
-    ) -> bool {
+    ) -> Option<String> {
         match branch {
             ImportBranch::Path(module, _, sub) => {
-                let Some(browser_file) = module_file(browser_root, module) else {
-                    return false;
-                };
+                let browser_file = module_file(browser_root, module)?;
                 let twin_files: Vec<std::path::PathBuf> = other_roots
                     .iter()
                     .filter_map(|root| module_file(root, module))
                     .collect();
                 if twin_files.is_empty() {
                     // Browser-exclusive — the module itself is the evidence.
-                    return true;
+                    return Some(format!(
+                        "it imports `std::{module}`, which only the browser layer serves"
+                    ));
                 }
                 // A twin: only a name the browser side alone declares says
                 // browser. A bare `import std::ui;` names nothing — neutral,
                 // and so is an aliased one (`import std::ui as u;`), which
                 // takes the module and no name out of it.
                 let ImportTail::Continue(sub) = sub else {
-                    return false;
+                    return None;
                 };
                 let mut names = Vec::new();
                 leaf_names(sub, &mut names);
-                names.iter().any(|name| {
-                    declares(&browser_file, name)
-                        && !twin_files.iter().any(|file| declares(file, name))
-                })
+                names
+                    .iter()
+                    .find(|name| {
+                        declares(&browser_file, name)
+                            && !twin_files.iter().any(|file| declares(file, name))
+                    })
+                    .map(|name| {
+                        format!(
+                            "it imports `{name}` from `std::{module}`, which only the browser \
+                             twin declares"
+                        )
+                    })
             }
             ImportBranch::Reach(_, inner) => {
                 child_is_browser_evidence(inner, browser_root, other_roots)
             }
-            ImportBranch::Selector(_) => false,
+            ImportBranch::Selector(_) => None,
             ImportBranch::Set(branches) => branches
                 .iter()
-                .any(|branch| child_is_browser_evidence(branch, browser_root, other_roots)),
+                .find_map(|branch| child_is_browser_evidence(branch, browser_root, other_roots)),
         }
     }
-    let imports_browser_layer = |branch: &ImportBranch| {
-        matches!(branch, ImportBranch::Path("std", _, ImportTail::Continue(child))
-            if child_is_browser_evidence(child, browser_root, &other_roots))
-    };
+    // The TWIN `std` modules one `std::<module>` reference names — each with
+    // the browser file and the files the other roots serve for it. F27 R2's
+    // subjects: a module with no twin is already decided by the rule above.
+    fn twin_modules(
+        branch: &ImportBranch,
+        browser_root: &Path,
+        other_roots: &[&Path],
+        into: &mut Vec<(String, std::path::PathBuf, Vec<std::path::PathBuf>)>,
+    ) {
+        match branch {
+            ImportBranch::Path(module, _, _) => {
+                let Some(browser_file) = module_file(browser_root, module) else {
+                    return;
+                };
+                let twin_files: Vec<std::path::PathBuf> = other_roots
+                    .iter()
+                    .filter_map(|root| module_file(root, module))
+                    .collect();
+                if twin_files.is_empty() || into.iter().any(|(name, _, _)| name == module) {
+                    return;
+                }
+                into.push(((*module).to_string(), browser_file, twin_files));
+            }
+            ImportBranch::Reach(_, inner) => twin_modules(inner, browser_root, other_roots, into),
+            ImportBranch::Selector(_) => {}
+            ImportBranch::Set(branches) => {
+                for branch in branches {
+                    twin_modules(branch, browser_root, other_roots, into);
+                }
+            }
+        }
+    }
     // Imports are block-scoped statements (backlog H2), so scan at every depth —
     // a browser import inside a function body flags the file too.
     fn any_node(nodes: &NodeList, matches: &mut dyn FnMut(&Node) -> bool) -> bool {
@@ -225,15 +335,79 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> Platform {
         }
         nodes.iter().any(|node| walk(node, matches))
     }
-    let references_browser = any_node(root, &mut |node| match node {
-        Node::Import(branch, _) | Node::Use(branch) => imports_browser_layer(branch),
-        _ => false,
+    let mut import_reason: Option<String> = None;
+    any_node(root, &mut |node| {
+        let branch = match node {
+            Node::Import(branch, _) | Node::Use(branch) => branch,
+            _ => return false,
+        };
+        let ImportBranch::Path("std", _, ImportTail::Continue(child)) = branch else {
+            return false;
+        };
+        import_reason = child_is_browser_evidence(child, browser_root, &other_roots);
+        import_reason.is_some()
     });
-    if references_browser {
-        Platform::Browser
-    } else {
-        Platform::default()
+    if let Some(reason) = import_reason {
+        return InferredPlatform {
+            platform: Platform::Browser,
+            reason,
+        };
     }
+    // F27 R2: no import settles it, so ask what the file DOES with the twins it
+    // imported. Only reached for a file that imports a twin module at all, and
+    // each twin's two member sets are read once.
+    let mut twins: Vec<(String, std::path::PathBuf, Vec<std::path::PathBuf>)> = Vec::new();
+    any_node(root, &mut |node| {
+        if let Node::Import(branch, _) | Node::Use(branch) = node
+            && let ImportBranch::Path("std", _, ImportTail::Continue(child)) = branch
+        {
+            twin_modules(child, browser_root, &other_roots, &mut twins);
+        }
+        false
+    });
+    if !twins.is_empty() {
+        // The member names the file uses, in source order — `region.anchor`,
+        // `region.cut_row()`. Untyped: which VALUE they are read off is the
+        // analyzer's question, and this runs before it.
+        let mut used: Vec<String> = Vec::new();
+        any_node(root, &mut |node| {
+            if let Node::MemberAccessor(_, member) = node {
+                let name = match &member.0 {
+                    Node::Accessor(name) | Node::AccessorWithGenerics(name, _) => Some(*name),
+                    Node::Call(callee, _, _) => match &callee.0 {
+                        Node::Accessor(name) | Node::AccessorWithGenerics(name, _) => Some(*name),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(name) = name
+                    && !used.iter().any(|seen| seen == name)
+                {
+                    used.push(name.to_string());
+                }
+            }
+            false
+        });
+        for (module, browser_file, twin_files) in &twins {
+            let browser_members = declared_members(browser_file);
+            let twin_members: HashSet<String> = twin_files
+                .iter()
+                .flat_map(|file| declared_members(file))
+                .collect();
+            if let Some(member) = used.iter().find(|name| {
+                browser_members.contains(name.as_str()) && !twin_members.contains(name.as_str())
+            }) {
+                return InferredPlatform {
+                    platform: Platform::Browser,
+                    reason: format!(
+                        "it reads `.{member}`, which only the browser twin of `std::{module}` \
+                         declares"
+                    ),
+                };
+            }
+        }
+    }
+    defaulted("no project sets its platform and nothing in it is browser-only")
 }
 
 /// [`parse_clean_cached`]'s store: clean parses by content hash. At module
@@ -672,7 +846,23 @@ fn analyze_source_unfenced(
     // false-flagging valid `std::dom` usage while still catching a genuine
     // cross-platform import (e.g. `std::http` in a file that also reaches for
     // `std::dom`).
-    let platform = platform.unwrap_or_else(|| infer_platform(&root.0, std));
+    // F27 R6: an inferred platform carries its own reason, so the overlay note
+    // can say why this file is under this twin even where no front end resolved
+    // the colour (a bare file, a `[library]` module, a test harness). The
+    // workspace is cloned only on that path — a front end that resolved a
+    // platform already stamped its own reason.
+    let inferred = platform.is_none().then(|| infer_platform(&root.0, std));
+    let platform = platform.unwrap_or_else(|| {
+        inferred
+            .as_ref()
+            .map(|inferred| inferred.platform)
+            .unwrap_or_default()
+    });
+    let inferred_workspace = inferred.map(|inferred| Workspace {
+        platform_reason: Some(inferred.reason),
+        ..workspace.clone()
+    });
+    let workspace = inferred_workspace.as_ref().unwrap_or(workspace);
     // M26's PARSE boundary (`editor-latency.md` §4.2): the first of the
     // checkpoints, and the cheapest place to stop — the tree is parsed and the
     // analysis proper has not begun. The handle rides out with the (empty)

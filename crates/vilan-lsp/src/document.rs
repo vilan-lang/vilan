@@ -11959,6 +11959,105 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // F27 R2: MEMBER evidence, for the file B36's name rule cannot decide. The
+    // owner's `lib/conditional_value.vl` imports `Region`, `Row` and `Slot` —
+    // every one of them declared by BOTH `std::ui` twins — so there is no name
+    // to weigh, and the file went to the process twin, where `region.anchor` is
+    // not a field. What it DOES with those names is the evidence: `anchor` is
+    // declared by the browser twin and by nothing on the process side.
+    #[test]
+    fn a_shared_file_reading_a_browser_only_member_infers_browser() {
+        let manifest =
+            "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
+        let shared =
+            "import std::ui::Region;\n\nfun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+        let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
+        let (dir, _client) = analyze_workspace(&[
+            ("src/client.vl", entry),
+            ("vilan.toml", manifest),
+            ("src/slot.vl", shared),
+            ("src/server.vl", entry),
+        ]);
+        let path = dir.join("src/slot.vl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let document = Document::analyze(&text, &std_root(), &path);
+        assert!(
+            document.published_diagnostics().is_empty(),
+            "{:?}",
+            document
+                .published_diagnostics()
+                .iter()
+                .map(|item| &item.message)
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The direction that keeps the rule a rule: a member only the PROCESS twin
+    // declares (`Region.parent`) is not browser evidence, so the file stays
+    // where it was — and it is clean there, which it would not be under the
+    // browser overlay. A "any member the browser twin has" rule would flip it.
+    #[test]
+    fn a_shared_file_reading_a_process_only_member_stays_on_the_process_twin() {
+        let manifest =
+            "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
+        let shared =
+            "import std::ui::Region;\n\nfun parent_of(region: Region) {\n\tregion.parent;\n}\n";
+        let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
+        let (dir, _client) = analyze_workspace(&[
+            ("src/client.vl", entry),
+            ("vilan.toml", manifest),
+            ("src/slot.vl", shared),
+            ("src/server.vl", entry),
+        ]);
+        let path = dir.join("src/slot.vl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let document = Document::analyze(&text, &std_root(), &path);
+        assert!(
+            document.published_diagnostics().is_empty(),
+            "{:?}",
+            document
+                .published_diagnostics()
+                .iter()
+                .map(|item| &item.message)
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // And member evidence is weighed only for a TWIN module the file imports:
+    // a file that imports no `std::ui` at all, and reads `.anchor` off its own
+    // struct, is not browser-coloured by the name of a field.
+    #[test]
+    fn a_member_name_off_a_users_own_type_is_not_platform_evidence() {
+        let manifest =
+            "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
+        let shared = "struct Marker {\n\tanchor: str,\n}\n\n             fun anchor_of(marker: Marker): str {\n\tmarker.anchor\n}\n";
+        let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
+        let (dir, _client) = analyze_workspace(&[
+            ("src/client.vl", entry),
+            ("vilan.toml", manifest),
+            ("src/marker.vl", shared),
+            ("src/server.vl", entry),
+        ]);
+        let path = dir.join("src/marker.vl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let document = Document::analyze(&text, &std_root(), &path);
+        assert!(
+            document
+                .published_diagnostics()
+                .iter()
+                .all(|item| !item.message.contains("browser")),
+            "{:?}",
+            document
+                .published_diagnostics()
+                .iter()
+                .map(|item| &item.message)
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── E113: a module's color is the entry that REACHES it ──────────────────
     //
     // §4.2 left a non-entry file to inference "because a module has no `main`
