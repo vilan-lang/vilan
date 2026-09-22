@@ -8563,3 +8563,135 @@ fn b380_a_concrete_shared_list_and_a_plain_generic_list_are_unchanged() {
         "2\n6\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B372 — a generic call whose argument is BUILT FROM an unfilled closure parameter
+// ---------------------------------------------------------------------------
+//
+// `n.map(|m| Signal::new(m * 2))` reported "the type of 'inner' is never fully
+// determined: `SignalCell<SignalCell<T>>` keeps its callee's type parameters".
+// The item blamed B162's receiverless trait default; it is not — `Shared::new`,
+// `SignalCell::new` and a user's own generic function all fail the same way
+// once the argument is `m * 2` rather than `m`. On the attempt that reaches the
+// inner call, `m` is still waiting on the owning call's fill, so `m * 2` types
+// as `Unknown`, and reconciling the callee's `T` against `Unknown` binds
+// nothing: the call wired with `T` open, and the type it published was
+// permanent. The BARE parameter never had the problem because the call door
+// already waited on it (B13's rule); the fix asks the same of any argument the
+// parameter is inside, as B288 did for a struct literal's field. Across files
+// the open `T` is refused as a leak; inside ONE file it was not refused at all,
+// and the binding checked vacuously — the third pin is a `str` binding that
+// held an `i32`.
+
+/// The reported shape, and the reason it matters: `Signal::new` is the
+/// documented everyday spelling.
+#[test]
+fn b372_signal_new_in_a_closures_return_binds_its_parameter_from_the_argument() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        fun main() {
+            let n = Signal::new(1);
+            let inner = n.map(|m| Signal::new(m * 2));
+            print(inner.get().get());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+/// Not B162's path: an `external` std constructor and an inherent std one
+/// through a free generic function fail and pass together.
+#[test]
+fn b372_an_external_and_an_inherent_std_constructor_bind_the_same_way() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ SignalCell, Source };
+        import std::shared::Shared;
+
+        fun apply<U>(value: i32, f: sync |i32| U): U {
+            f(value)
+        }
+
+        fun main() {
+            let shared = apply(1, |m| Shared::new(m * 2));
+            print(shared.read());
+            let cell = apply(2, |m| SignalCell::new(m + 1));
+            print(cell.get());
+        }
+        "#,
+        "2\n3\n",
+    );
+}
+
+/// Inside one file the open `T` was not refused — it was CHECKED AGAINST
+/// NOTHING: `b.value` typed as the callee's `T`, and a `str` binding took the
+/// `i32` the program then printed.
+#[test]
+fn b372_a_same_file_generic_callee_is_checked_rather_than_vacuous() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        struct Holder<T> { value: T }
+
+        fun wrap<T>(value: T): Holder<T> {
+            Holder { value }
+        }
+
+        fun apply<U>(value: i32, f: sync |i32| U): U {
+            f(value)
+        }
+
+        fun main() {
+            let b = apply(1, |m| wrap(m * 2));
+            let s: str = b.value;
+            print(s);
+        }
+        "#,
+        "Expected str, but got i32 instead.",
+    );
+}
+
+/// The item's second shape: a destructured tuple parameter feeding the call.
+#[test]
+fn b372_the_same_through_combine_and_a_destructured_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source, combine };
+
+        fun main() {
+            let a = Signal::new(1);
+            let b = Signal::new(10);
+            let summed = combine((a, b)).map(|(x, y)| Signal::new(x + y));
+            print(summed.get().get());
+        }
+        "#,
+        "11\n",
+    );
+}
+
+/// The deferral's limit: a LET-BOUND closure is filled at its own call site,
+/// which waits on the closure's type, which waits on this body — so the wait
+/// is never answered, and on the stalled fixpoint the call commits as it did
+/// before it deferred. Without that fallback this program, which compiled,
+/// would be refused with "type of variable 'f' could not be resolved".
+#[test]
+fn b372_a_let_bound_closure_still_compiles_when_its_wait_cannot_be_answered() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        fun main() {
+            let f = |m| Signal::new(m * 2);
+            print(f(4).get());
+        }
+        "#,
+        "8\n",
+    );
+}

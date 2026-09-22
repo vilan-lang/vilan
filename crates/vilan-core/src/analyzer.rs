@@ -3429,6 +3429,15 @@ pub struct Analyzer<'src> {
     // owns the definition of "moves the world"; see it for why a fresh mint and
     // an idempotent rewrite are both excluded.
     type_map_writes: u64,
+    // B372: set once the constraint fixpoint has stalled, for ONE more round.
+    // A call argument built from a closure parameter that is still awaiting
+    // its fill defers rather than bind the callee's generic to nothing — but
+    // the fill can itself be waiting on that call (a LET-BOUND closure is
+    // filled at its own call site, which needs the closure's type, which needs
+    // its body), and a deferral that can never be answered must not become a
+    // refusal the program never had. On a stalled fixpoint the door commits
+    // with what it has, which is exactly what it did before it deferred.
+    fixpoint_stalled: bool,
     // `std_sources` projected onto entity-id space: the sorted, disjoint
     // `[start, end)` ranges of frozen entities, sealed once after `build()`
     // (`seal_frozen_ranges`) so `frozen_entity` is a binary search — the
@@ -5766,6 +5775,7 @@ impl<'src> Analyzer<'src> {
             lazy_argument_resource_refusals: HashSet::default(),
             dependency_sources: HashSet::default(),
             type_map_writes: 0,
+            fixpoint_stalled: false,
             frozen_ranges: Vec::new(),
             world_ranges: Vec::new(),
             reused_sources: Vec::new(),
@@ -40198,6 +40208,38 @@ impl<'src> Analyzer<'src> {
                         if matches!(argument_type, Type::Unresolved) {
                             return Resolution::Deferred;
                         }
+                        // B372: an argument BUILT FROM a closure parameter that
+                        // is still awaiting its fill — `wrap(m * 2)` inside
+                        // `|m| ..` — types as `Unknown` on this attempt, and
+                        // reconciling a generic parameter against `Unknown`
+                        // binds nothing. The call then wired with its own `T`
+                        // open, and the `Holder<T>` it typed as was permanent:
+                        // "keeps its callee's type parameters" over complete
+                        // code, where the bare parameter (`wrap(m)`) waited
+                        // for the fill below and bound. The subtree is exactly
+                        // as unready as the parameter inside it, so it waits on
+                        // the same fill — but only where it has something to
+                        // bind: a CONCRETE declared type takes nothing from the
+                        // argument, and deferring there would only delay a
+                        // call that is already decided. And only until the
+                        // fixpoint stalls (`fixpoint_stalled`): a let-bound
+                        // closure is filled at its own call site, which waits
+                        // on this body, so its wait is never answered and the
+                        // call commits as it always did.
+                        if !self.fixpoint_stalled
+                            && matches!(argument_type, Type::Unknown)
+                            && !self.is_unknown_closure_parameter(argument_id)
+                            && self.value_awaits_a_closure_parameter(argument_id)
+                        {
+                            let declared =
+                                self.substitute_type(&parameter_type, &substitution_context);
+                            let mut generics = Vec::new();
+                            self.collect_generics(&declared, 0, &mut generics);
+                            let bindable = self.callee_bindable_generics(target_id);
+                            if generics.iter().any(|generic| bindable.contains(generic)) {
+                                return Resolution::Deferred;
+                            }
+                        }
                         // A closure parameter still awaiting its type. When this
                         // call's declared parameter is CONCRETE, adopt it (B13):
                         // a let-bound closure's parameter is typed by nothing
@@ -47779,6 +47821,7 @@ impl<'src> Analyzer<'src> {
         // refined no type in place. See the quiescence test at the bottom of
         // the loop for why the second one in a row ends the fixpoint.
         let mut fruitless_backstops = 0u32;
+        self.fixpoint_stalled = false;
 
         for _ in 0..max_iterations {
             let mut progress = self.resolve_constraints();
@@ -47847,9 +47890,21 @@ impl<'src> Analyzer<'src> {
             }
             fruitless_backstops += 1;
             if fruitless_backstops >= 2 {
+                // B372: a stationary fixpoint is the moment a PREFERENCE
+                // deferral gives way — see `fixpoint_stalled`. One more round
+                // with the door open, and only one: the flag stays set, so a
+                // second stall is the real fixpoint.
+                if !self.fixpoint_stalled {
+                    self.fixpoint_stalled = true;
+                    fruitless_backstops = 0;
+                    self.constraints
+                        .extend(self.deferred.drain(..).map(|(constraint, _)| constraint));
+                    continue;
+                }
                 break;
             }
         }
+        self.fixpoint_stalled = false;
         if split_on {
             split.push(("fixpoint", split_mark.elapsed()));
             let stages: Vec<String> = split
