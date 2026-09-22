@@ -5915,6 +5915,55 @@ export macro fun service(item: Item): Source {
 		.method(with_handlers)
 		.render();
 
+	// --- The connectionless constructor (A120 S2, `transport-rpc.md` §9.7.4).
+	//
+	// The client TYPE already speaks the `POST {mount}rpc` leg — the transport
+	// is a type parameter and every plain stub, `verify()` and
+	// `contract_hash()` live on the unconstrained impl — so nothing is
+	// generated here that has to be. What was missing is the constructor, and
+	// the RULE about which services get one.
+	//
+	// **The rule is the client struct's own field list**, which is already a
+	// total refusal and is measured as one: an `[expose]`d field puts a
+	// `RemoteSource`/`KeyedSource` on the client that only `connect`'s
+	// `__attach` can fill, and a handle-returning method puts a `reactive`
+	// field there that only `connect` mints. Neither can be built over
+	// `HttpTransport`, and the diagnostic an author meets is the field list's,
+	// which names the missing field and therefore the reason. So `over_http`
+	// is emitted when the struct has exactly its two base fields — and NOT for
+	// a `client = H` service, which is the one shape the field list does not
+	// catch: its reverse direction is dead over HTTP (`with_handlers` is
+	// `SocketTransport`-only, and the server's `notify` on the connectionless
+	// leg finds no client channel), so a client that could be built would have
+	// a declared second direction that silently does nothing.
+	//
+	// It is SYNC and it MAKES NO CALL, unlike `connect`, which verifies the
+	// contract in one round trip. Over HTTP there is no connection, so "once
+	// per client value" is an arbitrary unit — a login form constructs one per
+	// mount and may make exactly one call through it. `verify()` is on the
+	// generic impl and reachable, so a caller who wants the check asks for it:
+	// an HTTP client is unversioned unless you call `verify()`. A92's sync
+	// handle stub is the precedent.
+	//
+	// It takes the MOUNT and not the endpoint URL, so `connect("/admin/", c)`
+	// and `over_http("/admin/", c)` read the same and a service that moves
+	// mount moves one string on each side. `HttpTransport { url }` stays the
+	// raw door for a client pointed at another origin.
+	let http_client_is_holdable = !any_handle && exposed_names.len() == 0 && target.handler_name == "";
+	let over_http_impl = if target.client_name != "" && http_client_is_holdable {
+		impl_of(target.client_name)
+			.generics("<HttpTransport>")
+			.method(fun_of("over_http")
+				.parameter("mount: str")
+				.parameter("codec: Codec")
+				.returns(i"{target.client_name}<HttpTransport>")
+				.expr(i"{target.client_name} \{ transport = HttpTransport \{ url = mount + "
+					+ quote("rpc")
+					+ " }, codec }"))
+			.render()
+	} else {
+		""
+	};
 
 	// --- The client-service half (§9.3, R1): `<Name>Proxy`, the typed value a
 	// --- server-side factory stores in a field and calls its notifications on.
@@ -5957,7 +6006,7 @@ export macro fun service(item: Item): Source {
 	// the server half above described one nobody asked for; it is built either
 	// way (the builders are strings) and emitted only here.
 	let client_source = if target.client_name != "" {
-		client_struct.render() + client_impl.render() + connect_impl
+		client_struct.render() + client_impl.render() + connect_impl + over_http_impl
 	} else {
 		""
 	};
@@ -5975,7 +6024,7 @@ export macro fun service(item: Item): Source {
 	// so the service's vocabulary is the author's again.
 	let imports = "import std::rpc;\n"
 		+ "import std::reactive;\n"
-		+ "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, KeyedSource, RpcService, Origin, ClientProxy, SocketDuplex, SocketTransport, ReactiveClient };\n"
+		+ "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, KeyedSource, RpcService, Origin, ClientProxy, SocketDuplex, SocketTransport, HttpTransport, ReactiveClient };\n"
 		+ "import std::wire::{ Codec, Serializer, Frame, Keyed };\n"
 		+ "import std::result::Result;\n"
 		+ "import std::option::Option;\n"

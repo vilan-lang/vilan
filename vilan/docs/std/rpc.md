@@ -346,6 +346,23 @@ trait Transport {
 | `HttpTransport` | one POST per call | stateless calls, no mirrors, no handles |
 | `LocalTransport` | in-process | tests: client and service in one process; handles need a stamped connection |
 
+A `[service]` an HTTP client can hold gets a constructor for this leg:
+
+```vilan,fragment
+impl FooClient<HttpTransport> {
+	fun over_http(mount: str, codec: Codec): FooClient<HttpTransport>
+}
+```
+
+It takes the same `mount` string `connect` takes (`"/"`, `"/auth/"`) — the
+route is `{mount}rpc` — and it is SYNC and makes **no call**: over HTTP there
+is no connection, so there is no round trip to amortize, and an HTTP client is
+unversioned unless you call `verify()` yourself. There are no mirrors, no
+handles and no reverse direction, so it is generated only for a service that
+declares none: a service with an `[expose]`d field or a handle-returning
+method, or one declaring `client = H`, has no `over_http` and the call is
+refused by name.
+
 A transport FAILING is `Err(reason)`, which `call` maps to
 `RpcError::Transport(..)`: an unreachable host, a DNS failure, a connection
 dropped while the body was still arriving. `HttpTransport` answers that for

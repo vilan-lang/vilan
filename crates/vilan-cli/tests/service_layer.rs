@@ -6023,3 +6023,268 @@ fun main() {
         );
     }
 }
+
+/// A120 S2 (`transport-rpc.md` §9.7.4): `over_http` — the connectionless
+/// constructor.
+///
+/// The generated client already SPOKE the `POST {mount}rpc` leg: the transport
+/// is a type parameter, and every plain stub plus `verify()` and
+/// `contract_hash()` lives on the unconstrained impl, so a hand-written
+/// `AuthClient<HttpTransport> { transport = .., codec = .. }` worked on the
+/// shipped toolchain with no socket. What was missing was the constructor and
+/// the rule about which services get one. This is that constructor.
+///
+/// It takes the MOUNT, not the endpoint URL, so `connect("/auth/", codec)` and
+/// `over_http("/auth/", codec)` read the same and a service that moves mount
+/// moves one string on each side. It is SYNC and it makes NO CALL — over HTTP
+/// there is no connection, so "once per client value" is an arbitrary unit and
+/// a login form constructs one per mount; `verify()` is reachable for a caller
+/// who wants the check, which this asserts.
+///
+/// Four things are load-bearing here and each was measured in the paper: a
+/// `Result`-returning method round-trips BOTH arms (the outer arm is "did the
+/// call happen", the inner is "what did the server decide"); a plain method
+/// round-trips; an awaited `void` acks after its handler ran, over the POST
+/// leg; and `verify()` reaches `__contract`.
+#[test]
+fn a_service_client_reaches_the_post_leg_through_over_http() {
+    let dir = temp_project("over_http");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::Server;
+import std::rpc_server::Service;
+import std::wire::Wire;
+
+[derive(Wire)]
+struct AccountToken {
+	token: str,
+	user: str,
+}
+
+[service(AuthClient)]
+struct Auth {
+	seed: i32,
+}
+
+impl Auth {
+	[rpc]
+	fun login(self, user: str, password: str): Result<AccountToken, str> {
+		if password == "hunter2" {
+			Ok(AccountToken { token = "tok-ada", user })
+		} else {
+			Err("wrong password")
+		}
+	}
+
+	[rpc]
+	fun echo(self, value: i32): i32 {
+		value + self.seed
+	}
+
+	[rpc]
+	fun touch(self, tag: str) {
+		print(i"handler ran {tag}");
+	}
+}
+
+fun main() {
+	let auth = Auth { seed = 1 };
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(auth.dispatcher().into_protocol(json_codec())).at("/auth/"))
+		.on_start(|server| run_client(server.url()))
+		.build()
+		.start();
+}
+
+async fun run_client(base: str) {
+	// The MOUNT, exactly as `connect` takes it.
+	let client = AuthClient::over_http(base + "auth/", json_codec());
+	match client.login("ada", "hunter2") {
+		Ok(let outcome) => match outcome {
+			Ok(let token) => print(i"login {token.token} {token.user}"),
+			Err(let message) => print(i"login app error {message}"),
+		},
+		Err(let failure) => print(i"login failure {failure.to_json()}"),
+	}
+	match client.login("ada", "nope") {
+		Ok(let outcome) => match outcome {
+			Ok(let token) => print(i"login {token.token}"),
+			Err(let message) => print(i"login app error {message}"),
+		},
+		Err(let failure) => print(i"login failure {failure.to_json()}"),
+	}
+	match client.echo(40) {
+		Ok(let value) => print(i"echo {value}"),
+		Err(let failure) => print(i"echo failure {failure.to_json()}"),
+	}
+	match client.touch("via-stub") {
+		Ok(let _acked) => print("touch acked"),
+		Err(let failure) => print(i"touch failure {failure.to_json()}"),
+	}
+	match client.verify() {
+		Ok(let same) => print(i"verify {same}"),
+		Err(let failure) => print(i"verify failure {failure.to_json()}"),
+	}
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        "login tok-ada ada",
+        "login app error wrong password",
+        "echo 41",
+        "touch acked",
+        "verify true",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "`over_http` should have produced `{expected}`:\n{stdout}"
+        );
+    }
+    // The awaited `void` acks AFTER its handler ran, over the POST leg — the
+    // ordering is the claim, so the two lines are compared by position.
+    let handler = stdout
+        .find("handler ran via-stub")
+        .expect("the touch handler must have printed");
+    let acked = stdout.find("touch acked").expect("touch must have acked");
+    assert!(
+        handler < acked,
+        "an awaited void must ack after its handler ran:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The RULE `over_http` is emitted under (§9.7.5): the client struct has
+/// exactly its two base fields, and the service declares no `client = H`.
+///
+/// For an `[expose]`-bearing or handle-returning service the field list is
+/// already a total refusal — the mirror fields can only be filled by
+/// `connect`'s `__attach`, which over POST answers `unknown connection`. The
+/// `client = H` case is the one the field list does NOT catch, and it is the
+/// one that matters: `with_handlers` is `SocketTransport`-only and the server's
+/// `notify` on the connectionless leg finds no client channel, so a client that
+/// could be built would have a declared second direction that silently does
+/// nothing.
+///
+/// Three programs, one per shape, each refused by name at the call. The CONTROL
+/// is the test above: the same call on a plain service compiles and runs.
+#[test]
+fn over_http_is_not_generated_for_a_client_that_needs_a_connection() {
+    for (tag, source) in [
+        (
+            "expose",
+            r#"import std::reactive::{ Signal, SignalCell };
+import std::json::json_codec;
+
+[service(TallyClient)]
+struct Tally {
+	[expose] count: SignalCell<i32>,
+}
+
+impl Tally {
+	[rpc]
+	fun bump(self): i32 {
+		self.count.get()
+	}
+}
+
+fun main() {
+	let client = TallyClient::over_http("/", json_codec());
+}
+"#,
+        ),
+        (
+            "handle",
+            r#"import std::reactive::{ Signal, SignalCell };
+import std::json::json_codec;
+
+[service(WatchyClient)]
+struct Watchy {
+	seed: i32,
+}
+
+impl Watchy {
+	[rpc]
+	fun watch(self, id: str): SignalCell<i32> {
+		Signal::new(self.seed)
+	}
+}
+
+fun main() {
+	let client = WatchyClient::over_http("/", json_codec());
+}
+"#,
+        ),
+        (
+            "client_handler",
+            r#"import std::json::json_codec;
+
+[client_service]
+struct Peer {
+	seed: i32,
+}
+
+impl Peer {
+	[rpc]
+	fun ping(self, tag: str) {
+	}
+}
+
+[service(HubClient, client = Peer)]
+struct Hub {
+	seed: i32,
+}
+
+impl Hub {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.seed + by
+	}
+}
+
+fun main() {
+	let client = HubClient::over_http("/", json_codec());
+}
+"#,
+        ),
+    ] {
+        let dir = temp_project(&format!("over_http_refused_{tag}"));
+        write(
+            &dir,
+            "vilan.toml",
+            "[package]\nname = \"app\"\ntarget = \"node\"\n",
+        );
+        write(&dir, "src/main.vl", source);
+        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .args(["check", dir.to_str().unwrap()])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run vilan check");
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.status.success(),
+            "`over_http` must not exist on the `{tag}` client:\n{report}"
+        );
+        assert!(
+            report.contains("cannot find 'over_http'"),
+            "the `{tag}` client should be refused at the call by name:\n{report}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
