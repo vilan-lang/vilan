@@ -2141,19 +2141,21 @@ fn fmt(paths: &[PathBuf], check: bool) -> ExitCode {
     // the FORMATTER's, and a run reporting the second as the first is how a
     // printer gap stays invisible.
     let mut declined = 0;
-    // E205: `[fmt] wrap_comments` is a PACKAGE's opinion, so it is resolved per
-    // file — and cached per DIRECTORY for `exclude_generated`'s reason: every
-    // file in one directory has the same ancestors, so one manifest climb per
-    // directory rather than one per file.
-    let mut wrap_comments: HashMap<PathBuf, bool> = HashMap::new();
+    // E205/E215: the `[fmt]` knobs are a PACKAGE's opinion, so they are
+    // resolved per file — and cached per DIRECTORY for `exclude_generated`'s
+    // reason: every file in one directory has the same ancestors, so one
+    // manifest climb per directory rather than one per file. One climb answers
+    // both keys, and each key takes its own nearest declaration.
+    let mut fmt_opinions: HashMap<PathBuf, vilan_core::manifest::FmtOpinions> = HashMap::new();
     for file in &files {
         let directory = file.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let opinions = *fmt_opinions
+            .entry(directory)
+            .or_insert_with_key(|directory| vilan_core::manifest::fmt_opinions_covering(directory));
+        let defaults = vilan_core::formatter::FormatOptions::default();
         let options = vilan_core::formatter::FormatOptions {
-            wrap_comments: *wrap_comments
-                .entry(directory)
-                .or_insert_with_key(|directory| {
-                    vilan_core::manifest::wrap_comments_covering(directory)
-                }),
+            wrap_comments: opinions.wrap_comments.unwrap_or(defaults.wrap_comments),
+            comment_width: opinions.comment_width.unwrap_or(defaults.comment_width),
         };
         let source = match fs::read_to_string(file) {
             Ok(source) => source,

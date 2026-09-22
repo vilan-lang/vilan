@@ -463,12 +463,22 @@ pub const TABLES: &[Table] = &[
     Table {
         path: "fmt",
         documentation: "`vilan fmt`'s knobs for this package.",
-        keys: &[Key {
-            name: "wrap_comments",
-            documentation: "Re-fill a paragraph of `//` / `///` comment lines to the line \
-                            width, the way code is already laid out (default false).",
-            values: ValueSet::Boolean,
-        }],
+        keys: &[
+            Key {
+                name: "wrap_comments",
+                documentation: "Re-fill a paragraph of `//` / `///` comment lines to the \
+                                comment width, the way code is already laid out \
+                                (default false).",
+                values: ValueSet::Boolean,
+            },
+            Key {
+                name: "comment_width",
+                documentation: "The column budget a re-filled comment paragraph is laid out \
+                                to (default 100, the code width). Prose is not code: a \
+                                package writing narrower comments says so here.",
+                values: ValueSet::Open,
+            },
+        ],
     },
     Table {
         path: "macro",

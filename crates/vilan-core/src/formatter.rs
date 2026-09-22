@@ -2999,21 +2999,44 @@ struct DeclinedAt {
 
 /// The per-package knobs `vilan fmt` reads from a manifest's `[fmt]` section.
 ///
-/// Deliberately tiny, and deliberately not a width: the formatter has ONE
-/// canonical layout for code (see [`LINE_BUDGET`]), and a width knob would
-/// fork the shape of every file in every project. What is here is the one
-/// thing that cannot be settled globally — whether the formatter is allowed to
-/// rewrite the author's prose.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Deliberately tiny, and deliberately not a width for CODE: the formatter has
+/// ONE canonical layout for code (see [`LINE_BUDGET`]), and a code-width knob
+/// would fork the shape of every file in every project. What is here is what
+/// cannot be settled globally, and both of them are about PROSE — whether the
+/// formatter is allowed to rewrite the author's comments, and how wide the
+/// author writes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FormatOptions {
     /// `[fmt] wrap_comments` (E205): re-fill a paragraph of `//` / `///` lines
-    /// to the line width, the way the printer already lays out code.
+    /// to [`comment_width`](Self::comment_width), the way the printer already
+    /// lays out code.
     ///
-    /// **Default OFF, for one release** (R8 at Order 39's GO). Rewrapping
-    /// somebody's comments is the one thing the formatter does that no token
-    /// comparison can check, so it earns its default by being asked for first.
-    /// With the key off, `vilan fmt` is byte-for-byte what it was.
+    /// **Default OFF, for one release** (R8 at Order 39's GO, held by E215's
+    /// R3 until std has run under it for one order). Rewrapping somebody's
+    /// comments is the one thing the formatter does that no token comparison
+    /// can check, so it earns its default by being asked for first. With the
+    /// key off, `vilan fmt` is byte-for-byte what it was.
     pub wrap_comments: bool,
+    /// `[fmt] comment_width` (E215's R1): the column budget one re-filled
+    /// comment line is laid out to, at that comment's own indentation.
+    ///
+    /// **Default [`DEFAULT_COMMENT_WIDTH`], the code width** — which is what
+    /// E205 shipped and what a package that says nothing keeps. It is a
+    /// separate width because prose is not code: std's comments are written to
+    /// ~84 columns, so re-filling them to the code width would move 6,719
+    /// comment lines to a width nobody chose. Read only when
+    /// [`wrap_comments`](Self::wrap_comments) is on — with the knob off no
+    /// comment is re-laid-out at any width.
+    pub comment_width: usize,
+}
+
+impl Default for FormatOptions {
+    fn default() -> Self {
+        Self {
+            wrap_comments: false,
+            comment_width: DEFAULT_COMMENT_WIDTH,
+        }
+    }
 }
 
 /// Formats `original`, returning the reprinted text — or the [`Decline`] that
@@ -3354,6 +3377,11 @@ pub fn format(original: &str) -> String {
 /// and a width knob would fork every file's shape.
 const LINE_BUDGET: usize = 100;
 
+/// What [`FormatOptions::comment_width`] is when a package does not say: the
+/// CODE width (E215's R1). A comment budget defaulting to anything else would
+/// make E205's shipped behavior depend on a key nobody had written.
+pub const DEFAULT_COMMENT_WIDTH: usize = LINE_BUDGET;
+
 /// The columns a tab occupies when measuring a line. Vilan indents with tabs,
 /// so the measurement has to agree with what an editor shows.
 const TAB_COLUMNS: usize = 4;
@@ -3565,10 +3593,16 @@ impl<'src> Printer<'src> {
     /// Shared by the two places a standalone comment reaches the output: the
     /// comment stream, and E181's comments riding with an `export *;` marker.
     fn emit_comment_paragraph(&mut self, lines: &[&'src str], at: Option<Span>) {
-        // The budget is the line's, at the indentation this paragraph is being
-        // printed at — not the one it was written at, since the printer may
-        // have re-indented the block around it.
-        let budget = LINE_BUDGET.saturating_sub(self.indent * TAB_COLUMNS);
+        // The budget is the COMMENT width's, at the indentation this paragraph
+        // is being printed at — not the one it was written at, since the
+        // printer may have re-indented the block around it. It is the comment
+        // width and not [`LINE_BUDGET`] because prose has its own measure
+        // (E215): a package writing 84-column comments beside 100-column code
+        // says so once, and every paragraph in it is laid out to that.
+        let budget = self
+            .options
+            .comment_width
+            .saturating_sub(self.indent * TAB_COLUMNS);
         let filled = match self.options.wrap_comments {
             true => comment_reflow::reflow(lines, budget),
             false => comment_reflow::Reflow::AsWritten,
@@ -15498,11 +15532,14 @@ mod comment_wrapping {
     //! source unchanged), so "byte-identical under the knob" cannot be
     //! satisfied by a fixture that was going to be rewritten anyway.
 
-    use super::{Decline, DeclineReason, FormatOptions, decline, reprint, reprint_with};
+    use super::{
+        Decline, DeclineReason, FormatOptions, LINE_BUDGET, decline, reprint, reprint_with,
+    };
 
     /// The knob on.
     const ON: FormatOptions = FormatOptions {
         wrap_comments: true,
+        comment_width: super::DEFAULT_COMMENT_WIDTH,
     };
 
     /// Formats `source` with the knob on, asserting first that the fixture is
@@ -15580,6 +15617,109 @@ mod comment_wrapping {
                 <= 100),
             "{filled}"
         );
+    }
+
+    #[test]
+    fn a_narrower_comment_width_is_the_one_the_fill_uses() {
+        // E215's R1, and the whole point of the key: the SAME paragraph, the
+        // same knob, two widths — and the answers differ. The default is the
+        // code width, so `AT_84` is what a package that writes prose narrower
+        // than its code gets, and nothing else moves with it.
+        const AT_84: FormatOptions = FormatOptions {
+            wrap_comments: true,
+            comment_width: 84,
+        };
+        let source = concat!(
+            "// the formatter has laid code out to a width since the day it existed and ",
+            "left every comment exactly as typed\n",
+            "// which is the asymmetry this closes\nfun main() {}\n"
+        );
+        let at_default = reprint_with(source, ON).expect("the fixture reprints");
+        let at_84 = reprint_with(source, AT_84).expect("the fixture reprints");
+        assert_ne!(
+            at_84, at_default,
+            "a width other than the code width must reach the output"
+        );
+        assert_eq!(
+            at_84,
+            concat!(
+                "// the formatter has laid code out to a width since the day it existed and left\n",
+                "// every comment exactly as typed which is the asymmetry this closes\n",
+                "fun main() {}\n"
+            )
+        );
+        assert!(
+            at_84
+                .lines()
+                .filter(|line| line.starts_with("//"))
+                .all(|line| line.chars().count() <= 84),
+            "{at_84}"
+        );
+        // Wider than 84 somewhere, or the two widths would be the same claim.
+        assert!(
+            at_default
+                .lines()
+                .filter(|line| line.starts_with("//"))
+                .any(|line| line.chars().count() > 84),
+            "{at_default}"
+        );
+        assert_eq!(
+            reprint_with(&at_84, AT_84).as_deref(),
+            Ok(at_84.as_str()),
+            "the fill at a declared width must be idempotent"
+        );
+    }
+
+    #[test]
+    fn the_declared_width_is_measured_at_the_comment_s_own_indentation() {
+        // The indentation comes off the COMMENT width, not off the code
+        // width — otherwise a nested paragraph in an 84-column package would
+        // be filled to 96.
+        const AT_84: FormatOptions = FormatOptions {
+            wrap_comments: true,
+            comment_width: 84,
+        };
+        let source = concat!(
+            "fun main() {\n\t// a comment inside a block has four fewer columns to work ",
+            "with than one at the top level, and the fill has to know that\n\tlet x = 1;\n}\n"
+        );
+        let filled = reprint_with(source, AT_84).expect("the fixture reprints");
+        assert!(
+            filled
+                .lines()
+                .filter(|line| line.trim_start().starts_with("//"))
+                .all(|line| line.chars().count()
+                    + 3 * line.chars().take_while(|c| *c == '\t').count()
+                    <= 84),
+            "{filled}"
+        );
+        assert_ne!(
+            filled,
+            reprint_with(source, ON).expect("the fixture reprints"),
+            "the nested paragraph must move with the declared width too"
+        );
+    }
+
+    #[test]
+    fn the_default_width_is_the_code_width_and_the_knob_still_gates_it() {
+        // R1's default, pinned as an identity rather than as a number that
+        // happens to match: the options a package with no `comment_width` gets
+        // fill exactly as E205 shipped. And the width alone changes nothing —
+        // `wrap_comments` is still the gate.
+        assert_eq!(
+            FormatOptions::default().comment_width,
+            LINE_BUDGET,
+            "the default comment width is the code width"
+        );
+        let source = concat!(
+            "// this comment runs a very long way past the eighty-four-column width std ",
+            "writes its prose to, and stays exactly as written\nfun main() {}\n"
+        );
+        let narrow_but_off = FormatOptions {
+            wrap_comments: false,
+            comment_width: 84,
+        };
+        assert_eq!(reprint_with(source, narrow_but_off).as_deref(), Ok(source));
     }
 
     #[test]

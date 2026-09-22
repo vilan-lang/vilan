@@ -262,7 +262,12 @@
       "properties": {
         "wrap_comments": {
           "type": "boolean",
-          "description": "Re-fill a paragraph of `//` / `///` comment lines to the line width, the way code is already laid out (default false)."
+          "description": "Re-fill a paragraph of `//` / `///` comment lines to the comment width, the way code is already laid out (default false)."
+        },
+        "comment_width": {
+          "type": "integer",
+          "description": "The column budget a re-filled comment paragraph is laid out to, at that comment's own indentation. Prose is not code: a package whose comments are written narrower than its code says so here. Read only when `wrap_comments` is on.",
+          "default": 100
         }
       }
     },
