@@ -6,6 +6,8 @@
 // reference, not a value: methods mutate the node in place and binding/passing it
 // shares the one node rather than snapshotting it.
 
+import pkg::compare::Ord;
+import pkg::option::Option::{ None, Some };
 import pkg::reactive::Subscription;
 
 export *;
@@ -458,6 +460,127 @@ impl Element {
 		Subscription::teardown(|| {
 			observer.disconnect();
 		})
+	}
+
+	/// Whether this element can take SEQUENTIAL focus — whether Tab can reach
+	/// it (A121, `proposal/focus-scope.md` §3).
+	///
+	/// The literature's definition of tabbable is one big selector:
+	///
+	/// ```text
+	/// a[href], area[href], input:not([disabled]), select:not([disabled]),
+	/// textarea:not([disabled]), button:not([disabled]), iframe, object,
+	/// embed, summary, audio[controls], video[controls], [contenteditable],
+	/// [tabindex]
+	/// ```
+	///
+	/// That selector is the DEFINITION and this is the implementation of it,
+	/// which is not the same thing. Half of it — every tag in the list — is
+	/// what `tab_index` already answers, because the host reflects the
+	/// attribute with a per-tag default and knows its own focusable set; and
+	/// the half a selector CANNOT answer honestly is the subtree: `inert`,
+	/// `hidden` and a closed `<details>` disable everything under them, which
+	/// `[inert] *` expresses only approximately and misses entirely when the
+	/// element you started from is itself inside an inert ancestor. So the
+	/// predicate is read off the element and its ancestors, in cost order:
+	///
+	/// 1. a negative `tab_index` — the author's opt-out, and every tag that
+	///    is not focusable at all;
+	/// 2. `disabled`, which keeps its `tabIndex` of 0 and is not tabbable;
+	/// 3. an `inert` or `hidden` ANCESTOR, this element included;
+	/// 4. a resolved `visibility: hidden`, which INHERITS, so one read
+	///    answers for a hidden ancestor too;
+	/// 5. a 0x0 box, which is `display: none` — on this element or on any
+	///    ancestor, since a hidden subtree lays nothing out.
+	///
+	/// 4 and 5 are the two that force layout, and they come last for that
+	/// reason. What is deliberately NOT here: a scrolled container's
+	/// off-screen children are tabbable and stay tabbable — they are laid
+	/// out, and only their position is elsewhere.
+	fun is_tabbable(self): bool {
+		if self.tab_index() < 0 {
+			ret false;
+		}
+		if self.has_attribute("disabled") {
+			ret false;
+		}
+		mut walk = self;
+		for !is_null(walk) {
+			if walk.has_attribute("inert") || walk.has_attribute("hidden") {
+				ret false;
+			}
+			walk = walk.parent();
+		}
+		if self.computed_style("visibility") == "hidden" {
+			ret false;
+		}
+		self.offset_width() != 0f || self.offset_height() != 0f
+	}
+
+	/// Every tabbable DESCENDANT, in the order Tab visits them (A121).
+	///
+	/// The order is the part usually got wrong, and it is the reason this
+	/// answers a `List` rather than leaving the caller with
+	/// `query_selector_all`'s document order: within a subtree, Tab visits
+	/// POSITIVE `tabindex` values first in ascending order, then everything
+	/// else in document order. That is the HTML specification's sequential
+	/// focus navigation order restricted to a subtree, and a positive
+	/// `tabindex` is rare enough that a scope which has none pays only the
+	/// enumeration.
+	///
+	/// The enumeration is `query_selector_all("*")` — the UNIVERSAL selector,
+	/// which is every descendant element in document order rather than a
+	/// predicate — and each one is then asked `is_tabbable`. The ties are
+	/// stable, so two elements at `tabindex="2"` keep their document order.
+	fun tabbable(self): List<Element> {
+		mut positive: List<Element> = [];
+		mut natural: List<Element> = [];
+		for candidate in self.query_selector_all("*") {
+			if candidate.is_tabbable() {
+				if candidate.tab_index() > 0 {
+					positive.push(candidate);
+				} else {
+					natural.push(candidate);
+				}
+			}
+		}
+		mut ordered = positive.sort_by(|a, b| a.tab_index().compare(b.tab_index()));
+		for element in natural {
+			ordered.push(element);
+		}
+		ordered
+	}
+
+	/// Move focus to the first tabbable descendant, or — when there is none —
+	/// to this element itself, at `tabindex="-1"`. Answers whether the focus
+	/// was TAKEN (A121).
+	///
+	/// The last rung is the one worth reading twice: a `tabindex="-1"`
+	/// element is programmatically focusable and NOT tabbable, which is
+	/// exactly right for a panel with nothing to focus inside it — focus
+	/// lands on the panel, Tab then leaves it in document order, and the
+	/// panel never becomes a tab stop of its own. A bare `<div>` without that
+	/// attribute is not a focusable area at all, so `focus()` on one is a
+	/// silent no-op: this is the fallback every app writes by hand, made to
+	/// work.
+	///
+	/// The answer is a `bool` for `focus()`'s own reason (B271): focusing is
+	/// a REQUEST whose precondition is that the target is rendered and
+	/// visible at the call, so a caller that runs before layout — a show hook
+	/// that fires with the panel still `visibility: hidden` — reads `false`
+	/// and asks again on the next frame.
+	fun focus_first(self): bool {
+		match self.tabbable().get(0) {
+			Some(let first) => {
+				first.focus();
+				first.matches(":focus")
+			},
+			None => {
+				self.set_attribute("tabindex", "-1");
+				self.focus();
+				self.matches(":focus")
+			},
+		}
 	}
 }
 

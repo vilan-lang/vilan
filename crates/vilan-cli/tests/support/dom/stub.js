@@ -252,6 +252,18 @@ class StubElement {
     // first). `relatedTarget` carries the element focus LEFT, as it does in
     // the platform, so an S3 `focusout` path reads the same shape.
     focus() {
+        // A121 §1: `focus()` is a request whose target must be a FOCUSABLE
+        // AREA, and the platform's answer to anything else is to do nothing,
+        // silently. A bare `<div>` is not one — which is why the hand-written
+        // `panel.focus()` fallback every overlay carries does nothing at all
+        // until a `tabindex` is written onto it, and why `focus_first`'s last
+        // rung writes one. An explicit `tabindex` of ANY value makes an
+        // element programmatically focusable; a negative one keeps it out of
+        // the tab order and nothing more.
+        if (this.tabIndex < 0 && !("tabindex" in this.attributes)) {
+            global.focusLog.push(describe(this) + "!unfocusable");
+            return;
+        }
         const previous = global.activeElement;
         this.focused = true;
         global.activeElement = this;

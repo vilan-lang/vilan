@@ -3551,3 +3551,470 @@ fn a121_the_dom_reads_a_focus_scope_needs_answer_off_the_host() {
          got:\n{stdout}"
     );
 }
+
+// --- A121 S1: the tabbable walk, and a scope that traps without `inert` ------
+
+/// The walk, with one element per reason it can be dropped and one per
+/// position in the order. The tree is built through `std::dom` directly: this
+/// is a `std::dom` claim, and going through `std::ui` would only put a view
+/// layer between the assertion and the thing asserted.
+const TABBABLE_WALK: &str = r#"import std::dom::{ create_element, get_element_by_id };
+import std::io::print;
+
+fun main() {
+	let root = get_element_by_id("app");
+	let panel = create_element("div");
+	root.append(panel);
+
+	let late = create_element("input");
+	late.set_attribute("tabindex", "3");
+	panel.append(late);
+	let natural = create_element("input");
+	panel.append(natural);
+	let opted_out = create_element("input");
+	opted_out.set_attribute("tabindex", "-1");
+	panel.append(opted_out);
+	let off = create_element("input");
+	off.set_attribute("disabled", "");
+	panel.append(off);
+	let veiled = create_element("section");
+	veiled.set_attribute("hidden", "");
+	panel.append(veiled);
+	let under_veiled = create_element("input");
+	veiled.append(under_veiled);
+	let invisible = create_element("section");
+	invisible.set_style_property("visibility", "hidden");
+	panel.append(invisible);
+	let under_invisible = create_element("input");
+	invisible.append(under_invisible);
+	let unlaid = create_element("textarea");
+	panel.append(unlaid);
+	let early = create_element("input");
+	early.set_attribute("tabindex", "1");
+	panel.append(early);
+
+	mut order = "";
+	for element in panel.tabbable() {
+		order = order + i"{element.tab_index()},";
+	}
+	print(i"descendants={panel.query_selector_all("*").len()} order={order}");
+	print(i"kept late={late.is_tabbable()} natural={natural.is_tabbable()} early={early.is_tabbable()}");
+	print(i"dropped opted_out={opted_out.is_tabbable()} disabled={off.is_tabbable()} veiled={under_veiled.is_tabbable()} invisible={under_invisible.is_tabbable()} unlaid={unlaid.is_tabbable()}");
+
+	let empty = create_element("div");
+	root.append(empty);
+	print(i"fallback before={empty.has_attribute("tabindex")} took={empty.focus_first()} after={empty.has_attribute("tabindex")}");
+	print(i"first took={panel.focus_first()} landed={early.matches(":focus")}");
+}
+
+main();
+"#;
+
+/// The boxes every focus pin needs — the walk's last predicate is a 0x0
+/// measurement, and the stub has no layout engine, so a tag with no entry
+/// here measures 0x0 and is NOT tabbable, which is what `textarea` is doing
+/// in the tree above.
+const FOCUS_STUB_EXTRAS: &str = r##"
+global.boxes = {
+    input: { left: 0, top: 0, width: 100, height: 20 },
+    button: { left: 0, top: 0, width: 60, height: 20 },
+    div: { left: 0, top: 0, width: 200, height: 40 },
+    section: { left: 0, top: 0, width: 200, height: 40 },
+};
+global.findByName = (name) => {
+    const walk = (node) => {
+        if (node.attributes && node.attributes.name === name) return node;
+        for (const child of node.children) {
+            const found = walk(child);
+            if (found) return found;
+        }
+        return null;
+    };
+    return walk(documentRoot);
+};
+global.at = () => (global.activeElement ? global.activeElement.attributes.name : "none");
+"##;
+
+#[test]
+fn a121_the_tabbable_walk_implements_the_selectors_definition() {
+    let harness = format!("{DOM_STUB}{FOCUS_STUB_EXTRAS}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("a121_walk", TABBABLE_WALK, &harness);
+    let line = |key: &str| -> String {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(key))
+            .unwrap_or_else(|| panic!("no {key:?} line in:\n{stdout}"))
+            .to_string()
+    };
+    assert_eq!(
+        line("descendants="),
+        "descendants=10 order=1,3,0,",
+        "Tab visits POSITIVE `tabindex` values first in ascending order, then \
+         everything else in document order — the HTML specification's \
+         sequential focus order restricted to a subtree, which is why \
+         `tabbable` answers a List and not `querySelectorAll`'s order; \
+         got:\n{stdout}"
+    );
+    assert_eq!(
+        line("kept "),
+        "kept late=true natural=true early=true",
+        "a written `tabindex` and a natively focusable tag are both tabbable; \
+         got:\n{stdout}"
+    );
+    assert_eq!(
+        line("dropped "),
+        "dropped opted_out=false disabled=false veiled=false invisible=false \
+         unlaid=false",
+        "each of the five reasons drops its element: a negative `tabindex` \
+         (the author's opt-out), `disabled`, a `hidden` ANCESTOR, an INHERITED \
+         `visibility: hidden` (which keeps its box, so no measurement sees \
+         it), and a 0x0 box; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("fallback "),
+        "fallback before=false took=true after=true",
+        "a panel with nothing tabbable inside it takes focus ITSELF, and only \
+         because `focus_first` writes `tabindex=\"-1\"` first: a bare `<div>` \
+         is not a focusable area, so `focus()` on one does nothing at all — \
+         which is what the hand-written fallback in every overlay has been \
+         doing; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("first "),
+        "first took=true landed=true",
+        "`focus_first` focuses the first element in TAB order, not in document \
+         order; got:\n{stdout}"
+    );
+}
+
+/// A `Wrap` scope — a menu. The panel is a portal-shaped sibling of the rest
+/// of the page, and the page stays live: a Tab pressed outside the scope is
+/// not touched, which is A121's "without `inert`" stated as a test.
+const WRAP_SCOPE: &str = r#"import std::dom::window;
+import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ FocusContainment, View, focus_scope, mount_root, view, when };
+
+fun main() {
+	let open: SignalCell<bool> = Signal::new(false);
+	let root = mount_root("app", || {
+		view("div")
+			.child(view("input").attr("name", "before"))
+			.child(when(open, || {
+				view("div")
+					.attr("name", "panel")
+					.attr("tabindex", "-1")
+					.on_mount(|element| {
+						let _scope = focus_scope(element, FocusContainment::Wrap);
+						print("installed");
+					})
+					.child(view("input").attr("name", "first"))
+					.child(view("input").attr("name", "middle"))
+					.child(view("input").attr("name", "last"))
+			}))
+			.child(view("input").attr("name", "after"))
+	});
+	let _toggle = root.take(window().listen("toggle", |_event| {
+		open.set(!open.get());
+	}));
+	print("built");
+}
+
+main();
+"#;
+
+#[test]
+fn a121_wrap_cycles_at_the_ends_and_leaves_the_rest_of_the_page_alone() {
+    let harness = format!(
+        "{DOM_STUB}{FOCUS_STUB_EXTRAS}\nrequire(\"./app.js\");\n\
+         window.fire(\"toggle\", {{}});\n\
+         setTimeout(() => {{\n  \
+         findByName(\"last\").focus();\n  \
+         const tail = dispatchEvent(findByName(\"last\"), \"keydown\", {{ key: \"Tab\" }});\n  \
+         console.log(\"forward=\" + at() + \" prevented=\" + !!tail.prevented);\n  \
+         const head = dispatchEvent(activeElement, \"keydown\", {{ key: \"Tab\", shiftKey: true }});\n  \
+         console.log(\"backward=\" + at() + \" prevented=\" + !!head.prevented);\n  \
+         findByName(\"middle\").focus();\n  \
+         const middle = dispatchEvent(findByName(\"middle\"), \"keydown\", {{ key: \"Tab\" }});\n  \
+         console.log(\"middle=\" + at() + \" prevented=\" + !!middle.prevented);\n  \
+         findByName(\"before\").focus();\n  \
+         const outside = dispatchEvent(findByName(\"before\"), \"keydown\", {{ key: \"Tab\" }});\n  \
+         console.log(\"outside=\" + at() + \" prevented=\" + !!outside.prevented);\n  \
+         const other = dispatchEvent(findByName(\"first\"), \"keydown\", {{ key: \"Escape\" }});\n  \
+         console.log(\"otherkey=\" + at() + \" prevented=\" + !!other.prevented);\n  \
+         findByName(\"panel\").focus();\n  \
+         const onRoot = dispatchEvent(findByName(\"panel\"), \"keydown\", {{ key: \"Tab\" }});\n  \
+         console.log(\"fromRoot=\" + at() + \" prevented=\" + !!onRoot.prevented);\n  \
+         findByName(\"panel\").focus();\n  \
+         const backRoot = dispatchEvent(findByName(\"panel\"), \"keydown\", {{ key: \"Tab\", shiftKey: true }});\n  \
+         console.log(\"backFromRoot=\" + at() + \" prevented=\" + !!backRoot.prevented);\n\
+         }}, 0);\n"
+    );
+    let stdout = build_and_run("a121_wrap", WRAP_SCOPE, &harness);
+    let line = |key: &str| -> String {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(key))
+            .unwrap_or_else(|| panic!("no {key:?} line in:\n{stdout}"))
+            .to_string()
+    };
+    assert_eq!(
+        line("forward="),
+        "forward=first prevented=true",
+        "Tab from the LAST tabbable wraps to the first, and the default is \
+         cancelled — otherwise the platform would move focus as well; \
+         got:\n{stdout}"
+    );
+    assert_eq!(
+        line("backward="),
+        "backward=last prevented=true",
+        "Shift+Tab from the FIRST wraps to the last; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("middle="),
+        "middle=middle prevented=false",
+        "between the ends the scope does NOTHING and the platform moves \
+         focus — the stub has no sequential navigation of its own, so focus \
+         staying put IS the untouched case; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("outside="),
+        "outside=before prevented=false",
+        "a Tab pressed OUTSIDE the scope is untouched: the page stays live, \
+         which is what `Contain`/`Wrap` buy over `inert`; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("otherkey="),
+        "otherkey=before prevented=false",
+        "a key that is not Tab is not the scope's business; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("fromRoot="),
+        "fromRoot=first prevented=true",
+        "focus on the PANEL itself is inside the scope and on no tab stop — \
+         which is where `focus_first`'s fallback leaves it — so Tab enters \
+         the order at its start instead of leaving the scope; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("backFromRoot="),
+        "backFromRoot=last prevented=true",
+        "and Shift+Tab from the panel enters at the END; got:\n{stdout}"
+    );
+}
+
+/// A `Contain` scope and a nested one, in the shape that makes the stack
+/// necessary: both panels are SIBLINGS in the document (an overlay is a
+/// portal — a submenu opened from inside a menu's body mounts into the
+/// driver's container, not into its parent's panel), so
+/// `menu.contains(submenu)` is false and a containment test written on DOM
+/// ancestry would yank focus out of the submenu the moment it opened.
+const CONTAIN_SCOPE: &str = r#"import std::dom::window;
+import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ FocusContainment, View, focus_scope, mount_root, view, when };
+
+fun main() {
+	let menu: SignalCell<bool> = Signal::new(false);
+	let submenu: SignalCell<bool> = Signal::new(false);
+	let root = mount_root("app", || {
+		view("div")
+			.child(view("input").attr("name", "outside"))
+			.child(when(menu, || {
+				view("div")
+					.attr("name", "menu")
+					.on_mount(|element| {
+						let _scope = focus_scope(element, FocusContainment::Contain);
+					})
+					.child(view("input").attr("name", "menu-item"))
+			}))
+			.child(when(submenu, || {
+				view("div")
+					.attr("name", "sub")
+					.on_mount(|element| {
+						let _scope = focus_scope(element, FocusContainment::Contain);
+					})
+					.child(view("input").attr("name", "sub-item"))
+			}))
+	});
+	let _open_menu = root.take(window().listen("menu", |_event| {
+		menu.set(!menu.get());
+	}));
+	let _open_sub = root.take(window().listen("sub", |_event| {
+		submenu.set(!submenu.get());
+	}));
+	print("built");
+}
+
+main();
+"#;
+
+#[test]
+fn a121_contain_pulls_focus_back_and_the_nested_scope_takes_over() {
+    let harness = format!(
+        "{DOM_STUB}{FOCUS_STUB_EXTRAS}\nrequire(\"./app.js\");\n\
+         window.fire(\"menu\", {{}});\n\
+         setTimeout(() => {{\n  \
+         console.log(\"siblings=\" + findByName(\"menu\").contains(findByName(\"outside\")));\n  \
+         findByName(\"outside\").focus();\n  \
+         console.log(\"pulled=\" + at());\n  \
+         window.fire(\"sub\", {{}});\n  \
+         setTimeout(() => {{\n    \
+         console.log(\"nested=\" + findByName(\"menu\").contains(findByName(\"sub\")));\n    \
+         findByName(\"sub-item\").focus();\n    \
+         console.log(\"inSub=\" + at());\n    \
+         findByName(\"outside\").focus();\n    \
+         console.log(\"pulledBySub=\" + at());\n    \
+         window.fire(\"sub\", {{}});\n    \
+         setTimeout(() => {{\n      \
+         console.log(\"subGone=\" + !!findByName(\"sub\"));\n      \
+         findByName(\"outside\").focus();\n      \
+         console.log(\"handedBack=\" + at());\n      \
+         window.fire(\"menu\", {{}});\n      \
+         setTimeout(() => {{\n        \
+         findByName(\"outside\").focus();\n        \
+         console.log(\"released=\" + at());\n      \
+         }}, 0);\n    \
+         }}, 0);\n  \
+         }}, 0);\n\
+         }}, 0);\n"
+    );
+    let stdout = build_and_run("a121_contain", CONTAIN_SCOPE, &harness);
+    let line = |key: &str| -> String {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(key))
+            .unwrap_or_else(|| panic!("no {key:?} line in:\n{stdout}"))
+            .to_string()
+    };
+    assert_eq!(
+        line("siblings="),
+        "siblings=false",
+        "the panel does not contain the page — the control for the assertions \
+         below; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("pulled="),
+        "pulled=menu-item",
+        "focus arriving OUTSIDE a `Contain` scope is pulled back to the first \
+         tabbable thing inside it; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("nested="),
+        "nested=false",
+        "the submenu is a SIBLING of the menu, not a descendant — which is \
+         why the containment test cannot be DOM ancestry; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("inSub="),
+        "inSub=sub-item",
+        "focus inside the nested scope stays there: the menu's guard is no \
+         longer topmost and returns immediately, where a per-scope guard \
+         reading only its own root would yank it; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("pulledBySub="),
+        "pulledBySub=sub-item",
+        "while the submenu is open, IT is the scope that pulls focus back; \
+         got:\n{stdout}"
+    );
+    assert_eq!(
+        line("handedBack="),
+        "handedBack=menu-item",
+        "the submenu popped with its owner, so the menu is topmost again and \
+         guards once more — the stack hands back; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("released="),
+        "released=outside",
+        "with every scope disposed nothing guards, and the page has its focus \
+         back; got:\n{stdout}"
+    );
+}
+
+/// The restore, and both of its guards. A scope remembers what held focus at
+/// INSTALL and gives it back at disposal — unless the app moved focus
+/// deliberately in the meantime, in which case the app's choice stands.
+const RESTORE_SCOPE: &str = r#"import std::dom::window;
+import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ FocusContainment, View, focus_scope, mount_root, view, when };
+
+fun main() {
+	let open: SignalCell<bool> = Signal::new(false);
+	let root = mount_root("app", || {
+		view("div")
+			.child(view("input").attr("name", "opener"))
+			.child(view("input").attr("name", "elsewhere"))
+			.child(when(open, || {
+				view("div")
+					.attr("name", "panel")
+					.on_mount(|element| {
+						let _scope = focus_scope(element, FocusContainment::Wrap);
+					})
+					.child(view("input").attr("name", "inside"))
+			}))
+	});
+	let _toggle = root.take(window().listen("toggle", |_event| {
+		open.set(!open.get());
+	}));
+	print("built");
+}
+
+main();
+"#;
+
+#[test]
+fn a121_a_scope_restores_the_focus_it_took_and_not_the_focus_it_was_given() {
+    let harness = format!(
+        "{DOM_STUB}{FOCUS_STUB_EXTRAS}\nrequire(\"./app.js\");\n\
+         setTimeout(() => {{\n  \
+         findByName(\"opener\").focus();\n  \
+         window.fire(\"toggle\", {{}});\n  \
+         setTimeout(() => {{\n    \
+         findByName(\"inside\").focus();\n    \
+         console.log(\"taken=\" + at());\n    \
+         window.fire(\"toggle\", {{}});\n    \
+         setTimeout(() => {{\n      \
+         console.log(\"restored=\" + at());\n      \
+         findByName(\"opener\").focus();\n      \
+         window.fire(\"toggle\", {{}});\n      \
+         setTimeout(() => {{\n        \
+         findByName(\"elsewhere\").focus();\n        \
+         window.fire(\"toggle\", {{}});\n        \
+         setTimeout(() => {{\n          \
+         console.log(\"kept=\" + at());\n        \
+         }}, 0);\n      \
+         }}, 0);\n    \
+         }}, 0);\n  \
+         }}, 0);\n\
+         }}, 0);\n"
+    );
+    let stdout = build_and_run("a121_restore", RESTORE_SCOPE, &harness);
+    let line = |key: &str| -> String {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(key))
+            .unwrap_or_else(|| panic!("no {key:?} line in:\n{stdout}"))
+            .to_string()
+    };
+    assert_eq!(
+        line("taken="),
+        "taken=inside",
+        "the control: focus is inside the scope while it is open; \
+         got:\n{stdout}"
+    );
+    assert_eq!(
+        line("restored="),
+        "restored=opener",
+        "disposal gives focus back to whatever held it when the scope was \
+         installed — otherwise focus falls to `<body>` and the keyboard user \
+         is at the top of the page; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("kept="),
+        "kept=elsewhere",
+        "and it restores only if the focus is still OURS: an app that moved \
+         focus deliberately while the overlay was open keeps it; \
+         got:\n{stdout}"
+    );
+}

@@ -50,6 +50,9 @@ impl Element {
 	fun contains(self, other: Element): bool           // other is this element or inside it
 	fun query_selector_all(self, selector: str): List<Element>   // scoped to this subtree
 	fun focus(self)                                    // move keyboard focus here
+	fun is_tabbable(self): bool                        // can Tab reach it?
+	fun tabbable(self): List<Element>                  // every tabbable descendant, in TAB order
+	fun focus_first(self): bool                        // focus the first one, else this element at tabindex=-1
 	fun matches(self, selector: str): bool             // element.matches(..)
 	fun value(self): str                               // an input's current text
 	fun set_value(self, value: str)
@@ -285,6 +288,38 @@ too.
 
 Semantics, choosing between `show`/`when`/`swap`, and examples: the
 [UI guide](../guide/ui.md).
+
+### Focus scopes
+
+An overlay that wants Tab to stay inside it installs a **focus scope**. It
+does not use `inert`: the rest of the page stays pointer-live and stays in the
+accessibility tree, which is what a menu needs.
+
+```vilan,fragment
+enum FocusContainment { Contain, Wrap }
+fun focus_scope(root: Element, containment: FocusContainment): FocusScope
+```
+
+`Wrap` is a MENU — Tab cycles inside the subtree while focus is inside it, and
+focus that leaves by any other route is allowed to leave. `Contain` is a MODAL
+— it adds a guard that pulls focus back when it arrives anywhere else. The
+opt-OUT is not calling `focus_scope` at all. `inert` remains the app's own
+escape hatch for a true modal (`set_attribute("inert", "")` and
+`remove_attribute`), and it is a stronger, different thing: it also removes the
+subtree from the accessibility tree and blocks pointer events.
+
+**A scope focuses nothing by itself.** `focus()` needs a target that is
+connected, RENDERED and visible at the call, and an overlay panel is typically
+hidden until layout places it, so focus is a consequence of the SHOW — see
+`FocusScope::focus_initial` and `View::focus_scope` in the
+[UI guide](../guide/ui.md#focus-scopes).
+
+**Nesting is a stack, not DOM ancestry**, because an overlay is a portal: a
+submenu opened from inside a menu mounts beside its parent's panel, not inside
+it. std holds the stack, the guard belongs to whichever `Contain` scope is
+topmost at event time, and a scope pops when the owner that installed it is
+disposed — restoring focus to whatever held it before, if focus is still inside
+the scope and the remembered element is still in the document.
 
 ### The slot values
 
