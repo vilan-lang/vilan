@@ -33147,18 +33147,30 @@ impl<'src> Analyzer<'src> {
     /// Asked of the DECLARED types, in the callee's own terms: the return the
     /// call site holds has already had the receiver's bindings substituted in,
     /// so its element is no longer the id the parameters name.
+    ///
+    /// **A declared return that is not a container at all answers YES (B380.)**
+    /// `freshen_list_element_slots` exists for one shape — a callee whose own
+    /// return element is a HOLE, `List::new()` — and a callee cannot have a
+    /// hole in a container it does not return. `Shared<T>::read(self): T` on a
+    /// `Shared<List<K>>` receiver hands the call site a `List<K>` that came
+    /// entirely from the RECEIVER's type, and freshening its element threw `K`
+    /// away: `cells.read()[at]` inside a generic body reported "cannot index
+    /// this List: its element type is never determined" over complete code,
+    /// while `cells.read().get(at)` — the method path, which does not freshen —
+    /// resolved the same receiver. `List::new()` is still freshened, because
+    /// its declared return IS `List<T>` and no parameter fixes that `T`.
     fn external_parameters_fix_the_list_element(&self, function_id: Id) -> bool {
         let Some(function) = self.external_functions.get(&function_id) else {
             return false;
         };
         let Type::Struct(struct_id, arguments) = function.return_type_id.get_type(self) else {
-            return false;
+            return true;
         };
         if !self.is_slot_container(struct_id) || arguments.len() != 1 {
-            return false;
+            return true;
         }
         let Type::Generic(element_constraint_id) = arguments[0].get_type(self) else {
-            return false;
+            return true;
         };
         let parameter_ids = function.parameters.clone();
         parameter_ids.iter().any(|parameter_id| {

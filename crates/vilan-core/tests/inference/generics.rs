@@ -8471,3 +8471,95 @@ fn b306_a_failed_reconcile_at_a_bare_trait_parameter_is_not_a_defect() {
         "6\n",
     );
 }
+
+/// B380 — B280's guard, reached from the other side: an external callee whose
+/// declared return is not a CONTAINER at all.
+///
+/// `Shared<T>::read(self): T` on a `Shared<List<K>>` hands the call site a
+/// `List<K>` that came entirely from the receiver's own type, so there is no
+/// element hole in the callee for `freshen_list_element_slots` to fill — and
+/// freshening it anyway threw `K` away. `cells.read()[at]` inside a generic
+/// body reported "cannot index this List: its element type is never
+/// determined" over complete code; `cells.read().get(at)`, the method path,
+/// which never freshens, resolved the same receiver, which is the control.
+#[test]
+fn b380_indexing_a_read_temporary_at_a_generic_element_type_resolves() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::shared::Shared;
+
+        fun index_temporary<K>(cells: Shared<List<K>>, at: i32): K {
+            cells.read()[at]
+        }
+
+        // The control the item names: `.get(at)` on the same temporary already
+        // resolved, and must go on doing so.
+        fun get_temporary<K>(cells: Shared<List<K>>, at: i32): Option<K> {
+            cells.read().get(at)
+        }
+
+        fun main() {
+            let cells: Shared<List<i32>> = Shared::new([1, 2, 3]);
+            print(index_temporary(cells, 1));
+            match get_temporary(cells, 2) {
+                Some(let value) => print(value),
+                None => print("none"),
+            }
+        }
+        "#,
+        "2\n3\n",
+    );
+}
+
+/// The same read BOUND first — the item filed this as a property of the
+/// TEMPORARY, and it is not: a `let` between makes no difference, because the
+/// element was lost in the call's own return typing.
+#[test]
+fn b380_a_bound_read_at_a_generic_element_type_resolves_too() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        fun index_bound<K>(cells: Shared<List<K>>, at: i32): K {
+            let list = cells.read();
+            list[at]
+        }
+
+        fun main() {
+            let cells: Shared<List<i32>> = Shared::new([1, 2, 3]);
+            print(index_bound(cells, 0));
+        }
+        "#,
+        "1\n",
+    );
+}
+
+/// The two controls that were already green and must stay so: a CONCRETE
+/// `Shared<List<i32>>` indexes, and a plain generic `List<K>` parameter does.
+#[test]
+fn b380_a_concrete_shared_list_and_a_plain_generic_list_are_unchanged() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        fun index_concrete(cells: Shared<List<i32>>, at: i32): i32 {
+            cells.read()[at]
+        }
+
+        fun index_plain<K>(list: List<K>, at: i32): K {
+            list[at]
+        }
+
+        fun main() {
+            let cells: Shared<List<i32>> = Shared::new([1, 2, 3]);
+            print(index_concrete(cells, 1));
+            print(index_plain([4, 5, 6], 2));
+        }
+        "#,
+        "2\n6\n",
+    );
+}
