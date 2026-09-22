@@ -35,7 +35,9 @@ use std::fmt::Write as _;
 use std::rc;
 use std::rc::Rc;
 
+pub mod crypto;
 pub mod executor;
+pub mod fs;
 pub mod http;
 pub mod json;
 
@@ -1501,6 +1503,62 @@ pub fn str_substring(text: &str, start: i32, end: i32) -> Str {
     )
 }
 
+/// `Math.round` — JavaScript's, which rounds a half UP (toward `+∞`) where
+/// Rust's `f64::round` rounds a half AWAY FROM ZERO.
+///
+/// `Math.round(-2.5)` is `-2` and `(-2.5f64).round()` is `-3`. The differential
+/// compares bytes, so the divergence is a wrong answer and not a nuance; this
+/// is the one arm of the `Math` family that cannot be a method call.
+pub fn js_math_round(value: f64) -> f64 {
+    if !value.is_finite() {
+        return value;
+    }
+    let floor = value.floor();
+    if value - floor >= 0.5 {
+        floor + 1.0
+    } else {
+        floor
+    }
+}
+
+/// `Math.sign` — `-1`, `0` or `1`, with `NaN` and both zeros passed THROUGH.
+///
+/// `f64::signum` answers `1.0` for `+0.0` and `-1.0` for `-0.0`, which is a
+/// different function: JavaScript's `Math.sign(0)` is `0`.
+pub fn js_math_sign(value: f64) -> f64 {
+    if value.is_nan() || value == 0.0 {
+        return value;
+    }
+    value.signum()
+}
+
+/// `str::code_at` — JavaScript's `charCodeAt`, which indexes UTF-16 CODE
+/// UNITS, not characters and not bytes.
+///
+/// [`str_len`] counts the same units, so the two agree about what "within
+/// `len()`" means, which is the contract `string.vl` states at the binding.
+/// Out of range is `NaN` in JavaScript, which is not a `u32`; the binding is
+/// declared `u32` and the vilan side documents the index as the caller's
+/// contract, so `0` is the answer here — the one value a hash or a parser
+/// treats as "nothing", and the same thing `NaN | 0` gives on the other side
+/// wherever the result is used arithmetically.
+pub fn str_code_at(text: &str, index: i32) -> u32 {
+    if index < 0 {
+        return 0;
+    }
+    let mut remaining = index as usize;
+    for character in text.chars() {
+        let width = character.len_utf16();
+        if remaining < width {
+            let mut units = [0u16; 2];
+            let encoded = character.encode_utf16(&mut units);
+            return encoded[remaining] as u32;
+        }
+        remaining -= width;
+    }
+    0
+}
+
 pub fn parse_i32(text: &str) -> Option<i32> {
     text.trim().parse::<i32>().ok()
 }
@@ -1512,6 +1570,35 @@ pub fn parse_f64(text: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn math_round_and_math_sign_are_javascripts_and_not_rusts() {
+        // Rust's `round` would answer -3 and -2 here.
+        assert_eq!(js_math_round(-2.5), -2.0);
+        assert_eq!(js_math_round(-1.5), -1.0);
+        assert_eq!(js_math_round(2.5), 3.0);
+        assert_eq!(js_math_round(2.4), 2.0);
+        assert!(js_math_round(f64::NAN).is_nan());
+        // Rust's `signum` would answer 1 and -1 for the two zeros.
+        assert_eq!(js_math_sign(0.0), 0.0);
+        assert_eq!(js_math_sign(-0.0), -0.0);
+        assert_eq!(js_math_sign(-3.0), -1.0);
+        assert_eq!(js_math_sign(3.0), 1.0);
+        assert!(js_math_sign(f64::NAN).is_nan());
+    }
+
+    #[test]
+    fn code_at_indexes_utf16_code_units_the_way_char_code_at_does() {
+        assert_eq!(str_code_at("abc", 0), 97);
+        assert_eq!(str_code_at("abc", 2), 99);
+        // A code point outside the BMP is TWO units, and both are readable —
+        // which is also why `str_len` counts units rather than characters.
+        assert_eq!(str_len("\u{1f600}"), 2);
+        assert_eq!(str_code_at("\u{1f600}", 0), 0xd83d);
+        assert_eq!(str_code_at("\u{1f600}", 1), 0xde00);
+        assert_eq!(str_code_at("abc", 3), 0, "past the end");
+        assert_eq!(str_code_at("abc", -1), 0, "before the start");
+    }
 
     #[test]
     fn numbers_print_the_way_javascript_prints_them() {

@@ -274,6 +274,21 @@ struct Emitter<'a, 'src> {
     /// into a future rather than handed over with the wrong type.
     /// `Server::builder()`'s default handler is the shape.
     expects_async_value: bool,
+    /// Whether the function being emitted DECLARES an `async |T| U` return
+    /// type (J2's `async_returning`) — so the closure literal it hands back is
+    /// a future-answering one.
+    ///
+    /// [`Emitter::expects_async`] is the same fact on the TYPE side and was
+    /// already read; the value side was not, so `fold_service_requests` —
+    /// `std::rpc_server`'s fold, which every `Server::builder()` reaches —
+    /// returned a closure whose body calls an `async` one and was refused as an
+    /// adapted instance. It is not one: the position DECLARES the asyncness,
+    /// which is precisely the case F20 lifted the refusal for at a field and at
+    /// an argument.
+    ///
+    /// Saved and restored around a nested body, because a synchronous closure
+    /// inside such a function still returns a value.
+    returns_an_async_closure: bool,
     /// The bindings each enclosing closure CAPTURES, innermost last (F20).
     ///
     /// A `move` closure owns its captures, so a body that hands one on by value
@@ -316,6 +331,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             declaring_a_view: false,
             expects_async: false,
             expects_async_value: false,
+            returns_an_async_closure: false,
             closure_captures: Vec::new(),
         }
     }
@@ -567,6 +583,39 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// parameter — an unnamed tuple — and `value` and `factor` are declared by
     /// `Closure::parameter_destructures`, which the body walk never reaches, so
     /// every seed built from `closure.parameters` alone reads them as captures.
+    /// Whether a closure's body evaluates to nothing — the test that says a
+    /// dropped future loses no value. See the floating arm in
+    /// [`Emitter::closure`].
+    ///
+    /// **Silence is a NO.** The first spelling of this asked the body tail's
+    /// recorded type and read `None` as void, which is what every BLOCK-bodied
+    /// closure answers — `adapt.vl`'s `|url| { …; length }` among them — so
+    /// three closures whose callers read their value were floated and rustc
+    /// refused the emission with `expected i32, found ()`. A future may only be
+    /// dropped where there is provably nothing to drop, so every arm here has
+    /// to say void POSITIVELY: a written annotation that is void, no `ret`
+    /// carrying a value, and a tail that is either absent or typed void.
+    fn closure_answers_void(&self, closure: &vilan_core::analyzer::Closure) -> bool {
+        if let Some(type_id) = closure.return_type_id {
+            return matches!(self.resolve(type_id), Some(Type::Void));
+        }
+        if closure.rets.iter().any(|(_, value)| value.is_some()) {
+            return false;
+        }
+        let tail = match self.program.entity_map.get(&closure.return_) {
+            Some(Expr::Block((_, tail))) => *tail,
+            _ => closure.return_,
+        };
+        match self.program.entity_map.get(&tail) {
+            // A block whose last statement carried a `;` has no tail at all.
+            Some(Expr::Void) | None => true,
+            _ => matches!(
+                self.type_of(tail).and_then(|type_id| self.resolve(type_id)),
+                Some(Type::Void)
+            ),
+        }
+    }
+
     fn closure_parameter_bindings(&self, closure: &vilan_core::analyzer::Closure) -> HashSet<Id> {
         let mut bindings: HashSet<Id> = closure.parameters.iter().copied().collect();
         for destructure in &closure.parameter_destructures {
@@ -2093,9 +2142,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             &mut self.current_returns_view,
             function.returns_view || function.returns_mut_view,
         );
+        let saved_returns_async = std::mem::replace(
+            &mut self.returns_an_async_closure,
+            self.program.async_returning.contains(&function.id),
+        );
         let saved_origin = self.current_origin.replace(function.name);
         let walked = self.emit_block(&function.body.0, function.body.1, &mut body, 1);
         self.current_origin = saved_origin;
+        self.returns_an_async_closure = saved_returns_async;
         self.current_returns_view = saved_view;
         walked?;
 
@@ -2382,11 +2436,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // passes the loan on, and copying out of it answers `i32` where the
             // signature promised `&mut i32`.
             let returns_the_loan = depth == 1 && self.current_returns_view;
+            // The body TAIL of a function declared `-> async |T| U` is a
+            // return position, so a closure literal landing there answers a
+            // future. See [`Emitter::returns_an_async_closure`].
+            self.expects_async_value = depth == 1 && self.returns_an_async_closure;
             let rendered = if returns_the_loan {
-                self.expression(tail, depth)?
+                self.expression(tail, depth)
             } else {
-                self.value_of(tail, depth)?
+                self.value_of(tail, depth)
             };
+            self.expects_async_value = false;
+            let rendered = rendered?;
             let _ = writeln!(out, "{pad}{rendered}");
         }
         Ok(())
@@ -2497,7 +2557,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 Some(value) if self.current_returns_view => {
                     format!("return {}", self.expression(value, depth)?)
                 }
-                Some(value) => format!("return {}", self.value_of(value, depth)?),
+                Some(value) => {
+                    self.expects_async_value = self.returns_an_async_closure;
+                    let rendered = self.value_of(value, depth);
+                    self.expects_async_value = false;
+                    format!("return {}", rendered?)
+                }
                 None => "return".to_string(),
             },
             Expr::Assignment(target, value) => self.assignment(target, value, depth, span)?,
@@ -4287,7 +4352,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // backend, and this emitter monomorphizes on types, of which asyncness
         // is not one.
         let wants_a_future = std::mem::take(&mut self.expects_async_value);
-        if self.program.async_functions.contains(&closure_id) && !wants_a_future {
+        // F18 slice 2: an inferred-async closure at a position declared
+        // SYNCHRONOUS and answering `void` is a FLOATING body, and that is not
+        // an adapted instance — it is the shape node has when it drops the
+        // promise a void callback returned. `std::http`'s `upgrade_handler` is
+        // declared `|NodeRequest, NodeSocket, Bytes| void` while A40's
+        // `authorize` hook inside it may await, which is exactly the case:
+        // nothing observes the result on either backend, so the body is
+        // SPAWNED and the closure answers `()`. An unhandled failure reports
+        // through the unobserved-task path, which is what node does with a
+        // rejected floating promise.
+        //
+        // The `void` test is the whole of the licence. A closure answering a
+        // VALUE cannot have its future dropped — its caller reads the value —
+        // and that one really is F22's adapted instance.
+        let is_async_closure = self.program.async_functions.contains(&closure_id);
+        let floats = is_async_closure && !wants_a_future && self.closure_answers_void(&closure);
+        if is_async_closure && !wants_a_future && !floats {
             return self.host_gap(
                 "an `async` closure as a VALUE (a callee taking one at one call site and a \
                  synchronous closure at another is an adapted instance)"
@@ -4384,6 +4465,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.async_capture_prelude_declaring(closure.return_, &declared_inside_seed);
             return Ok(format!(
                 "{{ {prelude}std::rc::Rc::new(move |{}| {{ {inner}vilan_rt::executor::pin_future(async move {{ {body} }}) }}) }}",
+                parameters.join(", ")
+            ));
+        }
+        // The floating body: the same `async move` block, spawned rather than
+        // handed back, so the closure's own type is the synchronous one the
+        // position declares. The origin is the enclosing function's, as it is
+        // for a written spawn.
+        if floats {
+            let inner =
+                self.async_capture_prelude_declaring(closure.return_, &declared_inside_seed);
+            let origin = rust_string(self.current_origin.unwrap_or("a floating handler"));
+            return Ok(format!(
+                "{{ {prelude}std::rc::Rc::new(move |{}| {{ {inner}vilan_rt::executor::spawn(async move {{ {body} }}, {origin}); }}) }}",
                 parameters.join(", ")
             ));
         }
@@ -4774,6 +4868,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     self.place_argument(argument_ids, 0, depth)?
                 )
             }
+            // F18 slice 2: the two bindings that ANSWER a `JsonValue`, which is
+            // why they waited for `vilan_rt::json`. `Request::header` reads
+            // named entries out of the first with `std::json`'s accessors, and
+            // `Socket::remote_address` flattens the second's `undefined`.
+            ("NodeRequest", "headers") => {
+                format!(
+                    "({}).headers()",
+                    self.place_argument(argument_ids, 0, depth)?
+                )
+            }
+            ("NodeSocket", "remote_address_raw") => format!(
+                "({}).remote_address_raw()",
+                self.place_argument(argument_ids, 0, depth)?
+            ),
             // --- NodeResponse ---
             ("NodeResponse", "set_status_code") => format!(
                 "({}).set_status_code({})",
@@ -4914,6 +5022,190 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 span,
             )),
         }
+    }
+
+    /// The plain `node:fs/promises` set and `std::crypto`'s digest (F18
+    /// slice 2).
+    ///
+    /// Keyed on the pair (module + host symbol, vilan name) for
+    /// [`Emitter::json_host_binding`]'s reason, and here it is load-bearing in
+    /// a second way: `readFile` and `writeFile` each back TWO declarations that
+    /// differ only in whether the payload is text or bytes
+    /// (`read_file_encoded`/`read_bytes`, `write_file`/`write_bytes`), exactly
+    /// as `std::http`'s socket writes do.
+    ///
+    /// The `FsOptions` forms are deliberately absent — `vilan_rt::fs` says why
+    /// — and so are `sha384`/`sha512`, which are the SHA-512 block function
+    /// this slice did not need. Both stay refused BY NAME.
+    fn host_module_binding(
+        &mut self,
+        name: &str,
+        binding: Option<&ExternBinding<'src>>,
+        argument_ids: &[Id],
+        depth: usize,
+    ) -> Result<Option<String>, Error> {
+        let Some(ExternBinding::Function { module, symbol }) = binding else {
+            return Ok(None);
+        };
+        let one = |emitter: &mut Self, path: &str| {
+            Ok(Some(format!(
+                "vilan_rt::{path}({})",
+                emitter.value_argument(argument_ids, 0, depth)?
+            )))
+        };
+        let two = |emitter: &mut Self, path: &str| {
+            let first = emitter.value_argument(argument_ids, 0, depth)?;
+            let second = emitter.value_argument(argument_ids, 1, depth)?;
+            Ok(Some(format!("vilan_rt::{path}({first}, {second})")))
+        };
+        match (*module, *symbol, name) {
+            (None, "__sha256", _) => one(self, "crypto::sha256_bytes"),
+            (Some("node:fs/promises"), "readFile", "read_bytes") => one(self, "fs::read_bytes"),
+            (Some("node:fs/promises"), "readFile", "read_file_encoded") => {
+                two(self, "fs::read_text")
+            }
+            (Some("node:fs/promises"), "writeFile", "write_file") => two(self, "fs::write_text"),
+            (Some("node:fs/promises"), "writeFile", "write_bytes") => two(self, "fs::write_bytes"),
+            (Some("node:fs/promises"), "appendFile", _) => two(self, "fs::append"),
+            (Some("node:fs/promises"), "copyFile", _) => two(self, "fs::copy"),
+            (Some("node:fs/promises"), "rename", _) => two(self, "fs::rename"),
+            (Some("node:fs/promises"), "unlink", _) => one(self, "fs::remove"),
+            (Some("node:fs/promises"), "readdir", "read_dir") => one(self, "fs::read_dir"),
+            (Some("node:fs/promises"), "mkdir", "create_dir") => one(self, "fs::create_dir"),
+            (Some("node:fs/promises"), "rmdir", _) => one(self, "fs::remove_dir"),
+            _ => Ok(None),
+        }
+    }
+
+    /// `std::number`'s `Math.*` family (F18 slice 2).
+    ///
+    /// Almost all of it is the `f64` method of the same name, so the table is
+    /// the exceptions plus a list. The three that are NOT a rename:
+    ///
+    /// - `Math.round` rounds a half UP where Rust's rounds away from zero
+    ///   (`Math.round(-2.5)` is `-2`), and `Math.sign` passes both zeros and
+    ///   `NaN` through where `signum` answers `±1` for them. Both go to
+    ///   `vilan_rt`, which states the divergence at each.
+    /// - `Math.pow` computes in DOUBLE even where the declaration labels the
+    ///   result an integer, so the integer widths go through `f64` and cast
+    ///   back rather than through `i32::pow`, which panics on an overflow the
+    ///   other backend simply widens through.
+    ///
+    /// The result is cast to the DECLARED return type, which is the whole of
+    /// what makes one table serve `f64`, `f32` and the six integer widths: JS
+    /// has one number type and the declaration is where the vilan one is said.
+    fn math_host_binding(
+        &mut self,
+        target: Id,
+        binding: Option<&ExternBinding<'src>>,
+        argument_ids: &[Id],
+        depth: usize,
+        span: Span,
+    ) -> Result<Option<String>, Error> {
+        let Some(ExternBinding::Function {
+            module: None,
+            symbol,
+        }) = binding
+        else {
+            return Ok(None);
+        };
+        let Some(method) = symbol.strip_prefix("Math.") else {
+            return Ok(None);
+        };
+        let Some(external) = self.program.external_functions.get(&target) else {
+            return Ok(None);
+        };
+        let returns = self.rust_type(external.return_type_id, span)?;
+        if scalar_type(&returns).is_none() && !is_integer_type(&returns) && returns != "f64" {
+            return Ok(None);
+        }
+        let receiver = self.value_argument(argument_ids, 0, depth)?;
+        // Every arm computes in `f64` and casts back, because that is what the
+        // other backend does: a JS number IS an `f64`, and the vilan width is a
+        // label on the result. The cast is a no-op where the declaration says
+        // `f64`, which is most of this family.
+        let subject = format!("(({receiver}) as f64)");
+        let unary = |body: String| Ok(Some(format!("(({body}) as {returns})")));
+        match method {
+            "abs" => unary(format!("{subject}.abs()")),
+            "sqrt" => unary(format!("{subject}.sqrt()")),
+            "cbrt" => unary(format!("{subject}.cbrt()")),
+            "floor" => unary(format!("{subject}.floor()")),
+            "ceil" => unary(format!("{subject}.ceil()")),
+            "trunc" => unary(format!("{subject}.trunc()")),
+            "exp" => unary(format!("{subject}.exp()")),
+            "log" => unary(format!("{subject}.ln()")),
+            "log10" => unary(format!("{subject}.log10()")),
+            "log2" => unary(format!("{subject}.log2()")),
+            "sin" => unary(format!("{subject}.sin()")),
+            "cos" => unary(format!("{subject}.cos()")),
+            "tan" => unary(format!("{subject}.tan()")),
+            "asin" => unary(format!("{subject}.asin()")),
+            "acos" => unary(format!("{subject}.acos()")),
+            "atan" => unary(format!("{subject}.atan()")),
+            "round" => unary(format!("vilan_rt::js_math_round({subject})")),
+            "sign" => unary(format!("vilan_rt::js_math_sign({subject})")),
+            "pow" | "min" | "max" | "atan2" | "hypot" => {
+                let other = self.value_argument(argument_ids, 1, depth)?;
+                let other = format!("(({other}) as f64)");
+                let body = match method {
+                    "pow" => format!("{subject}.powf({other})"),
+                    "min" => format!("{subject}.min({other})"),
+                    "max" => format!("{subject}.max({other})"),
+                    "atan2" => format!("{subject}.atan2({other})"),
+                    _ => format!("{subject}.hypot({other})"),
+                };
+                unary(body)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The host bindings `std::number` and `std::string` declare over
+    /// JavaScript's global coercions (F18 slice 2).
+    ///
+    /// Three shapes, and none of them is a conversion natively:
+    ///
+    /// - `label_i32(value: f64): i32` and its eleven siblings are `Number(v)`
+    ///   over an `f64` that `fold_signed`/`fold_unsigned` has ALREADY folded
+    ///   into the target's range. `Number` is the identity there; the vilan
+    ///   type is the whole of what the call says. So the emission is the cast,
+    ///   and it is exact because the value is already in range and integral.
+    /// - `as_f64(self): f64` on each integer width, on `f32` and on `BigInt` is
+    ///   `Number(x)`, which is again the identity: a JS number IS an `f64`.
+    /// - `code_at` is `charCodeAt`, the one binding here that is a real
+    ///   function — `vilan_rt::str_code_at` indexes the same UTF-16 code units
+    ///   `str_len` counts.
+    ///
+    /// Keyed on the pair (host symbol, vilan name), for
+    /// [`Emitter::json_host_binding`]'s reason: `Number` is `std::json`'s
+    /// symbol too, and there the receiver is a `JsonValue` and the emission is
+    /// a coercion rather than a cast.
+    fn scalar_host_binding(
+        &mut self,
+        name: &str,
+        binding: Option<&ExternBinding<'src>>,
+        argument_ids: &[Id],
+        depth: usize,
+    ) -> Result<Option<String>, Error> {
+        let rendered = match binding {
+            Some(ExternBinding::Function {
+                module: None,
+                symbol: "Number",
+            }) if let Some(scalar) = scalar_label_target(name) => format!(
+                "(({}) as {scalar})",
+                self.value_argument(argument_ids, 0, depth)?
+            ),
+            Some(ExternBinding::Method {
+                symbol: Some("charCodeAt"),
+            }) if name == "code_at" => format!(
+                "vilan_rt::str_code_at(&{}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            _ => return Ok(None),
+        };
+        Ok(Some(rendered))
     }
 
     /// The host bindings `vilan-rt`'s JSON value answers (F18 slice 2).
@@ -5376,10 +5668,36 @@ impl<'a, 'src> Emitter<'a, 'src> {
             )? {
                 return Ok(rendered);
             }
-            // F18 slice 2: and `std::json`'s host seams in `vilan_rt::json`.
+            // F18 slice 2: and `std::json`'s host seams in `vilan_rt::json`,
+            // and `std::number`/`std::string`'s in the runtime's scalar half.
             if let Some(rendered) =
                 self.json_host_binding(name, binding.as_ref(), &function_call.argument_ids, depth)?
             {
+                return Ok(rendered);
+            }
+            if let Some(rendered) = self.scalar_host_binding(
+                name,
+                binding.as_ref(),
+                &function_call.argument_ids,
+                depth,
+            )? {
+                return Ok(rendered);
+            }
+            if let Some(rendered) = self.math_host_binding(
+                target,
+                binding.as_ref(),
+                &function_call.argument_ids,
+                depth,
+                span,
+            )? {
+                return Ok(rendered);
+            }
+            if let Some(rendered) = self.host_module_binding(
+                name,
+                binding.as_ref(),
+                &function_call.argument_ids,
+                depth,
+            )? {
                 return Ok(rendered);
             }
             let what = format!(
@@ -5771,6 +6089,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 {
                     return Ok(rendered);
                 }
+                if let Some(rendered) =
+                    self.scalar_host_binding(name, binding.as_ref(), argument_ids, depth)?
+                {
+                    return Ok(rendered);
+                }
+                if let Some(rendered) =
+                    self.math_host_binding(member_id, binding.as_ref(), argument_ids, depth, span)?
+                {
+                    return Ok(rendered);
+                }
+                if let Some(rendered) =
+                    self.host_module_binding(name, binding.as_ref(), argument_ids, depth)?
+                {
+                    return Ok(rendered);
+                }
                 let what = format!(
                     "the host binding `{name}`{}",
                     match binding {
@@ -6059,6 +6392,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Intrinsic::JsonIsNull => format!("({}).is_null()", next()),
             Intrinsic::JsonKind => format!("({}).kind()", next()),
             Intrinsic::TryParseJson => format!("vilan_rt::json::try_parse(&{})", next()),
+            // `std::process::env(key)` — `process.env[key]`, whose absent case
+            // is `undefined` and reads back as `None`. `std::env::var` answers
+            // `Err` for both "not set" and "not UTF-8"; the second is
+            // unreachable from a vilan `str`, which is UTF-8 by construction.
+            Intrinsic::Env => format!(
+                "std::env::var(&*{}).ok().map(|value| vilan_rt::str_new(&value))",
+                next()
+            ),
             other => return self.host_gap(format!("the intrinsic `{other:?}`"), span),
         };
         Ok(rendered)
@@ -6160,6 +6501,21 @@ fn http_host_type(name: &str) -> Option<&'static str> {
 /// for a type POSITION and this is it for a coercion's RESULT.
 fn json_coercion_target(name: &str) -> Option<&'static str> {
     let labelled = name.strip_prefix("coerce_")?;
+    scalar_type(labelled).filter(|rendered| *rendered != "vilan_rt::Str")
+}
+
+/// F18 slice 2: the Rust scalar one `[extern("Number")]` binding of
+/// `std::number` labels its argument with.
+///
+/// Two families, both answered by [`scalar_type`]: `label_i32(v: f64): i32` (a
+/// fold's result relabelled) and `i8::as_f64(self): f64` (a widening). `str`
+/// is excluded for the reason it is excluded in [`json_coercion_target`] —
+/// `Number` never answers one.
+fn scalar_label_target(name: &str) -> Option<&'static str> {
+    let labelled = match name {
+        "as_f64" => "f64",
+        other => other.strip_prefix("label_")?,
+    };
     scalar_type(labelled).filter(|rendered| *rendered != "vilan_rt::Str")
 }
 

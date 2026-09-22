@@ -46,6 +46,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::executor::{Boxed, IoSource, register_io, spawn};
+use crate::json::JsonValue;
 use crate::{Js, Str, str_new};
 
 /// One read of a connection. 8 KiB is node's own default highWaterMark for a
@@ -530,6 +531,19 @@ impl Socket {
         str_new(&self.0.peer)
     }
 
+    /// `socket.remoteAddress` AS the host value `std::http` declares it at
+    /// (`remote_address_raw(self): JsonValue`), which is what its
+    /// `remote_address` flattens: node answers `undefined` on a destroyed
+    /// socket, and the vilan side tests `kind() == String` before coercing.
+    /// `remote_address` above is the same fact already flattened, kept because
+    /// it is what this runtime's own code reads.
+    pub fn remote_address_raw(&self) -> JsonValue {
+        if self.destroyed() {
+            return JsonValue::Undefined;
+        }
+        JsonValue::Text(str_new(&self.0.peer))
+    }
+
     /// `socket.destroy()`.
     pub fn destroy(&self) {
         self.0.destroy();
@@ -603,6 +617,25 @@ impl Request {
     /// The whole body as bytes.
     pub fn bytes(&self) -> Bytes {
         self.0.body.clone()
+    }
+
+    /// `request.headers` — the whole field set as the opaque host object
+    /// `std::http` declares it at, which `Request::header` reads named entries
+    /// out of with `std::json`'s accessors (dynamic property access has no
+    /// plain extern shape, which is why the binding answers a `JsonValue` and
+    /// not a map).
+    ///
+    /// The names are already lowercased and repeats already joined, by the
+    /// parser above, for the reason node lowercases and joins: `Request::header`
+    /// is documented against that shape.
+    pub fn headers(&self) -> JsonValue {
+        JsonValue::object(
+            self.0
+                .fields
+                .iter()
+                .map(|(name, value)| (str_new(name), JsonValue::Text(str_new(value))))
+                .collect(),
+        )
     }
 }
 

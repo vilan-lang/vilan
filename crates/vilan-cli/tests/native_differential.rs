@@ -1077,6 +1077,64 @@ impl Drop for ServerUnderTest {
 /// Both the synchronous and the `async fun main` paths, because they are two
 /// different emitted shapes: one wraps the body, the other wraps the
 /// `block_on`.
+/// **F18 slice 2**: a closure declared SYNCHRONOUS, answering nothing, whose
+/// body awaits.
+///
+/// node drops the promise such a callback returns — the call site does not
+/// wait, and the body finishes later — so the native backend SPAWNS the body
+/// and the closure answers `()`. `std::http`'s `upgrade_handler` is the shape
+/// this was built for (`|NodeRequest, NodeSocket, Bytes| void`, with A40's
+/// `authorize` hook awaiting inside it).
+///
+/// The pin is the ORDER, which is the whole claim: `before`, `after`, then the
+/// handler's line, because the call returns before the awaited body resumes.
+/// A backend that simply ran the body to completion at the call would print
+/// them in a different order and still "work".
+///
+/// Non-vacuous by its neighbour: `adapt.vl`, whose closures answer a VALUE,
+/// stays refused by name in [`every_async_corpus_program_is_identical_or_named`]
+/// — and the first spelling of the void test floated those three too and was
+/// caught there by `expected i32, found ()`.
+#[test]
+fn a_void_closure_whose_body_awaits_floats_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_float.vl"), FLOAT_PROBE).expect("write the probe");
+    assert_eq!(
+        compare(&staged, "native_probe_float.vl"),
+        Verdict::Identical
+    );
+    let javascript = vilan(&staged)
+        .args(["run", "native_probe_float.vl"])
+        .output()
+        .expect("run the JS backend");
+    assert_eq!(
+        String::from_utf8_lossy(&javascript.stdout),
+        "before\nafter\nhandled 7\n",
+        "the call returns BEFORE the awaited body resumes"
+    );
+}
+
+const FLOAT_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::time::sleep;\n",
+    "\n",
+    "struct Sink {\n",
+    "\ton_event: |i32| void,\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet sink = Sink {\n",
+    "\t\ton_event = |value| {\n",
+    "\t\t\tsleep(1);\n",
+    "\t\t\tprint(i\"handled {value}\");\n",
+    "\t\t},\n",
+    "\t};\n",
+    "\tprint(\"before\");\n",
+    "\t(sink.on_event)(7);\n",
+    "\tprint(\"after\");\n",
+    "}\n",
+);
+
 #[test]
 fn a_failing_program_exits_one_on_both_backends_without_rusts_banner() {
     let staged = stage();
