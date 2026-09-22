@@ -5250,7 +5250,7 @@ const NATIVE_OPERATOR_PRIMITIVES: &[&str] = &[
 /// rather than a trait id because the promise is the SIGNATURE: any bound
 /// declaring `to_string(self): str` carries it, whether it is `Display`, a
 /// trait with `Display` as a supertrait, or a program's own.
-pub(crate) const RENDER_MEMBER: &str = "to_string";
+pub const RENDER_MEMBER: &str = "to_string";
 
 fn is_overloadable_operator(op: BinaryOp) -> bool {
     operator_trait_method(op).is_some()

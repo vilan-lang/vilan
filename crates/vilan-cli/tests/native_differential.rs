@@ -112,6 +112,11 @@ const DEFAULT_SUITE: &[&str] = &[
     "json-roundtrip.vl",
     "remainder.vl",
     "numeric-types.vl",
+    // F21: a VIEW inside an enum payload (`Option<&mut T>`) — the shape behind
+    // a view-returning `Arena::get`, refused by name since native-b-38. Every
+    // projection in it is matched where it is built, which is the position the
+    // payload view is carried through.
+    "option-view.vl",
 ];
 
 /// The corpus's ASYNC programs (tracker J6, lane native-b-38).
@@ -1903,6 +1908,358 @@ fn the_boxed_binding_count_is_reachable_and_counts_the_right_bindings() {
     );
 }
 
+/// A numeric literal in an ASSIGNMENT takes its width from the position, the
+/// way one in a `let` already did (B370's law, on the paths the native emitter
+/// had not carried it down).
+///
+/// `mut i: u53 = 5; i -= 1;` emitted `i - (1i32)` against a `u64` and rustc
+/// refused the program — a BACKEND defect, and one the byte gate could not see
+/// because no corpus program assigns a literal to a non-default width. Four
+/// positions are in here, because each carries the expectation down a
+/// different path: a plain binding, a subscript, a field, a counted cell's
+/// `write()`, and a module-level binding's own initializer. The subscripts are
+/// deliberately literal: an index is an index whatever the assignment expects,
+/// and a first fix made `xs[1]` come out `xs[(1u64)]`.
+const LITERAL_WIDTH_PROBE: &str = concat!(
+    "import std::shared::Shared;\n",
+    "\n",
+    "struct Counter { n: u53 }\n",
+    "\n",
+    "mut level: u32 = 10;\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut a: u53 = 5;\n",
+    "\ta -= 1;\n",
+    "\ta += 2;\n",
+    "\ta *= 3;\n",
+    "\tmut b: i53 = 9;\n",
+    "\tb = b - 1;\n",
+    "\tmut c: u32 = 7;\n",
+    "\tc /= 2;\n",
+    "\tmut d: u8 = 200;\n",
+    "\td -= 100;\n",
+    "\tmut e: i8 = -5;\n",
+    "\te += 3;\n",
+    "\tmut f: f64 = 1.5;\n",
+    "\tf *= 2;\n",
+    "\tmut xs: List<u53> = [5u53, 6u53];\n",
+    "\txs[0] -= 1;\n",
+    "\txs[1] = xs[1] + 2;\n",
+    "\tmut counter = Counter { n = 9 };\n",
+    "\tcounter.n -= 4;\n",
+    "\tlet cell: Shared<u53> = Shared::new(3u53);\n",
+    "\tcell.write() = cell.read() + 1;\n",
+    "\tlevel -= 3;\n",
+    "\tprint(xs);\n",
+    "\tprint(i\"{a} {b} {c} {d} {e} {f} {counter.n} {cell.read()} {level}\");\n",
+    "}\n",
+);
+
+#[test]
+fn a_literal_assigned_to_a_narrow_binding_takes_the_bindings_width() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_width.vl"), LITERAL_WIDTH_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_width.vl"),
+        Verdict::Identical,
+        "a literal assigned into a non-default width must take that width — a mismatch is a \
+         rustc refusal of the emitted Rust, which is a backend defect"
+    );
+}
+
+/// F31's trap, in one program: the read whose binding was declared OUTSIDE the
+/// loop keeps its copy, and the read whose binding the loop body itself
+/// declares moves.
+///
+/// "No later read" alone gets the first one wrong — `weigh(names)` IS the last
+/// read of `names` in the text, and moving there empties the binding the second
+/// iteration reads. Nothing reads `names` after the loop, deliberately: a read
+/// after it would make the loop read not-last for the trivial reason and the
+/// pin would measure nothing. The rule asks "deeper in a repeating region than
+/// the DECLARATION", which answers both halves with one question, and the two
+/// are in one program so a fix that satisfies either alone fails here.
+const LOOP_TRAP_PROBE: &str = concat!(
+    "struct Row { id: i32, tags: List<str> }\n",
+    "\n",
+    "fun weigh(tags: List<str>): i32 { tags.len() }\n",
+    "fun weigh_row(row: Row): i32 { row.tags.len() + row.id }\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet names = [\"alpha\", \"beta\"];\n",
+    "\tmut total = 0;\n",
+    "\tmut i = 0;\n",
+    "\tfor i < 3 {\n",
+    "\t\ttotal = total + weigh(names);\n",
+    "\t\tlet row = Row { id = i, tags = [\"one\"] };\n",
+    "\t\ttotal = total + weigh_row(row);\n",
+    "\t\ti = i + 1;\n",
+    "\t}\n",
+    "\tprint(total);\n",
+    "}\n",
+);
+
+#[test]
+fn a_last_use_inside_a_loop_keeps_its_copy_and_one_declared_inside_it_moves() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_loop_trap.vl"), LOOP_TRAP_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        copy_census_of(&staged, "native_probe_loop_trap.vl"),
+        (1, 1),
+        "the read of a binding declared OUTSIDE the loop must copy, and the read of one the \
+         loop body declares must move"
+    );
+    assert_eq!(
+        compare(&staged, "native_probe_loop_trap.vl"),
+        Verdict::Identical,
+        "and the program still prints the same bytes on both backends"
+    );
+}
+
+/// F31's census: the consumed place reads the native emitter COPIES, and the
+/// ones it moves because the read is its binding's last use.
+///
+/// The committed table, beside `copy-elision-census.tsv` and for the same
+/// reason its own head gives: the byte gate above already holds every one of
+/// these programs identical on both backends, so a change in elision cannot
+/// ship unnoticed — but it arrives as an unlabelled behaviour, and elision is
+/// exactly where the gate and the meaning come apart. A program that loses a
+/// copy is a win; a program that GAINS one is a regression in the liveness
+/// walk, and byte-identical output says the same thing about both.
+///
+/// **What is counted** is not every `.clone()` in the emitted Rust — a refcount
+/// bump on a handle is one of those and is not a copy. It is the copies
+/// `copy_a_consumed_place_read` decides: the consumed positions rule 1's own
+/// marking never reached (a closure call's arguments, a variant constructor's,
+/// a destructure's), which are exactly the ones the native liveness pass is
+/// answerable for.
+///
+/// **The programs** are [`DEFAULT_SUITE`] plus the paper's board probe, because
+/// that is the set the byte gate runs on every build; the whole corpus is one
+/// list away and costs an emit per program.
+const NATIVE_COPY_CENSUS: &str = "crates/vilan-cli/tests/native-copy-census.tsv";
+
+/// One program's census line, as the compiler reports it under
+/// `VILAN_NATIVE_REPORT_COPIES=1`.
+fn copy_census_of(staged: &Path, program: &str) -> (usize, usize) {
+    let output = vilan(staged)
+        .env("VILAN_NATIVE_REPORT_COPIES", "1")
+        .args(["build", "--backend", "rust", "--stdout", program])
+        .output()
+        .expect("emit the program");
+    assert!(
+        output.status.success(),
+        "{program} must emit for the census:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("vilan-native: consumed-copies="))
+        .unwrap_or_else(|| panic!("{program} reported no copy census"));
+    let mut numbers = line
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|piece| !piece.is_empty())
+        .map(|piece| piece.parse::<usize>().expect("a count"));
+    let copied = numbers.next().expect("the copied count");
+    let elided = numbers.next().expect("the elided count");
+    (copied, elided)
+}
+
+#[test]
+fn the_native_copy_census_matches_its_table() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_board.vl"), BOARD_PROBE)
+        .expect("write the board probe");
+    let mut rows = Vec::new();
+    for program in DEFAULT_SUITE
+        .iter()
+        .copied()
+        .chain(std::iter::once("native_probe_board.vl"))
+    {
+        let (copied, elided) = copy_census_of(&staged, program);
+        rows.push(format!(
+            "{}\t{copied}\t{elided}",
+            program.trim_end_matches(".vl")
+        ));
+    }
+    let measured = format!(
+        "{}{}\n",
+        concat!(
+            "# Consumed place reads the NATIVE emitter copied, and the ones it\n",
+            "# moved at a last use (tracker F31). Regenerate with\n",
+            "# VILAN_REGENERATE_NATIVE_COPY_CENSUS=1 cargo test -p vilan-cli \
+             --test native_differential\n",
+        ),
+        rows.join("\n")
+    );
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(NATIVE_COPY_CENSUS);
+    if std::env::var_os("VILAN_REGENERATE_NATIVE_COPY_CENSUS").is_some() {
+        std::fs::write(&path, &measured).expect("write the census");
+        return;
+    }
+    let committed = std::fs::read_to_string(&path).expect("read the committed census");
+    assert_eq!(
+        committed, measured,
+        "the native copy census moved; read the difference, then regenerate with \
+         VILAN_REGENERATE_NATIVE_COPY_CENSUS=1"
+    );
+}
+
+/// F29: a program whose host bindings sit ONLY inside a refused call — in its
+/// arguments, and in the body of a closure among them.
+///
+/// `random_uuid` is reached nowhere but inside the argument of the refused
+/// `random_bytes` call; `range_i32` nowhere but inside the body of the closure
+/// the refused `hmr_register_teardown` takes. Neither was in the census before
+/// the walk continued past a refusal, which is how `createServer`'s handler hid
+/// nine bindings from the census that sized F18.
+const CENSUS_PROBE: &str = concat!(
+    "import std::crypto::{ random_bytes, random_uuid };\n",
+    "import std::random::range_i32;\n",
+    "import std::rpc::hmr_register_teardown;\n",
+    "import std::bytes::Bytes;\n",
+    "import std::io::print;\n",
+    "\n",
+    "fun consume(value: Bytes) {}\n",
+    "\n",
+    "fun main() {\n",
+    "\tconsume(random_bytes(random_uuid().len()));\n",
+    "\thmr_register_teardown(|| { print(range_i32(1, 4)); });\n",
+    "}\n",
+);
+
+/// F29's pin: the host census reports what a REFUSAL stands in front of.
+///
+/// The census answers "what host surface does this program still need", and a
+/// walk that stops at the first refusal answers a smaller question. The two
+/// bindings asserted here are each reachable through exactly ONE refused
+/// construct, so a walk that stops names neither — which is what makes this
+/// pin measure the continuation rather than the program.
+#[test]
+fn the_host_census_walks_past_a_refusal_into_its_arguments_and_closure_bodies() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_census.vl"), CENSUS_PROBE)
+        .expect("write the probe program");
+    let output = vilan(&staged)
+        .env("VILAN_NATIVE_HOST_CENSUS", "1")
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_census.vl",
+        ])
+        .output()
+        .expect("census the probe");
+    assert!(
+        output.status.success(),
+        "the census emit failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let census = String::from_utf8_lossy(&output.stdout);
+    for hidden in [
+        // Reached only inside the ARGUMENT of a refused host binding's call.
+        "the host binding `random_uuid`",
+        // Reached only inside the BODY of a closure handed to a refused one.
+        "the intrinsic `RandomInt`",
+    ] {
+        assert!(
+            census.contains(hidden),
+            "the census must walk past a refusal and report `{hidden}`:\n{census}"
+        );
+    }
+    // And the refusals themselves are still reported, which is what the walk is
+    // a continuation OF.
+    for refused in [
+        "the host binding `random_bytes`",
+        "the host binding `hmr_register_teardown`",
+    ] {
+        assert!(
+            census.contains(refused),
+            "the census must still name the refusal itself `{refused}`:\n{census}"
+        );
+    }
+}
+
+/// F30: a binding that lives in a CELL, mutated IN PLACE through every spelling
+/// the language has for it.
+///
+/// A module-level binding is a `thread_local!` and a mutably-captured one is a
+/// `Captured` cell; a read of either answers a VALUE, which is right for a value
+/// and silently wrong for a place — the mutation lands in a temporary that is
+/// dropped at the end of the statement. Every line below printed the
+/// UNMUTATED value natively while the JS backend printed the mutated one, and
+/// none of them was visible to the whole-set differential because every mutated
+/// module binding in the corpus holds a `Shared`, whose copy is the same cell.
+///
+/// The last two lines are the borrow's own hazard rather than the copy's: the
+/// cell is borrowed for the whole of the mutating call, so a read of the same
+/// binding among the ARGUMENTS has to happen before the borrow is taken.
+const CELL_PLACE_PROBE: &str = concat!(
+    "struct Counter { n: i32 }\n",
+    "\n",
+    "impl Counter {\n",
+    "\tfun bump(&mut self) { self.n = self.n + 1; }\n",
+    "}\n",
+    "\n",
+    "mut counts: List<i32> = [1, 2];\n",
+    "mut counter: Counter = Counter { n = 0 };\n",
+    "\n",
+    "fun record(value: i32) { counts.push(value); }\n",
+    "\n",
+    "fun grow(xs: &mut List<i32>, by: i32) { xs.push(by); }\n",
+    "\n",
+    "fun main() {\n",
+    "\trecord(7);\n",
+    "\tprint(counts);\n",
+    "\tcounter.bump();\n",
+    "\tcounter.bump();\n",
+    "\tprint(counter.n);\n",
+    "\tcounter.n = 41;\n",
+    "\tprint(counter.n);\n",
+    "\tcounts[0] = 5;\n",
+    "\tprint(counts);\n",
+    "\tgrow(&mut counts, 9);\n",
+    "\tprint(counts);\n",
+    "\tmut seen: List<i32> = [];\n",
+    "\tmut inner: Counter = Counter { n = 0 };\n",
+    "\tlet bump = || { seen.push(seen.len()); inner.bump(); };\n",
+    "\tbump();\n",
+    "\tbump();\n",
+    "\tprint(seen);\n",
+    "\tprint(inner.n);\n",
+    "\tcounts.push(counts.len());\n",
+    "\tprint(counts);\n",
+    "\tgrow(&mut counts, counts.len());\n",
+    "\tprint(counts);\n",
+    "}\n",
+);
+
+/// F30's pin: every cell-resident binding above is mutated IN PLACE, on both
+/// backends, to the same bytes.
+///
+/// It is written as ONE program because it is one defect seen from seven
+/// sides — a mutating intrinsic's receiver, a `&mut self` method, a field
+/// write, an index write, a `&mut` argument, and the two argument orders the
+/// borrow constrains — and because a program that mixes them is the one that
+/// catches a fix applied at only one of them.
+#[test]
+fn a_binding_that_lives_in_a_cell_is_mutated_in_place_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_cell_place.vl"), CELL_PLACE_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_cell_place.vl"),
+        Verdict::Identical,
+        "a module-level or mutably-captured binding mutated in place must be mutated in the CELL, \
+         not in a copy of its value"
+    );
+}
+
 /// `native-apps.md`'s probe, verbatim from
 /// `proposals/projects/vilan/proposal/native-apps-probe/board.vl` — copied
 /// rather than referenced because the proposals repository is not a build
@@ -1991,7 +2348,13 @@ fn every_async_corpus_program_is_identical_or_named() {
     // child, and a join that must wait for a child list which GREW while it was
     // draining. If either stops being identical the executor or the emitter's
     // async arms have moved.
-    for required in ["await-postfix.vl", "nursery.vl"] {
+    // F22: `adapt.vl` joins them. It is the corpus's ADAPTED-INSTANCE program
+    // — one `map` called with an async closure at one site and a synchronous
+    // one at another, and a `run` the same way — so it is the pin that this
+    // emitter monomorphises on asyncness as well as on types. Two instances of
+    // each callee come out, one `async fn` and one plain, and the program that
+    // proves it is the one whose two answers must be the same bytes.
+    for required in ["await-postfix.vl", "nursery.vl", "adapt.vl"] {
         assert!(
             identical_programs.iter().any(|program| program == required),
             "{required} must be byte-identical on both backends; the census was:\n{}",

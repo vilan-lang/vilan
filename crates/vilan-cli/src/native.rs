@@ -34,6 +34,29 @@ pub fn record_boxed_bindings(count: usize) {
     BOXED_BINDINGS.store(count, Ordering::Relaxed);
 }
 
+/// F31's measurement, on the same terms: the consumed place reads the last
+/// emit COPIED, and the ones it moved because the read was a last use.
+/// `VILAN_NATIVE_REPORT_COPIES=1` prints them, and it prints on the `--stdout`
+/// path too — the census wants the numbers, not a linked binary.
+static CONSUMED_COPIES: AtomicUsize = AtomicUsize::new(0);
+static CONSUMED_COPIES_ELIDED: AtomicUsize = AtomicUsize::new(0);
+
+pub fn record_copy_census(copied: usize, elided: usize) {
+    CONSUMED_COPIES.store(copied, Ordering::Relaxed);
+    CONSUMED_COPIES_ELIDED.store(elided, Ordering::Relaxed);
+}
+
+/// The one line both report paths print.
+fn report_copy_census() {
+    if std::env::var_os("VILAN_NATIVE_REPORT_COPIES").is_some() {
+        println!(
+            "vilan-native: consumed-copies={} elided={}",
+            CONSUMED_COPIES.load(Ordering::Relaxed),
+            CONSUMED_COPIES_ELIDED.load(Ordering::Relaxed)
+        );
+    }
+}
+
 /// The host surface the last emit reached (F18's work list), recorded on the
 /// same terms and for the same reason as the boxed count above: the number
 /// belongs to the COMPILE and the caller that wants it drives the binary.
@@ -282,6 +305,7 @@ pub fn build(unit: &Unit, platform: Platform, emit_debug: bool, stdout: bool) ->
                 } else {
                     print!("{source}");
                 }
+                report_copy_census();
                 RoundOutcome::Succeeded
             }
             Err(_) => RoundOutcome::Failed,
@@ -307,6 +331,7 @@ pub fn build(unit: &Unit, platform: Platform, emit_debug: bool, stdout: bool) ->
             BOXED_BINDINGS.load(Ordering::Relaxed)
         );
     }
+    report_copy_census();
     RoundOutcome::Succeeded
 }
 

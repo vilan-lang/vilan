@@ -31,6 +31,7 @@ pub mod lexing;
 pub mod lift;
 pub(crate) mod macros;
 pub mod manifest;
+pub mod mono;
 pub mod node;
 pub mod options;
 pub mod owned_modules;
