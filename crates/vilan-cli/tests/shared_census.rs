@@ -69,7 +69,7 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ("process/ui.vl", 3, "O: the SSR request's view tree"),
     (
         "reactive.vl",
-        33,
+        35,
         "R + O + E: turns, owners, cells, drafts, the subscriber liveness flag \
          (A110 door 1 — `observe`'s per-subscriber cell, shared with the \
          `Subscription`; `Subscription::teardown`'s own; the module-level \
@@ -78,7 +78,15 @@ const CENSUS: &[(&str, usize, &str)] = &[
          module-level `minting_derivation` mark (R — one bit for the program, \
          set at a derivation's attach and spent by the `observe` it reaches); \
          and A114's `scoped_runner` cell (O: the CURRENT run's owner, released \
-         by the next run and by the enclosing boundary)",
+         by the next run and by the enclosing boundary); and A123's two \
+         (O: `switch`'s and `and_then`'s rolling inner subscription, the same \
+         shape as the two `flatten`s', released by the ambient owner)",
+    ),
+    (
+        "reactive_pipeline.vl",
+        1,
+        "O: the S1 probe's `Switch` node holds its rolling inner subscription \
+         exactly as `switch` does (A124 S1 — evidence, not surface)",
     ),
     (
         "rpc.vl",
@@ -201,7 +209,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 132,
+        total, 135,
         "the total number of `Shared` construction sites in std changed"
     );
 
