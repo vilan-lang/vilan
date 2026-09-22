@@ -50,7 +50,13 @@ opening a closure type, §3.9), `void` (the unit value/type), `self` and
 `must_use`, `rpc`, `trait_only`, `doc`, `expose`, `platform`,
 `deprecated` (attribute names in `[...]` position), and jump targets
 (`break`, `continue`) after `jump`. All remain usable as ordinary
-identifiers elsewhere.
+identifiers elsewhere, with one exception: `void` may not be a
+BINDER's name (a `let`, a `for` binder, a function parameter, a match
+capture). An expression `void` is always the unit, so a binding by
+that name could never be read back, and it is refused where it is
+written rather than where it is read (N113). A member — a struct
+field, a method — may still be called `void`: it is reached through a
+receiver, not through the atom production.
 
 ## 2.3 Literals
 
