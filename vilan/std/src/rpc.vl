@@ -97,21 +97,46 @@ export struct HttpTransport {
 	url: str,
 }
 
+/// The runtime's `try`/`catch` for a body that SUSPENDS — `std::reactive`'s
+/// `guarded` is the sync twin, and it cannot serve here (tracker B374): a
+/// rejected host promise is not a throw on the calling stack, so a sync guard
+/// around a `fetch` catches nothing. `Ok(value)` when the body settled;
+/// `Err(reason)` carrying the host's own diagnosis — and the `cause` it hangs
+/// off it, which is where an unreachable host's `connect ECONNREFUSED ..`
+/// lives — when it rejected. The glue is `__guarded_async` in
+/// `transformer.rs`, the shape `std::db`'s `exec_guarded` already uses at this
+/// boundary.
+[extern("__guarded_async")]
+async external fun guarded_async<T>(body: async || T): Result<T, str>;
+
 export impl HttpTransport with Transport {
 	/// The reply is read in the request's format — both sides run one codec
-	/// (deployment-wide, Q6), so the kinds always match. (An unreachable host
-	/// still surfaces as the host fetch's rejection — HTTP-level robustness is
-	/// recorded beyond-v1; the reconnecting transport is `SocketTransport`.)
+	/// (deployment-wide, Q6), so the kinds always match.
+	///
+	/// An unreachable host, a DNS failure, a connection dropped mid-body: each
+	/// is a rejection of the host `fetch`, and each answers `Err(reason)` —
+	/// `Transport`'s own contract, which this used to break by letting the
+	/// rejection leave as an UNHANDLED one and take the process down with it
+	/// (tracker B374). The caller's `match` runs; `call` maps the `Err` to
+	/// `RpcError::Transport`. The retrying transport is still `SocketTransport`
+	/// — nothing here dials twice.
 	fun call(self, request: Frame): Task<Result<Frame, str>> {
 		async {
+			// The guard wraps the READ as well as the POST: a response whose
+			// body is still arriving when the connection drops rejects at
+			// `text()`/`bytes()`, not at `send()`.
 			match request {
 				Frame::Text(let body) => {
-					let response = post(self.url, body).send();
-					Ok(Frame::Text(response.text()))
+					match guarded_async(|| post(self.url, body).send().text()) {
+						Ok(let text) => Ok(Frame::Text(text)),
+						Err(let reason) => Err(reason),
+					}
 				},
 				Frame::Binary(let body) => {
-					let response = post_bytes(self.url, body);
-					Ok(Frame::Binary(response.bytes()))
+					match guarded_async(|| post_bytes(self.url, body).bytes()) {
+						Ok(let bytes) => Ok(Frame::Binary(bytes)),
+						Err(let reason) => Err(reason),
+					}
 				},
 			}
 		}

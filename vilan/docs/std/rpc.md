@@ -338,6 +338,13 @@ trait Transport {
 | `HttpTransport` | one POST per call | stateless calls, no mirrors, no handles |
 | `LocalTransport` | in-process | tests: client and service in one process; handles need a stamped connection |
 
+A transport FAILING is `Err(reason)`, which `call` maps to
+`RpcError::Transport(..)`: an unreachable host, a DNS failure, a connection
+dropped while the body was still arriving. `HttpTransport` answers that for
+every rejection of the host `fetch`, so a call to a server that is not there is
+an arm of your `match` and not the end of the process. It does not retry —
+dialling again is `SocketTransport`'s job.
+
 Below `SocketTransport` sits `SocketDuplex` (the reconnect-surviving socket:
 pending-call registry, inbound dispatch, `on_reconnect` hooks) and the
 `DuplexTransport` machinery (`duplex_pair`, `bridge`, `connect_split` for

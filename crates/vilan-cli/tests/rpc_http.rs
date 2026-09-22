@@ -259,6 +259,87 @@ fun run_client(url: str) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// B374: `HttpTransport` against a host nothing answers on. The host `fetch`
+/// REJECTS, and a rejection is not a throw on the calling stack — so the
+/// transport's own contract ("a transport can FAIL … `Err(reason)` is the
+/// infrastructure path") used to be broken by the rejection leaving as an
+/// unhandled one and taking the whole process with it. A login form on a
+/// dropped network must say "offline", not take the page down.
+///
+/// The pin asserts BOTH halves, because either alone is passable by accident:
+/// the typed `Transport(..)` arm is reached (so the caller's `match` ran), and
+/// the line printed AFTER it is on stdout (so the program kept going). A
+/// process that dies here also writes `TypeError: fetch failed` to stderr,
+/// which `vilan_run_with_liveness_bound` fails on in its own right.
+#[test]
+fn an_unreachable_host_answers_a_typed_transport_error_and_the_process_survives() {
+    // A port bound and immediately released: nothing listens on it, and it is
+    // the OS's own answer to "which port is free", so no literal can collide
+    // with a service a developer happens to be running.
+    let closed_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a probe port");
+        let port = listener.local_addr().expect("read the probe port").port();
+        drop(listener);
+        port
+    };
+    let dir = temp_project("unreachable");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        &format!(
+            r#"import std::io::print;
+import std::process::exit;
+import std::result::Result::{{ self, Ok, Err }};
+import std::json::json_codec;
+import std::rpc::{{ HttpTransport, RpcError }};
+
+[service(Client)]
+struct Counter {{
+	seed: i32,
+}}
+
+impl Counter {{
+	[rpc]
+	fun add(self, by: i32): i32 {{
+		self.seed + by
+	}}
+}}
+
+async fun main() {{
+	let client = Client {{
+		transport = HttpTransport {{ url = "http://127.0.0.1:{closed_port}/rpc" }},
+		codec = json_codec(),
+	}};
+	match client.add(2) {{
+		Ok(let n) => print(i"add -> {{n}}"),
+		Err(let error) => match error {{
+			RpcError::Transport(let reason) => print(i"transport failure: {{reason}}"),
+			_ => print(i"wrong arm: {{error.to_json()}}"),
+		}},
+	}}
+	print("still running");
+	exit(0);
+}}
+"#
+        ),
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("transport failure: "),
+        "an unreachable host did not answer `RpcError::Transport`:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("still running"),
+        "the process did not survive an unreachable host:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn realtime_sync_reaches_every_session_over_sse() {
     // The realtime milestone's mechanics: two sessions connect over SplitDuplex

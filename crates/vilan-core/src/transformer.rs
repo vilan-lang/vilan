@@ -1091,6 +1091,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__db_run_guarded",
         "__with_finally",
         "__guarded",
+        "__guarded_async",
         "__with_finally_async",
         "__fs_close",
         "__fs_close_awaited",
@@ -1493,6 +1494,33 @@ fn helper_source(name: &str) -> &'static str {
              \t\treturn [ 1 ];\n\
              \t} catch (error) {\n\
              \t\treturn [ 0, error && error.message ? error.message : String(error) ];\n\
+             \t}\n\
+             }"
+        }
+        // `__guarded` for a body that SUSPENDS (`std::rpc`'s `HttpTransport`,
+        // tracker B374). The sync twin cannot serve: a rejected host promise
+        // is not a throw on the calling stack, so `try { body() }` around a
+        // `fetch` catches nothing and the rejection leaves the process as an
+        // unhandled one — which is exactly how an unreachable host used to
+        // take the program down through a transport whose own contract says
+        // `Err(reason)`. It answers the `Result` array form (`[ 0, value ]` /
+        // `[ 1, reason ]`) rather than `__guarded`'s `Option`, because the
+        // value is what the caller came for.
+        //
+        // The host's `fetch` rejection is the reason this reads `cause` too:
+        // its own message is the bare "fetch failed", and everything an
+        // operator needs — `connect ECONNREFUSED 127.0.0.1:59999` — is on the
+        // cause undici hangs off it.
+        "__guarded_async" => {
+            "async function __guarded_async(body) {\n\
+             \ttry {\n\
+             \t\treturn [ 0, await body() ];\n\
+             \t} catch (error) {\n\
+             \t\tlet reason = error && error.message ? error.message : String(error);\n\
+             \t\tif (error && error.cause && error.cause.message) {\n\
+             \t\t\treason = reason + \": \" + error.cause.message;\n\
+             \t\t}\n\
+             \t\treturn [ 1, reason ];\n\
              \t}\n\
              }"
         }
