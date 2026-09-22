@@ -92,6 +92,7 @@ macro_rules! corpus_manifest {
             derive_json => "derive-json.vl",
             destructuring => "destructuring.vl",
             display => "display.vl",
+            dyn_objects => "dyn-objects.vl",
             element_clones => "element-clones.vl",
             element_syntax => "element-syntax.vl",
             enum_discriminant => "enum-discriminant.vl",

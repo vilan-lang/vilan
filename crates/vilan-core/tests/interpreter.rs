@@ -51,6 +51,13 @@ fn std_spec() -> PackageSpec {
 /// excludes them. Everything not listed here must pass the equivalence check.
 const EXCLUDED: &[(&str, &str)] = &[
     ("adapt.vl", "async (adapted instances await)"),
+    (
+        "dyn-objects.vl",
+        "a call through a `dyn` object dispatches through its table, which the \
+         macro world's evaluator refuses by name (`not available at expansion \
+         time`, dyn-40) — the JS and native backends are the program's two \
+         observers",
+    ),
     ("async-await.vl", "async"),
     ("async-promise-all.vl", "async"),
     (
