@@ -980,6 +980,100 @@ impl<T: Js + std::hash::Hash + Eq + Clone> Js for Set<T> {
 
 // --------------------------------------------------------- canonical keys ---
 
+// ---------------------------------------------------------------- bigint ---
+
+/// `BigInt` — an **`i128`**, which is the native backend's documented LIMIT
+/// (tracker F32, RULED (b) 2026-09-22).
+///
+/// JavaScript's `BigInt` is arbitrary precision and this runtime takes no
+/// dependencies, so there is no bignum to lower one to. The ruling is a limit
+/// rather than a lie: a literal past `i128` is refused at COMPILE time by name,
+/// and an operation that leaves the range TRAPS here rather than wrapping. A
+/// program inside the range behaves identically on both backends, including
+/// its printing — node writes a `BigInt` with the `n` back on (`7n / 2n` is
+/// `3n`, not `3`), which is why this is a newtype and not a bare `i128`.
+///
+/// `i128` covers ±1.7×10^38, which is every hash, id, fixed-point amount and
+/// nanosecond timestamp a program reaches for a `BigInt` to hold. What it does
+/// not cover is arbitrary-precision arithmetic as a SUBJECT — RSA, a big
+/// factorial — and the ruling says so: a bignum lands when a real program asks
+/// for one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct BigInt(pub i128);
+
+/// The one sentence every trapping arm below raises, so a reader meets the
+/// rule and not an arithmetic accident.
+fn bigint_overflow(operation: &str) -> ! {
+    panic_with(&format!(
+        "a `BigInt` {operation} left the native backend's range: `BigInt` is an `i128` \
+         here (±1.7e38), which is F32's documented limit — the JS backend's is \
+         arbitrary precision"
+    ))
+}
+
+impl BigInt {
+    /// `Number(big)` — `std::number`'s `BigInt::as_f64`, which is lossy past
+    /// 2^53 exactly as JavaScript's is.
+    pub fn to_f64(self) -> f64 {
+        self.0 as f64
+    }
+}
+
+impl Js for BigInt {
+    /// node prints a `BigInt` with its suffix, at the top level and nested:
+    /// `console.log(1n)` is `1n` and `console.log([1n])` is `[ 1n ]`.
+    fn js(&self) -> String {
+        format!("{}n", self.0)
+    }
+}
+
+/// `JSON.stringify(1n)` throws a `TypeError` in JavaScript rather than writing
+/// a number, so the twin throws too instead of inventing a rendering.
+impl Json for BigInt {
+    fn json(&self) -> String {
+        panic_with("TypeError: Do not know how to serialize a BigInt")
+    }
+}
+
+macro_rules! bigint_operator {
+    ($($trait:ident, $method:ident, $checked:ident, $what:literal;)*) => {
+        $(impl std::ops::$trait for BigInt {
+            type Output = BigInt;
+            fn $method(self, other: BigInt) -> BigInt {
+                match self.0.$checked(other.0) {
+                    Some(value) => BigInt(value),
+                    None if other.0 == 0 && $what != "addition" && $what != "subtraction"
+                        && $what != "multiplication" =>
+                    {
+                        // JavaScript answers a `RangeError` for `1n / 0n`, which
+                        // is a different failure from leaving the range.
+                        panic_with("RangeError: Division by zero")
+                    }
+                    None => bigint_overflow($what),
+                }
+            }
+        })*
+    };
+}
+
+bigint_operator! {
+    Add, add, checked_add, "addition";
+    Sub, sub, checked_sub, "subtraction";
+    Mul, mul, checked_mul, "multiplication";
+    Div, div, checked_div, "division";
+    Rem, rem, checked_rem, "remainder";
+}
+
+impl std::ops::Neg for BigInt {
+    type Output = BigInt;
+    fn neg(self) -> BigInt {
+        match self.0.checked_neg() {
+            Some(value) => BigInt(value),
+            None => bigint_overflow("negation"),
+        }
+    }
+}
+
 /// `std::hash::Hash` — the opaque canonical key `Hashable` answers (I1,
 /// `proposal/hashable-keys.md`), as the JS backend's `__hash` actually computes
 /// it:

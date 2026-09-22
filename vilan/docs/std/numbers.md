@@ -12,7 +12,7 @@ and random values (`std::random`). Literal syntax and conversion semantics:
 | `u8 u16 u32 u53` | unsigned | suffixed (`0xFFu8`) |
 | `f64` | float | `2.5` or `10f` |
 | `f32` | float | `2.5f32` |
-| `BigInt` | arbitrary | `7n` |
+| `BigInt` | arbitrary (`i128` on the native backend — see the [native guide](../guide/native.md#numbers)) | `7n` |
 
 `i53`/`u53` are the **wide** integers, named for the precision they
 actually deliver: they are f64-backed on the JS backend, and every value

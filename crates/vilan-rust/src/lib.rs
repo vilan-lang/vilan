@@ -1401,6 +1401,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // answered the same way. The `external` gate is above, so this arm
             // cannot claim a vilan struct that merely shares one of the names.
             _ if let Some(native) = http_host_type(name) => Ok(native.to_string()),
+            // F32 (RULED (b), Order 40): `BigInt` is an `i128` natively — the
+            // documented LIMIT. `vilan_rt::BigInt` says what that buys and
+            // what it costs; it is a newtype and not a bare `i128` because
+            // node prints a `BigInt` with its `n`.
+            "BigInt" => Ok("vilan_rt::BigInt".to_string()),
             // F18 slice 2: `std::json`'s opaque host value. It stands apart
             // from the HTTP table because it is a different module's host
             // surface and because two of the HTTP bindings (`headers`,
@@ -3328,11 +3333,32 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // same bytes; `i64` is neither. Refused by name rather than narrowed.
         // `remainder.vl` is the corpus's only one and it was refused for its
         // overloaded `%` until now, which is why this had never been asked.
+        // F32, RULED (b) 2026-09-22: a `BigInt` is an `i128` natively — a
+        // documented LIMIT rather than a bignum this dependency-free runtime
+        // has no room for. A literal INSIDE the range is that value; one past
+        // it is refused here, at the only place the whole number is still
+        // written down, rather than silently narrowed (which is what this
+        // emitted before Order 39 made it a refusal: `9007199254740993n` came
+        // out as `…993i32`).
         if suffix == Some("n") {
-            return Err(unsupported(
-                "a `BigInt` literal (arbitrary precision, and node prints it with its `n`)",
-                span,
-            ));
+            let digits = whole.replace('_', "");
+            let Ok(value) = digits.parse::<i128>() else {
+                return Err(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "the `BigInt` literal `{digits}n` is outside the native backend's range: \
+                         a `BigInt` is an `i128` there (±1.7e38), which is the documented limit \
+                         — the JS backend's is arbitrary precision. Build this program with \
+                         `--backend js`, or keep the value inside the limit"
+                    ),
+                });
+            };
+            if fraction.is_some() {
+                return Err(unsupported("a `BigInt` literal with a fraction", span));
+            }
+            return Ok(format!("vilan_rt::BigInt({value}i128)"));
         }
         let cleaned = match fraction {
             Some(fraction) => format!("{whole}.{fraction}").replace('_', ""),
@@ -5077,6 +5103,56 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
+    /// The Rust scalar one `[extern("Number")]` binding of `std::number` labels
+    /// its argument with — read off the DECLARED RETURN TYPE, not off the
+    /// binding's name.
+    ///
+    /// The name is a hint and it lies: `label_i64(value: f64): i53` is the
+    /// vilan width `i53`, whose native width is `i64`, and a read of the name
+    /// answered "there is no `i64`" and refused `numeric-types.vl`. The
+    /// declaration is where the vilan type is said, which is the same reason
+    /// [`Emitter::math_host_binding`] casts from it.
+    ///
+    /// `str` is excluded — `Number` never answers one — and so is anything that
+    /// is not a scalar primitive, which is how a `BigInt` receiver falls
+    /// through to the arm above it.
+    fn scalar_label_target(
+        &mut self,
+        target: Id,
+        span: Span,
+    ) -> Result<Option<&'static str>, Error> {
+        let Some(external) = self.program.external_functions.get(&target) else {
+            return Ok(None);
+        };
+        let returns = external.return_type_id;
+        let Some(Type::Struct(struct_id, _)) = self.resolve(returns) else {
+            return Ok(None);
+        };
+        let Some(declaration) = self.program.structs.get(struct_id) else {
+            return Ok(None);
+        };
+        let _ = span;
+        Ok(scalar_type(declaration.name).filter(|rendered| *rendered != "vilan_rt::Str"))
+    }
+
+    /// Whether a call's receiver is a `BigInt` — the one width
+    /// [`Emitter::scalar_host_binding`]'s `Number` family cannot cast.
+    fn receiver_is_bigint(&self, argument_ids: &[Id]) -> bool {
+        let Some(&receiver) = argument_ids.first() else {
+            return false;
+        };
+        let Some(Type::Struct(struct_id, _)) = self
+            .type_of(receiver)
+            .and_then(|type_id| self.resolve(type_id))
+        else {
+            return false;
+        };
+        self.program
+            .structs
+            .get(struct_id)
+            .is_some_and(|declaration| declaration.external && declaration.name == "BigInt")
+    }
+
     /// `std::number`'s `Math.*` family (F18 slice 2).
     ///
     /// Almost all of it is the `f64` method of the same name, so the table is
@@ -5183,16 +5259,28 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// a coercion rather than a cast.
     fn scalar_host_binding(
         &mut self,
+        target: Id,
         name: &str,
         binding: Option<&ExternBinding<'src>>,
         argument_ids: &[Id],
         depth: usize,
+        span: Span,
     ) -> Result<Option<String>, Error> {
         let rendered = match binding {
+            // `BigInt::as_f64` is `Number(big)`, and a `BigInt` is a NEWTYPE
+            // natively (F32), so it converts through its own method where
+            // every other width is an `as` cast.
             Some(ExternBinding::Function {
                 module: None,
                 symbol: "Number",
-            }) if let Some(scalar) = scalar_label_target(name) => format!(
+            }) if name == "as_f64" && self.receiver_is_bigint(argument_ids) => format!(
+                "({}).to_f64()",
+                self.value_argument(argument_ids, 0, depth)?
+            ),
+            Some(ExternBinding::Function {
+                module: None,
+                symbol: "Number",
+            }) if let Some(scalar) = self.scalar_label_target(target, span)? => format!(
                 "(({}) as {scalar})",
                 self.value_argument(argument_ids, 0, depth)?
             ),
@@ -5243,12 +5331,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     self.value_argument(argument_ids, 0, depth)?
                 )
             }
-            // The scalar half of the `Json` trait: `impl i32 with Json` binds
-            // `to_json` straight to `JSON.stringify`, and a DERIVED struct's
-            // `to_json` calls it per field. `vilan_rt::Json` is that rendering
-            // and already existed — it is what `canonical_hash` keys on (F20) —
-            // so this arm is a rename, not a second stringifier.
-            ("JSON.stringify", "to_json") => format!(
+            // `JSON.stringify(value)` under whatever name declared it:
+            // `impl i32 with Json`'s `to_json`, `std::debug`'s `debug`, and a
+            // DERIVED struct's `to_json` calling the scalar one per field.
+            // `vilan_rt::Json` is that rendering and already existed — it is
+            // what `canonical_hash` keys on (F20) — so this arm is a rename
+            // rather than a second stringifier, and keying it on the SYMBOL
+            // rather than on one vilan name is the point: every declaration of
+            // it means the same function.
+            ("JSON.stringify", _) if argument_ids.len() == 1 => format!(
                 "vilan_rt::str_new(&vilan_rt::Json::json(&{}))",
                 self.place_argument(argument_ids, 0, depth)?
             ),
@@ -5676,10 +5767,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 return Ok(rendered);
             }
             if let Some(rendered) = self.scalar_host_binding(
+                target,
                 name,
                 binding.as_ref(),
                 &function_call.argument_ids,
                 depth,
+                span,
             )? {
                 return Ok(rendered);
             }
@@ -6089,9 +6182,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 {
                     return Ok(rendered);
                 }
-                if let Some(rendered) =
-                    self.scalar_host_binding(name, binding.as_ref(), argument_ids, depth)?
-                {
+                if let Some(rendered) = self.scalar_host_binding(
+                    member_id,
+                    name,
+                    binding.as_ref(),
+                    argument_ids,
+                    depth,
+                    span,
+                )? {
                     return Ok(rendered);
                 }
                 if let Some(rendered) =
@@ -6501,21 +6599,6 @@ fn http_host_type(name: &str) -> Option<&'static str> {
 /// for a type POSITION and this is it for a coercion's RESULT.
 fn json_coercion_target(name: &str) -> Option<&'static str> {
     let labelled = name.strip_prefix("coerce_")?;
-    scalar_type(labelled).filter(|rendered| *rendered != "vilan_rt::Str")
-}
-
-/// F18 slice 2: the Rust scalar one `[extern("Number")]` binding of
-/// `std::number` labels its argument with.
-///
-/// Two families, both answered by [`scalar_type`]: `label_i32(v: f64): i32` (a
-/// fold's result relabelled) and `i8::as_f64(self): f64` (a widening). `str`
-/// is excluded for the reason it is excluded in [`json_coercion_target`] —
-/// `Number` never answers one.
-fn scalar_label_target(name: &str) -> Option<&'static str> {
-    let labelled = match name {
-        "as_f64" => "f64",
-        other => other.strip_prefix("label_")?,
-    };
     scalar_type(labelled).filter(|rendered| *rendered != "vilan_rt::Str")
 }
 

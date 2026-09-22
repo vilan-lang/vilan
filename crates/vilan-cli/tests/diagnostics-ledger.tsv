@@ -571,3 +571,4 @@ row	flagship	key
 547	-	`[derive({name})]` expanded before std's `{module}` declared its `{name}` macro: a compiler load-ordering bug (B21's class); please report how this module is reached
 548	-	{count} `context` {checks} did not run: this program does not type, so the call graph it would be checked over has holes in it — fix the errors above and check again
 549	-	`external fun {name}` names no body: an external needs an `[extern(..)]` binding saying what the host calls it, or it is not external — give it a body. Without one, a call to it emits a name nothing in the program defines
+NEW	-	the `BigInt` literal `{digits}n` is outside the native backend's range: a `BigInt` is an `i128` there (±1.7e38), which is the documented limit

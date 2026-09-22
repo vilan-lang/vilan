@@ -69,6 +69,12 @@ use std::process::Command;
 /// `vilan_rt::json` existed, and every one of them is a row of the slice: the
 /// host type, the six intrinsics, the `!` assertion the derived decoders are
 /// written in, and a capturing `is`-test to the left of `&&`.
+///
+/// F32 adds the two `BigInt` rows. `remainder.vl` and `numeric-types.vl` are
+/// the corpus's only `n` literals, and both were refused by name after Order
+/// 39 caught the narrowing miscompile behind them (`9007199254740993n` had been
+/// emitting `…993i32`). They print `1n` and `3n` on both backends now, which is
+/// the whole of what the `i128` ruling claims.
 const DEFAULT_SUITE: &[&str] = &[
     "bool.vl",
     "recursion.vl",
@@ -88,6 +94,8 @@ const DEFAULT_SUITE: &[&str] = &[
     "interpolated-multiline-string.vl",
     "derive-json.vl",
     "json-roundtrip.vl",
+    "remainder.vl",
+    "numeric-types.vl",
 ];
 
 /// The corpus's ASYNC programs (tracker J6, lane native-b-38).
@@ -1077,6 +1085,108 @@ impl Drop for ServerUnderTest {
 /// Both the synchronous and the `async fun main` paths, because they are two
 /// different emitted shapes: one wraps the body, the other wraps the
 /// `block_on`.
+/// **F32 (RULED (b), Order 40)**: `BigInt` is an `i128` natively, and the limit
+/// is enforced at BOTH ends.
+///
+/// The two corpus programs that hold the inside of the range are in
+/// [`DEFAULT_SUITE`]; this pin is the two edges, which no corpus program can
+/// carry because each one fails on purpose. A literal past `i128` is refused at
+/// COMPILE time naming the value and the range (and the JS backend builds the
+/// same program, which is what makes the refusal a backend limit rather than a
+/// language one). An operation that leaves the range TRAPS at run time with the
+/// same sentence, where the JS backend — arbitrary precision — simply answers
+/// the bigger number; the pin reads both, so a native build that wrapped to a
+/// negative would red.
+#[test]
+fn a_bigint_past_the_native_limit_is_refused_and_an_overflow_traps() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_bigint.vl"), BIGINT_LIMIT_PROBE)
+        .expect("write the probe");
+    let refused = vilan(&staged)
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_bigint.vl",
+        ])
+        .output()
+        .expect("build the literal probe natively");
+    assert!(!refused.status.success(), "the literal must be refused");
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        message.contains("is outside the native backend's range"),
+        "the refusal names the rule: {message}"
+    );
+    assert!(
+        message.contains("170141183460469231731687303715884105728"),
+        "and the value it refused: {message}"
+    );
+    // The same program on the JS backend, where a `BigInt` really is arbitrary
+    // precision — so this is a BACKEND limit and the message is honest.
+    let javascript = vilan(&staged)
+        .args(["run", "native_probe_bigint.vl"])
+        .output()
+        .expect("run the literal probe on the JS backend");
+    assert!(javascript.status.success(), "the JS backend builds it");
+    assert_eq!(
+        String::from_utf8_lossy(&javascript.stdout),
+        "170141183460469231731687303715884105728n\n"
+    );
+
+    std::fs::write(
+        staged.join("native_probe_bigint_trap.vl"),
+        BIGINT_TRAP_PROBE,
+    )
+    .expect("write the trap probe");
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "native_probe_bigint_trap.vl"])
+        .output()
+        .expect("run the trap probe natively");
+    assert!(!native.status.success(), "the overflow ends the program");
+    assert!(
+        String::from_utf8_lossy(&native.stderr).contains("left the native backend's range"),
+        "the trap names the rule: {}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "170141183460469231731687303715884105727n\n",
+        "the value INSIDE the range printed first, with node's `n`"
+    );
+    let javascript = vilan(&staged)
+        .args(["run", "native_probe_bigint_trap.vl"])
+        .output()
+        .expect("run the trap probe on the JS backend");
+    assert!(
+        javascript.status.success(),
+        "arbitrary precision does not trap"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&javascript.stdout),
+        "170141183460469231731687303715884105727n\n\
+         170141183460469231731687303715884105728n\n"
+    );
+}
+
+const BIGINT_LIMIT_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(170141183460469231731687303715884105728n);\n",
+    "}\n",
+);
+
+const BIGINT_TRAP_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet near = 170141183460469231731687303715884105727n;\n",
+    "\tprint(near);\n",
+    "\tprint(near + 1n);\n",
+    "}\n",
+);
+
 /// **F18 slice 2**: a closure declared SYNCHRONOUS, answering nothing, whose
 /// body awaits.
 ///
