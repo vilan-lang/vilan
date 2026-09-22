@@ -11870,7 +11870,6 @@ impl<'src> Analyzer<'src> {
         }
         let skip = |analyzer: &Self, id: Id| restored_enrolment && analyzer.table_entity(id);
         let mut asked = 0usize;
-        crate::drop_plan_stats::reset_literal_evidence();
         let mut memo: HashMap<TypeId, bool> = HashMap::default();
         for function in self.functions.values() {
             if !function.has_body {
@@ -12046,16 +12045,29 @@ impl<'src> Analyzer<'src> {
             // the map from the one to the other, written at the same place;
             // the `EnumVariant` arm beside this one already carries its
             // declaration's id, which is why only this arm was dead.
+            //
+            // B384: this arm is the "constructed" leg of the completeness
+            // argument above, and it is SUBSUMED in every program anyone has
+            // written. The check at the top of this function reads the
+            // literal's own recorded type and asks `type_mentions_nominal`,
+            // whose `Type::Struct(id, ..)` leg is `nominals.contains(&id)` —
+            // the same question, keyed on the type instead of on the map — so
+            // the only literal this arm can decide is one the solver gave a
+            // DEFINITION and no TYPE, and both are written at the same place.
+            // Measured rather than reasoned: twelve shapes across two orders
+            // (solver-39's seven, and a generic wrapper, a module-level
+            // binding, an enum payload, an argument position and a helper's
+            // return here), plus a probe planted at this arm — it is REACHED
+            // 21 times per analysis of a std-importing program, always for a
+            // literal whose type does not reach a resource, and it has never
+            // once been the thing that decided. It stays as the backstop for
+            // the state that would otherwise have no answer; what has gone is
+            // the COUNTER that used to sit inside it, which could only ever
+            // read zero and made a pin over it vacuous.
             Some(Expr::StructInitializer(initializer_id, _)) => self
                 .struct_initializer_to_def
                 .get(initializer_id)
-                .is_some_and(|struct_id| {
-                    let reaches = nominals.contains(struct_id);
-                    if reaches {
-                        crate::drop_plan_stats::note_literal_evidence();
-                    }
-                    reaches
-                }),
+                .is_some_and(|struct_id| nominals.contains(struct_id)),
             Some(Expr::EnumVariant(enum_id, _)) => nominals.contains(enum_id),
             Some(Expr::Call(call_id)) => self.call_reaches_resource(*call_id, nominals, memo),
             _ => false,
