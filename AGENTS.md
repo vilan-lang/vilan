@@ -7,7 +7,7 @@ conflict, `CLAUDE.md` wins.
 
 ## The lay of the land
 
-Rust workspace, eight crates, plus the language's own tree:
+Rust workspace, nine crates, plus the language's own tree:
 
 - `crates/vilan-core` — the whole compiler as a library. Pipeline order: `lexing.rs` /
   `token.rs` → `parsing.rs` (a handwritten recursive-descent frontend; replaced
@@ -54,11 +54,16 @@ Rust workspace, eight crates, plus the language's own tree:
   the spec for your change.
 - `crates/vilan-rust` — the emit-Rust backend (F1 S1a, Order 37): the same `Program` the JS
   emitter reads, one `main.rs` out, a cargo project under `dist/native/<entry>/`; scoped to
-  what the platform-free corpus needs — no async, UI, rpc or `std::fs` yet.
+  what the platform-free corpus and `std::http`/`std::json`/`std::db` need — no UI or rpc
+  server yet.
 - `crates/vilan-rt` — the runtime that emitted Rust links against: `Rc<str>`, `Vec`, the
   ordered `Map`/`Set`, `Shared`/`Captured` cells, `guarded` panics and node's `console.log`
   rendering, so a native binary prints byte-for-byte what the JS build prints. No
   dependencies beyond Rust's std, by rule.
+- `crates/vilan-rt-sqlite` — `std::db` for emitted Rust (F18 slice 2; Order 39's R1): the
+  one runtime surface that takes a crates.io dependency (`rusqlite`, `bundled`), kept OUT of
+  `vilan-rt` so that rule holds; a generated cargo project names it only when the program
+  reaches `std::db`.
 
 ## Definition of done (the gates)
 
