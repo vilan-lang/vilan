@@ -829,11 +829,9 @@ pub struct Document {
     /// MOVE, and the answer used to be a walk of `program.structs` — every
     /// struct in the loaded world, with a `source_of` per struct — followed by
     /// a walk of `program.struct_initializer_field_spans`, every key in the
-    /// world, per request. Measured in release on this machine at loadavg 69,
-    /// over generated entries of 20 and 500 ten-field structs: **37.1 µs per
-    /// hover at 267 fields and 860.9 µs at 5,067** — 23.2x the cost for 19x
-    /// the fields, which is the scan, and 0.86 ms is four times M25's whole
-    /// completion budget spent on one hover in a workspace that is not large.
+    /// world, per request. What that cost, and how it was measured, is
+    /// `m85_field_hover_cost` below: the lookup grew with the WORKSPACE's
+    /// field count and now does not.
     field_spans: Vec<(usize, usize, Id, usize)>,
     /// Every identifier occurrence in the analyzed program, keyed by the
     /// definition it names — the one table find-references and rename both read
@@ -8184,12 +8182,6 @@ fn spans_contain(outer: Span, inner: Span) -> bool {
     outer.start <= inner.start && inner.end <= outer.end
 }
 
-/// Replaces the byte range `span` in `source` with `replacement`. The
-/// primitive [`Document::add_all_missing_imports_edit`] folds a SEQUENCE of
-/// `insert_import` edits through, each computed against the previous
-/// splice's result — so two new imports from the same not-yet-imported
-/// module land in one merged brace set, exactly as two separate manual
-/// add-imports would.
 /// M85: every entry-file struct FIELD position a hover can land on, sorted by
 /// start — a field's declaration name span, and every struct-initializer key
 /// span, each with the `(struct, field index)` pair it resolves to.
@@ -8230,6 +8222,12 @@ fn field_spans_of(program: &Program) -> Vec<(usize, usize, Id, usize)> {
     rows
 }
 
+/// Replaces the byte range `span` in `source` with `replacement`. The
+/// primitive [`Document::add_all_missing_imports_edit`] folds a SEQUENCE of
+/// `insert_import` edits through, each computed against the previous
+/// splice's result — so two new imports from the same not-yet-imported
+/// module land in one merged brace set, exactly as two separate manual
+/// add-imports would.
 fn splice(source: &str, span: Span, replacement: &str) -> String {
     let range = span.into_range();
     let mut result =
@@ -26978,11 +26976,12 @@ mod analysis_fence_tests {
 /// M85: what a field hover costs on a workspace with many structs.
 ///
 /// `Document::field_at_offset` — the answer behind a hover on a field's
-/// declaration or on a struct-initializer key (E204) — walks `program.structs`
+/// declaration or on a struct-initializer key (E204) — WALKED `program.structs`
 /// and then `program.struct_initializer_field_spans`, testing every span for
-/// containment. That is a linear scan per hover, and hover fires on MOVE, so
+/// containment. That was a linear scan per hover, and hover fires on MOVE, so
 /// the item asked whether it wants an offset -> field index built with the
-/// program.
+/// program. It got one (`Document::field_spans`); this measures the lookup
+/// that replaced the scan, and measured the scan before it landed.
 ///
 /// Measured before building anything, which is what the item asks for. The
 /// instrument is the thread CPU clock (M15) around a batch of hovers, the
