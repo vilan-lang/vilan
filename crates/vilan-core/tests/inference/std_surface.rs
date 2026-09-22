@@ -6424,3 +6424,122 @@ fn the_json_reader_refuses_a_list_longer_than_the_reads_at_its_close() {
         "refused:a list had 1 element(s) left unread\n",
     );
 }
+
+// --- The subscript operator's INDEX position ---------------------------------
+//
+// A list and an array are positional, so `xs[i]` takes the `i32` that
+// `xs.get(i)` takes. Nothing checked it: `xs[1.5]`, `xs["a"]`, `xs[true]` and
+// the write form all passed `vilan check` and reached the emitted array
+// subscript, where JS answers `undefined` for a position that does not exist —
+// so the program failed somewhere else entirely, or tripped the bounds check
+// with a non-number in its message.
+
+#[test]
+fn a_fractional_list_index_is_refused_at_the_subscript() {
+    // The reported program, whole: it checked clean and died at
+    // `found.len()` with `Cannot read properties of undefined`.
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let xs: List<str> = ["a", "b"];
+            let at: f64 = 1.5;
+            let found: str = xs[at];
+            print(i"{found.len()}");
+        }
+        "#,
+        "an index must be an `i32`, and this one is `f64`",
+    );
+}
+
+#[test]
+fn a_str_list_index_is_refused_at_the_subscript() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let xs: List<str> = ["a", "b"];
+            print(xs["a"]);
+        }
+        "#,
+        "an index must be an `i32`, and this one is `str`",
+    );
+}
+
+#[test]
+fn a_bool_list_index_is_refused_at_the_subscript() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let xs: List<str> = ["a", "b"];
+            print(xs[true]);
+        }
+        "#,
+        "an index must be an `i32`, and this one is `bool`",
+    );
+}
+
+#[test]
+fn the_subscript_write_form_checks_its_index_too() {
+    // `xs[k] = v` is the same `Expr::Index`, and it was accepted as readily.
+    assert_fails_with(
+        r#"
+        fun main() {
+            mut xs: List<str> = ["a", "b"];
+            xs["k"] = "v";
+        }
+        "#,
+        "an index must be an `i32`, and this one is `str`",
+    );
+}
+
+#[test]
+fn a_fixed_array_index_is_checked_at_the_same_position() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            let xs: [i32; 3] = [1, 2, 3];
+            let at: f64 = 0.5;
+            print(xs[at]);
+        }
+        "#,
+        "an index must be an `i32`, and this one is `f64`",
+    );
+}
+
+#[test]
+fn an_i32_index_still_reads_a_list_an_array_and_a_write() {
+    // The control, and the reason the check is exactly `i32`: every spelling
+    // that worked goes on working — a literal, an `i32` binding, a loop
+    // counter, a fixed array, and the write form.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        fun main() {
+            mut xs: List<str> = ["a", "b", "c"];
+            let at: i32 = 1;
+            print(xs[0]);
+            print(xs[at]);
+            xs[2] = "z";
+            print(xs[2]);
+            let fixed: [i32; 3] = [4, 5, 6];
+            print(fixed[at]);
+            mut total = 0;
+            mut index = 0;
+            for _slot in fixed {
+                total += fixed[index];
+                index += 1;
+            }
+            print(total);
+        }
+        "#,
+        "a\nb\nz\n5\n15\n",
+    );
+}

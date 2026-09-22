@@ -45202,6 +45202,52 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// The INDEX half of `subject[index]`: a position, so it is an `i32` —
+    /// the very type `List::get` and `List::set` take.
+    ///
+    /// Nothing checked it. `xs[1.5]`, `xs["a"]`, `xs[true]` and the write form
+    /// `xs[k] = v` all passed `vilan check` and went straight to the emitted
+    /// array subscript, where JS answered `undefined` for a position that does
+    /// not exist — so a program read a hole and failed somewhere else entirely
+    /// (`TypeError: Cannot read properties of undefined`), or tripped the
+    /// bounds check with a non-number in the message.
+    ///
+    /// Lenient about what is not yet a type: an index still `Unknown` or
+    /// `Unresolved` is reported by the fixpoint's own leftover sweep, and a
+    /// GENERIC one is left alone rather than refused here — a parameter's
+    /// bounds are the only thing that could make it an index, and the language
+    /// has no such bound to write yet. Both are holes this deliberately does
+    /// not close; the concrete wrong types are the miscompile.
+    fn subscript_index_is_an_index(&mut self, index_id: Id) -> bool {
+        let Some(index_struct_id) = self.primitive_struct_ids.get("i32").copied() else {
+            return true;
+        };
+        let expected = Type::Struct(index_struct_id, Vec::new());
+        let index_type = self.infer_type(index_id, &expected, &HashMap::default());
+        if matches!(
+            index_type,
+            Type::Unknown | Type::Unresolved | Type::Any | Type::Never | Type::Generic(_)
+        ) {
+            return true;
+        }
+        if index_type == expected {
+            return true;
+        }
+        let index_str = self.pretty_print_type(&index_type, &HashMap::default());
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span: **self.span_map.get(&index_id).unwrap_or(&&EMPTY_SPAN),
+            msg: format!(
+                "an index must be an `i32`, and this one is `{index_str}`: a list and an \
+                 array are POSITIONAL, so `xs[i]` takes the index `xs.get(i)` takes — \
+                 anything else names no element, and the emitted subscript read `undefined` \
+                 back instead of failing"
+            ),
+        });
+        false
+    }
+
     /// `subject[index]`: once the subject's `List<T>` type is known, the
     /// subscript's type is the element `T`; records the resolved `Expr::Index`.
     fn resolve_subscript(&mut self, id: Id, subject_id: Id, index_id: Id) -> Resolution {
@@ -45222,6 +45268,10 @@ impl<'src> Analyzer<'src> {
             Type::Struct(struct_id, arguments)
                 if Some(struct_id) == list_id && arguments.len() == 1 =>
             {
+                if !self.subscript_index_is_an_index(index_id) {
+                    self.expr_id_to_expr_map.insert(id, Expr::Error);
+                    return Resolution::Failed;
+                }
                 let element_type = arguments[0];
                 // A still-unknown element slot: wait for a `push` (or an
                 // annotation on the binding) to ground it. One left ungrounded
@@ -45256,6 +45306,10 @@ impl<'src> Analyzer<'src> {
             // a literal index the type proves out of range is a compile error (the
             // length is in the type); a dynamic index keeps its runtime bounds check.
             Type::Array(element_id, length) => {
+                if !self.subscript_index_is_an_index(index_id) {
+                    self.expr_id_to_expr_map.insert(id, Expr::Error);
+                    return Resolution::Failed;
+                }
                 let literal_index = match self.expr_id_to_expr_map.get(&index_id) {
                     Some(Expr::Number(whole, None, _)) => whole.parse::<usize>().ok(),
                     _ => None,

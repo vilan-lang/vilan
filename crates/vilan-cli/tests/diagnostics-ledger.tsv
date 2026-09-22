@@ -571,3 +571,4 @@ row	flagship	key
 547	-	`[derive({name})]` expanded before std's `{module}` declared its `{name}` macro: a compiler load-ordering bug (B21's class); please report how this module is reached
 548	-	{count} `context` {checks} did not run: this program does not type, so the call graph it would be checked over has holes in it — fix the errors above and check again
 549	-	`external fun {name}` names no body: an external needs an `[extern(..)]` binding saying what the host calls it, or it is not external — give it a body. Without one, a call to it emits a name nothing in the program defines
+NEW	-	an index must be an `i32`, and this one is `{index_str}`: a list and an array are POSITIONAL, so `xs[i]` takes the index `xs.get(i)` takes — anything else names no element, and the emitted subscript read `undefined` back instead of failing
