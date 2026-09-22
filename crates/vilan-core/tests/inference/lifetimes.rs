@@ -529,6 +529,58 @@ fn an_and_then_is_a_derivation_so_an_effect_reads_its_chain_settled() {
     );
 }
 
+#[test]
+fn switch_and_and_then_mint_two_subscribers_where_the_composed_form_mints_three() {
+    // The "one derived cell" claim, counted. `fresh_id` is the program's
+    // subscriber counter, so the delta across a construction is the number of
+    // subscribers it minted — two `fresh_id()` calls of its own included, hence
+    // the `- 1`.
+    //
+    // The pin carries its OWN control: the third line builds the same dynamic
+    // dependency the composed way (`map(select).flatten()`, spelled at a
+    // concrete type because the generic body hits B371) in the same program.
+    // Two subscribers and one cell against three subscribers and two cells is
+    // the whole reason A123 is written over `on_change`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        import std::reactive::{ Signal, SignalCell, fresh_id };
+
+        fun main() {
+            let which = Signal::new(0);
+            let first = Signal::new(10);
+            let second = Signal::new(20);
+
+            let before_switch = fresh_id();
+            let picked = which.switch(|n| if n == 0 { first } else { second });
+            print(fresh_id() - before_switch - 1);
+
+            let outer: SignalCell<Option<i32>> = Signal::new(Some(1));
+            let inner: SignalCell<Option<i32>> = Signal::new(Some(5));
+            let before_and_then = fresh_id();
+            let followed = outer.and_then(|id| inner);
+            print(fresh_id() - before_and_then - 1);
+
+            let before_composed = fresh_id();
+            let composed: SignalCell<i32> =
+                which.map(|n| if n == 0 { first } else { second }).flatten();
+            print(fresh_id() - before_composed - 1);
+
+            // Every one of the three is live, so none of the counts is the
+            // count of a chain that failed to attach.
+            which.set(1);
+            print(picked.get());
+            print(composed.get());
+            print(followed.get().unwrap_or(0));
+        }
+
+        main();
+        "#,
+        "2\n2\n3\n20\n20\n5\n",
+    );
+}
+
 // --- A124 S1: the push-pull pipeline as EVIDENCE ----------------------------
 //
 // `std/src/reactive_pipeline.vl` is the paper's S1 probe
