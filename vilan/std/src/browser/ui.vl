@@ -1138,6 +1138,11 @@ export fun swap_split<T: PartialEq, S: Source<T>, C: Slot>(
 /// property to bind. `{each(items, key, row)}` reads as markup where
 /// `{bind_each(..)}` read as a setter that had escaped — which is why A99 retired
 /// the method and left the value form alone.
+///
+/// Over a `ListCell` or any other `DeltaSource` the run follows the source's ops
+/// rather than re-diffing the list (A112 S3; `place_each` says how); the ruled
+/// spelling of the bound that placement asks for is `S: DeltaFeed<T>` alone, which
+/// waits on B395, so it is written `S: Source<List<T>> + DeltaFeed<T>` for now.
 export fun each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
 	source: S,
 	key: sync |T| K,
