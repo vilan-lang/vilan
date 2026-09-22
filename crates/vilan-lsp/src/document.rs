@@ -820,6 +820,21 @@ pub struct Document {
     /// `(start, end, id)` for every entry-file entity with a real span, used to
     /// find the innermost entity under a cursor.
     entity_spans: Vec<(usize, usize, Id)>,
+    /// M85: `(start, end, struct, field index)` for every entry-file struct
+    /// FIELD position a hover can land on — a field's declaration name span
+    /// and every struct-initializer KEY span — sorted by start, built with the
+    /// analysis.
+    ///
+    /// The same move `entity_spans` is, for the same reason. Hover fires on
+    /// MOVE, and the answer used to be a walk of `program.structs` — every
+    /// struct in the loaded world, with a `source_of` per struct — followed by
+    /// a walk of `program.struct_initializer_field_spans`, every key in the
+    /// world, per request. Measured in release on this machine at loadavg 69,
+    /// over generated entries of 20 and 500 ten-field structs: **37.1 µs per
+    /// hover at 267 fields and 860.9 µs at 5,067** — 23.2x the cost for 19x
+    /// the fields, which is the scan, and 0.86 ms is four times M25's whole
+    /// completion budget spent on one hover in a workspace that is not large.
+    field_spans: Vec<(usize, usize, Id, usize)>,
     /// Every identifier occurrence in the analyzed program, keyed by the
     /// definition it names — the one table find-references and rename both read
     /// (see `crate::references`). Computed with the analysis so a query is a
@@ -1578,6 +1593,7 @@ impl Document {
             text: text.to_string(),
             text_hash: hash_text(text),
             entity_spans: Vec::new(),
+            field_spans: Vec::new(),
             reference_index: ReferenceIndex::default(),
             retained_tail: Vec::new(),
             retained_tail_start: usize::MAX,
@@ -1736,6 +1752,12 @@ impl Document {
             .map(vilan_ide::entity_spans)
             .unwrap_or_default();
 
+        // M85's field-position table, built here for `entity_spans`'s reason:
+        // the question is "which field is under this offset", it is asked once
+        // per hover-on-move, and answering it by walking the world's structs
+        // made the answer cost the codebase rather than the buffer.
+        let field_spans = program.as_ref().map(field_spans_of).unwrap_or_default();
+
         // The identifier-occurrence table the reference queries read.
         let reference_index = program
             .as_ref()
@@ -1817,6 +1839,7 @@ impl Document {
             text: text.to_string(),
             text_hash,
             entity_spans,
+            field_spans,
             reference_index,
             retained_tail: Vec::new(),
             retained_tail_start: usize::MAX,
@@ -2579,6 +2602,7 @@ impl Document {
             live_edits: _,
             text_hash,
             entity_spans,
+            field_spans,
             reference_index,
             platform_requirements,
             manifest_problem,
@@ -2618,6 +2642,7 @@ impl Document {
         self.warning_sources = warning_sources;
         self.text_hash = text_hash;
         self.entity_spans = entity_spans;
+        self.field_spans = field_spans;
         self.reference_index = reference_index;
         self.platform_requirements = platform_requirements;
         self.manifest_problem = manifest_problem;
@@ -3549,27 +3574,21 @@ impl Document {
     /// span, contains `offset` in this document (E204). Entry-file only, like
     /// every other span-containment answer here: `offset` is an analyzed-space
     /// offset into this buffer.
-    fn field_at_offset(&self, program: &Program, offset: usize) -> Option<(Id, usize)> {
-        let contains = |span: Span| {
-            let range = span.into_range();
-            range.start <= offset && offset < range.end
-        };
-        for (struct_id, structure) in &program.structs {
-            if program.source_of(*struct_id) != Some(SourceId(0)) {
-                continue;
-            }
-            for (index, field) in structure.fields.iter().enumerate() {
-                if contains(field.name_span) {
-                    return Some((*struct_id, index));
-                }
-            }
-        }
-        for (source, span, struct_id, index) in &program.struct_initializer_field_spans {
-            if *source == SourceId(0) && contains(*span) {
-                return Some((*struct_id, *index));
-            }
-        }
-        None
+    ///
+    /// M85: a lookup in [`field_spans`](Document::field_spans), not a walk of
+    /// the world's structs. The rows are DISJOINT — a field's declaration name
+    /// occurs once and an initializer key occurs once, and neither can be
+    /// inside the other — so the containing row, if there is one, is the last
+    /// row starting at or before `offset`, and one containment test settles
+    /// it. The walk this replaces took the declarations before the keys; with
+    /// disjoint rows nothing can tell the two orders apart.
+    fn field_at_offset(&self, _program: &Program, offset: usize) -> Option<(Id, usize)> {
+        let candidate = self
+            .field_spans
+            .partition_point(|(start, ..)| *start <= offset)
+            .checked_sub(1)?;
+        let (start, end, struct_id, index) = self.field_spans[candidate];
+        (start <= offset && offset < end).then_some((struct_id, index))
     }
 
     /// The struct/enum definition an entity names in VALUE position — a
@@ -8171,6 +8190,46 @@ fn spans_contain(outer: Span, inner: Span) -> bool {
 /// splice's result — so two new imports from the same not-yet-imported
 /// module land in one merged brace set, exactly as two separate manual
 /// add-imports would.
+/// M85: every entry-file struct FIELD position a hover can land on, sorted by
+/// start — a field's declaration name span, and every struct-initializer key
+/// span, each with the `(struct, field index)` pair it resolves to.
+///
+/// Both halves come from records the analyzer already keeps, which is E204's
+/// design and the reason the declaration and the use site cannot drift apart:
+/// `Field::name_span` for a declaration, `struct_initializer_field_spans` for
+/// a key. This function is only the indexing.
+///
+/// Entry file only, like `entity_spans`: every span-containment answer in this
+/// file is about this buffer's coordinate space.
+fn field_spans_of(program: &Program) -> Vec<(usize, usize, Id, usize)> {
+    let mut rows: Vec<(usize, usize, Id, usize)> = Vec::new();
+    for (struct_id, structure) in &program.structs {
+        if program.source_of(*struct_id) != Some(SourceId(0)) {
+            continue;
+        }
+        for (index, field) in structure.fields.iter().enumerate() {
+            let range = field.name_span.into_range();
+            if range.start < range.end {
+                rows.push((range.start, range.end, *struct_id, index));
+            }
+        }
+    }
+    for (source, span, struct_id, index) in &program.struct_initializer_field_spans {
+        if *source != SourceId(0) {
+            continue;
+        }
+        let range = span.into_range();
+        if range.start < range.end {
+            rows.push((range.start, range.end, *struct_id, *index));
+        }
+    }
+    // `program.structs` is a hash map, so the rows arrive in an arbitrary
+    // order and the sort is what makes the bisect possible at all. Sorted by
+    // start alone: the rows are disjoint, so no two share one.
+    rows.sort_unstable_by_key(|(start, ..)| *start);
+    rows
+}
+
 fn splice(source: &str, span: Span, replacement: &str) -> String {
     let range = span.into_range();
     let mut result =
@@ -26912,6 +26971,210 @@ mod analysis_fence_tests {
         assert!(
             next.hover(offset).is_some(),
             "the request after a contained analyzer abort is answered normally"
+        );
+    }
+}
+
+/// M85: what a field hover costs on a workspace with many structs.
+///
+/// `Document::field_at_offset` — the answer behind a hover on a field's
+/// declaration or on a struct-initializer key (E204) — walks `program.structs`
+/// and then `program.struct_initializer_field_spans`, testing every span for
+/// containment. That is a linear scan per hover, and hover fires on MOVE, so
+/// the item asked whether it wants an offset -> field index built with the
+/// program.
+///
+/// Measured before building anything, which is what the item asks for. The
+/// instrument is the thread CPU clock (M15) around a batch of hovers, the
+/// subject is two generated entry files an order of magnitude apart in field
+/// count, and the claim is a RATIO: a scan follows the field count, an index
+/// does not.
+///
+/// `#[ignore]` for its cost, like every other gate in this tree that generates
+/// a workspace, and it asserts NOTHING — it is a measurement, and the number
+/// it prints is what the item is closed on. Run it with
+/// `cargo nextest run --release -p vilan-lsp --run-ignored all -E 'test(m85)'`.
+#[cfg(test)]
+mod m85_field_hover_cost {
+    use super::*;
+    use crate::document::tests::std_root;
+    use crate::keystroke::gate::{loadavg_1m, profile, thread_cpu_now};
+
+    /// The generated WORKSPACE module: `structs` exported structs of ten
+    /// fields each, mechanical, nothing copied from any application.
+    fn field_exhibit(structs: usize) -> String {
+        let mut text = String::from(
+            "// GENERATED by M85's measurement: structs of ten fields, mechanical.\n\n\
+             export *;\n\n",
+        );
+        for index in 0..structs {
+            text.push_str(&format!("struct Shape{index:04} {{\n"));
+            for field in 0..10 {
+                text.push_str(&format!("\tfield_{field}: i32,\n"));
+            }
+            text.push_str("}\n\n");
+        }
+        text
+    }
+
+    /// The small open buffer: two structs of its own, one initializer, and one
+    /// use of the workspace module so it is loaded. Held FIXED across both
+    /// subject sizes, which is what isolates workspace size from file size.
+    const M85_ENTRY: &str = "import pkg::table::Shape0000;\n\n         struct Local {\n\tmark: i32,\n\tcount: i32,\n}\n\n         struct Other {\n\tlabel: str,\n}\n\n         fun main() {\n         \tlet _local = Local { mark = 1, count = 2 };\n         \tlet _other = Other { label = \"x\" };\n         \tlet _shape = Shape0000 { field_0 = 0, field_1 = 0, field_2 = 0, field_3 = 0,          field_4 = 0, field_5 = 0, field_6 = 0, field_7 = 0, field_8 = 0, field_9 = 0 };\n}\n";
+
+    /// `(microseconds per field LOOKUP, microseconds per whole HOVER, field
+    /// count)` over `repetitions` requests on the entry's own field.
+    ///
+    /// The shape is the item's: a SMALL open buffer inside a LARGE workspace.
+    /// `structs` structs live in an imported `pkg::table`, and the entry that
+    /// is hovered declares two of its own — because the scan this measures
+    /// walks `program.structs`, which is every struct in the loaded WORLD, and
+    /// pays `source_of` on each before discovering it is not the entry's. An
+    /// exhibit that put the structs in the entry would measure a different and
+    /// much kinder loop.
+    /// Write the exhibit to a fresh directory, land one analysis on the small
+    /// entry, remove the directory, and answer the document with the
+    /// workspace's total field count.
+    fn exhibit(structs: usize) -> (Document, usize) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("vilan_m85_{}_{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create the exhibit directory");
+        std::fs::write(directory.join("table.vl"), field_exhibit(structs))
+            .expect("write the generated module");
+        let entry = directory.join("main.vl");
+        std::fs::write(&entry, M85_ENTRY).expect("write the entry");
+        let document = Document::analyze(M85_ENTRY, &std_root(), &entry);
+        let _ = std::fs::remove_dir_all(&directory);
+        let fields = document
+            .program
+            .as_ref()
+            .expect("the exhibit analyzes")
+            .structs
+            .values()
+            .map(|structure| structure.fields.len())
+            .sum::<usize>();
+        (document, fields)
+    }
+
+    fn microseconds_per_hover(structs: usize, repetitions: usize) -> Option<(f64, f64, usize)> {
+        let (document, fields) = exhibit(structs);
+        let program = document.program.as_ref().expect("the exhibit analyzes");
+        // The declaration of the entry's own first field.
+        let needle = "struct Local {\n\tmark";
+        let offset =
+            M85_ENTRY.find(needle).expect("the entry's struct") + needle.len() - "mark".len();
+        // Warm the caches the way a session would, so the reading is the
+        // steady state and not the first touch.
+        for _ in 0..8 {
+            let _ = document.field_at_offset(program, offset);
+            let _ = document.hover(offset);
+        }
+        // The SUBJECT: the field lookup alone. Measured apart from `hover`
+        // deliberately — the first reading of this took the whole request and
+        // could not tell the lookup from everything else hover does, which is
+        // how a perf item closes on the wrong number.
+        let started = thread_cpu_now()?;
+        for _ in 0..repetitions {
+            let answer = document.field_at_offset(program, offset);
+            assert!(answer.is_some(), "the exhibit's field must be found");
+        }
+        let lookup = thread_cpu_now()? - started;
+        // The whole request beside it, for scale.
+        let started = thread_cpu_now()?;
+        for _ in 0..repetitions {
+            let answer = document.hover(offset);
+            assert!(answer.is_some(), "the exhibit's field must hover");
+        }
+        let whole = thread_cpu_now()? - started;
+        Some((
+            lookup.as_secs_f64() * 1_000_000.0 / repetitions as f64,
+            whole.as_secs_f64() * 1_000_000.0 / repetitions as f64,
+            fields,
+        ))
+    }
+
+    /// The property the index HAS and the scan does not: the field table is
+    /// the size of the BUFFER, not of the workspace.
+    ///
+    /// A count and not a clock (N116's rule, one file over): this runs in the
+    /// default suite beside eleven other binaries, and the microseconds are
+    /// measured in the `#[ignore]`d gate below where they can be read and not
+    /// failed on. What the count says is the whole claim — twenty workspace
+    /// structs and five hundred give the open buffer the same table, because
+    /// the rows are the entry's own field positions and nothing else.
+    ///
+    /// Non-vacuous: it is asserted over a table the scan does not build, and
+    /// the number is pinned exactly, so a filter that let the workspace's
+    /// 5,000 rows in reds by three orders of magnitude.
+    #[test]
+    fn m85_the_field_table_is_the_buffers_not_the_programs() {
+        let (small, _) = exhibit(20);
+        let (large, _) = exhibit(500);
+        // The entry's own positions: three field declarations (`Local`'s two,
+        // `Other`'s one) and thirteen initializer keys (2 + 1 + `Shape0000`'s
+        // ten, which are written HERE even though the struct is not).
+        assert_eq!(
+            small.field_spans.len(),
+            16,
+            "the rows are the entry's own field positions: {:?}",
+            small
+                .field_spans
+                .iter()
+                .take(20)
+                .map(|(start, end, ..)| (*start, *end))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            small.field_spans.len(),
+            large.field_spans.len(),
+            "a workspace twenty-five times the size gives the open buffer the \
+             same table"
+        );
+        // And it is sorted, which is what makes the bisect an answer.
+        assert!(
+            large
+                .field_spans
+                .windows(2)
+                .all(|pair| pair[0].0 <= pair[1].0),
+            "the rows ascend by start"
+        );
+        // The lookup still answers, at both ends of a row and not past it.
+        let program = large.program.as_ref().expect("the exhibit analyzes");
+        let needle = "struct Local {\n\tmark";
+        let start = M85_ENTRY.find(needle).expect("the entry's struct") + needle.len() - 4;
+        assert!(large.field_at_offset(program, start).is_some());
+        assert!(large.field_at_offset(program, start + 3).is_some());
+        assert!(large.field_at_offset(program, start + 4).is_none());
+    }
+
+    #[test]
+    #[ignore = "M85: a measurement, not a gate — it generates two workspaces and asserts no cost"]
+    fn m85_field_hover_cost_against_the_field_count() {
+        const REPETITIONS: usize = 50;
+        let load = loadavg_1m();
+        let Some((small, small_hover, small_fields)) = microseconds_per_hover(20, REPETITIONS)
+        else {
+            println!("M85: no thread CPU clock on this host; nothing measured");
+            return;
+        };
+        let Some((large, large_hover, large_fields)) = microseconds_per_hover(500, REPETITIONS)
+        else {
+            println!("M85: no thread CPU clock on this host; nothing measured");
+            return;
+        };
+        let ratio = large / small.max(f64::MIN_POSITIVE);
+        let hover_ratio = large_hover / small_hover.max(f64::MIN_POSITIVE);
+        let growth = large_fields as f64 / small_fields as f64;
+        println!(
+            "M85 profile={} · lookup: {small_fields} fields {small:.2} µs, \
+             {large_fields} fields {large:.2} µs, ratio {ratio:.1}× · whole hover: \
+             {small_hover:.1} µs, {large_hover:.1} µs, ratio {hover_ratio:.1}× · over \
+             {growth:.0}× the fields · load={load}",
+            profile()
         );
     }
 }
