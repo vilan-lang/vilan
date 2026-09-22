@@ -323,7 +323,7 @@ row	flagship	key
 289	flagship	{name} is compile-time-only; evaluate this call inside a `const` expression
 290	flagship	{subject} is compile-time-only; call it directly inside a `const` expression — a compile-time-only function has no runtime value form
 291	-	{headline}{subject}: {}{}
-292	-	internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)
+292	-	internal error: the compiler panicked analyzing `{}` (this is a bug; the details are on stderr)
 293	-	internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)
 294	-	the `macro_std` package was not found beside `std`
 295	-	the macro `{}` did not compile to a callable function

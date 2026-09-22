@@ -1515,6 +1515,7 @@ impl Document {
         let outer_text = text.clone();
         let std_dir = std_dir.to_path_buf();
         let entry_path = entry_path.to_path_buf();
+        let outer_entry_path = entry_path.clone();
         let cancel = cancel.clone();
         std::thread::Builder::new()
             .stack_size(128 * 1024 * 1024)
@@ -1523,9 +1524,11 @@ impl Document {
                 // the thread ends, so the token is exactly the analysis's.
                 let _scope = cancel.install();
                 let document = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    #[cfg(test)]
+                    analysis_fence_tests::maybe_inject(&entry_path);
                     Self::analyze_on_this_thread(&text, &std_dir, &entry_path)
                 }))
-                .unwrap_or_else(|_| Self::internal_error(&text));
+                .unwrap_or_else(|_| Self::internal_error(&text, &entry_path));
                 // Read AFTER the analysis, on the thread that ran it: a
                 // cancelled analysis's document is dropped here — which is what
                 // gives its entry text, tree and owned modules back
@@ -1537,7 +1540,7 @@ impl Document {
             .join()
             // Unreachable while the thread body catches unwinds (an abort
             // never returns here); kept graceful all the same.
-            .unwrap_or_else(|_| Some(Self::internal_error(&outer_text)))
+            .unwrap_or_else(|_| Some(Self::internal_error(&outer_text, &outer_entry_path)))
     }
 
     /// A document holding `text` and NOTHING an analysis produces: no program,
@@ -1600,14 +1603,22 @@ impl Document {
     /// the one honest diagnostic saying so.
     ///
     /// [`unanalyzed`]: Document::unanalyzed
-    fn internal_error(text: &str) -> Self {
+    fn internal_error(text: &str, entry_path: &Path) -> Self {
         let mut document = Self::unanalyzed(text);
         document.diagnostics = vec![Error {
             trace: Vec::new(),
             note: None,
             span: vilan_core::span::Span::new((), 0..0),
-            msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)"
-                .to_string(),
+            // N119: the file is NAMED. The diagnostic is published against
+            // this document's own uri, so the editor already shows it in the
+            // right buffer — but the same text also reaches the output
+            // channel and a `vilan-lsp` bug report, where "this file" names
+            // nothing, and a workspace-wide analysis sweep can land several
+            // of these at once.
+            msg: format!(
+                "internal error: the compiler panicked analyzing `{}` (this is a bug; the details are on stderr)",
+                entry_path.display()
+            ),
         }];
         document.diagnostic_sources = vec![SourceId(0)];
         document
@@ -21017,7 +21028,7 @@ mod entry_reclaim {
     #[test]
     fn the_internal_error_document_owns_nothing_to_reclaim() {
         leak_tally::reset();
-        let document = Document::internal_error(FIRST);
+        let document = Document::internal_error(FIRST, Path::new("reclaim.vl"));
         assert!(!document.program.is_some());
         drop(document);
         assert_eq!(leak_tally::released_total(), 0);
@@ -26778,5 +26789,92 @@ mod dead_item_paint_tests {
             "with one entry, what the other entry used to reach grays too",
         );
         let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// N119: the analysis fence, and what it can and cannot contain.
+///
+/// [`Document::analyze_cancellable`] runs the whole pipeline on a dedicated
+/// 128 MiB-stack thread under `catch_unwind`, so an analyzer PANIC degrades to
+/// the internal-error document instead of unwinding through the join and out
+/// of whichever handler asked for the analysis (B40). The thread is what buys
+/// the depth; the fence is what buys the containment.
+///
+/// What the fence does NOT contain is a stack OVERFLOW, and the reason is the
+/// runtime's, not this server's: Rust's guard-page handler prints
+/// `thread '…' has overflowed its stack` and calls `abort()`, from ANY thread,
+/// so `join()` never returns and there is no `Err` to observe. Measured on
+/// this host: a 1 MiB-stack thread recursing without bound exits the process
+/// 134 (SIGABRT), and the line after the `join` never runs. That is what took
+/// the server down in B385, and it is why the guard that ends an unbounded
+/// walk has to live in the WALK — B385's own fix — rather than at this seam.
+/// A stack-remaining probe inside the analyzer's recursive descents (turning
+/// an overflow into a panic this fence already catches) is the general answer
+/// and is not this lane's file to write.
+#[cfg(test)]
+mod analysis_fence_tests {
+    use super::*;
+    use crate::document::tests::std_root;
+
+    /// The entry path whose analysis panics, once per call. Keyed on the file
+    /// rather than armed globally: the analysis runs on a thread this test
+    /// does not own, and the suite analyzes documents concurrently, so a
+    /// global flag would fire inside a stranger's analysis.
+    const PLANTED: &str = "n119-planted-panic.vl";
+
+    /// Called on the analysis thread, inside the fence.
+    pub(crate) fn maybe_inject(entry_path: &Path) {
+        if entry_path.file_name().is_some_and(|name| name == PLANTED) {
+            unreachable!("N119: planted analyzer abort");
+        }
+    }
+
+    const GOOD: &str = "fun main() {\n\tlet value = 1;\n\tlet _ = value;\n}\n";
+
+    /// A panicking analysis lands the internal-error document — which NAMES
+    /// the file — and the next analysis runs the normal path.
+    ///
+    /// Non-vacuous against the containment, which is TWO fences and not one:
+    /// the thread body's `catch_unwind` and the `join`'s own `Err` arm each
+    /// contain the planted `unreachable!()` on their own (removing either one
+    /// alone leaves this green — which is itself worth knowing). Remove BOTH
+    /// and the panic re-raises on this test's thread: measured red, with
+    /// `PROBE: outer fence removed: Any { .. }` in place of an assertion.
+    #[test]
+    fn a_panicked_analysis_answers_a_diagnostic_naming_the_file_and_the_next_analysis_works() {
+        let planted = Document::analyze(GOOD, &std_root(), Path::new(PLANTED));
+        assert!(
+            !planted.program.is_some(),
+            "a panicked analysis lands no program"
+        );
+        let published = planted.published_diagnostics();
+        let messages: Vec<&str> = published.iter().map(|one| one.message.as_str()).collect();
+        assert_eq!(published.len(), 1, "{messages:?}");
+        let message = &published[0].message;
+        assert!(
+            message.contains("internal error") && message.contains(PLANTED),
+            "the internal-error diagnostic names the file: {message}"
+        );
+        // The document is still a document: its line index is the live text's,
+        // so position mapping and the next re-analysis behave.
+        assert_eq!(planted.line_index.text(), GOOD);
+
+        // The next request — a fresh analysis of an ordinary file — runs the
+        // normal path. The injection is one file's, and the caught panic left
+        // nothing poisoned behind it.
+        let next = Document::analyze(GOOD, &std_root(), Path::new("n119-next.vl"));
+        assert!(
+            next.program.is_some(),
+            "the next analysis produces a program"
+        );
+        let after = next.published_diagnostics();
+        let after: Vec<&str> = after.iter().map(|one| one.message.as_str()).collect();
+        assert!(after.is_empty(), "{after:?}");
+        // And hover still answers on it.
+        let offset = GOOD.find("value").expect("the binding");
+        assert!(
+            next.hover(offset).is_some(),
+            "the request after a contained analyzer abort is answered normally"
+        );
     }
 }
