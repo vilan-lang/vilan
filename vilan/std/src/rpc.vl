@@ -1403,6 +1403,43 @@ export fun decode_failed(request: RpcRequest): Option<str> {
 	(request.deserializer.failed)()
 }
 
+/// The generated route's argument gate (tracker B383, A120 S1): the envelope's
+/// own declared arity against the method's, then the argument list CLOSED, then
+/// the reader's sticky error. `None` means "the arguments decoded"; a `Some` is
+/// the sentence the route answers as `RpcError::Decode`.
+///
+/// Three things are checked here and each closes a different door.
+///
+/// **Arity first**, because it is the only one that can name what went wrong in
+/// the caller's vocabulary: `expects 2 arguments, got 3` says more than the
+/// reader's "expected a number, found an object", which is what a SHORT list
+/// produces when the read runs off the end of the arguments and into the
+/// enclosing envelope. `open_request` has held the count since the day it was
+/// written and nothing read it.
+///
+/// **Then `end_list`**, which is what makes a LONG list a decode failure rather
+/// than a tail nobody reads: the count and the list can disagree (a hand-built
+/// binary frame declares its own count), and a JSON reader left holding unread
+/// elements hands the NEXT read one of them. `open_request` deliberately leaves
+/// the list open for the route to pull from, so this is the only place it can
+/// be closed.
+///
+/// **Then the sticky error**, which is the gate that was already here and still
+/// catches everything about the argument VALUES — the wrong kind, a fraction in
+/// an integer lane, a negative in an unsigned one.
+///
+/// For a vilan↔vilan socket none of this can fire: both sides were generated
+/// from one surface and the contract hash refuses a client that disagrees. For
+/// an HTTP API the caller is arbitrary, which is the whole reason it exists
+/// (`transport-rpc.md` §9.7.8).
+export fun decode_args_failed(request: RpcRequest, declared: i32): Option<str> {
+	if request.arity != declared {
+		ret Some(i"expects {declared} argument(s), got {request.arity}");
+	}
+	(request.deserializer.end_list)();
+	(request.deserializer.failed)()
+}
+
 /// Capture a procedure's result as a success outcome — described into the
 /// reply envelope when the protocol encodes it.
 export fun reply<T: Wire>(value: T): RpcOutcome {
@@ -5469,15 +5506,23 @@ export macro fun service(item: Item): Source {
 		// inside the wire turn — a no-arg method's signal writes coalesce
 		// exactly like an arg-taking one's (a bare `.on(...)` fast path here
 		// once skipped the turn, leaking one update per write).
-		if arity == 0 {
-			statements.push(route_outcome(returns_void, replier, i"self.{method.name}()"));
+		//
+		// The gate is `decode_args_failed` and every route has one, the
+		// no-argument routes included (B383): a method that takes nothing is
+		// still a method an arbitrary caller can POST three arguments at, and
+		// before this they were read as `Success`. It carries the method's
+		// DECLARED count, which is the number the envelope's own `arity` is
+		// compared against.
+		let argument_list = join(arguments, ", ");
+		let called = if arity == 0 {
+			i"self.{method.name}()"
 		} else {
-			let argument_list = join(arguments, ", ");
-			statements.push(match_of("rpc::decode_failed(__request)")
-				.arm("Option::Some(let reason)", "RpcOutcome::Failure(RpcError::Decode(reason))")
-				.arm("Option::None", route_outcome(returns_void, replier, i"self.{method.name}({argument_list})"))
-				.render());
-		}
+			i"self.{method.name}({argument_list})"
+		};
+		statements.push(match_of(i"rpc::decode_args_failed(__request, {arity})")
+			.arm("Option::Some(let reason)", "RpcOutcome::Failure(RpcError::Decode(reason))")
+			.arm("Option::None", route_outcome(returns_void, replier, called))
+			.render());
 		routes.push(route_block(method.name, statements));
 	}
 	routes.push(".on(" + quote("__contract") + ", |_| rpc::reply(self.contract_hash()))");
@@ -5535,7 +5580,7 @@ export macro fun service(item: Item): Source {
 		.render();
 	mut attach_statements: List<str> = [];
 	attach_statements.push("let connection: i32 = rpc::arg(__request, 0);");
-	attach_statements.push(match_of("rpc::decode_failed(__request)")
+	attach_statements.push(match_of("rpc::decode_args_failed(__request, 1)")
 		.arm("Option::Some(let reason)", "RpcOutcome::Failure(RpcError::Decode(reason))")
 		.arm("Option::None", attach_reply)
 		.render());
@@ -5869,6 +5914,7 @@ export macro fun service(item: Item): Source {
 		.method(connect_with.expr(client_value))
 		.method(with_handlers)
 		.render();
+
 
 	// --- The client-service half (§9.3, R1): `<Name>Proxy`, the typed value a
 	// --- server-side factory stores in a field and calls its notifications on.

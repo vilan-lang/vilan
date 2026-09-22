@@ -271,6 +271,14 @@ enum RpcError {
 Infrastructure failures only: an *application* "not found" belongs in the
 rpc's own return type (`Option<Task>`), not here.
 
+A `Decode` on the SERVER's side of a call is what the generated route answers
+for a request it cannot read: an argument count the method does not declare
+(`expects 2 argument(s), got 3` — extra arguments are a disagreement, not
+something to drop), or an argument of the wrong type. A vilan client cannot
+provoke either, since both sides are generated from one surface and the
+contract hash refuses a client that disagrees; an arbitrary HTTP caller can,
+which is what the check is for.
+
 ## Connection state
 
 ```vilan,fragment

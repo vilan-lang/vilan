@@ -5120,7 +5120,11 @@ fn a_service_over_a_std_without_rpc_is_refused_instead_of_falling_back_to_a_stal
     write(
         &dir,
         "src/main.vl",
-        "[service(EchoClient)]\nstruct Echo {\n\tseen: i32,\n}\n\nfun main() {}\n",
+        // The `[rpc]` method is not incidental: a `[service]` with an empty
+        // contract surface is refused in its own right (B375), and the control
+        // below has to reach the generator rather than that refusal.
+        "[service(EchoClient)]\nstruct Echo {\n\tseen: i32,\n}\n\nimpl Echo {\n\t[rpc]\n\t\
+         fun seen(self): i32 {\n\t\tself.seen\n\t}\n}\n\nfun main() {}\n",
     );
     let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .args(["check", dir.to_str().unwrap()])
@@ -5692,11 +5696,13 @@ fn a_malformed_rpc_argument_answers_a_decode_failure_rather_than_success() {
         .expect("the announced port is a number");
 
     for (body, expected) in [
-        // No argument at all: the read runs past the list into the request
-        // object. This is the row that answered `{"Success":NaN}`.
+        // No argument at all. This is the row that answered
+        // `{"Success":NaN}`; since B383 it is the ARITY gate that catches it,
+        // ahead of the reader, because the arity gate can name what is wrong
+        // in the caller's own vocabulary.
         (
             "{\"method\":\"add\",\"args\":[]}",
-            "{\"Failure\":{\"Decode\":\"expected a number, found an object\"}}",
+            "{\"Failure\":{\"Decode\":\"expects 1 argument(s), got 0\"}}",
         ),
         (
             "{\"method\":\"add\",\"args\":[\"x\"]}",
@@ -5905,4 +5911,115 @@ fun main() {}
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B383 (A120 S1's remaining half): the route checks the ARGUMENT LIST.
+///
+/// `open_request` opens the envelope's `args` list, records the arity it
+/// declares, and hands the deserializer to the route to pull from. Nothing read
+/// the arity and nothing closed the list, so a call carrying MORE arguments
+/// than the method takes decoded cleanly, the extras were dropped in silence,
+/// and the handler ran. `{"method":"add","args":[1,2,3]}` answered
+/// `{"Success":…}` on a one-argument method.
+///
+/// The gate is `rpc::decode_args_failed`, which does three things in order, and
+/// every generated route carries it — the NO-ARGUMENT routes included, which
+/// had no decode gate at all. Arity first, because it is the only one that can
+/// say what is wrong in the caller's vocabulary; then `end_list`, which is what
+/// makes a long list a failure rather than a tail nobody reads; then the
+/// reader's sticky error, which still catches everything about the argument
+/// VALUES.
+///
+/// vilan-to-vilan this cannot fire — both sides are generated from one surface
+/// and the contract hash refuses a client that disagrees. For an HTTP API the
+/// caller is arbitrary, which is the whole reason it exists.
+#[test]
+fn an_rpc_call_whose_argument_count_disagrees_with_the_method_is_a_decode_failure() {
+    const ARITY_SERVER: &str = r#"import std::io::print;
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::Service;
+
+[service(Client)]
+struct Counter {
+	seed: i32,
+}
+
+impl Counter {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.seed + by
+	}
+
+	[rpc]
+	fun ping(self): i32 {
+		self.seed
+	}
+}
+
+fun main() {
+	let counter = Counter { seed = 1 };
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(counter.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| print(i"ready {server.port()}"))
+		.build()
+		.start();
+}
+"#;
+    let (_server, port) = spawn_service_server("rpc_arity", ARITY_SERVER);
+
+    for (body, expected) in [
+        // TOO MANY: the row B383 is about. The extras were dropped silently.
+        (
+            "{\"method\":\"add\",\"args\":[2,3,4]}",
+            "{\"Failure\":{\"Decode\":\"expects 1 argument(s), got 3\"}}",
+        ),
+        // One too many is the same answer — nothing here is about magnitude.
+        (
+            "{\"method\":\"add\",\"args\":[2,3]}",
+            "{\"Failure\":{\"Decode\":\"expects 1 argument(s), got 2\"}}",
+        ),
+        // TOO FEW: caught before this by the reader running off the list into
+        // the enclosing object, with a sentence about kinds. The arity gate is
+        // ahead of it now, so the sentence is about the count.
+        (
+            "{\"method\":\"add\",\"args\":[]}",
+            "{\"Failure\":{\"Decode\":\"expects 1 argument(s), got 0\"}}",
+        ),
+        // A NO-ARGUMENT method is still a method an arbitrary caller can post
+        // arguments at, and its route had no decode gate whatsoever.
+        (
+            "{\"method\":\"ping\",\"args\":[9]}",
+            "{\"Failure\":{\"Decode\":\"expects 0 argument(s), got 1\"}}",
+        ),
+        // The VALUE gate is untouched: a right-sized list with a wrong-typed
+        // element still answers the reader's own sentence.
+        (
+            "{\"method\":\"add\",\"args\":[\"x\"]}",
+            "{\"Failure\":{\"Decode\":\"expected a number, found a string\"}}",
+        ),
+        // The controls, last: both methods still answer.
+        ("{\"method\":\"add\",\"args\":[2]}", "{\"Success\":3}"),
+        ("{\"method\":\"ping\",\"args\":[]}", "{\"Success\":1}"),
+    ] {
+        let response = raw_http_closed(
+            port,
+            &format!(
+                "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "`{body}` should still be answered with 200 (a decode failure is an \
+             envelope, not a status): {response}"
+        );
+        assert!(
+            response.ends_with(expected),
+            "`{body}` should answer `{expected}`: {response}"
+        );
+    }
 }
