@@ -161,6 +161,15 @@ fn provides_trait(program: &Program, type_id: TypeId, trait_id: Id) -> bool {
     if !is_resolvable(type_) {
         return true;
     }
+    // A124 R3: a trait OBJECT provides the trait it was erased to and that
+    // trait's supertraits — its table is the implementation, and no impl
+    // subject names it. That is what lets a blanket `impl type S: Src with
+    // Loud` apply to a `dyn Src`, with `S` bound to the object.
+    if let Type::Dyn(object_trait_id, _) = type_
+        && object_provides(program, *object_trait_id, trait_id)
+    {
+        return true;
+    }
     // A question already being asked further up this proof is NOT evidence
     // for itself. `trait Feed<T> with Source<List<T>>` beside
     // `impl type S: Source<List<type T>> with Feed<T>` makes the blanket a
@@ -211,6 +220,32 @@ impl Drop for ProvingGuard {
             proving.borrow_mut().pop();
         });
     }
+}
+
+/// Whether an object over `object_trait_id` provides `trait_id`: the trait
+/// itself, or one of its supertraits.
+fn object_provides(program: &Program, object_trait_id: Id, trait_id: Id) -> bool {
+    let mut stack = vec![object_trait_id];
+    let mut seen: Vec<Id> = Vec::new();
+    while let Some(id) = stack.pop() {
+        if id == trait_id {
+            return true;
+        }
+        if seen.contains(&id) {
+            continue;
+        }
+        seen.push(id);
+        if let Some(trait_) = program.traits.get(&id) {
+            for supertrait_type_id in &trait_.supertraits {
+                if let Some(Type::Trait(super_id, _)) =
+                    program.type_id_to_type_map.get(supertrait_type_id)
+                {
+                    stack.push(*super_id);
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Whether `subject` — an impl subject, in the impl's own generic terms —

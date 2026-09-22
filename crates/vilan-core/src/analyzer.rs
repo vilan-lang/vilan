@@ -6318,6 +6318,34 @@ impl<'src> Analyzer<'src> {
                         .contains(&required_trait_id)
                 });
         }
+        // A124 R3: a trait OBJECT satisfies the trait it was erased to and that
+        // trait's supertraits — at the arguments the object carries, threaded
+        // through the chain — with no impl to find; that is what its table is.
+        // Any OTHER bound it can meet only through a blanket (the scan below,
+        // narrowed to blankets). Without this the scan reconciled the object
+        // against every concrete impl subject, and `fun greet<T: Named>` took a
+        // `dyn Src` whose erased value happened to implement `Named`, then
+        // called a `name` slot its table never had.
+        if let Type::Dyn(object_trait_id, object_arguments) = value_type {
+            let (object_trait_id, object_arguments) = (*object_trait_id, object_arguments.clone());
+            if let Some((_, reached_arguments)) = self
+                .trait_with_supertraits_at(object_trait_id, &object_arguments)
+                .into_iter()
+                .find(|(reached, _)| *reached == required_trait_id)
+            {
+                return required_arguments.is_empty()
+                    || reached_arguments.len() != required_arguments.len()
+                    || required_arguments.iter().zip(reached_arguments.iter()).all(
+                        |(required, reached)| {
+                            self.compare_type(
+                                &required.get_type(self),
+                                &reached.get_type(self),
+                                &HashMap::default(),
+                            )
+                        },
+                    );
+            }
+        }
         // Each candidate keeps the arguments it provides for the required
         // trait — written on the clause when it names the trait DIRECTLY
         // (`with Feed<i32>`), and THREADED THROUGH THE SUPERTRAIT CHAIN when it
@@ -6368,6 +6396,9 @@ impl<'src> Analyzer<'src> {
             .collect();
         'candidates: for (subject_id, provided_arguments) in candidates {
             let subject_type = subject_id.get_type(self);
+            if matches!(value_type, Type::Dyn(..)) && !matches!(subject_type, Type::Generic(_)) {
+                continue;
+            }
             // Reconcile subject-first so the bindings key on the impl's
             // binders (`impl Box2<type X>` against `Box2<Cat>` binds X = Cat).
             let Some((_unified, bindings)) =
@@ -7663,14 +7694,51 @@ impl<'src> Analyzer<'src> {
     /// `impl Subject with Trait`. Lets a concrete value satisfy a trait-typed
     /// parameter (e.g. a `Self`-defaulted generic that resolved to the trait).
     fn type_implements_trait(&self, subject_type: &Type, trait_id: Id) -> bool {
+        // A124 R3: an object implements the trait it was erased to, and that
+        // trait's supertraits, with no impl to find — that is what its table
+        // is. Anything else it implements comes from a blanket, which the scan
+        // below admits (and only a blanket: see `impl_subject_admits`).
+        if let Type::Dyn(object_trait_id, _) = subject_type
+            && self
+                .trait_with_supertraits(*object_trait_id)
+                .contains(&trait_id)
+        {
+            return true;
+        }
         self.implementations.iter().any(|implementation| {
             implementation.trait_ids.contains(&trait_id)
-                && self.compare_type(
+                && self.impl_subject_admits(
                     subject_type,
                     implementation.subject.borrow_type(self),
                     &HashMap::default(),
                 )
         })
+    }
+
+    /// Whether an impl whose subject is `impl_subject` applies to a value of
+    /// `subject_type` — `compare_type`, with the one rule a trait OBJECT adds.
+    ///
+    /// `compare_type` admits `dyn Trait` against every concrete type that
+    /// implements `Trait`, because that is the coercion (a `Root` lands in a
+    /// `dyn Src` position). Asked of an IMPL SUBJECT it is the wrong question:
+    /// `impl Root { .. }`, or `impl Root with Named`, is an impl of the value
+    /// the object ERASED, and answering yes let an inherent member, another
+    /// trait's member, or another trait's bound reach the object — emitted
+    /// with the pair as its receiver, a `TypeError` at run time. An object is
+    /// reached by a BLANKET (`impl type S: Trait`, `S` bound to the object) and
+    /// by nothing concrete (A124 R3's `impl dyn Trait with Trait`).
+    fn impl_subject_admits(
+        &self,
+        subject_type: &Type,
+        impl_subject: &Type,
+        substitution_context: &SubstitutionContext,
+    ) -> bool {
+        if matches!(subject_type, Type::Dyn(..))
+            && !matches!(impl_subject, Type::Generic(_) | Type::Dyn(..))
+        {
+            return false;
+        }
+        self.compare_type(subject_type, impl_subject, substitution_context)
     }
 
     /// Whether the CALL OPERATOR reaches a value of this type (B340): its type
@@ -7693,7 +7761,7 @@ impl<'src> Analyzer<'src> {
             implementation
                 .declarations
                 .contains_key(CALL_OPERATOR_MEMBER)
-                && self.compare_type(
+                && self.impl_subject_admits(
                     subject_type,
                     implementation.subject.borrow_type(self),
                     &HashMap::default(),
@@ -17888,7 +17956,7 @@ impl<'src> Analyzer<'src> {
             .iter()
             .map(|index| &self.implementations[*index])
             .filter(|implementation| {
-                self.compare_type(
+                self.impl_subject_admits(
                     subject_type,
                     implementation.subject.borrow_type(self),
                     &HashMap::default(),
@@ -17987,7 +18055,7 @@ impl<'src> Analyzer<'src> {
             .iter()
             .filter(|implementation| !implementation.declarations.contains_key(member_name))
             .filter(|implementation| {
-                self.compare_type(
+                self.impl_subject_admits(
                     subject_type,
                     implementation.subject.borrow_type(self),
                     &HashMap::default(),
@@ -18102,7 +18170,7 @@ impl<'src> Analyzer<'src> {
             .iter()
             .filter(|implementation| implementation.trait_ids.contains(&trait_id))
             .filter(|implementation| {
-                self.compare_type(
+                self.impl_subject_admits(
                     subject_type,
                     implementation.subject.borrow_type(self),
                     &HashMap::default(),
@@ -18183,7 +18251,7 @@ impl<'src> Analyzer<'src> {
             .iter()
             .filter(|implementation| implementation.trait_ids.contains(&trait_id))
             .filter(|implementation| {
-                self.compare_type(
+                self.impl_subject_admits(
                     concrete,
                     implementation.subject.borrow_type(self),
                     &HashMap::default(),
@@ -18975,7 +19043,7 @@ impl<'src> Analyzer<'src> {
             .implementations
             .iter()
             .filter(|implementation| {
-                self.compare_type(
+                self.impl_subject_admits(
                     subject_type,
                     implementation.subject.borrow_type(self),
                     &HashMap::default(),
@@ -19050,7 +19118,7 @@ impl<'src> Analyzer<'src> {
         self.implementations
             .iter()
             .filter(|implementation| {
-                self.compare_type(
+                self.impl_subject_admits(
                     subject_type,
                     implementation.subject.borrow_type(self),
                     &HashMap::default(),
@@ -19894,7 +19962,7 @@ impl<'src> Analyzer<'src> {
         self.implementations
             .iter()
             .filter(|implementation| {
-                self.compare_type(
+                self.impl_subject_admits(
                     subject_type,
                     implementation.subject.borrow_type(self),
                     &HashMap::default(),
@@ -20325,7 +20393,7 @@ impl<'src> Analyzer<'src> {
             .implementations
             .iter()
             .filter(|implementation| {
-                self.compare_type(
+                self.impl_subject_admits(
                     subject_type,
                     implementation.subject.borrow_type(self),
                     &HashMap::default(),
@@ -20363,7 +20431,7 @@ impl<'src> Analyzer<'src> {
             .implementations
             .iter()
             .filter(|implementation| {
-                self.compare_type(
+                self.impl_subject_admits(
                     subject_type,
                     implementation.subject.borrow_type(self),
                     &HashMap::default(),
@@ -20690,7 +20758,7 @@ impl<'src> Analyzer<'src> {
     ) -> Vec<(Id, TypeId, Id, Vec<TypeId>)> {
         let mut candidates: Vec<(Id, TypeId, Id, Vec<TypeId>)> = Vec::new();
         for implementation in self.implementations.iter().filter(|implementation| {
-            self.compare_type(
+            self.impl_subject_admits(
                 subject_type,
                 implementation.subject.borrow_type(self),
                 &HashMap::default(),
@@ -21205,6 +21273,14 @@ impl<'src> Analyzer<'src> {
             // A fixed-length array is a value like a `List`/tuple — copied, so
             // `mut b = a` deep-clones it (`__clone` recurses the JS array).
             Type::Array(_, _) => true,
+            // A124 R3: a trait OBJECT is a value, and the value it erased is
+            // still an aggregate — `[value, table]` aliases under assignment
+            // exactly as the struct inside it would. Without this a `&mut self`
+            // member called through one binding wrote through every copy of
+            // it: `let b = a; a.bump()` moved `b` too, where the same program
+            // over the concrete type leaves `b` alone. `__clone` of the pair
+            // copies the value and keeps the table, which is what a copy is.
+            Type::Dyn(_, _) => true,
             _ => false,
         }
     }
@@ -28795,8 +28871,8 @@ impl<'src> Analyzer<'src> {
                 return Some(ObjectSafetyViolation {
                     message: format!(
                         "`{root_name}` cannot be a `dyn` object: {reason}.{through} An object \
-                         dispatches through a table of its trait's members, so every member \
-                         must take a receiver, name no `Self` in its signature, and be \
+                         dispatches through a table of its trait's members, so every member it \
+                         requires must take a receiver, name no `Self` in its signature, and be \
                          non-generic. Use a generic parameter (`<T: {root_name}>`) for a value \
                          whose type is known where it is written"
                     ),
@@ -37235,7 +37311,7 @@ impl<'src> Analyzer<'src> {
         }
         let member_id = self.implementations.iter().find_map(|implementation| {
             let member_id = implementation.declarations.get(CALL_OPERATOR_MEMBER)?;
-            self.compare_type(
+            self.impl_subject_admits(
                 subject_type,
                 implementation.subject.borrow_type(self),
                 &HashMap::default(),
@@ -40420,7 +40496,7 @@ impl<'src> Analyzer<'src> {
             .implementations
             .iter()
             .filter(|implementation| {
-                self.compare_type(
+                self.impl_subject_admits(
                     &receiver_type,
                     implementation.subject.borrow_type(self),
                     &HashMap::default(),
@@ -41419,6 +41495,22 @@ impl<'src> Analyzer<'src> {
         // another verdict (the inherited-default tier, the bound list): the
         // competing traits, which override whatever the arm returns.
         let mut return_ambiguous: Option<Vec<Id>> = None;
+        // A124 R3, the blanket (`impl dyn Trait with Trait`): a member the
+        // object's TRAIT declares is the object's own surface and takes the
+        // `Type::Dyn` arm below — a slot, or a per-call refusal. Every OTHER
+        // name falls to the impl lookup the nominal receivers take, where the
+        // object satisfies its trait's bound, so `impl type S: Trait { .. }`
+        // applies to it with `S` bound to the object. Nothing concrete can
+        // answer there: the concrete type is gone, so an inherent impl of the
+        // value the object erased is not consulted (§7.2's P15).
+        let object_declares_member = match &subject_type {
+            Type::Dyn(trait_id, trait_arguments) => {
+                let (trait_id, trait_arguments) = (*trait_id, trait_arguments.clone());
+                self.method_member_in_trait_at(trait_id, &trait_arguments, member_name)
+                    .is_some()
+            }
+            _ => false,
+        };
         let lookup = match &subject_type {
             // B220: an ARRAY receiver belongs here too, for B210's reason and
             // by B210's precedent. `len` is handled above and is the array's
@@ -41455,7 +41547,13 @@ impl<'src> Analyzer<'src> {
             // `impl (type T, T)` at `(i32, i32)`, and `list_element_slot`
             // answers `None` for a tuple, so the `push`/`run` slot branch is
             // inert here.
-            Type::Struct(_, _) | Type::Enum(_, _) | Type::Tuple(_) | Type::Array(_, _) => {
+            Type::Struct(_, _)
+            | Type::Enum(_, _)
+            | Type::Tuple(_)
+            | Type::Array(_, _)
+            | Type::Dyn(_, _)
+                if !object_declares_member =>
+            {
                 let mut resolution = self.resolve_impl_member(&subject_type, member_name);
                 // R2: before reporting two argument-distinct homes, let the type
                 // the call site expects choose between them.

@@ -278,9 +278,9 @@ Holder<Dog>` and `impl DogBox with Holder<Cat>` would both be fine.
 Traits are like interfaces, with two differences. They're implemented
 explicitly (`impl Robot with Greet`), never structurally. And they
 appear as *bounds* on generics (`T: Greet`) rather than as standalone
-types: `fun f(v: Greet)`, `fun make(): Greet` and `struct H { item:
-Greet }` are all compile errors. When you want "one of several things at
-runtime", use an enum.
+types: `fun make(): Greet` and `struct H { item: Greet }` are compile
+errors. When you want "one of several things at runtime", use an enum for
+a closed set and `dyn Greet` (below) for an open one.
 
 ## A trait on a binding is a constraint
 
@@ -404,6 +404,12 @@ that disqualified it named — and the fix is usually the generic
 
 A `resource` cannot become an object: its teardown would have to be
 dispatched, and vilan keeps teardown static.
+
+An object satisfies its own trait as a bound, so everything written over
+that bound applies to it: a generic `fun largest<S: Shape>(..)` takes a
+`List<dyn Shape>`, and a blanket `impl type S: Shape { .. }` adds its
+methods to the object as it does to every shape. What the erased value
+implements *besides* the trait is gone with its type.
 
 ## Associated functions
 

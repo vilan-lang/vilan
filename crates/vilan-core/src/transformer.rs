@@ -508,7 +508,7 @@ fn rewrite_sibling_node(
     match node {
         // A vtable's VALUES are references to emitted functions; its keys are
         // member names and never identifiers this walk may touch.
-        js::Node::Object(entries) => {
+        js::Node::Vtable(entries) => {
             for (_, value) in entries {
                 rewrite_sibling_node(value, siblings, bound, count);
             }
@@ -970,7 +970,7 @@ pub(crate) fn collect_references(nodes: &[js::Node], out: &mut BTreeSet<String>)
 
 fn collect_reference(node: &js::Node, out: &mut BTreeSet<String>) {
     match node {
-        js::Node::Object(entries) => {
+        js::Node::Vtable(entries) => {
             for (_, value) in entries {
                 collect_reference(value, out);
             }
@@ -2327,8 +2327,12 @@ enum Dispatch<'src> {
     /// the pair's own table at runtime. The blanket, as a dispatch rule: a
     /// generic body written over `S: Trait` reaches this arm whenever `S` bound
     /// to a `dyn Trait`, so nothing has to be written as an
-    /// `impl dyn Trait with Trait`.
-    Object(String),
+    /// `impl dyn Trait with Trait`. The flag is whether the trait DECLARES the
+    /// member async: a call through a table is emitted once for every value
+    /// the object may hold, so the declaration decides the await
+    /// (trait-objects.md §5 (i); the analyzer refuses a coercion whose
+    /// implementation is async under a sync declaration).
+    Object(String, bool),
 }
 
 /// One lowered `match` leg, kept in pieces until the whole match is compiled:
@@ -4998,7 +5002,19 @@ impl<'src> Transformer<'src> {
                 // table, once for the value), so a receiver that is not a
                 // pure read is bound first; see `emit_object_call`.
                 if let Some(member_name) = self.program.dyn_method_calls.get(id).copied() {
-                    return Some(self.emit_object_call(member_name, args));
+                    let call = self.emit_object_call(member_name, args);
+                    // The DECLARATION's asyncness is the call's (§5 (i)): the
+                    // call is emitted once for every value the object holds.
+                    let declared_async = matches!(
+                        self.program.entity_map.get(&function_call.subject_id),
+                        Some(Expr::Local(member_id))
+                            if self.program.async_functions.contains(member_id)
+                    );
+                    return Some(if declared_async {
+                        js::Node::Await(Box::new(call))
+                    } else {
+                        call
+                    });
                 }
 
                 // `a.member()` where `a`'s type is a trait-bounded generic `T`:
@@ -7561,7 +7577,7 @@ impl<'src> Transformer<'src> {
             | js::Node::Property(_, _)
             | js::Node::PropertyIndex(_, _)
             | js::Node::Array(_)
-            | js::Node::Object(_)
+            | js::Node::Vtable(_)
             | js::Node::Closure(_)
             | js::Node::Sequence(_)
             | js::Node::Local(_)
@@ -8915,8 +8931,16 @@ impl<'src> Transformer<'src> {
         // OBJECT. There is no impl to select — the concrete type is gone — so
         // the member comes out of the value's own table, which is the same
         // lowering a written `o.member()` on a `dyn` takes.
-        if let Some(Type::Dyn(..)) = self.program.type_id_to_type_map.get(&type_id) {
-            return Some(Dispatch::Object(member.to_string()));
+        //
+        // Only for a member the object's trait DECLARES (its own or a
+        // supertrait's) — those are the table's. A member some BLANKET
+        // provides (`impl type S: Src with Loud`) is not in the table, and
+        // falls through to the ordinary selection with the object as the
+        // concrete type, where the blanket is what applies.
+        if let Some(Type::Dyn(trait_id, _)) = self.program.type_id_to_type_map.get(&type_id)
+            && let Some(declared_async) = self.object_member_declared_async(*trait_id, member)
+        {
+            return Some(Dispatch::Object(member.to_string(), declared_async));
         }
         if let Some((trait_id, trait_arguments)) = preferred_trait {
             // Resolve strictly within the trait AND its instantiation (B73 R1).
@@ -9133,7 +9157,14 @@ impl<'src> Transformer<'src> {
                     call
                 }
             }
-            Dispatch::Object(member_name) => self.emit_object_call(&member_name, args),
+            Dispatch::Object(member_name, declared_async) => {
+                let call = self.emit_object_call(&member_name, args);
+                if declared_async {
+                    js::Node::Await(Box::new(call))
+                } else {
+                    call
+                }
+            }
         }
     }
 
@@ -9213,7 +9244,7 @@ impl<'src> Transformer<'src> {
         self.monomorphized
             .push(js::Node::ConstVariable(js::Variable {
                 name: name.clone(),
-                value: Box::new(js::Node::Object(entries)),
+                value: Box::new(js::Node::Vtable(entries)),
             }));
         name
     }
@@ -9285,6 +9316,33 @@ impl<'src> Transformer<'src> {
             }
         }
         out
+    }
+
+    /// Whether `trait_id` (or the supertrait that declares it) declares
+    /// `member` async — the await a call through the object's table takes —
+    /// or `None` when no trait in the chain declares it at all.
+    fn object_member_declared_async(&self, trait_id: Id, member: &str) -> Option<bool> {
+        let mut stack = vec![trait_id];
+        let mut seen: HashSet<Id> = HashSet::default();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(trait_) = self.program.traits.get(&id) else {
+                continue;
+            };
+            if let Some(member_id) = trait_.declarations.get(member) {
+                return Some(self.program.async_functions.contains(member_id));
+            }
+            for supertrait_type_id in &trait_.supertraits {
+                if let Some(Type::Trait(super_id, _)) =
+                    self.program.type_id_to_type_map.get(supertrait_type_id)
+                {
+                    stack.push(*super_id);
+                }
+            }
+        }
+        None
     }
 
     /// A trait member's parameter count INCLUDING the receiver — the arity a
@@ -11001,7 +11059,7 @@ impl Formatter {
                     self.array_surround, s_items, self.array_surround, terminator
                 )
             }
-            js::Node::Object(entries) => {
+            js::Node::Vtable(entries) => {
                 let s_entries = entries
                     .iter()
                     .map(|(name, value)| {
@@ -11009,7 +11067,7 @@ impl Formatter {
                     })
                     .collect::<Vec<_>>()
                     .join(format!(",{}", self.space).as_str());
-                format!("{{{}}}{}", s_entries, terminator)
+                format!("Object.create({{{}}}){}", s_entries, terminator)
             }
             // `(a, b, c)` (B224). Always parenthesized: the comma binds looser
             // than every operator, so an unwrapped sequence would be re-parsed
@@ -11854,14 +11912,24 @@ pub mod js {
         LetVariable(Variable<'src>),
         Local(String),
         Null,
-        // `{ name: <value>, … }` — an object literal. The ONE producer is
-        // A124 R3's vtable (`emit_vtable`): a trait object's table maps a
+        // `Object.create({ name: <value>, … })` — A124 R3's vtable
+        // (`emit_vtable`), the one producer: a trait object's table maps a
         // member's name to the emitted function for that `(type, trait)` pair,
         // and the name is what makes the emitted bundle readable —
         // `x[1].get(x[0])` says which member is being dispatched, where a
         // positional `x[1][0](x[0])` would not. Keys are emitted verbatim and
         // are always vilan identifiers, so no quoting rule is needed.
-        Object(Vec<(String, Self)>),
+        //
+        // The slots sit on the table's PROTOTYPE, not on the table, and that is
+        // measured rather than stylistic: every table written as a bare literal
+        // shares one hidden class, so `x[1].get` at a call site that sees two
+        // concrete types loads a field whose value varies and calls through it
+        // blind — 5.3-7.0x a direct call in node 24 at two and three types. A
+        // table whose slots live on its own prototype has a class of its own,
+        // the load caches per class with a constant target, and the same site
+        // costs 2.0-2.9x (1.4-1.9x monomorphic, where the literal is 1.6-1.8x).
+        // The interpreter reads it as the plain object it is.
+        Vtable(Vec<(String, Self)>),
         Number(String, Option<String>),
         // Object(Vec<(&'src str, Self)>),
         Property(Box<Self>, String),
@@ -12475,7 +12543,7 @@ fn collect_node(
     children: &mut Vec<JsScope>,
 ) {
     match node {
-        js::Node::Object(entries) => {
+        js::Node::Vtable(entries) => {
             for (_, value) in entries {
                 collect_node(value, renameable, declarations, children);
             }
@@ -12654,7 +12722,7 @@ fn rename_one(name: &mut String, rename: &HashMap<String, String>) {
 
 fn rename_node(node: &mut js::Node, rename: &HashMap<String, String>) {
     match node {
-        js::Node::Object(entries) => {
+        js::Node::Vtable(entries) => {
             for (_, value) in entries {
                 rename_node(value, rename);
             }

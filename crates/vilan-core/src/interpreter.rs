@@ -1334,7 +1334,7 @@ impl<'a> Interpreter<'a> {
             // A124 R3's vtable, the one producer of an object literal: keys in
             // written order, values evaluated left to right, exactly as the
             // emitted JS evaluates them.
-            js::Node::Object(entries) => {
+            js::Node::Vtable(entries) => {
                 let mut object: IndexMap<Rc<str>, Value<'a>> = IndexMap::default();
                 for (name, value) in entries {
                     let value = self.eval(value, env)?;

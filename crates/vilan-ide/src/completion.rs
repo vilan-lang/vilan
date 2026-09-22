@@ -322,7 +322,7 @@ pub const KEYWORD_DOCS: &[(&str, &str, &str)] = &[
     ),
     (
         "dyn",
-        "`dyn Trait` is a trait OBJECT: a value whose concrete type is erased, carrying its trait's members in a table. Written explicitly, and only over a trait every one of whose members takes a receiver, names no `Self`, and is non-generic.",
+        "`dyn Trait` is a trait OBJECT: a value whose concrete type is erased, carrying its trait's members in a table. Written explicitly, and only over a trait every one of whose REQUIRED members takes a receiver, names no `Self`, and is non-generic.",
         "tour/data-and-traits.html#trait-objects--dyn-trait",
     ),
     (

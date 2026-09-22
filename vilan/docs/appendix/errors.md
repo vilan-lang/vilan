@@ -205,10 +205,11 @@ module. For a CLOSED set of alternatives, an enum is still better than an
 object: it is exhaustive, checked, and costs nothing at runtime.
 → [Data and traits](../tour/data-and-traits.md)
 
-**"'…' cannot be a `dyn` object: '…' is a static — it takes no `self`"**
-Also **"… is generic — one vtable slot cannot hold an unbounded family of
-specializations"** and **"… returns `Self` — the caller would have to know
-the type the object erased"**. An object dispatches through a table of its
+**"`…` cannot be a `dyn` object: … An object dispatches through a table of its trait's members, so every member it requires must take a receiver, name no `Self` in its signature, and be non-generic"**
+The first sentence names the member and why: **"`…` is a static — it takes
+no `self`"**, **"… is generic — one vtable slot cannot hold an unbounded
+family of specializations"**, or **"… returns `Self` — the caller would have
+to know the type the object erased"**. An object dispatches through a table of its
 trait's members, so each member the trait *requires* has to fit a slot: it
 takes a receiver, it names no `Self`, and it is not generic. The message
 names the **member** that disqualified the trait and the note points at

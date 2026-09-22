@@ -414,3 +414,290 @@ fun main() {
         "made\n3\n",
     );
 }
+
+/// The brief's own pin, over std's `Source<i32>` with all THREE kinds of node
+/// in one `List<Holder>`: the root cell, a COLD node written in the program
+/// (a struct over its upstream that owns no value and pulls through `get`),
+/// and an eager mapped cell. The second slot, `on_change`, is exercised
+/// through the object as well as the first: the cold node's subscription is
+/// taken through its `dyn` and reports the settled value.
+#[test]
+fn a_dyn_source_field_holds_a_root_a_cold_node_and_a_cell() {
+    assert_compiles_and_runs(
+        "import std::reactive::{ Source, SignalCell, Subscription };
+struct Plus { up: dyn Source<i32>, k: i32 }
+impl Plus with Source<i32> {
+\tfun get(self): i32 { self.up.get() + self.k }
+\tfun on_change(self, observer: |i32| void): Subscription {
+\t\tlet k = self.k;
+\t\tself.up.on_change(|n| observer(n + k))
+\t}
+}
+struct Holder { s: dyn Source<i32> }
+fun main() {
+\tlet root = SignalCell::new(1);
+\tlet cold = Plus { up = root, k = 100 };
+\tlet mapped = root.map(|n| n * 10);
+\tlet hs: List<Holder> = [ Holder { s = root }, Holder { s = cold }, Holder { s = mapped } ];
+\tfor h in hs { print(h.s.get()); }
+\tlet watch = hs[1].s.on_change(|n| print(i\"cold saw {n}\"));
+\troot.set(5);
+\tfor h in hs { print(h.s.get()); }
+\twatch.dispose();
+}
+",
+        "1\n101\n10\ncold saw 105\n5\n105\n50\n",
+    );
+}
+
+/// An object is a VALUE: copying one copies what it erased. `let b = a` and
+/// a list element read into a `mut` binding are rule 1's copies exactly as
+/// they are for the concrete type — without them a `&mut self` member called
+/// through one binding wrote through every copy (`2 2` / `6 6`), where the
+/// same program over the concrete struct prints `2 1` / `6 5`.
+#[test]
+fn a_copied_object_does_not_alias_its_original() {
+    assert_compiles_and_runs(
+        "trait Counter { fun get(self): i32; fun bump(&mut self): void; }
+struct C { n: i32 }
+impl C with Counter {
+\tfun get(self): i32 { self.n }
+\tfun bump(&mut self): void { self.n = self.n + 1; }
+}
+fun main() {
+\tmut a: dyn Counter = C { n = 1 };
+\tlet b = a;
+\ta.bump();
+\tprint(i\"{a.get()} {b.get()}\");
+\tlet list: List<dyn Counter> = [C { n = 5 }];
+\tmut c = list[0];
+\tc.bump();
+\tprint(i\"{c.get()} {list[0].get()}\");
+}
+",
+        "2 1\n6 5\n",
+    );
+}
+
+/// trait-objects.md §5 (i): the declaration binds in object position. B29
+/// lets an impl be async under a sync declaration because every generic
+/// dispatch is monomorphized; a call through an object is emitted once,
+/// against the declaration, so it would not await and printed
+/// `Promise { <pending> }`. Refused at the coercion, naming the member.
+#[test]
+fn an_async_implementation_under_a_sync_declaration_cannot_be_erased() {
+    assert_fails_with(
+        "trait Fetch { fun get(self): str; }
+struct Remote { u: str }
+impl Remote with Fetch { async fun get(self): str { \"remote\" } }
+fun show(f: dyn Fetch) { print(f.get()); }
+fun main() { show(Remote { u = \"a\" }); }
+",
+        "`Remote`'s `get` is async, but `Fetch::get` is declared sync",
+    );
+}
+
+/// The other disagreement is sound: an ASYNC declaration's call through an
+/// object awaits — both through the object directly and through a generic
+/// body and a blanket impl whose parameter bound to it — and a sync
+/// implementation behind it is a plain value, which awaiting leaves alone.
+#[test]
+fn an_async_declaration_awaits_through_the_object() {
+    assert_compiles_and_runs(
+        "trait Fetch { async fun get(self): str; }
+struct Remote { u: str }
+impl Remote with Fetch { async fun get(self): str { \"remote\" } }
+struct Local { u: str }
+impl Local with Fetch { fun get(self): str { \"local\" } }
+fun twice<F: Fetch>(f: F): str { f.get() + f.get() }
+impl type S: Fetch { fun loud(self): str { self.get() + \"!\" } }
+fun show(f: dyn Fetch) { print(f.get()); }
+fun main() {
+\tshow(Remote { u = \"a\" });
+\tshow(Local { u = \"b\" });
+\tlet a: dyn Fetch = Remote { u = \"a\" };
+\tlet b: dyn Fetch = Local { u = \"b\" };
+\tprint(twice(a));
+\tprint(twice(b));
+\tprint(a.loud());
+\tprint(b.loud());
+}
+",
+        "remote\nlocal\nremoteremote\nlocallocal\nremote!\nlocal!\n",
+    );
+}
+
+/// §5 of the brief, for a blanket IMPL — `impl type S: Src { .. }` — rather
+/// than a generic function: the object satisfies the bound, `S` binds to it,
+/// and the body's `self.get()` goes through the table. Two concrete types
+/// implement the trait, which is the case the bound's impl ranking used to
+/// refuse as ambiguous: an object's bound is met by its table, not by
+/// choosing between the impls of the types it may hold.
+#[test]
+fn a_blanket_impl_applies_to_the_object() {
+    assert_compiles_and_runs(
+        "trait Src { fun get(self): i32; }
+struct Root { v: i32 }
+impl Root with Src { fun get(self): i32 { self.v } }
+struct Dbl { v: i32 }
+impl Dbl with Src { fun get(self): i32 { self.v * 2 } }
+impl type S: Src { fun plus_one(self): i32 { self.get() + 1 } }
+fun twice<S: Src>(s: S): i32 { s.get() * 2 }
+fun main() {
+\tlet all: List<dyn Src> = [Root { v = 4 }, Dbl { v = 4 }];
+\tfor s in all { print(i\"{s.plus_one()} {twice(s)}\"); }
+}
+",
+        "5 8\n9 16\n",
+    );
+}
+
+/// std's own blankets over `S: Source<..>` reach an object: `flatten` over a
+/// cell holding a `dyn Source<i32>` follows the inner source through the table.
+#[test]
+fn a_std_blanket_flattens_through_the_object() {
+    assert_compiles_and_runs(
+        "import std::reactive::{ Source, SignalCell };
+fun main() {
+\tlet cell = SignalCell::new(1);
+\tlet inner: dyn Source<i32> = cell;
+\tlet outer = SignalCell::new(inner);
+\tlet flat = outer.flatten();
+\tprint(flat.get());
+\tcell.set(3);
+\tprint(flat.get());
+}
+",
+        "1\n3\n",
+    );
+}
+
+/// What the ERASED value implements besides the object's trait is gone with
+/// its type: another trait's member, and another trait's default, are not on
+/// the object. Both used to resolve — the default through the ordinary
+/// inherited-default tier — and were emitted as table calls the table had no
+/// slot for (`r[1].hello is not a function`).
+#[test]
+fn another_trait_of_the_erased_value_is_not_on_the_object() {
+    let source = |call: &str| {
+        format!(
+            "trait Src {{ fun get(self): i32; }}
+struct Root {{ v: i32 }}
+impl Root with Src {{ fun get(self): i32 {{ self.v }} }}
+trait Named {{ fun name(self): str; fun hello(self): str {{ \"hi \" + self.name() }} }}
+impl Root with Named {{ fun name(self): str {{ \"root\" }} }}
+fun main() {{
+\tlet r: dyn Src = Root {{ v = 4 }};
+\tprint({call});
+}}
+"
+        )
+    };
+    assert_fails_with(&source("r.name()"), "dyn Src has no method 'name'");
+    assert_fails_with(&source("r.hello()"), "dyn Src has no method 'hello'");
+}
+
+/// The same fact at a BOUND: an object meets the trait it was erased to (and
+/// its supertraits), not a trait its erased value happens to implement. The
+/// bound check used to reconcile the object against every concrete impl
+/// subject and admitted it, then called a `name` slot the table never had.
+#[test]
+fn an_object_does_not_meet_a_bound_its_erased_value_meets() {
+    assert_fails_with(
+        "trait Src { fun get(self): i32; }
+struct Root { v: i32 }
+impl Root with Src { fun get(self): i32 { self.v } }
+trait Named { fun name(self): str; }
+impl Root with Named { fun name(self): str { \"root\" } }
+fun greet<T: Named>(x: T): str { x.name() }
+fun main() {
+\tlet r: dyn Src = Root { v = 4 };
+\tprint(greet(r));
+}
+",
+        "'dyn Src' does not implement trait 'Named'",
+    );
+}
+
+/// A blanket that gives an object a SECOND trait (`impl type S: Src with
+/// Loud`), reached both directly and through a generic bound on that second
+/// trait. The table holds `Src`'s members only, so a `Loud` call is the
+/// blanket's body with `S` bound to the object — the generic-bound path used
+/// to read it out of the table (`t[1].loud is not a function`).
+#[test]
+fn a_blanket_trait_impl_reaches_the_object_through_a_bound() {
+    assert_compiles_and_runs(
+        "trait Src { fun get(self): i32; }
+struct Root { v: i32 }
+impl Root with Src { fun get(self): i32 { self.v } }
+trait Loud { fun loud(self): str; }
+impl type S: Src with Loud { fun loud(self): str { i\"{self.get()}!\" } }
+fun shout<T: Loud>(t: T): str { t.loud() }
+fun main() {
+\tlet r: dyn Src = Root { v = 4 };
+\tprint(r.loud());
+\tprint(shout(r));
+\tprint(shout(Root { v = 5 }));
+}
+",
+        "4!\n4!\n5!\n",
+    );
+}
+
+/// A body reached ONLY through a table still belongs to the program. The call
+/// graph recorded a call through an object as a direct call to the trait's
+/// declaration, so `SignalCell::on_change` — reached here through the cold
+/// node's `dyn Source` upstream and nowhere else — was invisible to the
+/// reachability that decides which module-level bindings are emitted, and the
+/// subscriber registry it reads was pruned: `ReferenceError:
+/// next_subscriber_id is not defined` at the first subscription.
+#[test]
+fn a_body_reached_only_through_an_object_keeps_its_module_state() {
+    assert_compiles_and_runs(
+        "import std::reactive::{ Source, SignalCell, Subscription };
+struct Plus { up: dyn Source<i32>, k: i32 }
+impl Plus with Source<i32> {
+\tfun get(self): i32 { self.up.get() + self.k }
+\tfun on_change(self, observer: |i32| void): Subscription {
+\t\tlet k = self.k;
+\t\tself.up.on_change(|n| observer(n + k))
+\t}
+}
+fun main() {
+\tlet root = SignalCell::new(1);
+\tlet cold: dyn Source<i32> = Plus { up = root, k = 100 };
+\tlet watch = cold.on_change(|n| print(i\"cold saw {n}\"));
+\troot.set(5);
+\tprint(cold.get());
+\twatch.dispose();
+}
+",
+        "cold saw 105\n105\n",
+    );
+}
+
+/// The brief's pin in its own words — a root, a COLD node and a `.cell()` in
+/// one `List<Holder>` of `dyn Source<i32>` — over the S1 probe's real nodes
+/// (`std::reactive_pipeline`, reactive-40's). Those nodes are not on this
+/// lane's base, so the pin waits for the merge; it was run green over
+/// `origin/next`'s two std files (`1 101 10 / 5 105 50`) before it was filed.
+#[test]
+#[ignore = "A124: needs std::reactive_pipeline (reactive-40, merged to next after this lane's base) - un-ignore at the dyn-40 merge"]
+fn a_dyn_source_field_holds_a_root_a_map_node_and_a_cell() {
+    assert_compiles_and_runs(
+        "import std::reactive::{ Source, SignalCell };
+import std::reactive_pipeline::{ Cold };
+struct Holder { s: dyn Source<i32> }
+fun main() {
+\tlet root = SignalCell::new(1);
+\tlet cold = root.map_node(|n| n + 100);
+\tlet cached = root.map_node(|n| n * 10).cell();
+\tlet hs: List<Holder> = [ Holder { s = root }, Holder { s = cold }, Holder { s = cached } ];
+\tfor h in hs { print(h.s.get()); }
+\troot.set(5);
+\tfor h in hs { print(h.s.get()); }
+}
+",
+        "1\n101\n10\n5\n105\n50\n",
+    );
+}
