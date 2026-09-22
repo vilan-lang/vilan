@@ -529,6 +529,166 @@ fn an_and_then_is_a_derivation_so_an_effect_reads_its_chain_settled() {
     );
 }
 
+// --- A124 S1: the push-pull pipeline as EVIDENCE ----------------------------
+//
+// `std/src/reactive_pipeline.vl` is the paper's S1 probe
+// (`proposal/reactive-pipeline.md` §7): the cold-node model built over today's
+// `Source` with no compiler change, exported but re-exported nowhere and used
+// by no other std module. These four pins are its numbers — the claims the
+// paper's cost table rests on, run rather than argued. They go with the file if
+// the file goes.
+
+#[test]
+fn a124_s1_a_cold_chain_with_no_subscriber_evaluates_nothing() {
+    // Claim 1: a node allocates no cell and registers nothing, so three writes
+    // to the root of a five-deep chain do no work at all. Today's five `map`
+    // cells would have evaluated fifteen times. One `get()` then pulls the
+    // whole chain — five evaluations, paid by the reader.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+        import std::reactive_pipeline::{ Cold, watch };
+        import std::shared::Shared;
+
+        fun main() {
+            let root: SignalCell<i32> = Signal::new(1);
+            let evals: Shared<i32> = Shared::new(0);
+            let chain = root
+                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 });
+            print(evals.read());
+            root.set(2);
+            root.set(3);
+            root.set(4);
+            print(evals.read());
+            print(chain.get());
+            print(evals.read());
+        }
+
+        main();
+        "#,
+        "0\n0\n9\n5\n",
+    );
+}
+
+#[test]
+fn a124_s1_a_cold_chain_evaluates_once_per_leaf_subscriber() {
+    // Claim 2: N leaves means N evaluations, by design — the cold contract.
+    // One leaf: five. Two leaves on the same chain: ten. The notification
+    // carries no payload, so the hops themselves compute nothing; the count is
+    // exactly the leaves' pulls.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+        import std::reactive_pipeline::{ Cold, watch };
+        import std::shared::Shared;
+
+        fun main() {
+            let root: SignalCell<i32> = Signal::new(1);
+            let evals: Shared<i32> = Shared::new(0);
+            let chain = root
+                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 });
+            let _one = watch(chain, |_value| {});
+            evals.write() = 0;
+            root.set(2);
+            print(evals.read());
+            let _two = watch(chain, |_value| {});
+            evals.write() = 0;
+            root.set(3);
+            print(evals.read());
+        }
+
+        main();
+        "#,
+        "5\n10\n",
+    );
+}
+
+#[test]
+fn a124_s1_a_cell_between_runs_the_segment_above_it_once() {
+    // Claim 3: `.cell()` is one more node, composable anywhere, and it is where
+    // sharing is bought. Two leaves below a cell: the two nodes ABOVE it run
+    // once (2), the three below it run per leaf (3 x 2 = 6).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+        import std::reactive_pipeline::{ Cold, watch };
+        import std::shared::Shared;
+
+        fun main() {
+            let root: SignalCell<i32> = Signal::new(1);
+            let upper: Shared<i32> = Shared::new(0);
+            let lower: Shared<i32> = Shared::new(0);
+            let cached = root
+                .map_node(|x| { upper.write() = upper.read() + 1; x + 1 })
+                .map_node(|x| { upper.write() = upper.read() + 1; x + 1 })
+                .cell();
+            let below = cached
+                .map_node(|x| { lower.write() = lower.read() + 1; x + 1 })
+                .map_node(|x| { lower.write() = lower.read() + 1; x + 1 })
+                .map_node(|x| { lower.write() = lower.read() + 1; x + 1 });
+            let _a = watch(below, |_value| {});
+            let _b = watch(below, |_value| {});
+            upper.write() = 0;
+            lower.write() = 0;
+            root.set(2);
+            print(upper.read());
+            print(lower.read());
+        }
+
+        main();
+        "#,
+        "2\n6\n",
+    );
+}
+
+#[test]
+fn a124_s1_a_diamond_pulls_a_settled_pair_and_fires_twice() {
+    // Claim 4, and the honest half of R2. Two arms over one root, joined: the
+    // leaf is told twice per settle, because each arm's registration mints its
+    // own subscriber id at the root and door 2's dedup is keyed on that id. It
+    // is a duplicate CALL and never a torn pair — both calls pull, so both read
+    // the settled `(20, 102)`. Threading ONE id down a leaf's whole chain is
+    // what would collapse the duplicate, and `observe` mints the id itself, so
+    // that is std work for S2 rather than something this probe can show.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+        import std::reactive_pipeline::{ Cold, watch };
+        import std::shared::Shared;
+
+        fun main() {
+            let source: SignalCell<i32> = Signal::new(1);
+            let seen: Shared<str> = Shared::new("");
+            let diamond = source
+                .map_node(|x| x * 10)
+                .combine_node(source.map_node(|x| x + 100));
+            let _leaf = watch(diamond, |pair| {
+                let (left, right) = pair;
+                seen.write() = i"{seen.read()}({left},{right})";
+            });
+            seen.write() = "";
+            source.set(2);
+            print(seen.read());
+        }
+
+        main();
+        "#,
+        "(20,102)(20,102)\n",
+    );
+}
+
 // --- A29: a disposed session lets its transport forget it --------------------
 
 // `ReactiveClient::new`/`ReactiveServer::new` install an inbound handler that
