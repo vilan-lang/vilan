@@ -43,6 +43,13 @@
 //!    one, and the edge between them lives in `std::rpc`. A grep over the two
 //!    reactive-layer files is honest here and costs microseconds: there is no
 //!    import to find, so nothing subtler than the text is needed.
+//! 7. [`std_delta_feed_admits_list_sources_and_refuses_everything_else`] —
+//!    A112 S3's `DeltaFeed<T>` and its two blankets must make nothing a source
+//!    that was not one. Its ruled form, `with Source<List<T>>` beside its own
+//!    blanket over `Source<List<T>>`, made every `Source` bound in every
+//!    program admit ANY type before solver-40b's fix; held here against std's
+//!    REAL trait, whichever spelling it carries, where the solver's own pins
+//!    hold a user-written copy.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -418,5 +425,106 @@ fn std_reactive_imports_nothing_from_std_wire() {
                  make the whole reactive core depend on the `Patch` frame."
             );
         }
+    }
+}
+
+/// Checks `contents` as a one-file program and answers the compiler's stderr,
+/// asserting the check FAILED — the refusal half of the pin below.
+fn refused(tag: &str, contents: &str) -> String {
+    let directory = support::scratch_dir(&format!("vilan_delta_log_{tag}_{}", std::process::id()));
+    std::fs::create_dir_all(&directory)
+        .unwrap_or_else(|error| panic!("{}", support::storage_failure(&directory, &error)));
+    let program = directory.join("app.vl");
+    std::fs::write(&program, contents)
+        .unwrap_or_else(|error| panic!("{}", support::storage_failure(&program, &error)));
+    let checked = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .arg("check")
+        .arg(&program)
+        .env("VILAN_STD", std_dir())
+        .output()
+        .expect("run vilan check");
+    let stderr = String::from_utf8_lossy(&checked.stderr).into_owned();
+    assert!(
+        !checked.status.success(),
+        "{tag} must be REFUSED, and checked clean:\n{}{stderr}",
+        String::from_utf8_lossy(&checked.stdout)
+    );
+    stderr
+}
+
+/// A112 S3's `DeltaFeed` must answer the question it exists for (a `ListCell`
+/// has a feed, a plain `SignalCell<List<T>>` has none) and must NOT make
+/// anything else a source. It ships as the two-bound fallback (no supertrait;
+/// a consumer writes `S: Source<List<T>> + DeltaFeed<T>`), and this pin is
+/// what the switch to the ruled `with Source<List<T>>` form must keep green.
+///
+/// Non-vacuous by the compiler it was found on: on 3e4e6c51 (before
+/// solver-40b's guard in `satisfies_trait_bound`) with the ruled supertrait
+/// form in std, all four refusals below checked CLEAN and ran — a plain struct and an `i32` passed as
+/// `Source<T>`, a `SignalCell<i32>` as `Source<List<T>>` (printing
+/// `undefined`), an `i32` as `DeltaFeed<T>` — because the blanket was a
+/// candidate for its own supertrait and the recursion's depth cap answered yes.
+/// The control is what keeps the refusals from passing by refusing everything.
+#[test]
+fn std_delta_feed_admits_list_sources_and_refuses_everything_else() {
+    let stdout = build_and_run(
+        "feed_control",
+        "feed_control.vl",
+        r#"import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ DeltaFeed, ListCell, Signal, SignalCell, Source };
+
+fun logged<T, S: Source<List<T>> + DeltaFeed<T>>(source: S): str {
+	match source.delta_cursor() {
+		Some(let _cursor) => i"log over {source.get().len()}",
+		None => i"none over {source.get().len()}",
+	}
+}
+
+fun main() {
+	let cell: ListCell<str> = ListCell<str>::of(["a"]);
+	let plain: SignalCell<List<str>> = Signal::new(["a", "b"]);
+	print(i"{logged(cell)} / {logged(plain)}");
+}
+
+main();
+"#,
+    );
+    assert_eq!(
+        stdout, "log over 1 / none over 2\n",
+        "a `ListCell` answers a feed and a plain cell answers none"
+    );
+
+    let cases: [(&str, &str, &str); 4] = [
+        (
+            "feed_struct_as_source",
+            "struct Plain {\n\tn: i32,\n}\n\nfun src<T, S: Source<T>>(source: S): i32 {\n\t1\n}\n\nfun main() {\n\tlet plain = Plain { n = 1 };\n\tprint(i\"{src(plain)}\");\n}\n",
+            "'Plain' does not implement trait 'Source<T>'",
+        ),
+        (
+            "feed_integer_as_source",
+            "fun src<T, S: Source<T>>(source: S): i32 {\n\t1\n}\n\nfun main() {\n\tprint(i\"{src(5)}\");\n}\n",
+            "'i32' does not implement trait 'Source<T>'",
+        ),
+        (
+            "feed_scalar_cell_as_list_source",
+            "fun src<T, S: Source<List<T>>>(source: S): List<T> {\n\tsource.get()\n}\n\nfun main() {\n\tlet number: SignalCell<i32> = Signal::new(3);\n\tlet got: List<str> = src(number);\n\tprint(i\"{got.len()}\");\n}\n",
+            "'SignalCell<i32>' does not implement trait 'Source<List<str>>'",
+        ),
+        (
+            "feed_integer_as_feed",
+            "fun feed<T, S: DeltaFeed<T>>(source: S): i32 {\n\t1\n}\n\nfun main() {\n\tprint(i\"{feed(5)}\");\n}\n",
+            "'i32' does not implement trait 'DeltaFeed<T>'",
+        ),
+    ];
+    for (tag, body, wanted) in cases {
+        let program = format!(
+            "import std::io::print;\nimport std::reactive::{{ DeltaFeed, Signal, SignalCell, Source }};\n\n{body}\nmain();\n"
+        );
+        let stderr = refused(tag, &program);
+        assert!(
+            stderr.contains(wanted),
+            "{tag}: expected the refusal {wanted:?}, got:\n{stderr}"
+        );
     }
 }

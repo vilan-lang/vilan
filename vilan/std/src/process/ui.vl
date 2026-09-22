@@ -609,6 +609,10 @@ fun place_swap<T: PartialEq, S: Source<T>, C: Slot>(
 /// boundary. Nothing a row registers survives, so the owner is discarded.
 /// (`List<T>` is annotated so `get`'s element type resolves — the
 /// two-parameter-generic inference trap.)
+///
+/// No op path (A112 S3): the browser twin follows a `DeltaSource`'s ops after its
+/// first build, and a server render IS only a first build — it reads the list once
+/// and never hears a change, so there is nothing for ops to say.
 fun place_each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
 	parent: View,
 	source: S,

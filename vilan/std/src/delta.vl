@@ -328,6 +328,82 @@ export trait DeltaSource<C, O> with Source<C> {
 	fun since(self, cursor: DeltaCursor): List<O>;
 }
 
+/// What a CONSUMER asks a source for when it can use ops but does not require
+/// them: a delta feed, or nothing (A112 S3).
+///
+/// `each` takes any `Source<List<T>>` and must go on doing so, so it cannot bound
+/// on `DeltaSource` — and vilan has no overloading, so the choice cannot be two
+/// functions of one name either. It is one trait with a BLANKET impl answering "no
+/// feed", which every collection source satisfies, and a second blanket over
+/// `DeltaSource` answering a real one; the specificity order picks the second
+/// wherever both match, because a subject bound by a subtrait is the more specific
+/// one (B378).
+///
+/// **A cell with a log needs nothing more.** Being a `DeltaSource` is the whole of
+/// it — the second blanket forwards to its members. What the extra trait buys over
+/// bounding on `DeltaSource` directly is that a consumer may be written ONCE for
+/// both kinds of source.
+///
+/// **No supertrait, yet — the declared fallback.** The ruled spelling is `trait
+/// DeltaFeed<T> with Source<List<T>>`, so a consumer could bound on `DeltaFeed<T>`
+/// alone. It waits on B395: with it, a `Source` DEFAULT member (`sub`, `map`,
+/// `effect_on_change`) called on a type that is a `Source` at OTHER arguments — a
+/// custom `Source<i32>`, an rpc mirror's `Source<Option<List<T>>>` — resolves
+/// through this trait's blanket and is refused at its bound. Until then a consumer
+/// writes both bounds, `S: Source<List<T>> + DeltaFeed<T>`.
+///
+/// It is a separate trait rather than three defaults on `Source<T>` because
+/// `Source`'s argument is the whole value and these are about a COLLECTION's
+/// element type — a `Source<i32>` has no `SeqOp<i32>` feed to offer, and giving it
+/// one would put a collection's vocabulary on every signal in the language.
+export trait DeltaFeed<T> {
+	/// A cursor into this source's op log, or `None` when it keeps none.
+	fun delta_cursor(self): Option<DeltaCursor>;
+
+	/// Everything the cursor has not been told. A source that answered `None` above
+	/// is never asked.
+	fun delta_since(self, cursor: DeltaCursor): List<SeqOp<T>>;
+
+	/// Retire the cursor, so a disposed consumer stops pinning history.
+	fun drop_delta_cursor(self, cursor: DeltaCursor);
+}
+
+/// Every collection source, including every plain `SignalCell<List<T>>`: no log, so
+/// no feed, so the consumer keeps its whole-value path. This is what "a
+/// `SignalCell` is not a delta source" means in code.
+export impl type S: Source<List<type T>> with DeltaFeed<T> {
+	fun delta_cursor(self): Option<DeltaCursor> {
+		None
+	}
+
+	fun delta_since(self, cursor: DeltaCursor): List<SeqOp<T>> {
+		mut none: List<SeqOp<T>> = [];
+		none
+	}
+
+	fun drop_delta_cursor(self, cursor: DeltaCursor) {}
+}
+
+/// Every source that KEEPS a positional log — `ListCell`, `std::rpc`'s `KeyedCell`,
+/// and anything an application writes against `DeltaSource` — answers with a real
+/// feed. This impl and the one above both match such a source, and this one is
+/// chosen because `DeltaSource<List<T>, SeqOp<T>>` is declared
+/// `with Source<List<T>>`: a subject bound by a subtrait is the more specific one
+/// (B378). It forwards, one line each.
+export impl type S: DeltaSource<List<type T>, SeqOp<T>> with DeltaFeed<T> {
+	fun delta_cursor(self): Option<DeltaCursor> {
+		Some(self.cursor())
+	}
+
+	fun delta_since(self, cursor: DeltaCursor): List<SeqOp<T>> {
+		self.since(cursor)
+	}
+
+	fun drop_delta_cursor(self, cursor: DeltaCursor) {
+		self.drop_cursor(cursor);
+	}
+}
+
 // === The sequence cell, and the first operator (A112 S2) =====================
 //
 // S1 built the LOG half. This is the CELL half: a collection whose writes are its

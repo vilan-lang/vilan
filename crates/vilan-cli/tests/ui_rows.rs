@@ -4233,3 +4233,401 @@ fn a121_the_ssr_twins_render_the_same_markup_and_trap_nothing() {
          server-rendered page that chains it)"
     );
 }
+
+// --- A112 S3: the delta-driven `each` ----------------------------------------
+
+/// Eleven edits over one `ListCell` under `each`, each printed as
+/// `pass|tree|cost`, then the two measurements the slice exists for: the same
+/// push into a PLAIN `SignalCell` (the control, which keeps the pass) and one
+/// push and one removal at 1,000 rows. `keys` counts calls of the key function,
+/// which is what a pass spends on every row and the op path on none but the
+/// row that arrived.
+const A112_S3_OPS: &str = r#"import std::io::print;
+import std::reactive::{ ListCell, SequenceCell, Signal, SignalCell, Source };
+import std::shared::Shared;
+import std::ui::{ View, each, mount_root, view };
+
+[derive(PartialEq, Hashable)]
+struct Row {
+	id: i32,
+	text: str,
+}
+
+fun row(id: i32, text: str): Row {
+	Row { id = id, text = text }
+}
+
+let keys: Shared<i32> = Shared::new(0);
+
+fun keyed(item: Row): i32 {
+	keys.write() = keys.read() + 1;
+	item.id
+}
+
+fun spent(): str {
+	let line = i"{cost()} keys={keys.read()}";
+	keys.write() = 0;
+	line
+}
+
+fun main() {
+	let rows: ListCell<Row> = ListCell<Row>::of([row(1, "a"), row(2, "b"), row(3, "c"), row(4, "d")]);
+	let _root = mount_root("app", || {
+		view("ul")
+			.child(view("li").text("H"))
+			.child(each(rows, keyed, |item: Row| view("li").text(item.text)))
+			.child(view("li").text("F"))
+	});
+	print(i"mount|{tree()}|{spent()}");
+	rows.push(row(5, "e"));
+	print(i"push|{tree()}|{spent()}");
+	rows.prepend(row(0, "z"));
+	print(i"prepend|{tree()}|{spent()}");
+	rows.remove_at(2);
+	print(i"remove|{tree()}|{spent()}");
+	rows.set_at(1, row(1, "A"));
+	print(i"set_at|{tree()}|{spent()}");
+	rows.set_at(1, row(1, "A"));
+	print(i"set_at-same|{tree()}|{spent()}");
+	rows.insert_all(2, [row(7, "g"), row(8, "h")]);
+	print(i"insert_all|{tree()}|{spent()}");
+	rows.edit(|&mut list| {
+		list.push(row(9, "i"));
+		list.remove_at(0);
+		list.insert_at(1, row(6, "f"));
+	});
+	print(i"edit|{tree()}|{spent()}");
+	rows.move_range(0, 1, 3);
+	print(i"move|{tree()}|{spent()}");
+	rows.set([row(1, "a"), row(2, "b")]);
+	print(i"set|{tree()}|{spent()}");
+	rows.clear();
+	print(i"clear|{tree()}|{spent()}");
+
+	// The control: a plain cell keeps the pass.
+	let plain: SignalCell<List<Row>> = Signal::new([row(1, "a"), row(2, "b"), row(3, "c")]);
+	let _second = mount_root("app", || {
+		view("ol").child(each(plain, keyed, |item: Row| view("li").text(item.text)))
+	});
+	let _reset = spent();
+	plain.update(|&mut list| { list.push(row(4, "d")); });
+	print(i"plain-push||{spent()}");
+
+	// At scale: one push into 1,000 rows, then one removal.
+	mut many: List<Row> = [];
+	mut index = 0;
+	for index < 1000 {
+		many.push(row(index, "r"));
+		index += 1;
+	}
+	let big: ListCell<Row> = ListCell<Row>::of(many);
+	let _third = mount_root("app", || {
+		view("ol").child(each(big, keyed, |item: Row| view("li").text(item.text)))
+	});
+	let _mounted = spent();
+	big.push(row(1000, "new"));
+	print(i"big-push||{spent()}");
+	big.remove_at(500);
+	print(i"big-remove||{spent()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+[extern("__cost")]
+external fun cost(): str;
+
+main();
+"#;
+
+/// A112 S3: a `ListCell` under `each` is followed by its OPS.
+///
+/// The claim is the cost column — one push into 1,000 rows builds ONE row and
+/// calls the key function ONCE, a removal cuts one row and calls it never —
+/// and the tree column is what says the cheaper path still built the right run
+/// after every edit in the vocabulary: a splice at each end and in the middle,
+/// an element changed in place (and "changed" to an equal value, which costs
+/// nothing), a batch of three inside one `edit`, a `Move`, a wholesale `set`
+/// (a `Reset`, which is the pass) and a `clear`. The plain `SignalCell` beside
+/// it is the control: the same push costs a whole pass there, `keys=8` over
+/// four rows.
+///
+/// Non-vacuity: with the op path planted out (`place_each` answering every
+/// source with the pass, as it did before S3), the tree column is unchanged and
+/// the cost column reds — `big-push` reads `keys=2002` and `push` `keys=10`.
+#[test]
+fn a112_s3_a_list_cell_under_each_builds_only_the_rows_its_ops_name() {
+    let harness = format!("{DOM_STUB}{A98_COST_HARNESS_TAIL}");
+    let stdout = build_and_run("a112_s3_ops", A112_S3_OPS, &harness);
+    let seen: Vec<(String, Vec<String>, String)> = stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('|');
+            let name = parts.next()?.to_string();
+            let tree = nodes(parts.next()?);
+            let cost = parts.next()?.to_string();
+            Some((name, tree, cost))
+        })
+        .collect();
+    let tree = |labels: &[&str]| {
+        let mut expected = vec!["root".to_string(), "ul".to_string(), "li'H'".to_string()];
+        for label in labels {
+            expected.push(format!("li'{label}'"));
+        }
+        expected.push("li'F'".to_string());
+        expected
+    };
+    let none: Vec<String> = Vec::new();
+    let expected: Vec<(String, Vec<String>, String)> = vec![
+        // The first build is the pass: seven elements, four keys read twice
+        // (the plan and the key list it keeps).
+        ("mount", tree(&["a", "b", "c", "d"]), "cut=0 built=7 keys=8"),
+        (
+            "push",
+            tree(&["a", "b", "c", "d", "e"]),
+            "cut=0 built=1 keys=1",
+        ),
+        (
+            "prepend",
+            tree(&["z", "a", "b", "c", "d", "e"]),
+            "cut=0 built=1 keys=1",
+        ),
+        (
+            "remove",
+            tree(&["z", "a", "c", "d", "e"]),
+            "cut=1 built=0 keys=0",
+        ),
+        // Same key, different item: that row rebuilt, nothing else touched.
+        (
+            "set_at",
+            tree(&["z", "A", "c", "d", "e"]),
+            "cut=1 built=1 keys=2",
+        ),
+        // Same key, EQUAL item: a `Keep`, as the pass would have made it.
+        (
+            "set_at-same",
+            tree(&["z", "A", "c", "d", "e"]),
+            "cut=0 built=0 keys=1",
+        ),
+        (
+            "insert_all",
+            tree(&["z", "A", "g", "h", "c", "d", "e"]),
+            "cut=0 built=2 keys=2",
+        ),
+        // Three ops, one notification: the push and the insert build a row
+        // each, the removal cuts one.
+        (
+            "edit",
+            tree(&["A", "f", "g", "h", "c", "d", "e", "i"]),
+            "cut=1 built=2 keys=2",
+        ),
+        // A `Move` is the pass at the moved list: the one row that moved is cut
+        // and put back (A98), nothing is built.
+        (
+            "move",
+            tree(&["f", "g", "h", "A", "c", "d", "e", "i"]),
+            "cut=1 built=0 keys=16",
+        ),
+        // A `Reset` is the pass: every row whose key left is cut.
+        ("set", tree(&["a", "b"]), "cut=8 built=2 keys=4"),
+        ("clear", tree(&[]), "cut=2 built=0 keys=0"),
+        ("plain-push", none.clone(), "cut=0 built=1 keys=8"),
+        ("big-push", none.clone(), "cut=0 built=1 keys=1"),
+        ("big-remove", none, "cut=1 built=0 keys=0"),
+    ]
+    .into_iter()
+    .map(|(name, tree, cost)| (name.to_string(), tree, cost.to_string()))
+    .collect();
+    assert_eq!(
+        seen, expected,
+        "A112 S3: a `ListCell` under `each` must build only the rows its ops \
+         name and still show the right run; a plain `SignalCell` keeps the \
+         pass; got:\n{stdout}"
+    );
+}
+
+/// The S2 random walk (`vilan/test/list-cell.vl`, claim 10), extended THROUGH
+/// `each`: 300 turns of 1–4 ops each, drawn from the whole vocabulary and made
+/// inside one `batch` (so one drain applies several ops in order), with three
+/// runs mounted on it — `each` over the cell, `each` over a `map_each` chained
+/// on it, and `each_values` over the cell. After every turn the program reads
+/// the three runs back out of the document and panics on the first one that
+/// differs from what the cell holds.
+const A112_S3_WALK: &str = r#"import std::io::{ panic, print };
+import std::reactive::{ ListCell, SequenceCell, Signal, Source, batch, map_each };
+import std::shared::Shared;
+import std::ui::{ View, each, each_values, mount_root, view };
+
+[derive(PartialEq, Hashable)]
+struct Row {
+	id: i32,
+	text: str,
+}
+
+/// A seeded MINSTD Lehmer sequence, as in `list-cell.vl`: deterministic, so the
+/// printed tail is a golden.
+let seed: Shared<i53> = Shared::new(7i53);
+
+fun next_random(bound: i32): i32 {
+	let state = (seed.read() * 16807i53) % 2147483647i53;
+	seed.write() = state;
+	(state % bound.as_i53()).as_i32()
+}
+
+/// Every row gets an id no other row has had, so the keys stay unique.
+let ids: Shared<i32> = Shared::new(0);
+
+fun fresh(): Row {
+	let id = ids.read() + 1;
+	ids.write() = id;
+	Row { id = id, text = i"{id}" }
+}
+
+let renders: Shared<i32> = Shared::new(0);
+
+fun rendered(item: Row): View {
+	renders.write() = renders.read() + 1;
+	view("li").text(item.text)
+}
+
+fun joined(values: List<Row>, suffix: str): str {
+	mut out = "";
+	mut first = true;
+	for value in values {
+		if !first {
+			out = out + ",";
+		}
+		out = out + value.text + suffix;
+		first = false;
+	}
+	out
+}
+
+fun main() {
+	let walk: ListCell<Row> = ListCell<Row>::of([fresh(), fresh(), fresh()]);
+	let starred = map_each(walk, |item: Row| Row { id = item.id, text = item.text + "*" });
+	let _root = mount_root("app", || {
+		view("div")
+			.child(view("ol").child(each(walk, |item: Row| item.id, |item: Row| rendered(item))))
+			.child(view("ol").child(each(starred, |item: Row| item.id, |item: Row| rendered(item))))
+			.child(view("ol").child(each_values(walk, |item: Row| rendered(item))))
+	});
+	renders.write() = 0;
+	mut naive = 0;
+	mut turn = 1;
+	for turn <= 300 {
+		let op_count = 1 + next_random(4);
+		batch(|| {
+			mut made = 0;
+			for made < op_count {
+				let size = walk.size();
+				let choice = next_random(24);
+				// Biased to GROW, as S2's walk is.
+				if choice < 7 || size == 0 {
+					walk.push(fresh());
+				} else if choice < 10 {
+					walk.insert_at(next_random(size + 1), fresh());
+				} else if choice < 12 {
+					walk.remove_at(next_random(size));
+				} else if choice < 13 {
+					// An element changed in place: a new row under the same key.
+					let at = next_random(size);
+					let held = walk.get()[at];
+					walk.set_at(at, Row { id = held.id, text = held.text + "'" });
+				} else if choice < 14 {
+					// ...and an element replaced by a different key.
+					walk.set_at(next_random(size), fresh());
+				} else if choice < 17 {
+					let from = next_random(size);
+					let count = 1 + next_random(size - from);
+					walk.move_range(from, count, next_random(size - count + 1));
+				} else if choice < 18 {
+					walk.pop();
+				} else if choice < 19 && size > 12 {
+					walk.remove_range(next_random(size), 1 + next_random(4));
+				} else if choice < 20 && size > 20 {
+					walk.truncate(next_random(size));
+				} else if choice < 21 && size > 16 {
+					// The wholesale write: a `Reset`, the pass.
+					mut rows: List<Row> = [];
+					mut fill = 0;
+					for fill < 1 + next_random(6) {
+						rows.push(fresh());
+						fill += 1;
+					}
+					walk.set(rows);
+				} else if choice < 22 {
+					// The compat door: one element edited, one appended.
+					mut edited = walk.get();
+					let at = next_random(size);
+					edited[at] = Row { id = edited[at].id, text = edited[at].text + "~" };
+					edited.push(fresh());
+					walk.reconcile_to(edited);
+				} else {
+					// The batch door, inside the batch.
+					let at = next_random(size);
+					walk.edit(|&mut list| {
+						list.insert_at(at, fresh());
+						list.remove_at(0);
+						list.push(fresh());
+					});
+				}
+				made += 1;
+			}
+		});
+		let held = walk.get();
+		naive += held.len() * 3;
+		let wanted = i"{joined(held, "")}|{joined(held, "*")}|{joined(held, "")}";
+		let shown = lists();
+		if shown != wanted {
+			panic(i"turn {turn}: the document shows\n  {shown}\nwhere the cell holds\n  {wanted}");
+		}
+		turn += 1;
+	}
+	print(i"walk: turns=300 length={walk.get().len()} ids={ids.read()} renders={renders.read()} rerun={naive}");
+}
+
+[extern("__lists")]
+external fun lists(): str;
+
+main();
+"#;
+
+/// Every `<ol>` in document order, each as its rows' labels joined by commas,
+/// and the lists joined by `|` — the program compares this against the cell.
+const A112_S3_WALK_HARNESS_TAIL: &str = r#"
+global.__lists = () => {
+    const out = [];
+    const visit = (node) => {
+        if (node.tagName === "ol") {
+            out.push(node.children.filter((child) => child.tagName === "li").map((child) => child._text).join(","));
+        }
+        node.children.forEach(visit);
+    };
+    visit(documentRoot);
+    return out.join("|");
+};
+require("./app.js");
+"#;
+
+/// A112 S3: the law, in the DOM. Every assertion is inside the program (a
+/// `panic` names the turn and both runs); this reads the exit code and holds
+/// the printed tail, so a walk that stops reaching the vocabulary — or a
+/// generator change — reds instead of passing quietly.
+///
+/// Non-vacuity, three plants, each red at a named turn: the `Move` arm handing
+/// the pass `source.get()` — the state after the WHOLE drain, which is what the
+/// patch held at Order 39 wrote — instead of the list after the move (turn 4);
+/// `splice_rows` placing arrivals at the anchor instead of before the next
+/// row's marker (turn 1); and the `SetAt` arm skipping the rebuild when only
+/// the key matches (turn 13).
+#[test]
+fn a112_s3_the_random_walk_holds_through_each() {
+    let harness = format!("{DOM_STUB}{A112_S3_WALK_HARNESS_TAIL}");
+    let stdout = build_and_run("a112_s3_walk", A112_S3_WALK, &harness);
+    assert_eq!(
+        stdout, "walk: turns=300 length=0 ids=587 renders=3306 rerun=12258\n",
+        "A112 S3's walk tail moved: the renders count is rows BUILT across \
+         three runs, the rerun the rows a pass would have looked at; got:\n{stdout}"
+    );
+}
