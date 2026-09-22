@@ -797,6 +797,11 @@ pub fn post_analysis_passes(
     // dangling name. Refused at the declaration, which needs the FINISHED
     // program: the compiler's own lowerings are resolved by name in `build`.
     analyzer::check_unlowered_externals(program);
+    // N113 (the fourth edge): a global host PROPERTY bound in the FUNCTION
+    // form emits a call to it — `[extern("document.activeElement")]` reaches
+    // the host as `document.activeElement()`. Same table, same question about
+    // a declaration, so it runs beside the check above.
+    analyzer::check_global_property_externs(program);
     // M26's POST-PASS boundary, the outermost of the three the phase line names
     // (`contexts+graph`, `const-pass`, `dispatch-refine`; the last is a slice
     // through the first two, so cancelling either cancels it). The passes are

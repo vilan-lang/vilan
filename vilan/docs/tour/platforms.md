@@ -136,6 +136,19 @@ The binding forms:
 | `[extern(new, "Class")]` | construction — `new Class(…)`, which a host constructor requires |
 | `[extern(new, "module", "Class")]` | the same, on a class imported from a host module |
 
+**A global PROPERTY is not one of the forms.** `[extern("global.path")]`
+binds a dotted global that is CALLABLE — `history.pushState`,
+`document.getElementById` — and it emits a call, so writing
+`[extern("document.activeElement")]` emits `document.activeElement()` and
+fails at the host. The compiler refuses the globals it knows are properties
+rather than letting the program ship. Two spellings work instead: bind the
+property on a RECEIVER with `[extern(get, "activeElement")]` when the
+program holds the object it hangs off, or — for a true global, which has no
+receiver — wrap it in a one-line host function of your own and bind that.
+std does the second for `window`, `location.pathname` and
+`document.activeElement`, which is why `std::dom::window()` and
+`std::dom::active_element()` exist.
+
 Any of them takes a trailing `retains` —
 `[extern(method, "addEventListener", retains)]` — and you need it whenever
 the host *keeps* what you hand it instead of reading it only until the
