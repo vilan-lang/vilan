@@ -6553,26 +6553,63 @@ impl Document {
         })
     }
 
-    /// E216 (R8's other half): the comment run under `range` re-filled to this
-    /// package's comment width — the "Reflow this comment" refactor.
+    /// E216 (R8's other half): the buffer re-printed with comment wrapping
+    /// FORCED ON, offered when the caret is in a comment run that the wrap
+    /// changes — the "Reflow this comment" refactor.
     ///
-    /// Offered REGARDLESS of `[fmt] wrap_comments`, because an explicit action
-    /// is consent where a format-on-save is not; offered only where something
-    /// changes, which is what [`vilan_core::formatter::reflow_comment_at`]
-    /// answers `None` for — a run no line of which is over the width, one
-    /// already filled, a trailing comment after code, and each of E205's ten
-    /// never-reflow classes.
+    /// Offered regardless of the package's `[fmt] wrap_comments`, because an
+    /// explicit action is consent where a format-on-save is not.
     ///
-    /// The width is the covering package's `[fmt] comment_width` (E215), read
-    /// from this document's own manifest directory — the same climb the
-    /// formatting path walks, so the action and the save cannot fill to two
-    /// different measures.
-    pub fn comment_reflow(&self, range: Span) -> Option<vilan_core::formatter::CommentReflowEdit> {
-        let width = self
-            .manifest_dir
-            .as_deref()
-            .and_then(vilan_core::manifest::comment_width_covering);
-        vilan_core::formatter::reflow_comment_at(&self.text, range.start, width)
+    /// **It is a whole-buffer edit, and that is deliberate.** The printer's
+    /// paragraph rule and its ten never-reflow classes are private to the
+    /// formatter (`comment_reflow`), and a second implementation of them here
+    /// is exactly the drift that would make the action and the save disagree
+    /// about one comment. So the action asks the formatter the question it
+    /// already answers — `reprint_with`, the entry point format-on-save takes
+    /// — and hands back what it said. The width is the formatter's own; a
+    /// package's `[fmt] comment_width` reaches it through `FormatOptions` when
+    /// that key lands (E215), with no second reader here.
+    ///
+    /// Two reprints, and the comparison is the point: with the wrap on and
+    /// with it off, the CODE renders identically, so a difference between them
+    /// is a comment and nothing else. That is what makes "would this change a
+    /// comment" answerable without re-deriving the rule — and it answers `None`
+    /// for a run already filled, one under the width, a trailing comment after
+    /// code, and each of the never-reflow classes, because in every one of
+    /// those the two reprints are the same text. Both are skipped entirely
+    /// unless the caret is in a comment, which is a scan of the buffer's
+    /// comment spans.
+    pub fn comment_reflow(&self, range: Span) -> Option<(Span, String)> {
+        let source = self.text.as_str();
+        let offset = range.start;
+        let in_a_comment =
+            vilan_core::formatter::extract_comments(source)
+                .iter()
+                .any(|(span, _)| {
+                    let range = span.into_range();
+                    offset >= range.start && offset <= range.end
+                });
+        if !in_a_comment {
+            return None;
+        }
+        let plain = vilan_core::formatter::reprint_with(
+            source,
+            vilan_core::formatter::FormatOptions {
+                wrap_comments: false,
+            },
+        )
+        .ok()?;
+        let wrapped = vilan_core::formatter::reprint_with(
+            source,
+            vilan_core::formatter::FormatOptions {
+                wrap_comments: true,
+            },
+        )
+        .ok()?;
+        if wrapped == plain {
+            return None;
+        }
+        Some((Span::from(0..source.len()), wrapped))
     }
 
     /// The `css`-spelling conversion offered over `range` (LIVE space, and the

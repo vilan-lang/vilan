@@ -4213,14 +4213,15 @@ impl LanguageServer for Backend {
             // them, it needs no `program`: a comment is trivia the lexer
             // drops, so this reads the buffer's own text.
             if wants_refactor
-                && let Some(reflow) = document.comment_reflow(live_span(&document, params.range))
+                && let Some((span, replacement)) =
+                    document.comment_reflow(live_span(&document, params.range))
             {
                 let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
                 changes.insert(
                     uri.clone(),
                     vec![TextEdit {
-                        range: document.line_index.range(&reflow.span),
-                        new_text: reflow.replacement,
+                        range: document.line_index.range(&span),
+                        new_text: replacement,
                     }],
                 );
                 actions.push(CodeActionOrCommand::CodeAction(CodeAction {
@@ -9387,35 +9388,36 @@ mod fmt_options_tests {
     }
 
     #[tokio::test]
-    async fn the_reflow_refactor_fills_to_the_packages_comment_width() {
-        // E215's key, read end to end: at the code width this run is under
-        // budget and no action is offered at all; at 60 it is over, and the
-        // fill lands at 60 rather than at 100.
-        const RUN: &str = "// the formatter has laid code out to a width since the day it existed
-fun main() {}
-";
-        let (silent, uri, actions) =
-            actions_at_the_first_comment("[package]\nname = \"wrapprobe\"\n", RUN, "widthdefault")
-                .await;
-        assert_eq!(
-            reflow_edit(&actions, &uri),
-            None,
-            "under the code width there is nothing to reflow"
+    async fn the_reflow_refactor_is_not_offered_away_from_a_comment() {
+        // The action is about the run the caret is in, so the caret has to be
+        // in one — and this is also what keeps the two reprints off every
+        // other code-action request.
+        const RUN: &str = "// the formatter has laid code out to a width since the day it existed and left every comment exactly as typed\nfun main() {}\n";
+        let (dir, uri) = package("awayfromcomment", "[package]\nname = \"wrapprobe\"\n", RUN);
+        let (service, _socket) = backend();
+        let server = service.inner();
+        server.documents.insert(
+            uri.clone(),
+            Document::analyze(RUN, &std_root(), &uri.to_file_path().expect("a path")),
         );
-        let _ = std::fs::remove_dir_all(&silent);
-        let (narrow, uri, actions) = actions_at_the_first_comment(
-            "[package]\nname = \"wrapprobe\"\n\n[fmt]\ncomment_width = 60\n",
-            RUN,
-            "widthnarrow",
-        )
-        .await;
-        let text = reflow_edit(&actions, &uri).expect("60 columns is over budget");
-        assert!(
-            text.lines().all(|line| line.chars().count() <= 60),
-            "every filled line fits the declared width: {text:?}"
-        );
-        assert!(text.lines().count() > 1, "{text:?}");
-        let _ = std::fs::remove_dir_all(&narrow);
+        let actions = server
+            .code_action(CodeActionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                // Line 1 is `fun main() {}` — code, not a comment.
+                range: Range::new(Position::new(1, 2), Position::new(1, 2)),
+                context: CodeActionContext {
+                    diagnostics: Vec::new(),
+                    only: None,
+                    trigger_kind: None,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .expect("the code-action request is answered")
+            .unwrap_or_default();
+        assert_eq!(reflow_edit(&actions, &uri), None, "{actions:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -9477,13 +9479,24 @@ fun main() {}
             .expect("`Reflow this comment` is offered");
         // The action applies the FILLER, whatever the package's opt-in says —
         // an explicit action is consent where a save is not. This package
-        // declares nothing, and the edit still arrives.
+        // declares nothing, and the edit still arrives. The edit is the whole
+        // buffer, re-printed with the wrap forced on: the formatter has no
+        // public paragraph entry, and asking it the question it already
+        // answers is what keeps the action and format-on-save agreeing.
         let changes = reflow.edit.expect("an edit").changes.expect("one file's");
         let edits = &changes[&uri];
         assert_eq!(edits.len(), 1, "{edits:?}");
         assert!(
-            edits[0].new_text.ends_with("// exactly as typed"),
+            edits[0].new_text.starts_with(
+                "// the formatter has laid code out to a width since the day it existed and left \
+                 every comment\n// exactly as typed\n"
+            ),
             "{:?}",
+            edits[0].new_text
+        );
+        assert!(
+            edits[0].new_text.contains("fun main() {}"),
+            "the rest of the buffer rides with it: {:?}",
             edits[0].new_text
         );
         let _ = std::fs::remove_dir_all(&dir);

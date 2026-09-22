@@ -73,17 +73,6 @@ pub struct Fmt {
     /// arriving with an upgrade.
     #[serde(rename = "wrap_comments")]
     pub wrap_comments: Option<bool>,
-    /// The column a re-filled COMMENT is filled to (E215 R1), when it is not
-    /// the code width. std's prose was written at ~84 and the code budget is
-    /// 100, so reflowing std at the code width would rewrite 6,719 comment
-    /// lines to a measure nobody chose; a package that opts into
-    /// `wrap_comments` says here what its prose is written at.
-    ///
-    /// Absent means the code width, which is what a package that has never
-    /// thought about it gets. Deliberately NOT a code-width knob: the
-    /// formatter still has one canonical layout for code.
-    #[serde(rename = "comment_width")]
-    pub comment_width: Option<usize>,
 }
 
 /// The `[macro]` section: per-package expansion budgets.
@@ -911,29 +900,9 @@ pub fn wrap_comments_covering(path: &Path) -> bool {
 /// which is what makes the climb in [`wrap_comments_covering`] pass through a
 /// manifest that has no opinion.
 fn wrap_comments_in(directory: &Path) -> Option<bool> {
-    fmt_section_in(directory)?.wrap_comments
-}
-
-/// The `[fmt] comment_width` for the package covering `path` (E215 R1), or
-/// `None` for the code width — [`wrap_comments_covering`]'s climb, key for
-/// key, so the two `[fmt]` answers cannot come from two different manifests.
-pub fn comment_width_covering(path: &Path) -> Option<usize> {
-    let mut current = Some(crate::util::spelled_path(path));
-    while let Some(directory) = current {
-        if let Some(declared) = fmt_section_in(&directory).and_then(|fmt| fmt.comment_width) {
-            return Some(declared);
-        }
-        current = directory.parent().map(Path::to_path_buf);
-    }
-    None
-}
-
-/// The `[fmt]` section of `directory`'s own `vilan.toml` — `None` when there
-/// is no manifest, it does not parse, or it declares no `[fmt]`.
-fn fmt_section_in(directory: &Path) -> Option<Fmt> {
     let text = std::fs::read_to_string(directory.join("vilan.toml")).ok()?;
     let (manifest, _warnings) = Manifest::parse(&text).ok()?;
-    manifest.fmt
+    manifest.fmt?.wrap_comments
 }
 
 pub fn generated_root_covering(path: &Path) -> Option<PathBuf> {
