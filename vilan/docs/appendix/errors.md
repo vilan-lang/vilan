@@ -186,20 +186,48 @@ An `impl … with Trait` doesn't provide every required method, or a bound
 demands a trait the type never implemented.
 → [Data and traits](../tour/data-and-traits.md)
 
-**"'…' is a trait, not a type: a trait is not a value type (vilan has no trait objects)"**
+**"'…' is a trait, not a type: a trait names a bound, and a value needs a type"**
 A trait's name was written where a type belongs — a return type, a struct
 field, or a generic argument like `List<Display>`. Traits are **bounds**,
-not types, so no value can ever have that type: the impl is fine, the
-signature is not. Write the generic the message spells out —
-`struct Holder<T: A> { v: T }` — or, inside the trait's own declaration,
-write `Self`, which is what a trait naming itself in a return position
-always meant. The note points at the trait, which may live in another
-module. For "one of several things at runtime", use an enum. Two
-annotations are not this error and the message names them both: a
-**parameter**, where a trait is an implicit generic (`fun f(x: A)` is
-`fun f<T: A>(x: T)`), and a `let` binding's own annotation, where it is a
-*constraint* on the inferred type — see the next entry.
+not types, so no value can have that type: the impl is fine, the
+signature is not. Three spellings do what was meant, and the message names
+each. `dyn A` is the **trait object** — a value whose concrete type is
+erased, carrying the trait's members in a table — and it is what a field,
+an element type or any other value position takes when what it holds is
+decided at runtime. A **parameter** needs nothing: `fun f(x: A)` already
+IS `fun f<T: A>(x: T)`. A **return** takes the generic the message spells
+out, `<T: A>` with `T` written in the return position; inside the trait's
+own declaration it takes `Self`, which is what a trait naming itself in a
+return position always meant. A `let` binding's own annotation is not this
+error at all — there a trait is a *constraint* on the inferred type; see
+the next entry. The note points at the trait, which may live in another
+module. For a CLOSED set of alternatives, an enum is still better than an
+object: it is exhaustive, checked, and costs nothing at runtime.
 → [Data and traits](../tour/data-and-traits.md)
+
+**"`…` cannot be a `dyn` object: … An object dispatches through a table of its trait's members, so every member it requires must take a receiver, name no `Self` in its signature, and be non-generic"**
+The first sentence names the member and why: **"`…` is a static — it takes
+no `self`"**, **"… is generic — one vtable slot cannot hold an unbounded
+family of specializations"**, or **"… returns `Self` — the caller would have
+to know the type the object erased"**. An object dispatches through a table of its
+trait's members, so each member the trait *requires* has to fit a slot: it
+takes a receiver, it names no `Self`, and it is not generic. The message
+names the **member** that disqualified the trait and the note points at
+its declaration, because naming the trait would send you to read every
+signature it has. A trait's *default* members never disqualify it — they
+are the trait's own code over the requirements. Where the trait cannot be
+an object, the generic is the answer: `<T: Trait>` keeps the type, needs
+no table, and is what the language does everywhere else.
+→ [Data and traits](../tour/data-and-traits.md)
+
+**"'…' is a resource, so it cannot become a `dyn …`"**
+A `resource` has exactly one owner and a destructor that runs at a known
+point. Erasing it into a trait object would make that destructor dynamic —
+dispatched through the table like everything else — where the rest of the
+language keeps teardown static. Hold the resource in a struct field of
+your own and put *that* behind the object, or take it through a generic
+bound, where its type is still known.
+→ [Memory model](../tour/memory-model.md)
 
 **"'…' does not implement trait '…', required by the annotation on '…'"**
 A `let` binding's annotation named a trait, which reads as a constraint

@@ -164,6 +164,12 @@ pub(crate) fn reset_refine_time() {
 /// [`crate::async_infer::dispatch_at`] alone would not; a consumer that wants
 /// those sites too reads the record directly.
 pub fn member_name_at<'src>(program: &Program<'src>, call_id: Id) -> Option<&'src str> {
+    // A124 R3: a call through a trait OBJECT's table is a dispatch like a
+    // bound's — any implementation of the member may answer it, so a hidden
+    // context parameter one of them needs has to be threaded at the site.
+    if let Some(name) = program.dyn_method_calls.get(&call_id) {
+        return Some(name);
+    }
     let subject_id = program.function_calls.get(&call_id)?.subject_id;
     for key in [call_id, subject_id] {
         match program.generic_dispatch.get(&key) {

@@ -514,7 +514,129 @@ pub fn infer(program: &mut Program, graph: &CallGraph) {
     }
     program.suspending_calls = suspending_calls;
 
+    for (error, source) in object_asyncness_refusals(program, &async_set) {
+        program.push_diagnostic(error, source);
+    }
+
     program.async_functions = async_set;
+}
+
+/// A124 R3 / trait-objects.md §5 (i): a trait member's DECLARED asyncness binds
+/// in object position.
+///
+/// B29 lets an impl disagree with its trait's declaration because every
+/// dispatch is monomorphized: `fun consume<T: Fetch>(v: T)` is emitted once per
+/// `T`, and each instance awaits or does not by the member it bound. A call
+/// through a `dyn` is emitted ONCE, against the declaration, for every value
+/// the object may hold — so a sync declaration's call site does not await, and
+/// an async implementation behind it hands back a promise where a value was
+/// typed: `print(f.get())` printed `Promise { <pending> }`.
+///
+/// Refused at the COERCION, which is the one place the concrete type and the
+/// object's trait are both in hand; and only for the members a call actually
+/// reaches through an object of that trait (the table's own slot set), since a
+/// member no object call reaches is never dispatched through one and keeps
+/// B29's freedom untouched. The other disagreement — an async declaration, a
+/// sync implementation — is sound as it stands: the call site awaits, and
+/// awaiting a plain value is a no-op.
+fn object_asyncness_refusals(
+    program: &Program,
+    async_set: &HashSet<Id>,
+) -> Vec<(crate::error::Error, SourceId)> {
+    let mut refusals = Vec::new();
+    if program.dyn_coercions.is_empty() {
+        return refusals;
+    }
+    let mut coercions: Vec<(&Id, &(TypeId, Id, Vec<TypeId>))> =
+        program.dyn_coercions.iter().collect();
+    coercions.sort_by_key(|(expr_id, _)| expr_id.0);
+    for (expr_id, (subject_type_id, trait_id, trait_arguments)) in coercions {
+        let mut members: Vec<&str> = program
+            .dyn_dispatched_members
+            .iter()
+            .filter(|(object_trait, _)| object_trait == trait_id)
+            .map(|(_, member)| *member)
+            .collect();
+        members.sort_unstable();
+        for member in members {
+            let Some((declaration_id, declaring_trait_id)) =
+                trait_declaration(program, *trait_id, member)
+            else {
+                continue;
+            };
+            if async_set.contains(&declaration_id) {
+                continue;
+            }
+            let wanted = crate::impl_select::WantedTrait {
+                trait_id: *trait_id,
+                arguments: trait_arguments,
+            };
+            let Some(selected) = crate::impl_select::select_member(
+                program,
+                None,
+                *subject_type_id,
+                member,
+                Some(wanted),
+            ) else {
+                continue;
+            };
+            if selected.member_id == declaration_id || !async_set.contains(&selected.member_id) {
+                continue;
+            }
+            let trait_name = program
+                .traits
+                .get(&declaring_trait_id)
+                .map(|trait_| trait_.name)
+                .unwrap_or("the trait");
+            let subject_name = match program.type_id_to_type_map.get(subject_type_id) {
+                Some(Type::Struct(id, _)) => program.structs.get(id).map(|found| found.name),
+                Some(Type::Enum(id, _)) => program.enums.get(id).map(|found| found.name),
+                _ => None,
+            }
+            .map(|name| format!("`{name}`'s"))
+            .unwrap_or_else(|| "this value's".to_string());
+            refusals.push(anchored(
+                program,
+                *expr_id,
+                format!(
+                    "{subject_name} `{member}` is async, but `{trait_name}::{member}` is \
+                     declared sync, so this value cannot become a `dyn {trait_name}`: a call \
+                     through an object is compiled once, against the declaration, and would \
+                     hand back an unawaited promise. Declare `{trait_name}::{member}` `async` \
+                     (an implementation may then be either), or keep the value behind a \
+                     generic bound, where each implementation is awaited as it is written"
+                ),
+                None,
+            ));
+        }
+    }
+    refusals
+}
+
+/// The member `name` as `trait_id` or one of its supertraits DECLARES it, with
+/// the declaring trait.
+fn trait_declaration(program: &Program, trait_id: Id, name: &str) -> Option<(Id, Id)> {
+    let mut stack = vec![trait_id];
+    let mut seen: HashSet<Id> = HashSet::default();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(trait_) = program.traits.get(&id) else {
+            continue;
+        };
+        if let Some(member_id) = trait_.declarations.get(name) {
+            return Some((*member_id, id));
+        }
+        for supertrait_type_id in &trait_.supertraits {
+            if let Some(Type::Trait(super_id, _)) =
+                program.type_id_to_type_map.get(supertrait_type_id)
+            {
+                stack.push(*super_id);
+            }
+        }
+    }
+    None
 }
 
 /// Whether a call THROUGH `subject_id` is an await point (J2): the subject is
@@ -595,6 +717,22 @@ fn call_returns_async_closure(program: &Program, call_id: Id) -> bool {
 /// resolve to across monomorphizations: an impl's member for the method, or the
 /// trait's own default. The async fixpoint marks the caller async if any is.
 pub(crate) fn dispatch_candidates(program: &Program, call_id: Id) -> Vec<Id> {
+    // A124 R3: a call through an OBJECT reaches every implementation of the
+    // member under the trait that declares it (the analyzer resolved the call
+    // to that declaration), plus the declaration itself — a default body is the
+    // slot for a type that does not override it.
+    if let Some(member) = program.dyn_method_calls.get(&call_id)
+        && let Some(Expr::Local(declaration)) = program
+            .function_calls
+            .get(&call_id)
+            .and_then(|call| program.entity_map.get(&call.subject_id))
+        && let Some((declaring_trait, _)) = program
+            .traits
+            .iter()
+            .find(|(_, trait_)| trait_.declarations.values().any(|id| id == declaration))
+    {
+        return trait_method_candidates(program, *declaring_trait, member);
+    }
     let Some(dispatch) = dispatch_at(program, call_id) else {
         return Vec::new();
     };

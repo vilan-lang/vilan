@@ -372,6 +372,37 @@ struct Emitter<'a, 'src> {
     /// consumed place reads this emit COPIED and how many it moved.
     copies_taken: usize,
     copies_elided: usize,
+    /// A124 R3: the Rust trait each OBJECT type lowers to — one per vilan trait
+    /// at its concrete arguments (`dyn Source<i32>` and `dyn Source<str>` are
+    /// two), keyed like a nominal instance. See [`Emitter::ensure_object_trait`].
+    object_traits: HashMap<(Id, Vec<String>), ObjectTrait>,
+    /// The `impl ObjectX for Concrete` blocks already written, by the object
+    /// trait's name and the RENDERED concrete type — rendered, because two
+    /// vilan types that lower to one Rust type must share one impl.
+    object_impls: HashSet<(String, String)>,
+}
+
+/// One object type's Rust trait: its name and its slots, each slot's
+/// signature rendered ONCE, at the object's own arguments, so an impl written
+/// later — under another body's substitution — repeats it verbatim.
+#[derive(Clone)]
+struct ObjectTrait {
+    name: String,
+    slots: Vec<ObjectSlot>,
+}
+
+#[derive(Clone)]
+struct ObjectSlot {
+    /// The vilan member's name, which is also the slot method's.
+    member: String,
+    /// The member as the trait (or the supertrait that declares it) declares
+    /// it — whose parameters' conventions a call through the object renders
+    /// its arguments against.
+    declaration: Id,
+    /// `fn get(&self, observer: T) -> R`, without the trailing `;` or body.
+    signature: String,
+    /// The non-receiver parameters' names, in order — what an impl forwards.
+    forwarded: Vec<String>,
 }
 
 /// F31's walk state: where each binding was declared, and the last read of it
@@ -432,6 +463,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             liveness_walked: HashSet::new(),
             copies_taken: 0,
             copies_elided: 0,
+            object_traits: HashMap::default(),
+            object_impls: HashSet::new(),
         }
     }
 
@@ -1144,6 +1177,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let _ = write!(out, "T{}", id.0);
                 self.write_key_arguments(arguments, out);
             }
+            // A124 R3: a trait OBJECT keys apart from the trait it erases and
+            // from every other instantiation of it. The backend refuses to
+            // EMIT one (see `rust_type_inner`), but a key is read before a
+            // type is rendered, and two keys that collided would make the
+            // refusal name the wrong instance.
+            Type::Dyn(id, arguments) => {
+                let _ = write!(out, "D{}", id.0);
+                self.write_key_arguments(arguments, out);
+            }
             Type::Tuple(elements) => {
                 out.push_str("Tup");
                 self.write_key_arguments(elements, out);
@@ -1416,6 +1458,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // system, just the value type a heterogeneous list needs where the
             // JS backend has a bare array.
             Type::Any => Ok("vilan_rt::Any".to_string()),
+            // A124 R3 / F1: a `dyn` lowers natively to a FAT POINTER —
+            // `vilan_rt::Dyn<dyn ObjectX>`, the counted value pointer beside
+            // Rust's own vtable for the per-object trait this emitter writes,
+            // the shape a closure already takes (`Rc<dyn Fn(..)>`).
+            Type::Dyn(trait_id, arguments) => {
+                let object = self.ensure_object_trait(trait_id, &arguments, span)?;
+                Ok(format!("vilan_rt::Dyn<dyn {}>", object.name))
+            }
             // A generic the substitution did not reach. The refusal names the
             // PARAMETER, because which one went unbound is the whole diagnosis
             // when it happens.
@@ -3154,6 +3204,29 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// own `__clone` decision, read here so the two backends copy in exactly
     /// the same places rather than in two opinions of the same places.
     fn value_of(&mut self, id: Id, depth: usize) -> Result<String, Error> {
+        let text = self.value_of_unerased(id, depth)?;
+        self.erase_into_object(id, text)
+    }
+
+    /// A124 R3: a concrete value landing in a `dyn`-typed position becomes the
+    /// object here — AFTER every copy the position owes has been applied to
+    /// the value, so what the pointer takes is the copy rather than a moved
+    /// original (the JS emitter builds its pair at the same point for the same
+    /// reason). The `Rc<Concrete>` coerces to `Rc<dyn ObjectX>` at
+    /// `Dyn::new`'s argument, which is the whole erasure.
+    fn erase_into_object(&mut self, id: Id, text: String) -> Result<String, Error> {
+        let Some((subject, trait_id, arguments)) = self.program.dyn_coercions.get(&id).cloned()
+        else {
+            return Ok(text);
+        };
+        let span = self.span_of(id);
+        let object = self.ensure_object_impl(subject, trait_id, &arguments, span)?;
+        Ok(format!(
+            "vilan_rt::Dyn::<dyn {object}>::new(std::rc::Rc::new({text}))"
+        ))
+    }
+
+    fn value_of_unerased(&mut self, id: Id, depth: usize) -> Result<String, Error> {
         // B109: a `&place` and a `borrows` CALL are leaves that name storage
         // without being places, and in a VALUE position both are read THROUGH —
         // which is rule 1's copy. `element-clones.vl` states the claim in its
@@ -6487,6 +6560,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Ok(format!("{path}({})", arguments.join(", ")));
         }
 
+        // A124 R3: `o.member(..)` where `o` is a trait OBJECT — a slot call.
+        if let Some(member) = self.program.dyn_method_calls.get(&call_id).copied() {
+            let receiver_type = function_call
+                .argument_ids
+                .first()
+                .and_then(|receiver| self.type_of(*receiver))
+                .ok_or_else(|| {
+                    unsupported("a call through an object whose receiver has no type", span)
+                })?;
+            return self.object_call(
+                receiver_type,
+                member,
+                &function_call.argument_ids,
+                depth,
+                span,
+            );
+        }
+
         // `T::member(..)` inside a monomorphized body, and `value.method()` on
         // a value whose type IS a bounded `T`: the analyzer could not pin the
         // callee, so it recorded how to re-resolve it at each instantiation.
@@ -6998,6 +7089,387 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// FRONT-END rule, and a program that reaches emission has already been
     /// held to it — re-asking it here with no `current_admitting_file` to
     /// supply would refuse a member the analyzer admitted.
+    /// A124 R3: the Rust trait an object type `dyn Trait<args>` lowers to,
+    /// written once per concrete argument list.
+    ///
+    /// ```rust,ignore
+    /// trait ObjectSource_12_0: vilan_rt::Js + vilan_rt::Json {
+    ///     fn get(&self) -> i32;
+    ///     fn on_change(&self, observer: std::rc::Rc<dyn Fn(i32)>) -> Subscription_40;
+    /// }
+    /// ```
+    ///
+    /// The slots are the members a call reaches THROUGH an object of this
+    /// trait (`dyn_dispatched_members`, the set the JS table is built from),
+    /// so a read-only `dyn Source<i32>` carries `get` alone. `Js` and `Json`
+    /// are supertraits so the object prints and serializes as the JS pair
+    /// does — `[ value, {} ]` — through the value it erased.
+    ///
+    /// Three member shapes are refused BY NAME rather than lowered: a `&mut
+    /// self` slot (the pointer is counted, so a write through one copy would
+    /// reach every copy — the JS backend copies the pair instead, and this
+    /// backend has no copy-on-write for an unsized value yet), an async
+    /// member (a slot answering a future is the executor's `Boxed`, not built
+    /// for objects), and a view-returning one.
+    fn ensure_object_trait(
+        &mut self,
+        trait_id: Id,
+        arguments: &[TypeId],
+        span: Span,
+    ) -> Result<ObjectTrait, Error> {
+        let arguments: Vec<TypeId> = arguments
+            .iter()
+            .map(|argument| self.concrete(*argument))
+            .collect();
+        let key: Vec<String> = arguments
+            .iter()
+            .map(|argument| self.type_key(*argument))
+            .collect();
+        if let Some(object) = self.object_traits.get(&(trait_id, key.clone())) {
+            return Ok(object.clone());
+        }
+        let trait_ = self
+            .program
+            .traits
+            .get(&trait_id)
+            .cloned()
+            .ok_or_else(|| unsupported("an object over an unresolved trait", span))?;
+        let sequence = self
+            .object_traits
+            .keys()
+            .filter(|(existing, _)| *existing == trait_id)
+            .count();
+        let name = format!("Object{}_{}_{sequence}", sanitize(trait_.name), trait_id.0);
+        let slot = self.next_type_slot;
+        self.next_type_slot += 1;
+        // Recorded BEFORE the slots render: a slot may name this very object
+        // type (`fun next(self): Option<dyn Src>`), and the recursion has to
+        // find the name rather than mint a second trait.
+        self.object_traits.insert(
+            (trait_id, key.clone()),
+            ObjectTrait {
+                name: name.clone(),
+                slots: Vec::new(),
+            },
+        );
+        let mut members: Vec<&'src str> = self
+            .program
+            .dyn_dispatched_members
+            .iter()
+            .filter(|(object_trait, _)| *object_trait == trait_id)
+            .map(|(_, member)| *member)
+            .collect();
+        members.sort_unstable();
+        members.dedup();
+        let entries = self.nominal_entries(&trait_.generic_parameter_constraint_ids, &arguments);
+        let saved = self.enter_substitution(entries);
+        let mut slots = Vec::new();
+        let mut failure = None;
+        for member in members {
+            match self.object_slot(trait_id, member, span) {
+                Ok(Some(slot)) => slots.push(slot),
+                Ok(None) => {}
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        self.current_substitution = saved;
+        if let Some(error) = failure {
+            self.object_traits.remove(&(trait_id, key));
+            return Err(error);
+        }
+        let mut out = String::new();
+        let _ = writeln!(out, "trait {name}: vilan_rt::Js + vilan_rt::Json {{");
+        for slot in &slots {
+            let _ = writeln!(out, "    {};", slot.signature);
+        }
+        let _ = writeln!(out, "}}");
+        self.types.insert(slot, out);
+        let object = ObjectTrait { name, slots };
+        self.object_traits.insert((trait_id, key), object.clone());
+        Ok(object)
+    }
+
+    /// One slot of an object trait, rendered under the object's substitution
+    /// (already installed), or `None` for a member no table can hold — a
+    /// generic one or one naming `Self`, which the analyzer refuses at every
+    /// call, so a bound's over-approximation never makes it a slot.
+    fn object_slot(
+        &mut self,
+        trait_id: Id,
+        member: &str,
+        span: Span,
+    ) -> Result<Option<ObjectSlot>, Error> {
+        let Some((declaration, declaring_trait, chain)) =
+            object_member_declaration(self.program, trait_id, member)
+        else {
+            return Ok(None);
+        };
+        let Some(function) = self.program.functions.get(&declaration).cloned() else {
+            return Ok(None);
+        };
+        if !function.generic_parameter_constraint_ids.is_empty() {
+            return Ok(None);
+        }
+        let names_self = function.return_type_id.is_some_and(|type_id| {
+            matches!(
+                self.program.type_id_to_type_map.get(&type_id),
+                Some(Type::Trait(mentioned, _)) if *mentioned == declaring_trait
+            )
+        });
+        if names_self {
+            return Ok(None);
+        }
+        let Some((receiver, rest)) = function.parameters.split_first() else {
+            return Ok(None);
+        };
+        let Some(receiver) = self.program.parameters.get(receiver).cloned() else {
+            return Ok(None);
+        };
+        if receiver.name != "self" {
+            return Ok(None);
+        }
+        let trait_name = self
+            .program
+            .traits
+            .get(&declaring_trait)
+            .map(|trait_| trait_.name)
+            .unwrap_or("the trait");
+        if self.receiving_form(&receiver) == Receiving::RefMut {
+            return Err(unsupported(
+                &format!(
+                    "`{trait_name}::{member}` through a `dyn` object (a `&mut self` slot: the \
+                     object's pointer is counted, and a write through one copy would reach \
+                     every copy)"
+                ),
+                span,
+            ));
+        }
+        if self.program.async_functions.contains(&declaration) {
+            return Err(unsupported(
+                &format!("the async member `{trait_name}::{member}` through a `dyn` object"),
+                span,
+            ));
+        }
+        if function.returns_view || function.returns_mut_view {
+            return Err(unsupported(
+                &format!(
+                    "the view-returning member `{trait_name}::{member}` through a `dyn` object"
+                ),
+                span,
+            ));
+        }
+        // A member a SUPERTRAIT declares is written in that trait's terms, and
+        // the chain's `with` clauses say what its parameters are here.
+        let saved = self.enter_substitution(chain);
+        let rendered = self.object_slot_signature(member, rest, &function, span);
+        self.current_substitution = saved;
+        let (signature, forwarded) = rendered?;
+        Ok(Some(ObjectSlot {
+            member: member.to_string(),
+            declaration,
+            signature,
+            forwarded,
+        }))
+    }
+
+    fn object_slot_signature(
+        &mut self,
+        member: &str,
+        parameters: &[Id],
+        function: &vilan_core::analyzer::Function<'src>,
+        span: Span,
+    ) -> Result<(String, Vec<String>), Error> {
+        let mut rendered = vec!["&self".to_string()];
+        let mut forwarded = Vec::new();
+        for parameter in parameters {
+            // A trait method with no body takes no binding patterns, so the
+            // by-value binder's `mut` (H9's local copy) is dropped here; the
+            // impl forwards the value to a function that declares its own.
+            let declaration = self.parameter_declaration(*parameter, span)?;
+            let declaration = declaration
+                .strip_prefix("mut ")
+                .unwrap_or(&declaration)
+                .to_string();
+            forwarded.push(self.binding_name(*parameter));
+            rendered.push(declaration);
+        }
+        let returned = match self.return_type_of(function) {
+            Some(type_id) => {
+                self.expects_async = self.program.async_returning.contains(&function.id);
+                let returned = self.rust_type(type_id, span);
+                self.expects_async = false;
+                returned?
+            }
+            None => "()".to_string(),
+        };
+        Ok((
+            format!(
+                "fn {}({}) -> {returned}",
+                sanitize(member),
+                rendered.join(", ")
+            ),
+            forwarded,
+        ))
+    }
+
+    /// A124 R3: `impl ObjectX for Concrete`, written the first time a value of
+    /// `Concrete` is erased into the object — each slot calls the member B57's
+    /// ranking selects for that type under the object's trait (trait-objects.md
+    /// §9.1: the table carries the WINNERS, so an impl's override of a default
+    /// is what the slot runs).
+    fn ensure_object_impl(
+        &mut self,
+        subject: TypeId,
+        trait_id: Id,
+        arguments: &[TypeId],
+        span: Span,
+    ) -> Result<String, Error> {
+        let object = self.ensure_object_trait(trait_id, arguments, span)?;
+        let subject = self.concrete(subject);
+        let rendered_subject = self.rust_type(subject, span)?;
+        if !self
+            .object_impls
+            .insert((object.name.clone(), rendered_subject.clone()))
+        {
+            return Ok(object.name);
+        }
+        let arguments: Vec<TypeId> = arguments
+            .iter()
+            .map(|argument| self.concrete(*argument))
+            .collect();
+        let mut out = String::new();
+        let _ = writeln!(out, "impl {} for {rendered_subject} {{", object.name);
+        for slot in &object.slots {
+            let preferred = Some((trait_id, arguments.clone()));
+            let dispatch = self.resolve_dispatch(subject, &slot.member, &[], preferred, span)?;
+            let Some(NativeDispatch::Call(function_name)) = dispatch else {
+                self.object_impls
+                    .remove(&(object.name.clone(), rendered_subject.clone()));
+                return Err(unsupported(
+                    &format!(
+                        "`{}` through a `dyn` object on `{rendered_subject}` (its member is not an \
+                         emitted function — an intrinsic or a host binding)",
+                        slot.member
+                    ),
+                    span,
+                ));
+            };
+            let target = self.instance_target(&function_name);
+            let target_parameters: Vec<Id> = target
+                .and_then(|target| self.program.functions.get(&target))
+                .map(|function| function.parameters.clone())
+                .unwrap_or_default();
+            let receiver = match target_parameters
+                .first()
+                .and_then(|parameter| self.program.parameters.get(parameter))
+                .map(|parameter| self.receiving_form(parameter))
+            {
+                Some(Receiving::Ref) => "self".to_string(),
+                Some(Receiving::ByValue) => "self.clone()".to_string(),
+                _ => {
+                    self.object_impls
+                        .remove(&(object.name.clone(), rendered_subject.clone()));
+                    return Err(unsupported(
+                        &format!(
+                            "`{}` through a `dyn` object on `{rendered_subject}` (the member's \
+                             receiver is neither a loan nor a copy)",
+                            slot.member
+                        ),
+                        span,
+                    ));
+                }
+            };
+            if target_parameters.len() != slot.forwarded.len() + 1 {
+                self.object_impls
+                    .remove(&(object.name.clone(), rendered_subject.clone()));
+                return Err(unsupported(
+                    &format!(
+                        "`{}` through a `dyn` object on `{rendered_subject}` (the implementation \
+                         takes {} parameters where the declaration takes {})",
+                        slot.member,
+                        target_parameters.len(),
+                        slot.forwarded.len() + 1
+                    ),
+                    span,
+                ));
+            }
+            let mut forwarded = vec![receiver];
+            forwarded.extend(slot.forwarded.iter().cloned());
+            let _ = writeln!(out, "    {} {{", slot.signature);
+            let _ = writeln!(out, "        {function_name}({})", forwarded.join(", "));
+            let _ = writeln!(out, "    }}");
+        }
+        let _ = writeln!(out, "}}");
+        let slot = self.next_type_slot;
+        self.next_type_slot += 1;
+        self.types.insert(slot, out);
+        Ok(object.name)
+    }
+
+    /// A call through an object's table: `ObjectX::member(o.object(), ..)`.
+    ///
+    /// The receiver is rendered as the PLACE it is — the object is read, never
+    /// copied, to make a call — and the rest of the arguments against the
+    /// DECLARATION's conventions, which are the slot's.
+    fn object_call(
+        &mut self,
+        receiver_type: TypeId,
+        member: &str,
+        argument_ids: &[Id],
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        let receiver_type = self.concrete(receiver_type);
+        let Some(Type::Dyn(trait_id, arguments)) = self.resolve(receiver_type).cloned() else {
+            return Err(unsupported(
+                "a call through an object whose receiver is not one",
+                span,
+            ));
+        };
+        let object = self.ensure_object_trait(trait_id, &arguments, span)?;
+        let Some(slot) = object
+            .slots
+            .iter()
+            .find(|slot| slot.member == member)
+            .cloned()
+        else {
+            return Err(unsupported(
+                &format!(
+                    "`{member}` through a `dyn` object (no call to it through an object was \
+                     recorded, so its table has no slot for it)"
+                ),
+                span,
+            ));
+        };
+        let Some((receiver_id, _)) = argument_ids.split_first() else {
+            return Err(unsupported(
+                "a call through an object with no receiver",
+                span,
+            ));
+        };
+        let receiver = self.expression(*receiver_id, depth)?;
+        let mut prelude = String::new();
+        let mut rendered =
+            self.call_arguments(slot.declaration, argument_ids, depth, &mut prelude)?;
+        if !rendered.is_empty() {
+            rendered.remove(0);
+        }
+        let mut parts = vec![format!("({receiver}).object()")];
+        parts.extend(rendered);
+        Ok(Self::with_argument_prelude(
+            prelude,
+            format!(
+                "{}::{}({})",
+                object.name,
+                sanitize(member),
+                parts.join(", ")
+            ),
+        ))
+    }
+
     fn resolve_dispatch(
         &mut self,
         type_id: TypeId,
@@ -7007,6 +7479,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
         span: Span,
     ) -> Result<Option<NativeDispatch>, Error> {
         let type_id = self.concrete(type_id);
+        // A124 R3, the blanket as a dispatch rule: a generic body whose
+        // parameter bound to an OBJECT reaches the object's own trait members
+        // through its table. A member some BLANKET provides is not a slot and
+        // falls through to the selection below, where the blanket applies with
+        // the object as its subject.
+        if let Some(Type::Dyn(trait_id, _)) = self.resolve(type_id).cloned()
+            && object_member_declaration(self.program, trait_id, member).is_some()
+        {
+            return Ok(Some(NativeDispatch::Object(type_id, member.to_string())));
+        }
         if let Some((trait_id, written)) = preferred_trait {
             let arguments: Vec<TypeId> = written
                 .iter()
@@ -7093,7 +7575,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
     fn selectable_receiver(&self, type_id: TypeId) -> bool {
         matches!(
             self.program.type_id_to_type_map.get(&type_id),
-            Some(Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..))
+            Some(
+                Type::Struct(..)
+                    | Type::Enum(..)
+                    | Type::Tuple(..)
+                    | Type::Array(..)
+                    | Type::Dyn(..)
+            )
         )
     }
 
@@ -7157,6 +7645,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
         match dispatch {
             NativeDispatch::Intrinsic(intrinsic) => {
                 self.emit_intrinsic(intrinsic, argument_ids, depth, span)
+            }
+            NativeDispatch::Object(receiver_type, member) => {
+                self.object_call(receiver_type, &member, argument_ids, depth, span)
             }
             NativeDispatch::Call(name) => {
                 // The callee is known by id only inside `dispatch_to_member`;
@@ -7592,6 +8083,49 @@ enum NativeDispatch {
     /// host tables at [`Emitter::emit_dispatch`] where the call's arguments are
     /// in hand.
     Host(Id),
+    /// A124 R3: a call through an OBJECT's table — the receiver's `dyn` type
+    /// and the member.
+    Object(TypeId, String),
+}
+
+/// A124 R3: `member` as the object's trait or one of its supertraits DECLARES
+/// it — the declaration, the declaring trait, and the substitution the chain's
+/// `with` clauses make for that trait's own parameters (`trait Signal<T> with
+/// Source<T>` reaches `Source`'s `T` at `Signal`'s).
+fn object_member_declaration(
+    program: &Program<'_>,
+    trait_id: Id,
+    member: &str,
+) -> Option<(Id, Id, Vec<(TypeId, TypeId)>)> {
+    let mut stack: Vec<(Id, Vec<(TypeId, TypeId)>)> = vec![(trait_id, Vec::new())];
+    let mut seen: HashSet<Id> = HashSet::new();
+    while let Some((id, chain)) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let trait_ = program.traits.get(&id)?;
+        if let Some(declaration) = trait_.declarations.get(member) {
+            return Some((*declaration, id, chain));
+        }
+        for supertrait_type_id in &trait_.supertraits {
+            if let Some(Type::Trait(super_id, super_arguments)) =
+                program.type_id_to_type_map.get(supertrait_type_id)
+            {
+                let mut extended = chain.clone();
+                if let Some(supertrait) = program.traits.get(super_id) {
+                    extended.extend(
+                        supertrait
+                            .generic_parameter_constraint_ids
+                            .iter()
+                            .copied()
+                            .zip(super_arguments.iter().copied()),
+                    );
+                }
+                stack.push((*super_id, extended));
+            }
+        }
+    }
+    None
 }
 
 /// Whether an intrinsic MUTATES the value its receiver names — the set whose
@@ -7835,6 +8369,7 @@ fn describe(resolved: &Type) -> String {
         Type::Never => "never".to_string(),
         Type::Mapped(_, _, _) => "a mapped tuple".to_string(),
         Type::Trait(_, _) => "a trait object".to_string(),
+        Type::Dyn(_, _) => "a `dyn` trait object".to_string(),
         Type::Function(_) => "a function value".to_string(),
         Type::Module(_) => "a module".to_string(),
         Type::Unknown | Type::Unresolved => "an unresolved type".to_string(),

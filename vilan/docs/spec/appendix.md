@@ -26,11 +26,11 @@ top-tier-only forms: `const expr` and struct initializers (§3.8).
 ## A.2 Reserved words
 
 ```text
-async     await     borrows  const   css    else    enum  export
-external  for       fun      if      impl   import  in    is
-jump      lazy      let      macro   match  mod     mut   null
-own       resource  ret      struct  trait  type    use   with
-true      false
+async     await     borrows  const   css    dyn     else  enum
+export    external  for      fun     if     impl    import in
+is        jump      lazy     let     macro  match   mod   mut
+null      own       resource ret     struct trait   type  use
+with      true      false
 ```
 
 Contextual (identifier everywhere else): `context`, `sync`, `void`,

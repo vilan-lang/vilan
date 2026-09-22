@@ -13190,7 +13190,12 @@ pub(crate) mod tests {
 
     #[test]
     fn b184_a_trait_typed_field_paints_as_an_interface_and_hovers_as_the_bound() {
-        let text = "trait X {\n\tfun who(self): str;\n}\n\nstruct A {}\n\nimpl A with X {\n\tfun who(self): str {\n\t\t\"A\"\n\t}\n}\n\nstruct C {\n\tx: X,\n}\n\nstruct D {\n\ta: A,\n}\n";
+        // A124 R3 withdrew the BARE spelling at a field; the annotation is
+        // `dyn X` now, and §R4.2's argument is asked of it — the trait name
+        // inside the `dyn` still paints `interface` where a struct name in the
+        // same position paints `struct`, so the reader can still tell a bound
+        // from a type without a keyword to look at.
+        let text = "trait X {\n\tfun who(self): str;\n}\n\nstruct A {}\n\nimpl A with X {\n\tfun who(self): str {\n\t\t\"A\"\n\t}\n}\n\nstruct C {\n\tx: dyn X,\n}\n\nstruct D {\n\ta: A,\n}\n";
         let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
         let tokens = document.semantic_tokens();
         let kind_at = |at: usize, len: usize| -> Option<TokenKind> {
@@ -13205,7 +13210,7 @@ pub(crate) mod tests {
         // The two annotations, in the SAME position, one line apart in shape:
         // the trait paints `interface`, the struct paints `struct`. That is the
         // whole of §R4.2's argument for the bare grammar.
-        let trait_annotation = text.find("x: X").unwrap() + "x: ".len();
+        let trait_annotation = text.find("x: dyn X").unwrap() + "x: dyn ".len();
         let struct_annotation = text.find("a: A").unwrap() + "a: ".len();
         assert_eq!(
             kind_at(trait_annotation, 1),
@@ -13217,8 +13222,8 @@ pub(crate) mod tests {
             Some(TokenKind::Struct),
             "{tokens:?}"
         );
-        // And hover on the annotation answers with the trait — the bound is what
-        // the author wrote and what the hidden parameter is quantified over.
+        // And hover on the annotation answers with the trait — the trait is
+        // what the author wrote and what the object erases to.
         let hover = document.hover(trait_annotation).unwrap_or_default();
         assert!(hover.contains('X'), "hover on the annotation: {hover:?}");
     }
@@ -13244,12 +13249,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn b184_an_inlay_hint_on_a_trait_typed_struct_shows_the_hidden_argument() {
-        // The display rule where a reader meets it most often. An unannotated
-        // binding's hint is the value's type, and the value's type is `C<A>` —
-        // B186's trait-name display would have printed a bare `C` here, which
-        // says nothing about which `C` the binding holds.
-        let text = "trait X {\n\tfun who(self): str;\n}\n\nstruct A {}\n\nimpl A with X {\n\tfun who(self): str {\n\t\t\"A\"\n\t}\n}\n\nstruct C {\n\tx: X,\n}\n\nfun main() {\n\tlet holder = C { x = A {} };\n}\n";
+    fn b184_an_inlay_hint_on_an_object_field_struct_shows_one_type() {
+        // The display rule where a reader meets it most often, re-asked under
+        // A124 R3. Under B184's sugar the hint read `: C<A>` — the hidden
+        // argument, because a `C` over an `A` and a `C` over a `B` were two
+        // types. An object field makes `C` ONE type whatever it holds, so the
+        // honest hint is `: C`, and the simplification is visible exactly here.
+        let text = "trait X {\n\tfun who(self): str;\n}\n\nstruct A {}\n\nimpl A with X {\n\tfun who(self): str {\n\t\t\"A\"\n\t}\n}\n\nstruct C {\n\tx: dyn X,\n}\n\nfun main() {\n\tlet holder = C { x = A {} };\n}\n";
         let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
         let hints = document.inlay_hints();
         let at = text.find("holder").unwrap() + "holder".len();
@@ -13258,7 +13264,7 @@ pub(crate) mod tests {
                 .iter()
                 .find(|(offset, _)| *offset == at)
                 .map(|(_, label)| label.clone()),
-            Some(": C<A>".to_string()),
+            Some(": C".to_string()),
             "{hints:?}"
         );
     }

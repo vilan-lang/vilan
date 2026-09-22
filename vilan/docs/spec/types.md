@@ -577,59 +577,26 @@ and at a binding alike.
 
 ### A trait annotation on a struct field
 
-A struct field's annotation is the third position, and it is the
-parameter's reading moved onto the struct: a trait written here is a
-**hidden type parameter** of the struct, bounded by that trait.
+A struct field's annotation is the third position a trait name can reach,
+and there it is **refused**, with a steer to the trait object:
 
 ```
-struct Store { count: Signal<i32> }   // == struct Store<S: Signal<i32>> { count: S }
+struct Store { count: Signal<i32> }       // error: a field holds a value
+struct Store { count: dyn Signal<i32> }   // one type, whatever it holds (§5.12)
+struct Store<S: Signal<i32>> { count: S } // or the parameter, written
 ```
 
-One hidden parameter per such field, appended after every parameter the
-declaration writes. The author never writes it and never writes an
-argument for it: `Store` is really `Store<impl Signal<i32>>`, and the
-argument comes from a **value**.
-
-- A struct **literal** grounds it, exactly as it grounds a written
-  parameter: `Store { count = SignalCell::new(1) }` is a `Store<SignalCell<i32>>`,
-  and reading `.count`'s members reaches `SignalCell`'s own.
-- Two literals may ground it differently. `let a = Store { count = SignalCell::new(1) }`
-  and `let b = Store { count = OtherCell::new(2) }` in one scope are two
-  types, both legal — the same per-binding answer a `let` annotation and a
-  parameter annotation already give. Reassigning one to the other is the
-  ordinary mismatch it would be for any two types, and the report names the
-  hidden argument: `Expected Store<SignalCell<i32>>, but got
-  Store<OtherCell<i32>> instead.`
-- A **parameter** whose annotation is such a struct mints a fresh implicit
-  generic for it, so `fun read(s: Store): i32` is generic and accepts both
-  of the values above. Two mentions in one signature are two independent
-  hidden arguments, as two trait-typed parameters are.
-- A **field of another struct** makes that struct hidden-generic in turn:
-  `struct Outer { store: Store }` is `struct Outer<S: Signal<i32>> { store: Store<S> }`.
-  The genericity is viral in exactly the way a written parameter's is.
-- An **`impl` subject** grounds it the way `impl Store<type S>` would:
-  `impl Store { … }` is generic over the hidden parameter, and `Self` is
-  `Store<S>`.
-- A **binding's** annotation grounds nothing, so it reads as a binding
-  annotation always does — a constraint on the initializer's own type.
-  `let s: Store = Store { count = … }` keeps `Store<SignalCell<i32>>`.
-
-Every other position is refused **at the annotation**, because it holds no
-value to take the argument from: a return type (`fun get(): Store`), a
-type argument (`Context<Store>`), and any nested spelling. Writing the
-argument is refused too — the hidden parameter is not part of the written
-arity, so `Store<SignalCell<i32>>` is over-supply; a declaration that wants
-to be named with its argument writes the parameter instead.
-
-The reading is the parameter's in one further respect: it applies to the
-field's OWN annotation, never to a trait nested inside one
-(`List<Display>`).
-
-**Not on an attributed declaration.** A `[derive(..)]`, `[service(..)]` or
-user macro attribute generates code from the types the declaration
-**wrote**, and a hidden parameter is written nowhere, so a field of such a
-declaration keeps the refusal and its steer says so. Name the
-implementation there, or write the parameter.
+A field is part of a type every value of the struct shares, so the two
+readings the other positions give do not fit it: a binding's constraint
+has no initializer to keep, and a parameter's implicit generic would be a
+parameter of the STRUCT that no one wrote — grounded per literal, so a
+struct over one implementation and the same struct over another would be
+two types that no one list could hold, and viral through every struct that
+embeds one. `dyn Trait` is the value the field wants when what varies is
+the implementation; a written parameter is the answer when one instance
+should keep its concrete type. The refusal is the same on an attributed
+(`[derive(..)]`, `[service(..)]`) declaration, where `dyn Trait` is a
+spelling a generator can read.
 
 ### Associated functions
 
@@ -1326,3 +1293,65 @@ parameter still abstract, so a pattern inside it was not checked at all.
 Both call paths now bind from the non-closure arguments and defer before
 typing any closure, so the substitution has landed by the time the body
 is read.)*
+
+## 5.12 Trait objects (`dyn Trait`)
+
+`dyn Trait` is a **trait object**: a value whose concrete type has been
+erased, carrying its trait's members in a table beside it. It is a type in
+its own right and may stand wherever a type stands — a `let` annotation, a
+parameter, a struct field, an element type, a generic argument.
+
+The keyword is **required**. A bare trait name in a value position is an
+error (§5.11); a trait object is written out, because coercing a value into
+one changes which member a call runs: a vtable holds the trait's tier, and
+an inherent member of the same name outranks the trait's on a concrete
+receiver (§5.7).
+
+**Object safety.** `dyn Trait` is legal only when every member the trait
+*requires* — one with no default body — can occupy a table slot:
+
+- it takes a receiver (`self`). A static has nothing to select an
+  implementation with;
+- it names no `Self` in its signature. Neither side can be supplied or
+  received once the type is gone;
+- it is not generic. One slot cannot hold an unbounded family of
+  specializations.
+
+A trait's **default** members are not slots: a default body is the
+trait's own code and reaches the object through the same two rules a
+blanket over `T: Trait` does. A trait whose supertrait is not
+object-safe is not object-safe either.
+
+A member that is generic, or that names `Self`, is unreachable *through*
+an object even when the trait is object-safe; the call is refused by
+name, and the fix is a generic parameter, where the type is known.
+
+**Coercion is explicit and positional.** A value becomes an object only
+where the position's type is a `dyn`: an annotated binding, a parameter,
+a field, an element of a list whose element type is a `dyn`. There is no
+implicit coercion between two concrete types, and no coercion out of an
+object: a `dyn Trait` never narrows back to the type it erased.
+
+**Resources.** A `resource` value may not be coerced into a trait object.
+Teardown through a table would make the destructor dynamic where the rest
+of the language keeps it static (memory.md R7/R10), so the coercion is
+refused and the resource is held in a struct field of its own.
+
+**What reaches an object.** The members its trait and that trait's
+supertraits declare, through the table. Beyond those, only what is written
+over a *bound* the object satisfies: a blanket impl (`impl type S: Trait {
+.. }`, or `impl type S: Trait with Other`) and a generic function over
+`S: Trait`, each with `S` bound to the object. Nothing else the erased value
+implements is reachable — not an inherent member, not another trait's
+member, and not another trait's bound: `dyn Shape` does not satisfy `T:
+Named` because the value it holds happens to.
+
+**Copies.** A trait object is a value, and copying one copies what it
+erased (§6.1, rule 1), exactly as the concrete value would be copied.
+
+**Asyncness.** A call through an object is compiled once, against the
+member's *declaration*, for every value the object may hold — so the
+declaration's asyncness binds there, where through a generic bound an
+implementation may differ from it. A value whose implementation of a member is `async`
+cannot be coerced into an object whose trait declares that member sync; an
+`async` declaration admits both.

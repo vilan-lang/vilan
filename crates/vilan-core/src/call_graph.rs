@@ -1006,6 +1006,17 @@ fn resolve_target(program: &Program, call_id: Id) -> CallTarget {
     // by the call id (an instance method call on a generic-bounded receiver, or an
     // `OnType` re-dispatch) — the transformer checks both, so this must too, or an
     // instance dispatch is mistaken for a direct call to the trait's signature.
+    // A124 R3: a call through a trait OBJECT's table reaches whichever
+    // implementation the object holds at run time — every implementation of
+    // the member is a candidate, exactly as for a bound's dispatch. Recording
+    // it as a direct call to the trait's declaration (the member the analyzer
+    // resolved) hid every body behind it from the graph: a module-level
+    // binding read only by `SignalCell::on_change`, reached only through a
+    // `dyn Source`, was pruned from the build and the table's slot threw
+    // `ReferenceError` at its first call.
+    if program.dyn_method_calls.contains_key(&call_id) {
+        return CallTarget::Indirect(IndirectReason::TraitDispatch);
+    }
     for key in [call_id, function_call.subject_id] {
         match program.generic_dispatch.get(&key) {
             Some(GenericDispatch::OnConstraint(..)) => {

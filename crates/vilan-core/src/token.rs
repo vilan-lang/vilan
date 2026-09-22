@@ -64,6 +64,11 @@ pub enum Token<'src> {
     Type,
     Use,
     With,
+    // `dyn Trait` — the TRAIT OBJECT marker in type position (A124 R3,
+    // trait-objects.md §7.2's explicit spelling). A keyword rather than a
+    // contextual marker because the explicitness is the point: `dyn` must be
+    // impossible to write by accident and impossible to miss when reading.
+    Dyn,
 }
 
 impl std::fmt::Display for Token<'_> {
@@ -117,6 +122,7 @@ impl std::fmt::Display for Token<'_> {
             Token::Type => write!(f, "type"),
             Token::Use => write!(f, "use"),
             Token::With => write!(f, "with"),
+            Token::Dyn => write!(f, "dyn"),
         }
     }
 }

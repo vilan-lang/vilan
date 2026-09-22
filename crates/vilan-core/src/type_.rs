@@ -97,6 +97,14 @@ pub enum Type {
     // `Trait(readable_id, [U])`). The arguments drive parameterized-trait impl
     // selection and a mapped trait template's inversion.
     Trait(Id, Vec<TypeId>),
+    // B4/A124 R3: a TRAIT OBJECT — the erased pair `(value, vtable)` over a
+    // trait whose members are all dispatchable. `dyn Source<i32>` ->
+    // `Dyn(source_id, [i32])`, carrying exactly the arguments `Trait` carries.
+    //
+    // It is a VALUE type and `Trait` is not: that is the whole distinction
+    // §0 of trait-objects.md says the one representation was missing. Every
+    // reader that asks "is this a value" answers yes here and no there.
+    Dyn(Id, Vec<TypeId>),
     Tuple(Vec<TypeId>),
     // A fixed-length array `[T; n]` — the element type and a compile-time-known
     // length (`[i32; 4]` -> `Array(i32, 4)`). Unlike `List<T>` (a growable

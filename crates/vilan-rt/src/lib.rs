@@ -596,6 +596,74 @@ pub fn reference_eq<T: ReferenceEq + ?Sized>(left: &T, right: &T) -> bool {
     left.reference_eq(right)
 }
 
+// -------------------------------------------------------- trait objects ---
+
+/// `dyn Trait` (A124 R3): the FAT POINTER a trait object is natively — F1's
+/// shape, the one a closure already takes (`Rc<dyn Fn(..)>`), applied to a
+/// trait's table instead of a call signature.
+///
+/// `T` is always `dyn Object..`, a Rust trait the emitter writes per object
+/// type (the vilan trait at its arguments) with one method per slot, so the
+/// two words are the value pointer and Rust's own vtable for it. The table has
+/// the members a call reaches through an object and NO drop slot a vilan
+/// program can observe: an object holds no resource (refused at the coercion),
+/// so what the pointer's drop runs is the ordinary memory release the value
+/// would have had unerased.
+///
+/// Counted, because an object is COPIED like the value it erased and a copy
+/// that shares its pointee is only unobservable while nothing writes through
+/// one. Nothing can: the emitter refuses a `&mut self` slot by name, and every
+/// other member reads the value (`self`) or copies it first (`mut self`).
+pub struct Dyn<T: ?Sized> {
+    object: Rc<T>,
+}
+
+impl<T: ?Sized> Dyn<T> {
+    /// The erasure. `Rc<Concrete>` coerces to `Rc<dyn Object..>` at this
+    /// argument position, which is the whole of building the pair.
+    pub fn new(object: Rc<T>) -> Self {
+        Dyn { object }
+    }
+
+    /// The erased value, for a slot call (`ObjectSrc::get(x.object())`).
+    pub fn object(&self) -> &T {
+        &self.object
+    }
+}
+
+impl<T: ?Sized> Clone for Dyn<T> {
+    fn clone(&self) -> Self {
+        Dyn {
+            object: Rc::clone(&self.object),
+        }
+    }
+}
+
+/// `==` on an object is refused by the checker (a `dyn` implements no
+/// `PartialEq`); this exists so an aggregate HOLDING one can derive its own,
+/// and it is identity, the only equality two erased values have without one.
+impl<T: ?Sized> PartialEq for Dyn<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.object, &other.object)
+    }
+}
+
+/// On the JS backend the pair is `[ value, table ]` and the table carries its
+/// slots on its PROTOTYPE, so node prints it as `{}` and `JSON.stringify` as
+/// `{}` — both reproducible here, with the value rendered through the object's
+/// `Js` supertrait.
+impl<T: ?Sized + Js> Js for Dyn<T> {
+    fn js(&self) -> String {
+        js_tuple(&[self.object.js_nested(), "{}".to_string()])
+    }
+}
+
+impl<T: ?Sized + Json> Json for Dyn<T> {
+    fn json(&self) -> String {
+        json_array(&[self.object.json(), "{}".to_string()])
+    }
+}
+
 // ------------------------------------------------------------------ lazy ---
 
 /// `proposal/lazy.md` §5's memo cell — the ONE shape both lazy positions share

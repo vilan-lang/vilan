@@ -1331,6 +1331,17 @@ impl<'a> Interpreter<'a> {
                 }
                 Ok(Value::Array(Rc::new(RefCell::new(values))))
             }
+            // A124 R3's vtable, the one producer of an object literal: keys in
+            // written order, values evaluated left to right, exactly as the
+            // emitted JS evaluates them.
+            js::Node::Vtable(entries) => {
+                let mut object: IndexMap<Rc<str>, Value<'a>> = IndexMap::default();
+                for (name, value) in entries {
+                    let value = self.eval(value, env)?;
+                    object.insert(Rc::from(name.as_str()), value);
+                }
+                Ok(Value::Object(Rc::new(RefCell::new(object))))
+            }
             js::Node::Spread(_) => Err(Failure::internal("spread outside an array literal")),
             js::Node::Local(name) => self.eval_local(name, env),
             js::Node::Closure(closure) => {
