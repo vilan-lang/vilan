@@ -6424,3 +6424,115 @@ fn the_json_reader_refuses_a_list_longer_than_the_reads_at_its_close() {
         "refused:a list had 1 element(s) left unread\n",
     );
 }
+
+// --- B373: the scalar `FromJson` impls take the integer lanes' value check ---
+//
+// 2321790e gave the typed READER a whole-number rule and a non-negative rule
+// (`JsonReader::expect_integer`), and the scalar `from_json`/`from_json_value`
+// entry points went on parsing the document and handing the number through:
+// `i32::from_json("1.5")` answered `Ok(1.5)` — a value typed `i32` that is not
+// an integer — and `u32::from_json("-1")` answered `Ok(-1)`. One lane read two
+// ways, which is the shape of every hole in this file's history; the two now
+// share one predicate (`integer_lane_failure`).
+//
+// The derives ride on this: a `[derive(Json)]` field of type `i32` decodes
+// through `i32::from_json_value`, so a struct field is gated by the same rule.
+
+/// A fraction where an `i32` is asked for.
+#[test]
+fn b373_the_scalar_i32_from_json_refuses_a_fraction() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::FromJson;
+        fun main() {
+            match i32::from_json("1.5") {
+                Ok(let value) => print(i"read:{value}"),
+                Err(let reason) => print(i"refused:{reason}"),
+            }
+        }
+        "#,
+        "refused:expected a whole number, found 1.5\n",
+    );
+}
+
+/// A negative where a `u32` is asked for.
+#[test]
+fn b373_the_scalar_u32_from_json_refuses_a_negative() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::FromJson;
+        fun main() {
+            match u32::from_json("-1") {
+                Ok(let value) => print(i"read:{value}"),
+                Err(let reason) => print(i"refused:{reason}"),
+            }
+        }
+        "#,
+        "refused:expected a non-negative number, found -1\n",
+    );
+}
+
+/// The kind gate that was already there still fires, and still says what it
+/// said: the lane check is an addition, not a replacement.
+#[test]
+fn b373_the_scalar_i32_from_json_still_refuses_a_string_by_kind() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::FromJson;
+        fun main() {
+            match i32::from_json("\"x\"") {
+                Ok(let value) => print(i"read:{value}"),
+                Err(let reason) => print(i"refused:{reason}"),
+            }
+        }
+        "#,
+        "refused:expected a number\n",
+    );
+}
+
+/// A DERIVED type's field takes the same rule, because the derive decodes each
+/// field through its type's `from_json_value` — which is the reason this is
+/// worth closing rather than a curiosity about a scalar entry point.
+#[test]
+fn b373_a_derived_json_field_refuses_a_fraction_in_an_integer_lane() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::{ FromJson, Json };
+        [derive(Json)]
+        struct Row {
+            count: i32,
+        }
+        fun main() {
+            match Row::from_json("{\"count\":1.5}") {
+                Ok(let row) => print(i"read:{row.count}"),
+                Err(let reason) => print(i"refused:{reason}"),
+            }
+        }
+        "#,
+        "refused:expected a whole number, found 1.5\n",
+    );
+}
+
+/// The controls, and they come last so a passing run proves the lanes still
+/// READ rather than that they stopped: a whole number, a negative one in the
+/// signed lane, and a fraction in the float lane, which has no such rule.
+#[test]
+fn b373_the_scalar_lanes_still_read_what_they_are_for() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::json::FromJson;
+        fun main() {
+            print(i"i32:{i32::from_json(\"42\").unwrap_or(0)}");
+            print(i"i32:{i32::from_json(\"-7\").unwrap_or(0)}");
+            print(i"u32:{u32::from_json(\"9\").unwrap_or(0u32)}");
+            print(i"f64:{f64::from_json(\"1.5\").unwrap_or(0.0)}");
+        }
+        "#,
+        "i32:42\ni32:-7\nu32:9\nf64:1.5\n",
+    );
+}

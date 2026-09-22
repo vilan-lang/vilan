@@ -43,6 +43,14 @@ The two decode methods differ in what they take, not in what they answer:
 is the one to call when a value is nested inside another decode, and the
 one to write when implementing the trait by hand.
 
+The scalar lanes check the VALUE and not only the JSON kind, and it is the
+same rule the codec reader applies: an integer lane wants a whole number
+(`i32::from_json("1.5")` is `Err`), and an unsigned one wants a
+non-negative one (`u32::from_json("-1")` is `Err`). A derived type's field
+decodes through its own type's `from_json_value`, so a struct field gets
+the rule too. The magnitude is deliberately not checked: `i32`/`u32` are
+the runtime's numeric lanes rather than hardware widths.
+
 ```vilan
 import std::json::{ Json, FromJson, JsonValue, parse_json_value };
 import std::result::Result::{ self, Ok, Err };
