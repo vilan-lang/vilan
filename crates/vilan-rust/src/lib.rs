@@ -4151,7 +4151,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// went native). `if` had the same problem and answers it with `if let`;
     /// this is the same answer one level down:
     ///
-    ///     `p is Ok(let v) && f(v)`  →  `match p { Ok(v) => f(v), _ => false }`
+    /// ```text
+    /// `p is Ok(let v) && f(v)`  →  `match p { Ok(v) => f(v), _ => false }`
+    /// ```
     ///
     /// which is exactly what `&&` means when its left operand binds — the
     /// short-circuit IS the `_` arm, and B215's rule ("a capture binds nothing
@@ -5024,7 +5026,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// other backend reads, which is what keeps the two from having two
     /// opinions about which `next` a loop calls.
     ///
-    ///     `for x in r { .. }`  →  `{ let mut it = r; while let Some(x) = next(&mut it) { .. } }`
+    /// ```text
+    /// `for x in r { .. }`  →  `{ let mut it = r; while let Some(x) = next(&mut it) { .. } }`
+    /// ```
     ///
     /// `next` takes `&mut self`, so the iterator is a `mut` binding of its own
     /// and the receiver is a borrow of it: the loop ADVANCES the iterator, and
