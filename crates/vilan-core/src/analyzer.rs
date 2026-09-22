@@ -4106,6 +4106,14 @@ pub struct Analyzer<'src> {
     // stays because the LSP re-analyzes per keystroke and an unbounded entity
     // per deferral is a real cost.
     spread_packs: HashMap<Id, Vec<Id>>,
+    // B379 — how deep [`Analyzer::trait_args_for`] is inside its own
+    // blanket-grounding step. That step asks `bind_subject_bound_binders`,
+    // which asks `trait_args_for` again for the binder's own bound, so a pair
+    // of blankets that name each other's traits is a cycle. Four hops is more
+    // than any shape in the estate and the walk is LENIENT past it: an
+    // argument that stays abstract leaves the binder where it was, which is
+    // what happened for every shape before the grounding existed.
+    bound_argument_grounding_depth: u32,
     // proposal/lazy.md §1 — the three tables the `lazy` lowering needs, filled
     // by `record_lazy_arguments` once every call has resolved and read by the
     // transformer through their `Program` twins.
@@ -5882,6 +5890,7 @@ impl<'src> Analyzer<'src> {
             trait_qualified_calls: HashMap::default(),
             own_generic_call_bindings: HashMap::default(),
             spread_packs: HashMap::default(),
+            bound_argument_grounding_depth: 0,
             lazy_argument_thunks: IndexMap::default(),
             lazy_argument_forwards: HashSet::default(),
             lazy_cells: HashSet::default(),
@@ -35745,13 +35754,14 @@ impl<'src> Analyzer<'src> {
                     .map(|(_, arguments)| (implementation.subject, arguments.clone()))
             })
             .collect();
+        let mut first_match: Option<Vec<TypeId>> = None;
         for (subject_id, arguments) in candidates {
             let subject = subject_id.get_type(self);
             if let Some((_, bindings)) = self.reconcile_declaration(concrete, &subject, &subject) {
                 let mut binders = Vec::new();
                 self.collect_subject_binders(subject_id, &mut binders);
-                let context = self.bindings_for_binders(&binders, bindings);
-                let resolved = arguments
+                let mut context = self.bindings_for_binders(&binders, bindings);
+                let mut resolved: Vec<TypeId> = arguments
                     .iter()
                     .map(|argument| {
                         let argument_type = argument.get_type(self);
@@ -35759,10 +35769,60 @@ impl<'src> Analyzer<'src> {
                             .get_type_id(self)
                     })
                     .collect();
-                return Some(resolved);
+                // B379 — a BLANKET provider writes its trait arguments in
+                // binders its SUBJECT does not carry. `impl type S: Wrap<type T>
+                // with Feed<T>` provides `Feed<T>`, and `T` lives in `S`'s
+                // BOUND, not in the shape `S` matches — so the substitution
+                // above grounds `S` and hands `Feed<T>` back with `T` still
+                // abstract. A caller reading this to bind its own `T` from
+                // `S: Feed<T>` therefore bound nothing, and the parameter it
+                // could not determine was reported as missing the bound its own
+                // declaration carries. A NOMINAL provider never had the problem:
+                // `impl Box<type T> with Feed<T>` writes `T` in its subject.
+                //
+                // The binder is not free, though — the subject's own bound says
+                // the receiver implements `Wrap` AT it, so the receiver's impl
+                // of `Wrap` decides it, which is exactly what
+                // `bind_subject_bound_binders` grounds (the same act B299 wrote
+                // for an impl BODY's binders). Asked only when something is
+                // still abstract, so the common answer costs one scan of the
+                // list it just built.
+                if self.bound_argument_grounding_depth < 4
+                    && resolved
+                        .iter()
+                        .any(|argument| matches!(argument.get_type(self), Type::Generic(_)))
+                {
+                    self.bound_argument_grounding_depth += 1;
+                    self.bind_subject_bound_binders(subject_id, concrete, &mut context);
+                    self.bound_argument_grounding_depth -= 1;
+                    resolved = arguments
+                        .iter()
+                        .map(|argument| {
+                            let argument_type = argument.get_type(self);
+                            self.substitute_type(&argument_type, &context)
+                                .get_type_id(self)
+                        })
+                        .collect();
+                }
+                // A BLANKET subject reconciles with every receiver — its shape
+                // is a hole — so the first candidate to match is not
+                // necessarily the one that PROVIDES this trait for this type:
+                // `impl type S: Wrap<type T> with Feed<T>` matches a `Box2`
+                // that is no `Wrap` at all, and the grounding above then finds
+                // nothing to ground `T` with. A candidate whose arguments came
+                // out concrete answered the question; one that did not is kept
+                // only as the fallback, which is exactly what this returned
+                // before there was anything to prefer.
+                if !resolved
+                    .iter()
+                    .any(|argument| matches!(argument.get_type(self), Type::Generic(_)))
+                {
+                    return Some(resolved);
+                }
+                first_match.get_or_insert(resolved);
             }
         }
-        None
+        first_match
     }
 
     /// The half of a receiver/subject reconciliation that grounds an impl's

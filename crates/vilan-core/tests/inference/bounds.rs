@@ -11623,3 +11623,109 @@ fn b378_a_bounded_binder_still_outranks_an_unbounded_one() {
         "named\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B379 — a generic reachable only through a BLANKET provider's trait argument
+// ---------------------------------------------------------------------------
+//
+// `trait_args_for` answers "what arguments does this concrete type provide for
+// that trait", by matching the type against the providing impl's SUBJECT and
+// substituting the impl's recorded trait arguments through the bindings that
+// match produced. A blanket writes its trait arguments in binders its subject
+// does not carry — `impl type S: Wrap<type T> with Feed<T>` provides `Feed<T>`
+// where `T` lives in `S`'s BOUND — so the substitution grounded `S` and handed
+// `Feed<T>` back with `T` still abstract. A caller binding its own `T` from
+// `S: Feed<T>` bound nothing, and the parameter it could not determine was then
+// reported as missing the bound its own declaration carries. A NOMINAL provider
+// never had the problem, which is the control below.
+
+/// The isolated pair: one trait, two providers, one call.
+#[test]
+fn b379_a_blanket_providers_trait_argument_binds_the_callers_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+
+        trait Wrap<T> { fun unwrap(self): T; }
+        trait Feed<T> { fun feeds(self): bool; }
+
+        struct Box1<T> { value: T }
+        impl Box1<type T> with Wrap<T> { fun unwrap(self): T { self.value } }
+
+        // The BLANKET provider: `T` is written in the subject's BOUND only.
+        impl type S: Wrap<type T> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        struct Box2<T> { value: T }
+
+        // The NOMINAL provider, which always bound: `T` is in the subject.
+        impl Box2<type T> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        fun through_a_bound<T: PartialEq, S: Feed<T>>(source: S): bool {
+            source.feeds()
+        }
+
+        fun main() {
+            let nominal = Box2 { value = 5 };
+            let blanket = Box1 { value = 7 };
+            print(through_a_bound(nominal));
+            print(through_a_bound(blanket));
+        }
+        "#,
+        "true\ntrue\n",
+    );
+}
+
+/// collections-39's FIND, whole: the same bound carried through a STRUCT the
+/// call constructs, and through the `Placed` impl written over that struct —
+/// which is where A112 S3 met it.
+#[test]
+fn b379_the_bound_carries_through_a_struct_built_from_a_blanket_provider() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        trait Feed<T> { fun feeds(self): bool; }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        struct Holder<T: PartialEq, S: Feed<T>> {
+            source: S,
+            render: |T| str,
+        }
+
+        trait Placed { fun place(self): bool; }
+
+        impl Holder<type T: PartialEq, type S: Feed<T>> with Placed {
+            fun place(self): bool { self.source.feeds() }
+        }
+
+        // The control: the SAME bound in a plain call.
+        fun direct<T: PartialEq, S: Feed<T>>(source: S): bool {
+            source.feeds()
+        }
+
+        fun hold<T: PartialEq, S: Feed<T>>(source: S, render: |T| str): Holder<T, S> {
+            Holder { source, render }
+        }
+
+        fun take<C: Placed>(content: C): bool { content.place() }
+
+        fun main() {
+            let cell: SignalCell<List<str>> = Signal::new(["a"]);
+            print(direct(cell));
+            let held = hold(cell, |item| item);
+            print(take(held));
+        }
+        "#,
+        "true\ntrue\n",
+    );
+}
