@@ -705,8 +705,13 @@ fn the_builders_wire_matches_the_bytes_recorded_from_serve_service() {
         port,
         "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
     );
+    // The body is `{}` — an envelope with no `method` — so this is a DECODE
+    // failure, and A120 S3 gives a decode failure its own status (400). The
+    // recorded capture read 200, when every outcome the protocol decided was
+    // 200; the envelope below is the half that did not move, and it is the
+    // half a vilan client reads.
     assert!(
-        rpc_response.starts_with("HTTP/1.1 200 OK\r\n"),
+        rpc_response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
         "/rpc status line moved:\n{rpc_response}"
     );
     assert!(
@@ -825,10 +830,16 @@ fn the_segment_match_lets_rpcs_through_where_starts_with_swallowed_it() {
     // Sanity: the real route is untouched by the fix.
     let real = raw_http_closed(
         port,
-        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: 2\r\nConnection: close\r\n\r\n{}",
     );
+    // 400 because the body is `{}` (a decode failure, A120 S3's own status);
+    // what this pin is about is that the SERVICE answered rather than the
+    // fallback, which the rpc envelope is the evidence for.
     assert!(
-        real.starts_with("HTTP/1.1 200 OK\r\n") && real.contains("application/json"),
+        real.starts_with("HTTP/1.1 400 Bad Request\r\n")
+            && real.contains("application/json")
+            && real.contains("\"Failure\":{\"Decode\""),
         "the real /rpc route must still be answered by the service: {real}"
     );
 
@@ -1024,7 +1035,8 @@ fun main() {
 
     let refused = raw_http_closed(
         port,
-        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: 2\r\nConnection: close\r\n\r\n{}",
     );
     assert!(
         refused.starts_with("HTTP/1.1 501 "),
@@ -1034,14 +1046,27 @@ fun main() {
         refused.contains("Service::factory") && refused.contains("WebSocket"),
         "the refusal must name the cause and the way out: {refused}"
     );
+    // A120 S3: the 501 is an ENVELOPE now, so a vilan client meeting it reads
+    // a typed `Remote(..)` instead of `Decode("unrecognized reply envelope")`
+    // about a plain-text sentence — and the media type is what tells its
+    // transport that this IS a reply.
+    assert!(
+        refused.contains("application/json") && refused.contains("{\"Failure\":{\"Remote\":"),
+        "the 501 must be an rpc envelope: {refused}"
+    );
 
     let answered = raw_http_closed(
         port,
-        "POST /shared/rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: \
-         close\r\n\r\n{}",
+        "POST /shared/rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: 2\r\nConnection: close\r\n\r\n{}",
     );
+    // Same `{}` body, same decode failure, same 400 — the point being that
+    // this mount answered with an rpc envelope where the factory mount above
+    // refused with a 501 one.
     assert!(
-        answered.starts_with("HTTP/1.1 200 OK\r\n") && answered.contains("application/json"),
+        answered.starts_with("HTTP/1.1 400 Bad Request\r\n")
+            && answered.contains("application/json")
+            && answered.contains("\"Failure\":{\"Decode\""),
         "a stateless `Service::new` still answers its POST rpc leg: {answered}"
     );
 
@@ -1272,7 +1297,8 @@ fn an_unauthorized_handshake_is_refused_before_the_upgrade() {
     // gets its producer.
     let posted = raw_http_closed(
         port,
-        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: 2\r\nConnection: close\r\n\r\n{}",
     );
     assert!(
         posted.starts_with("HTTP/1.1 401 Unauthorized\r\n") && posted.contains("Unauthorized"),
@@ -5736,10 +5762,18 @@ fn a_malformed_rpc_argument_answers_a_decode_failure_rather_than_success() {
                 body.len()
             ),
         );
+        // A120 S3: a decode failure carries its own status (400) and the
+        // control row carries 200. The ENVELOPE is what a vilan client reads
+        // and it is the same envelope either way — the two never disagree,
+        // which is the property asserted here by checking both.
+        let status = if expected.contains("\"Failure\"") {
+            "HTTP/1.1 400 Bad Request\r\n"
+        } else {
+            "HTTP/1.1 200 OK\r\n"
+        };
         assert!(
-            response.starts_with("HTTP/1.1 200 OK\r\n"),
-            "`{body}` should still be answered with 200 (a decode failure is an \
-             envelope, not a status): {response}"
+            response.starts_with(status),
+            "`{body}` should be answered `{status}`: {response}"
         );
         assert!(
             response.ends_with(expected),
@@ -6012,10 +6046,18 @@ fun main() {
                 body.len()
             ),
         );
+        // A120 S3: a decode failure carries its own status (400) and the
+        // control row carries 200. The ENVELOPE is what a vilan client reads
+        // and it is the same envelope either way — the two never disagree,
+        // which is the property asserted here by checking both.
+        let status = if expected.contains("\"Failure\"") {
+            "HTTP/1.1 400 Bad Request\r\n"
+        } else {
+            "HTTP/1.1 200 OK\r\n"
+        };
         assert!(
-            response.starts_with("HTTP/1.1 200 OK\r\n"),
-            "`{body}` should still be answered with 200 (a decode failure is an \
-             envelope, not a status): {response}"
+            response.starts_with(status),
+            "`{body}` should be answered `{status}`: {response}"
         );
         assert!(
             response.ends_with(expected),
@@ -6287,4 +6329,263 @@ fun main() {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// A120 S3 (`transport-rpc.md` §9.7.7): the STATUS table.
+///
+/// The leg answered 200 for everything the protocol decided, and the reason it
+/// survived is that `HttpTransport::call` never read `response.status()` — it
+/// read the body and handed it to the codec. So the statuses are the contract
+/// for everything that is NOT a vilan client (curl, a `fetch` in a page, a
+/// proxy, a load balancer, a monitoring probe), and moving them breaks no vilan
+/// client, which is what makes this non-breaking and what makes it worth doing.
+///
+/// **The rule: the ENVELOPE is the vilan client's contract, the STATUS is
+/// everyone else's, and the two never disagree.** Every row below asserts both
+/// halves, because the status alone would pass for a server that stopped
+/// answering and the envelope alone is what was already true.
+///
+/// The `Success` row carries an application `Err` arm on purpose (Q5, RULED
+/// NEVER): a value that crossed successfully is a 200 whatever the value says.
+/// A server answering 401 for "wrong password" would be claiming the CALL was
+/// unauthorized, which is a different fact and the one `authorize` reports.
+#[test]
+fn the_post_legs_status_says_what_the_envelope_says() {
+    const STATUS_SERVER: &str = r#"import std::io::print;
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::Service;
+
+[service(Client)]
+struct Door {
+	seed: i32,
+}
+
+impl Door {
+	[rpc]
+	fun login(self, password: str): Result<str, str> {
+		if password == "hunter2" {
+			Ok("tok-ada")
+		} else {
+			Err("wrong password")
+		}
+	}
+}
+
+fun main() {
+	let door = Door { seed = 1 };
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(door.dispatcher().into_protocol(json_codec())))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| print(i"ready {server.port()}"))
+		.build()
+		.start();
+}
+"#;
+    let (_server, port) = spawn_service_server("post_status", STATUS_SERVER);
+    let post = |body: &str| {
+        raw_http_closed(
+            port,
+            &format!(
+                "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    };
+
+    for (label, body, status, envelope) in [
+        (
+            "a call that happened",
+            "{\"method\":\"login\",\"args\":[\"hunter2\"]}",
+            "HTTP/1.1 200 OK\r\n",
+            "{\"Success\":{\"Ok\":\"tok-ada\"}}",
+        ),
+        (
+            "an APPLICATION error — still 200, because the value crossed",
+            "{\"method\":\"login\",\"args\":[\"nope\"]}",
+            "HTTP/1.1 200 OK\r\n",
+            "{\"Success\":{\"Err\":\"wrong password\"}}",
+        ),
+        (
+            "the caller's bytes were wrong",
+            "not json at all",
+            "HTTP/1.1 400 Bad Request\r\n",
+            "{\"Failure\":{\"Decode\":\"malformed JSON\"}}",
+        ),
+        (
+            "the method is the resource",
+            "{\"method\":\"nosuch\",\"args\":[]}",
+            "HTTP/1.1 404 Not Found\r\n",
+            "{\"Failure\":{\"Remote\":\"unknown method: nosuch\"}}",
+        ),
+    ] {
+        let response = post(body);
+        assert!(
+            response.starts_with(status),
+            "{label}: expected `{status}`, got:\n{response}"
+        );
+        assert!(
+            response.contains("Content-Type: application/json\r\n"),
+            "{label}: every envelope carries the rpc media type, whatever the \
+             status — it is what tells a transport this IS a reply:\n{response}"
+        );
+        assert!(
+            response.ends_with(envelope),
+            "{label}: the envelope must still read `{envelope}`:\n{response}"
+        );
+    }
+
+    // A non-POST on the rpc route. Measured before this: a GET was answered
+    // 200 with a `Decode` envelope, because nothing read `request.method()`.
+    let got = raw_http_closed(
+        port,
+        "GET /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        got.starts_with("HTTP/1.1 405 Method Not Allowed\r\n") && got.contains("Allow: POST\r\n"),
+        "a GET on the rpc route must be 405 with an `Allow`:\n{got}"
+    );
+
+    // §9.7.9: the content-type gate. `text/plain` is one of the three types a
+    // cross-site HTML form can produce, and it is what the host sends by
+    // default for a string body — so a form POST used to be indistinguishable
+    // on the wire from the shipped client. Refusing it is what makes a
+    // cross-site form structurally unable to reach ANY `[service]`.
+    let body = "{\"method\":\"login\",\"args\":[\"hunter2\"]}";
+    for (label, header) in [
+        ("no content type at all", ""),
+        (
+            "the host's default for a string body",
+            "Content-Type: text/plain;charset=UTF-8\r\n",
+        ),
+        (
+            "an HTML form's default",
+            "Content-Type: application/x-www-form-urlencoded\r\n",
+        ),
+    ] {
+        let response = raw_http_closed(
+            port,
+            &format!(
+                "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1\r\n{header}Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "{label} must be refused 400:\n{response}"
+        );
+        assert!(
+            !response.contains("\"Success\""),
+            "{label} must not have reached the handler:\n{response}"
+        );
+    }
+    // The control: the same body with the media type set is answered.
+    let allowed = post(body);
+    assert!(
+        allowed.starts_with("HTTP/1.1 200 OK\r\n") && allowed.contains("\"Success\""),
+        "an `application/json` POST must still be answered:\n{allowed}"
+    );
+}
+
+/// A120 S3's client half: `HttpTransport` tells an rpc envelope from something
+/// else, and says `Transport(..)` rather than blaming the codec.
+///
+/// Measured before this, a stub pointed at four different answers: a 404 (the
+/// app's own fallback text) and a 501 (the factory refusal's plain text) both
+/// arrived as `Decode("unrecognized reply envelope")` — a sentence about the
+/// codec for an infrastructure failure the caller can act on, and the same
+/// sentence a proxy's HTML error page would produce. A 401 arrived correctly,
+/// and only because its body happened to be an envelope.
+///
+/// The discriminator is the reply's `Content-Type` and not its status, and the
+/// reason is in the table above: the leg's own statuses are ordinary ones — its
+/// 404 for an unknown METHOD and an app's 404 for an unclaimed path are the
+/// same number — so a status cannot tell an envelope from a stranger's
+/// document, where the media type can.
+#[test]
+fn an_answer_that_is_not_an_rpc_envelope_is_a_transport_failure() {
+    let dir = temp_project("not_an_envelope");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Response, Server };
+import std::rpc_server::Service;
+import std::rpc::RpcError;
+
+[service(Client)]
+struct Door {
+	seed: i32,
+}
+
+impl Door {
+	[rpc]
+	fun echo(self, value: i32): i32 {
+		value + self.seed
+	}
+}
+
+fun main() {
+	let door = Door { seed = 1 };
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(door.dispatcher().into_protocol(json_codec())).at("/api/"))
+		// Everything else is the app's, and it answers HTML — the shape a
+		// proxy or a load balancer answers with.
+		.on_request(|request| Response::builder()
+			.code(502)
+			.set_header("Content-Type", "text/html")
+			.body("<html>bad gateway</html>")
+			.build())
+		.on_start(|server| run_client(server.url()))
+		.build()
+		.start();
+}
+
+fun say(label: str, outcome: Result<i32, RpcError>) {
+	match outcome {
+		Ok(let value) => print(i"{label} ok {value}"),
+		Err(let error) => match error {
+			RpcError::Transport(let reason) => print(i"{label} transport {reason}"),
+			RpcError::Decode(let reason) => print(i"{label} decode {reason}"),
+			_ => print(i"{label} other {error.to_json()}"),
+		},
+	}
+}
+
+async fun run_client(base: str) {
+	// The real mount: an envelope, so the call answers.
+	say("real", Client::over_http(base + "api/", json_codec()).echo(41));
+	// A mount no service claims: the app's own HTML answer.
+	say("stray", Client::over_http(base + "nothing/", json_codec()).echo(41));
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("real ok 42"),
+        "the real mount must still answer:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "stray transport the server answered 502 with something \
+                         that is not an rpc reply"
+        ),
+        "a non-envelope answer must be a transport failure naming the status, \
+         not a decode failure blaming the codec:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

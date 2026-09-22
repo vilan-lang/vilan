@@ -1347,6 +1347,57 @@ for the app's per-connection state (an app-written attach), and
 `Service::factory` is the same knob for CONSTRUCTION — without changing
 anything else about the chain.
 
+## Reaching a service over plain HTTP
+
+A service you can hold without a connection — no `[expose]`d field, no
+handle-returning method, no `client = ..` — gets a second constructor, for the
+connectionless `POST {mount}rpc` route the server already installs beside every
+mount:
+
+```vilan,fragment
+let auth = AuthClient::over_http("/auth/", json_codec());
+match auth.login(name.get(), password.get()) {
+	Ok(let outcome) => match outcome {
+		Ok(let token) => sign_in(token),
+		Err(let message) => show_error(message),
+	},
+	Err(let failure) => show_error(offline_text(failure)),
+}
+```
+
+This is the shape for a login door, and login is why it exists: the token a
+socket's `authorize` reads back is what login RETURNS, so login has to happen
+before there is a socket to authorize. The nesting is the point — the outer arm
+is "did the call happen", the inner is "what did the server decide".
+
+`over_http` takes the same `mount` string `connect` takes, and it makes no
+call: an HTTP client is unversioned unless you call `verify()`. There are no
+mirrors and no reverse direction over this leg, which is why the constructor
+exists only for a service that declares neither.
+
+### CORS, and the credential
+
+std does no CORS. The mechanism is already on the builder, a service's mount is
+a string you wrote, and an allowed-origin list is a security decision std has
+no information for — so it is three lines of yours:
+
+```vilan,fragment
+.on_request(|request| match request.method() {
+	"OPTIONS" => Response::builder()
+		.code(204)
+		.set_header("Access-Control-Allow-Origin", "https://app.example.com")
+		.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		.build(),
+	_ => page(request),
+})
+```
+
+Two sentences are the whole posture. A credential in a HEADER is CSRF-immune by
+construction: a cross-site page cannot set one without a preflight, and the rpc
+leg requires `Content-Type: application/json`, which a cross-site HTML form
+cannot produce. A credential in a COOKIE needs `SameSite=Lax` *and* that
+content-type check — and std will not read a cookie for you.
+
 ## Traps
 
 - Mysterious contract-mismatch failures while developing usually mean an

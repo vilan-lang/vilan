@@ -271,6 +271,50 @@ enum RpcError {
 Infrastructure failures only: an *application* "not found" belongs in the
 rpc's own return type (`Option<Task>`), not here.
 
+### The `POST {mount}rpc` leg's statuses
+
+A vilan client reads the ENVELOPE and has never read the status. The status is
+the contract for everything that is not a vilan client — curl, a `fetch` in a
+page, a proxy, a load balancer, a monitoring probe — and **the two never
+disagree**:
+
+| outcome | status |
+|---|---|
+| `Success(..)`, including an application `Err` arm | **200** |
+| `Failure(Decode(..))` | **400** |
+| `Failure(Unauthorized)` | **401** |
+| `Failure(Remote("unknown method: …"))` | **404** |
+| `Failure(Contract(..))` | **409** |
+| `Failure(Remote(..))` — a handler failed | **500** |
+| a `Service::factory` service on this leg | **501**, as an envelope |
+| `Failure(Unavailable)` | **503** |
+| a non-POST on `{mount}rpc` | **405**, `Allow: POST` |
+
+An application error is a **200**: `Result<Token, str>`'s `Err` arm is a value
+that crossed successfully, and a server answering 401 for "wrong password"
+would be claiming the CALL was unauthorized — a different fact, and the one
+`authorize` reports. The cost is worth stating: a dashboard reading statuses
+alone cannot see application errors, because they are not errors of the
+transport.
+
+The leg **requires** `Content-Type: application/json` or
+`application/octet-stream`, and answers 400 otherwise. That one check is the
+CSRF posture: a cross-site HTML form can produce only `text/plain`,
+`application/x-www-form-urlencoded` and `multipart/form-data`, so it is
+structurally unable to reach any `[service]` — whether or not the service's
+author thought about CSRF. `HttpTransport` sets the header; a hand-written
+caller must too. std does no CORS beyond this: `on_request` plus
+`Response::builder().set_header` is the whole mechanism, and an allowed-origin
+list is a decision std has no information for — the
+[services guide](../guide/services.md) carries the recipe.
+
+Every envelope carries one of those two media types whatever its status, and
+that is what `HttpTransport` reads to tell a reply from a stranger's document:
+an answer that is not an envelope is `Err(RpcError::Transport(..))` naming the
+status, not a `Decode` blaming the codec. A status cannot serve — the leg's 404
+for an unknown method and an app's 404 for an unclaimed path are the same
+number.
+
 A `Decode` on the SERVER's side of a call is what the generated route answers
 for a request it cannot read: an argument count the method does not declare
 (`expects 2 argument(s), got 3` — extra arguments are a disagreement, not

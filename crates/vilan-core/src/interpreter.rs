@@ -1698,6 +1698,9 @@ impl<'a> Interpreter<'a> {
             // same reason: it guards a body that SUSPENDS, and the expansion
             // environment has no suspension at all.
             "__guarded_async" => Err(Failure::unsupported("`guarded_async`")),
+            // A host `fetch` Response cannot exist in the expansion
+            // environment — there is no `fetch` here to have made one.
+            "__response_header" => Err(Failure::unsupported("`response_header`")),
             // proposal/lazy.md §5's memo cell and its forcing helper, mirroring
             // `helper_source`'s JS exactly — the equivalence gate the paper
             // names ("the helper needs its interpreter arm in the same commit").

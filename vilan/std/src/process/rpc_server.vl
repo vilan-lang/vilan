@@ -25,6 +25,8 @@ import pkg::rpc::{
 	RpcOutcome,
 	RpcProtocol,
 	RpcService,
+	RPC_BINARY_MEDIA_TYPE,
+	RPC_TEXT_MEDIA_TYPE,
 	drop_client_channel,
 	drop_session,
 	duplex_pair,
@@ -934,25 +936,84 @@ fun send_response(request: Request): Response {
 /// instance, no session, no identity. That is refused in as many words rather
 /// than silently answered by some other client's instance.
 fun rpc_frame_response(service: Service, request: Request): Response {
+	// §9.7.7's 405, and §9.7.9's content-type gate — both before the body is
+	// read, because both are statements about the REQUEST rather than about
+	// what it carries.
+	if request.method() != "POST" {
+		ret Response::builder()
+			.code(405)
+			.set_header("Allow", "POST")
+			.body("this route takes a POST carrying one rpc frame")
+			.build();
+	}
+	match content_type_refusal(request) {
+		Some(let response) => ret response,
+		None => {},
+	}
 	match service.shared {
 		Some(let protocol) => {
-			let reply = turn(FlushPolicy::AtEnd, || protocol.respond(Frame::Binary(request.bytes())));
-			match reply {
-				Frame::Text(let frame) => Response::builder()
-					.set_header("Content-Type", "application/json")
-					.body(frame)
-					.build(),
-				Frame::Binary(let frame) => Response::builder()
-					.set_header("Content-Type", "application/octet-stream")
-					.body_bytes(frame)
-					.build(),
-			}
+			let (reply, status) = turn(FlushPolicy::AtEnd, || protocol.respond_with_status(Frame::Binary(request.bytes())));
+			envelope_response(reply, status)
 		},
-		None => Response::builder()
-			.code(501)
-			.body("this service builds one instance per connection (Service::factory), and a POST rpc frame carries no connection to build for — connect over the WebSocket transport instead")
+		// §9.7.7: as an ENVELOPE now, so a vilan client meeting it reads a
+		// typed `Remote(..)` rather than `Decode("unrecognized reply
+		// envelope")` about a plain-text sentence.
+		None => envelope_response(
+			encode_reply(service.codec, RpcOutcome::Failure(RpcError::Remote(FACTORY_REFUSAL))),
+			501,
+		),
+	}
+}
+
+let FACTORY_REFUSAL: str = "this service builds one instance per connection (Service::factory), and a POST rpc frame carries no connection to build for — connect over the WebSocket transport instead";
+
+/// One envelope answer: the frame's own media type, and the status §9.7.7's
+/// table gives it. The media type is on EVERY envelope whatever the status,
+/// which is what lets `HttpTransport` tell an envelope from a proxy's error
+/// page (`std::rpc`'s `reply_is_an_envelope`).
+fun envelope_response(reply: Frame, status: i32): Response {
+	match reply {
+		Frame::Text(let frame) => Response::builder()
+			.code(status)
+			.set_header("Content-Type", RPC_TEXT_MEDIA_TYPE)
+			.body(frame)
+			.build(),
+		Frame::Binary(let frame) => Response::builder()
+			.code(status)
+			.set_header("Content-Type", RPC_BINARY_MEDIA_TYPE)
+			.body_bytes(frame)
 			.build(),
 	}
+}
+
+/// §9.7.9: the leg REQUIRES a non-safelisted content type, and answers 400
+/// otherwise.
+///
+/// This is the whole CSRF posture, and it costs one comparison. A cross-site
+/// HTML form can produce exactly three content types — `text/plain`,
+/// `application/x-www-form-urlencoded`, `multipart/form-data`, the
+/// CORS-safelisted ones — and nothing else; a `fetch` that sets any other
+/// header is subject to a preflight the server never answers. So requiring one
+/// of the two rpc media types makes a cross-site form structurally unable to
+/// reach ANY `[service]`, whether or not its author thought about CSRF — which
+/// is the property to want, because the author who did not think about it is
+/// the one who needs it.
+///
+/// std does no CORS beyond this (Q3, RULED): `on_request` plus `set_header` is
+/// already the whole mechanism, and an allowed-origin list is a security
+/// decision std has no information for. The guide carries the recipe.
+fun content_type_refusal(request: Request): Option<Response> {
+	let declared = match request.header("content-type") {
+		Some(let value) => value.to_lowercase_ascii(),
+		None => "",
+	};
+	if declared.starts_with(RPC_TEXT_MEDIA_TYPE) || declared.starts_with(RPC_BINARY_MEDIA_TYPE) {
+		ret None;
+	}
+	Some(Response::builder()
+		.code(400)
+		.body("an rpc frame is posted as " + RPC_TEXT_MEDIA_TYPE + " or " + RPC_BINARY_MEDIA_TYPE + "; this request declared '" + declared + "'")
+		.build())
 }
 
 /// An authorized service (A40) answers ONLY the WebSocket upgrade: the SSE

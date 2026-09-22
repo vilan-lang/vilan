@@ -1100,6 +1100,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__fs_watch",
         "__fs_watch_stop",
         "__local_get",
+        "__response_header",
         "__session_get",
         "__dom_window",
         "__dom_bounding_rect",
@@ -1339,6 +1340,19 @@ fn helper_source(name: &str) -> &'static str {
             "async function __sha512(data) {\n\treturn new Uint8Array(await crypto.subtle.digest(\"SHA-512\", data));\n}"
         }
         // Web Storage glue (std::storage): a missing key reads null; flatten to "".
+        // A120 S3: one header off a host `fetch` Response. `Headers` is not a
+        // plain object — its entries are not own properties, so the `JsonValue`
+        // reading `std::http::Request::header` uses on node's request object
+        // cannot serve here — and `Headers.get` answers `null` for a header
+        // that is not there. The absent case is `""`, which is
+        // `__local_get`'s convention at this boundary and is unambiguous: a
+        // present header with an empty value and an absent one are the same
+        // fact to every caller this has.
+        "__response_header" => {
+            "function __response_header(response, name) {\n\
+             \treturn (response && response.headers ? response.headers.get(name) : null) ?? \"\";\n\
+             }"
+        }
         "__local_get" => {
             "function __local_get(key) {\n\treturn localStorage.getItem(key) ?? \"\";\n}"
         }

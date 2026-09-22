@@ -49,7 +49,33 @@ export impl Response {
 	fun bytes(self): Bytes {
 		bytes_of_buffer(self.raw_body())
 	}
+
+	/// One response header, case-insensitively, or `None` when the response
+	/// does not carry it.
+	///
+	/// The host `Headers` object is not a plain object — its entries are not
+	/// own properties — so this is glue (`__response_header`,
+	/// `transformer.rs`) rather than the `JsonValue` read
+	/// `std::http::Request::header` does on node's request object. `Headers`
+	/// already lowercases what it is asked for, which is why nothing is done
+	/// to `name` here.
+	///
+	/// A header that is PRESENT with an empty value reads back as `None`, and
+	/// that is deliberate rather than a rounding: the two are the same fact to
+	/// a caller deciding what a body is, and distinguishing them would cost a
+	/// second host call for a case no HTTP header meaningfully has.
+	fun header(self, name: str): Option<str> {
+		let value = raw_response_header(self, name);
+		if value == "" {
+			None
+		} else {
+			Some(value)
+		}
+	}
 }
+
+[extern("__response_header")]
+external fun raw_response_header(response: Response, name: str): str;
 
 // --- Streaming responses -------------------------------------------------------
 
@@ -152,10 +178,26 @@ export fun post(url: str, body: str): Request {
 
 /// A one-shot binary POST (no header chaining): send `body` as bytes and await
 /// the response — the byte-capable leg of the RPC transport (§6.2).
+///
+/// It sends no `Content-Type`, and the host's default for a `Uint8Array` body
+/// is none at all. `post_bytes_typed` is the same call with one, which is what
+/// a server that requires a media type needs (`transport-rpc.md` §9.7.9).
 export fun post_bytes(url: str, body: Bytes): Response {
+	post_bytes_with(url, body, "")
+}
+
+/// `post_bytes` with a declared `Content-Type`.
+export fun post_bytes_typed(url: str, body: Bytes, media_type: str): Response {
+	post_bytes_with(url, body, media_type)
+}
+
+fun post_bytes_with(url: str, body: Bytes, media_type: str): Response {
 	let options = new_request_init();
 	options.set_method("POST");
 	options.set_body_bytes(body);
+	if media_type != "" {
+		options.set_headers([Header { name = "Content-Type", value = media_type }]);
+	}
 	attach_ambient_signal(options);
 	fetch_with(url, options)
 }

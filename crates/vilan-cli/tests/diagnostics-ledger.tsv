@@ -573,3 +573,4 @@ row	flagship	key
 549	-	`external fun {name}` names no body: an external needs an `[extern(..)]` binding saying what the host calls it, or it is not external — give it a body. Without one, a call to it emits a name nothing in the program defines
 NEW	-	`guarded_async`
 NEW	-	`[service]` on `{name}` has an empty contract surface: it declares no `[rpc]` method, no `[expose]`d field and no `client = ..` handler, so the client it generates can call nothing and every call answers `unknown method` at runtime
+NEW	-	`response_header`
