@@ -15,6 +15,13 @@ A **service** is that struct. Three attributes do the work:
 There are no REST endpoints, fetch calls, or JSON shapes to keep in
 sync by hand. The compiler knows both sides.
 
+The attribute reads the `[rpc]` methods off this module's inherent `impl`
+blocks, and `export impl` is one of them — `export` is visibility, not shape.
+A service that declares nothing at all — no `[rpc]` method, no `[expose]`d
+field, no `client = ..` handler — is refused: its client could call nothing,
+and because both generated sides would agree about that empty surface, even
+`verify()` would say they match.
+
 Here's a complete little server:
 
 ```vilan,norun

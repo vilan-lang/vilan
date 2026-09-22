@@ -5741,3 +5741,168 @@ fn a_malformed_rpc_argument_answers_a_decode_failure_rather_than_success() {
         );
     }
 }
+
+/// B375: `[service]` over an `export impl`.
+///
+/// The attribute's reflection walks the module's inherent impls for `[rpc]`
+/// methods, and it looked for a bare `Impl` node. `export impl Echo { .. }` is
+/// an `Impl` under an `Export` wrapper, so the walk found NOTHING: the
+/// dispatcher was generated with no routes, the contract surface was empty, and
+/// the hash was the empty-set hash `00001505`. Both generated sides agreed
+/// about that empty surface, so the service BUILT, a client CONNECTED, and
+/// every call answered `unknown method` at runtime with nothing said at compile
+/// time. `export` is visibility, not shape.
+///
+/// The pin asserts three things, and the third is what makes it a pin about the
+/// walker rather than about one program: the route answers, the hash is not the
+/// empty-set hash, and the hash is BYTE-IDENTICAL to the same surface written
+/// with a plain `impl`. A walker that read `export impl` as some other surface
+/// would pass the first two.
+#[test]
+fn a_service_over_an_export_impl_finds_its_methods() {
+    let dir = temp_project("export_impl_service");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::json::json_codec;
+import std::wire::Frame;
+
+[service(ExportedClient)]
+struct Exported {
+	seed: i32,
+}
+
+export impl Exported {
+	[rpc]
+	fun add(self, left: i32, right: i32): i32 {
+		left + right + self.seed
+	}
+}
+
+// The identical surface, written with a plain `impl` reached through the
+// module-level re-export: the control the hash is compared against, and the
+// exact pair the find was minimised to.
+export *;
+
+[service(PlainClient)]
+struct Plain {
+	seed: i32,
+}
+
+impl Plain {
+	[rpc]
+	fun add(self, left: i32, right: i32): i32 {
+		left + right + self.seed
+	}
+}
+
+async fun main() {
+	let exported = Exported { seed = 0 };
+	let protocol = exported.dispatcher().into_protocol(json_codec());
+	let body = "{\"method\":\"add\",\"args\":[1,2]}";
+	match protocol.respond(Frame::Text(body)) {
+		Frame::Text(let reply) => print(i"reply={reply}"),
+		Frame::Binary(let _bytes) => print("binary"),
+	}
+	let plain = Plain { seed = 0 };
+	print(i"exported_hash={exported.contract_hash()}");
+	print(i"plain_hash={plain.contract_hash()}");
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    assert!(
+        stdout.contains("reply={\"Success\":3}"),
+        "an `export impl`'s `[rpc]` method must route:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("00001505"),
+        "the contract hash must not be the empty-surface hash:\n{stdout}"
+    );
+    let hash_of = |label: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(label))
+            .unwrap_or_else(|| panic!("no `{label}` line:\n{stdout}"))
+            .trim()
+            .to_string()
+    };
+    assert_eq!(
+        hash_of("exported_hash="),
+        hash_of("plain_hash="),
+        "`export` is visibility, not shape: the two surfaces must hash the \
+         same:\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B375's other half: a `[service]` whose contract surface is EMPTY is refused
+/// at the attribute.
+///
+/// The empty surface hashes to the empty-set hash on both generated sides, so
+/// the two AGREE — `verify()` answers `true` — and every call the client can
+/// make answers `unknown method` at runtime. Nothing said it at compile time,
+/// and it is never what anyone meant: the whole point of the attribute is the
+/// surface it generates.
+///
+/// Spanned on the STRUCT, because the struct is what carries the attribute, and
+/// naming the struct is what lets the sentence recommend an inherent `impl` for
+/// it.
+#[test]
+fn a_service_with_an_empty_contract_surface_is_refused_at_the_attribute() {
+    let dir = temp_project("empty_service_surface");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"[service(HollowClient)]
+struct Hollow {
+	seed: i32,
+}
+
+impl Hollow {
+	// Not `[rpc]`: an ordinary method contributes nothing to the surface.
+	fun helper(self): i32 {
+		self.seed
+	}
+}
+
+fun main() {}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["check", dir.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan check");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "a `[service]` with no surface must not compile:\n{report}"
+    );
+    for expected in [
+        "`[service]` on `Hollow` has an empty contract surface",
+        "no `[rpc]` method, no `[expose]`d field and no `client = ..` handler",
+        "Write an `[rpc]` method in an inherent `impl Hollow`",
+    ] {
+        assert!(
+            report.contains(expected),
+            "the refusal should contain `{expected}`:\n{report}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

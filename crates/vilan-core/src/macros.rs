@@ -2087,9 +2087,39 @@ impl Expander<'_, '_> {
         text: &str,
         depth: u32,
     ) {
-        let Some((literal, input)) = construct_service(attribute, item, siblings, text) else {
+        let Some((literal, input, surface)) = construct_service(attribute, item, siblings, text)
+        else {
             return; // a bodyless struct generates nothing, like the Rust path
         };
+        // B375: a `[service]` whose CONTRACT SURFACE is empty — no `[rpc]`
+        // method, no `[expose]`d field, no `client = H` handler. The empty
+        // surface hashes to the empty-set hash on both generated sides, so the
+        // two AGREE, `verify()` answers true, and every call the client makes
+        // answers `unknown method` at runtime with nothing said at compile
+        // time. It is never what anyone meant. Said here rather than in the
+        // expansion because a macro's only error channel is a `panic`, which
+        // reads as "`service` failed at expansion time" — and this is a
+        // statement about the author's declaration, not about the generator.
+        //
+        // The expansion still runs: the client type and the dispatcher are what
+        // the rest of the file is written against, and refusing to generate
+        // them would bury this sentence under a cascade of unknown names.
+        if surface.is_empty() {
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span: item.1,
+                msg: format!(
+                    "`[service]` on `{}` has an empty contract surface: it declares no `[rpc]` \
+                     method, no `[expose]`d field and no `client = ..` handler, so the client it \
+                     generates can call nothing and every call answers `unknown method` at \
+                     runtime — the two sides agree about the empty surface, so even `verify()` \
+                     says they match. Write an `[rpc]` method in an inherent `impl {}`, or drop \
+                     the attribute",
+                    surface.subject, surface.subject
+                ),
+            });
+        }
         // The input text (struct + gathered methods) is only `expand_call`'s
         // cache key, which hashes it transiently — `run_attribute` passes a
         // plain `slice(text, ..)` here for exactly that reason. So it need not
@@ -2957,12 +2987,30 @@ fn construct_function_item(function: &Func, text: &str) -> js::Node<'static> {
 /// definition). Returns the literal plus the canonical INPUT text the
 /// expansion cache keys on: the output depends on the sibling impls, so the
 /// struct's own text alone would go stale when a method changes.
+/// What `[service]` found to put on the wire, for the one check `run_service`
+/// makes on it (B375). The three counts are the three kinds of contract-surface
+/// entry `service_hash` folds, and `is_empty` is exactly "this service hashes
+/// to the empty-set hash".
+pub(crate) struct ServiceSurface {
+    /// The annotated struct's name, for the refusal's sentence.
+    pub(crate) subject: String,
+    rpc_methods: usize,
+    exposed_fields: usize,
+    handler_methods: usize,
+}
+
+impl ServiceSurface {
+    fn is_empty(&self) -> bool {
+        self.rpc_methods == 0 && self.exposed_fields == 0 && self.handler_methods == 0
+    }
+}
+
 pub(crate) fn construct_service(
     attribute: ServiceAttr,
     item: &Spanned<Node>,
     nodes: &NodeList,
     text: &str,
-) -> Option<(js::Node<'static>, String)> {
+) -> Option<(js::Node<'static>, String, ServiceSurface)> {
     let Node::Struct(name, _generics, _external, _resource, Some(fields)) = &item.0 else {
         return None;
     };
@@ -3016,6 +3064,16 @@ pub(crate) fn construct_service(
     } else {
         Vec::new()
     };
+    let surface = ServiceSurface {
+        subject: service_name.to_string(),
+        rpc_methods: methods.len(),
+        exposed_fields: fields
+            .0
+            .iter()
+            .filter(|(field, _)| field.2.is_exposed())
+            .count(),
+        handler_methods: handler_methods.len(),
+    };
     let literal = array(vec![
         discriminant(3),
         array(vec![
@@ -3028,7 +3086,7 @@ pub(crate) fn construct_service(
             array(handler_methods),
         ]),
     ]);
-    Some((literal, input))
+    Some((literal, input, surface))
 }
 
 /// Every `[rpc]` method declared on `subject` by an inherent impl in `nodes`,
@@ -3043,6 +3101,17 @@ fn gather_rpc_methods(
 ) -> Vec<js::Node<'static>> {
     let mut methods = Vec::new();
     for (node, _span) in nodes {
+        // `export impl Echo { .. }` is an `Impl` under an `Export` wrapper, and
+        // this walk used to look only for the bare node (B375): a service whose
+        // impl block carried `export` therefore found NO methods, generated a
+        // dispatcher with no routes and a contract hash over the empty surface,
+        // and — because both generated sides agreed about that empty surface —
+        // built, connected and answered every call `unknown method`, with
+        // nothing said at compile time. `export` is VISIBILITY, not shape.
+        let mut node = node;
+        while let Node::Export(_, inner) = node {
+            node = &inner.0;
+        }
         let Node::Impl(impl_subject, impl_traits, body) = node else {
             continue;
         };
