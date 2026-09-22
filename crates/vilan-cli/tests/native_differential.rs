@@ -1903,6 +1903,82 @@ fn the_boxed_binding_count_is_reachable_and_counts_the_right_bindings() {
     );
 }
 
+/// F29: a program whose host bindings sit ONLY inside a refused call — in its
+/// arguments, and in the body of a closure among them.
+///
+/// `random_uuid` is reached nowhere but inside the argument of the refused
+/// `random_bytes` call; `range_i32` nowhere but inside the body of the closure
+/// the refused `hmr_register_teardown` takes. Neither was in the census before
+/// the walk continued past a refusal, which is how `createServer`'s handler hid
+/// nine bindings from the census that sized F18.
+const CENSUS_PROBE: &str = concat!(
+    "import std::crypto::{ random_bytes, random_uuid };\n",
+    "import std::random::range_i32;\n",
+    "import std::rpc::hmr_register_teardown;\n",
+    "import std::bytes::Bytes;\n",
+    "import std::io::print;\n",
+    "\n",
+    "fun consume(value: Bytes) {}\n",
+    "\n",
+    "fun main() {\n",
+    "\tconsume(random_bytes(random_uuid().len()));\n",
+    "\thmr_register_teardown(|| { print(range_i32(1, 4)); });\n",
+    "}\n",
+);
+
+/// F29's pin: the host census reports what a REFUSAL stands in front of.
+///
+/// The census answers "what host surface does this program still need", and a
+/// walk that stops at the first refusal answers a smaller question. The two
+/// bindings asserted here are each reachable through exactly ONE refused
+/// construct, so a walk that stops names neither — which is what makes this
+/// pin measure the continuation rather than the program.
+#[test]
+fn the_host_census_walks_past_a_refusal_into_its_arguments_and_closure_bodies() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_census.vl"), CENSUS_PROBE)
+        .expect("write the probe program");
+    let output = vilan(&staged)
+        .env("VILAN_NATIVE_HOST_CENSUS", "1")
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_census.vl",
+        ])
+        .output()
+        .expect("census the probe");
+    assert!(
+        output.status.success(),
+        "the census emit failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let census = String::from_utf8_lossy(&output.stdout);
+    for hidden in [
+        // Reached only inside the ARGUMENT of a refused host binding's call.
+        "the host binding `random_uuid`",
+        // Reached only inside the BODY of a closure handed to a refused one.
+        "the intrinsic `RandomInt`",
+    ] {
+        assert!(
+            census.contains(hidden),
+            "the census must walk past a refusal and report `{hidden}`:\n{census}"
+        );
+    }
+    // And the refusals themselves are still reported, which is what the walk is
+    // a continuation OF.
+    for refused in [
+        "the host binding `random_bytes`",
+        "the host binding `hmr_register_teardown`",
+    ] {
+        assert!(
+            census.contains(refused),
+            "the census must still name the refusal itself `{refused}`:\n{census}"
+        );
+    }
+}
+
 /// F30: a binding that lives in a CELL, mutated IN PLACE through every spelling
 /// the language has for it.
 ///

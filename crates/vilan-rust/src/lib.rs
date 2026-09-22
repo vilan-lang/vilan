@@ -4664,12 +4664,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let is_async_closure = self.program.async_functions.contains(&closure_id);
         let floats = is_async_closure && !wants_a_future && self.closure_answers_void(&closure);
         if is_async_closure && !wants_a_future && !floats {
-            return self.host_gap(
+            let rendered = self.host_gap(
                 "an `async` closure as a VALUE (a callee taking one at one call site and a \
                  synchronous closure at another is an adapted instance)"
                     .to_string(),
                 span,
             );
+            // F29: a refused closure's BODY is the other half of what a census
+            // loses at a refusal — `createServer`'s handler is one of these.
+            self.census_walk(&[closure.return_], depth);
+            return rendered;
         }
         let mut parameters = Vec::new();
         for parameter_id in &closure.parameters {
@@ -6054,12 +6058,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     Some(Expr::Reference(_, _))
                 )
             }) {
-                return self.host_gap(
+                let rendered = self.host_gap(
                     "a view inside an enum payload (`Option<&mut T>`: the payload's type is \
                      its pointee's, so the emitted variant takes a value)"
                         .to_string(),
                     span,
                 );
+                self.census_walk(&function_call.argument_ids, depth);
+                return rendered;
             }
             let arguments =
                 self.variant_arguments(call_expr_id, enum_id, index, &function_call.argument_ids);
@@ -6238,7 +6244,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     _ => String::new(),
                 }
             );
-            return self.host_gap(what, span);
+            let rendered = self.host_gap(what, span);
+            // F29: the census goes on into the arguments — this is the call
+            // that hid nine bindings inside `createServer`'s handler.
+            self.census_walk(&function_call.argument_ids, depth);
+            return rendered;
         }
 
         // A named BINDING that holds a closure — `g()` where `g` is a
@@ -6579,6 +6589,31 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Ok("unimplemented!()".to_string())
     }
 
+    /// F29: what a REFUSAL owes the census — a walk of the subtrees the
+    /// refusal stopped at.
+    ///
+    /// A gap answers `unimplemented!()` and the walk returns, so everything
+    /// UNDER the refused construct went unrecorded. `createServer(handler)` is
+    /// the shape that made it visible: one gap was reported and the handler's
+    /// whole body — nine more bindings — was never walked, so the census that
+    /// sized F18 was low by them. The program is refused whatever this walk
+    /// finds; what the census owes is the whole list, which is the question it
+    /// exists to answer ("what host surface does this program still need").
+    ///
+    /// The rendered text is thrown away, and so are the walk's ERRORS: a
+    /// subtree that cannot be emitted is not a second refusal to report, it is
+    /// a subtree whose gaps are recorded as far as the walk reached. Off unless
+    /// the census is on, so a build pays nothing and takes exactly the first
+    /// refusal it took before.
+    fn census_walk(&mut self, argument_ids: &[Id], depth: usize) {
+        if !self.census {
+            return;
+        }
+        for argument in argument_ids {
+            let _ = self.value_of(*argument, depth);
+        }
+    }
+
     /// Whether a receiver is a shape an impl can be written for — the nominal
     /// ones plus the two structural ones (spec §5.7). `select_member` admits
     /// impl SUBJECTS of every shape past this; the guard is about the RECEIVER,
@@ -6727,7 +6762,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         _ => String::new(),
                     }
                 );
-                self.host_gap(what, span)
+                let rendered = self.host_gap(what, span);
+                // F29: as at a direct host call, the census goes on into the
+                // arguments of one reached through a blanket impl.
+                self.census_walk(argument_ids, depth);
+                rendered
             }
         }
     }
