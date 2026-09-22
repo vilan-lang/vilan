@@ -133,6 +133,7 @@ guide/services.md h3 what-the-turn-model-owes-you-here
 guide/services.md h3 what-happens-to-a-peer-that-has-not-heard-of-any-of-this
 guide/services.md h2 growing-past-one-service
 guide/services.md h2 reaching-a-service-over-plain-http
+guide/services.md h3 gating-the-post-leg-authorize_request
 guide/services.md h3 cors-and-the-credential
 guide/services.md h2 traps
 guide/ssr.md h1 server-side-rendering

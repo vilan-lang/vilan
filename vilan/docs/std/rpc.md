@@ -460,6 +460,7 @@ impl Service {
 	// the handshake gate and its limits
 	fun authorize(own self, check: async |Handshake| Result<Session, Reject>): Service
 	fun authorize_timeout(own self, millis: i32): Service   // 429 if the hook does not answer — std's limit, never the app's 503
+	fun authorize_request(own self, check: async |Request| Result<Session, Reject>): Service   // gates each POST {mount}rpc (A120 S4)
 	fun max_connections(own self, limit: i32): Service      // upgraded sockets on this mount only
 	fun handshake_rate(own self, attempts: i32, window_millis: f64): Service
 	fun handshake_timeout(own self, millis: i32): Service   // bounds the greeting, not idleness

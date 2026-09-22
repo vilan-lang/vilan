@@ -21,12 +21,12 @@ import pkg::rpc::{
 	ClientProxy,
 	Dispatcher,
 	DuplexEnd,
+	RPC_BINARY_MEDIA_TYPE,
+	RPC_TEXT_MEDIA_TYPE,
 	RpcError,
 	RpcOutcome,
 	RpcProtocol,
 	RpcService,
-	RPC_BINARY_MEDIA_TYPE,
-	RPC_TEXT_MEDIA_TYPE,
 	drop_client_channel,
 	drop_session,
 	duplex_pair,
@@ -38,6 +38,12 @@ import pkg::rpc::{
 	tag_duplex_bytes,
 	tag_rpc_bytes,
 };
+// `Session` — what the app proved about a caller — is `std::rpc`'s and
+// re-exported here, because a service is where it is minted: `authorize`
+// proves a connection's at the upgrade (`Connection.session`),
+// `authorize_request` one POST's (`RpcRequest.session`, A120 S4). It moved to
+// `std::rpc` when `RpcRequest` began carrying it; this path still names it.
+export import pkg::rpc::Session;
 import pkg::shared::Shared;
 import pkg::time::now_millis;
 import pkg::wire::{ Codec, Frame };
@@ -72,43 +78,6 @@ export fun ws_accept_key(key: str): str {
 }
 
 // --- Service: an rpc mount installed on a `ServerBuilder` (fullstack-dx.md §4) -
-
-/// What the app proved about a connection before the socket went up — the
-/// identity half of `transport-rpc.md` Q4, carried into the factory as
-/// `Connection.session`. A service with no `authorize` hook sees
-/// `Session::anonymous()`; the app decides what more a connection's identity
-/// means by looking `identity` up in the instance the factory builds.
-export struct Session {
-	/// The app's name for whoever is on the other end — a user id, a subject
-	/// claim. Empty when nothing authorized this connection.
-	identity: str,
-	/// The credential the identity was proved with, kept for apps that must
-	/// re-present it downstream. Empty when there was none.
-	credential: str,
-}
-
-export impl Session {
-	/// A connection nothing authorized: no identity, no credential.
-	fun anonymous(): Session {
-		Session { identity = "", credential = "" }
-	}
-
-	/// The ordinary `authorize` result: this connection is `identity`.
-	fun of(identity: str): Session {
-		Session { identity, credential = "" }
-	}
-
-	/// `of`, keeping the credential the identity was proved with.
-	fun with_credential(own self, credential: str): Session {
-		self.credential = credential;
-		self
-	}
-
-	/// Whether anything authorized this connection.
-	fun is_anonymous(self): bool {
-		self.identity == ""
-	}
-}
 
 /// One connected client, as the factory sees it: the connection id the rest of
 /// the layer keys by (the same id `on_connect`/`on_disconnect` carry and the
@@ -256,11 +225,17 @@ fun reject_announcement(reject: Reject): str {
 /// The status NUMBER, as text — the announcement's payload and the first token
 /// of the status line, named once so the two cannot drift.
 fun reject_code(reject: Reject): str {
+	i"{reject_number(reject)}"
+}
+
+/// The status number itself — what the POST leg's refusal is answered with
+/// (A120 S4), and what `reject_code` spells.
+fun reject_number(reject: Reject): i32 {
 	match reject {
-		Reject::Unauthorized => "401",
-		Reject::Forbidden => "403",
-		Reject::TooMany => "429",
-		Reject::Unavailable => "503",
+		Reject::Unauthorized => 401,
+		Reject::Forbidden => 403,
+		Reject::TooMany => 429,
+		Reject::Unavailable => 503,
 	}
 }
 
@@ -436,6 +411,12 @@ export struct Service {
 	/// call await, so a hook that verifies a signature settles before the
 	/// handshake is answered.
 	authorize: Option<|Handshake| Result<Session, Reject>>,
+	/// The per-request gate on the connectionless `{mount}rpc` POST leg
+	/// (A120 S4, `transport-rpc.md` §9.7.6), when the app installed one.
+	/// `authorize`'s twin for the leg that has no handshake: `Ok(session)`
+	/// is stamped on that one request's `RpcRequest`, `Err(reject)` answers
+	/// the POST. Stored plain for `authorize`'s reason.
+	authorize_request: Option<|Request| Result<Session, Reject>>,
 	/// Live upgraded connections on this mount, and the ceiling `0` means
 	/// none. A cell, so every copy of this `Service` value counts into one
 	/// total.
@@ -485,13 +466,16 @@ export impl Service {
 			// connection's capability table, and the stamp is how it finds it
 			// (`transport-rpc.md` §9.2). The dispatcher is still shared —
 			// only the connection id differs between the copies.
-			build_protocol = |connection| protocol.for_connection(connection.id),
+			build_protocol = |connection| protocol
+				.for_connection(connection.id)
+				.in_session(connection.session),
 			shared = Some(protocol),
 			codec = protocol.codec,
 			mount = "/",
 			on_connect = |connection, wire| register_session(connection, wire, protocol.codec),
 			on_disconnect = |connection| drop_session(connection),
 			authorize = None,
+			authorize_request = None,
 			live = Shared::new(0),
 			max_connections = 0,
 			handshake_rate = 0,
@@ -532,13 +516,15 @@ export impl Service {
 			build_protocol = |connection| build(connection)
 				.dispatcher_for()
 				.into_protocol(codec)
-				.for_connection(connection.id),
+				.for_connection(connection.id)
+				.in_session(connection.session),
 			shared = None,
 			codec,
 			mount = "/",
 			on_connect = |connection, wire| register_session(connection, wire, codec),
 			on_disconnect = |connection| drop_session(connection),
 			authorize = None,
+			authorize_request = None,
 			live = Shared::new(0),
 			max_connections = 0,
 			handshake_rate = 0,
@@ -600,9 +586,59 @@ export impl Service {
 	/// An authorized service answers ONLY the WebSocket upgrade: the
 	/// connectionless SSE/POST legs carry no handshake to gate, so they are
 	/// refused (`{mount}rpc` with a typed `RpcError::Unauthorized` envelope,
-	/// the other two with a plain 401).
+	/// the other two with a plain 401) — unless the service ALSO installs
+	/// `authorize_request`, which gates the POST leg in its own vocabulary.
 	fun authorize(own self, check: async |Handshake| Result<Session, Reject>): Service {
 		self.authorize = Some(check);
+		self
+	}
+
+	/// Decide whether ONE connectionless `POST {mount}rpc` may be answered
+	/// (A120 S4, `transport-rpc.md` §9.7.6) — `authorize`'s twin for the leg
+	/// that has no handshake. `check` runs on the request, after the leg's
+	/// own method and content-type gates and before the frame is read;
+	/// `Ok(session)` is stamped on that request's `RpcRequest.session`, and
+	/// `Err(reject)` answers the POST with the reject's status — 401 and 403
+	/// as a `Failure(RpcError::Unauthorized)` envelope, 503 as
+	/// `Failure(RpcError::Unavailable)`, the arms a vilan client already
+	/// reads for a refused socket, and 429 as a plain status, which a vilan
+	/// client reads as `Transport(..)` exactly as it does a rate-limited
+	/// handshake.
+	///
+	/// A SECOND hook rather than a `Handshake` built from the request,
+	/// because the credential lives somewhere else: a socket's in the
+	/// `"token."` subprotocol (`Handshake::token`), a POST's in a header
+	/// (`Authorization: Bearer …`) or a cookie, which `Request::header` reads.
+	///
+	/// ```text
+	/// Service::new(Door {}.dispatcher().into_protocol(json_codec()))
+	///     .authorize_request(|request| match request.header("authorization") {
+	///         Some(let bearer) => match verify(bearer) { … },
+	///         None => Result::Err(Reject::Unauthorized),
+	///     })
+	/// ```
+	///
+	/// How the two hooks compose — each gates its own leg, and neither opens
+	/// the other's:
+	///
+	/// | installed | the socket upgrade | `POST {mount}rpc` |
+	/// |---|---|---|
+	/// | neither | open | open |
+	/// | `authorize` only | gated | 401 — no silent back door |
+	/// | `authorize_request` only | open | gated per request |
+	/// | both | gated | gated per request |
+	///
+	/// The SSE `{mount}events`/`{mount}send` pair is a CONNECTION, not a
+	/// request, so it follows the upgrade's column. A `Service::factory`
+	/// service stays 501 on the POST leg whatever this hook would say: the
+	/// instance, not the identity, is what a POST cannot supply.
+	///
+	/// A credential read from a COOKIE is only as safe as the leg's
+	/// content-type gate, which is what keeps a cross-site form from reaching
+	/// this hook at all; a credential a script puts in a header is CSRF-immune
+	/// by construction. std reads no cookie for you.
+	fun authorize_request(own self, check: async |Request| Result<Session, Reject>): Service {
+		self.authorize_request = Some(check);
 		self
 	}
 
@@ -952,17 +988,52 @@ fun rpc_frame_response(service: Service, request: Request): Response {
 	}
 	match service.shared {
 		Some(let protocol) => {
-			let (reply, status) = turn(FlushPolicy::AtEnd, || protocol.respond_with_status(Frame::Binary(request.bytes())));
+			// A120 S4: the per-request gate, after the two statements about
+			// the request's SHAPE — so a cross-site form, which cannot pass
+			// the content-type gate, never reaches a hook that might read a
+			// cookie — and before the frame is read.
+			let session = match service.authorize_request {
+				None => Session::anonymous(),
+				Some(let check) => {
+					// Re-marked at the `let` so the call awaits, as
+					// `gate_upgrade` does for `authorize`.
+					let gate: async |Request| Result<Session, Reject> = check;
+					match gate(request) {
+						Ok(let proved) => proved,
+						Err(let reject) => ret request_refusal(service, reject),
+					}
+				},
+			};
+			let answering = protocol.in_session(session);
+			let (reply, status) = turn(FlushPolicy::AtEnd, || answering.respond_with_status(Frame::Binary(request.bytes())));
 			envelope_response(reply, status)
 		},
 		// §9.7.7: as an ENVELOPE now, so a vilan client meeting it reads a
 		// typed `Remote(..)` rather than `Decode("unrecognized reply
 		// envelope")` about a plain-text sentence.
-		None => envelope_response(
-			encode_reply(service.codec, RpcOutcome::Failure(RpcError::Remote(FACTORY_REFUSAL))),
-			501,
-		),
+		None => envelope_response(encode_reply(service.codec, RpcOutcome::Failure(RpcError::Remote(FACTORY_REFUSAL))), 501),
 	}
+}
+
+/// `authorize_request`'s `Err(reject)`, answered on the POST leg with the
+/// reject's own status (A120 S4). The arms a vilan client can be TOLD about
+/// travel as an envelope, in the vocabulary a refused socket already reads —
+/// 401 and 403 as `Unauthorized` (`RpcError` has one arm for both, as the
+/// socket client's mapping does), 503 as `Unavailable` — so the envelope and
+/// the status say the same thing. `TooMany` is a limit rather than the app's
+/// judgement (`tells_the_client`), and a limit is answered as a bare status
+/// on this leg as on the socket, which a vilan client reads as
+/// `Transport(..)` naming it.
+fun request_refusal(service: Service, reject: Reject): Response {
+	let status = reject_number(reject);
+	if !tells_the_client(reject) {
+		ret Response::builder().code(status).body(i"this request was refused ({status})").build();
+	}
+	let error = match reject {
+		Reject::Unavailable => RpcError::Unavailable,
+		_ => RpcError::Unauthorized,
+	};
+	envelope_response(encode_reply(service.codec, RpcOutcome::Failure(error)), status)
 }
 
 let FACTORY_REFUSAL: str = "this service builds one instance per connection (Service::factory), and a POST rpc frame carries no connection to build for — connect over the WebSocket transport instead";
@@ -1012,7 +1083,13 @@ fun content_type_refusal(request: Request): Option<Response> {
 	}
 	Some(Response::builder()
 		.code(400)
-		.body("an rpc frame is posted as " + RPC_TEXT_MEDIA_TYPE + " or " + RPC_BINARY_MEDIA_TYPE + "; this request declared '" + declared + "'")
+		.body("an rpc frame is posted as "
+			+ RPC_TEXT_MEDIA_TYPE
+			+ " or "
+			+ RPC_BINARY_MEDIA_TYPE
+			+ "; this request declared '"
+			+ declared
+			+ "'")
 		.build())
 }
 
@@ -1050,7 +1127,12 @@ fun unauthorized_response(service: Service, route: str): Response {
 /// when the path is not this service's.
 fun service_response(service: Service, request: Request): Option<Response> {
 	let path = request.path();
+	// The two CONNECTION legs follow the upgrade's gate. The rpc leg is
+	// refused outright only when the upgrade is gated and nothing gates the
+	// request itself — `authorize_request` is that gate (A120 S4), and with
+	// it the leg answers per request instead.
 	let gated = service.authorize.is_some();
+	let post_refused = gated && service.authorize_request.is_none();
 	if path_matches_route(path, service.mount + "events") {
 		if gated {
 			Some(unauthorized_response(service, "events"))
@@ -1064,7 +1146,7 @@ fun service_response(service: Service, request: Request): Option<Response> {
 			Some(send_response(request))
 		}
 	} else if path_matches_route(path, service.mount + "rpc") {
-		if gated {
+		if post_refused {
 			Some(unauthorized_response(service, "rpc"))
 		} else {
 			Some(rpc_frame_response(service, request))

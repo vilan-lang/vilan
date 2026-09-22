@@ -928,7 +928,9 @@ section is about.
 An authorized service answers **only** the WebSocket upgrade: the
 connectionless SSE and POST legs carry no handshake to authorize, so they
 answer `401` rather than standing open as the way around the gate — the
-rpc leg with a typed `RpcError::Unauthorized` envelope.
+rpc leg with a typed `RpcError::Unauthorized` envelope. The POST leg can be
+gated in its own vocabulary instead, with a second hook:
+[`authorize_request`](#gating-the-post-leg-authorize_request).
 
 ### A refused client is told, and stops
 
@@ -1374,6 +1376,48 @@ is "did the call happen", the inner is "what did the server decide".
 call: an HTTP client is unversioned unless you call `verify()`. There are no
 mirrors and no reverse direction over this leg, which is why the constructor
 exists only for a service that declares neither.
+
+### Gating the POST leg: `authorize_request`
+
+A login door is open on purpose. The services after it are not, and a POST
+has no handshake for `authorize` to read — but it has headers, so it gets its
+own hook:
+
+```vilan,fragment
+Service::new(Billing {}.dispatcher().into_protocol(json_codec()))
+	.at("/billing/")
+	.authorize_request(|request: Request| match request.header("authorization") {
+		Some(let bearer) => match verify(bearer) {
+			Some(let subject) => Result::Ok(Session::of(subject)),
+			None => Result::Err(Reject::Forbidden),
+		},
+		None => Result::Err(Reject::Unauthorized),
+	})
+```
+
+It runs on every POST, after the leg's own method and content-type checks and
+before the frame is read. `Ok(session)` is stamped on that one request —
+`RpcRequest.session`, which a hand-written `Dispatcher` route reads — and
+`Err` answers the reject's status: `401`/`403` as an `Unauthorized` envelope
+and `503` as `Unavailable`, the arms a refused socket already gives a vilan
+client, and `429` as a bare status, which a client reads as `Transport(..)`.
+
+A second hook rather than `authorize` reading a request, because the
+credential lives somewhere else — a socket's in the `"token."` subprotocol, a
+POST's in a header or a cookie — and a `handshake.token()` that answered `None`
+for a request carrying a perfectly good `Authorization` header would be a trap.
+The two compose, and neither opens the other's leg:
+
+| installed | the socket upgrade | `POST {mount}rpc` |
+| --- | --- | --- |
+| neither | open | open |
+| `authorize` only | gated | `401` — no silent back door |
+| `authorize_request` only | open | gated per request |
+| both | gated | gated per request |
+
+The SSE pair is a connection, so it follows the upgrade's column. A
+`Service::factory` service stays `501` on the POST leg whatever the hook says:
+the instance, not the identity, is what a POST cannot supply.
 
 ### CORS, and the credential
 

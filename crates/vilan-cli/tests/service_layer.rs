@@ -6589,3 +6589,286 @@ async fun run_client(base: str) {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A120 S4's server: one `Door` behind each of the four rows of §9.7.6's
+/// composition table, plus a hand-written route that answers the session it
+/// was stamped with, and a factory under `authorize_request`.
+///
+/// The hooks are the app's, so the pin's are the cheapest checks there are:
+/// a socket's `token.good` and a POST's `Bearer good` are `ada`; the other
+/// bearer spellings name the refusal they earn.
+const TWO_HOOK_SERVER: &str = r#"import std::io::print;
+import std::option::Option::{ self, Some, None };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Request, Response, Server };
+import std::rpc_server::{ Connection, Handshake, Reject, Service, Session };
+import std::rpc::{ Dispatcher, reply };
+
+[service(Client)]
+struct Door {
+	seed: i32,
+}
+
+impl Door {
+	[rpc]
+	fun echo(self, value: i32): i32 {
+		value + self.seed
+	}
+}
+
+fun by_token(handshake: Handshake): Result<Session, Reject> {
+	match handshake.token() {
+		Some(let token) => if token == "good" { Ok(Session::of("ada")) } else { Err(Reject::Forbidden) },
+		None => Err(Reject::Unauthorized),
+	}
+}
+
+fun by_bearer(request: Request): Result<Session, Reject> {
+	match request.header("authorization") {
+		Some(let value) => if value == "Bearer good" {
+			Ok(Session::of("ada").with_credential("good"))
+		} else if value == "Bearer busy" {
+			Err(Reject::Unavailable)
+		} else if value == "Bearer flood" {
+			Err(Reject::TooMany)
+		} else {
+			Err(Reject::Forbidden)
+		},
+		None => Err(Reject::Unauthorized),
+	}
+}
+
+fun door(): Service {
+	Service::new(Door { seed = 1 }.dispatcher().into_protocol(json_codec()))
+}
+
+fun main() {
+	let who = Dispatcher::new().on("whoami", |request| reply(request.session.identity));
+	Server::builder()
+		.port(0)
+		.with_service(door().at("/open/"))
+		.with_service(door().at("/sock/").authorize(|handshake| by_token(handshake)))
+		.with_service(door().at("/req/").authorize_request(|request| by_bearer(request)))
+		.with_service(door()
+			.at("/both/")
+			.authorize(|handshake| by_token(handshake))
+			.authorize_request(|request| by_bearer(request)))
+		.with_service(Service::new(who.into_protocol(json_codec()))
+			.at("/who/")
+			.authorize_request(|request| by_bearer(request)))
+		.with_service(Service::factory(|connection: Connection| Door { seed = 1 }, json_codec())
+			.at("/fac/")
+			.authorize_request(|request| by_bearer(request)))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| print(i"ready {server.port()}"))
+		.build()
+		.start();
+}
+"#;
+
+/// A120 S4: `authorize_request`, the second hook — §9.7.6's four-row table,
+/// per row, on both legs, with and without a credential.
+///
+/// The row that must NOT move is `authorize` alone: its POST leg answered 401
+/// before this and still does, a good bearer included, because a service that
+/// gated its sockets and said nothing about requests did not ask for its POST
+/// leg to open. That is the no-back-door property, and adding a second hook is
+/// exactly the change that could have weakened it.
+#[test]
+fn the_two_hooks_compose_per_the_table_and_neither_opens_the_others_leg() {
+    let (server, port) = spawn_service_server("two_hooks", TWO_HOOK_SERVER);
+    let post = |path: &str, credential: &str, body: &str| {
+        let authorization = if credential.is_empty() {
+            String::new()
+        } else {
+            format!("Authorization: Bearer {credential}\r\n")
+        };
+        raw_http_closed(
+            port,
+            &format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+                 {authorization}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    };
+    let echo = "{\"method\":\"echo\",\"args\":[41]}";
+    let answered = "{\"Success\":42}";
+    let refused = "{\"Failure\":\"Unauthorized\"}";
+
+    // (mount, upgrade with no credential, POST with no credential, POST with a good one)
+    for (mount, bare_upgrade, bare_post, good_post) in [
+        ("/open/", "101", "200", "200"),
+        ("/sock/", "401", "401", "401"),
+        ("/req/", "101", "401", "200"),
+        ("/both/", "401", "401", "200"),
+    ] {
+        let upgrade = raw_upgrade(port, mount, "");
+        assert!(
+            upgrade.starts_with(&format!("HTTP/1.1 {bare_upgrade} ")),
+            "{mount}: an upgrade with no credential must answer {bare_upgrade}:\n{upgrade}"
+        );
+        // The socket's own credential opens every row's socket: the request
+        // hook never gates the upgrade.
+        let admitted = raw_upgrade(
+            port,
+            mount,
+            "Sec-WebSocket-Protocol: vilan-rpc, token.good\r\n",
+        );
+        assert!(
+            admitted.starts_with("HTTP/1.1 101 "),
+            "{mount}: an upgrade carrying the socket's credential must be admitted:\n{admitted}"
+        );
+        for (label, credential, status) in [("no", "", bare_post), ("a good", "good", good_post)] {
+            let response = post(&format!("{mount}rpc"), credential, echo);
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{mount}: a POST with {label} credential must answer {status}:\n{response}"
+            );
+            let envelope = if status == "200" { answered } else { refused };
+            assert!(
+                response.contains("Content-Type: application/json\r\n")
+                    && response.ends_with(envelope),
+                "{mount}: a POST with {label} credential must carry `{envelope}` — the \
+                 envelope and the status say the same thing:\n{response}"
+            );
+        }
+    }
+
+    // The reject's own status, and the arm a refused SOCKET already reads:
+    // 403 is `Unauthorized` (one arm for both, as the socket client maps it),
+    // 503 is `Unavailable`, and 429 — a limit, not the app's judgement — is a
+    // bare status with no envelope, which a vilan client reads as a transport
+    // failure naming it.
+    for (credential, status, envelope) in [
+        ("nope", "403", Some(refused)),
+        ("busy", "503", Some("{\"Failure\":\"Unavailable\"}")),
+        ("flood", "429", None),
+    ] {
+        let response = post("/req/rpc", credential, echo);
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status} ")),
+            "`Bearer {credential}` must answer {status}:\n{response}"
+        );
+        match envelope {
+            Some(envelope) => assert!(
+                response.contains("Content-Type: application/json\r\n")
+                    && response.ends_with(envelope),
+                "`Bearer {credential}` must carry `{envelope}`:\n{response}"
+            ),
+            None => assert!(
+                !response.contains("Content-Type: application/json")
+                    && !response.contains("\"Failure\""),
+                "`Bearer {credential}` is a limit and must not be an envelope:\n{response}"
+            ),
+        }
+    }
+
+    // The session reaches the handler: on the `RpcRequest`, the only thing a
+    // connectionless request carries.
+    let whoami = "{\"method\":\"whoami\",\"args\":[]}";
+    let proved = post("/who/rpc", "good", whoami);
+    assert!(
+        proved.starts_with("HTTP/1.1 200 ") && proved.ends_with("{\"Success\":\"ada\"}"),
+        "the session `authorize_request` proved must be the request's:\n{proved}"
+    );
+
+    // A factory service stays 501 whatever the hook would say: the instance,
+    // not the identity, is what a POST cannot supply.
+    for credential in ["good", ""] {
+        let factory = post("/fac/rpc", credential, echo);
+        assert!(
+            factory.starts_with("HTTP/1.1 501 ") && factory.contains("Service::factory"),
+            "a factory service's POST leg must stay 501 under `authorize_request` \
+             (credential `{credential}`):\n{factory}"
+        );
+    }
+
+    drop(server);
+}
+
+/// A120 S4's client half: a vilan stub refused by `authorize_request` reads
+/// the SAME arm a refused socket reads — nothing new to match on. The pin runs
+/// the generated `over_http` client against the gate with no credential
+/// (`HttpTransport` carries none), so every call is refused, and each refusal
+/// must arrive typed.
+#[test]
+fn a_vilan_client_refused_per_request_reads_the_arm_a_refused_socket_reads() {
+    let dir = temp_project("request_refused_stub");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::http::{ Request, Response, Server };
+import std::rpc_server::{ Reject, Service, Session };
+import std::rpc::RpcError;
+
+[service(Client)]
+struct Door {
+	seed: i32,
+}
+
+impl Door {
+	[rpc]
+	fun echo(self, value: i32): i32 {
+		value + self.seed
+	}
+}
+
+fun gated(reject: Reject): Service {
+	Service::new(Door { seed = 1 }.dispatcher().into_protocol(json_codec()))
+		.authorize_request(|request: Request| Result::Err(reject))
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(gated(Reject::Unauthorized).at("/who/"))
+		.with_service(gated(Reject::Unavailable).at("/busy/"))
+		.with_service(gated(Reject::TooMany).at("/flood/"))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run_client(server.url()))
+		.build()
+		.start();
+}
+
+fun say(label: str, outcome: Result<i32, RpcError>) {
+	match outcome {
+		Ok(let value) => print(i"{label} ok {value}"),
+		Err(let error) => match error {
+			RpcError::Transport(let reason) => print(i"{label} transport {reason}"),
+			_ => print(i"{label} {error.to_json()}"),
+		},
+	}
+}
+
+async fun run_client(base: str) {
+	say("who", Client::over_http(base + "who/", json_codec()).echo(41));
+	say("busy", Client::over_http(base + "busy/", json_codec()).echo(41));
+	say("flood", Client::over_http(base + "flood/", json_codec()).echo(41));
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    for expected in [
+        "who \"Unauthorized\"",
+        "busy \"Unavailable\"",
+        "flood transport the server answered 429 with something that is not an rpc reply",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "expected `{expected}` in:\n{stdout}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

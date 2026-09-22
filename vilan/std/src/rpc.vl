@@ -1161,6 +1161,50 @@ export fun dial_socket(url: str, protocols: List<str>): Result<SocketDuplex, Dia
 
 // === Wire envelope (RPC) ====================================================
 
+/// What the app proved about a caller before a request was answered — the
+/// identity half of `transport-rpc.md` Q4. A socket's session is what the
+/// service's `authorize` hook proved at the upgrade, carried into the factory
+/// as `Connection.session`; a connectionless POST's is what `authorize_request`
+/// proved about THAT request (A120 S4, §9.7.6), and it has nowhere to live but
+/// the `RpcRequest` it arrived as. Where nothing authorized the caller it is
+/// `Session::anonymous()`; the app decides what more an identity means by
+/// looking `identity` up in its own state.
+///
+/// It lives here rather than in `std::rpc_server` because `RpcRequest` carries
+/// it and `RpcRequest` is platform-neutral; `std::rpc_server` re-exports it, so
+/// `import std::rpc_server::Session` still names it.
+export struct Session {
+	/// The app's name for whoever is on the other end — a user id, a subject
+	/// claim. Empty when nothing authorized this caller.
+	identity: str,
+	/// The credential the identity was proved with, kept for apps that must
+	/// re-present it downstream. Empty when there was none.
+	credential: str,
+}
+
+export impl Session {
+	/// A caller nothing authorized: no identity, no credential.
+	fun anonymous(): Session {
+		Session { identity = "", credential = "" }
+	}
+
+	/// The ordinary `authorize` result: this caller is `identity`.
+	fun of(identity: str): Session {
+		Session { identity, credential = "" }
+	}
+
+	/// `of`, keeping the credential the identity was proved with.
+	fun with_credential(own self, credential: str): Session {
+		self.credential = credential;
+		self
+	}
+
+	/// Whether anything authorized this caller.
+	fun is_anonymous(self): bool {
+		self.identity == ""
+	}
+}
+
 /// The request handle a dispatcher hands to handlers: the method that routed it
 /// plus the request's deserializer, positioned at the first argument. `arg`
 /// pulls the NEXT argument — arguments are read in declaration order, exactly
@@ -1179,6 +1223,17 @@ export struct RpcRequest {
 	/// service built this protocol for — the honest source — and never read
 	/// off the frame, which the caller writes.
 	connection: i32,
+	/// Who the app proved the caller to be (A120 S4, `transport-rpc.md`
+	/// §9.7.6): the connection's `authorize` session on a socket, the
+	/// request's own `authorize_request` session on the connectionless POST
+	/// leg, and `Session::anonymous()` wherever nothing authorized it. Stamped
+	/// by the protocol like `connection`, and never read off the frame.
+	///
+	/// A hand-written `Dispatcher` route reads it here. A generated `[rpc]`
+	/// method has no parameter it could arrive in; a method that must know
+	/// its caller is written on a `Service::factory` instance, whose fields
+	/// the connection's session built.
+	session: Session,
 }
 
 export impl RpcRequest {
@@ -1187,6 +1242,14 @@ export impl RpcRequest {
 	/// cannot know, because a frame carries no connection.
 	fun on_connection(own self, connection: i32): RpcRequest {
 		self.connection = connection;
+		self
+	}
+
+	/// The same request, carrying the session its caller was proved to be —
+	/// stamped by `RpcProtocol::respond` beside the connection, for the same
+	/// reason: a frame carries neither.
+	fun in_session(own self, session: Session): RpcRequest {
+		self.session = session;
 		self
 	}
 }
@@ -1262,7 +1325,7 @@ export fun open_request(codec: Codec, frame: Frame): RpcRequest {
 	let method = (deserializer.str_value)();
 	(deserializer.field)("args");
 	let arity = (deserializer.begin_list)();
-	RpcRequest { method, deserializer, arity, connection = 0 - 1 }
+	RpcRequest { method, deserializer, arity, connection = 0 - 1, session = Session::anonymous() }
 }
 
 /// One reply envelope: an externally-tagged `Success` carrying the described
@@ -1304,6 +1367,12 @@ export struct RpcProtocol {
 	/// connection at the upgrade, which is how a source-returning route
 	/// reaches THIS client's capability table and no other's (§9.2).
 	connection: i32,
+	/// The session every request through this protocol is stamped with —
+	/// the connection's under `Service` (what `authorize` proved at the
+	/// upgrade), or ONE request's on the connectionless POST leg (what
+	/// `authorize_request` proved, A120 S4). `Session::anonymous()` until
+	/// something stamps it.
+	session: Session,
 	/// The `[rpc]` methods whose reply is a signal HANDLE, read off the
 	/// dispatcher at `into_protocol` (tracker A78). What lets `local_rpc`
 	/// refuse a handle service it has no connection for at WIRING time,
@@ -1319,6 +1388,14 @@ export impl RpcProtocol {
 	/// exports through.
 	fun for_connection(own self, connection: i32): RpcProtocol {
 		self.connection = connection;
+		self
+	}
+
+	/// The same protocol, answering for one proved caller — the copy a
+	/// `Service` makes per connection (its `authorize` session) and per POST
+	/// (its `authorize_request` session). Only the stamp differs.
+	fun in_session(own self, session: Session): RpcProtocol {
+		self.session = session;
 		self
 	}
 
@@ -1339,7 +1416,9 @@ export impl RpcProtocol {
 	/// client: curl, a `fetch` in a page, a proxy, a load balancer, a
 	/// monitoring probe.
 	fun respond_with_status(self, frame: Frame): (Frame, i32) {
-		let request = open_request(self.codec, frame).on_connection(self.connection);
+		let request = open_request(self.codec, frame)
+			.on_connection(self.connection)
+			.in_session(self.session);
 		let outcome = match (request.deserializer.failed)() {
 			Some(let reason) => RpcOutcome::Failure(RpcError::Decode(reason)),
 			None => (self.dispatch)(request),
@@ -1785,6 +1864,7 @@ export impl Dispatcher {
 			codec,
 			dispatch = |request| self.handle(request),
 			connection = 0 - 1,
+			session = Session::anonymous(),
 			handle_methods = self.handle_methods.read(),
 		}
 	}
@@ -6059,7 +6139,9 @@ export macro fun service(item: Item): Source {
 	// and `over_http("/admin/", c)` read the same and a service that moves
 	// mount moves one string on each side. `HttpTransport { url }` stays the
 	// raw door for a client pointed at another origin.
-	let http_client_is_holdable = !any_handle && exposed_names.len() == 0 && target.handler_name == "";
+	let http_client_is_holdable = !any_handle
+		&& exposed_names.len() == 0
+		&& target.handler_name == "";
 	let over_http_impl = if target.client_name != "" && http_client_is_holdable {
 		impl_of(target.client_name)
 			.generics("<HttpTransport>")
