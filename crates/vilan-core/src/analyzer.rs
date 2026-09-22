@@ -25137,8 +25137,28 @@ impl<'src> Analyzer<'src> {
             .filter(|parameter| parameter.lazy)
             .map(|parameter| parameter.id)
             .collect();
+        // B362 (RULED) — **a trait's declaration and every impl of it are ONE
+        // convention**, so they are eager together or lazy together.
+        //
+        // A call reached through a BOUND has no impl to resolve at check time;
+        // it resolves to the trait's own declaration, so the pair banked above
+        // names the DECLARATION's parameter. That parameter and the impl's are
+        // different ids, and the eager decision is taken per id — so a program
+        // whose dispatched site passes `7` (inert: eager, no thunk) beside a
+        // DIRECT call on the impl passing `expensive()` (not inert: lazy, the
+        // body forces) got a callee that forces and a caller that does not.
+        // `__force(7)` wrote `.state` on a number and the program died with a
+        // `TypeError` it had checked clean.
+        //
+        // `lazy` is part of the signature and `check_one_conformance` holds an
+        // impl to its trait's answer, so the convention is KNOWN at the bound —
+        // which is exactly what makes thunking at the dispatched site right,
+        // and what makes this group the unit the decision is taken over. Each
+        // group is one member's parameters at one position: the trait's, and
+        // every implementing member's.
+        let conventions = self.lazy_convention_groups();
         loop {
-            let retracted: Vec<Id> = lazy_pairs
+            let mut retracted: Vec<Id> = lazy_pairs
                 .iter()
                 .filter(|(parameter_id, argument_id, _)| {
                     eager_parameters.contains(parameter_id)
@@ -25146,6 +25166,12 @@ impl<'src> Analyzer<'src> {
                 })
                 .map(|(parameter_id, _, _)| *parameter_id)
                 .collect();
+            for parameter_id in retracted.clone() {
+                if let Some(group) = conventions.get(&parameter_id) {
+                    retracted.extend(group.iter().copied());
+                }
+            }
+            retracted.retain(|parameter_id| eager_parameters.contains(parameter_id));
             if retracted.is_empty() {
                 break;
             }
@@ -25190,6 +25216,79 @@ impl<'src> Analyzer<'src> {
             );
             self.lazy_thunk_effects.insert(argument_id, effects);
         }
+    }
+
+    /// B362 — the `lazy` CONVENTION groups: every trait-declared member's
+    /// parameters tied, position by position, to the same member's parameters
+    /// in every impl that provides it.
+    ///
+    /// A `lazy` parameter is part of the signature, and `check_one_conformance`
+    /// already holds an impl to its trait's answer — so a dispatched call site,
+    /// which can only see the DECLARATION, is looking at the same convention
+    /// the impl's body will read. The eager elision is taken per parameter id,
+    /// and those are different ids, so without this the two halves of one
+    /// signature could disagree: the caller passes a plain value and the callee
+    /// forces it.
+    ///
+    /// Returned as `parameter -> the OTHER parameters in its group`, which is
+    /// what the retraction loop asks. Only members with a `lazy` position build
+    /// a group, so a program with no `lazy` trait member pays one walk over the
+    /// traits and nothing else.
+    fn lazy_convention_groups(&self) -> HashMap<Id, Vec<Id>> {
+        let mut groups: HashMap<Id, Vec<Id>> = HashMap::default();
+        for (trait_id, trait_) in &self.traits {
+            for (member_name, declaration_id) in &trait_.declarations {
+                let Some(declared) = self.functions.get(declaration_id) else {
+                    continue;
+                };
+                let declared_parameters = declared.parameters.clone();
+                if !declared_parameters.iter().any(|parameter_id| {
+                    self.parameters
+                        .get(parameter_id)
+                        .is_some_and(|parameter| parameter.lazy)
+                }) {
+                    continue;
+                }
+                // Every impl that provides this trait — DIRECTLY or through a
+                // subtrait's clause, which is the same reach method resolution
+                // takes to the member.
+                let mut positions: Vec<Vec<Id>> =
+                    declared_parameters.iter().map(|id| vec![*id]).collect();
+                for implementation in &self.implementations {
+                    if !implementation.trait_ids.iter().any(|implemented| {
+                        self.trait_with_supertraits(*implemented).contains(trait_id)
+                    }) {
+                        continue;
+                    }
+                    let Some(member_id) = implementation.declarations.get(member_name) else {
+                        continue;
+                    };
+                    let Some(member) = self.functions.get(member_id) else {
+                        continue;
+                    };
+                    for (position, parameter_id) in member.parameters.iter().enumerate() {
+                        let Some(slot) = positions.get_mut(position) else {
+                            continue;
+                        };
+                        slot.push(*parameter_id);
+                    }
+                }
+                for slot in positions {
+                    if slot.len() < 2 {
+                        continue;
+                    }
+                    for parameter_id in &slot {
+                        let others: Vec<Id> = slot
+                            .iter()
+                            .copied()
+                            .filter(|other| other != parameter_id)
+                            .collect();
+                        groups.entry(*parameter_id).or_default().extend(others);
+                    }
+                }
+            }
+        }
+        groups
     }
 
     /// M81 — whether the expression standing in a `lazy` position is INERT:
