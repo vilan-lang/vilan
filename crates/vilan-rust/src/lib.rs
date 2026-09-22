@@ -560,6 +560,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Ok(format!("{{ {prefix}{body} }}"))
     }
 
+    /// Every name a closure's PARAMETER LIST introduces: the parameters
+    /// themselves, plus the binders a tuple parameter's destructures bind.
+    ///
+    /// The second half is why this is a function. `|(value, factor)| ..` has one
+    /// parameter — an unnamed tuple — and `value` and `factor` are declared by
+    /// `Closure::parameter_destructures`, which the body walk never reaches, so
+    /// every seed built from `closure.parameters` alone reads them as captures.
+    fn closure_parameter_bindings(&self, closure: &vilan_core::analyzer::Closure) -> HashSet<Id> {
+        let mut bindings: HashSet<Id> = closure.parameters.iter().copied().collect();
+        for destructure in &closure.parameter_destructures {
+            if let Some(Expr::Destructure(_, pattern)) = self.program.entity_map.get(destructure) {
+                collect_pattern_bindings_into(pattern, &mut bindings);
+            }
+        }
+        bindings
+    }
+
     /// Walks a closure body, collecting the bindings it DECLARES and the
     /// bindings it READS. The difference is what it captured.
     fn scan_closure(
@@ -4196,8 +4213,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // The scan runs BEFORE the body is walked, because the body's own reads
         // of a capture need the set: see [`Emitter::closure_captures`].
         // The scan is given the BODY, so this closure's own parameters are
-        // declared-inside by seeding rather than by the walk.
-        let mut declared_inside: HashSet<Id> = closure.parameters.iter().copied().collect();
+        // declared-inside by seeding rather than by the walk — and so are the
+        // names a TUPLE PARAMETER's destructures bind (F18): `|(value, factor)|
+        // value * factor` has one parameter, an unnamed tuple, and `value` and
+        // `factor` are declared by `parameter_destructures`, which the body walk
+        // never visits. Without them in the seed both read as captures and the
+        // prelude cloned them before either existed.
+        let declared_inside_seed: HashSet<Id> = self.closure_parameter_bindings(&closure);
+        let mut declared_inside: HashSet<Id> = declared_inside_seed.clone();
         let mut referenced = HashSet::new();
         let mut visited = HashSet::new();
         self.scan_closure(
@@ -4264,7 +4287,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // them, which would make the closure itself `FnOnce` and no
         // `Rc<dyn Fn>` at all.
         if wants_a_future {
-            let inner = self.async_capture_prelude(closure.return_);
+            let inner =
+                self.async_capture_prelude_declaring(closure.return_, &declared_inside_seed);
             return Ok(format!(
                 "{{ {prelude}std::rc::Rc::new(move |{}| {{ {inner}vilan_rt::executor::pin_future(async move {{ {body} }}) }}) }}",
                 parameters.join(", ")
@@ -4588,22 +4612,29 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.expects_async_value = false;
                 return Ok(Some(format!("vilan_rt::http::create_server({})", handler?)));
             }
+            // The two body reads CONSUME the request handle, and the callback
+            // reads the same handle again afterwards — `std::http`'s own
+            // `Server::start` awaits the body and then builds
+            // `Request { node = node_request, .. }` out of it. A handle is
+            // RETAINED per use, exactly as J6 retains a `Task` read out of a
+            // binding: `clone_sites` marks nothing, because on the JS backend a
+            // handle is a class instance that `__clone` passes through.
             ExternBinding::Function {
                 module: Some("node:stream/consumers"),
                 symbol: "buffer",
             } => {
-                let request = self.value_argument(argument_ids, 0, depth)?;
+                let request = self.place_argument(argument_ids, 0, depth)?;
                 return Ok(Some(format!(
-                    "vilan_rt::http::read_request_bytes({request})"
+                    "vilan_rt::http::read_request_bytes(({request}).clone())"
                 )));
             }
             ExternBinding::Function {
                 module: Some("node:stream/consumers"),
                 symbol: "text",
             } => {
-                let request = self.value_argument(argument_ids, 0, depth)?;
+                let request = self.place_argument(argument_ids, 0, depth)?;
                 return Ok(Some(format!(
-                    "vilan_rt::http::read_request_text({request})"
+                    "vilan_rt::http::read_request_text(({request}).clone())"
                 )));
             }
             _ => {}
@@ -4805,7 +4836,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// already says a capture is a copy, and a handle's copy is the same
     /// handle.
     fn async_capture_prelude(&mut self, body: Id) -> String {
-        let mut declared_inside = HashSet::new();
+        self.async_capture_prelude_declaring(body, &HashSet::new())
+    }
+
+    /// [`Emitter::async_capture_prelude`] with names the CALLER knows are
+    /// declared inside and the body walk cannot see — a tuple parameter's
+    /// destructured binders (F18).
+    fn async_capture_prelude_declaring(&mut self, body: Id, seed: &HashSet<Id>) -> String {
+        let mut declared_inside = seed.clone();
         let mut referenced = HashSet::new();
         let mut visited = HashSet::new();
         self.scan_closure(body, &mut declared_inside, &mut referenced, &mut visited);

@@ -103,6 +103,25 @@ impl Js for Bytes {
     }
 }
 
+/// `JSON.stringify(new Uint8Array([1, 2]))` is `{"0":1,"1":2}` — a typed array
+/// has its indices as own enumerable properties, so it stringifies as an OBJECT
+/// and not as an array. Reproduced rather than refused, because unlike the
+/// handles below a `Bytes` really does have a JSON rendering on the other
+/// backend.
+impl crate::Json for Bytes {
+    fn json(&self) -> String {
+        let mut out = String::from("{");
+        for (index, byte) in self.0.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!("\"{index}\":{byte}"));
+        }
+        out.push('}');
+        out
+    }
+}
+
 // ---------------------------------------------------------------- parsing ---
 
 /// A request head, parsed off the wire.
@@ -1101,6 +1120,24 @@ impl Js for Server {
         )
     }
 }
+
+/// The five host types this module IS are opaque objects on the JS backend — a
+/// `NodeRequest` is an `http.IncomingMessage` — and `JSON.stringify` of an
+/// object whose own enumerable properties are all functions or absent is `{}`.
+/// They exist as [`crate::Json`] only so that a vilan struct holding one can
+/// still carry the `impl Json` the emitter writes beside every `impl Js` (F20).
+/// Anything that needs a real rendering of a request is reading the wrong type.
+macro_rules! opaque_json {
+    ($($type:ty),*) => {
+        $(impl crate::Json for $type {
+            fn json(&self) -> String {
+                "{}".to_string()
+            }
+        })*
+    };
+}
+
+opaque_json!(Server, Address, Request, Response, Socket);
 
 #[cfg(test)]
 mod tests {

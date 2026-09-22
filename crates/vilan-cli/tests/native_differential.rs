@@ -34,6 +34,7 @@
 //! `CARGO_TARGET_TMPDIR`, so the runtime compiles ONCE for the whole sweep
 //! rather than once per program.
 
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -749,21 +750,18 @@ const DESTRUCTURE_PROBE: &str = concat!(
 ///
 /// A `std::http` server program EMITS, and what comes out names the runtime's
 /// own calls rather than a refusal — `create_server`, the bound `listen`, the
-/// request body read, and the response's status/header/end. The exit this slice
-/// is measured against is a RUNNING native server, and it is not reached: four
-/// general emitter gaps stand between this source and rustc, each recorded in
-/// the lane's report and none of them about HTTP (an `async` closure TYPE at a
-/// struct field, a derived `PartialEq` over an `Option` of a closure, an enum
-/// payload holding a closure, and a non-`Copy` field read off a loaned
-/// receiver). So this pin holds what DOES stand: twenty-three of `std::http`'s
-/// twenty-five raw `node:http` bindings are answered by `vilan_rt::http` — the
-/// two that are not are `NodeRequest::headers` and `NodeSocket::remoteAddress`,
-/// which answer a `JsonValue` and are Order 40's — and this program reaches
-/// neither, so none of its bindings is refused.
+/// request body read, and the response's status/header/end. Twenty-three of
+/// `std::http`'s twenty-five raw `node:http` bindings are answered by
+/// `vilan_rt::http`; the two that are not are `NodeRequest::headers` and
+/// `NodeSocket::remoteAddress`, which answer a `JsonValue` and are Order 40's,
+/// and this program reaches neither.
 ///
 /// It asserts the CALLS and not merely that the emit succeeded, because an
 /// emitter that refused every binding under the census's `unimplemented!()`
-/// would also "succeed".
+/// would also "succeed". The slice's EXIT — the same program built, run, and
+/// answering a GET over a real socket — is
+/// [`a_native_std_http_server_answers_a_get_over_a_real_socket`]; this pin is
+/// the cheap half, and it is what says WHICH bindings the exit went through.
 #[test]
 fn a_std_http_server_emits_calls_into_the_native_runtime() {
     let staged = stage();
@@ -838,6 +836,222 @@ const HTTP_PROBE: &str = concat!(
     "\tserver.start();\n",
     "}\n",
 );
+
+/// **F18 slice 1's EXIT**: a `std::http` server compiled with `--backend rust`
+/// runs as a native binary and answers a `GET /` over a real socket, and the JS
+/// twin answers the same thing.
+///
+/// The whole slice is measured here. Everything else about it — the
+/// dependency-free HTTP/1.1 server in `vilan-rt`, the `IoSource` turn, the
+/// twenty-three `node:http` bindings, the executor's free list — exists so that
+/// this program serves a request, and a runtime whose own unit tests pass while
+/// the compiler cannot reach it would be a runtime nobody can use.
+///
+/// **What is compared, and what cannot be.** The status line, the header the
+/// PROGRAM set, and the body, byte for byte on both legs. Not the whole
+/// response: node adds a `Date`, which changes every second, and node and this
+/// server order `Connection` and `Content-Length` differently — two facts
+/// written down rather than normalised away, because a reader deserves to know
+/// the comparison is not the whole wire. stdout IS compared whole, and it is
+/// the port announcement, which is the same line from both.
+///
+/// **The ordering is the harness's own, not a sleep.** The SERVER binds port 0
+/// and announces the number it got; the fetch cannot start before that line has
+/// arrived, because the line is where the number comes from. There is no
+/// bind-release-rebind window (`support/port.rs`'s N40 finding) and no sleep
+/// standing in for a happens-before.
+#[test]
+fn a_native_std_http_server_answers_a_get_over_a_real_socket() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_http.vl"), HTTP_PROBE)
+        .expect("write the probe program");
+
+    // The native leg: build, then run the BINARY rather than `vilan run`, so
+    // the child this test kills is the server itself and not a parent that
+    // would outlive it.
+    let built = vilan(&staged)
+        .args(["build", "--backend", "rust", "native_probe_http.vl"])
+        .output()
+        .expect("build the server natively");
+    assert!(
+        built.status.success(),
+        "the native leg did not build:\n{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let binary = String::from_utf8_lossy(&built.stdout)
+        .lines()
+        .find_map(|line| line.split(" -> ").nth(1).map(str::to_string))
+        .expect("`vilan build` says where the binary is");
+    let native = ServedRequest::take(Command::new(staged.join(&binary)));
+
+    // The JS leg, the same program, the same request.
+    let bundled = vilan(&staged)
+        .args(["build", "native_probe_http.vl"])
+        .output()
+        .expect("build the server for node");
+    assert!(
+        bundled.status.success(),
+        "the JS leg did not build:\n{}",
+        String::from_utf8_lossy(&bundled.stderr)
+    );
+    let mut node = Command::new("node");
+    node.current_dir(&staged).arg("native_probe_http.mjs");
+    let javascript = ServedRequest::take(node);
+
+    assert_eq!(
+        native.status, javascript.status,
+        "the two backends must answer the same status line"
+    );
+    assert_eq!(
+        native.status, "HTTP/1.1 200 OK",
+        "and it is a 200 — a pin that agreed on a 500 would agree about nothing"
+    );
+    assert_eq!(
+        native.body, javascript.body,
+        "the two backends must answer the same body"
+    );
+    assert_eq!(native.body, "hello\n", "and it is the handler's own body");
+    // The header the PROGRAM set goes out on both. Node's `Date` and the order
+    // it writes `Connection`/`Content-Length` in are its own; see this test's
+    // header comment.
+    for leg in [&native, &javascript] {
+        assert!(
+            leg.headers
+                .iter()
+                .any(|line| line == "Content-Type: text/plain"),
+            "the program's header must reach the wire: {:?}",
+            leg.headers
+        );
+        assert!(
+            leg.headers.iter().any(|line| line == "Content-Length: 6"),
+            "a buffered body declares its length: {:?}",
+            leg.headers
+        );
+    }
+    assert_eq!(
+        native.announced_line.split('=').next(),
+        javascript.announced_line.split('=').next(),
+        "both legs announce through the same `on_start`"
+    );
+}
+
+/// One request answered by a spawned server, and the pieces of the answer the
+/// two backends can be held to.
+struct ServedRequest {
+    status: String,
+    headers: Vec<String>,
+    body: String,
+    announced_line: String,
+}
+
+impl ServedRequest {
+    /// Spawns `command`, waits for the port IT bound, fetches `GET /`, and
+    /// reaps the child.
+    ///
+    /// The child is killed on the way out of this function on every path,
+    /// including a panic inside it, because [`ServerUnderTest`] owns it and its
+    /// `Drop` does the kill — a failed assertion must not leak a listener into
+    /// the rest of the suite.
+    fn take(mut command: Command) -> ServedRequest {
+        let server = ServerUnderTest::spawn(&mut command);
+        let port = server.port();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
+            .expect("connect to the port the server announced");
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .expect("send the request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("read the response");
+        let (head, body) = response
+            .split_once("\r\n\r\n")
+            .unwrap_or_else(|| panic!("a response with a head and a body, got {response:?}"));
+        let mut lines = head.split("\r\n");
+        let status = lines.next().unwrap_or_default().to_string();
+        ServedRequest {
+            status,
+            headers: lines.map(str::to_string).collect(),
+            body: body.to_string(),
+            announced_line: server.announcement.clone(),
+        }
+    }
+}
+
+/// A spawned server whose port is the one it actually bound, killed on drop.
+///
+/// `support/port.rs` is the same mechanism for the e2e suites; this binary has
+/// no `mod support`, and the twenty lines are cheaper than giving it one for a
+/// single test.
+struct ServerUnderTest {
+    child: std::process::Child,
+    announcement: String,
+    port: u16,
+}
+
+impl ServerUnderTest {
+    fn spawn(command: &mut Command) -> ServerUnderTest {
+        let mut child = command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("spawn the server");
+        let stdout = child.stdout.take().expect("the server's stdout");
+        let (sender, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut server = ServerUnderTest {
+            child,
+            announcement: String::new(),
+            port: 0,
+        };
+        // A LIVENESS bound, not a claim about how fast a server boots: a green
+        // spawn returns the moment the line lands.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "the server never announced its port");
+            match lines.recv_timeout(remaining) {
+                Ok(line) => {
+                    if let Some(number) = line
+                        .split_whitespace()
+                        .find_map(|field| field.strip_prefix("vilan-test-port="))
+                    {
+                        let port: u16 = number.parse().expect("the announced port is a number");
+                        assert_ne!(
+                            port, 0,
+                            "the server reported the port it ASKED for, not one it bound"
+                        );
+                        server.announcement = line;
+                        server.port = port;
+                        return server;
+                    }
+                }
+                Err(_) => panic!("the server's stdout ended before it announced a port"),
+            }
+        }
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl Drop for ServerUnderTest {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
 
 /// F25: a program that FAILS answers the same exit code on both backends, and
 /// the native binary does not print Rust's panic banner.

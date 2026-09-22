@@ -1375,7 +1375,14 @@ pub fn run_pending() {
         drain_microtasks();
         report_unobserved_failures();
         reap_settled();
-        if !advance_timers() {
+        // [`advance_macrotasks`] rather than [`advance_timers`], for the same
+        // reason `block_on` uses it (F18): a synchronous `fun main` that bound a
+        // SERVER left an I/O source behind, not a timer, and a loop that only
+        // asked the deadline list saw nothing to do and let the process exit
+        // with the listener still open — the socket announced its port and then
+        // refused every connection. With no source registered the two are the
+        // same function.
+        if !advance_macrotasks() {
             break;
         }
     }
