@@ -62618,6 +62618,133 @@ mod rigidity_agreement_tests {
     }
 }
 
+/// N113 (the fourth edge) — a global host PROPERTY bound in the FUNCTION form,
+/// which emits a call to it.
+///
+/// `[extern("document.activeElement")]` emits `document.activeElement()`. The
+/// function form of `[extern]` addresses a CALLABLE — it is the form
+/// `[extern("Math.max")]` and `[extern("node:http", "createServer")]` use — so
+/// binding a property through it produces a program that compiles clean and
+/// dies at the first line that reaches it with "is not a function". std paid
+/// this coin three times before anyone wrote it down: `__dom_window`,
+/// `__router_path` and now `__dom_active_element` are all runtime helpers that
+/// exist ONLY because the value on the other side is a property and not a
+/// function.
+///
+/// The check is a TABLE, and it has to be: nothing in a host binding says
+/// whether the name on the other side is callable, so the honest scope is the
+/// globals whose shape is fixed by the web platform and by node — the ones a
+/// vilan author is actually likely to reach for. A name outside it is still
+/// bound as before; this refuses what it KNOWS is wrong rather than guessing
+/// at what might be.
+///
+/// The two fixes the message names are the two that exist: a runtime helper
+/// (what std does for its own), or, when the property hangs off a value the
+/// program holds rather than off a global, `[extern(get, "..")]` with the
+/// holder as the receiver.
+const GLOBAL_HOST_PROPERTIES: &[&str] = &[
+    // The document's own reads.
+    "document.activeElement",
+    "document.body",
+    "document.cookie",
+    "document.documentElement",
+    "document.head",
+    "document.hidden",
+    "document.readyState",
+    "document.title",
+    "document.visibilityState",
+    // The URL, and the reason `__router_path` exists.
+    "location",
+    "location.hash",
+    "location.host",
+    "location.hostname",
+    "location.href",
+    "location.origin",
+    "location.pathname",
+    "location.port",
+    "location.protocol",
+    "location.search",
+    // The window, and the reason `__dom_window` exists.
+    "window",
+    "window.devicePixelRatio",
+    "window.innerHeight",
+    "window.innerWidth",
+    "window.outerHeight",
+    "window.outerWidth",
+    "window.scrollX",
+    "window.scrollY",
+    // The rest of the browser's globals a binding reaches for.
+    "history.length",
+    "history.state",
+    "navigator.language",
+    "navigator.onLine",
+    "navigator.userAgent",
+    "screen.height",
+    "screen.width",
+    "localStorage",
+    "sessionStorage",
+    "navigator",
+    "document",
+    "history",
+    "screen",
+    // node's, on the process side.
+    "process.argv",
+    "process.env",
+    "process.platform",
+    "process.stdout",
+    "process.stderr",
+    "process.stdin",
+    "process.version",
+];
+
+/// The refusal above, over the finished program's externals. A post-pass for
+/// the same reason [`check_unlowered_externals`] is one — the two read the same
+/// table and answer the same kind of question about a DECLARATION — and it runs
+/// beside it.
+pub fn check_global_property_externs(program: &mut Program) {
+    let mut sites: Vec<(Span, SourceId, String)> = Vec::new();
+    for external in program.external_functions.values() {
+        let Some(ExternBinding::Function {
+            module: None,
+            symbol,
+        }) = external.extern_binding.as_ref()
+        else {
+            continue;
+        };
+        if !GLOBAL_HOST_PROPERTIES.contains(symbol) {
+            continue;
+        }
+        let Some(source) = program.source_of(external.id) else {
+            continue;
+        };
+        sites.push((
+            external.name_span,
+            source,
+            format!(
+                "`{symbol}` is a host PROPERTY, not a function: the function form of \
+                 `[extern]` emits a CALL, so this binding reaches the host as \
+                 `{symbol}()` and fails there. Read it through a runtime helper \
+                 (`std::dom`'s `__dom_active_element` and `__dom_window` are that \
+                 shape), or, if the property hangs off a value the program holds \
+                 rather than off a global, bind it with `[extern(get, \"..\")]` on a \
+                 receiver"
+            ),
+        ));
+    }
+    sites.sort_by_key(|(span, source, _)| (source.0, span.start, span.end));
+    for (span, source, msg) in sites {
+        program.push_diagnostic(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg,
+            },
+            source,
+        );
+    }
+}
+
 /// B360 — an `external fun` with NO `[extern]` binding and no compiler
 /// lowering, refused where it is DECLARED (R4).
 ///

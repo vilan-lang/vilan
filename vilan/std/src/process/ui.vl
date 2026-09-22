@@ -268,7 +268,22 @@ export impl View {
 
 	/// Focus, server side: nothing to focus. Dropped like `on_mount`, whose
 	/// one-word form it is on the browser twin. KEEP IN STEP.
+	///
+	/// The browser twin also WRITES the `autofocus` attribute (A121 §6.1),
+	/// and this deliberately does not: a served `autofocus` attribute is
+	/// honored by the browser's own initial parse, which would focus the
+	/// element before the client build ever ran — a real behaviour change to
+	/// every server-rendered page that chains this, and a wider question than
+	/// the focus scope that motivated the write. The client build sets it at
+	/// mount either way.
 	fun autofocus(self): View {
+		self
+	}
+
+	/// Make this element a focus scope, server side: nothing is trapped and
+	/// nothing is focused. Dropped like `autofocus` above, whose clock it
+	/// shares on the browser twin. KEEP IN STEP.
+	fun focus_scope(self, containment: FocusContainment): View {
 		self
 	}
 
@@ -828,4 +843,72 @@ fun place_when_some<T, S: Source<Option<T>>, C: Slot>(
 		},
 		None => {},
 	}
+}
+
+// === A121: focus scopes, server side (proposal/focus-scope.md) ===============
+//
+// ACCEPTED AND DROPPED, exactly as `on_mount` and `autofocus` are: a server
+// render has no focus to trap and no document to trap it in — the request
+// creates, serializes and discards. The surface is declared name for name so
+// the same component source compiles through both layers; the browser twin
+// (browser/ui.vl) carries the mechanism and its reasoning. KEEP IN STEP.
+
+/// What a focus scope does with a Tab that would leave it — the browser
+/// twin's enum, declared here so a component that names an arm compiles on
+/// both legs.
+export enum FocusContainment {
+	/// A modal: Tab cycles, and focus that arrives elsewhere is pulled back.
+	Contain,
+	/// A menu: Tab cycles while focus is inside; anything else may leave.
+	Wrap,
+}
+
+/// An installed focus scope, server side: an id and a latch, both inert. The
+/// browser twin's handle also carries its root element, which a server layer
+/// cannot name — a FIELD may differ between twins where a member may not, and
+/// nothing here ever reads one.
+export struct FocusScope {
+	id: i32,
+	focused: Shared<bool>,
+}
+
+export impl FocusScope {
+	/// Take the initial focus, server side: there is none to take. `false` is
+	/// also what the browser answers for a scope whose subtree holds nothing
+	/// focusable, so a driver that retries on the next frame behaves the same
+	/// on both legs — it simply has no next frame here. KEEP IN STEP.
+	fun focus_initial(self): bool {
+		false
+	}
+}
+
+/// The scope stack, server side: nothing is ever pushed onto it. It is
+/// declared rather than omitted because the twin surfaces are held name for
+/// name, and a name that exists on one side only is the drift that gate
+/// exists to catch.
+let focus_scopes: Shared<List<i32>> = Shared::new([]);
+
+/// The id source, inert with the stack above.
+let next_focus_scope: Shared<i32> = Shared::new(0);
+
+/// The stack's two readers, answering the empty stack. They are what the
+/// browser twin's two window listeners consult at event time; there are no
+/// events here.
+fun focus_reaches_from(id: i32, target: i32): bool {
+	false
+}
+
+fun topmost_contain_scope(): Option<i32> {
+	None
+}
+
+/// Install a focus scope, server side: nothing is installed and nothing is
+/// focused. The root is GENERIC for `on_mount`'s reason — a server layer
+/// cannot name the browser-only `std::dom::Element` — and the handle it
+/// hands back answers `false` from `focus_initial`, which is the same answer
+/// the browser gives for a scope whose subtree holds nothing focusable.
+export fun focus_scope<E>(root: E, containment: FocusContainment): FocusScope {
+	let id = next_focus_scope.read() + 1;
+	next_focus_scope.write() = id;
+	FocusScope { id, focused = Shared::new(false) }
 }

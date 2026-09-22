@@ -38,8 +38,13 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ("browser/router.vl", 1, "R: the module-level `wired` latch"),
     (
         "browser/ui.vl",
-        24,
-        "O: per-boundary row/owner bookkeeping (+3 at Order 39: `when_some`'s row, owner and payload cell — A119)",
+        27,
+        "O + R: per-boundary row/owner bookkeeping (+3 at Order 39: `when_some`'s \
+         row, owner and payload cell — A119), plus A121's focus scopes at Order \
+         40 — the scope STACK and its id source are R (module bindings, program \
+         lifetime, because the document is global and an overlay is a portal: \
+         the nesting cannot be read off the DOM), and a `FocusScope`'s `focused` \
+         latch is O (it dies with the boundary that installed the scope)",
     ),
     (
         "delta.vl",
@@ -66,7 +71,14 @@ const CENSUS: &[(&str, usize, &str)] = &[
         6,
         "R + O: the registry, the server's stats",
     ),
-    ("process/ui.vl", 3, "O: the SSR request's view tree"),
+    (
+        "process/ui.vl",
+        6,
+        "O: the SSR request's view tree, plus A121's three inert focus-scope \
+         twins at Order 40 (R by shape, never written): the twin surfaces are \
+         held name for name by `std_twin_parity`, so the stack and its id \
+         source are declared on the server side and nothing ever pushes to them",
+    ),
     (
         "reactive.vl",
         35,
@@ -209,7 +221,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 135,
+        total, 141,
         "the total number of `Shared` construction sites in std changed"
     );
 

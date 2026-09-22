@@ -7023,3 +7023,101 @@ fn b360_every_extern_form_counts_as_a_binding() {
         "#,
     );
 }
+
+// --- N113 (the fourth edge): a global PROPERTY bound in the FUNCTION form ----
+//
+// `[extern("document.activeElement")]` emits `document.activeElement()`. The
+// function form addresses a CALLABLE, so binding a property through it ships a
+// program that compiles clean and dies at the first line that reaches it. std
+// paid the coin three times before it was written down — `__dom_window`,
+// `__router_path` and `__dom_active_element` are all runtime helpers that
+// exist only because the value on the other side is a property.
+
+#[test]
+fn n113_a_global_property_bound_as_a_function_is_refused_at_its_declaration() {
+    assert_fails_spanning(
+        r#"
+        external struct Element;
+
+        [extern("document.activeElement")]
+        external fun focus_holder(): Element;
+
+        fun main() {
+        	let _held = focus_holder();
+        }
+        "#,
+        "focus_holder",
+        "`document.activeElement` is a host PROPERTY, not a function",
+    );
+}
+
+/// A BARE global is the same hole — `[extern("window")]` emits `window()` —
+/// and it is the one `__dom_window` exists for, so the refusal has to reach
+/// it too.
+#[test]
+fn n113_a_bare_global_property_is_refused_the_same_way() {
+    assert_fails_with(
+        r#"
+        external struct Window;
+
+        [extern("window")]
+        external fun host_window(): Window;
+
+        fun main() {
+        	let _held = host_window();
+        }
+        "#,
+        "`window` is a host PROPERTY, not a function",
+    );
+}
+
+/// Refused at the DECLARATION, so an uncalled binding is refused too: the
+/// dangling call is a property of the declaration, and waiting for a call
+/// means an unreached branch ships it (B360's rule, same reason).
+#[test]
+fn n113_an_uncalled_global_property_binding_is_still_refused() {
+    assert_fails_with(
+        r#"
+        external struct Element;
+
+        [extern("location.pathname")]
+        external fun path(): Element;
+
+        fun main() {
+        	print("ok");
+        }
+        "#,
+        "`location.pathname` is a host PROPERTY, not a function",
+    );
+}
+
+/// The CONTROLS, and they are what keep the table from becoming a guess: the
+/// two spellings that DO work are untouched — a runtime helper (what std
+/// writes for its own), and `[extern(get, ..)]` on a receiver that holds the
+/// property — and so is a dotted global the table does not know, which is
+/// bound exactly as before.
+#[test]
+fn n113_the_helper_the_getter_and_an_unknown_global_still_compile() {
+    assert_compiles(
+        r#"
+        external struct Element;
+
+        [extern("__dom_active_element")]
+        external fun active(): Element;
+
+        impl Element {
+        	[extern(get, "activeElement")]
+        	external fun active_child(self): Element;
+        }
+
+        [extern("globalThis.myApp.boot")]
+        external fun boot(): void;
+
+        fun main() {
+        	let held = active();
+        	let _inner = held.active_child();
+        	boot();
+        }
+        "#,
+    );
+}

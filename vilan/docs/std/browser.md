@@ -16,6 +16,8 @@ fun create_element_ns(namespace: str, tag: str): Element   // createElementNS
 fun create_text_node(content: str): Text                   // a fresh text node
 fun query_selector(selector: str): Element
 fun query_selector_all(selector: str): List<Element>
+fun active_element(): Element                              // document.activeElement — who holds focus
+fun is_null(handle: Element): bool                         // the peek a nullable read needs
 fun request_animation_frame(callback: || void)             // requestAnimationFrame
 
 struct DomRect { left: f64, top: f64, width: f64, height: f64 }   // a VALUE, not a handle
@@ -41,9 +43,16 @@ impl Element {
 	fun offset_width(self): f64                        // offsetWidth — laid out, rounded
 	fun offset_height(self): f64                       // offsetHeight
 	fun is_connected(self): bool                       // attached to the document?
+	fun tab_index(self): i32                           // tabIndex — the sequential focus order, per-tag default
+	fun parent(self): Element                          // parentElement — null at the root
+	fun has_attribute(self, name: str): bool           // hasAttribute — a boolean attribute's read
+	fun computed_style(self, name: str): str           // getComputedStyle — the RESOLVED value; forces layout
 	fun contains(self, other: Element): bool           // other is this element or inside it
 	fun query_selector_all(self, selector: str): List<Element>   // scoped to this subtree
 	fun focus(self)                                    // move keyboard focus here
+	fun is_tabbable(self): bool                        // can Tab reach it?
+	fun tabbable(self): List<Element>                  // every tabbable descendant, in TAB order
+	fun focus_first(self): bool                        // focus the first one, else this element at tabindex=-1
 	fun matches(self, selector: str): bool             // element.matches(..)
 	fun value(self): str                               // an input's current text
 	fun set_value(self, value: str)
@@ -94,6 +103,7 @@ impl Event {
 	fun code(self): str          // "KeyE", "Digit1", "Escape" — the PHYSICAL key
 	fun target(self): Element    // the node the event was dispatched to
 	fun current_target(self): Element  // the node whose listener is running
+	fun related_target(self): Element  // relatedTarget — where focus went (or came from); null off-document
 	fun target_value(self): str  // event.target.value — the input's text
 	fun target(self): Element    // event.target — what contains() is asked about
 	fun pointer_x(self): f64     // clientX — where the pointer is, in the viewport
@@ -274,10 +284,43 @@ too.
 | `bind_draft` | `(draft: Draft<str>): View` | local-first input bind ([drafts](reactive.md#draft--local-first-cells)) |
 | `show` | `(condition: S): View`; `S: Source<bool>` | state-PRESERVING visibility toggle — sets the `hidden` attribute AND an inline `display:none`, restoring the element's own inline `display` when it turns true |
 | `on_mount` | `(action: sync \|Element\| void): View` | run `action` with this element once it is in the document |
-| `autofocus` | `(): View` | focus this element once it is mounted AND rendered — the modal-input form HTML's `autofocus` cannot serve |
+| `autofocus` | `(): View` | focus this element once it is mounted AND rendered — the modal-input form HTML's `autofocus` cannot serve; also WRITES the `autofocus` attribute, which is how a focus scope reads the author's choice (the SSR twin writes neither) |
+| `focus_scope` | `(containment: FocusContainment): View` | make this element a focus scope and take the initial focus on `autofocus`'s clock — the sugar for the case with no show hook |
 
 Semantics, choosing between `show`/`when`/`swap`, and examples: the
 [UI guide](../guide/ui.md).
+
+### Focus scopes
+
+An overlay that wants Tab to stay inside it installs a **focus scope**. It
+does not use `inert`: the rest of the page stays pointer-live and stays in the
+accessibility tree, which is what a menu needs.
+
+```vilan,fragment
+enum FocusContainment { Contain, Wrap }
+fun focus_scope(root: Element, containment: FocusContainment): FocusScope
+```
+
+`Wrap` is a MENU — Tab cycles inside the subtree while focus is inside it, and
+focus that leaves by any other route is allowed to leave. `Contain` is a MODAL
+— it adds a guard that pulls focus back when it arrives anywhere else. The
+opt-OUT is not calling `focus_scope` at all. `inert` remains the app's own
+escape hatch for a true modal (`set_attribute("inert", "")` and
+`remove_attribute`), and it is a stronger, different thing: it also removes the
+subtree from the accessibility tree and blocks pointer events.
+
+**A scope focuses nothing by itself.** `focus()` needs a target that is
+connected, RENDERED and visible at the call, and an overlay panel is typically
+hidden until layout places it, so focus is a consequence of the SHOW — see
+`FocusScope::focus_initial` and `View::focus_scope` in the
+[UI guide](../guide/ui.md#focus-scopes).
+
+**Nesting is a stack, not DOM ancestry**, because an overlay is a portal: a
+submenu opened from inside a menu mounts beside its parent's panel, not inside
+it. std holds the stack, the guard belongs to whichever `Contain` scope is
+topmost at event time, and a scope pops when the owner that installed it is
+disposed — restoring focus to whatever held it before, if focus is still inside
+the scope and the remembered element is still in the document.
 
 ### The slot values
 

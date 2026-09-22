@@ -33,6 +33,7 @@ import pkg::dom::{
 	Element,
 	Event,
 	Text,
+	active_element,
 	create_document_fragment,
 	create_element,
 	create_element_ns,
@@ -40,6 +41,7 @@ import pkg::dom::{
 	create_text_node,
 	get_element_by_id,
 	request_animation_frame,
+	window,
 };
 import pkg::io::panic;
 import pkg::option::Option::{ self, None, Some };
@@ -405,6 +407,20 @@ export impl View {
 	/// driver runs when it flips visibility, or `<dialog>.showModal()`, whose
 	/// focusing steps run once the dialog is rendered — not a retry.
 	fun autofocus(self): View {
+		// A121 §6.1: WRITE THE ATTRIBUTE TOO. HTML's `autofocus` is inert for
+		// a dynamically inserted element — which is the whole reason this
+		// method exists — so setting it costs nothing at runtime and makes
+		// the author's choice READABLE: to an enclosing `FocusScope`, whose
+		// `focus_initial` prefers an `[autofocus]` descendant over the first
+		// tabbable one; to devtools; and to a test that asserts markup. Both
+		// mechanisms may then fire for one element, and that is harmless —
+		// they focus the same element, and focusing an already-focused
+		// element is a no-op.
+		//
+		// Inside a focus scope, `autofocus` marks which element the scope
+		// should start on; outside one it focuses on its own bounded clock.
+		// It means the same thing in both places.
+		self.element.set_attribute("autofocus", "");
 		self.on_mount(|element| {
 			element.focus();
 			if !element.matches(":focus") {
@@ -412,6 +428,39 @@ export impl View {
 					element.focus();
 					if !element.matches(":focus") {
 						request_animation_frame(|| element.focus());
+					}
+				});
+			}
+		})
+	}
+
+	/// Make this element a FOCUS SCOPE and take the initial focus on
+	/// `autofocus`'s own bounded clock — the chained sugar for the ordinary
+	/// case, the one with no show hook of its own (A121).
+	///
+	/// It stands to `focus_scope` exactly as `autofocus` stands to
+	/// `on_mount`: the same relation, in the same file, so there is one
+	/// pattern and not two. The trap is installed HERE, at build time, which
+	/// it may be because a window listener works whenever it is registered
+	/// and nothing about it needs the element to be in the document. The
+	/// FOCUS is what has a precondition, so it is attempted in `on_mount`'s
+	/// microtask and then, if it did not take, on the next animation frame
+	/// and once more on the frame after — B271's clock, unchanged, and for
+	/// B271's reason.
+	///
+	/// An overlay driver that owns its own visibility flip should install the
+	/// scope with `focus_scope` and call `focus_initial` from the flip
+	/// instead: this form cannot know when a panel it does not own becomes
+	/// visible, and three frames is a bound, not a promise.
+	fun focus_scope(self, containment: FocusContainment): View {
+		let scope = focus_scope(self.element, containment);
+		self.on_mount(|_element| {
+			if !scope.focus_initial() {
+				request_animation_frame(|| {
+					if !scope.focus_initial() {
+						request_animation_frame(|| {
+							let _took = scope.focus_initial();
+						});
 					}
 				});
 			}
@@ -1907,4 +1956,262 @@ fun place_when_some<T, S: Source<Option<T>>, C: Slot>(
 			},
 		}
 	});
+}
+
+// === A121: focus scopes (proposal/focus-scope.md) ============================
+//
+// A trap and a restore, WITHOUT `inert`: an overlay may make itself the only
+// place Tab can reach while the rest of the page stays pointer-live and stays
+// in the accessibility tree. `inert` is the platform's "this subtree does not
+// exist" tool — it also removes the subtree from the accessibility tree and
+// blocks pointer events — so it is the app's own escape hatch
+// (`set_attribute("inert", "")` and its `remove_attribute` half), named here
+// because a doc comment that pretended otherwise would teach the wrong thing,
+// and deliberately not what `Contain` does.
+//
+// Two mechanisms answer two different questions, and the second is the one
+// that makes a MODAL rather than a menu. The WRAP hears a Tab pressed while
+// focus is inside the scope, and answers it at the ends of the tab order; it
+// does nothing at all in between, so the platform moves focus. The GUARD
+// hears focus ARRIVING outside the scope — by a click, by a programmatic
+// `focus()`, by the browser's chrome cycling back into the document — and
+// pulls it back.
+//
+// NESTING IS A STACK, and it has to be, because an overlay is a PORTAL: a
+// submenu opened from inside a menu's body mounts into the overlay driver's
+// own container, as a SIBLING of its parent's panel, so
+// `parent.contains(submenu)` is false and any containment test written on DOM
+// ancestry yanks focus out of a submenu the moment it opens. The stack is
+// std's rather than every driver's for exactly that reason: something must
+// hold the nesting, and if std does not then each driver writes this twice —
+// once for focus, once for the pointer-down dismissal it already has.
+//
+// KEEP IN STEP with the process twin (process/ui.vl), which declares this
+// surface name for name and drops it: a server render has no focus.
+
+/// What a focus scope does with a Tab that would leave it. The opt-OUT is not
+/// calling `focus_scope` at all.
+export enum FocusContainment {
+	/// A MODAL. Tab cycles inside the subtree, and focus that arrives
+	/// anywhere else is pulled back in. Its honest cost is that focus LANDS
+	/// on the outside element for one event before being pulled back, where
+	/// `inert` would never let it land — assistive technology may announce
+	/// that element.
+	Contain,
+	/// A MENU. Tab cycles inside the subtree while focus is inside it; focus
+	/// that leaves by any other route is allowed to leave, and the page stays
+	/// live. A click outside dismisses through whatever pointer path the app
+	/// already has.
+	Wrap,
+}
+
+/// An installed focus scope: the handle the SHOW calls `focus_initial` on.
+///
+/// The `id` is what the STACK is read by — the nesting is consulted at event
+/// time rather than captured at registration, which is what lets a nested
+/// scope take over and hand back — and `focused` is the latch that makes
+/// `focus_initial` idempotent.
+export struct FocusScope {
+	id: i32,
+	root: Element,
+	focused: Shared<bool>,
+}
+
+export impl FocusScope {
+	/// Take the INITIAL focus, and answer whether it was taken. The driver
+	/// calls this at the SHOW — when it flips the panel visible — and the
+	/// scope never calls it by itself (B271: `focus()` needs a target that is
+	/// rendered and visible AT THE CALL, and an overlay panel is hidden until
+	/// layout places it, so focus is a consequence of the show and not of the
+	/// mount).
+	///
+	/// The order is: the first `[autofocus]` descendant — the author saying
+	/// which element the scope should start on — else the first tabbable one,
+	/// else the panel itself at `tabindex="-1"` (`focus_first`'s own
+	/// fallback).
+	///
+	/// IDEMPOTENT, and answering `false` rather than latching when the focus
+	/// did not take: a driver whose show hook may fire before layout calls it
+	/// again on the next pass, which is what every overlay's `focused` flag
+	/// was already doing one layer up.
+	///
+	/// `View::autofocus` also WRITES the `autofocus` attribute, so the two
+	/// mechanisms may both fire for one element and that is harmless: they
+	/// focus the same element, and focusing an already-focused element is a
+	/// no-op.
+	fun focus_initial(self): bool {
+		if self.focused.read() {
+			ret true;
+		}
+		mut marked: Option<Element> = None;
+		for candidate in self.root.query_selector_all("*") {
+			if marked.is_none() && candidate.has_attribute("autofocus") {
+				marked = Some(candidate);
+			}
+		}
+		let took = match marked {
+			Some(let target) => {
+				target.focus();
+				target.matches(":focus")
+			},
+			None => self.root.focus_first(),
+		};
+		if took {
+			self.focused.write() = true;
+		}
+		took
+	}
+}
+
+/// The live scopes, outermost first. A scope pushes on install and pops in
+/// its owner's `defer`, so a scope's lifetime IS its boundary's by
+/// construction: a per-open owner — which is what an overlay driver's
+/// `attach` gives every overlay — makes it exactly one open.
+///
+/// The entry is `(id, root, containment, restore)`: the restore target is
+/// remembered at install, BEFORE the scope takes focus.
+let focus_scopes: Shared<List<(i32, Element, FocusContainment, Element)>> = Shared::new([]);
+
+/// The id source. Ids are never reused, so a stale handle names nothing.
+let next_focus_scope: Shared<i32> = Shared::new(0);
+
+/// Install `root` as a focus scope for as long as the ambient owner lives.
+///
+/// It focuses NOTHING. That is the decision that keeps this from re-opening
+/// B271: `focus()` needs a target that is connected, RENDERED and visible AT
+/// THE CALL, and an overlay panel is typically `visibility: hidden` until a
+/// layout callback places it — so focus is a consequence of the SHOW, which
+/// is what `FocusScope::focus_initial` is for and what a driver calls when it
+/// flips visibility. Installing the trap has no timing requirement at all: a
+/// listener works whenever it is registered, so this belongs at mount.
+///
+/// `View::focus_scope` is the chained sugar for the ordinary case with no
+/// show hook.
+///
+/// Disposal is the ambient owner's: the scope pops off the stack, and focus
+/// is restored to whatever held it before — but only if focus is still OURS
+/// (an app that moved focus deliberately while the overlay was open keeps it)
+/// and only if the remembered element is still in the document (the button
+/// that opened the overlay may have been removed by the very action the
+/// overlay took, and focusing a detached element sends focus to `<body>`,
+/// which is worse than leaving it).
+export fun focus_scope(root: Element, containment: FocusContainment): FocusScope {
+	let owner = get_owner();
+	let id = next_focus_scope.read() + 1;
+	next_focus_scope.write() = id;
+	let restore = active_element();
+	focus_scopes.write().push((id, root, containment, restore));
+	owner.defer(|| {
+		let kept = focus_scopes.read().filter(|entry| {
+			let (scope_id, _root, _containment, _restore) = entry;
+			scope_id != id
+		});
+		focus_scopes.write() = kept;
+		if !is_null(restore) && restore.is_connected() && root.contains(active_element()) {
+			restore.focus();
+		}
+	});
+	// The WRAP. In the CAPTURE phase on the window, so no handler inside the
+	// panel can swallow the key first, and gated on the target so a Tab
+	// pressed anywhere else on a live page is untouched — which is the whole
+	// of "without `inert`".
+	owner.take(window().listen_capture("keydown", |event| {
+		if event.key() != "Tab" {
+			ret;
+		}
+		if !focus_reaches_from(id, event.target()) {
+			ret;
+		}
+		let order = root.tabbable();
+		if order.len() == 0 {
+			ret;
+		}
+		mut index = 0 - 1;
+		mut position = 0;
+		for candidate in order {
+			if candidate.matches(":focus") {
+				index = position;
+			}
+			position = position + 1;
+		}
+		let last = order.len() - 1;
+		if index == 0 - 1 {
+			// Focus is inside the scope (or inside one above it) and is not
+			// on a tab stop: the panel ITSELF, holding focus at
+			// `tabindex="-1"` because nothing inside it was tabbable, or an
+			// element that stopped being tabbable after it took focus. Tab
+			// enters the order at the near end rather than leaving the
+			// scope, which is the whole promise — and it is the case that
+			// makes the reach test above load-bearing, since a target
+			// outside every scope has no index either.
+			event.prevent_default();
+			let entry = if event.shift_key() { order.get(last) } else { order.get(0) };
+			match entry {
+				Some(let target) => target.focus(),
+				None => {},
+			}
+		} else if event.shift_key() && index == 0 {
+			event.prevent_default();
+			match order.get(last) {
+				Some(let target) => target.focus(),
+				None => {},
+			}
+		} else if !event.shift_key() && index == last {
+			event.prevent_default();
+			match order.get(0) {
+				Some(let target) => target.focus(),
+				None => {},
+			}
+		}
+	}));
+	// The GUARD, for `Contain` only. Every `Contain` scope registers one and
+	// all but the TOPMOST return immediately, read from the stack at event
+	// time — which is what makes a nested scope take over and hand back.
+	if containment is FocusContainment::Contain {
+		owner.take(window().listen_capture("focusin", |event| {
+			match topmost_contain_scope() {
+				Some(let top) => {
+					let (top_id, top_root, _containment, _restore) = top;
+					if top_id == id && !top_root.contains(event.target()) {
+						let _took = top_root.focus_first();
+					}
+				},
+				None => {},
+			}
+		}));
+	}
+	FocusScope { id, root, focused = Shared::new(false) }
+}
+
+/// Whether `target` lies inside the scope `id` names, or inside any scope
+/// ABOVE it — which, by construction, are its own children: a submenu opened
+/// from a menu is pushed later, and focus inside it is focus the menu should
+/// not fight. Generalised from the pointer-down test an overlay driver
+/// already writes, read for focus instead.
+fun focus_reaches_from(id: i32, target: Element): bool {
+	mut reached = false;
+	mut within = false;
+	for entry in focus_scopes.read() {
+		let (scope_id, scope_root, _containment, _restore) = entry;
+		if scope_id == id {
+			reached = true;
+		}
+		if reached && scope_root.contains(target) {
+			within = true;
+		}
+	}
+	within
+}
+
+/// The topmost `Contain` scope, or `None` — the guard's own question, asked
+/// at event time.
+fun topmost_contain_scope(): Option<(i32, Element, FocusContainment, Element)> {
+	mut found: Option<(i32, Element, FocusContainment, Element)> = None;
+	for entry in focus_scopes.read() {
+		let (_id, _root, containment, _restore) = entry;
+		if containment is FocusContainment::Contain {
+			found = Some(entry);
+		}
+	}
+	found
 }

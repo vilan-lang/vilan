@@ -2541,6 +2541,16 @@ impl<'a> Interpreter<'a> {
             "fetch" | "setTimeout" | "setInterval" | "structuredClone" | "__timer" => {
                 Err(Failure::unsupported(format!("`{name}`")))
             }
+            // The DOM helpers (`std::dom`, A121 and A59 before it). There is no
+            // document at expansion time and there never will be — a macro body
+            // runs in the compiler — so every one of them is a capability MISS
+            // by design, exactly like `fetch` above, rather than the
+            // "unknown host call" an unlisted name falls to (which reads as a
+            // compiler bug and is the wrong thing to tell an author who wrote
+            // `window()` in a macro). The prefix rather than a list: the table
+            // these mirror is `helper_source`'s `__dom_*` family, and a new
+            // member of it is absent here for the same reason as the rest.
+            _ if name.starts_with("__dom_") => Err(Failure::unsupported(format!("`{name}`"))),
             other => Err(Failure::internal(format!("unknown host call `{other}`"))),
         }
     }
