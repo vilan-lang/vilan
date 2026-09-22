@@ -1,0 +1,24 @@
+# Consumed place reads the NATIVE emitter copied, and the ones it
+# moved at a last use (tracker F31). Regenerate with
+# VILAN_REGENERATE_NATIVE_COPY_CENSUS=1 cargo test -p vilan-cli --test native_differential
+bool	1	0
+recursion	0	0
+loops	0	0
+copy-elision	0	0
+field-assignment	0	0
+for-in	0	0
+list-splice	0	0
+display	0	0
+match-ergonomics	0	1
+borrows	0	0
+generic-inference	0	4
+default-generic-param	0	1
+default	0	0
+mut-parameters	2	0
+compound-index	0	0
+interpolated-multiline-string	0	0
+derive-json	2	1
+json-roundtrip	2	12
+remainder	0	1
+numeric-types	1	6
+native_probe_board	0	4

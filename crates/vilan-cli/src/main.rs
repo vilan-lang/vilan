@@ -6882,6 +6882,10 @@ fn compile_to_js(
                 None if backend == Backend::Rust => {
                     vilan_rust::emit(&program, options).map(|emitted| {
                         native::record_boxed_bindings(emitted.boxed_bindings);
+                        native::record_copy_census(
+                            emitted.consumed_copies,
+                            emitted.consumed_copies_elided,
+                        );
                         native::record_host_gaps(emitted.host_gaps);
                         native::record_reaches_sqlite(emitted.reaches_sqlite);
                         emitted.source

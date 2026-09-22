@@ -101,6 +101,17 @@ pub struct Emitted {
     /// them and something writes them. C15's by-value capture optimisation is
     /// the later item this number pays for.
     pub boxed_bindings: usize,
+    /// F31's measurement, the native twin of `copy-elision-census.tsv`: how
+    /// many CONSUMED place reads this emit had to copy, and how many it moved
+    /// because the read was the binding's last use.
+    ///
+    /// These are the copies rule 1's own marking never reached — a closure
+    /// call's arguments, a variant constructor's, a destructure's — so they are
+    /// exactly the number the native liveness pass is answerable for, and not a
+    /// count of every `.clone()` in the emitted source (a refcount bump on a
+    /// handle is one of those and is not a copy).
+    pub consumed_copies: usize,
+    pub consumed_copies_elided: usize,
 }
 
 /// Emits `program` as a single Rust source file.
@@ -323,6 +334,41 @@ struct Emitter<'a, 'src> {
     /// it at a LAST use, and a last use inside a closure body is not a last use
     /// of the capture.
     closure_captures: Vec<HashSet<Id>>,
+    /// F31: the READS that are their binding's last use in the body they sit
+    /// in, so the conservative copy [`Emitter::copy_a_consumed_place_read`]
+    /// takes can be downgraded to a move.
+    ///
+    /// The JS emitter gets this from the analyzer (`clone_sites`' rule-2
+    /// elision, `lifetimes.md` §6); the positions this backend copies at are
+    /// the ones rule 1's marking never reached, so the answer is computed here
+    /// over the SAME bodies the emitter walks.
+    last_uses: HashSet<Id>,
+    /// The function bodies whose liveness has been computed, so a function
+    /// emitted at three instantiations is walked once. Keyed on the
+    /// FUNCTION, because the expression ids under it are the same at every
+    /// instantiation.
+    liveness_walked: HashSet<Id>,
+    /// F31's census, the native twin of `copy-elision-census.tsv`: how many
+    /// consumed place reads this emit COPIED and how many it moved.
+    copies_taken: usize,
+    copies_elided: usize,
+}
+
+/// F31's walk state: where each binding was declared, and the last read of it
+/// that is a candidate for a move.
+#[derive(Default)]
+struct Liveness {
+    /// The region depth a binding was declared at. A read deeper than that is
+    /// inside a loop, a closure or a spawn RELATIVE to the declaration, so it
+    /// may run more than once for one declaration and is never a last use;
+    /// a binding the loop body itself declares is fresh on every iteration and
+    /// elides at its last use, which is the distinction a lexical
+    /// "inside a loop" set cannot make (`lifetimes.md` §6 makes the same one).
+    declared_at: HashMap<Id, usize>,
+    /// The candidate read per binding: `Some(id)` for the latest read that may
+    /// move, `None` once a read that may repeat has been seen. Overwritten by
+    /// every later read, so what survives the walk is the last one.
+    candidate: HashMap<Id, Option<Id>>,
 }
 
 impl<'a, 'src> Emitter<'a, 'src> {
@@ -358,6 +404,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             reaches_sqlite: false,
             returns_an_async_closure: false,
             closure_captures: Vec::new(),
+            last_uses: HashSet::new(),
+            liveness_walked: HashSet::new(),
+            copies_taken: 0,
+            copies_elided: 0,
         }
     }
 
@@ -411,6 +461,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             host_gaps: self.host_gaps.iter().cloned().collect(),
             reaches_sqlite: self.reaches_sqlite,
             boxed_bindings: self.boxed_emitted.len(),
+            consumed_copies: self.copies_taken,
+            consumed_copies_elided: self.copies_elided,
         })
     }
 
@@ -713,6 +765,139 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             None => {}
         }
+    }
+
+    // ------------------------------------------------------- F31 liveness ---
+
+    /// F31: computes, once per FUNCTION, which reads are their binding's last
+    /// use — the answer [`Emitter::copy_a_consumed_place_read`] needs to
+    /// downgrade a conservative copy to a move.
+    ///
+    /// The JS backend does not need this: rule 1's marking is made against a
+    /// NAMED callee's parameter modes, so the positions this backend copies at
+    /// (a closure call's arguments, a variant constructor's, a destructure's)
+    /// carry no `clone_sites` decision at all and the JS emitter moves there for
+    /// free. Natively the same read is a real move, so it was taken
+    /// conservatively as a copy — which is right, and four copies a second
+    /// backward look would not take.
+    ///
+    /// **The rule.** A read is a last use when no later read of the same
+    /// binding follows it AND it is not deeper in a repeatable region than the
+    /// declaration. The walk is forward and the candidate is overwritten, which
+    /// is the same answer a backward walk gives for structured control flow and
+    /// is written forward because `children_of` already enumerates a node's
+    /// children in evaluation order.
+    ///
+    /// **Why it is sound where it is not complete.** A read in one branch of an
+    /// `if` is "earlier" than one in the other, so the first keeps its copy and
+    /// the second moves — each path moves once, which is what rustc asks. A
+    /// read whose statement is unreachable on the path that took an early
+    /// `return` is later in the walk, so the `return`'s own read keeps its copy.
+    /// And a read inside a loop, a closure or a spawn is never a candidate
+    /// unless its binding was declared inside the same region, because the
+    /// region may run again for one declaration — the classic trap, and the one
+    /// shape a "no later read" rule alone gets wrong.
+    fn compute_liveness(&mut self, function_id: Id, statements: &[Id], tail: Id) {
+        if !self.liveness_walked.insert(function_id) {
+            return;
+        }
+        let mut state = Liveness::default();
+        for statement in statements {
+            self.walk_liveness(*statement, 0, &mut state);
+        }
+        self.walk_liveness(tail, 0, &mut state);
+        for candidate in state.candidate.values().flatten() {
+            self.last_uses.insert(*candidate);
+        }
+    }
+
+    fn walk_liveness(&self, expr_id: Id, depth: usize, state: &mut Liveness) {
+        match self.program.entity_map.get(&expr_id).cloned() {
+            Some(Expr::Variable(binding)) => {
+                // The INITIALIZER is read before the binding exists, so it is
+                // walked first and the declaration recorded after it.
+                if let Some(initial) = self
+                    .program
+                    .variables
+                    .get(&binding)
+                    .and_then(|variable| variable.initial)
+                {
+                    self.walk_liveness(initial, depth, state);
+                }
+                state.declared_at.insert(binding, depth);
+            }
+            Some(Expr::Local(binding) | Expr::Parameter(binding)) => {
+                let declared = state.declared_at.get(&binding).copied().unwrap_or(0);
+                let candidate = (depth <= declared).then_some(expr_id);
+                state.candidate.insert(binding, candidate);
+            }
+            Some(other) => {
+                // The binders a node introduces are declared at the depth its
+                // BODY is walked at, which for a loop or a closure is one
+                // deeper: a `for` binder is fresh on every iteration.
+                let inner = depth + Self::repeats_its_body(&other) as usize;
+                match &other {
+                    Expr::ForEach(_, item, _) => {
+                        for binding in item.iter() {
+                            state.declared_at.insert(*binding, inner);
+                        }
+                    }
+                    Expr::Closure(closure_id) => {
+                        if let Some(closure) = self.program.closures.get(closure_id) {
+                            for parameter in &closure.parameters {
+                                state.declared_at.insert(*parameter, inner);
+                            }
+                        }
+                    }
+                    Expr::Match(_, legs) => {
+                        let mut bound = HashSet::new();
+                        for leg in legs {
+                            collect_pattern_bindings_into(&leg.pattern, &mut bound);
+                        }
+                        for binding in bound {
+                            state.declared_at.insert(binding, inner);
+                        }
+                    }
+                    Expr::Is(_, pattern) | Expr::Destructure(_, pattern) => {
+                        let mut bound = HashSet::new();
+                        collect_pattern_bindings_into(pattern, &mut bound);
+                        for binding in bound {
+                            state.declared_at.insert(binding, inner);
+                        }
+                    }
+                    _ => {}
+                }
+                // The ITERABLE of a `for .. in` is evaluated once, outside the
+                // body — every other child of a repeating node is inside it.
+                let iterable = match &other {
+                    Expr::ForEach(iterable, _, _) => Some(*iterable),
+                    _ => None,
+                };
+                for child in self.children_of(expr_id) {
+                    let child_depth = if Some(child) == iterable {
+                        depth
+                    } else {
+                        inner
+                    };
+                    self.walk_liveness(child, child_depth, state);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Whether a node's body may run more than once for one entry — a loop, a
+    /// closure (called as often as its holder likes), a spawn (which runs after
+    /// the statement that made it), or a comprehension.
+    fn repeats_its_body(expr: &Expr<'_>) -> bool {
+        matches!(
+            expr,
+            Expr::For(_, _)
+                | Expr::ForEach(_, _, _)
+                | Expr::Closure(_)
+                | Expr::Async(_)
+                | Expr::TupleComprehension(_, _, _)
+        )
     }
 
     /// Every sub-expression of `expr_id`, for the walks that only need to
@@ -2250,6 +2435,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             None => "()".to_string(),
         };
 
+        // F31: the body's liveness, computed before it is walked and once per
+        // function however many instantiations it is emitted at.
+        self.compute_liveness(function.id, &function.body.0, function.body.1);
         let mut body = String::new();
         let saved_view = std::mem::replace(
             &mut self.current_returns_view,
@@ -6458,7 +6646,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
     ///
     /// Two shapes are skipped: a read already copied, and a binding that holds a
     /// VIEW — `(&mut T).clone()` derefs rather than copies.
-    fn copy_a_consumed_place_read(&self, id: Id, rendered: String) -> String {
+    fn copy_a_consumed_place_read(&mut self, id: Id, rendered: String) -> String {
         if rendered.ends_with(".clone()") {
             return rendered;
         }
@@ -6482,6 +6670,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
             _ => false,
         };
         if reads_a_place {
+            // F31: a read that is the binding's LAST use donates its storage
+            // instead of copying it — nothing can observe the difference,
+            // which is exactly what rule 2's elision says. A read inside a
+            // closure the emitter is walking is never one: the closure owns its
+            // captures and handing one on by value would make it `FnOnce`,
+            // which no closure-typed position natively takes.
+            if self.last_uses.contains(&id) && !self.reads_a_captured_binding(id) {
+                self.copies_elided += 1;
+                return rendered;
+            }
+            self.copies_taken += 1;
             return format!("({rendered}).clone()");
         }
         rendered

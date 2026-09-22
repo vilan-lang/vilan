@@ -1903,6 +1903,147 @@ fn the_boxed_binding_count_is_reachable_and_counts_the_right_bindings() {
     );
 }
 
+/// F31's trap, in one program: the read whose binding was declared OUTSIDE the
+/// loop keeps its copy, and the read whose binding the loop body itself
+/// declares moves.
+///
+/// "No later read" alone gets the first one wrong — `weigh(names)` IS the last
+/// read of `names` in the text, and moving there empties the binding the second
+/// iteration reads. Nothing reads `names` after the loop, deliberately: a read
+/// after it would make the loop read not-last for the trivial reason and the
+/// pin would measure nothing. The rule asks "deeper in a repeating region than
+/// the DECLARATION", which answers both halves with one question, and the two
+/// are in one program so a fix that satisfies either alone fails here.
+const LOOP_TRAP_PROBE: &str = concat!(
+    "struct Row { id: i32, tags: List<str> }\n",
+    "\n",
+    "fun weigh(tags: List<str>): i32 { tags.len() }\n",
+    "fun weigh_row(row: Row): i32 { row.tags.len() + row.id }\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet names = [\"alpha\", \"beta\"];\n",
+    "\tmut total = 0;\n",
+    "\tmut i = 0;\n",
+    "\tfor i < 3 {\n",
+    "\t\ttotal = total + weigh(names);\n",
+    "\t\tlet row = Row { id = i, tags = [\"one\"] };\n",
+    "\t\ttotal = total + weigh_row(row);\n",
+    "\t\ti = i + 1;\n",
+    "\t}\n",
+    "\tprint(total);\n",
+    "}\n",
+);
+
+#[test]
+fn a_last_use_inside_a_loop_keeps_its_copy_and_one_declared_inside_it_moves() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_loop_trap.vl"), LOOP_TRAP_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        copy_census_of(&staged, "native_probe_loop_trap.vl"),
+        (1, 1),
+        "the read of a binding declared OUTSIDE the loop must copy, and the read of one the \
+         loop body declares must move"
+    );
+    assert_eq!(
+        compare(&staged, "native_probe_loop_trap.vl"),
+        Verdict::Identical,
+        "and the program still prints the same bytes on both backends"
+    );
+}
+
+/// F31's census: the consumed place reads the native emitter COPIES, and the
+/// ones it moves because the read is its binding's last use.
+///
+/// The committed table, beside `copy-elision-census.tsv` and for the same
+/// reason its own head gives: the byte gate above already holds every one of
+/// these programs identical on both backends, so a change in elision cannot
+/// ship unnoticed — but it arrives as an unlabelled behaviour, and elision is
+/// exactly where the gate and the meaning come apart. A program that loses a
+/// copy is a win; a program that GAINS one is a regression in the liveness
+/// walk, and byte-identical output says the same thing about both.
+///
+/// **What is counted** is not every `.clone()` in the emitted Rust — a refcount
+/// bump on a handle is one of those and is not a copy. It is the copies
+/// `copy_a_consumed_place_read` decides: the consumed positions rule 1's own
+/// marking never reached (a closure call's arguments, a variant constructor's,
+/// a destructure's), which are exactly the ones the native liveness pass is
+/// answerable for.
+///
+/// **The programs** are [`DEFAULT_SUITE`] plus the paper's board probe, because
+/// that is the set the byte gate runs on every build; the whole corpus is one
+/// list away and costs an emit per program.
+const NATIVE_COPY_CENSUS: &str = "crates/vilan-cli/tests/native-copy-census.tsv";
+
+/// One program's census line, as the compiler reports it under
+/// `VILAN_NATIVE_REPORT_COPIES=1`.
+fn copy_census_of(staged: &Path, program: &str) -> (usize, usize) {
+    let output = vilan(staged)
+        .env("VILAN_NATIVE_REPORT_COPIES", "1")
+        .args(["build", "--backend", "rust", "--stdout", program])
+        .output()
+        .expect("emit the program");
+    assert!(
+        output.status.success(),
+        "{program} must emit for the census:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("vilan-native: consumed-copies="))
+        .unwrap_or_else(|| panic!("{program} reported no copy census"));
+    let mut numbers = line
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|piece| !piece.is_empty())
+        .map(|piece| piece.parse::<usize>().expect("a count"));
+    let copied = numbers.next().expect("the copied count");
+    let elided = numbers.next().expect("the elided count");
+    (copied, elided)
+}
+
+#[test]
+fn the_native_copy_census_matches_its_table() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_board.vl"), BOARD_PROBE)
+        .expect("write the board probe");
+    let mut rows = Vec::new();
+    for program in DEFAULT_SUITE
+        .iter()
+        .copied()
+        .chain(std::iter::once("native_probe_board.vl"))
+    {
+        let (copied, elided) = copy_census_of(&staged, program);
+        rows.push(format!(
+            "{}\t{copied}\t{elided}",
+            program.trim_end_matches(".vl")
+        ));
+    }
+    let measured = format!(
+        "{}{}\n",
+        concat!(
+            "# Consumed place reads the NATIVE emitter copied, and the ones it\n",
+            "# moved at a last use (tracker F31). Regenerate with\n",
+            "# VILAN_REGENERATE_NATIVE_COPY_CENSUS=1 cargo test -p vilan-cli \
+             --test native_differential\n",
+        ),
+        rows.join("\n")
+    );
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(NATIVE_COPY_CENSUS);
+    if std::env::var_os("VILAN_REGENERATE_NATIVE_COPY_CENSUS").is_some() {
+        std::fs::write(&path, &measured).expect("write the census");
+        return;
+    }
+    let committed = std::fs::read_to_string(&path).expect("read the committed census");
+    assert_eq!(
+        committed, measured,
+        "the native copy census moved; read the difference, then regenerate with \
+         VILAN_REGENERATE_NATIVE_COPY_CENSUS=1"
+    );
+}
+
 /// F29: a program whose host bindings sit ONLY inside a refused call — in its
 /// arguments, and in the body of a closure among them.
 ///
