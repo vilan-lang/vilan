@@ -11372,3 +11372,254 @@ fn e208_the_annotated_spellings_and_the_agreeing_case_are_unchanged() {
         "1\n2\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B378 — a SUBTRAIT bound outranks its supertrait bound
+// ---------------------------------------------------------------------------
+//
+// §13.4(a)(2) ranks two impls of equal subject shape by their binders' bounds,
+// and "stronger" was read off the bound names the author wrote. `trait Narrow<T>
+// with Base<T>` means `S: Narrow<T>` admits strictly fewer types than
+// `S: Base<T>`, so the subtrait-bounded subject is the more specific one — but
+// the written lists `[Narrow]` and `[Base]` contained neither the other, so the
+// pair never ranked and every call through it was §13.4(a)(3) residue. That is
+// the OPTIONAL-CAPABILITY dispatch A112 S3 is built on: one consumer, a blanket
+// answering "no feed" for every `Source<List<T>>` and a narrower one answering a
+// real feed for a `DeltaSource`.
+
+/// The shape collections-39 was refused, with both blankets providing one trait.
+#[test]
+fn b378_a_subtrait_bounded_blanket_outranks_its_supertrait_bounded_one() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        trait Base<T> { fun read(self): T; }
+        trait Narrow<T> with Base<T> { fun extra(self): i32; }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Base<i32> { fun read(self): i32 { self.n } }
+        impl Cell with Narrow<i32> { fun extra(self): i32 { self.n * 2 } }
+
+        trait Maybe<T> { fun capability(self): Option<i32>; }
+
+        impl type S: Base<type T> with Maybe<T> {
+            fun capability(self): Option<i32> { None }
+        }
+
+        impl type S: Narrow<type T> with Maybe<T> {
+            fun capability(self): Option<i32> { Some(self.extra()) }
+        }
+
+        fun ask<T, S: Base<T> + Maybe<T>>(source: S): i32 {
+            match source.capability() {
+                Some(let value) => value,
+                None => -1,
+            }
+        }
+
+        fun main() {
+            let cell = Cell { n = 7 };
+            print(ask(cell));
+        }
+        "#,
+        "14\n",
+    );
+}
+
+/// The same pair with the impls DECLARED the other way round: the order picks
+/// the winner, not the file.
+#[test]
+fn b378_the_same_pair_declared_in_the_other_order_still_picks_the_subtrait() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        trait Base<T> { fun read(self): T; }
+        trait Narrow<T> with Base<T> { fun extra(self): i32; }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Base<i32> { fun read(self): i32 { self.n } }
+        impl Cell with Narrow<i32> { fun extra(self): i32 { self.n * 2 } }
+
+        trait Maybe<T> { fun capability(self): Option<i32>; }
+
+        impl type S: Narrow<type T> with Maybe<T> {
+            fun capability(self): Option<i32> { Some(self.extra()) }
+        }
+
+        impl type S: Base<type T> with Maybe<T> {
+            fun capability(self): Option<i32> { None }
+        }
+
+        fun ask<T, S: Base<T> + Maybe<T>>(source: S): i32 {
+            match source.capability() {
+                Some(let value) => value,
+                None => -1,
+            }
+        }
+
+        fun main() {
+            let cell = Cell { n = 7 };
+            print(ask(cell));
+        }
+        "#,
+        "14\n",
+    );
+}
+
+/// A112 S3's own pair, over std's real `DeltaSource<C, O> with Source<C>`: a
+/// consumer written once for both kinds of source reaches the delta arm on a
+/// cell that keeps a log, and the whole-value arm on one that does not.
+#[test]
+fn b378_the_a112_shape_ranks_a_delta_source_above_a_plain_source() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{
+            DeltaCursor,
+            DeltaLog,
+            DeltaSource,
+            SeqOp,
+            Signal,
+            SignalCell,
+            Source,
+            Subscription,
+        };
+
+        struct Logged { elements: SignalCell<List<i32>>, log: DeltaLog<SeqOp<i32>> }
+
+        impl Logged with Source<List<i32>> {
+            fun get(self): List<i32> { self.elements.get() }
+
+            [must_use]
+            fun on_change(self, observer: |List<i32>| void): Subscription {
+                self.elements.on_change(observer)
+            }
+        }
+
+        impl Logged with DeltaSource<List<i32>, SeqOp<i32>> {
+            fun cursor(self): DeltaCursor { self.log.cursor() }
+
+            fun drop_cursor(self, cursor: DeltaCursor) { self.log.drop_cursor(cursor); }
+
+            fun since(self, cursor: DeltaCursor): List<SeqOp<i32>> {
+                match self.log.since(cursor) {
+                    Some(let ops) => ops,
+                    None => {
+                        mut lost: List<SeqOp<i32>> = [];
+                        lost
+                    },
+                }
+            }
+        }
+
+        trait Feed { fun feed(self): str; }
+
+        impl type S: Source<List<type T>> with Feed {
+            fun feed(self): str { "whole" }
+        }
+
+        impl type S: DeltaSource<List<type T>, SeqOp<type O>> with Feed {
+            fun feed(self): str { "delta" }
+        }
+
+        fun consume<T, S: Source<List<T>> + Feed>(source: S): str {
+            source.feed()
+        }
+
+        fun main() {
+            let logged = Logged {
+                elements = Signal::new([1, 2]),
+                log = DeltaLog<SeqOp<i32>>::new(),
+            };
+            let plain: SignalCell<List<i32>> = Signal::new([3]);
+            print(consume(logged));
+            print(consume(plain));
+        }
+        "#,
+        "delta\nwhole\n",
+    );
+}
+
+/// The control the order must keep: two UNRELATED bounds are neither more
+/// specific, so the pair is still §13.4(a)(3)'s residue and still reported.
+#[test]
+fn b378_two_unrelated_bounds_are_still_unranked() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        trait Base<T> { fun read(self): T; }
+        trait Other<T> { fun extra(self): i32; }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Base<i32> { fun read(self): i32 { self.n } }
+        impl Cell with Other<i32> { fun extra(self): i32 { self.n * 2 } }
+
+        trait Maybe<T> { fun capability(self): Option<i32>; }
+
+        impl type S: Base<type T> with Maybe<T> {
+            fun capability(self): Option<i32> { None }
+        }
+
+        impl type S: Other<type T> with Maybe<T> {
+            fun capability(self): Option<i32> { Some(self.extra()) }
+        }
+
+        fun ask<T, S: Base<T> + Maybe<T>>(source: S): i32 {
+            match source.capability() {
+                Some(let value) => value,
+                None => -1,
+            }
+        }
+
+        fun main() {
+            let cell = Cell { n = 7 };
+            print(ask(cell));
+        }
+        "#,
+        "neither impl subject is more specific than the other",
+    );
+}
+
+/// The other control: the tier this shares with `Box<type T: Display>` over
+/// `Box<type T>` — a bound beats no bound — still ranks, so trading the bound
+/// COUNT for a set difference did not cost the case the count was written for.
+#[test]
+fn b378_a_bounded_binder_still_outranks_an_unbounded_one() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Show { fun show(self): str; }
+        trait Mark { fun mark(self): str; }
+
+        struct Box1<T> { value: T }
+
+        struct Named { name: str }
+        impl Named with Show { fun show(self): str { self.name } }
+
+        impl Box1<type T> with Mark {
+            fun mark(self): str { "plain" }
+        }
+
+        impl Box1<type T: Show> with Mark {
+            fun mark(self): str { self.value.show() }
+        }
+
+        fun main() {
+            let shown = Box1 { value = Named { name = "named" } };
+            print(shown.mark());
+        }
+        "#,
+        "named\n",
+    );
+}

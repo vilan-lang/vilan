@@ -301,19 +301,47 @@ fn bounds_are_stronger(program: &Program, stronger: TypeId, weaker: TypeId) -> b
     }
     let mut strictly = false;
     for (stronger_id, weaker_id) in stronger_binders.iter().zip(weaker_binders.iter()) {
-        let stronger_bounds = bound_trait_ids(program, *stronger_id);
-        let weaker_bounds = bound_trait_ids(program, *weaker_id);
+        let stronger_bounds = bound_trait_closure(program, *stronger_id);
+        let weaker_bounds = bound_trait_closure(program, *weaker_id);
         if !weaker_bounds
             .iter()
             .all(|trait_id| stronger_bounds.contains(trait_id))
         {
             return false;
         }
-        if stronger_bounds.len() > weaker_bounds.len() {
+        if stronger_bounds
+            .iter()
+            .any(|trait_id| !weaker_bounds.contains(trait_id))
+        {
             strictly = true;
         }
     }
     strictly
+}
+
+/// A binder's declared bounds CLOSED over the supertrait graph — the emission
+/// side's copy of the analyzer's `bound_trait_closure` (B378), so a subtrait
+/// bound outranks its supertrait bound here exactly as it does at check time.
+/// The two must agree: a program the analyzer ranks and this does not would
+/// dispatch to the loser's body.
+fn bound_trait_closure(program: &Program, constraint_id: TypeId) -> Vec<Id> {
+    let mut closure = Vec::new();
+    let mut pending = bound_trait_ids(program, constraint_id);
+    while let Some(trait_id) = pending.pop() {
+        if closure.contains(&trait_id) {
+            continue;
+        }
+        closure.push(trait_id);
+        let Some(trait_) = program.traits.get(&trait_id) else {
+            continue;
+        };
+        for supertrait in &trait_.supertraits {
+            if let Some(Type::Trait(super_id, _)) = program.type_id_to_type_map.get(supertrait) {
+                pending.push(*super_id);
+            }
+        }
+    }
+    closure
 }
 
 /// The specificity order over two impl subjects (tier 3): shape first, then

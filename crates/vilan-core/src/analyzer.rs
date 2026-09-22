@@ -18222,19 +18222,51 @@ impl<'src> Analyzer<'src> {
         }
         let mut strictly = false;
         for (stronger_id, weaker_id) in stronger_binders.iter().zip(weaker_binders.iter()) {
-            let stronger_bounds = self.generic_bound_trait_ids(*stronger_id);
-            let weaker_bounds = self.generic_bound_trait_ids(*weaker_id);
+            let stronger_bounds = self.bound_trait_closure(*stronger_id);
+            let weaker_bounds = self.bound_trait_closure(*weaker_id);
             if !weaker_bounds
                 .iter()
                 .all(|trait_id| stronger_bounds.contains(trait_id))
             {
                 return false;
             }
-            if stronger_bounds.len() > weaker_bounds.len() {
+            if stronger_bounds
+                .iter()
+                .any(|trait_id| !weaker_bounds.contains(trait_id))
+            {
                 strictly = true;
             }
         }
         strictly
+    }
+
+    /// A binder's declared bounds CLOSED over the supertrait graph — the set
+    /// [`Self::subject_bounds_are_stronger`] compares, rather than the names
+    /// the author happened to write (B378).
+    ///
+    /// `trait Narrow<T> with Base<T>` says every `Narrow` is a `Base`, so
+    /// `type S: Narrow<T>` admits strictly fewer types than `type S: Base<T>`
+    /// and is the more specific subject — which is how an OPTIONAL CAPABILITY
+    /// is dispatched (`each` over a `DeltaSource` beside `each` over a plain
+    /// `Source`). Comparing the written names alone made the two bounds
+    /// unrelated: neither set contained the other, so the pair never ranked and
+    /// the call landed in §13.4(a)(3)'s residue (or, for an inherent member,
+    /// took whichever impl was declared first).
+    ///
+    /// Strictness is set-difference rather than a count for the same reason: a
+    /// single subtrait name closes to several traits, so `[Narrow]` is larger
+    /// than `[Base]` while the written lists are the same length. Two unrelated
+    /// bounds still rank neither way, which is the residue R3 keeps.
+    fn bound_trait_closure(&self, constraint_id: TypeId) -> Vec<Id> {
+        let mut closure = Vec::new();
+        for declared in self.generic_bound_trait_ids(constraint_id) {
+            for reached in self.trait_with_supertraits(declared) {
+                if !closure.contains(&reached) {
+                    closure.push(reached);
+                }
+            }
+        }
+        closure
     }
 
     /// The specificity order over two impls of ONE home (§13.4(a)): subject
