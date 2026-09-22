@@ -1983,23 +1983,34 @@ fn b362_stds_lazy_members_are_untouched() {
     );
 }
 
-/// B362's DISPATCHED face, STILL OPEN and pinned red. A call through a generic
-/// BOUND has no callee to rewrite, so `record_lazy_arguments` never sees it and
-/// the argument arrives as a plain value: the body's `__force(7)` writes
-/// `.state` on a number and the program dies with a `TypeError` it checked
-/// clean. The coercion refusal above does not reach this door.
+/// B362's DISPATCHED face, RULED and closed: thunk at the dispatched call site
+/// through the callee's recorded convention.
+///
+/// A call through a generic BOUND has no impl to resolve at check time, so it
+/// resolves to the TRAIT's declaration and the pair `record_lazy_arguments`
+/// banks names the declaration's parameter — a different id from the impl's.
+/// M81's eager elision is taken per id, so the two halves of one signature
+/// could disagree: the caller passed a plain value and the callee's
+/// `__force(7)` wrote `.state` on a number, a `TypeError` out of a program
+/// `vilan check` passed. They are one CONVENTION now (`lazy_convention_groups`),
+/// which is sound for exactly the reason the ruling gives — `lazy` is part of
+/// the signature and `check_one_conformance` holds an impl to its trait's
+/// answer, so the convention is known at the bound.
 ///
 /// It is NOT closed by refusing `lazy` on a trait member: that was tried and
 /// backed out, because a trait member reached by a DIRECT call on a concrete
 /// receiver keeps its laziness and the language ships that deliberately —
 /// `an_impl_that_agrees_keeps_the_laziness_through_dispatch` and
-/// `lazy_is_accepted_in_all_three_grammar_homes` are both pins on it. The fix
-/// belongs at the dispatched CALL, either as a refusal there or by thunking
-/// through the callee's recorded convention (the item's own alternative).
+/// `lazy_is_accepted_in_all_three_grammar_homes` are both pins on it.
+///
+/// **This pin alone is not the evidence, and it was never red.** It has ONE
+/// call site, whose argument is a literal, so M81's elision made the whole
+/// parameter eager and the program ran right by accident — which is exactly
+/// what the item recorded ("M81 made the NO-direct-call case correct and left
+/// the MIXED case as it was"). The two pins below it are the red-first pair:
+/// they put an effect on one side of the convention and a literal on the
+/// other, in both orders.
 #[test]
-#[ignore = "B362: a `lazy` parameter reached through a generic BOUND is still \
-            handed a plain value and forced; the fix belongs at the dispatched \
-            call, not at the declaration (see the comment above)"]
 fn b362_a_lazy_parameter_reached_through_a_bound_is_still_unsound() {
     assert_compiles_and_runs(
         r#"
@@ -2056,5 +2067,118 @@ fn b362_an_inherent_member_still_takes_a_lazy_parameter() {
         }
         "#,
         "1\ncomputing\n42\n",
+    );
+}
+
+/// The MIXED case, which is the one M81 could not reach and the one that
+/// actually crashed: a DIRECT call whose argument is not inert (so the
+/// parameter stays lazy and the body forces) beside a DISPATCHED call whose
+/// argument is (so the eager elision would have fired at the declaration's own
+/// parameter and passed a plain `7`).
+#[test]
+fn b362_a_direct_and_a_dispatched_call_agree_on_one_convention() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Fallback {
+        	fun pick(self, flag: bool, lazy other: i32): i32;
+        }
+
+        struct Picker { base: i32 }
+
+        impl Picker with Fallback {
+        	fun pick(self, flag: bool, lazy other: i32): i32 {
+        		if flag { self.base } else { other }
+        	}
+        }
+
+        fun expensive(): i32 {
+        	print("computing");
+        	42
+        }
+
+        fun through<T: Fallback>(value: T): i32 { value.pick(false, 7) }
+
+        fun main() {
+        	let direct = Picker { base = 1 };
+        	print(direct.pick(true, expensive()));
+        	print(direct.pick(false, expensive()));
+        	print(through(Picker { base = 1 }));
+        }
+        "#,
+        "1\ncomputing\n42\n7\n",
+    );
+}
+
+/// The other direction of the same convention: the DIRECT call is the inert
+/// one and the DISPATCHED call carries the effect. The parameter must stay
+/// lazy for both, and the effect must run exactly once, on the `None` path.
+#[test]
+fn b362_a_dispatched_call_carrying_the_effect_still_defers_it() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Fallback {
+        	fun pick(self, flag: bool, lazy other: i32): i32;
+        }
+
+        struct Picker { base: i32 }
+
+        impl Picker with Fallback {
+        	fun pick(self, flag: bool, lazy other: i32): i32 {
+        		if flag { self.base } else { other }
+        	}
+        }
+
+        fun expensive(): i32 {
+        	print("computing");
+        	42
+        }
+
+        fun taken<T: Fallback>(value: T): i32 { value.pick(false, expensive()) }
+        fun skipped<T: Fallback>(value: T): i32 { value.pick(true, expensive()) }
+
+        fun main() {
+        	let picker = Picker { base = 1 };
+        	print(picker.pick(true, 7));
+        	print(skipped(picker));
+        	print(taken(picker));
+        }
+        "#,
+        "1\n1\ncomputing\n42\n",
+    );
+}
+
+/// The elision M81 built is untouched where the whole convention is inert: a
+/// `lazy` parameter every site — direct and dispatched — fills with a literal
+/// builds no cell at all.
+#[test]
+fn b362_a_convention_every_site_fills_inertly_is_still_eager() {
+    assert_emits_containing(
+        r#"
+        import std::io::print;
+
+        trait Fallback {
+        	fun pick(self, flag: bool, lazy other: i32): i32;
+        }
+
+        struct Picker { base: i32 }
+
+        impl Picker with Fallback {
+        	fun pick(self, flag: bool, lazy other: i32): i32 {
+        		if flag { self.base } else { other }
+        	}
+        }
+
+        fun through<T: Fallback>(value: T): i32 { value.pick(false, 7) }
+
+        fun main() {
+        	print(Picker { base = 1 }.pick(true, 3));
+        	print(through(Picker { base = 1 }));
+        }
+        "#,
+        "\t\t$a = other;",
     );
 }

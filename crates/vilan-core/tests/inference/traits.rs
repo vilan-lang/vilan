@@ -4663,6 +4663,208 @@ fn b300_an_unbounded_blanket_binder_is_left_alone() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// B371 — a nested-bound blanket reached from inside a GENERIC body
+// ---------------------------------------------------------------------------
+//
+// `self.map(f).flatten()` inside `fun switch<U, I: Source<U>>` stopped the
+// compiler with "internal: a call resolved to `Source`'s requirement `get`,
+// which has no body", pointed at std's `flatten`. B300's worklist grounds a
+// bound's binders from the receiver — and here the receiver is
+// `SignalCell<I>`, so `Source`'s argument comes back as the CALLER's own `I`,
+// which the worklist declined as "not concrete". `flatten`'s `I` was left out
+// of the recorded substitution, and the instance the caller's instantiation
+// emitted had nothing to resolve `self.get().get()` through. Bound to the
+// caller's parameter it composes (B244): the caller's instance grounds `I`,
+// and the caller's declared `I: Source<U>` answers `flatten`'s `U` in turn.
+// The item suspected the chained receiver against the `Option` twin's
+// pattern-bound one; the twin works because it binds nothing through the
+// abstract `I` at all — it is the control below.
+
+/// The minimal form, no std: a nested-bound blanket's member called at an
+/// abstract `I` from a generic function.
+#[test]
+fn b371_a_nested_bound_blanket_called_at_an_abstract_parameter_dispatches() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<type I: Read<type U>> {
+            fun join(self): U { self.get().get() }
+        }
+
+        fun join_at<U, I: Read<U>>(outer: Cell<I>): U {
+            outer.join()
+        }
+
+        fun main() {
+            print(join_at(Cell { value = Cell { value = 7 } }));
+            print(join_at(Cell { value = Cell { value = "x" } }));
+        }
+        "#,
+        "7\nx\n",
+    );
+}
+
+/// The second half: the member's `U` is the CALLER's `U`, read off the
+/// caller's declared `I: Read<U>` — so the result carries the caller's bound.
+/// With `I` bound but that step missing, `joined` typed as `join`'s own
+/// unbounded `U` and the `==` was refused.
+#[test]
+fn b371_the_members_result_carries_the_callers_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+
+        trait Read<T> { fun get(self): T; }
+        struct Cell<T> { value: T }
+        impl Cell<type T> with Read<T> {
+            fun get(self): T { self.value }
+        }
+
+        impl type S: Read<type I: Read<type U>> {
+            fun join(self): U { self.get().get() }
+        }
+
+        fun same_at<U: PartialEq, I: Read<U>>(outer: Cell<I>, other: U): bool {
+            let joined = outer.join();
+            joined == other
+        }
+
+        fun main() {
+            print(same_at(Cell { value = Cell { value = 7 } }, 7));
+            print(same_at(Cell { value = Cell { value = "a" } }, "b"));
+        }
+        "#,
+        "true\nfalse\n",
+    );
+}
+
+/// The item's repro: `switch` as a blanket method over std's `flatten`,
+/// following the inner cell across a set.
+#[test]
+fn b371_switch_over_std_flatten_runs_as_a_blanket_method() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source, run_with_owner, Owner };
+
+        impl type S: Source<type T> {
+            fun switch_to<U, I: Source<U>>(self, f: sync |T| I): SignalCell<U> {
+                self.map(f).flatten()
+            }
+        }
+
+        fun main() {
+            let n = Signal::new(1);
+            run_with_owner(Owner::new(), || {
+                let doubled: SignalCell<i32> = n.switch_to(|m| Signal::new(m * 2));
+                print(doubled.get());
+                n.set(5);
+                print(doubled.get());
+            });
+        }
+        "#,
+        "2\n10\n",
+    );
+}
+
+/// The free-function spelling the item also named.
+#[test]
+fn b371_switch_over_std_flatten_runs_as_a_free_function() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source, run_with_owner, Owner };
+
+        fun switch_to<T, U, S: Source<T>, I: Source<U>>(source: S, f: sync |T| I): SignalCell<U> {
+            source.map(f).flatten()
+        }
+
+        fun main() {
+            let n = Signal::new(1);
+            run_with_owner(Owner::new(), || {
+                let doubled: SignalCell<i32> = switch_to(n, |m| Signal::new(m * 2));
+                print(doubled.get());
+                n.set(5);
+                print(doubled.get());
+            });
+        }
+        "#,
+        "2\n10\n",
+    );
+}
+
+/// The annotation the item's repro carried to keep B300(a)'s inference gap
+/// out of the picture is no longer needed: `flatten`'s `U` binds to the
+/// caller's `U` through the caller's own `I: Source<U>`.
+#[test]
+fn b371_the_result_infers_without_an_annotation() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source, run_with_owner, Owner };
+
+        impl type S: Source<type T> {
+            fun switch_to<U, I: Source<U>>(self, f: sync |T| I): SignalCell<U> {
+                self.map(f).flatten()
+            }
+        }
+
+        fun main() {
+            let n = Signal::new(1);
+            run_with_owner(Owner::new(), || {
+                let doubled = n.switch_to(|m| Signal::new(m * 2));
+                n.set(4);
+                print(doubled.get() + 1);
+            });
+        }
+        "#,
+        "9\n",
+    );
+}
+
+/// The control: the OPTION twin, whose inner dispatch is on a pattern-bound
+/// local, compiled and ran before and must still.
+#[test]
+fn b371_the_optional_twin_is_unchanged() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ Signal, SignalCell, Source, run_with_owner, Owner };
+
+        impl type S: Source<type T> {
+            fun and_then_to<U, I: Source<U>>(self, f: sync |T| Option<I>): SignalCell<Option<U>> {
+                self.map(f).flatten()
+            }
+        }
+
+        fun main() {
+            let n = Signal::new(1);
+            run_with_owner(Owner::new(), || {
+                let doubled: SignalCell<Option<i32>> = n.and_then_to(|m| if m > 2 {
+                    Some(Signal::new(m * 2))
+                } else {
+                    None
+                });
+                print(doubled.get().unwrap_or(-1));
+                n.set(5);
+                print(doubled.get().unwrap_or(-1));
+            });
+        }
+        "#,
+        "-1\n10\n",
+    );
+}
+
 #[test]
 fn a86_two_blankets_bounded_at_different_arguments_may_share_a_member_name() {
     // The duplicate-member rule compared inherent subjects with `compare_type`,

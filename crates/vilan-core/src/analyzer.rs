@@ -3453,6 +3453,15 @@ pub struct Analyzer<'src> {
     // owns the definition of "moves the world"; see it for why a fresh mint and
     // an idempotent rewrite are both excluded.
     type_map_writes: u64,
+    // B372: set once the constraint fixpoint has stalled, for ONE more round.
+    // A call argument built from a closure parameter that is still awaiting
+    // its fill defers rather than bind the callee's generic to nothing — but
+    // the fill can itself be waiting on that call (a LET-BOUND closure is
+    // filled at its own call site, which needs the closure's type, which needs
+    // its body), and a deferral that can never be answered must not become a
+    // refusal the program never had. On a stalled fixpoint the door commits
+    // with what it has, which is exactly what it did before it deferred.
+    fixpoint_stalled: bool,
     // `std_sources` projected onto entity-id space: the sorted, disjoint
     // `[start, end)` ranges of frozen entities, sealed once after `build()`
     // (`seal_frozen_ranges`) so `frozen_entity` is a binary search — the
@@ -4130,6 +4139,14 @@ pub struct Analyzer<'src> {
     // stays because the LSP re-analyzes per keystroke and an unbounded entity
     // per deferral is a real cost.
     spread_packs: HashMap<Id, Vec<Id>>,
+    // B379 — how deep [`Analyzer::trait_args_for`] is inside its own
+    // blanket-grounding step. That step asks `bind_subject_bound_binders`,
+    // which asks `trait_args_for` again for the binder's own bound, so a pair
+    // of blankets that name each other's traits is a cycle. Four hops is more
+    // than any shape in the estate and the walk is LENIENT past it: an
+    // argument that stays abstract leaves the binder where it was, which is
+    // what happened for every shape before the grounding existed.
+    bound_argument_grounding_depth: u32,
     // proposal/lazy.md §1 — the three tables the `lazy` lowering needs, filled
     // by `record_lazy_arguments` once every call has resolved and read by the
     // transformer through their `Program` twins.
@@ -5816,6 +5833,7 @@ impl<'src> Analyzer<'src> {
             lazy_argument_resource_refusals: HashSet::default(),
             dependency_sources: HashSet::default(),
             type_map_writes: 0,
+            fixpoint_stalled: false,
             frozen_ranges: Vec::new(),
             world_ranges: Vec::new(),
             reused_sources: Vec::new(),
@@ -5940,6 +5958,7 @@ impl<'src> Analyzer<'src> {
             trait_qualified_calls: HashMap::default(),
             own_generic_call_bindings: HashMap::default(),
             spread_packs: HashMap::default(),
+            bound_argument_grounding_depth: 0,
             lazy_argument_thunks: IndexMap::default(),
             lazy_argument_forwards: HashSet::default(),
             lazy_cells: HashSet::default(),
@@ -18292,19 +18311,51 @@ impl<'src> Analyzer<'src> {
         }
         let mut strictly = false;
         for (stronger_id, weaker_id) in stronger_binders.iter().zip(weaker_binders.iter()) {
-            let stronger_bounds = self.generic_bound_trait_ids(*stronger_id);
-            let weaker_bounds = self.generic_bound_trait_ids(*weaker_id);
+            let stronger_bounds = self.bound_trait_closure(*stronger_id);
+            let weaker_bounds = self.bound_trait_closure(*weaker_id);
             if !weaker_bounds
                 .iter()
                 .all(|trait_id| stronger_bounds.contains(trait_id))
             {
                 return false;
             }
-            if stronger_bounds.len() > weaker_bounds.len() {
+            if stronger_bounds
+                .iter()
+                .any(|trait_id| !weaker_bounds.contains(trait_id))
+            {
                 strictly = true;
             }
         }
         strictly
+    }
+
+    /// A binder's declared bounds CLOSED over the supertrait graph — the set
+    /// [`Self::subject_bounds_are_stronger`] compares, rather than the names
+    /// the author happened to write (B378).
+    ///
+    /// `trait Narrow<T> with Base<T>` says every `Narrow` is a `Base`, so
+    /// `type S: Narrow<T>` admits strictly fewer types than `type S: Base<T>`
+    /// and is the more specific subject — which is how an OPTIONAL CAPABILITY
+    /// is dispatched (`each` over a `DeltaSource` beside `each` over a plain
+    /// `Source`). Comparing the written names alone made the two bounds
+    /// unrelated: neither set contained the other, so the pair never ranked and
+    /// the call landed in §13.4(a)(3)'s residue (or, for an inherent member,
+    /// took whichever impl was declared first).
+    ///
+    /// Strictness is set-difference rather than a count for the same reason: a
+    /// single subtrait name closes to several traits, so `[Narrow]` is larger
+    /// than `[Base]` while the written lists are the same length. Two unrelated
+    /// bounds still rank neither way, which is the residue R3 keeps.
+    fn bound_trait_closure(&self, constraint_id: TypeId) -> Vec<Id> {
+        let mut closure = Vec::new();
+        for declared in self.generic_bound_trait_ids(constraint_id) {
+            for reached in self.trait_with_supertraits(declared) {
+                if !closure.contains(&reached) {
+                    closure.push(reached);
+                }
+            }
+        }
+        closure
     }
 
     /// The specificity order over two impls of ONE home (§13.4(a)): subject
@@ -18566,6 +18617,28 @@ impl<'src> Analyzer<'src> {
     ) {
         let pattern = pattern_id.get_type(self);
         let actual = actual_id.get_type(self);
+        // B371: the CALLER's own parameter is an answer, not a hole. A blanket
+        // reached from inside a generic body — `self.map(f).flatten()` in
+        // `fun switch<U, I: Source<U>>` — matches `flatten`'s
+        // `S: Source<type I: Source<type U>>` against `SignalCell<I>`, and the
+        // bound's argument comes back as the caller's `I`. Declining it left
+        // `flatten`'s `I` unbound in the recorded substitution, so the
+        // instance the caller's instantiation emitted had nothing to resolve
+        // `self.get().get()` through and reached `Source`'s bodyless `get`.
+        // Bound to the caller's parameter, it composes: the caller's instance
+        // grounds that parameter, and the emitter follows a binding to a
+        // binding (B244). Only a bare binder takes it — a written shape
+        // (`Option<type I>`) cannot be read off an abstract type.
+        if let Some(caller_generic) = self.callers_rigid_generic(&actual) {
+            if let Type::Generic(binder) = pattern {
+                let mut pattern_binders = Vec::new();
+                self.collect_subject_binders(pattern_id, &mut pattern_binders);
+                if binder != caller_generic && pattern_binders.contains(&binder) {
+                    bindings.entry(binder).or_insert(actual_id);
+                }
+            }
+            return;
+        }
         if !crate::impl_select::is_resolvable(&actual) {
             return;
         }
@@ -18577,6 +18650,18 @@ impl<'src> Analyzer<'src> {
         let grounded = self.bindings_for_binders(&pattern_binders, pairs);
         for (constraint_id, bound_id) in grounded {
             bindings.entry(constraint_id).or_insert(bound_id);
+        }
+    }
+
+    /// The constraint id when `type_` is a generic parameter the ENCLOSING
+    /// declaration owns at the site being checked — the caller's own `I`,
+    /// rigid in its body (B211) and grounded by every instantiation of it.
+    fn callers_rigid_generic(&self, type_: &Type) -> Option<TypeId> {
+        match type_ {
+            Type::Generic(constraint_id) if self.generic_is_rigid_here(*constraint_id) => {
+                Some(*constraint_id)
+            }
+            _ => None,
         }
     }
 
@@ -18623,14 +18708,27 @@ impl<'src> Analyzer<'src> {
                 continue;
             };
             let concrete = concrete_id.get_type(self);
-            if !crate::impl_select::is_resolvable(&concrete) {
+            // B371: a binder bound to the CALLER's parameter answers its own
+            // bounds from that parameter's DECLARED bounds — `I: Source<U>`
+            // says what `Source` argument the caller's `I` provides, which is
+            // what binds `flatten`'s `U` to the caller's `U`.
+            let caller_generic = self.callers_rigid_generic(&concrete);
+            if caller_generic.is_none() && !crate::impl_select::is_resolvable(&concrete) {
                 continue;
             }
             for (trait_id, bound_arguments) in self.generic_bound_traits(binder) {
                 if bound_arguments.is_empty() {
                     continue;
                 }
-                let Some(provided) = self.trait_args_for(&concrete, trait_id) else {
+                let provided = match caller_generic {
+                    Some(caller_generic) => self
+                        .generic_bound_traits(caller_generic)
+                        .into_iter()
+                        .find(|(declared_trait_id, _)| *declared_trait_id == trait_id)
+                        .map(|(_, arguments)| arguments),
+                    None => self.trait_args_for(&concrete, trait_id),
+                };
+                let Some(provided) = provided else {
                     continue;
                 };
                 if provided.len() != bound_arguments.len() {
@@ -25166,8 +25264,28 @@ impl<'src> Analyzer<'src> {
             .filter(|parameter| parameter.lazy)
             .map(|parameter| parameter.id)
             .collect();
+        // B362 (RULED) — **a trait's declaration and every impl of it are ONE
+        // convention**, so they are eager together or lazy together.
+        //
+        // A call reached through a BOUND has no impl to resolve at check time;
+        // it resolves to the trait's own declaration, so the pair banked above
+        // names the DECLARATION's parameter. That parameter and the impl's are
+        // different ids, and the eager decision is taken per id — so a program
+        // whose dispatched site passes `7` (inert: eager, no thunk) beside a
+        // DIRECT call on the impl passing `expensive()` (not inert: lazy, the
+        // body forces) got a callee that forces and a caller that does not.
+        // `__force(7)` wrote `.state` on a number and the program died with a
+        // `TypeError` it had checked clean.
+        //
+        // `lazy` is part of the signature and `check_one_conformance` holds an
+        // impl to its trait's answer, so the convention is KNOWN at the bound —
+        // which is exactly what makes thunking at the dispatched site right,
+        // and what makes this group the unit the decision is taken over. Each
+        // group is one member's parameters at one position: the trait's, and
+        // every implementing member's.
+        let conventions = self.lazy_convention_groups();
         loop {
-            let retracted: Vec<Id> = lazy_pairs
+            let mut retracted: Vec<Id> = lazy_pairs
                 .iter()
                 .filter(|(parameter_id, argument_id, _)| {
                     eager_parameters.contains(parameter_id)
@@ -25175,6 +25293,12 @@ impl<'src> Analyzer<'src> {
                 })
                 .map(|(parameter_id, _, _)| *parameter_id)
                 .collect();
+            for parameter_id in retracted.clone() {
+                if let Some(group) = conventions.get(&parameter_id) {
+                    retracted.extend(group.iter().copied());
+                }
+            }
+            retracted.retain(|parameter_id| eager_parameters.contains(parameter_id));
             if retracted.is_empty() {
                 break;
             }
@@ -25219,6 +25343,79 @@ impl<'src> Analyzer<'src> {
             );
             self.lazy_thunk_effects.insert(argument_id, effects);
         }
+    }
+
+    /// B362 — the `lazy` CONVENTION groups: every trait-declared member's
+    /// parameters tied, position by position, to the same member's parameters
+    /// in every impl that provides it.
+    ///
+    /// A `lazy` parameter is part of the signature, and `check_one_conformance`
+    /// already holds an impl to its trait's answer — so a dispatched call site,
+    /// which can only see the DECLARATION, is looking at the same convention
+    /// the impl's body will read. The eager elision is taken per parameter id,
+    /// and those are different ids, so without this the two halves of one
+    /// signature could disagree: the caller passes a plain value and the callee
+    /// forces it.
+    ///
+    /// Returned as `parameter -> the OTHER parameters in its group`, which is
+    /// what the retraction loop asks. Only members with a `lazy` position build
+    /// a group, so a program with no `lazy` trait member pays one walk over the
+    /// traits and nothing else.
+    fn lazy_convention_groups(&self) -> HashMap<Id, Vec<Id>> {
+        let mut groups: HashMap<Id, Vec<Id>> = HashMap::default();
+        for (trait_id, trait_) in &self.traits {
+            for (member_name, declaration_id) in &trait_.declarations {
+                let Some(declared) = self.functions.get(declaration_id) else {
+                    continue;
+                };
+                let declared_parameters = declared.parameters.clone();
+                if !declared_parameters.iter().any(|parameter_id| {
+                    self.parameters
+                        .get(parameter_id)
+                        .is_some_and(|parameter| parameter.lazy)
+                }) {
+                    continue;
+                }
+                // Every impl that provides this trait — DIRECTLY or through a
+                // subtrait's clause, which is the same reach method resolution
+                // takes to the member.
+                let mut positions: Vec<Vec<Id>> =
+                    declared_parameters.iter().map(|id| vec![*id]).collect();
+                for implementation in &self.implementations {
+                    if !implementation.trait_ids.iter().any(|implemented| {
+                        self.trait_with_supertraits(*implemented).contains(trait_id)
+                    }) {
+                        continue;
+                    }
+                    let Some(member_id) = implementation.declarations.get(member_name) else {
+                        continue;
+                    };
+                    let Some(member) = self.functions.get(member_id) else {
+                        continue;
+                    };
+                    for (position, parameter_id) in member.parameters.iter().enumerate() {
+                        let Some(slot) = positions.get_mut(position) else {
+                            continue;
+                        };
+                        slot.push(*parameter_id);
+                    }
+                }
+                for slot in positions {
+                    if slot.len() < 2 {
+                        continue;
+                    }
+                    for parameter_id in &slot {
+                        let others: Vec<Id> = slot
+                            .iter()
+                            .copied()
+                            .filter(|other| other != parameter_id)
+                            .collect();
+                        groups.entry(*parameter_id).or_default().extend(others);
+                    }
+                }
+            }
+        }
+        groups
     }
 
     /// M81 — whether the expression standing in a `lazy` position is INERT:
@@ -33133,18 +33330,30 @@ impl<'src> Analyzer<'src> {
     /// Asked of the DECLARED types, in the callee's own terms: the return the
     /// call site holds has already had the receiver's bindings substituted in,
     /// so its element is no longer the id the parameters name.
+    ///
+    /// **A declared return that is not a container at all answers YES (B380.)**
+    /// `freshen_list_element_slots` exists for one shape — a callee whose own
+    /// return element is a HOLE, `List::new()` — and a callee cannot have a
+    /// hole in a container it does not return. `Shared<T>::read(self): T` on a
+    /// `Shared<List<K>>` receiver hands the call site a `List<K>` that came
+    /// entirely from the RECEIVER's type, and freshening its element threw `K`
+    /// away: `cells.read()[at]` inside a generic body reported "cannot index
+    /// this List: its element type is never determined" over complete code,
+    /// while `cells.read().get(at)` — the method path, which does not freshen —
+    /// resolved the same receiver. `List::new()` is still freshened, because
+    /// its declared return IS `List<T>` and no parameter fixes that `T`.
     fn external_parameters_fix_the_list_element(&self, function_id: Id) -> bool {
         let Some(function) = self.external_functions.get(&function_id) else {
             return false;
         };
         let Type::Struct(struct_id, arguments) = function.return_type_id.get_type(self) else {
-            return false;
+            return true;
         };
         if !self.is_slot_container(struct_id) || arguments.len() != 1 {
-            return false;
+            return true;
         }
         let Type::Generic(element_constraint_id) = arguments[0].get_type(self) else {
-            return false;
+            return true;
         };
         let parameter_ids = function.parameters.clone();
         parameter_ids.iter().any(|parameter_id| {
@@ -35839,13 +36048,14 @@ impl<'src> Analyzer<'src> {
                     .map(|(_, arguments)| (implementation.subject, arguments.clone()))
             })
             .collect();
+        let mut first_match: Option<Vec<TypeId>> = None;
         for (subject_id, arguments) in candidates {
             let subject = subject_id.get_type(self);
             if let Some((_, bindings)) = self.reconcile_declaration(concrete, &subject, &subject) {
                 let mut binders = Vec::new();
                 self.collect_subject_binders(subject_id, &mut binders);
-                let context = self.bindings_for_binders(&binders, bindings);
-                let resolved = arguments
+                let mut context = self.bindings_for_binders(&binders, bindings);
+                let mut resolved: Vec<TypeId> = arguments
                     .iter()
                     .map(|argument| {
                         let argument_type = argument.get_type(self);
@@ -35853,10 +36063,60 @@ impl<'src> Analyzer<'src> {
                             .get_type_id(self)
                     })
                     .collect();
-                return Some(resolved);
+                // B379 — a BLANKET provider writes its trait arguments in
+                // binders its SUBJECT does not carry. `impl type S: Wrap<type T>
+                // with Feed<T>` provides `Feed<T>`, and `T` lives in `S`'s
+                // BOUND, not in the shape `S` matches — so the substitution
+                // above grounds `S` and hands `Feed<T>` back with `T` still
+                // abstract. A caller reading this to bind its own `T` from
+                // `S: Feed<T>` therefore bound nothing, and the parameter it
+                // could not determine was reported as missing the bound its own
+                // declaration carries. A NOMINAL provider never had the problem:
+                // `impl Box<type T> with Feed<T>` writes `T` in its subject.
+                //
+                // The binder is not free, though — the subject's own bound says
+                // the receiver implements `Wrap` AT it, so the receiver's impl
+                // of `Wrap` decides it, which is exactly what
+                // `bind_subject_bound_binders` grounds (the same act B299 wrote
+                // for an impl BODY's binders). Asked only when something is
+                // still abstract, so the common answer costs one scan of the
+                // list it just built.
+                if self.bound_argument_grounding_depth < 4
+                    && resolved
+                        .iter()
+                        .any(|argument| matches!(argument.get_type(self), Type::Generic(_)))
+                {
+                    self.bound_argument_grounding_depth += 1;
+                    self.bind_subject_bound_binders(subject_id, concrete, &mut context);
+                    self.bound_argument_grounding_depth -= 1;
+                    resolved = arguments
+                        .iter()
+                        .map(|argument| {
+                            let argument_type = argument.get_type(self);
+                            self.substitute_type(&argument_type, &context)
+                                .get_type_id(self)
+                        })
+                        .collect();
+                }
+                // A BLANKET subject reconciles with every receiver — its shape
+                // is a hole — so the first candidate to match is not
+                // necessarily the one that PROVIDES this trait for this type:
+                // `impl type S: Wrap<type T> with Feed<T>` matches a `Box2`
+                // that is no `Wrap` at all, and the grounding above then finds
+                // nothing to ground `T` with. A candidate whose arguments came
+                // out concrete answered the question; one that did not is kept
+                // only as the fallback, which is exactly what this returned
+                // before there was anything to prefer.
+                if !resolved
+                    .iter()
+                    .any(|argument| matches!(argument.get_type(self), Type::Generic(_)))
+                {
+                    return Some(resolved);
+                }
+                first_match.get_or_insert(resolved);
             }
         }
-        None
+        first_match
     }
 
     /// The half of a receiver/subject reconciliation that grounds an impl's
@@ -40120,6 +40380,38 @@ impl<'src> Analyzer<'src> {
                             self.infer_type(argument_id, &parameter_type, &substitution_context);
                         if matches!(argument_type, Type::Unresolved) {
                             return Resolution::Deferred;
+                        }
+                        // B372: an argument BUILT FROM a closure parameter that
+                        // is still awaiting its fill — `wrap(m * 2)` inside
+                        // `|m| ..` — types as `Unknown` on this attempt, and
+                        // reconciling a generic parameter against `Unknown`
+                        // binds nothing. The call then wired with its own `T`
+                        // open, and the `Holder<T>` it typed as was permanent:
+                        // "keeps its callee's type parameters" over complete
+                        // code, where the bare parameter (`wrap(m)`) waited
+                        // for the fill below and bound. The subtree is exactly
+                        // as unready as the parameter inside it, so it waits on
+                        // the same fill — but only where it has something to
+                        // bind: a CONCRETE declared type takes nothing from the
+                        // argument, and deferring there would only delay a
+                        // call that is already decided. And only until the
+                        // fixpoint stalls (`fixpoint_stalled`): a let-bound
+                        // closure is filled at its own call site, which waits
+                        // on this body, so its wait is never answered and the
+                        // call commits as it always did.
+                        if !self.fixpoint_stalled
+                            && matches!(argument_type, Type::Unknown)
+                            && !self.is_unknown_closure_parameter(argument_id)
+                            && self.value_awaits_a_closure_parameter(argument_id)
+                        {
+                            let declared =
+                                self.substitute_type(&parameter_type, &substitution_context);
+                            let mut generics = Vec::new();
+                            self.collect_generics(&declared, 0, &mut generics);
+                            let bindable = self.callee_bindable_generics(target_id);
+                            if generics.iter().any(|generic| bindable.contains(generic)) {
+                                return Resolution::Deferred;
+                            }
                         }
                         // A closure parameter still awaiting its type. When this
                         // call's declared parameter is CONCRETE, adopt it (B13):
@@ -45150,6 +45442,52 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// The INDEX half of `subject[index]`: a position, so it is an `i32` —
+    /// the very type `List::get` and `List::set` take.
+    ///
+    /// Nothing checked it. `xs[1.5]`, `xs["a"]`, `xs[true]` and the write form
+    /// `xs[k] = v` all passed `vilan check` and went straight to the emitted
+    /// array subscript, where JS answered `undefined` for a position that does
+    /// not exist — so a program read a hole and failed somewhere else entirely
+    /// (`TypeError: Cannot read properties of undefined`), or tripped the
+    /// bounds check with a non-number in the message.
+    ///
+    /// Lenient about what is not yet a type: an index still `Unknown` or
+    /// `Unresolved` is reported by the fixpoint's own leftover sweep, and a
+    /// GENERIC one is left alone rather than refused here — a parameter's
+    /// bounds are the only thing that could make it an index, and the language
+    /// has no such bound to write yet. Both are holes this deliberately does
+    /// not close; the concrete wrong types are the miscompile.
+    fn subscript_index_is_an_index(&mut self, index_id: Id) -> bool {
+        let Some(index_struct_id) = self.primitive_struct_ids.get("i32").copied() else {
+            return true;
+        };
+        let expected = Type::Struct(index_struct_id, Vec::new());
+        let index_type = self.infer_type(index_id, &expected, &HashMap::default());
+        if matches!(
+            index_type,
+            Type::Unknown | Type::Unresolved | Type::Any | Type::Never | Type::Generic(_)
+        ) {
+            return true;
+        }
+        if index_type == expected {
+            return true;
+        }
+        let index_str = self.pretty_print_type(&index_type, &HashMap::default());
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span: **self.span_map.get(&index_id).unwrap_or(&&EMPTY_SPAN),
+            msg: format!(
+                "an index must be an `i32`, and this one is `{index_str}`: a list and an \
+                 array are POSITIONAL, so `xs[i]` takes the index `xs.get(i)` takes — \
+                 anything else names no element, and the emitted subscript read `undefined` \
+                 back instead of failing"
+            ),
+        });
+        false
+    }
+
     /// `subject[index]`: once the subject's `List<T>` type is known, the
     /// subscript's type is the element `T`; records the resolved `Expr::Index`.
     fn resolve_subscript(&mut self, id: Id, subject_id: Id, index_id: Id) -> Resolution {
@@ -45170,6 +45508,10 @@ impl<'src> Analyzer<'src> {
             Type::Struct(struct_id, arguments)
                 if Some(struct_id) == list_id && arguments.len() == 1 =>
             {
+                if !self.subscript_index_is_an_index(index_id) {
+                    self.expr_id_to_expr_map.insert(id, Expr::Error);
+                    return Resolution::Failed;
+                }
                 let element_type = arguments[0];
                 // A still-unknown element slot: wait for a `push` (or an
                 // annotation on the binding) to ground it. One left ungrounded
@@ -45204,6 +45546,10 @@ impl<'src> Analyzer<'src> {
             // a literal index the type proves out of range is a compile error (the
             // length is in the type); a dynamic index keeps its runtime bounds check.
             Type::Array(element_id, length) => {
+                if !self.subscript_index_is_an_index(index_id) {
+                    self.expr_id_to_expr_map.insert(id, Expr::Error);
+                    return Resolution::Failed;
+                }
                 let literal_index = match self.expr_id_to_expr_map.get(&index_id) {
                     Some(Expr::Number(whole, None, _)) => whole.parse::<usize>().ok(),
                     _ => None,
@@ -47427,8 +47773,58 @@ impl<'src> Analyzer<'src> {
                         span: check.span,
                     });
             }
+            // A BLANKET's subject bound IS an implementation of the bound
+            // trait and of everything above it. `impl type S: Base<type T> with
+            // Feed<T>`, under `trait Feed<T> with Base<T>`, admits only
+            // subjects that already implement `Base<T>` — so `Base`'s members
+            // are provided for every subject the impl can ever reach, and
+            // demanding them here ("'S' does not implement trait 'Feed<T>':
+            // missing 'read'") refused the one spelling that states the
+            // requirement outright. Asked at the ARGUMENTS the requirement is
+            // reached with, so a bound on `Base<i32>` does not answer a
+            // `Feed<str>` that needs `Base<str>`.
+            let reached_requirements: Vec<(Id, Vec<TypeId>)> =
+                self.trait_with_supertraits_at(trait_id, &check.trait_arguments);
+            let mut bound_provides: Vec<(Id, Vec<TypeId>)> = Vec::new();
+            let subject_binder = match check.subject_type_id.get_type(self) {
+                Type::Generic(constraint_id) => Some(constraint_id),
+                Type::Trait(..) => Some(check.subject_type_id),
+                _ => None,
+            };
+            for (bound_trait_id, bound_arguments) in subject_binder
+                .map(|binder| self.generic_bound_traits(binder))
+                .unwrap_or_default()
+            {
+                bound_provides
+                    .extend(self.trait_with_supertraits_at(bound_trait_id, &bound_arguments));
+            }
             for (member_name, declaring_trait_id) in required {
                 if check.declarations.contains_key(member_name) {
+                    continue;
+                }
+                let provided_by_the_subjects_bound = reached_requirements
+                    .iter()
+                    .filter(|(reached_id, _)| *reached_id == declaring_trait_id)
+                    .any(|(_, reached_arguments)| {
+                        bound_provides
+                            .iter()
+                            .any(|(provided_id, provided_arguments)| {
+                                *provided_id == declaring_trait_id
+                                    && provided_arguments.len() == reached_arguments.len()
+                                    && provided_arguments.iter().zip(reached_arguments).all(
+                                        |(provided, reached)| {
+                                            let provided = provided.get_type(self);
+                                            let reached = reached.get_type(self);
+                                            self.compare_type(
+                                                &provided,
+                                                &reached,
+                                                &HashMap::default(),
+                                            )
+                                        },
+                                    )
+                            })
+                    });
+                if provided_by_the_subjects_bound {
                     continue;
                 }
                 // A supertrait member may be provided by a SEPARATE impl of
@@ -47673,6 +48069,7 @@ impl<'src> Analyzer<'src> {
         // refined no type in place. See the quiescence test at the bottom of
         // the loop for why the second one in a row ends the fixpoint.
         let mut fruitless_backstops = 0u32;
+        self.fixpoint_stalled = false;
 
         for _ in 0..max_iterations {
             let mut progress = self.resolve_constraints();
@@ -47741,9 +48138,21 @@ impl<'src> Analyzer<'src> {
             }
             fruitless_backstops += 1;
             if fruitless_backstops >= 2 {
+                // B372: a stationary fixpoint is the moment a PREFERENCE
+                // deferral gives way — see `fixpoint_stalled`. One more round
+                // with the door open, and only one: the flag stays set, so a
+                // second stall is the real fixpoint.
+                if !self.fixpoint_stalled {
+                    self.fixpoint_stalled = true;
+                    fruitless_backstops = 0;
+                    self.constraints
+                        .extend(self.deferred.drain(..).map(|(constraint, _)| constraint));
+                    continue;
+                }
                 break;
             }
         }
+        self.fixpoint_stalled = false;
         if split_on {
             split.push(("fixpoint", split_mark.elapsed()));
             let stages: Vec<String> = split

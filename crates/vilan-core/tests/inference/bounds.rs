@@ -11372,3 +11372,700 @@ fn e208_the_annotated_spellings_and_the_agreeing_case_are_unchanged() {
         "1\n2\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B378 — a SUBTRAIT bound outranks its supertrait bound
+// ---------------------------------------------------------------------------
+//
+// §13.4(a)(2) ranks two impls of equal subject shape by their binders' bounds,
+// and "stronger" was read off the bound names the author wrote. `trait Narrow<T>
+// with Base<T>` means `S: Narrow<T>` admits strictly fewer types than
+// `S: Base<T>`, so the subtrait-bounded subject is the more specific one — but
+// the written lists `[Narrow]` and `[Base]` contained neither the other, so the
+// pair never ranked and every call through it was §13.4(a)(3) residue. That is
+// the OPTIONAL-CAPABILITY dispatch A112 S3 is built on: one consumer, a blanket
+// answering "no feed" for every `Source<List<T>>` and a narrower one answering a
+// real feed for a `DeltaSource`.
+
+/// The shape collections-39 was refused, with both blankets providing one trait.
+#[test]
+fn b378_a_subtrait_bounded_blanket_outranks_its_supertrait_bounded_one() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        trait Base<T> { fun read(self): T; }
+        trait Narrow<T> with Base<T> { fun extra(self): i32; }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Base<i32> { fun read(self): i32 { self.n } }
+        impl Cell with Narrow<i32> { fun extra(self): i32 { self.n * 2 } }
+
+        trait Maybe<T> { fun capability(self): Option<i32>; }
+
+        impl type S: Base<type T> with Maybe<T> {
+            fun capability(self): Option<i32> { None }
+        }
+
+        impl type S: Narrow<type T> with Maybe<T> {
+            fun capability(self): Option<i32> { Some(self.extra()) }
+        }
+
+        fun ask<T, S: Base<T> + Maybe<T>>(source: S): i32 {
+            match source.capability() {
+                Some(let value) => value,
+                None => -1,
+            }
+        }
+
+        fun main() {
+            let cell = Cell { n = 7 };
+            print(ask(cell));
+        }
+        "#,
+        "14\n",
+    );
+}
+
+/// The same pair with the impls DECLARED the other way round: the order picks
+/// the winner, not the file.
+#[test]
+fn b378_the_same_pair_declared_in_the_other_order_still_picks_the_subtrait() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        trait Base<T> { fun read(self): T; }
+        trait Narrow<T> with Base<T> { fun extra(self): i32; }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Base<i32> { fun read(self): i32 { self.n } }
+        impl Cell with Narrow<i32> { fun extra(self): i32 { self.n * 2 } }
+
+        trait Maybe<T> { fun capability(self): Option<i32>; }
+
+        impl type S: Narrow<type T> with Maybe<T> {
+            fun capability(self): Option<i32> { Some(self.extra()) }
+        }
+
+        impl type S: Base<type T> with Maybe<T> {
+            fun capability(self): Option<i32> { None }
+        }
+
+        fun ask<T, S: Base<T> + Maybe<T>>(source: S): i32 {
+            match source.capability() {
+                Some(let value) => value,
+                None => -1,
+            }
+        }
+
+        fun main() {
+            let cell = Cell { n = 7 };
+            print(ask(cell));
+        }
+        "#,
+        "14\n",
+    );
+}
+
+/// A112 S3's own pair, over std's real `DeltaSource<C, O> with Source<C>`: a
+/// consumer written once for both kinds of source reaches the delta arm on a
+/// cell that keeps a log, and the whole-value arm on one that does not.
+#[test]
+fn b378_the_a112_shape_ranks_a_delta_source_above_a_plain_source() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{
+            DeltaCursor,
+            DeltaLog,
+            DeltaSource,
+            SeqOp,
+            Signal,
+            SignalCell,
+            Source,
+            Subscription,
+        };
+
+        struct Logged { elements: SignalCell<List<i32>>, log: DeltaLog<SeqOp<i32>> }
+
+        impl Logged with Source<List<i32>> {
+            fun get(self): List<i32> { self.elements.get() }
+
+            [must_use]
+            fun on_change(self, observer: |List<i32>| void): Subscription {
+                self.elements.on_change(observer)
+            }
+        }
+
+        impl Logged with DeltaSource<List<i32>, SeqOp<i32>> {
+            fun cursor(self): DeltaCursor { self.log.cursor() }
+
+            fun drop_cursor(self, cursor: DeltaCursor) { self.log.drop_cursor(cursor); }
+
+            fun since(self, cursor: DeltaCursor): List<SeqOp<i32>> {
+                match self.log.since(cursor) {
+                    Some(let ops) => ops,
+                    None => {
+                        mut lost: List<SeqOp<i32>> = [];
+                        lost
+                    },
+                }
+            }
+        }
+
+        trait Feed { fun feed(self): str; }
+
+        impl type S: Source<List<type T>> with Feed {
+            fun feed(self): str { "whole" }
+        }
+
+        impl type S: DeltaSource<List<type T>, SeqOp<type O>> with Feed {
+            fun feed(self): str { "delta" }
+        }
+
+        fun consume<T, S: Source<List<T>> + Feed>(source: S): str {
+            source.feed()
+        }
+
+        fun main() {
+            let logged = Logged {
+                elements = Signal::new([1, 2]),
+                log = DeltaLog<SeqOp<i32>>::new(),
+            };
+            let plain: SignalCell<List<i32>> = Signal::new([3]);
+            print(consume(logged));
+            print(consume(plain));
+        }
+        "#,
+        "delta\nwhole\n",
+    );
+}
+
+/// The control the order must keep: two UNRELATED bounds are neither more
+/// specific, so the pair is still §13.4(a)(3)'s residue and still reported.
+#[test]
+fn b378_two_unrelated_bounds_are_still_unranked() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        trait Base<T> { fun read(self): T; }
+        trait Other<T> { fun extra(self): i32; }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Base<i32> { fun read(self): i32 { self.n } }
+        impl Cell with Other<i32> { fun extra(self): i32 { self.n * 2 } }
+
+        trait Maybe<T> { fun capability(self): Option<i32>; }
+
+        impl type S: Base<type T> with Maybe<T> {
+            fun capability(self): Option<i32> { None }
+        }
+
+        impl type S: Other<type T> with Maybe<T> {
+            fun capability(self): Option<i32> { Some(self.extra()) }
+        }
+
+        fun ask<T, S: Base<T> + Maybe<T>>(source: S): i32 {
+            match source.capability() {
+                Some(let value) => value,
+                None => -1,
+            }
+        }
+
+        fun main() {
+            let cell = Cell { n = 7 };
+            print(ask(cell));
+        }
+        "#,
+        "neither impl subject is more specific than the other",
+    );
+}
+
+/// The other control: the tier this shares with `Box<type T: Display>` over
+/// `Box<type T>` — a bound beats no bound — still ranks, so trading the bound
+/// COUNT for a set difference did not cost the case the count was written for.
+#[test]
+fn b378_a_bounded_binder_still_outranks_an_unbounded_one() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Show { fun show(self): str; }
+        trait Mark { fun mark(self): str; }
+
+        struct Box1<T> { value: T }
+
+        struct Named { name: str }
+        impl Named with Show { fun show(self): str { self.name } }
+
+        impl Box1<type T> with Mark {
+            fun mark(self): str { "plain" }
+        }
+
+        impl Box1<type T: Show> with Mark {
+            fun mark(self): str { self.value.show() }
+        }
+
+        fun main() {
+            let shown = Box1 { value = Named { name = "named" } };
+            print(shown.mark());
+        }
+        "#,
+        "named\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B379 — a generic reachable only through a BLANKET provider's trait argument
+// ---------------------------------------------------------------------------
+//
+// `trait_args_for` answers "what arguments does this concrete type provide for
+// that trait", by matching the type against the providing impl's SUBJECT and
+// substituting the impl's recorded trait arguments through the bindings that
+// match produced. A blanket writes its trait arguments in binders its subject
+// does not carry — `impl type S: Wrap<type T> with Feed<T>` provides `Feed<T>`
+// where `T` lives in `S`'s BOUND — so the substitution grounded `S` and handed
+// `Feed<T>` back with `T` still abstract. A caller binding its own `T` from
+// `S: Feed<T>` bound nothing, and the parameter it could not determine was then
+// reported as missing the bound its own declaration carries. A NOMINAL provider
+// never had the problem, which is the control below.
+
+/// The isolated pair: one trait, two providers, one call.
+#[test]
+fn b379_a_blanket_providers_trait_argument_binds_the_callers_parameter() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+
+        trait Wrap<T> { fun unwrap(self): T; }
+        trait Feed<T> { fun feeds(self): bool; }
+
+        struct Box1<T> { value: T }
+        impl Box1<type T> with Wrap<T> { fun unwrap(self): T { self.value } }
+
+        // The BLANKET provider: `T` is written in the subject's BOUND only.
+        impl type S: Wrap<type T> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        struct Box2<T> { value: T }
+
+        // The NOMINAL provider, which always bound: `T` is in the subject.
+        impl Box2<type T> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        fun through_a_bound<T: PartialEq, S: Feed<T>>(source: S): bool {
+            source.feeds()
+        }
+
+        fun main() {
+            let nominal = Box2 { value = 5 };
+            let blanket = Box1 { value = 7 };
+            print(through_a_bound(nominal));
+            print(through_a_bound(blanket));
+        }
+        "#,
+        "true\ntrue\n",
+    );
+}
+
+/// collections-39's FIND, whole: the same bound carried through a STRUCT the
+/// call constructs, and through the `Placed` impl written over that struct —
+/// which is where A112 S3 met it.
+#[test]
+fn b379_the_bound_carries_through_a_struct_built_from_a_blanket_provider() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        trait Feed<T> { fun feeds(self): bool; }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        struct Holder<T: PartialEq, S: Feed<T>> {
+            source: S,
+            render: |T| str,
+        }
+
+        trait Placed { fun place(self): bool; }
+
+        impl Holder<type T: PartialEq, type S: Feed<T>> with Placed {
+            fun place(self): bool { self.source.feeds() }
+        }
+
+        // The control: the SAME bound in a plain call.
+        fun direct<T: PartialEq, S: Feed<T>>(source: S): bool {
+            source.feeds()
+        }
+
+        fun hold<T: PartialEq, S: Feed<T>>(source: S, render: |T| str): Holder<T, S> {
+            Holder { source, render }
+        }
+
+        fun take<C: Placed>(content: C): bool { content.place() }
+
+        fun main() {
+            let cell: SignalCell<List<str>> = Signal::new(["a"]);
+            print(direct(cell));
+            let held = hold(cell, |item| item);
+            print(take(held));
+        }
+        "#,
+        "true\ntrue\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B381 — `==` on a bounded parameter inside a nested `match` arm in a closure
+// ---------------------------------------------------------------------------
+//
+// Filed from collections-39's FIND 4 as "the arm scope loses the enclosing
+// function's bounds". It does not reproduce as filed: on 49de3915 the nested
+// shape checks, two levels deep and in collections-39's own transcription.
+// What collections-39 met was B379 — its `K` bound only through the
+// `DeltaFeed` BLANKET's trait argument, so it never bound at all, and the
+// refusal ("`K` is missing the bound `: PartialEq`") read as a lost bound at
+// whichever comparison it landed on. The nesting was incidental: the same
+// program with the comparison hoisted out of the closure fails identically on
+// 49de3915 (the fourth pin's shape). These pins hold both facts — the nested
+// shapes check, and the blanket-reached parameter compares inside them.
+
+/// The item's shape, verbatim in spirit: never broken, pinned so it stays so.
+#[test]
+fn b381_eq_on_a_bounded_parameter_inside_a_match_arm_inside_a_closure() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        fun count<K: PartialEq>(xs: List<Option<K>>, key: K): i32 {
+            mut hits = 0;
+            xs.for_each(|x| match x {
+                Some(let k) => if k == key { hits += 1; },
+                None => {},
+            });
+            hits
+        }
+
+        fun main() {
+            print(count([Some(1), None, Some(2), Some(1)], 1));
+        }
+        "#,
+        "2\n",
+    );
+}
+
+/// Two levels of `match` inside the closure.
+#[test]
+fn b381_eq_two_match_levels_deep_inside_a_closure() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        fun count<K: PartialEq>(xs: List<Option<Option<K>>>, key: K): i32 {
+            mut hits = 0;
+            xs.for_each(|x| match x {
+                Some(let inner) => match inner {
+                    Some(let k) => if k == key { hits += 1; },
+                    None => {},
+                },
+                None => {},
+            });
+            hits
+        }
+
+        fun main() {
+            print(count([Some(Some(1)), None, Some(None), Some(Some(1))], 1));
+        }
+        "#,
+        "2\n",
+    );
+}
+
+/// What collections-39 actually met: the compared parameter is reachable only
+/// through a BLANKET provider's trait argument (B379), inside the nested arm.
+/// Red on 49de3915 with "`T` is missing the bound `: PartialEq`".
+#[test]
+fn b381_a_blanket_reached_parameter_compares_inside_a_nested_arm() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        trait Feed<T> { fun feeds(self): bool; }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        fun count<T: PartialEq, S: Feed<T>>(source: S, items: List<Option<T>>, key: T): i32 {
+            mut hits = 0;
+            items.for_each(|x| match x {
+                Some(let k) => if k == key { hits += 1; },
+                None => {},
+            });
+            hits
+        }
+
+        fun main() {
+            let cell: SignalCell<List<str>> = Signal::new(["a"]);
+            print(count(cell, [Some("a"), None, Some("b"), Some("a")], "a"));
+        }
+        "#,
+        "2\n",
+    );
+}
+
+/// The control that locates it: the comparison OUTSIDE the closure and the
+/// `match`, same blanket-reached parameter. It failed on 49de3915 exactly as
+/// the nested one did, which is what says the nesting was never the cause.
+#[test]
+fn b381_the_same_comparison_outside_the_closure_is_the_control() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        trait Feed<T> { fun feeds(self): bool; }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        fun same<T: PartialEq, S: Feed<T>>(source: S, left: T, right: T): bool {
+            left == right
+        }
+
+        fun main() {
+            let cell: SignalCell<List<str>> = Signal::new(["a"]);
+            print(same(cell, "a", "a"));
+        }
+        "#,
+        "true\n",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A trait whose SUPERTRAIT is the bound of its own blanket impl
+// ---------------------------------------------------------------------------
+//
+// `trait Feed<T> with Source<List<T>>` beside `impl type S: Source<List<type
+// T>> with Feed<T>` — A112 S3's `DeltaFeed`, and the most direct way to write
+// "a capability every source has". Two defects, one per face (collections-40's
+// finds, both pre-existing on 49de3915):
+//
+// - With std's `Source` it overflowed the compiler's stack. Whether a type
+//   provides `Source` asked every impl providing it; the blanket provides
+//   `Source` (a supertrait comes with the trait), and whether the blanket
+//   applies is whether the type provides `Source` — the question itself,
+//   asked again until the stack was gone. With the pair in std, EVERY program
+//   importing `std::reactive` aborted. A question already open further up the
+//   proof is no evidence for itself now (`impl_select::provides_trait`).
+// - With a user trait the recursion never started and the impl was REFUSED:
+//   "'S' does not implement trait 'Feed<T>': missing 'read'" — conformance
+//   wanted the supertrait's members from the impl or from a separate impl on
+//   the same subject, and a blanket's subject is a binder BOUNDED by that very
+//   supertrait, which provides them for every type the impl can reach.
+
+/// The std face, collections-40's repro: an abort before, runs now.
+#[test]
+fn a_supertrait_that_is_its_blankets_own_bound_does_not_overflow() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        trait Feed<T> with Source<List<T>> {
+            fun feeds(self): bool;
+        }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun feeds(self): bool { false }
+        }
+
+        fun direct<T, S: Feed<T>>(source: S): bool {
+            source.feeds()
+        }
+
+        fun main() {
+            let cell: SignalCell<List<str>> = Signal::new(["a"]);
+            print(i"direct={direct(cell)} method={cell.feeds()}");
+        }
+        "#,
+        "direct=false method=false\n",
+    );
+}
+
+/// The std-free face: accepted, and it answers for a type that implements the
+/// bound.
+#[test]
+fn a_blankets_subject_bound_provides_its_supertraits_members() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base<T> { fun read(self): T; }
+        trait Feed<T> with Base<T> { fun feeds(self): bool; }
+
+        impl type S: Base<type T> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        struct Cell { n: i32 }
+        impl Cell with Base<i32> {
+            fun read(self): i32 { self.n }
+        }
+
+        fun both<T, S: Feed<T>>(source: S): T {
+            source.feeds();
+            source.read()
+        }
+
+        fun main() {
+            print(both(Cell { n = 3 }));
+        }
+        "#,
+        "3\n",
+    );
+}
+
+/// The bound answers AT ITS ARGUMENTS: `Feed<str>` needs `Base<str>`, and a
+/// subject bounded on `Base<i32>` is not one — still refused.
+#[test]
+fn a_subject_bound_at_other_arguments_does_not_provide_the_supertrait() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        trait Base<T> { fun read(self): T; }
+        trait Feed<T> with Base<T> { fun feeds(self): bool; }
+
+        impl type S: Base<i32> with Feed<str> {
+            fun feeds(self): bool { false }
+        }
+
+        fun main() { print("hello"); }
+        "#,
+        "'S' does not implement trait 'Feed<str>': missing 'read'",
+    );
+}
+
+/// The cycle answers NO, not yes: a type with no `Base` of its own does not
+/// become a `Feed` through the blanket that requires one.
+#[test]
+fn a_type_without_the_bound_does_not_reach_the_blanket_through_the_cycle() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Source };
+
+        trait Feed<T> with Source<List<T>> {
+            fun feeds(self): bool;
+        }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        struct Bare { n: i32 }
+
+        fun main() {
+            print(Bare { n = 1 }.feeds());
+        }
+        "#,
+        "Bare has no method 'feeds'",
+    );
+}
+
+/// A112 S3's whole shape, std-free of `std::ui`: the supertrait form of the
+/// optional capability, a "no feed" blanket over `Source` and a real one over
+/// `DeltaSource` (B378 ranks the second), reached through ONE bound.
+#[test]
+fn the_a112_optional_capability_takes_the_supertrait_form() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{
+            DeltaCursor,
+            DeltaLog,
+            DeltaSource,
+            SeqOp,
+            Signal,
+            SignalCell,
+            Source,
+            Subscription,
+        };
+
+        struct Logged { elements: SignalCell<List<i32>>, log: DeltaLog<SeqOp<i32>> }
+
+        impl Logged with Source<List<i32>> {
+            fun get(self): List<i32> { self.elements.get() }
+
+            [must_use]
+            fun on_change(self, observer: |List<i32>| void): Subscription {
+                self.elements.on_change(observer)
+            }
+        }
+
+        impl Logged with DeltaSource<List<i32>, SeqOp<i32>> {
+            fun cursor(self): DeltaCursor { self.log.cursor() }
+
+            fun drop_cursor(self, cursor: DeltaCursor) { self.log.drop_cursor(cursor); }
+
+            fun since(self, cursor: DeltaCursor): List<SeqOp<i32>> {
+                mut none: List<SeqOp<i32>> = [];
+                none
+            }
+        }
+
+        trait Feed<T> with Source<List<T>> {
+            fun has_feed(self): bool;
+        }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun has_feed(self): bool { false }
+        }
+
+        impl type S: DeltaSource<List<type T>, SeqOp<T>> with Feed<T> {
+            fun has_feed(self): bool { true }
+        }
+
+        fun consume<T, S: Feed<T>>(source: S): str {
+            i"feed={source.has_feed()} len={source.get().len()}"
+        }
+
+        fun main() {
+            let logged = Logged {
+                elements = Signal::new([1, 2]),
+                log = DeltaLog<SeqOp<i32>>::new(),
+            };
+            let plain: SignalCell<List<i32>> = Signal::new([1, 2, 3]);
+            print(consume(logged));
+            print(consume(plain));
+        }
+        "#,
+        "feed=true len=2\nfeed=false len=3\n",
+    );
+}
