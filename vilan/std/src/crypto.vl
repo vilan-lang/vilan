@@ -13,9 +13,9 @@ export *;
 [extern("__hmac_sha512")]
 async external fun hmac_sha512(key: Bytes, data: Bytes): Bytes;
 
-/// PBKDF2-HMAC-SHA-512: `bits` derived from `password` and `salt` over
-/// `iterations` rounds — the v1 password-hashing primitive. Store the salt
-/// beside the derived hash; compare with `equals_constant_time`.
+/// PBKDF2-HMAC-SHA-512: `bits` derived from `password` and `salt` over `iterations`
+/// rounds — the v1 password-hashing primitive. Store the salt beside the derived
+/// hash; compare with `equals_constant_time`.
 [extern("__pbkdf2_sha512")]
 async external fun pbkdf2_sha512(password: Bytes, salt: Bytes, iterations: i32, bits: i32): Bytes;
 
@@ -23,9 +23,9 @@ async external fun pbkdf2_sha512(password: Bytes, salt: Bytes, iterations: i32, 
 /// content: an asset fingerprint, a cache validator, a dedup key. Pair with
 /// `Bytes::to_hex` for the hex form those are written as.
 ///
-/// NOT a password primitive (`pbkdf2_sha512` is — a raw digest is far too
-/// fast to hash a password with), and not `std::hash`, which is the Map/Set
-/// canonical-key mechanism and makes no avalanche promise at all.
+/// NOT a password primitive (`pbkdf2_sha512` is — a raw digest is far too fast to
+/// hash a password with), and not `std::hash`, which is the Map/Set canonical-key
+/// mechanism and makes no avalanche promise at all.
 [extern("__sha256")]
 async external fun sha256(data: Bytes): Bytes;
 

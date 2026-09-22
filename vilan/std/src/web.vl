@@ -1,34 +1,34 @@
 // The WEB prelude — the ambient scope for applications, selected with
 // `prelude = "std::web"` (`prelude.md` §5.3). The census that drew it is blunt:
-// `print` is not the most-imported name in real vilan code, `Signal` is, and
-// nine of the top sixteen application names are the style/UI cluster. No single
-// fixed set serves both a test corpus and an application, so std ships both and
-// the manifest picks.
+// `print` is not the most-imported name in real vilan code, `Signal` is, and nine
+// of the top sixteen application names are the style/UI cluster. No single fixed
+// set serves both a test corpus and an application, so std ships both and the
+// manifest picks.
 //
-// The base seven are re-stated rather than derived. That is the override rule
-// (§8) applied to std itself: a prelude REPLACES, extension is spelled by
-// re-export, and std does not get a merge mechanism its users lack.
+// The base seven are re-stated rather than derived. That is the override rule (§8)
+// applied to std itself: a prelude REPLACES, extension is spelled by re-export, and
+// std does not get a merge mechanism its users lack.
 export import pkg::io::print;
 export import pkg::option::Option::{ self, None, Some };
 export import pkg::result::Result::{ self, Err, Ok };
 
-// `Signal` — rank 1 in application code (21 of 42 app files, ahead of `print`
-// at 15). Base layer, so a server-rendered build reaches it too.
+// `Signal` — rank 1 in application code (21 of 42 app files, ahead of `print` at
+// 15). Base layer, so a server-rendered build reaches it too.
 //
 // `SignalCell` travels with it (A32). `Signal` is the writable TRAIT now, and
-// `Signal::new(v)` — the everyday spelling, unchanged — hands back the cell; but
-// a trait may only be written as a `let` annotation (B161), so the three
-// positions that need a real type name the cell instead: a struct field
-// (`todos: SignalCell<List<Todo>>`), a return type, a generic argument. Those
-// are exactly the sites the census counted `Signal` at, so leaving the cell out
-// would put back the import this set exists to delete.
+// `Signal::new(v)` — the everyday spelling, unchanged — hands back the cell; but a
+// trait may only be written as a `let` annotation (B161), so the three positions
+// that need a real type name the cell instead: a struct field
+// (`todos: SignalCell<List<Todo>>`), a return type, a generic argument. Those are
+// exactly the sites the census counted `Signal` at, so leaving the cell out would
+// put back the import this set exists to delete.
 export import pkg::reactive::Signal;
 export import pkg::reactive::SignalCell;
 
 // `view` and `View` — ranks 3 and 4, the builder and its type, one idea. A view
-// tree is dense with `view("div")` calls, which is why these are bare members
-// and not left to `ui::`. `std::ui` is declared by BOTH platform layers, so
-// neither name colors this prelude to one target.
+// tree is dense with `view("div")` calls, which is why these are bare members and
+// not left to `ui::`. `std::ui` is declared by BOTH platform layers, so neither
+// name colors this prelude to one target.
 //
 // The SLOT functions travel with them (A99, and `when_some` with A119). They
 // are the whole conditional/dynamic/keyed surface now that the `View` methods
@@ -41,8 +41,8 @@ export import pkg::reactive::SignalCell;
 // reading: the prelude already binds it.
 export import pkg::ui::{ View, each, each_by, each_values, swap, view, when, when_some };
 
-// Ambient MODULES (§5.2). A module entry costs one name in the bare namespace —
-// its own — and buys a whole namespace behind one qualifying segment.
+// Ambient MODULES (§5.2). A module entry costs one name in the bare namespace — its
+// own — and buys a whole namespace behind one qualifying segment.
 //
 // `style` is the move that dissolves the `Display` collision: the CSS enum is
 // `style::Display` and the `to_string` trait keeps bare `Display` to itself, so
@@ -52,7 +52,7 @@ export import pkg::ui::{ View, each, each_by, each_values, swap, view, when, whe
 // untouched.
 //
 // `ui` carries `mount_root` and the rest of the UI surface without putting a
-// once-per-app name into the bare namespace. `ui::mount_root` on a node build
-// is an error at the call, which is where a platform error reads.
+// once-per-app name into the bare namespace. `ui::mount_root` on a node build is an
+// error at the call, which is where a platform error reads.
 export import pkg::style;
 export import pkg::ui;

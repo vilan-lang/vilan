@@ -71,14 +71,14 @@ trait Ord with Eq + PartialOrd {
 // always loaded, so a program that imports nothing still reaches all four —
 // unlike `join`, whose `Display` bound strands it in `display.vl`.
 //
-// All four are eager and pure: they take `self` by value and return a new
-// value, matching `map`/`filter`/`fold`. `List`'s mutating methods
+// All four are eager and pure: they take `self` by value and return a new value,
+// matching `map`/`filter`/`fold`. `List`'s mutating methods
 // (`push`/`pop`/`insert`/`remove`) are the `&mut self` half of that line.
 impl List<type T> {
 	/// A new list ordered by `compare`, which reports how its first argument
-	/// relates to its second. STABLE: elements the comparator calls `Equal`
-	/// keep their input order (an intrinsic over the host's `Array.sort`, which
-	/// ECMA-262 has guaranteed stable since ES2019).
+	/// relates to its second. STABLE: elements the comparator calls `Equal` keep
+	/// their input order (an intrinsic over the host's `Array.sort`, which ECMA-262
+	/// has guaranteed stable since ES2019).
 	///
 	/// `own self` because the result is built from the receiver's ELEMENTS: the
 	/// intrinsic reorders a copied spine, so without owning them the two lists
@@ -108,8 +108,7 @@ impl List<type T: PartialEq> {
 		false
 	}
 
-	/// The index of the FIRST element equal to `value` — `None` when there is
-	/// none.
+	/// The index of the FIRST element equal to `value` — `None` when there is none.
 	fun index_of(self, value: T): Option<i32> {
 		mut index = 0;
 		for item in self {
@@ -154,9 +153,9 @@ impl List<type T: PartialEq> with PartialEq {
 }
 
 // `str` carries the full ordering family (lexicographic, the native `<`), so
-// generic `T: Ord` code (sorting, `math::min`/`max`, `clamp`) accepts it.
-// The numeric primitives' ordering impls live with their other trait impls
-// in `number.vl`; the floats are deliberately NOT `Ord` (NaN — see there).
+// generic `T: Ord` code (sorting, `math::min`/`max`, `clamp`) accepts it. The
+// numeric primitives' ordering impls live with their other trait impls in
+// `number.vl`; the floats are deliberately NOT `Ord` (NaN — see there).
 
 impl str with Eq {}
 
@@ -209,17 +208,17 @@ impl bool with PartialEq {
 	}
 }
 
-// The `PartialEq` derive (macro-engine.md §10): a prelude macro — `compare`
-// is always loaded, so `[derive(PartialEq)]` needs no import. Its output
-// carries its own trait import.
+// The `PartialEq` derive (macro-engine.md §10): a prelude macro — `compare` is
+// always loaded, so `[derive(PartialEq)]` needs no import. Its output carries its
+// own trait import.
 
 macro fun PartialEq(item: Item): Source {
 	import macro_std::option::Option::{ self, Some, None };
 	import macro_std::build::{ impl_of, fun_of, match_of, join };
 
 	if item.as_struct() is Some(let target) {
-		// `self.a == other.a && self.b == other.b` (a field-less struct is
-		// always equal).
+		// `self.a == other.a && self.b == other.b` (a field-less struct is always
+		// equal).
 		mut comparisons: List<str> = [];
 		for field in target.fields {
 			comparisons.push(i"self.{field.name} == other.{field.name}");
@@ -228,10 +227,9 @@ macro fun PartialEq(item: Item): Source {
 		if comparison == "" {
 			comparison = "true";
 		}
-		// `other` is the subject spelled as an application of its own
-		// parameters (`Holder<T>`), and the impl binds them under `PartialEq`
-		// (B194's rule) — a bare `Holder` there is an under-supplied
-		// application (B188).
+		// `other` is the subject spelled as an application of its own parameters
+		// (`Holder<T>`), and the impl binds them under `PartialEq` (B194's rule) —
+		// a bare `Holder` there is an under-supplied application (B188).
 		let eq = fun_of("eq")
 			.parameter("self")
 			.parameter(i"other: {target.subject()}")
@@ -279,10 +277,9 @@ macro fun PartialEq(item: Item): Source {
 			.method(eq)
 			.render());
 	}
-	// Anything else (a bodyless external struct): nothing, like the Rust
-	// generator. (One recorded divergence: the Rust path also skips a
-	// BODYLESS struct; the reflection cannot distinguish it from a field-less
-	// one, which derives `true`-equality — deriving on an external struct was
-	// never meaningful.)
+	// Anything else (a bodyless external struct): nothing, like the Rust generator.
+	// (One recorded divergence: the Rust path also skips a BODYLESS struct; the
+	// reflection cannot distinguish it from a field-less one, which derives
+	// `true`-equality — deriving on an external struct was never meaningful.)
 	source("")
 }

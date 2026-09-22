@@ -38,8 +38,8 @@ export impl i32 {
 		}
 	}
 
-	/// Absolute value, exponentiation, and pairwise min/max — thin wrappers over the
-	/// host `Math` functions (the receiver is passed as the first argument).
+	/// Absolute value, exponentiation, and pairwise min/max — thin wrappers over
+	/// the host `Math` functions (the receiver is passed as the first argument).
 	[extern("Math.abs")]
 	external fun abs(self): i32;
 
@@ -113,8 +113,8 @@ export impl f64 {
 	[extern("Math.atan")]
 	external fun atan(self): f64;
 
-	/// The two-argument arctangent: `y.atan2(x)` is the angle of the point
-	/// `(x, y)` — the receiver is `y`, matching the host argument order.
+	/// The two-argument arctangent: `y.atan2(x)` is the angle of the point `(x, y)`
+	/// — the receiver is `y`, matching the host argument order.
 	[extern("Math.atan2")]
 	external fun atan2(self, x: f64): f64;
 
@@ -184,9 +184,9 @@ export impl f64 {
 		!self.is_finite() && !self.is_nan()
 	}
 
-	/// `self` confined to `min..=max`. The integers get this from `Ord`'s
-	/// default; the floats are deliberately not `Ord` (NaN, see below), so they
-	/// carry it themselves — the same recipe `Ord::clamp` uses.
+	/// `self` confined to `min..=max`. The integers get this from `Ord`'s default;
+	/// the floats are deliberately not `Ord` (NaN, see below), so they carry it
+	/// themselves — the same recipe `Ord::clamp` uses.
 	fun clamp(self, min: f64, max: f64): f64 {
 		self.min(max).max(min)
 	}
@@ -482,9 +482,9 @@ export impl BigInt with Ord {
 }
 
 export impl f64 with PartialOrd {
-	/// NaN-honest: unordered comparisons yield `None`. The floats are
-	/// deliberately NOT `Ord` — a total order over NaN would be a lie; use
-	/// the `Math`-backed `min`/`max` METHODS for float pairs.
+	/// NaN-honest: unordered comparisons yield `None`. The floats are deliberately
+	/// NOT `Ord` — a total order over NaN would be a lie; use the `Math`-backed
+	/// `min`/`max` METHODS for float pairs.
 	fun partial_compare(self, b: f64): Option<Ordering> {
 		if self < b {
 			Some(Ordering::Less)
@@ -503,9 +503,9 @@ export impl f64 with PartialOrd {
 }
 
 export impl f32 with PartialOrd {
-	/// NaN-honest: unordered comparisons yield `None`. The floats are
-	/// deliberately NOT `Ord` — a total order over NaN would be a lie; use
-	/// the `Math`-backed `min`/`max` METHODS for float pairs.
+	/// NaN-honest: unordered comparisons yield `None`. The floats are deliberately
+	/// NOT `Ord` — a total order over NaN would be a lie; use the `Math`-backed
+	/// `min`/`max` METHODS for float pairs.
 	fun partial_compare(self, b: f32): Option<Ordering> {
 		if self < b {
 			Some(Ordering::Less)
@@ -525,12 +525,11 @@ export impl f32 with PartialOrd {
 
 // --- Trait impls for the numeric primitives -----------------------------------
 //
-// Equality and the operator traits, so generic `T: PartialEq` / `T: Add` / ...
-// code (and conditional impls over it) accepts the numeric primitives. Every
-// body is the native operator: `+`/`==`/`&` on primitives always lower to
-// native JS, so nothing recurses — a body runs only when reached through an
-// explicit method call or a generic bound's dispatch; written `a + b` stays
-// native and never touches these.
+// Equality and the operator traits, so generic `T: PartialEq` / `T: Add` / ... code
+// (and conditional impls over it) accepts the numeric primitives. Every body is the
+// native operator: `+`/`==`/`&` on primitives always lower to native JS, so nothing
+// recurses — a body runs only when reached through an explicit method call or a
+// generic bound's dispatch; written `a + b` stays native and never touches these.
 
 export impl i32 with PartialEq {
 	fun eq(self, b: i32): bool {
@@ -652,9 +651,9 @@ export impl BigInt with Div {
 	}
 }
 
-// The bitwise/shift traits, for the two types the operators are defined on
-// (the hex/bitwise slice): `i32` and `u32`. `f64` has no bitwise story and
-// `BigInt`'s is unverified — deliberately omitted.
+// The bitwise/shift traits, for the two types the operators are defined on (the
+// hex/bitwise slice): `i32` and `u32`. `f64` has no bitwise story and `BigInt`'s is
+// unverified — deliberately omitted.
 
 export impl i32 with Shl {
 	fun shl(self, b: i32): i32 {
@@ -751,11 +750,11 @@ export impl u32 {
 // operators, truncating integer division; width semantics become real on a
 // non-JS backend.
 //
-// GENERATED ONCE by a macro and checked in as plain source: `number.vl` is
-// loaded inside every macro world (via std's lib surface), and world files
-// must not DISPATCH macros — a world expands with an empty macro scope
-// (macro-engine.md §10). The family's shape is pinned by the numeric corpus
-// program; regenerate by hand if the surface changes.
+// GENERATED ONCE by a macro and checked in as plain source: `number.vl` is loaded
+// inside every macro world (via std's lib surface), and world files must not
+// DISPATCH macros — a world expands with an empty macro scope (macro-engine.md
+// §10). The family's shape is pinned by the numeric corpus program; regenerate by
+// hand if the surface changes.
 
 export external struct i8;
 
@@ -771,11 +770,11 @@ export external struct u53;
 
 export external struct f32;
 
-// Conversions (`as_*`, numeric-types.md §4): truncate toward zero, then fold
-// into the target's range (two's-complement wrap) — Rust-`as` semantics. All
-// arithmetic happens in f64 space: `as_f64` widens (the host `Number` is the
-// identity on numbers), the folds below shape the value, and a `label_*`
-// extern re-types the result (identity at the JS level).
+// Conversions (`as_*`, numeric-types.md §4): truncate toward zero, then fold into
+// the target's range (two's-complement wrap) — Rust-`as` semantics. All arithmetic
+// happens in f64 space: `as_f64` widens (the host `Number` is the identity on
+// numbers), the folds below shape the value, and a `label_*` extern re-types the
+// result (identity at the JS level).
 
 [extern("Number")]
 external fun label_i8(value: f64): i8;
@@ -829,20 +828,20 @@ fun fold_signed(value: f64, modulus: f64, half: f64): f64 {
 }
 
 export impl f64 {
-	/// Truncation toward zero — the integer-division primitive (§2) and the
-	/// first step of every narrowing conversion.
+	/// Truncation toward zero — the integer-division primitive (§2) and the first
+	/// step of every narrowing conversion.
 	[extern("Math.trunc")]
 	external fun trunc(self): f64;
 }
 
 // --- Type bounds ---
 //
-// `max_value()`/`min_value()` per integer type. vilan has no associated-const
-// or static-member mechanism, so `i8::MAX` has nothing to hang on; the ruling
-// (2026-08-26) was to take the niladic-function spelling now rather than wait
-// for that design. When it lands these become `i8::MAX`/`i8::MIN` and this
-// pair enters L4's `[deprecated("steer")]` window, which rewrites callers —
-// the rename is scheduled, not a surprise, so reach for these freely today.
+// `max_value()`/`min_value()` per integer type. vilan has no associated-const or
+// static-member mechanism, so `i8::MAX` has nothing to hang on; the ruling
+// (2026-08-26) was to take the niladic-function spelling now rather than wait for
+// that design. When it lands these become `i8::MAX`/`i8::MIN` and this pair enters
+// L4's `[deprecated("steer")]` window, which rewrites callers — the rename is
+// scheduled, not a surprise, so reach for these freely today.
 //
 // These are the TYPE's range, which is deliberately NOT the LITERAL admission
 // range: `128i8` compiles, because the signed literal check admits the
@@ -935,8 +934,8 @@ export impl u8 {
 		255u8
 	}
 
-	/// The smallest `u8` — `0`. Stopgap spelling for `u8::MIN`; see the type
-	/// bounds note above.
+	/// The smallest `u8` — `0`. Stopgap spelling for `u8::MIN`; see the type bounds
+	/// note above.
 	fun min_value(): u8 {
 		0u8
 	}
@@ -1003,14 +1002,14 @@ export impl u8 {
 }
 
 export impl i16 {
-	/// The largest `i16` — `32767`. Stopgap spelling for `i16::MAX`; see the
-	/// type bounds note above.
+	/// The largest `i16` — `32767`. Stopgap spelling for `i16::MAX`; see the type
+	/// bounds note above.
 	fun max_value(): i16 {
 		32767i16
 	}
 
-	/// The smallest `i16` — `-32768`. Stopgap spelling for `i16::MIN`; see the
-	/// type bounds note above.
+	/// The smallest `i16` — `-32768`. Stopgap spelling for `i16::MIN`; see the type
+	/// bounds note above.
 	fun min_value(): i16 {
 		-32768i16
 	}
@@ -1080,8 +1079,8 @@ export impl i16 {
 }
 
 export impl u16 {
-	/// The largest `u16` — `65535`. Stopgap spelling for `u16::MAX`; see the
-	/// type bounds note above.
+	/// The largest `u16` — `65535`. Stopgap spelling for `u16::MAX`; see the type
+	/// bounds note above.
 	fun max_value(): u16 {
 		65535u16
 	}
@@ -1154,14 +1153,14 @@ export impl u16 {
 }
 
 export impl i32 {
-	/// The largest `i32` — `2147483647`. Stopgap spelling for `i32::MAX`; see
-	/// the type bounds note above.
+	/// The largest `i32` — `2147483647`. Stopgap spelling for `i32::MAX`; see the
+	/// type bounds note above.
 	fun max_value(): i32 {
 		2147483647i32
 	}
 
-	/// The smallest `i32` — `-2147483648`. Stopgap spelling for `i32::MIN`; see
-	/// the type bounds note above.
+	/// The smallest `i32` — `-2147483648`. Stopgap spelling for `i32::MIN`; see the
+	/// type bounds note above.
 	fun min_value(): i32 {
 		-2147483648i32
 	}
@@ -1215,8 +1214,8 @@ export impl i32 {
 }
 
 export impl u32 {
-	/// The largest `u32` — `4294967295`. Stopgap spelling for `u32::MAX`; see
-	/// the type bounds note above.
+	/// The largest `u32` — `4294967295`. Stopgap spelling for `u32::MAX`; see the
+	/// type bounds note above.
 	fun max_value(): u32 {
 		4294967295u32
 	}
@@ -1357,8 +1356,8 @@ export impl i53 {
 
 export impl u53 {
 	/// The largest `u53` — `9007199254740992`, the top of the [0, 2^53] window
-	/// (spec/lexical.md), one past `Number.MAX_SAFE_INTEGER`. Stopgap spelling
-	/// for `u53::MAX`; see the type bounds note above.
+	/// (spec/lexical.md), one past `Number.MAX_SAFE_INTEGER`. Stopgap spelling for
+	/// `u53::MAX`; see the type bounds note above.
 	fun max_value(): u53 {
 		9007199254740992u53
 	}
@@ -1458,8 +1457,8 @@ export impl f32 {
 	[extern("Math.max")]
 	external fun max(self, other: f32): f32;
 
-	/// `self` confined to `min..=max` — see `f64::clamp` for why the floats
-	/// carry their own rather than inheriting `Ord`'s default.
+	/// `self` confined to `min..=max` — see `f64::clamp` for why the floats carry
+	/// their own rather than inheriting `Ord`'s default.
 	fun clamp(self, min: f32, max: f32): f32 {
 		self.min(max).max(min)
 	}

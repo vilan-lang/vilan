@@ -1,13 +1,13 @@
-// Random number generation. `range(low, high)` gives a uniformly random value
-// in the HALF-OPEN range `[low, high)` — `low` is reachable, `high` is not —
-// for any numeric type. Half-open because that is the range every draw
-// composes with: `range(0, list.len())` is an index, and the integer and float
-// arms then say the same thing about their bounds rather than two things
-// (A118; `Math.random()` itself is `[0, 1)`).
+// Random number generation. `range(low, high)` gives a uniformly random value in
+// the HALF-OPEN range `[low, high)` — `low` is reachable, `high` is not — for any
+// numeric type. Half-open because that is the range every draw composes with:
+// `range(0, list.len())` is an index, and the integer and float arms then say the
+// same thing about their bounds rather than two things (A118; `Math.random()`
+// itself is `[0, 1)`).
 //
 // A degenerate range answers `low`: `range(4, 4)` is 4, because `[4, 4)` holds
-// nothing and there is no other value to answer. `low` above `high` is not a
-// range and nothing here promises anything about it.
+// nothing and there is no other value to answer. `low` above `high` is not a range
+// and nothing here promises anything about it.
 
 /// Per-type runtime primitives, lowered to a `Math.random` helper. The `Random`
 /// impls below forward to these; prefer `range` over calling them directly.

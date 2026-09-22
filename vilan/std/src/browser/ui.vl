@@ -1,29 +1,29 @@
 // `std::ui` — a declarative, fine-grained reactive view layer over `std::dom`.
 //
 // A `View` describes a DOM element; methods chain to build it. Plain setters
-// (`text`/`class`/`attr`) set static content; the `bind_*` setters take a
-// `Source` and keep one DOM property in sync — each is an `effect`, so when
-// the source changes only that property updates, with no re-render.
+// (`text`/`class`/`attr`) set static content; the `bind_*` setters take a `Source`
+// and keep one DOM property in sync — each is an `effect`, so when the source
+// changes only that property updates, with no re-render.
 //
 // A READ-ONLY binding demands only `Source<T>`, never the concrete `SignalCell<T>`
-// (A33): a binding that never writes its argument has no business insisting on
-// the writable type, and a user's own `Source` — a storage-backed cell, a
+// (A33): a binding that never writes its argument has no business insisting on the
+// writable type, and a user's own `Source` — a storage-backed cell, a
 // `RemoteSource`, any custom mirror — drives them exactly like a signal.
-// `bind_value` and `bind_draft` stay concrete because they WRITE BACK; the
-// write side is A32's ruling, not this one's.
+// `bind_value` and `bind_draft` stay concrete because they WRITE BACK; the write
+// side is A32's ruling, not this one's.
 //
 // OWNERSHIP LIVES AT DISPOSAL BOUNDARIES (proposal/ambient-owner.md §4): a
-// subscription must die exactly when its subtree becomes garbage, and
-// subtrees only become garbage at DYNAMIC boundaries — a `mount_root`/`comp`
-// root, an `each` row, a `when` instantiation. Static content shares its
-// nearest boundary's lifetime, so `View` carries no owner and bindings
-// register AMBIENTLY into the nearest boundary. Building UI outside every
-// boundary is a COMPILE error (the context coverage fence): every entry
-// point establishes a root, so no subscription can be unrooted.
+// subscription must die exactly when its subtree becomes garbage, and subtrees only
+// become garbage at DYNAMIC boundaries — a `mount_root`/`comp` root, an `each` row,
+// a `when` instantiation. Static content shares its nearest boundary's lifetime, so
+// `View` carries no owner and bindings register AMBIENTLY into the nearest
+// boundary. Building UI outside every boundary is a COMPILE error (the context
+// coverage fence): every entry point establishes a root, so no subscription can be
+// unrooted.
 //
-// `show` deliberately stays a visibility toggle — content mounted, state
-// preserved, no boundary. `when` is the state-dropping form: it mounts its
-// body under a fresh owner per instantiation and disposes it on the way out.
+// `show` deliberately stays a visibility toggle — content mounted, state preserved,
+// no boundary. `when` is the state-dropping form: it mounts its body under a fresh
+// owner per instantiation and disposes it on the way out.
 //
 // Only available when building for the browser (`vilan build --target browser`).
 
@@ -64,8 +64,8 @@ import pkg::reactive::{
 import pkg::shared::Shared;
 import pkg::style::Style;
 
-/// A handle to a DOM element under construction — nothing more: ownership is
-/// the enclosing boundary's job.
+/// A handle to a DOM element under construction — nothing more: ownership is the
+/// enclosing boundary's job.
 export struct View {
 	element: Element,
 }
@@ -84,13 +84,12 @@ export fun view(tag: str): View {
 	}
 }
 
-/// The SVG vocabulary `view` routes through `createElementNS` — the drawing
-/// and paint-server elements, exact-case (the camelCase names cannot be
-/// created by `createElement` at all: it lowercases). Deliberately excludes
-/// the HTML-ambiguous tags (`a`, `title`, `style`, `script`).
-/// KEEP IN STEP with the process twin's copy (process/ui.vl) — the layer
-/// system shares no file between them, and SSR must serialize exactly the
-/// set the browser namespaces.
+/// The SVG vocabulary `view` routes through `createElementNS` — the drawing and
+/// paint-server elements, exact-case (the camelCase names cannot be created by
+/// `createElement` at all: it lowercases). Deliberately excludes the HTML-ambiguous
+/// tags (`a`, `title`, `style`, `script`). KEEP IN STEP with the process twin's
+/// copy (process/ui.vl) — the layer system shares no file between them, and SSR
+/// must serialize exactly the set the browser namespaces.
 fun is_svg_tag(tag: str): bool {
 	match tag {
 		"svg" => true,
@@ -146,9 +145,9 @@ export impl View {
 		self
 	}
 
-	/// Classes from a compiled `Style` (proposal/ui-styling.md §4). Rendering
-	/// is runtime-legal — the rules were emitted when the style was
-	/// constructed, inside its `const` expression.
+	/// Classes from a compiled `Style` (proposal/ui-styling.md §4). Rendering is
+	/// runtime-legal — the rules were emitted when the style was constructed,
+	/// inside its `const` expression.
 	fun styled(self, style: Style): View {
 		self.element.set_attribute("class", style.class_list());
 		self
@@ -167,30 +166,28 @@ export impl View {
 		self
 	}
 
-	/// An attribute. The value's TYPE decides its life
-	/// (proposal/element-syntax.md §5): a `str` sets once; a `SignalCell<str>`
-	/// re-sets whenever it changes, exactly `bind_attr`. Anything `AttrValue`
-	/// fills the slot.
+	/// An attribute. The value's TYPE decides its life (proposal/element-syntax.md
+	/// §5): a `str` sets once; a `SignalCell<str>` re-sets whenever it changes,
+	/// exactly `bind_attr`. Anything `AttrValue` fills the slot.
 	fun attr<V: AttrValue>(self, name: str, value: V): View {
 		value.apply(self, name);
 		self
 	}
 
-	/// An event listener (`"click"`, `"input"`, …). A DOM event is a TURN
-	/// boundary (proposal/reactive-turns.md §2): the host stores only the
-	/// plain adapter below, and each dispatch runs the clause-typed handler
-	/// inside a fresh turn — an event's signal writes settle as one wave.
-	/// (`AtSuspension` behaves as `AtEnd` until the async hook lands.)
-	/// Handlers die with the DOM
-	/// node — no registration needed.
+	/// An event listener (`"click"`, `"input"`, …). A DOM event is a TURN boundary
+	/// (proposal/reactive-turns.md §2): the host stores only the plain adapter
+	/// below, and each dispatch runs the clause-typed handler inside a fresh turn —
+	/// an event's signal writes settle as one wave. (`AtSuspension` behaves as
+	/// `AtEnd` until the async hook lands.) Handlers die with the DOM node — no
+	/// registration needed.
 	fun on(self, event: str, handler: (|| void) context turn_scope): View {
 		self.element.on(event, || turn(FlushPolicy::AtSuspension, || handler()));
 		self
 	}
 
-	/// Like `on`, but the handler receives the DOM `Event` — for
-	/// `prevent_default`, modifier keys, key names. The same turn discipline:
-	/// each dispatch settles as one wave.
+	/// Like `on`, but the handler receives the DOM `Event` — for `prevent_default`,
+	/// modifier keys, key names. The same turn discipline: each dispatch settles as
+	/// one wave.
 	fun on_event(self, event: str, handler: (|Event| void) context turn_scope): View {
 		self.element
 			.on_event(event, |dispatched| turn(FlushPolicy::AtSuspension, || handler(dispatched)));
@@ -198,16 +195,15 @@ export impl View {
 	}
 
 	/// Append content. Anything `Slot` fills a child position
-	/// (proposal/element-syntax.md §5), which is the whole CHILD CONTRACT
-	/// (B268): a `View` appends as an element, a `str` as a text node, a
-	/// `List<View>` appends each, and a `Source` of any of those three keeps
-	/// the position in sync — text re-set in place, an element or a run
-	/// replaced. Text and element children interleave as real siblings — mixed
-	/// content without wrapper spans.
+	/// (proposal/element-syntax.md §5), which is the whole CHILD CONTRACT (B268): a
+	/// `View` appends as an element, a `str` as a text node, a `List<View>` appends
+	/// each, and a `Source` of any of those three keeps the position in sync — text
+	/// re-set in place, an element or a run replaced. Text and element children
+	/// interleave as real siblings — mixed content without wrapper spans.
 	///
 	/// Structure only for the static arms; the reactive ones register their one
-	/// subscription with the nearest enclosing boundary, exactly as every
-	/// `bind_*` does.
+	/// subscription with the nearest enclosing boundary, exactly as every `bind_*`
+	/// does.
 	fun child<C: Slot>(self, content: C): View {
 		content.place(self);
 		self
@@ -221,10 +217,10 @@ export impl View {
 		self
 	}
 
-	/// Reactive text content — re-set whenever `source` changes. Registers
-	/// with the nearest enclosing boundary (an ambient `effect`). Any
-	/// `Source<str>` drives it: a `Signal`, a derived signal, a `RemoteSource`
-	/// mirror, a user's own cell (A33).
+	/// Reactive text content — re-set whenever `source` changes. Registers with the
+	/// nearest enclosing boundary (an ambient `effect`). Any `Source<str>` drives
+	/// it: a `Signal`, a derived signal, a `RemoteSource` mirror, a user's own cell
+	/// (A33).
 	fun bind_text<S: Source<str>>(self, source: S): View {
 		let element = self.element;
 		source.effect(|value| {
@@ -242,11 +238,11 @@ export impl View {
 		self
 	}
 
-	/// Reactive `Style` — the reactive twin of `styled`, the way `bind_class`
-	/// is `class`'s. The whole compiled style swaps when `source` changes.
-	/// Nothing is CONSTRUCTED here: every candidate style emitted its rules
-	/// inside its own `const` expression, and `class_list` is a map read, so
-	/// the construct-in-const rule holds with a signal in the middle.
+	/// Reactive `Style` — the reactive twin of `styled`, the way `bind_class` is
+	/// `class`'s. The whole compiled style swaps when `source` changes. Nothing is
+	/// CONSTRUCTED here: every candidate style emitted its rules inside its own
+	/// `const` expression, and `class_list` is a map read, so the
+	/// construct-in-const rule holds with a signal in the middle.
 	fun bind_styled<S: Source<Style>>(self, source: S): View {
 		let element = self.element;
 		source.effect(|value| {
@@ -257,37 +253,36 @@ export impl View {
 
 	/// Reactive attribute — the value re-set whenever `source` changes.
 	///
-	/// TWO value types, and the difference between them is what an ABSENT
-	/// attribute means (A105). A `Source<str>` always has a value, so the
-	/// attribute is always there; a `Source<Option<str>>` says the ATTRIBUTE
-	/// itself comes and goes — `Some(text)` sets it, `None` REMOVES it.
-	/// `data-dragging` is the worked example: while a drag is in progress the
-	/// attribute names what is being dragged, and between drags it must not be
-	/// present at all, because `[data-dragging="row"] *` matches on PRESENCE.
-	/// Writing "" is a different thing, and `toggle_attr` is the form for an
-	/// attribute whose whole meaning is presence and which has no value to
-	/// carry.
+	/// TWO value types, and the difference between them is what an ABSENT attribute
+	/// means (A105). A `Source<str>` always has a value, so the attribute is always
+	/// there; a `Source<Option<str>>` says the ATTRIBUTE itself comes and goes —
+	/// `Some(text)` sets it, `None` REMOVES it. `data-dragging` is the worked
+	/// example: while a drag is in progress the attribute names what is being
+	/// dragged, and between drags it must not be present at all, because
+	/// `[data-dragging="row"] *` matches on PRESENCE. Writing "" is a different
+	/// thing, and `toggle_attr` is the form for an attribute whose whole meaning is
+	/// presence and which has no value to carry.
 	///
 	/// vilan has neither overloading nor optional parameters, so the two value
-	/// types are two impls of `AttrBinding` and this method takes the trait.
-	/// There is nothing to disambiguate: a `Source<str>` is not a
-	/// `Source<Option<str>>` and vice versa, so a `SignalCell<str>` argument
-	/// selects the first arm and a `SignalCell<Option<str>>` the second.
+	/// types are two impls of `AttrBinding` and this method takes the trait. There
+	/// is nothing to disambiguate: a `Source<str>` is not a `Source<Option<str>>`
+	/// and vice versa, so a `SignalCell<str>` argument selects the first arm and a
+	/// `SignalCell<Option<str>>` the second.
 	fun bind_attr<V: AttrBinding>(self, name: str, source: V): View {
 		source.bind_attribute(self, name);
 		self
 	}
 
-	/// A BOOLEAN attribute, bound: present when `source` is true, absent when
-	/// it is false (A66). `inert`, `disabled`, `hidden`, `open` — the family
-	/// whose meaning is PRESENCE, not value, so `attr("disabled", "false")` is
-	/// a disabled control and there is no string that turns one off.
+	/// A BOOLEAN attribute, bound: present when `source` is true, absent when it is
+	/// false (A66). `inert`, `disabled`, `hidden`, `open` — the family whose
+	/// meaning is PRESENCE, not value, so `attr("disabled", "false")` is a disabled
+	/// control and there is no string that turns one off.
 	///
 	/// `bind_attr`'s twin at the other value type: an effect under the current
-	/// owner, dying with the boundary that built it exactly as every binding
-	/// does. The set writes the empty string, which is the canonical spelling
-	/// of a present boolean attribute (`<div inert>` and `<div inert="">`
-	/// serialize alike).
+	/// owner, dying with the boundary that built it exactly as every binding does.
+	/// The set writes the empty string, which is the canonical spelling of a
+	/// present boolean attribute (`<div inert>` and `<div inert="">` serialize
+	/// alike).
 	fun toggle_attr<S: Source<bool>>(self, name: str, source: S): View {
 		let element = self.element;
 		source.effect(|present| {
@@ -300,8 +295,8 @@ export impl View {
 		self
 	}
 
-	/// Two-way bind an `<input>`'s value to a signal: the input shows the
-	/// signal, and typing writes it back.
+	/// Two-way bind an `<input>`'s value to a signal: the input shows the signal,
+	/// and typing writes it back.
 	///
 	/// Bounded on `Signal<str>`, the WRITABLE trait (A32): this binding writes,
 	/// so `Source` — which declares `get`/`sub` and no `set` — is not enough,
@@ -333,8 +328,8 @@ export impl View {
 	fun bind_draft(self, draft: Draft<str>): View {
 		let element = self.element;
 		draft.local.effect(|value| {
-			// Skip the no-op write (a push echoing through `local`): setting
-			// an input's value, even to itself, can move the caret.
+			// Skip the no-op write (a push echoing through `local`): setting an
+			// input's value, even to itself, can move the caret.
 			if element.value() != value {
 				element.set_value(value);
 			}
@@ -343,8 +338,7 @@ export impl View {
 		self
 	}
 
-	/// Run `action` with this element once it is IN THE DOCUMENT (backlog
-	/// A45).
+	/// Run `action` with this element once it is IN THE DOCUMENT (backlog A45).
 	///
 	/// Attachment happens at six different places in this module — `mount`,
 	/// `Slot::place`, `children`, `each`'s order pass, `when`, `swap` —
@@ -359,20 +353,20 @@ export impl View {
 	/// `set_timeout(1)`, look the element back up. There is nothing to look
 	/// up: the callback is handed the element itself.
 	///
-	/// WHAT THIS GUARANTEES, AND WHAT IT DOES NOT (B271). The element is IN
-	/// THE DOCUMENT when `action` runs, and that is the whole promise. A
-	/// microtask runs BEFORE the frame's rendering step, so at that moment the
-	/// element is connected but not yet rendered: it has no layout, its
-	/// computed style is not resolved, and nothing a `ResizeObserver` or an
-	/// `IntersectionObserver` does in reaction to layout has happened. Any
-	/// action whose precondition is "rendered" or "visible" — `focus()`, a
-	/// measurement, a scroll into view — must ask again on an animation frame
-	/// if the first attempt does not take. `View::autofocus` is that pattern
-	/// written once; `std::dom::request_animation_frame` is the clock.
+	/// WHAT THIS GUARANTEES, AND WHAT IT DOES NOT (B271). The element is IN THE
+	/// DOCUMENT when `action` runs, and that is the whole promise. A microtask runs
+	/// BEFORE the frame's rendering step, so at that moment the element is
+	/// connected but not yet rendered: it has no layout, its computed style is not
+	/// resolved, and nothing a `ResizeObserver` or an `IntersectionObserver` does
+	/// in reaction to layout has happened. Any action whose precondition is
+	/// "rendered" or "visible" — `focus()`, a measurement, a scroll into view —
+	/// must ask again on an animation frame if the first attempt does not take.
+	/// `View::autofocus` is that pattern written once;
+	/// `std::dom::request_animation_frame` is the clock.
 	fun on_mount(self, action: sync |Element| void): View {
-		// Capture the ELEMENT, not the view: the closure the host holds must
-		// reach exactly what the callback needs and nothing more
-		// (`proposal/lifetimes.md` §5, V1).
+		// Capture the ELEMENT, not the view: the closure the host holds must reach
+		// exactly what the callback needs and nothing more (`proposal/lifetimes.md`
+		// §5, V1).
 		let element = self.element;
 		queue_microtask(|| action(element));
 		self
@@ -383,14 +377,14 @@ export impl View {
 	/// `on_mount` exists. HTML's `autofocus` attribute fires only on a
 	/// document's initial parse, so it does nothing for a modal opened later.
 	///
-	/// FRAME-AWARE AND BOUNDED (B271). `focus()` is a request with a
-	/// PRECONDITION — the target must be connected, RENDERED, visible and not
-	/// inert at the call — and the platform's answer to a target that is not is
-	/// to do nothing, silently. `on_mount`'s microtask runs before the frame's
-	/// rendering step, so a subtree that becomes focusable only during that
-	/// step is still hidden when the first attempt lands: an overlay panel held
-	/// at `visibility: hidden` until a `ResizeObserver` callback places it and
-	/// flips it visible is exactly this, and it refused focus every time.
+	/// FRAME-AWARE AND BOUNDED (B271). `focus()` is a request with a PRECONDITION —
+	/// the target must be connected, RENDERED, visible and not inert at the call —
+	/// and the platform's answer to a target that is not is to do nothing,
+	/// silently. `on_mount`'s microtask runs before the frame's rendering step, so
+	/// a subtree that becomes focusable only during that step is still hidden when
+	/// the first attempt lands: an overlay panel held at `visibility: hidden` until
+	/// a `ResizeObserver` callback places it and flips it visible is exactly this,
+	/// and it refused focus every time.
 	///
 	/// So: attempt in the microtask; if the element did not take focus, attempt
 	/// again on the next animation frame, and once more on the frame after
@@ -400,10 +394,10 @@ export impl View {
 	/// `focus()` returns void and reports nothing.
 	///
 	/// THE CASE NO TIMING FIXES: iOS Safari ignores a programmatic `focus()`
-	/// outside a user gesture, whatever frame it runs on. And the formal shape
-	/// for an overlay is that focus is a consequence of the SHOW — a hook the
-	/// driver runs when it flips visibility, or `<dialog>.showModal()`, whose
-	/// focusing steps run once the dialog is rendered — not a retry.
+	/// outside a user gesture, whatever frame it runs on. And the formal shape for
+	/// an overlay is that focus is a consequence of the SHOW — a hook the driver
+	/// runs when it flips visibility, or `<dialog>.showModal()`, whose focusing
+	/// steps run once the dialog is rendered — not a retry.
 	fun autofocus(self): View {
 		self.on_mount(|element| {
 			element.focus();
@@ -418,9 +412,9 @@ export impl View {
 		})
 	}
 
-	/// Show or hide the element on a reactive condition — present when
-	/// `condition` is true, hidden otherwise. A pure visibility toggle: the
-	/// content stays mounted and its state (bindings, input text) survives.
+	/// Show or hide the element on a reactive condition — present when `condition`
+	/// is true, hidden otherwise. A pure visibility toggle: the content stays
+	/// mounted and its state (bindings, input text) survives.
 	///
 	/// TWO WRITES, and the second one is the one that hides (A60). The
 	/// `hidden` ATTRIBUTE is what CSS selectors and assistive technology read,
@@ -441,9 +435,9 @@ export impl View {
 	/// inline display ends with none.
 	///
 	/// The cost is stated plainly: an app that writes this element's inline
-	/// `display` itself, after `show` has bound it, loses that write on the
-	/// next toggle. Style the element through a `Style` — which is what the
-	/// styling surface is for — and the two never meet.
+	/// `display` itself, after `show` has bound it, loses that write on the next
+	/// toggle. Style the element through a `Style` — which is what the styling
+	/// surface is for — and the two never meet.
 	fun show<S: Source<bool>>(self, condition: S): View {
 		let element = self.element;
 		let restored = element.style_property("display");
@@ -462,19 +456,19 @@ export impl View {
 // === The input write-back listeners (proposal/lifetimes.md §5, V3) ==========
 //
 // These exist as FUNCTIONS OF THEIR OWN, and that is the whole fix. A closure
-// captures its enclosing SCOPE, not the names it happens to mention (§4's
-// capture rule), and one JS scope is allocated per invocation — so a listener
-// written inline in `bind_value` would reach the `element` its sibling effect
-// closure needs, however carefully the listener's own body avoids naming it.
-// Element → listener → element is the one cycle that straddles the
-// language/host boundary, where no vilan-side disposal can see both halves, so
-// it has to be absent by CONSTRUCTION.
+// captures its enclosing SCOPE, not the names it happens to mention (§4's capture
+// rule), and one JS scope is allocated per invocation — so a listener written
+// inline in `bind_value` would reach the `element` its sibling effect closure
+// needs, however carefully the listener's own body avoids naming it. Element →
+// listener → element is the one cycle that straddles the language/host boundary,
+// where no vilan-side disposal can see both halves, so it has to be absent by
+// CONSTRUCTION.
 //
-// Born here, a listener's scope chain holds the signal (or the draft) and
-// nothing else: the element is a plain parameter no closure reads, and the
-// typed text comes off the event (`Event::target_value`). After an unmount the
-// element still reaches the signal — a dead end, since the effect that pointed
-// back was disposed with the boundary.
+// Born here, a listener's scope chain holds the signal (or the draft) and nothing
+// else: the element is a plain parameter no closure reads, and the typed text comes
+// off the event (`Event::target_value`). After an unmount the element still reaches
+// the signal — a dead end, since the effect that pointed back was disposed with the
+// boundary.
 
 /// The write-back half of `bind_value`. Each input event's write is a boundary
 /// dispatch, so it settles in its own turn.
@@ -484,30 +478,30 @@ fun write_back_value<S: Signal<str>>(element: Element, signal: S) {
 	}));
 }
 
-/// The write-back half of `bind_draft`: USER input pushes (locally first, then
-/// the draft's commit).
+/// The write-back half of `bind_draft`: USER input pushes (locally first, then the
+/// draft's commit).
 fun write_back_draft(element: Element, draft: Draft<str>) {
 	element.on_event("input", |event| turn(FlushPolicy::AtSuspension, || {
 		draft.push(event.target_value());
 	}));
 }
 
-/// True while a route chunk is in flight (proposal/bundle-splitting.md §2) —
-/// the one hook a loading indicator needs. Re-exported as
-/// `std::router::pending`, which is where an app reads it.
+/// True while a route chunk is in flight (proposal/bundle-splitting.md §2) — the
+/// one hook a loading indicator needs. Re-exported as `std::router::pending`, which
+/// is where an app reads it.
 let chunk_pending_signal: SignalCell<bool> = SignalCell::new(false);
 
 /// Why the last route chunk fetch failed, or `None` (§S3). Re-exported as
-/// `std::router::chunk_error`. Cleared when the next navigation starts, so a
-/// view bound to it shows the failure exactly until something is retried.
+/// `std::router::chunk_error`. Cleared when the next navigation starts, so a view
+/// bound to it shows the failure exactly until something is retried.
 let chunk_error_signal: SignalCell<Option<str>> = SignalCell::new(None);
 
 /// The route arm a value selects. See `swap_split`.
 [extern("__chunk_arm", retains)]
 external fun chunk_arm<T>(value: T): i32;
 
-/// Whether `arm`'s code is already present — true for every arm of a build
-/// that emitted no chunk map.
+/// Whether `arm`'s code is already present — true for every arm of a build that
+/// emitted no chunk map.
 [extern("__chunk_ready")]
 external fun chunk_ready(arm: i32): bool;
 
@@ -517,21 +511,20 @@ external fun chunk_ready(arm: i32): bool;
 [extern("__chunk_load", retains)]
 external fun chunk_load(arm: i32, then: || void, failed: |str| void): void;
 
-/// Starts `arm`'s chunk fetching without waiting for it. Failure is silent
-/// here — `chunk_load` has already reported it, and the gate's own load
-/// surfaces it on `chunk_error()`.
+/// Starts `arm`'s chunk fetching without waiting for it. Failure is silent here —
+/// `chunk_load` has already reported it, and the gate's own load surfaces it on
+/// `chunk_error()`.
 [extern("__chunk_preload")]
 external fun chunk_preload_arm(arm: i32): void;
 
 /// The BOOT PRELOAD (proposal/bundle-splitting.md §S3): start the chunk for
-/// `source`'s current value and do not wait. A split build's emitter plants a
-/// call to this immediately before the statement that mounts the route swap —
-/// the swap is the last call in its view chain, so without it the whole shell
-/// subtree is built before the boot route's chunk is even asked for. Declares
-/// the same generics as `swap_split`, in the same order, because the emitter
-/// rebinds the gate call's type arguments onto it by position. `swap_split`
-/// then joins the in-flight fetch this started rather than opening a second
-/// one.
+/// `source`'s current value and do not wait. A split build's emitter plants a call
+/// to this immediately before the statement that mounts the route swap — the swap
+/// is the last call in its view chain, so without it the whole shell subtree is
+/// built before the boot route's chunk is even asked for. Declares the same
+/// generics as `swap_split`, in the same order, because the emitter rebinds the
+/// gate call's type arguments onto it by position. `swap_split` then joins the
+/// in-flight fetch this started rather than opening a second one.
 export fun chunk_preload<T: PartialEq, S: Source<T>>(source: S) {
 	chunk_preload_arm(chunk_arm(source.get()));
 }
@@ -570,12 +563,11 @@ fun clear_chunk_error() {
 /// APPENDED, so the first change moved the run behind whatever static
 /// siblings had been added after it.
 ///
-/// The mechanism is one empty text node. `open` appends it at the parent's
-/// current end, which is the position the caller is standing at — the `when`
-/// / `swap` / `each` call sits in the chain exactly where its content
-/// belongs, and a `Slot::place` runs at the `{hole}` it fills. Every later
-/// insertion goes BEFORE that anchor, so the run stays put however the
-/// parent grows afterwards.
+/// The mechanism is one empty text node. `open` appends it at the parent's current
+/// end, which is the position the caller is standing at — the `when` / `swap` /
+/// `each` call sits in the chain exactly where its content belongs, and a
+/// `Slot::place` runs at the `{hole}` it fills. Every later insertion goes BEFORE
+/// that anchor, so the run stays put however the parent grows afterwards.
 ///
 /// THE BOUNDARY REMOVES WHAT IT PLACED (A88). A region holds the run that is
 /// live in it, and `close` takes the nodes OUT of the document before dropping
@@ -586,18 +578,17 @@ fun clear_chunk_error() {
 /// `get_owner().defer(|| live_panel.read()?.remove())` with a comment saying
 /// exactly this; that line is what this closes, for every form at once.
 ///
-/// The region does not RECONCILE the run — each form still tracks what it has
-/// live and disposes its owners, which is the half the region has no business
-/// repeating — it is TOLD the current run (`hold`) after each update, so
-/// `close` has the node list without a second copy of the bookkeeping. The
-/// cost is one `remove` per live node at disposal, and it is paid only at
-/// disposal; a `remove` of a node whose parent already went is a no-op.
+/// The region does not RECONCILE the run — each form still tracks what it has live
+/// and disposes its owners, which is the half the region has no business repeating
+/// — it is TOLD the current run (`hold`) after each update, so `close` has the node
+/// list without a second copy of the bookkeeping. The cost is one `remove` per live
+/// node at disposal, and it is paid only at disposal; a `remove` of a node whose
+/// parent already went is a no-op.
 ///
-/// A85 (positional slots) is the design this serves: there, `when(..)` /
-/// `swap(..)` / `each(..)` become VALUES that create their region in
-/// `Slot::place`, and the parent methods below become one-line sugar over
-/// them. Nothing in this order changes a signature.
-/// KEEP IN STEP with the process twin's copy (process/ui.vl).
+/// A85 (positional slots) is the design this serves: there, `when(..)` / `swap(..)`
+/// / `each(..)` become VALUES that create their region in `Slot::place`, and the
+/// parent methods below become one-line sugar over them. Nothing in this order
+/// changes a signature. KEEP IN STEP with the process twin's copy (process/ui.vl).
 export struct Region {
 	anchor: Text,
 	live: Shared<List<View>>,
@@ -606,50 +597,49 @@ export struct Region {
 
 /// One ROW of a region — the unit a reconciler moves, refreshes and removes.
 ///
-/// A row is not an element and not even a fixed set of nodes. Since A91 a
-/// render closure may yield any `Slot`, so a row can be a fragment, a text
-/// node, or a value form that GROWS after it was placed (a `when` inside a row
-/// inserts its body before its own anchor, which no snapshot taken at build
-/// time could know about). What IS stable is the row's leading MARKER — an
-/// empty text node planted immediately before the row's first node — so a
-/// row's extent is "everything after my marker, up to the next boundary", and
-/// the next boundary is the next row's marker or the region's own anchor.
+/// A row is not an element and not even a fixed set of nodes. Since A91 a render
+/// closure may yield any `Slot`, so a row can be a fragment, a text node, or a
+/// value form that GROWS after it was placed (a `when` inside a row inserts its
+/// body before its own anchor, which no snapshot taken at build time could know
+/// about). What IS stable is the row's leading MARKER — an empty text node planted
+/// immediately before the row's first node — so a row's extent is "everything after
+/// my marker, up to the next boundary", and the next boundary is the next row's
+/// marker or the region's own anchor.
 ///
-/// That marker is the one node a row costs beyond its content, and it is the
-/// price of a row whose shape is the app's business rather than std's.
-/// KEEP IN STEP with the process twin's copy (process/ui.vl), where a row is
-/// nothing at all: a server render is one pass in source order, so a row IS
-/// wherever it was written.
+/// That marker is the one node a row costs beyond its content, and it is the price
+/// of a row whose shape is the app's business rather than std's. KEEP IN STEP with
+/// the process twin's copy (process/ui.vl), where a row is nothing at all: a server
+/// render is one pass in source order, so a row IS wherever it was written.
 export struct Row {
 	marker: Text,
 }
 
 export impl Region {
-	/// Opens a region at `parent`'s current end — the caller's position in
-	/// the chain.
+	/// Opens a region at `parent`'s current end — the caller's position in the
+	/// chain.
 	fun open(parent: View): Region {
 		let anchor = create_text_node("");
 		parent.element.append_text(anchor);
 		Region { anchor, live = Shared::new([]), rows = Shared::new([]) }
 	}
 
-	/// The element the region currently sits in, read off the anchor rather
-	/// than remembered.
+	/// The element the region currently sits in, read off the anchor rather than
+	/// remembered.
 	///
-	/// That is not an economy, it is the correctness condition A91 needs: a
-	/// region opened INSIDE a row is built in a detached staging parent and
-	/// then planted, and the row is re-inserted on every order pass — so a host
-	/// captured at `open` would be a parent the content has since left, and a
-	/// `when` inside a row would go on toggling into a fragment nobody can see.
-	/// The anchor IS the region's identity; wherever it is, that is where the
-	/// region's content belongs.
+	/// That is not an economy, it is the correctness condition A91 needs: a region
+	/// opened INSIDE a row is built in a detached staging parent and then planted,
+	/// and the row is re-inserted on every order pass — so a host captured at
+	/// `open` would be a parent the content has since left, and a `when` inside a
+	/// row would go on toggling into a fragment nobody can see. The anchor IS the
+	/// region's identity; wherever it is, that is where the region's content
+	/// belongs.
 	fun host(self): Element {
 		self.anchor.parent_element()
 	}
 
-	/// Puts `child` at the end of the region, before the anchor. A child that
-	/// is already in the document MOVES, which is what makes this the order
-	/// pass for a reconciled run as well as the insert for a fresh one.
+	/// Puts `child` at the end of the region, before the anchor. A child that is
+	/// already in the document MOVES, which is what makes this the order pass for a
+	/// reconciled run as well as the insert for a fresh one.
 	fun insert(self, child: View) {
 		self.host().insert_before(child.element, self.anchor);
 	}
@@ -660,9 +650,9 @@ export impl Region {
 		self.open_row_before(content, self.anchor)
 	}
 
-	/// Places `content` as a new row immediately BEFORE `end` — the marker of
-	/// the row it must precede, or this region's own anchor for the end of the
-	/// run (A98). `open_row` is this at the anchor.
+	/// Places `content` as a new row immediately BEFORE `end` — the marker of the
+	/// row it must precede, or this region's own anchor for the end of the run
+	/// (A98). `open_row` is this at the anchor.
 	///
 	/// The content is built into a detached fragment first and planted whole.
 	/// That is not an optimisation: `Slot::place` appends to the parent it is
@@ -683,10 +673,10 @@ export impl Region {
 
 	/// Takes the row's CURRENT nodes out of the document, as a fragment.
 	///
-	/// `end` is whatever bounds the row on the right in the document order
-	/// being read — the next row's marker, or this region's anchor for the
-	/// last row. The marker itself stays where it is, so a whole run can be cut
-	/// row by row before anything moves: every boundary is still meaningful.
+	/// `end` is whatever bounds the row on the right in the document order being
+	/// read — the next row's marker, or this region's anchor for the last row. The
+	/// marker itself stays where it is, so a whole run can be cut row by row before
+	/// anything moves: every boundary is still meaningful.
 	fun cut_row(self, row: Row, end: Text): Element {
 		let range = create_range();
 		range.set_start_after(row.marker);
@@ -696,15 +686,14 @@ export impl Region {
 
 	/// Puts a cut row back immediately BEFORE `end`: its marker first, then its
 	/// nodes. Re-inserting the marker MOVES it, so this is the order pass — the
-	/// per-row `insert` of a run whose rows are single elements, widened to a
-	/// run of any shape.
+	/// per-row `insert` of a run whose rows are single elements, widened to a run
+	/// of any shape.
 	///
 	/// `end` is the marker of the next row the order pass is NOT moving, or the
-	/// region's anchor when there is none after this one (A98). Before A98
-	/// every row was re-inserted at the anchor, in the new order, which is the
-	/// same answer and costs a move per row whether or not the row went
-	/// anywhere.
-	/// KEEP IN STEP with the process twin's copy (process/ui.vl).
+	/// region's anchor when there is none after this one (A98). Before A98 every
+	/// row was re-inserted at the anchor, in the new order, which is the same
+	/// answer and costs a move per row whether or not the row went anywhere. KEEP
+	/// IN STEP with the process twin's copy (process/ui.vl).
 	fun insert_row(self, row: Row, content: Element, end: Text) {
 		self.host().insert_text_before(row.marker, end);
 		self.host().insert_before(content, end);
@@ -716,16 +705,15 @@ export impl Region {
 		row.marker.remove();
 	}
 
-	/// Records the run that is live in this region, for `close` to remove
-	/// (A88). Every form calls it wherever it already writes its own live
-	/// bookkeeping — after the order pass, after an instantiation, after a
-	/// swap — so the two can never disagree; an empty run is the right answer
-	/// for a `when` that is off.
+	/// Records the run that is live in this region, for `close` to remove (A88).
+	/// Every form calls it wherever it already writes its own live bookkeeping —
+	/// after the order pass, after an instantiation, after a swap — so the two can
+	/// never disagree; an empty run is the right answer for a `when` that is off.
 	///
-	/// Two spellings, and they are never both non-empty: `hold` is for the
-	/// three reactive CHILD arms, which place exactly the views they were
-	/// handed and so cost no marker, and `hold_rows` is for the forms whose
-	/// content is a `Slot` of the app's choosing (A91).
+	/// Two spellings, and they are never both non-empty: `hold` is for the three
+	/// reactive CHILD arms, which place exactly the views they were handed and so
+	/// cost no marker, and `hold_rows` is for the forms whose content is a `Slot`
+	/// of the app's choosing (A91).
 	fun hold(self, live: List<View>) {
 		self.live.write() = live;
 	}
@@ -735,14 +723,14 @@ export impl Region {
 		self.rows.write() = rows;
 	}
 
-	/// Takes the region out of the document: every live node, then the
-	/// anchor (A88). Called from the `defer` each form registers with the
-	/// enclosing boundary, so the content and the marker die with it rather
-	/// than outliving it in a parent that survives.
+	/// Takes the region out of the document: every live node, then the anchor
+	/// (A88). Called from the `defer` each form registers with the enclosing
+	/// boundary, so the content and the marker die with it rather than outliving it
+	/// in a parent that survives.
 	///
-	/// A row is cut by its span rather than removed node by node, for the
-	/// reason `Row` records: whatever a row's `Slot` placed, and whatever it
-	/// grew afterwards, lies between its marker and the next boundary.
+	/// A row is cut by its span rather than removed node by node, for the reason
+	/// `Row` records: whatever a row's `Slot` placed, and whatever it grew
+	/// afterwards, lies between its marker and the next boundary.
 	fun close(self) {
 		for view in self.live.read() {
 			view.element.remove();
@@ -761,23 +749,22 @@ export impl Region {
 	}
 }
 
-/// Something that can fill a child position (proposal/element-syntax.md §5) —
-/// the type-directed half of `child`: the value's type carries the
-/// static-vs-tracked distinction, and ordinary trait dispatch decides what
-/// lands in the DOM.
+/// Something that can fill a child position (proposal/element-syntax.md §5) — the
+/// type-directed half of `child`: the value's type carries the static-vs-tracked
+/// distinction, and ordinary trait dispatch decides what lands in the DOM.
 ///
 /// THE CHILD CONTRACT (B268), six arms in three pairs — a `str`, a `View`, a
-/// `List<View>`, and a `Source` of each. The static arm places once; the
-/// reactive arm places and REPLACES, owning its own re-render under the nearest
-/// boundary. That pairing is the whole rule: whatever may be a child statically
-/// may be a child reactively, and `{expr}` in element syntax means the same
-/// thing either way.
+/// `List<View>`, and a `Source` of each. The static arm places once; the reactive
+/// arm places and REPLACES, owning its own re-render under the nearest boundary.
+/// That pairing is the whole rule: whatever may be a child statically may be a
+/// child reactively, and `{expr}` in element syntax means the same thing either
+/// way.
 ///
-/// The trait keeps the name `Slot` rather than becoming a `Child`: it already
-/// IS this contract — the arms grew, the trait did not change — `Child` is
-/// taken on the process twin (the `enum Child` `render` walks), and every doc
-/// page and generic helper in the estate spells the bound `Slot` today.
-/// KEEP IN STEP with the process twin's copy (process/ui.vl).
+/// The trait keeps the name `Slot` rather than becoming a `Child`: it already IS
+/// this contract — the arms grew, the trait did not change — `Child` is taken on
+/// the process twin (the `enum Child` `render` walks), and every doc page and
+/// generic helper in the estate spells the bound `Slot` today. KEEP IN STEP with
+/// the process twin's copy (process/ui.vl).
 export trait Slot {
 	fun place(self, parent: View);
 }
@@ -796,23 +783,22 @@ export impl str with Slot {
 	}
 }
 
-/// A reactive text node — re-set whenever the source changes: `bind_text`
-/// scoped to one node instead of the whole element. Registers with the
-/// nearest enclosing boundary, like every binding.
+/// A reactive text node — re-set whenever the source changes: `bind_text` scoped to
+/// one node instead of the whole element. Registers with the nearest enclosing
+/// boundary, like every binding.
 ///
-/// A BLANKET over the read trait (B158/B165): every `Source<str>` places
-/// reactively — a cell, a derived signal, a `RemoteSource`, a user's own
-/// mirror — and `str`'s own impl outranks it by the specificity order wherever
-/// both would match.
+/// A BLANKET over the read trait (B158/B165): every `Source<str>` places reactively
+/// — a cell, a derived signal, a `RemoteSource`, a user's own mirror — and `str`'s
+/// own impl outranks it by the specificity order wherever both would match.
 export impl type S: Source<str> with Slot {
 	fun place(self, parent: View) {
 		let node = create_text_node("");
 		parent.element.append_text(node);
-		// A88: the boundary removes what it PLACED. This arm has no region —
-		// one text node is its whole run — so it takes that node out itself.
-		// The three STATIC arms take no such defer, deliberately: a static
-		// child's lifetime is its parent element's, and it was placed while
-		// the caller was building that parent, not by a boundary.
+		// A88: the boundary removes what it PLACED. This arm has no region — one
+		// text node is its whole run — so it takes that node out itself. The three
+		// STATIC arms take no such defer, deliberately: a static child's lifetime
+		// is its parent element's, and it was placed while the caller was building
+		// that parent, not by a boundary.
 		get_owner().defer(|| node.remove());
 		self.effect(|value| {
 			node.set_text(value);
@@ -832,9 +818,9 @@ export impl List<View> with Slot {
 }
 
 /// A reactive ELEMENT child — the view the source holds, replaced whenever it
-/// changes. `swap`'s shape without `swap`'s render closure: the source's value
-/// IS the new subtree, so there is nothing to build, only the previous element
-/// to remove and the new one to append.
+/// changes. `swap`'s shape without `swap`'s render closure: the source's value IS
+/// the new subtree, so there is nothing to build, only the previous element to
+/// remove and the new one to append.
 ///
 /// This is what `{signal}` means when the signal carries a `View`. It used to
 /// mean the text arm below — a `Signal<View>` reached the `Source<str>` blanket
@@ -852,18 +838,17 @@ export impl List<View> with Slot {
 /// must be built and disposed per value; reach for this when the views are
 /// values the app already holds.
 ///
-/// POSITION: the view keeps the `{signal}`'s own place among its siblings
-/// (A71). The arm opens a `Region` where it is placed and inserts every
-/// replacement before that anchor, so a reactive element child in the middle
-/// of a chain stays in the middle — which is what `{expr}` means the same
-/// thing either way requires.
+/// POSITION: the view keeps the `{signal}`'s own place among its siblings (A71).
+/// The arm opens a `Region` where it is placed and inserts every replacement before
+/// that anchor, so a reactive element child in the middle of a chain stays in the
+/// middle — which is what `{expr}` means the same thing either way requires.
 export impl type S: Source<View> with Slot {
 	fun place(self, parent: View) {
 		let region = Region::open(parent);
 		let live: Shared<Option<View>> = Shared::new(None);
 		// A88: the arm's view and its anchor leave with the boundary. The
-		// subscription already dies with it (an ambient `effect`); this is the
-		// DOM half, which matters exactly when the parent survives.
+		// subscription already dies with it (an ambient `effect`); this is the DOM
+		// half, which matters exactly when the parent survives.
 		get_owner().defer(|| region.close());
 		self.effect(|next: View| {
 			match live.read() {
@@ -892,8 +877,8 @@ export impl type S: Source<List<View>> with Slot {
 	fun place(self, parent: View) {
 		let region = Region::open(parent);
 		let live: Shared<List<View>> = Shared::new([]);
-		// A88, as for the single-view arm above: the run and its anchor leave
-		// with the boundary.
+		// A88, as for the single-view arm above: the run and its anchor leave with
+		// the boundary.
 		get_owner().defer(|| region.close());
 		self.effect(|next: List<View>| {
 			for previous in live.read() {
@@ -909,11 +894,11 @@ export impl type S: Source<List<View>> with Slot {
 }
 // === The positional value forms (A85) ======================================
 //
-// `when`, `swap`, `each`, `each_values` and `each_by` as VALUES that fill a
-// CHILD POSITION, instead of methods that append to a parent. Each is a struct
-// holding its source and its closures, and each `impl .. with Slot` opens its
-// `Region` (A71) where `place` runs — which is where the `{hole}` sits — so a
-// conditional or a keyed run reads as one child among its siblings:
+// `when`, `swap`, `each`, `each_values` and `each_by` as VALUES that fill a CHILD
+// POSITION, instead of methods that append to a parent. Each is a struct holding
+// its source and its closures, and each `impl .. with Slot` opens its `Region`
+// (A71) where `place` runs — which is where the `{hole}` sits — so a conditional or
+// a keyed run reads as one child among its siblings:
 //
 //     <ul>{header}{each(items, key, row)}{when(more, || footer_row())}</ul>
 //
@@ -925,19 +910,18 @@ export impl type S: Source<List<View>> with Slot {
 // it to `child` (`parent.child(each(..))`) for the parent's current end, which
 // is byte-for-byte what the method did.
 //
-// THE CLOSURES ARE FIELDS, not type parameters (positional-slots.md §3a), and
-// that is load-bearing: a helper returning one of these has to be able to NAME
-// the type (`fun account(): Conditional<SignalCell<bool>>`), and a type
-// parameterized by a closure's own type is unnameable. A body field carries its
-// `context` clause (B309) WITHOUT the `sync` marker — `sync` is parameter-only
-// by design (it refuses an async ARGUMENT, and a plain closure field already
-// refuses an async store) — so each constructor below takes the marked closure
-// as a PARAMETER and lands it in the unmarked field. The clause is what makes
-// §3e's "ownership unchanged" true: the body answers to the owner ambient at
-// `place`, not to whichever one happened to be ambient where the value was
-// BUILT (a plain closure field captures at CREATION — measured, and pinned as
-// this one's control).
-// KEEP IN STEP with the process twin's copy (process/ui.vl).
+// THE CLOSURES ARE FIELDS, not type parameters (positional-slots.md §3a), and that
+// is load-bearing: a helper returning one of these has to be able to NAME the type
+// (`fun account(): Conditional<SignalCell<bool>>`), and a type parameterized by a
+// closure's own type is unnameable. A body field carries its `context` clause
+// (B309) WITHOUT the `sync` marker — `sync` is parameter-only by design (it refuses
+// an async ARGUMENT, and a plain closure field already refuses an async store) — so
+// each constructor below takes the marked closure as a PARAMETER and lands it in
+// the unmarked field. The clause is what makes §3e's "ownership unchanged" true:
+// the body answers to the owner ambient at `place`, not to whichever one happened
+// to be ambient where the value was BUILT (a plain closure field captures at
+// CREATION — measured, and pinned as this one's control). KEEP IN STEP with the
+// process twin's copy (process/ui.vl).
 
 /// Conditional content as a child — the `when` slot value (A85/A99).
 export struct Conditional<S: Source<bool>, C: Slot> {
@@ -991,11 +975,11 @@ export struct EachBy<T, K: PartialEq, S: Source<List<T>>, C: Slot> {
 	render: (|SignalCell<T>| C) context owner_scope,
 }
 
-/// Conditional CONTENT at THIS position: while `condition` is true the body's
-/// view is mounted under a fresh owner; when it turns false the owner is
-/// disposed and the content removed. Write it in a child hole when the
-/// conditional is one child among siblings, or `parent.child(when(..))` when it
-/// belongs at the parent's current end (A99 retired the `View::when` method).
+/// Conditional CONTENT at THIS position: while `condition` is true the body's view
+/// is mounted under a fresh owner; when it turns false the owner is disposed and
+/// the content removed. Write it in a child hole when the conditional is one child
+/// among siblings, or `parent.child(when(..))` when it belongs at the parent's
+/// current end (A99 retired the `View::when` method).
 export fun when<S: Source<bool>, C: Slot>(
 	condition: S,
 	body: (sync || C) context owner_scope,
@@ -1004,9 +988,9 @@ export fun when<S: Source<bool>, C: Slot>(
 }
 
 /// The dynamic subtree at THIS position: whenever `source` CHANGES the previous
-/// subtree is disposed and `render` builds the new one under a fresh owner.
-/// Write it in a child hole, or `parent.child(swap(..))` at the parent's current
-/// end (A99 retired the `View::swap` method).
+/// subtree is disposed and `render` builds the new one under a fresh owner. Write
+/// it in a child hole, or `parent.child(swap(..))` at the parent's current end (A99
+/// retired the `View::swap` method).
 export fun swap<T: PartialEq, S: Source<T>, C: Slot>(
 	source: S,
 	render: (sync |T| C) context owner_scope,
@@ -1015,15 +999,15 @@ export fun swap<T: PartialEq, S: Source<T>, C: Slot>(
 }
 
 /// `swap`, gated on the route's chunk — what the split recognizer retargets a
-/// recognized `swap` VALUE to (`chunks.rs`). It declares the same generics in
-/// the same ORDER as `swap`, because the gate rebinds the call's type arguments
-/// by position. An app never writes it.
+/// recognized `swap` VALUE to (`chunks.rs`). It declares the same generics in the
+/// same ORDER as `swap`, because the gate rebinds the call's type arguments by
+/// position. An app never writes it.
 ///
-/// A99 folded `split_route` back into this function. The third name existed
-/// only because `View::swap_split` — a method — could not call the free
-/// `swap_split` from inside its own `impl` block, where that name was the
-/// method; the method is gone, so nothing shadows this one and the gate lives
-/// under the name the recognizer already looks for.
+/// A99 folded `split_route` back into this function. The third name existed only
+/// because `View::swap_split` — a method — could not call the free `swap_split`
+/// from inside its own `impl` block, where that name was the method; the method is
+/// gone, so nothing shadows this one and the gate lives under the name the
+/// recognizer already looks for.
 ///
 /// The gate is BUILT here and RUN at `place`, so `place` names nothing
 /// chunk-shaped: a build that did not ask to split never reaches this function,
@@ -1037,9 +1021,9 @@ export fun swap_split<T: PartialEq, S: Source<T>, C: Slot>(
 	render: (sync |T| C) context owner_scope,
 ): Swap<T, S, C> {
 	let gated: SignalCell<T> = SignalCell::new(source.get());
-	// `place` renders nothing until the gate has advanced at least once: on
-	// boot the route's chunk may still be in flight, and the arm's code is not
-	// there to build with.
+	// `place` renders nothing until the gate has advanced at least once: on boot
+	// the route's chunk may still be in flight, and the arm's code is not there to
+	// build with.
 	let armed: Shared<bool> = Shared::new(false);
 	let generation: Shared<i32> = Shared::new(0);
 	// The clause is written out so the NEED does not leak into this function's
@@ -1051,8 +1035,8 @@ export fun swap_split<T: PartialEq, S: Source<T>, C: Slot>(
 		gated.set(value);
 	};
 	// Built here, RUN at `place`: the closure carries only the owner clause, so
-	// this function needs no context of its own and the retargeted call keeps
-	// the emitted shape of the `swap` call it replaces.
+	// this function needs no context of its own and the retargeted call keeps the
+	// emitted shape of the `swap` call it replaces.
 	//
 	// Each navigation opens ITS OWN turn — the gate's writes (the pending flag,
 	// the gated route) settle as one wave, exactly as the two chunk-arrival
@@ -1061,16 +1045,16 @@ export fun swap_split<T: PartialEq, S: Source<T>, C: Slot>(
 	// this function a context node, which the gate cannot afford.
 	let wire = || {
 		source.effect(|value: T| turn(FlushPolicy::AtSuspension, || {
-			// Claim this navigation's generation before anything can await, so
-			// a continuation can tell whether it is still the latest.
+			// Claim this navigation's generation before anything can await, so a
+			// continuation can tell whether it is still the latest.
 			let mine = generation.read() + 1;
 			generation.write() = mine;
 			clear_chunk_error();
 			let arm = chunk_arm(value);
 			if chunk_ready(arm) {
-				// Navigating BACK to loaded code while something is in flight
-				// ends the wait: that fetch has just been superseded, and its
-				// arrival is dropped by the generation guard below.
+				// Navigating BACK to loaded code while something is in flight ends
+				// the wait: that fetch has just been superseded, and its arrival is
+				// dropped by the generation guard below.
 				set_chunk_pending(false);
 				advance(value);
 			} else {
@@ -1094,11 +1078,11 @@ export fun swap_split<T: PartialEq, S: Source<T>, C: Slot>(
 
 /// A keyed reactive run at THIS position — one row per element, in a child hole.
 ///
-/// Named `each` and not `bind_each`: the `bind_` prefix means "one property
-/// kept in sync" on every other method in this module, and a value that IS a
-/// child has no property to bind. `{each(items, key, row)}` reads as markup
-/// where `{bind_each(..)}` read as a setter that had escaped — which is why A99
-/// retired the method and left the value form alone.
+/// Named `each` and not `bind_each`: the `bind_` prefix means "one property kept in
+/// sync" on every other method in this module, and a value that IS a child has no
+/// property to bind. `{each(items, key, row)}` reads as markup where
+/// `{bind_each(..)}` read as a setter that had escaped — which is why A99 retired
+/// the method and left the value form alone.
 export fun each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
 	source: S,
 	key: sync |T| K,
@@ -1133,8 +1117,7 @@ export impl Conditional<type S: Source<bool>, type C: Slot> with Slot {
 		let region = Region::open(parent);
 		let live_row: Shared<Option<Row>> = Shared::new(None);
 		let live_owner: Shared<Option<Owner>> = Shared::new(None);
-		// Live content dies with the enclosing boundary, and the anchor with
-		// it.
+		// Live content dies with the enclosing boundary, and the anchor with it.
 		get_owner().defer(|| {
 			live_owner.read()?.dispose();
 			region.close();
@@ -1145,13 +1128,12 @@ export impl Conditional<type S: Source<bool>, type C: Slot> with Slot {
 					Some(let _present) => {},
 					None => {
 						let owner = Owner::new();
-						// The body's own owner is established HERE, at the
-						// call — the clause on the field is what carries the
-						// requirement this far (B309) — and the PLACE runs
-						// under it too, so whatever the body's `Slot` registers
-						// (a nested region's `defer`, above all) dies with the
-						// instantiation rather than with the enclosing
-						// boundary (A91).
+						// The body's own owner is established HERE, at the call —
+						// the clause on the field is what carries the requirement
+						// this far (B309) — and the PLACE runs under it too, so
+						// whatever the body's `Slot` registers (a nested region's
+						// `defer`, above all) dies with the instantiation rather
+						// than with the enclosing boundary (A91).
 						let row = run_with_owner(owner, || region.open_row((self.body)()));
 						region.hold_rows([row]);
 						live_row.write() = Some(row);
@@ -1162,9 +1144,9 @@ export impl Conditional<type S: Source<bool>, type C: Slot> with Slot {
 				match live_row.read() {
 					Some(let row) => {
 						live_owner.read()?.dispose();
-						// The instantiation is a ROW, not an element: its body
-						// may be a fragment, a text node or a value form that
-						// grew after it was placed, so it leaves by its span.
+						// The instantiation is a ROW, not an element: its body may
+						// be a fragment, a text node or a value form that grew
+						// after it was placed, so it leaves by its span.
 						let _cut = region.cut_row(row, region.anchor);
 						region.drop_row(row);
 						region.hold_rows([]);
@@ -1209,24 +1191,23 @@ export impl EachBy<type T, type K: PartialEq, type S: Source<List<T>>, type C: S
 	}
 }
 
-/// `swap`'s body, against a region opened at `parent`'s current end — shared by
-/// the `swap` and `swap_split` values. `armed` is the route gate's hold (see
-/// `Swap`): `true` for every ordinary swap.
+/// `swap`'s body, against a region opened at `parent`'s current end — shared by the
+/// `swap` and `swap_split` values. `armed` is the route gate's hold (see `Swap`):
+/// `true` for every ordinary swap.
 fun place_swap<T: PartialEq, S: Source<T>, C: Slot>(
 	parent: View,
 	source: S,
 	render: (sync |T| C) context owner_scope,
 	armed: Shared<bool>,
 ) {
-	// The rendered subtree keeps THIS position among the parent's children
-	// (A71): a page container between a header and a footer stays between them
-	// across every navigation.
+	// The rendered subtree keeps THIS position among the parent's children (A71): a
+	// page container between a header and a footer stays between them across every
+	// navigation.
 	let region = Region::open(parent);
 	let last_value: Shared<Option<T>> = Shared::new(None);
 	let live_row: Shared<Option<Row>> = Shared::new(None);
 	let live_owner: Shared<Option<Owner>> = Shared::new(None);
-	// The live subtree dies with the enclosing boundary, and the anchor with
-	// it.
+	// The live subtree dies with the enclosing boundary, and the anchor with it.
 	get_owner().defer(|| {
 		live_owner.read()?.dispose();
 		region.close();
@@ -1259,12 +1240,12 @@ fun place_swap<T: PartialEq, S: Source<T>, C: Slot>(
 ///
 /// A settled row is one whose previous index reads as part of an INCREASING run
 /// across the new order: those rows already stand in the document in their new
-/// relative order, so leaving them alone and threading every other row around
-/// them (each inserted before the next settled row's marker) produces exactly
-/// the new order. Before A98 nothing was settled — every live row was cut by
-/// span and re-inserted at the anchor, whether or not it had gone anywhere —
-/// which is one `extractContents`, one marker move and one content move per
-/// row per pass, for a list that may not have moved at all.
+/// relative order, so leaving them alone and threading every other row around them
+/// (each inserted before the next settled row's marker) produces exactly the new
+/// order. Before A98 nothing was settled — every live row was cut by span and
+/// re-inserted at the anchor, whether or not it had gone anywhere — which is one
+/// `extractContents`, one marker move and one content move per row per pass, for a
+/// list that may not have moved at all.
 ///
 /// TWO SCANS, and the better of them wins. A forward greedy run keeps the
 /// EARLIEST row of each increasing chain and is optimal when one row moved
@@ -1296,10 +1277,10 @@ fun settled_steps(steps: List<RowStep>): List<bool> {
 			},
 		}
 	}
-	// The same greedy run read from the end. `lowest` starts above every index
-	// (an empty run has nothing to its right), and a row settles when it sits
-	// strictly below whatever settled after it — which, read forwards, is the
-	// increasing condition again.
+	// The same greedy run read from the end. `lowest` starts above every index (an
+	// empty run has nothing to its right), and a row settles when it sits strictly
+	// below whatever settled after it — which, read forwards, is the increasing
+	// condition again.
 	mut backward: List<bool> = [];
 	mut backward_count = 0;
 	mut lowest = steps.len();
@@ -1328,13 +1309,13 @@ fun settled_steps(steps: List<RowStep>): List<bool> {
 	}
 }
 
-/// A98: the marker each step must insert BEFORE — the next settled row's
-/// marker, or the region's anchor when no settled row follows.
+/// A98: the marker each step must insert BEFORE — the next settled row's marker, or
+/// the region's anchor when no settled row follows.
 ///
 /// Read from the end, because the answer for a step is a property of what comes
-/// after it. A step that is itself settled still gets an answer (it is never
-/// asked for one); what matters is that the answer it CONTRIBUTES is its own
-/// marker, for every step to its left.
+/// after it. A step that is itself settled still gets an answer (it is never asked
+/// for one); what matters is that the answer it CONTRIBUTES is its own marker, for
+/// every step to its left.
 fun row_references(
 	steps: List<RowStep>,
 	rows: List<Row>,
@@ -1359,24 +1340,24 @@ fun row_references(
 	references.reverse()
 }
 
-/// `each`'s body, against a region opened at `parent`'s current end —
-/// shared by `Each`, `EachValues` and, through them, by the two methods.
+/// `each`'s body, against a region opened at `parent`'s current end — shared by
+/// `Each`, `EachValues` and, through them, by the two methods.
 fun place_each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
 	parent: View,
 	source: S,
 	key: sync |T| K,
 	render: (sync |T| C) context owner_scope,
 ) {
-	// The rows keep THIS position among the parent's children (A71): the hole
-	// sits where they belong, so the anchor goes down now and every row is
-	// inserted before it.
+	// The rows keep THIS position among the parent's children (A71): the hole sits
+	// where they belong, so the anchor goes down now and every row is inserted
+	// before it.
 	let region = Region::open(parent);
 	let row_keys: Shared<List<K>> = Shared::new([]);
 	let row_items: Shared<List<T>> = Shared::new([]);
 	let row_rows: Shared<List<Row>> = Shared::new([]);
 	let row_owners: Shared<List<Owner>> = Shared::new([]);
-	// Whichever rows are live when the enclosing boundary is disposed go with
-	// it, and the anchor goes with them.
+	// Whichever rows are live when the enclosing boundary is disposed go with it,
+	// and the anchor goes with them.
 	get_owner().defer(|| {
 		for owner in row_owners.read() {
 			owner.dispose();
@@ -1411,12 +1392,12 @@ fun place_each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
 			}
 			settled_at += 1;
 		}
-		// A91's order pass, in two halves. First CUT every live row that is
-		// going somewhere, in the order the document holds them: a row's extent
-		// runs from its own marker to the next row's, and those boundaries are
-		// only meaningful while nothing has moved. A settled row is not cut at
-		// all (A98) — it keeps its marker, its nodes and its place — and a
-		// `None` in `cut` is exactly "this row did not move".
+		// A91's order pass, in two halves. First CUT every live row that is going
+		// somewhere, in the order the document holds them: a row's extent runs from
+		// its own marker to the next row's, and those boundaries are only
+		// meaningful while nothing has moved. A settled row is not cut at all (A98)
+		// — it keeps its marker, its nodes and its place — and a `None` in `cut` is
+		// exactly "this row did not move".
 		mut cut: List<Option<Element>> = [];
 		mut at = 0;
 		for row in previous_rows {
@@ -1440,9 +1421,9 @@ fun place_each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
 		mut next_owners: List<Owner> = [];
 		mut position = 0;
 		// Then put the moved rows back in the NEW order, each before the next
-		// settled row's marker: a kept row is its marker and its cut nodes
-		// moved as a unit, a fresh one is placed from scratch at that same
-		// point. A settled row is already there and is touched by nothing here.
+		// settled row's marker: a kept row is its marker and its cut nodes moved as
+		// a unit, a fresh one is placed from scratch at that same point. A settled
+		// row is already there and is touched by nothing here.
 		for step in plan.steps {
 			let item = list[position];
 			let reference = references[position];
@@ -1504,8 +1485,8 @@ fun place_each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
 	let row_cells: Shared<List<SignalCell<T>>> = Shared::new([]);
 	let row_rows: Shared<List<Row>> = Shared::new([]);
 	let row_owners: Shared<List<Owner>> = Shared::new([]);
-	// Whichever rows are live when the enclosing boundary is disposed go with
-	// it, exactly as `place_each`'s do.
+	// Whichever rows are live when the enclosing boundary is disposed go with it,
+	// exactly as `place_each`'s do.
 	get_owner().defer(|| {
 		for owner in row_owners.read() {
 			owner.dispose();
@@ -1522,8 +1503,8 @@ fun place_each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
 		let previous_rows = row_rows.read();
 		let previous_owners = row_owners.read();
 		// A98, exactly as `place_each` reads it: the rows already in their new
-		// relative order stay put, and every other row is threaded in before
-		// the next settled row's marker.
+		// relative order stay put, and every other row is threaded in before the
+		// next settled row's marker.
 		let settled = settled_steps(plan.steps);
 		let references = row_references(plan.steps, previous_rows, settled, region.anchor);
 		mut staying: List<bool> = [];
@@ -1544,8 +1525,8 @@ fun place_each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
 			}
 			settled_at += 1;
 		}
-		// Cut what moves first, in old document order — `place_each`'s two
-		// halves, for `place_each`'s reason (A91).
+		// Cut what moves first, in old document order — `place_each`'s two halves,
+		// for `place_each`'s reason (A91).
 		mut cut: List<Option<Element>> = [];
 		mut at = 0;
 		for row in previous_rows {
@@ -1587,8 +1568,8 @@ fun place_each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
 					next_owners.push(previous_owners[index]);
 				},
 				// Unreachable: `same` above is constantly true, so `reconcile`
-				// never refreshes here. Kept in step with `Keep` rather than
-				// left to rot differently.
+				// never refreshes here. Kept in step with `Keep` rather than left
+				// to rot differently.
 				RowStep::Refresh(let index) => {
 					let cell = previous_cells[index];
 					cell.set(item);
@@ -1629,12 +1610,12 @@ fun place_each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
 	});
 }
 
-/// Something that can fill an attribute value (proposal/element-syntax.md §5).
-/// This is what `<div name(value)>` desugars through — element syntax builds
+/// Something that can fill an attribute value (proposal/element-syntax.md §5). This
+/// is what `<div name(value)>` desugars through — element syntax builds
 /// `.attr(name, value)`, never `.bind_attr` — so the arms below are exactly the
 /// element-syntax attribute vocabulary. The tracked arm is a BLANKET over
-/// `Source<str>` (B158/B165), so any reactive value fills an attribute.
-/// KEEP IN STEP with the process twin's copy (process/ui.vl).
+/// `Source<str>` (B158/B165), so any reactive value fills an attribute. KEEP IN
+/// STEP with the process twin's copy (process/ui.vl).
 export trait AttrValue {
 	fun apply(self, parent: View, name: str);
 }
@@ -1656,11 +1637,11 @@ export impl type S: Source<str> with AttrValue {
 	}
 }
 
-/// Set once, or NOT AT ALL: a `None` writes nothing (A115). The static twin of
-/// the removal arm below, and the one an element-syntax attribute needs when
-/// the value is an `Option` in hand — `<div data-dragging(maybe)>` — which was
-/// refused at the bound before this arm existed even though `Style::attribute`
-/// (A89) and `bind_attr` (A105) both took the `Option` shape.
+/// Set once, or NOT AT ALL: a `None` writes nothing (A115). The static twin of the
+/// removal arm below, and the one an element-syntax attribute needs when the value
+/// is an `Option` in hand — `<div data-dragging(maybe)>` — which was refused at the
+/// bound before this arm existed even though `Style::attribute` (A89) and
+/// `bind_attr` (A105) both took the `Option` shape.
 ///
 /// `Some("")` is a present, empty attribute and `None` is no attribute: that
 /// distinction is the whole reason an absence needs its own value rather than a
@@ -1675,9 +1656,9 @@ export impl Option<str> with AttrValue {
 }
 
 /// Set and track, with `None` REMOVING the attribute (A115) — `AttrBinding`'s
-/// coming-and-going arm, reached from element syntax. Its customer is a
-/// selector that reads PRESENCE (`[data-dragging] *`), where there is no string
-/// that turns the attribute off.
+/// coming-and-going arm, reached from element syntax. Its customer is a selector
+/// that reads PRESENCE (`[data-dragging] *`), where there is no string that turns
+/// the attribute off.
 export impl type S: Source<Option<str>> with AttrValue {
 	fun apply(self, parent: View, name: str) {
 		let element = parent.element;
@@ -1719,8 +1700,8 @@ export impl type S: Source<str> with AttrBinding {
 	}
 }
 
-/// Present exactly while the source says `Some`, and gone while it says
-/// `None` — the shape kolt hand-wrote as `bind_attr_proper` (A105).
+/// Present exactly while the source says `Some`, and gone while it says `None` —
+/// the shape kolt hand-wrote as `bind_attr_proper` (A105).
 export impl type S: Source<Option<str>> with AttrBinding {
 	fun bind_attribute(self, parent: View, name: str) {
 		let element = parent.element;
@@ -1733,12 +1714,12 @@ export impl type S: Source<Option<str>> with AttrBinding {
 	}
 }
 
-/// Whether a host value is JS `null`/`undefined` — the one peek this module
-/// needs at `get_element_by_id`'s result. `get_element_by_id` (`browser/dom.vl`)
-/// has no `Option` return, so a missing id reads back as `null` typed as
-/// `Element`; giving IT an `Option<Element>` signature is a wider API question
-/// (A24, fullstack-dx.md §9.5) deliberately NOT taken here — this is a private
-/// guard at the mount seam alone.
+/// Whether a host value is JS `null`/`undefined` — the one peek this module needs
+/// at `get_element_by_id`'s result. `get_element_by_id` (`browser/dom.vl`) has no
+/// `Option` return, so a missing id reads back as `null` typed as `Element`; giving
+/// IT an `Option<Element>` signature is a wider API question (A24, fullstack-dx.md
+/// §9.5) deliberately NOT taken here — this is a private guard at the mount seam
+/// alone.
 export [extern("__is_null")]
 external fun is_null(value: Element): bool;
 
@@ -1767,18 +1748,18 @@ export fun mount(id: str, view: View) {
 	element.append(view.element);
 }
 
-/// Mount a component ROOT: the body builds under a fresh ambient owner (the
-/// root boundary — every binding inside registers into it) and the view is
-/// attached. Returns the root owner; most apps let it live forever.
+/// Mount a component ROOT: the body builds under a fresh ambient owner (the root
+/// boundary — every binding inside registers into it) and the view is attached.
+/// Returns the root owner; most apps let it live forever.
 export fun mount_root(id: str, body: (sync || View) context owner_scope): Owner {
-	// The initial build is a turn boundary too: bindings created during
-	// mount settle as one wave instead of notifying per-`set`.
+	// The initial build is a turn boundary too: bindings created during mount
+	// settle as one wave instead of notifying per-`set`.
 	let (built, root) = turn(FlushPolicy::AtSuspension, || comp(body));
 	mount(id, built);
 	// HMR (`hmr.md` §3, step 2): before the next bundle mounts, dispose the root
 	// owner (so every subscription under it dies) and clear the container element
-	// (so the old DOM is gone). A no-op without a dev shim — the closure isn't
-	// even built in a production run.
+	// (so the old DOM is gone). A no-op without a dev shim — the closure isn't even
+	// built in a production run.
 	if hmr_active() {
 		let element = get_element_by_id(id);
 		on_teardown(|| {
@@ -1794,18 +1775,17 @@ export fun mount_root(id: str, body: (sync || View) context owner_scope): Owner 
 // `when` takes a `Source<bool>` and `swap` rebuilds on every distinct value, so
 // "show this while the source is `Some`, with the payload in hand" had no std
 // spelling and an app wrote its own — kolt's `lib/conditional_value.vl`, a
-// hand-rolled `Slot` impl over `Region`/`Owner`, under three of its own
-// comments.
+// hand-rolled `Slot` impl over `Region`/`Owner`, under three of its own comments.
 //
 // THE ROW SURVIVES A PAYLOAD CHANGE (R6, ruled at Order 39's GO). The body is
-// handed a `SignalCell<T>` rather than a `T`: on `Some -> Some` the cell takes
-// the new value and whatever the body bound to it updates in place, so a
-// changed field does not tear the subtree down and build it again. That is
-// `each_by`'s row cell applied to a single row, and it is why `T` needs no
-// `PartialEq` — there is no value comparison to make. It also answers the
-// FIXME kolt wrote beside its own version ("implement cache or ignore recompute
-// on every change"): the recompute it was trying to avoid is not a cache
-// question, it is the difference between rebuilding a row and writing to it.
+// handed a `SignalCell<T>` rather than a `T`: on `Some -> Some` the cell takes the
+// new value and whatever the body bound to it updates in place, so a changed field
+// does not tear the subtree down and build it again. That is `each_by`'s row cell
+// applied to a single row, and it is why `T` needs no `PartialEq` — there is no
+// value comparison to make. It also answers the FIXME kolt wrote beside its own
+// version ("implement cache or ignore recompute on every change"): the recompute it
+// was trying to avoid is not a cache question, it is the difference between
+// rebuilding a row and writing to it.
 //
 // The PRESENCE is what decides structure: `None -> Some` builds under a fresh
 // `Owner`, `Some -> None` disposes that owner and takes the row out by its
@@ -1820,19 +1800,19 @@ export struct WhenSome<T, S: Source<Option<T>>, C: Slot> {
 	render: (|SignalCell<T>| C) context owner_scope,
 }
 
-/// `Some`-conditional CONTENT at THIS position, with the payload in hand:
-/// while `source` holds a value the body's view is mounted under a fresh owner
-/// and the body's cell carries that value; when it turns `None` the owner is
-/// disposed and the content removed.
+/// `Some`-conditional CONTENT at THIS position, with the payload in hand: while
+/// `source` holds a value the body's view is mounted under a fresh owner and the
+/// body's cell carries that value; when it turns `None` the owner is disposed and
+/// the content removed.
 ///
-/// The body takes a `SignalCell<T>`, not a `T`, so a CHANGED payload updates
-/// the row rather than replacing it (R6) — read it with `.get()` inside a
-/// binding, exactly as an `each_by` row reads its own cell.
+/// The body takes a `SignalCell<T>`, not a `T`, so a CHANGED payload updates the
+/// row rather than replacing it (R6) — read it with `.get()` inside a binding,
+/// exactly as an `each_by` row reads its own cell.
 ///
 ///     <aside>{when_some(selected, |account| account_panel(account))}</aside>
 ///
-/// Write it in a child hole where the conditional content belongs, or hand it
-/// to `child` (`parent.child(when_some(..))`) for the parent's current end.
+/// Write it in a child hole where the conditional content belongs, or hand it to
+/// `child` (`parent.child(when_some(..))`) for the parent's current end.
 export fun when_some<T, S: Source<Option<T>>, C: Slot>(
 	source: S,
 	render: (sync |SignalCell<T>| C) context owner_scope,
@@ -1854,8 +1834,8 @@ fun place_when_some<T, S: Source<Option<T>>, C: Slot>(
 	source: S,
 	render: (sync |SignalCell<T>| C) context owner_scope,
 ) {
-	// The content keeps THIS position among the parent's children (A71), so a
-	// panel between a header and a footer stays between them.
+	// The content keeps THIS position among the parent's children (A71), so a panel
+	// between a header and a footer stays between them.
 	let region = Region::open(parent);
 	let live_cell: Shared<Option<SignalCell<T>>> = Shared::new(None);
 	let live_row: Shared<Option<Row>> = Shared::new(None);
@@ -1875,11 +1855,11 @@ fun place_when_some<T, S: Source<Option<T>>, C: Slot>(
 					None => {
 						let cell: SignalCell<T> = SignalCell::new(payload);
 						let owner = Owner::new();
-						// The body's own owner is established HERE, at the call
-						// — the clause on the field carries the requirement this
-						// far (B309) — and the PLACE runs under it too, so a
-						// nested region's `defer` dies with the instantiation
-						// rather than with the enclosing boundary (A91).
+						// The body's own owner is established HERE, at the call —
+						// the clause on the field carries the requirement this far
+						// (B309) — and the PLACE runs under it too, so a nested
+						// region's `defer` dies with the instantiation rather than
+						// with the enclosing boundary (A91).
 						let row = run_with_owner(owner, || region.open_row(render(cell)));
 						region.hold_rows([row]);
 						live_cell.write() = Some(cell);
@@ -1892,9 +1872,9 @@ fun place_when_some<T, S: Source<Option<T>>, C: Slot>(
 				match live_row.read() {
 					Some(let row) => {
 						live_owner.read()?.dispose();
-						// The instantiation is a ROW, not an element: its body
-						// may be a fragment, a text node or a value form that
-						// grew after it was placed, so it leaves by its span.
+						// The instantiation is a ROW, not an element: its body may
+						// be a fragment, a text node or a value form that grew
+						// after it was placed, so it leaves by its span.
 						let _cut = region.cut_row(row, region.anchor);
 						region.drop_row(row);
 						region.hold_rows([]);

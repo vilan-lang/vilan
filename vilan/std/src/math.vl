@@ -1,11 +1,11 @@
 // std::math — mathematical constants and generic free functions (backlog K2).
 //
-// The METHOD families on the numeric types (`x.sin()`, `x.abs()`, `x.rem(m)`)
-// are the primary surface and live in `number.vl`; this module holds what has
-// no receiver: the constants, and the `Ord`-generic free functions (moved
-// here from `compare.vl` — the trait METHODS `Ord::min`/`max`/`clamp` stay
-// there). The surface is bounded to what `libm` provides, so the native
-// backends (F3/F4) stay implementable — no JS-isms.
+// The METHOD families on the numeric types (`x.sin()`, `x.abs()`, `x.rem(m)`) are
+// the primary surface and live in `number.vl`; this module holds what has no
+// receiver: the constants, and the `Ord`-generic free functions (moved here from
+// `compare.vl` — the trait METHODS `Ord::min`/`max`/`clamp` stay there). The
+// surface is bounded to what `libm` provides, so the native backends (F3/F4) stay
+// implementable — no JS-isms.
 
 import pkg::compare::{ Ord, PartialEq };
 import pkg::operators::{ Add, Sub };
@@ -51,14 +51,14 @@ fun minmax<T: Ord>(a: T, b: T): (T, T) {
 //
 // The smallest vector value the estate actually asks for (A83). Pointer drags
 // measure offsets, distances and thresholds, and an app without this writes
-// `magnitude((x, y): (f64, f64))` by hand — the exhibit is kolt's
-// `interact.vl`, with a TODO on it asking for exactly this.
+// `magnitude((x, y): (f64, f64))` by hand — the exhibit is kolt's `interact.vl`,
+// with a TODO on it asking for exactly this.
 //
 // A NAMED type rather than a `(f64, f64)` tuple, because the call site reads:
-// `origin.distance(pointer)` says what it measures, while `distance(a, b)`
-// over two pairs says only that four numbers went in — and a tuple of two
-// floats is also a size, a range and a pair of weights, so nothing catches the
-// argument that was none of those.
+// `origin.distance(pointer)` says what it measures, while `distance(a, b)` over two
+// pairs says only that four numbers went in — and a tuple of two floats is also a
+// size, a range and a pair of weights, so nothing catches the argument that was
+// none of those.
 //
 // The components are plain `f64` and carry NO UNIT: they are CSS pixels at a
 // UI call site and metres at a physics one, so a `Length` here would be a
@@ -66,26 +66,26 @@ fun minmax<T: Ord>(a: T, b: T): (T, T) {
 // so the native backends (F3/F4) stay implementable, exactly as the constants
 // above do.
 
-/// A 2-D vector — a point, an offset, a velocity, a size: whichever the call
-/// site means, in its own units.
+/// A 2-D vector — a point, an offset, a velocity, a size: whichever the call site
+/// means, in its own units.
 struct Vec2 {
 	x: f64,
 	y: f64,
 }
 
 impl Vec2 {
-	/// `self` with both components multiplied by `factor` — the scalar half
-	/// of the arithmetic, which `Mul` cannot carry: the operator traits take
-	/// ONE other operand type per impl, and `Vec2 * Vec2` would be the more
-	/// natural claim on `Mul` if this module ever wanted a component-wise
-	/// product. A method says which of the two it is.
+	/// `self` with both components multiplied by `factor` — the scalar half of the
+	/// arithmetic, which `Mul` cannot carry: the operator traits take ONE other
+	/// operand type per impl, and `Vec2 * Vec2` would be the more natural claim on
+	/// `Mul` if this module ever wanted a component-wise product. A method says
+	/// which of the two it is.
 	fun scale(self, factor: f64): Vec2 {
 		Vec2 { x = self.x * factor, y = self.y * factor }
 	}
 
 	/// The vector's LENGTH from the origin (its magnitude) — `sqrt(x² + y²)`.
-	/// Comparing two lengths, or a length against a threshold, does not need
-	/// the square root: reach for `length_squared` and square the threshold.
+	/// Comparing two lengths, or a length against a threshold, does not need the
+	/// square root: reach for `length_squared` and square the threshold.
 	fun length(self): f64 {
 		self.length_squared().sqrt()
 	}
@@ -93,27 +93,26 @@ impl Vec2 {
 	/// The length WITHOUT the square root — `x² + y²`, which is `self.dot(self)`
 	/// under the name the comparison actually wants. `sqrt` is monotonic, so
 	/// `a.length() < b.length()` and `a.length_squared() < b.length_squared()`
-	/// agree on every pair, and a THRESHOLD comparison squares the threshold
-	/// once instead of taking a root per sample:
+	/// agree on every pair, and a THRESHOLD comparison squares the threshold once
+	/// instead of taking a root per sample:
 	///
 	///     if moved.length_squared() > drag_threshold * drag_threshold { … }
 	///
-	/// Which is a pointer-move handler's whole arithmetic, run on every event.
-	/// It is a name for a comparison, not a faster `length`: take the root when
-	/// the NUMBER is the answer.
+	/// Which is a pointer-move handler's whole arithmetic, run on every event. It
+	/// is a name for a comparison, not a faster `length`: take the root when the
+	/// NUMBER is the answer.
 	fun length_squared(self): f64 {
 		self.dot(self)
 	}
 
-	/// The distance between the two points `self` and `other` — the length of
-	/// the vector between them, and the reason this type exists at a drag
-	/// call site.
+	/// The distance between the two points `self` and `other` — the length of the
+	/// vector between them, and the reason this type exists at a drag call site.
 	fun distance(self, other: Vec2): f64 {
 		self.sub(other).length()
 	}
 
-	/// The dot product `self.x * other.x + self.y * other.y`. Zero when the
-	/// two are perpendicular, and `v.dot(v)` is `v`'s length squared.
+	/// The dot product `self.x * other.x + self.y * other.y`. Zero when the two are
+	/// perpendicular, and `v.dot(v)` is `v`'s length squared.
 	fun dot(self, other: Vec2): f64 {
 		self.x * other.x + self.y * other.y
 	}
@@ -126,8 +125,8 @@ impl Vec2 with Add {
 	}
 }
 
-/// Component-wise subtraction. `pointer - origin` is the offset of a drag, and
-/// the operand order reads the way the arithmetic does.
+/// Component-wise subtraction. `pointer - origin` is the offset of a drag, and the
+/// operand order reads the way the arithmetic does.
 impl Vec2 with Sub {
 	fun sub(self, b: Vec2): Vec2 {
 		Vec2 { x = self.x - b.x, y = self.y - b.y }

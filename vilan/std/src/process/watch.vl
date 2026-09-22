@@ -1,18 +1,16 @@
-// `std::watch` — the process layer's dev-mode surface (`dev-refresh.md` §5
-// item 2). Named apart from the browser's `std::dev` (`std/src/browser/dev.vl`)
-// on purpose: `std_twin_parity.rs`'s `TWINNED_MODULES` documents `dev` as
-// deliberately single-platform (browser-only, no counterpart to hold it
-// against — the same reasoning `db`/`fs`/`http`/`process`/`rpc_server` already
-// get on the process side), so reusing that name here would silently open a
-// twin the parity gate was never meant to cover — the two surfaces share no
-// component source the way `std::ui`'s two halves do, which is what that gate
-// actually protects.
+// `std::watch` — the process layer's dev-mode surface (`dev-refresh.md` §5 item 2).
+// Named apart from the browser's `std::dev` (`std/src/browser/dev.vl`) on purpose:
+// `std_twin_parity.rs`'s `TWINNED_MODULES` documents `dev` as deliberately
+// single-platform (browser-only, no counterpart to hold it against — the same
+// reasoning `db`/`fs`/`http`/`process`/`rpc_server` already get on the process
+// side), so reusing that name here would silently open a twin the parity gate was
+// never meant to cover — the two surfaces share no component source the way
+// `std::ui`'s two halves do, which is what that gate actually protects.
 //
-// `force_refresh()` is the manual half of the ruling's composed mechanism:
-// check `is_watching()`, re-read cheaply, `force_refresh()`, and the browser
-// re-pulls current bytes over the existing push routes. A no-op outside
-// `vilan run --watch` — importing this module costs nothing in a shipped
-// process.
+// `force_refresh()` is the manual half of the ruling's composed mechanism: check
+// `is_watching()`, re-read cheaply, `force_refresh()`, and the browser re-pulls
+// current bytes over the existing push routes. A no-op outside `vilan run --watch`
+// — importing this module costs nothing in a shipped process.
 //
 import pkg::fetch::post;
 import pkg::option::Option::{ self, None, Some };
@@ -24,20 +22,20 @@ export *;
 /// loop (`dev-refresh.md` §5, item 2).
 ///
 /// Uniform: DEFINED under every run and `false` outside a watch, so a program
-/// branches on it without knowing how it was started. `std::dev` is the
-/// browser's answer to the same question and is browser-only by construction
-/// (HMR swaps the browser leg in place; the node leg restarts), so this is the
-/// process layer's own.
+/// branches on it without knowing how it was started. `std::dev` is the browser's
+/// answer to the same question and is browser-only by construction (HMR swaps the
+/// browser leg in place; the node leg restarts), so this is the process layer's
+/// own.
 ///
 /// What it is for is FRESHNESS, not code: a server that restarts on every code
 /// change can still serve week-old bytes for a file it read once at the top of
 /// `main`. `serve_build` uses it to revalidate its assets per request while
-/// watching and serve them from memory otherwise; a hand-rolled server can do
-/// the same. Server-side HMR remains a permanent non-goal (`hmr.md` §8).
+/// watching and serve them from memory otherwise; a hand-rolled server can do the
+/// same. Server-side HMR remains a permanent non-goal (`hmr.md` §8).
 ///
-/// The signal is the `VILAN_WATCHING` environment variable the watcher sets on
-/// the Node child it spawns — nothing that can fail independently of the
-/// process actually starting, and nothing left behind by a watcher that died.
+/// The signal is the `VILAN_WATCHING` environment variable the watcher sets on the
+/// Node child it spawns — nothing that can fail independently of the process
+/// actually starting, and nothing left behind by a watcher that died.
 fun is_watching(): bool {
 	match env("VILAN_WATCHING") {
 		Some(let value) => value == "1",
@@ -45,22 +43,22 @@ fun is_watching(): bool {
 	}
 }
 
-/// Ask every connected browser to reload once (`dev-refresh.md` §5 item 2).
-/// The watcher hands its child the dev channel's port over `VILAN_HMR_PORT`
-/// and that run's channel token over `VILAN_HMR_TOKEN` (the node-child spawn
-/// site inside `run --watch`'s HMR round); with no watch session — the env
-/// vars unset, a plain `vilan run`, or any shipped process — this is a no-op.
-/// Fire-and-forget: the call doesn't wait for the POST to land or for the
-/// browser to actually reload, so it never blocks the caller.
+/// Ask every connected browser to reload once (`dev-refresh.md` §5 item 2). The
+/// watcher hands its child the dev channel's port over `VILAN_HMR_PORT` and that
+/// run's channel token over `VILAN_HMR_TOKEN` (the node-child spawn site inside
+/// `run --watch`'s HMR round); with no watch session — the env vars unset, a plain
+/// `vilan run`, or any shipped process — this is a no-op. Fire-and-forget: the call
+/// doesn't wait for the POST to land or for the browser to actually reload, so it
+/// never blocks the caller.
 ///
-/// The token is required by every dev-channel route (backlog E93): the channel
-/// used to take an unauthenticated `POST /refresh`, which meant any page the
-/// developer's browser happened to be on could fire a reload flood at the dev
-/// session. This process is the one legitimate caller that is not the browser
-/// shim, and it learns the token the same way it learns everything else about
-/// the session — an environment variable inherited at spawn, alongside
-/// `VILAN_WATCHING`. `zip` is the "both or nothing" the pairing wants: a port
-/// without a token could only produce a refused POST, so it stays a no-op.
+/// The token is required by every dev-channel route (backlog E93): the channel used
+/// to take an unauthenticated `POST /refresh`, which meant any page the developer's
+/// browser happened to be on could fire a reload flood at the dev session. This
+/// process is the one legitimate caller that is not the browser shim, and it learns
+/// the token the same way it learns everything else about the session — an
+/// environment variable inherited at spawn, alongside `VILAN_WATCHING`. `zip` is
+/// the "both or nothing" the pairing wants: a port without a token could only
+/// produce a refused POST, so it stays a no-op.
 fun force_refresh(): void {
 	match env("VILAN_HMR_PORT").zip(env("VILAN_HMR_TOKEN")) {
 		Some(let (port, token)) => {

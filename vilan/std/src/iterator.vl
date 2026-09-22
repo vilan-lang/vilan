@@ -3,9 +3,9 @@ import pkg::option::Option::{ self, None, Some };
 export *;
 
 /// The lazy-sequence protocol. `next` advances the iterator's own state, so it
-/// takes `&mut self`: a stateful iterator — a cursor, a counter, an adapter
-/// holding an upstream — is exactly what this trait is for, and a by-value
-/// receiver made every one of them unconformable (I5).
+/// takes `&mut self`: a stateful iterator — a cursor, a counter, an adapter holding
+/// an upstream — is exactly what this trait is for, and a by-value receiver made
+/// every one of them unconformable (I5).
 trait Iterator<T> {
 	fun next(&mut self): Option<T>;
 
@@ -20,18 +20,18 @@ trait Iterator<T> {
 	}
 
 	/// `map` and `filter` in one pass: `fn` answers `Some(value)` to keep that
-	/// value and `None` to drop the element, so a fallible or partial
-	/// projection needs neither a two-stage chain nor an `Option` to unwrap
-	/// afterwards. `it.filter_map(f)` is `it.map(f).filter(is_some)` with the
-	/// intermediate `Option` never materialized (I3; kolt hand-wrote the eager
-	/// form as `List::map_filter` at `server.vl:92`).
+	/// value and `None` to drop the element, so a fallible or partial projection
+	/// needs neither a two-stage chain nor an `Option` to unwrap afterwards.
+	/// `it.filter_map(f)` is `it.map(f).filter(is_some)` with the intermediate
+	/// `Option` never materialized (I3; kolt hand-wrote the eager form as
+	/// `List::map_filter` at `server.vl:92`).
 	fun filter_map<U>(self, fn: |T| Option<U>): FilterMapped<Self, T, U> {
 		FilterMapped { upstream = self, fn }
 	}
 
-	/// The first `count` values, then exhausted. `take` is what makes an
-	/// unbounded source usable: it never pulls past its budget, so
-	/// `source.take(3).to_list()` terminates over an infinite `from_fn`.
+	/// The first `count` values, then exhausted. `take` is what makes an unbounded
+	/// source usable: it never pulls past its budget, so `source.take(3).to_list()`
+	/// terminates over an infinite `from_fn`.
 	fun take(self, count: i32): Taken<Self, T> {
 		Taken { upstream = self, remaining = count }
 	}
@@ -47,8 +47,8 @@ trait Iterator<T> {
 		Enumerated { upstream = self, index = 0 }
 	}
 
-	/// Pairs this iterator's values with `other`'s, stopping when EITHER runs
-	/// out — so the result is as long as the shorter side.
+	/// Pairs this iterator's values with `other`'s, stopping when EITHER runs out —
+	/// so the result is as long as the shorter side.
 	fun zip<U, J: Iterator<U>>(self, other: J): Zipped<Self, J, T, U> {
 		Zipped { left = self, right = other }
 	}
@@ -114,8 +114,8 @@ trait Iterator<T> {
 		false
 	}
 
-	/// Whether `predicate` holds for every value — vacuously true when there
-	/// are none. Short-circuits on the first miss.
+	/// Whether `predicate` holds for every value — vacuously true when there are
+	/// none. Short-circuits on the first miss.
 	fun all(mut self, predicate: |T| bool): bool {
 		for value in self {
 			if !predicate(value) {
@@ -125,12 +125,12 @@ trait Iterator<T> {
 		true
 	}
 
-	/// The values in reverse order. A BARRIER, not a lazy adapter: it drains
-	/// the upstream into a `List` and reverses that, so it is O(n) in space and
-	/// never returns over an unbounded source. (A lazy reverse wants a
-	/// double-ended protocol — every adapter would have to decide whether it
-	/// can walk backwards — and that is additive later: `rev`'s signature does
-	/// not change, only its body.)
+	/// The values in reverse order. A BARRIER, not a lazy adapter: it drains the
+	/// upstream into a `List` and reverses that, so it is O(n) in space and never
+	/// returns over an unbounded source. (A lazy reverse wants a double-ended
+	/// protocol — every adapter would have to decide whether it can walk backwards
+	/// — and that is additive later: `rev`'s signature does not change, only its
+	/// body.)
 	fun rev(mut self): ListIterator<T> {
 		ListIterator { items = self.to_list().reverse(), index = 0 }
 	}
@@ -152,12 +152,11 @@ impl Iterator<type T> {
 	}
 }
 
-/// The cursor `List::iter()` hands back: an index over a SNAPSHOT of the list.
-/// The snapshot is rule 1 — `iter` receives its list by value, and storing a
-/// value in a slot that outlives the call copies it — so pushing to the list
-/// afterwards cannot disturb a walk already in flight. It also means `iter()`
-/// costs a copy of the list; the eager `List` methods that only need one pass
-/// still take one.
+/// The cursor `List::iter()` hands back: an index over a SNAPSHOT of the list. The
+/// snapshot is rule 1 — `iter` receives its list by value, and storing a value in a
+/// slot that outlives the call copies it — so pushing to the list afterwards cannot
+/// disturb a walk already in flight. It also means `iter()` costs a copy of the
+/// list; the eager `List` methods that only need one pass still take one.
 struct ListIterator<T> {
 	items: List<T>,
 	index: i32,
@@ -180,12 +179,12 @@ impl ListIterator<type T> with Iterator<T> {
 // Each adapter is a struct holding its upstream BY VALUE plus whatever state it
 // needs, and each implements `Iterator` in terms of `self.upstream.next()`. The
 // names are past-participle (`Mapped`, not `Map`) because `Map` is a std type:
-// method resolution does not diagnose a collision, it picks by registration
-// order, so the type names are kept apart on purpose. The METHOD names stay
+// method resolution does not diagnose a collision, it picks by registration order,
+// so the type names are kept apart on purpose. The METHOD names stay
 // `map`/`filter`/`take`.
 //
-// A closure held in a FIELD is called parenthesized — `(self.fn)(value)` —
-// because method lookup does not fall back to fields.
+// A closure held in a FIELD is called parenthesized — `(self.fn)(value)` — because
+// method lookup does not fall back to fields.
 
 struct Mapped<I, T, U> {
 	upstream: I,
@@ -208,9 +207,9 @@ struct Filtered<I, T> {
 
 impl Filtered<type I: Iterator<T>, type T> with Iterator<T> {
 	fun next(&mut self): Option<T> {
-		// Pull until the predicate holds or the upstream runs out. The loop is
-		// what makes `filter` lazy AND total: the rejected values are consumed
-		// here, not materialized.
+		// Pull until the predicate holds or the upstream runs out. The loop is what
+		// makes `filter` lazy AND total: the rejected values are consumed here, not
+		// materialized.
 		mut found: Option<T> = None;
 		mut searching = true;
 		for searching {
@@ -236,8 +235,8 @@ impl FilterMapped<type I: Iterator<T>, type T, type U> with Iterator<U> {
 	fun next(&mut self): Option<U> {
 		// `Filtered`'s loop, projecting as it goes: the upstream is pulled until
 		// the projection answers `Some` or the upstream runs out, so the dropped
-		// elements are consumed here rather than materialized — which is what
-		// keeps one pass one pass.
+		// elements are consumed here rather than materialized — which is what keeps
+		// one pass one pass.
 		mut found: Option<U> = None;
 		mut searching = true;
 		for searching {
@@ -276,8 +275,8 @@ struct Skipped<I, T> {
 
 impl Skipped<type I: Iterator<T>, type T> with Iterator<T> {
 	fun next(&mut self): Option<T> {
-		// The skip is paid on the FIRST pull, not at construction — an adapter
-		// that consumed its upstream when it was built would not be lazy.
+		// The skip is paid on the FIRST pull, not at construction — an adapter that
+		// consumed its upstream when it was built would not be lazy.
 		for self.pending > 0 {
 			self.pending = self.pending - 1;
 			if self.upstream.next() is None {
@@ -312,9 +311,9 @@ struct Zipped<I, J, T, U> {
 
 impl Zipped<type I: Iterator<T>, type J: Iterator<U>, type T, type U> with Iterator<(T, U)> {
 	fun next(&mut self): Option<(T, U)> {
-		// The left value is pulled first and DROPPED when the right side is
-		// already exhausted — a length mismatch costs the longer side one extra
-		// pull, which is the price of not buffering.
+		// The left value is pulled first and DROPPED when the right side is already
+		// exhausted — a length mismatch costs the longer side one extra pull, which
+		// is the price of not buffering.
 		if self.left.next() is Some(let first) {
 			if self.right.next() is Some(let second) {
 				ret Some((first, second));

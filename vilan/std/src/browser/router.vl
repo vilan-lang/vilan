@@ -1,16 +1,16 @@
 // `std::router` — history-API routing (proposal/router.md, backlog A10).
 //
-// The model: routes are an ENUM, not pattern strings — the URL is a wire
-// format for a typed value. An app declares its route space as (nested)
-// enums, writes an inverse `parse`/`href` pair over `segments`, and derives
-// its typed route signal itself:
+// The model: routes are an ENUM, not pattern strings — the URL is a wire format for
+// a typed value. An app declares its route space as (nested) enums, writes an
+// inverse `parse`/`href` pair over `segments`, and derives its typed route signal
+// itself:
 //
 //     let route = current_path().map(parse);
 //     view("main").child(swap(route, |current| match current { .. }));
 //
-// Nested layouts are nested functions, guards are `if`s, and `link` takes a
-// route VALUE (`Routable`), so every link's path comes from the enum. Only
-// available when building for the browser.
+// Nested layouts are nested functions, guards are `if`s, and `link` takes a route
+// VALUE (`Routable`), so every link's path comes from the enum. Only available when
+// building for the browser.
 
 import pkg::dom::{ Event, window };
 import pkg::map::Map;
@@ -31,30 +31,29 @@ external fun history_replace(state: str, title: str, path: str): void;
 [extern("__router_path")]
 external fun location_path(): str;
 
-/// `location.pathname + location.search + location.hash` — the whole relative
-/// URL, which is what `parse_path` needs to see a query or a fragment at all.
+/// `location.pathname + location.search + location.hash` — the whole relative URL,
+/// which is what `parse_path` needs to see a query or a fragment at all.
 ///
-/// Deliberately NOT what `current_path()` tracks. A signal that advanced on
-/// every `#anchor` would re-render a page for a scroll, and a route enum whose
-/// `to_path` prints a pathname would then never compare equal to what the
-/// location says. Read this where the query matters — on load, and in a
-/// `popstate` handler — and keep routing on the path.
+/// Deliberately NOT what `current_path()` tracks. A signal that advanced on every
+/// `#anchor` would re-render a page for a scroll, and a route enum whose `to_path`
+/// prints a pathname would then never compare equal to what the location says. Read
+/// this where the query matters — on load, and in a `popstate` handler — and keep
+/// routing on the path.
 export [extern("__router_url")]
 external fun location_url(): str;
 
 /// Decodes percent-escapes (`decodeURIComponent`): `"hello%20world"` is
 /// `"hello world"`, `"caf%C3%A9"` is `"café"`.
 ///
-/// TOTAL, unlike the host function it wraps: a malformed escape (`%zz`, a
-/// trailing `%`) decodes to ITSELF rather than throwing. A URL is text a
-/// stranger chose, so a decoder that can crash is a route that a link can take
-/// down — and the useful answer for a piece that is not an escape sequence is
-/// the piece.
+/// TOTAL, unlike the host function it wraps: a malformed escape (`%zz`, a trailing
+/// `%`) decodes to ITSELF rather than throwing. A URL is text a stranger chose, so
+/// a decoder that can crash is a route that a link can take down — and the useful
+/// answer for a piece that is not an escape sequence is the piece.
 export [extern("__percent_decode")]
 external fun percent_decode(text: str): str;
 
-/// The path-signal singleton (the `std::reactive` module-state pattern) —
-/// created empty at load, wired to the real location on first use.
+/// The path-signal singleton (the `std::reactive` module-state pattern) — created
+/// empty at load, wired to the real location on first use.
 let path_signal: SignalCell<str> = SignalCell::new("");
 export let wired: Shared<bool> = Shared::new(false);
 
@@ -74,52 +73,50 @@ fun ensure_wired() {
 	}
 }
 
-/// The current `location.pathname`, live across `navigate` and back/forward.
-/// Derive the app's typed route from it: `current_path().map(parse)`.
+/// The current `location.pathname`, live across `navigate` and back/forward. Derive
+/// the app's typed route from it: `current_path().map(parse)`.
 export fun current_path(): SignalCell<str> {
 	ensure_wired();
 	path_signal
 }
 
-/// Programmatic navigation: push a history entry and update the path signal.
-/// Joins the caller's ambient turn — an event handler's writes, this one
-/// included, settle as one wave.
+/// Programmatic navigation: push a history entry and update the path signal. Joins
+/// the caller's ambient turn — an event handler's writes, this one included, settle
+/// as one wave.
 export fun navigate(path: str) {
 	ensure_wired();
 	history_push("", "", path);
 	path_signal.set(path);
 }
 
-/// Navigation that REPLACES the current history entry instead of pushing one
-/// (A72): the URL and the path signal advance exactly as `navigate`'s do, and
-/// the back button goes wherever it went before this call.
+/// Navigation that REPLACES the current history entry instead of pushing one (A72):
+/// the URL and the path signal advance exactly as `navigate`'s do, and the back
+/// button goes wherever it went before this call.
 ///
-/// Reach for it where the entry that would be pushed is not a place a user
-/// meant to go back to: a redirect off a bare path onto its canonical form
-/// (`/` → `/inbox`), a sign-in bounce landing on the page the user actually
-/// asked for, a filter or a tab written into the URL so a reload restores it.
-/// Pushing in those places is what makes Back walk through a redirect and
-/// arrive where it started.
+/// Reach for it where the entry that would be pushed is not a place a user meant to
+/// go back to: a redirect off a bare path onto its canonical form (`/` → `/inbox`),
+/// a sign-in bounce landing on the page the user actually asked for, a filter or a
+/// tab written into the URL so a reload restores it. Pushing in those places is
+/// what makes Back walk through a redirect and arrive where it started.
 ///
 /// A SECOND FUNCTION rather than `navigate(path, replace)`: vilan has neither
-/// overloading nor default arguments, so a parameter would be a breaking change
-/// to every existing call — and `navigate_replace(path)` reads as what it does
-/// at the call site, which a bare `true` does not. Joins the caller's ambient
-/// turn, exactly as `navigate` does.
+/// overloading nor default arguments, so a parameter would be a breaking change to
+/// every existing call — and `navigate_replace(path)` reads as what it does at the
+/// call site, which a bare `true` does not. Joins the caller's ambient turn,
+/// exactly as `navigate` does.
 export fun navigate_replace(path: str) {
 	ensure_wired();
 	history_replace("", "", path);
 	path_signal.set(path);
 }
 
-/// A path's non-empty segments, RAW: `"/w/acme/tasks"` → `["w", "acme",
-/// "tasks"]`. Trailing and duplicate slashes are forgiven — they produce no
-/// segment — and a query or fragment is not recognized, so `"/a?b=1"` is one
-/// segment `"a?b=1"`.
+/// A path's non-empty segments, RAW: `"/w/acme/tasks"` → `["w", "acme", "tasks"]`.
+/// Trailing and duplicate slashes are forgiven — they produce no segment — and a
+/// query or fragment is not recognized, so `"/a?b=1"` is one segment `"a?b=1"`.
 ///
 /// `parse_path` is the form that reads a whole URL: same segment rule, plus the
-/// query and the fragment, and every piece percent-DECODED. This one stays raw
-/// so that a caller who wants the URL's own bytes still has them.
+/// query and the fragment, and every piece percent-DECODED. This one stays raw so
+/// that a caller who wants the URL's own bytes still has them.
 export fun segments(path: str): List<str> {
 	mut parts: List<str> = [];
 	for part in path.split("/") {
@@ -132,14 +129,14 @@ export fun segments(path: str): List<str> {
 
 /// A URL taken apart: what `parse_path` reads out of a path string.
 ///
-/// Every piece is percent-DECODED, which is why the parts exist as a value
-/// rather than as three calls over the same string — decoding before splitting
-/// would turn an escaped separator into a real one (`%2F` is a slash INSIDE a
-/// segment, `%26` an ampersand inside a query value), so the order is: cut, then
-/// decode, once, here.
+/// Every piece is percent-DECODED, which is why the parts exist as a value rather
+/// than as three calls over the same string — decoding before splitting would turn
+/// an escaped separator into a real one (`%2F` is a slash INSIDE a segment, `%26`
+/// an ampersand inside a query value), so the order is: cut, then decode, once,
+/// here.
 export struct PathParts {
-	/// The path's non-empty segments, decoded — `segments`'s rule, so
-	/// `"/w//acme/"` is `["w", "acme"]` and `"/"` is `[]`.
+	/// The path's non-empty segments, decoded — `segments`'s rule, so `"/w//acme/"`
+	/// is `["w", "acme"]` and `"/"` is `[]`.
 	segments: List<str>,
 	/// The query string as key → value, decoded. An empty or absent query is an
 	/// empty map; a repeated key keeps the LAST value.
@@ -201,11 +198,11 @@ export fun parse_path(path: str): PathParts {
 /// A query string — WITHOUT its leading `?` — as key → value, decoded:
 /// `"tag=due%20soon&open"` → `{ "tag": "due soon", "open": "" }`.
 ///
-/// `parse_path` calls this; it is public because a query arrives from other
-/// places too (a form's serialization, a link's `href`, `location.search`). An
-/// empty pair is skipped, so `"&&a=1&"` is `{ "a": "1" }`, and a repeated key
-/// keeps the last value — a map, not a multimap, because a route reads one
-/// value per key and the alternative is a `List` at every call site.
+/// `parse_path` calls this; it is public because a query arrives from other places
+/// too (a form's serialization, a link's `href`, `location.search`). An empty pair
+/// is skipped, so `"&&a=1&"` is `{ "a": "1" }`, and a repeated key keeps the last
+/// value — a map, not a multimap, because a route reads one value per key and the
+/// alternative is a `List` at every call site.
 export fun parse_query(query: str): Map<str, str> {
 	mut values: Map<str, str> = Map::new();
 	for pair in query.split("&") {
@@ -224,22 +221,22 @@ export fun parse_query(query: str): Map<str, str> {
 	values
 }
 
-/// A value that prints as a history-API path — implement it on the app's
-/// route enum (usually delegating to the app's `href`). What `link` accepts.
+/// A value that prints as a history-API path — implement it on the app's route enum
+/// (usually delegating to the app's `href`). What `link` accepts.
 export trait Routable {
 	fun to_path(self): str;
 }
 
 /// `Routable`'s inverse: a value the URL can be READ back into, declared once
-/// beside the one that writes it. A type implementing both states its wire
-/// format in both directions, and the pair has a law — `from_path(r.to_path())
-/// == r` for every route the app can reach — which is one round-trip test per
-/// route space instead of a drift nobody notices until a link 404s.
+/// beside the one that writes it. A type implementing both states its wire format
+/// in both directions, and the pair has a law — `from_path(r.to_path()) == r` for
+/// every route the app can reach — which is one round-trip test per route space
+/// instead of a drift nobody notices until a link 404s.
 ///
-/// The member is over SEGMENTS, not over the path, because that is where a
-/// route space is actually decided: `parse_path` has already cut, decoded, and
-/// dropped the empty segments, so an implementation is a `match` on `len()`
-/// and a few string comparisons with no index arithmetic to get wrong.
+/// The member is over SEGMENTS, not over the path, because that is where a route
+/// space is actually decided: `parse_path` has already cut, decoded, and dropped
+/// the empty segments, so an implementation is a `match` on `len()` and a few
+/// string comparisons with no index arithmetic to get wrong.
 ///
 /// A total function, deliberately — no `Option`. A URL a route space does not
 /// recognize is a route (`NotFound`), and an app that models it as one gets to
@@ -259,16 +256,16 @@ export trait FromPath {
 	fun from_segments(parts: List<str>): Self;
 }
 
-/// The route a whole path names: `parse_path`, then the type's own
-/// `from_segments`. The counterpart to `to_path`, and the call an app makes.
+/// The route a whole path names: `parse_path`, then the type's own `from_segments`.
+/// The counterpart to `to_path`, and the call an app makes.
 ///
-/// It is a FREE function rather than a `from_path` default on the trait
-/// because the language admits neither half of that shape — `Self::` cannot
-/// dispatch inside a trait default (an associated function without a body has
-/// nothing to call), and an associated function with a default body is not
-/// inherited by an impl (there is no receiver to inherit it through). Both are
-/// diagnosed, both are deliberate; a generic function over the bound is the
-/// spelling that works, and it monomorphizes the same way.
+/// It is a FREE function rather than a `from_path` default on the trait because the
+/// language admits neither half of that shape — `Self::` cannot dispatch inside a
+/// trait default (an associated function without a body has nothing to call), and
+/// an associated function with a default body is not inherited by an impl (there is
+/// no receiver to inherit it through). Both are diagnosed, both are deliberate; a
+/// generic function over the bound is the spelling that works, and it monomorphizes
+/// the same way.
 ///
 /// The route type comes from context — an annotation, a parameter, or a
 /// return:
@@ -280,23 +277,22 @@ export fun from_path<R: FromPath>(path: str): R {
 	R::from_segments(parse_path(path).segments)
 }
 
-/// A navigation link: a real `<a href=..>` (middle-click / ctrl-click /
-/// copy-link keep native anchor behavior), intercepting only a PLAIN
-/// left-click with `prevent_default` + `navigate`. Returns a `View` — chain
-/// as usual (`link("Tasks", route).styled(nav_item)`).
+/// A navigation link: a real `<a href=..>` (middle-click / ctrl-click / copy-link
+/// keep native anchor behavior), intercepting only a PLAIN left-click with
+/// `prevent_default` + `navigate`. Returns a `View` — chain as usual
+/// (`link("Tasks", route).styled(nav_item)`).
 ///
-/// The anchor is NOT DRAGGABLE (B293), and that is the one thing here that is
-/// not plain anchor behavior. An `<a href>` is drag-armed by default, and in
-/// Chrome a link drag that starts while a quick click's in-app navigation is
-/// still settling WEDGES THE TAB: from then on every drag in that tab gets
-/// `dragstart` then `pointercancel` and never `dragend`, and pointer input
-/// stays dead — hover, `:active`, clicks, native scrollbars — while
-/// compositor wheel scrolling keeps working. It is per TAB, survives a hard
-/// refresh, and only a new tab escapes it. Chrome's bug to fix; std's not to
-/// arm it. The cost is nothing an app wants: the `href` stays, so
-/// middle-click, ctrl-click and copy-link-address are untouched, and only the
-/// native "drag this link somewhere" gesture goes. An app that hand-writes
-/// its own `<a href on:click>` should set the attribute too.
+/// The anchor is NOT DRAGGABLE (B293), and that is the one thing here that is not
+/// plain anchor behavior. An `<a href>` is drag-armed by default, and in Chrome a
+/// link drag that starts while a quick click's in-app navigation is still settling
+/// WEDGES THE TAB: from then on every drag in that tab gets `dragstart` then
+/// `pointercancel` and never `dragend`, and pointer input stays dead — hover,
+/// `:active`, clicks, native scrollbars — while compositor wheel scrolling keeps
+/// working. It is per TAB, survives a hard refresh, and only a new tab escapes it.
+/// Chrome's bug to fix; std's not to arm it. The cost is nothing an app wants: the
+/// `href` stays, so middle-click, ctrl-click and copy-link-address are untouched,
+/// and only the native "drag this link somewhere" gesture goes. An app that
+/// hand-writes its own `<a href on:click>` should set the attribute too.
 export fun link<R: Routable>(label: str, route: R): View {
 	view("a").link_to(route).text(label)
 }
@@ -331,8 +327,8 @@ export impl View {
 	}
 }
 
-/// A main-button click with no modifier keys — the only click `link`
-/// intercepts; anything else keeps the anchor's native behavior.
+/// A main-button click with no modifier keys — the only click `link` intercepts;
+/// anything else keeps the anchor's native behavior.
 export fun plain_left_click(event: Event): bool {
 	let no_modifiers = !event.meta_key()
 		&& !event.ctrl_key()
@@ -341,21 +337,19 @@ export fun plain_left_click(event: Event): bool {
 	event.button() == 0 && no_modifiers
 }
 
-/// True while a route chunk is being fetched — the loading hook of a split
-/// build (proposal/bundle-splitting.md §2). The route signal does not advance
-/// until the chunk lands, so the previous page stays on screen; bind this to
-/// show a spinner over it. Always false in a single-file build, which has no
-/// chunk to wait for.
+/// True while a route chunk is being fetched — the loading hook of a split build
+/// (proposal/bundle-splitting.md §2). The route signal does not advance until the
+/// chunk lands, so the previous page stays on screen; bind this to show a spinner
+/// over it. Always false in a single-file build, which has no chunk to wait for.
 export fun pending(): SignalCell<bool> {
 	chunk_pending()
 }
 
-/// Why the last route chunk fetch FAILED, or `None`
-/// (proposal/bundle-splitting.md §S3) — the failure hook beside `pending()`.
-/// A failed fetch leaves the route where it was (the navigation simply did not
-/// happen) and publishes the reason here; the next navigation clears it and
-/// refetches, so a retry is a link click and needs no API. Always `None` in a
-/// single-file build.
+/// Why the last route chunk fetch FAILED, or `None` (proposal/bundle-splitting.md
+/// §S3) — the failure hook beside `pending()`. A failed fetch leaves the route
+/// where it was (the navigation simply did not happen) and publishes the reason
+/// here; the next navigation clears it and refetches, so a retry is a link click
+/// and needs no API. Always `None` in a single-file build.
 export fun chunk_error(): SignalCell<Option<str>> {
 	chunk_failure()
 }

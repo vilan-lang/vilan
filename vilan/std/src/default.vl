@@ -4,9 +4,9 @@ trait Default {
 	fun default(): Self;
 }
 
-// Default values for the core scalar primitives that don't define one in their
-// own module (numbers do, in `number.vl`). An empty string and `false` mirror
-// the zero/identity each takes.
+// Default values for the core scalar primitives that don't define one in their own
+// module (numbers do, in `number.vl`). An empty string and `false` mirror the
+// zero/identity each takes.
 impl str with Default {
 	fun default(): str {
 		""
@@ -33,8 +33,8 @@ macro fun Default(item: Item): Source {
 		}
 		// The subject is spelled as an application of its own parameters
 		// (`Holder<T>`) where a TYPE is wanted, and the impl binds them under
-		// `Default` (B194's rule); the struct literal's head names a namespace
-		// and stays bare.
+		// `Default` (B194's rule); the struct literal's head names a namespace and
+		// stays bare.
 		let constructor = fun_of("default").returns(target.subject()).expr(literal.render());
 		ret source("import std::default::Default;\n" + impl_of(target.name)
 			.generics(target.binders("Default"))

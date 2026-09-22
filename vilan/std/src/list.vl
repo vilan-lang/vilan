@@ -1,6 +1,6 @@
-// `List<T>` is the built-in growable array. It is `external` (an opaque
-// intrinsic): a `List` value is a native JS array, `List::new()` is `[]`, and
-// `push` is the native `.push`. Iterating a `List` uses a native `for...of`.
+// `List<T>` is the built-in growable array. It is `external` (an opaque intrinsic):
+// a `List` value is a native JS array, `List::new()` is `[]`, and `push` is the
+// native `.push`. Iterating a `List` uses a native `for...of`.
 import pkg::default::Default;
 import pkg::iterator::ListIterator;
 import pkg::operators::{ Add, Mul };
@@ -13,13 +13,13 @@ external struct List<T>;
 impl List<type T> {
 	external fun new(): List<T>;
 
-	/// Appends `item`, which the list KEEPS — hence `own` (rule 1: storing a
-	/// place in a slot that outlives the call is a copy, and `own` is how a
-	/// signature says so; a fresh value moves in for free).
+	/// Appends `item`, which the list KEEPS — hence `own` (rule 1: storing a place
+	/// in a slot that outlives the call is a copy, and `own` is how a signature
+	/// says so; a fresh value moves in for free).
 	external fun push(&mut self, own item: T): void;
 
-	/// Removes and returns the last element — `None` when empty (an intrinsic:
-	/// the compiler lowers it over the native `.pop`).
+	/// Removes and returns the last element — `None` when empty (an intrinsic: the
+	/// compiler lowers it over the native `.pop`).
 	external fun pop(&mut self): Option<T>;
 
 	external fun len(self): i32;
@@ -29,10 +29,10 @@ impl List<type T> {
 	}
 
 	/// A lazy cursor over the list, and the entry to the adapter chain:
-	/// `xs.iter().filter(f).take(3).to_list()`. The cursor holds a SNAPSHOT
-	/// (rule 1), so mutating `xs` afterwards cannot disturb a walk in flight —
-	/// and the copy is why the eager methods below do not route through it for
-	/// a single pass.
+	/// `xs.iter().filter(f).take(3).to_list()`. The cursor holds a SNAPSHOT (rule
+	/// 1), so mutating `xs` afterwards cannot disturb a walk in flight — and the
+	/// copy is why the eager methods below do not route through it for a single
+	/// pass.
 	fun iter(self): ListIterator<T> {
 		ListIterator { items = self, index = 0 }
 	}
@@ -86,21 +86,21 @@ impl List<type T> {
 	}
 
 	/// Inserts `value` before the element at `index`, shifting the tail right.
-	/// `index == len()` appends. PANICS out of bounds, in `[]`'s words: a bad
-	/// index is a caller bug, the class `[]` already punishes. (`get`'s
-	/// `Option` is for callers who don't know whether an index is live; an
-	/// arbitrary bad index passed to a splice is not that.)
+	/// `index == len()` appends. PANICS out of bounds, in `[]`'s words: a bad index
+	/// is a caller bug, the class `[]` already punishes. (`get`'s `Option` is for
+	/// callers who don't know whether an index is live; an arbitrary bad index
+	/// passed to a splice is not that.)
 	///
-	/// An intrinsic, like `pop`: the compiler lowers it over the native
-	/// `.splice`, one `memmove` instead of a checked load and store per moved
-	/// element. The emitted helper keeps the panic, because `splice` CLAMPS an
-	/// index past the end — it would silently accept exactly the index this
-	/// doc says a caller must be punished for.
+	/// An intrinsic, like `pop`: the compiler lowers it over the native `.splice`,
+	/// one `memmove` instead of a checked load and store per moved element. The
+	/// emitted helper keeps the panic, because `splice` CLAMPS an index past the
+	/// end — it would silently accept exactly the index this doc says a caller must
+	/// be punished for.
 	external fun insert(&mut self, index: i32, own value: T): void;
 
-	/// Removes and returns the element at `index`, shifting the tail left.
-	/// PANICS out of bounds — see `insert`. (`pop` returns an `Option` because
-	/// "the list was empty" is a normal condition; a bad index is not.)
+	/// Removes and returns the element at `index`, shifting the tail left. PANICS
+	/// out of bounds — see `insert`. (`pop` returns an `Option` because "the list
+	/// was empty" is a normal condition; a bad index is not.)
 	///
 	/// An intrinsic over the native `.splice`, like `insert`. The emitted
 	/// helper keeps the panic: `splice` reads a NEGATIVE index from the END,
@@ -109,10 +109,10 @@ impl List<type T> {
 	external fun remove(&mut self, index: i32): T;
 }
 
-// `sum`/`product` seed with the first element and fall back to `T::default()`
-// only for an empty list. NOTE: that empty-list fallback can't resolve `T`
-// concretely yet — a `List` erases its element type — so it relies on Gap B
-// (parameterized enum/struct types). The common non-empty path works today.
+// `sum`/`product` seed with the first element and fall back to `T::default()` only
+// for an empty list. NOTE: that empty-list fallback can't resolve `T` concretely
+// yet — a `List` erases its element type — so it relies on Gap B (parameterized
+// enum/struct types). The common non-empty path works today.
 impl List<type T: Add + Default> {
 	fun sum(self): T {
 		mut total = T::default();
@@ -131,10 +131,10 @@ impl List<type T: Add + Default> {
 
 /// The empty list is a `List`'s default (I4). It is here rather than in
 /// `default.vl` for the reason that module's own comment gives: a type with a
-/// module of its own declares its default there, the way `Option` does. Without
-/// it a `T: Default` bound could not be met by a container at all, so a derived
-/// `Default` over a struct holding a `List` had nothing to call and every app
-/// wrote the impl itself (kolt's `prefs.vl:100`, for `Map`).
+/// module of its own declares its default there, the way `Option` does. Without it
+/// a `T: Default` bound could not be met by a container at all, so a derived
+/// `Default` over a struct holding a `List` had nothing to call and every app wrote
+/// the impl itself (kolt's `prefs.vl:100`, for `Map`).
 impl List<type T> with Default {
 	fun default(): List<T> {
 		[]

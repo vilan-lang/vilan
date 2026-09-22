@@ -1,9 +1,9 @@
 // Compile-time build outputs (proposal/const-eval.md §3): `emit(kind, line)`
-// appends a line to the build's `kind` asset. The channel deduplicates by
-// line, orders deterministically, and writes `<output>.<kind>` beside the
-// compiled JS. Compile-time-only: callable only from within a `const`
-// expression — a runtime call path is a compile error. `emit_keyed` below is
-// the same channel with the contribution's own sort key.
+// appends a line to the build's `kind` asset. The channel deduplicates by line,
+// orders deterministically, and writes `<output>.<kind>` beside the compiled JS.
+// Compile-time-only: callable only from within a `const` expression — a runtime
+// call path is a compile error. `emit_keyed` below is the same channel with the
+// contribution's own sort key.
 
 export *;
 
@@ -11,34 +11,33 @@ export *;
 external fun emit(kind: str, line: str): void;
 
 // `emit`'s ORDERED spelling (proposal/build-hooks.md §5.3): the contribution
-// carries its own sort key. The kind's file holds its lines ordered by
-// (key, line) and deduplicated by that same pair, so two contributions of one
-// line under two keys are two contributions and both survive.
+// carries its own sort key. The kind's file holds its lines ordered by (key, line)
+// and deduplicated by that same pair, so two contributions of one line under two
+// keys are two contributions and both survive.
 //
-// The key is data you compute — a route's path, an icon's name, a zero-padded
-// rank — and the flush never re-derives it from the line. It is never written:
-// only `line` reaches the file.
+// The key is data you compute — a route's path, an icon's name, a zero-padded rank
+// — and the flush never re-derives it from the line. It is never written: only
+// `line` reaches the file.
 //
-// `emit(kind, line)` is exactly `emit_keyed(kind, line, line)`, which is why
-// an un-keyed kind's file is ordered lexically by line.
+// `emit(kind, line)` is exactly `emit_keyed(kind, line, line)`, which is why an
+// un-keyed kind's file is ordered lexically by line.
 //
-// The `css` kind is refused here: the style sidecar is ordered by the CSS
-// cascade rather than by a contribution's key, so a key passed for it would
-// have no meaning. Write CSS with `emit`, or with `std::style`.
+// The `css` kind is refused here: the style sidecar is ordered by the CSS cascade
+// rather than by a contribution's key, so a key passed for it would have no
+// meaning. Write CSS with `emit`, or with `std::style`.
 //
 // Compile-time-only, exactly like `emit`.
 
 [extern("__emit_asset_keyed")]
 external fun emit_keyed(kind: str, key: str, line: str): void;
 
-// Compile-time build inputs (proposal/docs-port.md §3.3, markdown.md §7 —
-// the read direction of the channel above): `read(path)` returns the file's
-// text. The path must be relative and resolves against the package root (the
-// same base imports resolve under), never the process working directory; a
-// path that is absolute, escapes the root, or names no readable file is a
-// compile error at the `const` expression. Every file read becomes a tracked
-// build input: a change to it invalidates the compile that read it.
-// Compile-time-only, exactly like `emit`.
+// Compile-time build inputs (proposal/docs-port.md §3.3, markdown.md §7 — the read
+// direction of the channel above): `read(path)` returns the file's text. The path
+// must be relative and resolves against the package root (the same base imports
+// resolve under), never the process working directory; a path that is absolute,
+// escapes the root, or names no readable file is a compile error at the `const`
+// expression. Every file read becomes a tracked build input: a change to it
+// invalidates the compile that read it. Compile-time-only, exactly like `emit`.
 
 // The END-OF-EVALUATION HOOK (G23): `schedule_at_end(f)` asks the build to
 // call `f` once, after EVERY const evaluation of this compile has finished,
@@ -49,19 +48,18 @@ external fun emit_keyed(kind: str, key: str, line: str): void;
 // rule is recorded when it is built and the sheet is written here, once, from
 // the rules that survived.
 //
-// `f` must be a NAMED function, and its name is its IDENTITY: scheduling the
-// same function three times schedules it once (the set is deduplicated, so
-// every contributor can ask without coordinating), and the order the
-// finalisers run in is the order they were first asked for. An anonymous
-// closure is refused — a closure's captured scope belongs to the evaluation
-// that made it and does not survive to the end of the pass, so there would be
-// nothing to call.
+// `f` must be a NAMED function, and its name is its IDENTITY: scheduling the same
+// function three times schedules it once (the set is deduplicated, so every
+// contributor can ask without coordinating), and the order the finalisers run in is
+// the order they were first asked for. An anonymous closure is refused — a
+// closure's captured scope belongs to the evaluation that made it and does not
+// survive to the end of the pass, so there would be nothing to call.
 //
-// A finaliser sees every contribution made AFTER its scheduling, which is the
-// point of the hook: it runs after the last const expression, not after the
-// one that asked for it. A finaliser may schedule another (it runs in the same
-// pass); one that re-schedules itself does nothing. A finaliser that panics
-// fails the build, naming the function.
+// A finaliser sees every contribution made AFTER its scheduling, which is the point
+// of the hook: it runs after the last const expression, not after the one that
+// asked for it. A finaliser may schedule another (it runs in the same pass); one
+// that re-schedules itself does nothing. A finaliser that panics fails the build,
+// naming the function.
 //
 // "The end" is the end of ONE COMPILE's const pass — per leg, like every other
 // const fact. Under `run --watch` that is the end of the ROUND: what the round
@@ -73,30 +71,30 @@ external fun emit_keyed(kind: str, key: str, line: str): void;
 [extern("__schedule_at_end")]
 external fun schedule_at_end(finaliser: || void): void;
 
-// The channel's REGISTRY (B308), and what the hook above is for. `stage(kind,
-// token, line)` records a contribution WITHOUT writing it: the build holds it
-// until evaluation ends, and it reaches the kind's file only if a finaliser
-// puts it there. `token` is the contribution's LIVENESS TOKEN — the name the
-// rest of the build has to still be using for the line to be worth keeping.
+// The channel's REGISTRY (B308), and what the hook above is for.
+// `stage(kind, token, line)` records a contribution WITHOUT writing it: the build
+// holds it until evaluation ends, and it reaches the kind's file only if a
+// finaliser puts it there. `token` is the contribution's LIVENESS TOKEN — the name
+// the rest of the build has to still be using for the line to be worth keeping.
 //
-// `staged(kind)` is the read-back: the staged lines of `kind` whose token the
-// build still NAMES — a token appears in a value some `const` expression
-// evaluated to — in `(token, line)` order and deduplicated on that pair, the
-// same order and the same dedup the keyed flush uses, so the answer is a
-// function of the SET of contributions and never of the order they were made
-// in. A contribution staged with an empty token is unconditional: it names
-// nothing, so nothing can stop naming it.
+// `staged(kind)` is the read-back: the staged lines of `kind` whose token the build
+// still NAMES — a token appears in a value some `const` expression evaluated to —
+// in `(token, line)` order and deduplicated on that pair, the same order and the
+// same dedup the keyed flush uses, so the answer is a function of the SET of
+// contributions and never of the order they were made in. A contribution staged
+// with an empty token is unconditional: it names nothing, so nothing can stop
+// naming it.
 //
-// It answers only AFTER evaluation has finished — until the last `const`
-// expression has run, a token may still be about to be named — so it is read
-// from a function passed to `schedule_at_end` and reading it anywhere else is
-// a compile error saying so. That pairing is the mechanism: a module stages
-// while the program evaluates, and its finaliser emits what survived.
+// It answers only AFTER evaluation has finished — until the last `const` expression
+// has run, a token may still be about to be named — so it is read from a function
+// passed to `schedule_at_end` and reading it anywhere else is a compile error
+// saying so. That pairing is the mechanism: a module stages while the program
+// evaluates, and its finaliser emits what survived.
 //
-// This is how `std::style` writes a stylesheet. Every rule is staged under
-// its class; a condition combinator that re-mints an inner style's rules under
-// a composed condition drops the inner, so the inner's class is in no
-// surviving style and its rule never reaches the sheet.
+// This is how `std::style` writes a stylesheet. Every rule is staged under its
+// class; a condition combinator that re-mints an inner style's rules under a
+// composed condition drops the inner, so the inner's class is in no surviving style
+// and its rule never reaches the sheet.
 //
 // Compile-time-only, exactly like `emit`.
 
@@ -109,20 +107,20 @@ external fun staged(kind: str): List<str>;
 [extern("__read_asset")]
 external fun read(path: str): str;
 
-// Compile-time build outputs, whole FILES (kolt.local 029 — `emit`'s sibling
-// on the other axis: `emit` accumulates LINES into one generated file, this
-// carries an existing file through unchanged). `bundle(path)` tells the build
-// to copy the file into the output directory beside the compiled JS, and
-// returns the url its copy answers on: `bundle("static/logo.png")` writes
-// `dist/static/logo.png` and evaluates to `"/static/logo.png"`.
+// Compile-time build outputs, whole FILES (kolt.local 029 — `emit`'s sibling on the
+// other axis: `emit` accumulates LINES into one generated file, this carries an
+// existing file through unchanged). `bundle(path)` tells the build to copy the file
+// into the output directory beside the compiled JS, and returns the url its copy
+// answers on: `bundle("static/logo.png")` writes `dist/static/logo.png` and
+// evaluates to `"/static/logo.png"`.
 //
-// The path is the name. It is relative and resolves against the package root
-// (the same base imports and `read` resolve under), it is `/`-separated on
-// every host, and the copy keeps it — so a subdirectory survives, two
-// different files can never claim one output name, and nothing is renamed
-// behind your back. Where a resource lands in `dist/` is therefore decided by
-// where you put the file. A path that is absolute, escapes the root, or names
-// no readable file is a compile error at the `const` expression.
+// The path is the name. It is relative and resolves against the package root (the
+// same base imports and `read` resolve under), it is `/`-separated on every host,
+// and the copy keeps it — so a subdirectory survives, two different files can never
+// claim one output name, and nothing is renamed behind your back. Where a resource
+// lands in `dist/` is therefore decided by where you put the file. A path that is
+// absolute, escapes the root, or names no readable file is a compile error at the
+// `const` expression.
 //
 // The file becomes a tracked build input exactly as `read`'s does: change it
 // and the compile that named it is invalidated, so `run --watch` recopies it.
@@ -149,10 +147,9 @@ external fun bundle(path: str): str;
 // because the target IS the url.)
 //
 // 029's "nothing is renamed behind your back" survives because the rename is
-// spelled here: a file lands somewhere its own path does not spell only where
-// a program said so. What this frees is the path-pinned name — `/favicon.ico`
-// can live under `static/` — and the fingerprinted url, which needs `digest`
-// below.
+// spelled here: a file lands somewhere its own path does not spell only where a
+// program said so. What this frees is the path-pinned name — `/favicon.ico` can
+// live under `static/` — and the fingerprinted url, which needs `digest` below.
 //
 // The url starts with `/`, is `/`-separated on every host (a backslash is
 // refused rather than translated), and every segment must be a NAME: no empty
@@ -162,19 +159,19 @@ external fun bundle(path: str): str;
 // (`<leg>.js`, `<leg>.css`, `<leg>.chunks.json`, the route chunks) exactly as
 // `bundle`'s is, by reaching the same check.
 //
-// One refusal `bundle` did not need: "the path is the name" made two files
-// claiming one name impossible, and this breaks that, so two registrations of
-// one target from two different sources are a compile error naming both. The
-// same (source, target) pair reached twice deduplicates, as `bundle`'s does.
+// One refusal `bundle` did not need: "the path is the name" made two files claiming
+// one name impossible, and this breaks that, so two registrations of one target
+// from two different sources are a compile error naming both. The same (source,
+// target) pair reached twice deduplicates, as `bundle`'s does.
 //
 // Compile-time-only, exactly like `bundle`.
 
 [extern("__bundle_asset_as")]
 external fun bundle_as(path: str, url: str): str;
 
-// The channel's DIRECTORY listing (kolt.local 035, const-eval.md §3.1) —
-// `read`'s sibling one level up, and what lets a static estate be a loop
-// instead of a hand-written list of `bundle` calls:
+// The channel's DIRECTORY listing (kolt.local 035, const-eval.md §3.1) — `read`'s
+// sibling one level up, and what lets a static estate be a loop instead of a
+// hand-written list of `bundle` calls:
 //
 //     fun static_estate() {
 //         for file in asset::read_dir_all("static") {
@@ -192,8 +189,8 @@ external fun bundle_as(path: str, url: str): str;
 // missing, unreadable, or not-a-directory path is a compile error at the
 // `const` expression.
 //
-// Two things differ from `std::fs::read_dir`, both because this result is
-// compiled INTO the build:
+// Two things differ from `std::fs::read_dir`, both because this result is compiled
+// INTO the build:
 //
 //   - **Entries are byte-sorted, always.** `std::fs` is honest that the
 //     host's order is the host's; here host order would make one source tree
@@ -203,27 +200,26 @@ external fun bundle_as(path: str, url: str): str;
 //     there is no const `stat`, so a directory entry would be one the program
 //     could neither act on nor filter out.
 //
-// A symlink is classified by what it points AT, so a link to a file is a file
-// and is bundleable; the walk never follows one into a directory, so it
-// cannot loop. Nothing is filtered by name: a dotfile is an entry.
+// A symlink is classified by what it points AT, so a link to a file is a file and
+// is bundleable; the walk never follows one into a directory, so it cannot loop.
+// Nothing is filtered by name: a dotfile is an entry.
 //
 // The directory is a tracked build input, exactly as a read file is: a file
 // appearing or disappearing invalidates the compile that listed it, both
-// directions, so `run --watch` sees a new asset arrive. Fuel is charged per
-// entry (the directory itself counting as one), which prices the walk rather
-// than the names.
+// directions, so `run --watch` sees a new asset arrive. Fuel is charged per entry
+// (the directory itself counting as one), which prices the walk rather than the
+// names.
 //
 // Compile-time-only, exactly like `read`.
 
 [extern("__read_asset_dir")]
 external fun read_dir(path: str): List<str>;
 
-// `read_dir`'s recursive spelling: every FILE beneath `path`, however deep, as
-// a path RELATIVE to `path` (`"icons/close.svg"`), `/`-separated on every host
-// and byte-sorted on the whole relative path — so a tree's listing is stable
-// whatever order the host walks in. Every rule above holds here, and the
-// tracked-input record is per DIRECTORY walked, so a change anywhere in the
-// tree invalidates.
+// `read_dir`'s recursive spelling: every FILE beneath `path`, however deep, as a
+// path RELATIVE to `path` (`"icons/close.svg"`), `/`-separated on every host and
+// byte-sorted on the whole relative path — so a tree's listing is stable whatever
+// order the host walks in. Every rule above holds here, and the tracked-input
+// record is per DIRECTORY walked, so a change anywhere in the tree invalidates.
 //
 // Compile-time-only, exactly like `read_dir`.
 
@@ -235,8 +231,8 @@ external fun read_dir_all(path: str): List<str>;
 // be a fingerprint of the file and not of a decoding, which is also why this
 // exists rather than `crypto` over `read`'s text.
 //
-// What it is for is the content-hashed url — the immutable-cache tier's whole
-// basis — now spellable in the language that ships the file:
+// What it is for is the content-hashed url — the immutable-cache tier's whole basis
+// — now spellable in the language that ships the file:
 //
 //     let logo = const asset::bundle_as(
 //         "static/logo.png",
@@ -244,10 +240,10 @@ external fun read_dir_all(path: str): List<str>;
 //     );
 //
 // The file is a tracked build input exactly as `read`'s is, so a changed file
-// re-mints the url. Fuel is charged per byte at an eighth of `read`'s rate:
-// the bytes never enter the program and the result is 64 characters whatever
-// the file weighs, so the charge bounds how much a build hashes rather than
-// how large a value it holds.
+// re-mints the url. Fuel is charged per byte at an eighth of `read`'s rate: the
+// bytes never enter the program and the result is 64 characters whatever the file
+// weighs, so the charge bounds how much a build hashes rather than how large a
+// value it holds.
 //
 // Compile-time-only, exactly like `read`.
 

@@ -1,12 +1,11 @@
-// SQLite over the host's built-in `node:sqlite` (proposal/kolt-migration.md
-// §2.2): the server-only storage seam. Node 22.5+ ships it; Deno 2 serves it
-// through node-compat — no package-manager dependency at all. The client
-// physically cannot import this module (it lives in the @process platform
-// layer), which is Kolt's server-only-database principle made structural.
+// SQLite over the host's built-in `node:sqlite` (proposal/kolt-migration.md §2.2):
+// the server-only storage seam. Node 22.5+ ships it; Deno 2 serves it through
+// node-compat — no package-manager dependency at all. The client physically cannot
+// import this module (it lives in the @process platform layer), which is Kolt's
+// server-only-database principle made structural.
 //
-// Minimal by design: exec / prepare / run / first / all, with rows read
-// through typed column accessors. No ORM ambitions — grow from real call
-// sites.
+// Minimal by design: exec / prepare / run / first / all, with rows read through
+// typed column accessors. No ORM ambitions — grow from real call sites.
 
 import pkg::drop::Drop;
 import pkg::io::panic;
@@ -14,11 +13,11 @@ import pkg::option::Option::{ self, None, Some };
 import pkg::set::Set;
 import pkg::time::now;
 
-/// An open database handle (`node:sqlite`'s DatabaseSync — synchronous, the
-/// right shape for a single-threaded server loop over local storage). A
-/// `resource`: it moves rather than copies, and its `Drop` (below) closes the
-/// underlying handle at the owner's scope end. A module-level `Database` is
-/// process-lifetime and never drops — the serve-forever server idiom.
+/// An open database handle (`node:sqlite`'s DatabaseSync — synchronous, the right
+/// shape for a single-threaded server loop over local storage). A `resource`: it
+/// moves rather than copies, and its `Drop` (below) closes the underlying handle at
+/// the owner's scope end. A module-level `Database` is process-lifetime and never
+/// drops — the serve-forever server idiom.
 export resource external struct Database;
 
 /// A prepared statement (reusable; parameters bind per call).
@@ -43,8 +42,8 @@ export impl Database {
 
 /// Closes the underlying `node:sqlite` handle — the one host operation with no
 /// public surface. It is reachable only from `Database`'s `Drop` (below), so a
-/// handle closes exactly once, at teardown. There is no public `close()` to
-/// fall out of sync with the destructor; `drop(db)` is the early form.
+/// handle closes exactly once, at teardown. There is no public `close()` to fall
+/// out of sync with the destructor; `drop(db)` is the early form.
 [extern("__db_close")]
 external fun close_handle(database: Database): void;
 
@@ -86,9 +85,9 @@ external fun column_real(row: Row, name: str): f64;
 external fun column_is_null(row: Row, name: str): bool;
 
 export impl Statement {
-	/// Executes with `parameters` bound positionally; returns the inserted
-	/// rowid (0 when the statement inserts nothing). Rowids exceed i32 only
-	/// past 2^31 rows — revisit alongside real i53 needs.
+	/// Executes with `parameters` bound positionally; returns the inserted rowid (0
+	/// when the statement inserts nothing). Rowids exceed i32 only past 2^31 rows —
+	/// revisit alongside real i53 needs.
 	fun run(self, parameters: List<any>): i32 {
 		statement_run(self, parameters)
 	}
@@ -112,9 +111,9 @@ export impl Row {
 		column_integer(self, name)
 	}
 
-	/// An INTEGER column at i53 width — timestamps (epoch millis), large ids.
-	/// Exact for values to 2^53 (the i53 representation); a column beyond that
-	/// arrives from `node:sqlite` as a BigInt and is out of v1's reach.
+	/// An INTEGER column at i53 width — timestamps (epoch millis), large ids. Exact
+	/// for values to 2^53 (the i53 representation); a column beyond that arrives
+	/// from `node:sqlite` as a BigInt and is out of v1's reach.
 	fun big_integer(self, name: str): i53 {
 		column_big_integer(self, name)
 	}
@@ -131,11 +130,10 @@ export impl Row {
 // --- Migrations (db-migrations.md, kolt.local 036) ----------------------------
 //
 // `CREATE TABLE IF NOT EXISTS` is an idempotent schema ENSURE, and it is right
-// exactly until the first schema CHANGE: add a column and the clause is a
-// no-op, so the running database keeps the old shape while the code querying
-// it has the new one. `migrate` is the spelling for "carry this database
-// forward" — an ordered list of named steps, the applied ones recorded in a
-// table this module owns.
+// exactly until the first schema CHANGE: add a column and the clause is a no-op, so
+// the running database keeps the old shape while the code querying it has the new
+// one. `migrate` is the spelling for "carry this database forward" — an ordered
+// list of named steps, the applied ones recorded in a table this module owns.
 
 /// One migration step: a `name` that identifies it forever, and the `sql` that
 /// applies it. The name is the row's key in the applied table, so it must be
@@ -157,17 +155,16 @@ export struct Migration {
 	sql: str,
 }
 
-/// `database.exec(sql)` / `statement.run(parameters)` with the host throw
-/// CAUGHT: `None` on success, `Some(message)` carrying the host's own
-/// diagnosis on failure. `vilan` has no `try`/`catch`, so the catch is glue
-/// (`__db_exec_guarded` / `__db_run_guarded`, `transformer.rs`) in the same
-/// "`Option` array form" `Database.first` and `std::fs::stat` already use at
-/// this boundary.
+/// `database.exec(sql)` / `statement.run(parameters)` with the host throw CAUGHT:
+/// `None` on success, `Some(message)` carrying the host's own diagnosis on failure.
+/// `vilan` has no `try`/`catch`, so the catch is glue (`__db_exec_guarded` /
+/// `__db_run_guarded`, `transformer.rs`) in the same "`Option` array form"
+/// `Database.first` and `std::fs::stat` already use at this boundary.
 ///
 /// Deliberately not public surface: whether `std::db` should offer a
-/// `Result`-returning `try_exec` is a question about the module's error posture
-/// — everything else in it throws — and it wants its own answer rather than
-/// arriving as a side effect of migrations (`db-migrations.md` §6).
+/// `Result`-returning `try_exec` is a question about the module's error posture —
+/// everything else in it throws — and it wants its own answer rather than arriving
+/// as a side effect of migrations (`db-migrations.md` §6).
 [extern("__db_exec_guarded")]
 external fun exec_guarded(database: Database, sql: str): Option<str>;
 
@@ -175,25 +172,23 @@ external fun exec_guarded(database: Database, sql: str): Option<str>;
 external fun run_guarded(statement: Statement, parameters: List<any>): Option<str>;
 
 export impl Database {
-	/// Applies `migrations` in LIST ORDER, recording each in the
-	/// `vilan_migrations` table this module owns, and returns the names it
-	/// applied. A re-run applies nothing and returns an empty list — call it at
-	/// boot, unconditionally, before the first query.
+	/// Applies `migrations` in LIST ORDER, recording each in the `vilan_migrations`
+	/// table this module owns, and returns the names it applied. A re-run applies
+	/// nothing and returns an empty list — call it at boot, unconditionally, before
+	/// the first query.
 	///
-	/// Each step runs inside its own transaction WITH its record insert, which
-	/// buys the invariant everything else rests on: **a step is recorded if and
-	/// only if its SQL committed.** There is no window in which the schema
-	/// moved and the record did not. A process killed mid-migration leaves a
-	/// database whose recorded set exactly describes its schema, and the next
-	/// boot resumes from there. The transaction is per STEP and not per run: a
-	/// failure in the fifth step leaves the first four applied and recorded, so
-	/// fixing the SQL and re-running resumes at the failure instead of
-	/// re-running a prefix that may not be re-runnable (a `DROP`, a backfill
-	/// that would double).
+	/// Each step runs inside its own transaction WITH its record insert, which buys
+	/// the invariant everything else rests on: **a step is recorded if and only if
+	/// its SQL committed.** There is no window in which the schema moved and the
+	/// record did not. A process killed mid-migration leaves a database whose
+	/// recorded set exactly describes its schema, and the next boot resumes from
+	/// there. The transaction is per STEP and not per run: a failure in the fifth
+	/// step leaves the first four applied and recorded, so fixing the SQL and
+	/// re-running resumes at the failure instead of re-running a prefix that may
+	/// not be re-runnable (a `DROP`, a backfill that would double).
 	///
-	/// Three conditions stop the boot LOUDLY, all of them before a single
-	/// statement is applied, so a database this refuses is a database it did
-	/// not touch:
+	/// Three conditions stop the boot LOUDLY, all of them before a single statement
+	/// is applied, so a database this refuses is a database it did not touch:
 	///
 	/// - a step FAILS — the step is named alongside the host's message, its
 	///   transaction is rolled back, and nothing is recorded for it;
@@ -281,11 +276,11 @@ export impl Database {
 	}
 }
 
-/// The list's names as a set, refusing an empty or a duplicate one first. This
-/// is a check on the ARGUMENT: it runs before the database is read, let alone
-/// written to. A name is a step's identity — an empty one names nothing, and
-/// two steps sharing one map to a single record, which would make "recorded if
-/// and only if applied" unstatable.
+/// The list's names as a set, refusing an empty or a duplicate one first. This is a
+/// check on the ARGUMENT: it runs before the database is read, let alone written
+/// to. A name is a step's identity — an empty one names nothing, and two steps
+/// sharing one map to a single record, which would make "recorded if and only if
+/// applied" unstatable.
 fun migration_names(migrations: List<Migration>): Set<str> {
 	mut names: Set<str> = Set::new();
 	mut index = 0;
@@ -303,12 +298,12 @@ fun migration_names(migrations: List<Migration>): Set<str> {
 	names
 }
 
-/// Drift (a): the database is AHEAD of the code. Every recorded step must
-/// still be in the list; one that is not means this database was migrated by a
-/// build that contains a step this one does not — the rolled-back deploy, whose
-/// queries predate a schema change the file already has. Also the "someone
-/// deleted a migration" case. Either way history disagrees, and the only safe
-/// move is to stop before touching anything.
+/// Drift (a): the database is AHEAD of the code. Every recorded step must still be
+/// in the list; one that is not means this database was migrated by a build that
+/// contains a step this one does not — the rolled-back deploy, whose queries
+/// predate a schema change the file already has. Also the "someone deleted a
+/// migration" case. Either way history disagrees, and the only safe move is to stop
+/// before touching anything.
 fun refuse_database_ahead(names: Set<str>, recorded: Set<str>, count: i32) {
 	for recorded_name in recorded.values() {
 		if !names.contains(recorded_name) {
@@ -325,8 +320,8 @@ fun refuse_database_ahead(names: Set<str>, recorded: Set<str>, count: i32) {
 /// which is to say a schema no fresh database will ever have.
 ///
 /// This is also why the surface does NOT require ascending names: on a database
-/// with history this refusal catches every misordering such a rule would, and
-/// on a fresh database any list order is self-consistent — it IS the history.
+/// with history this refusal catches every misordering such a rule would, and on a
+/// fresh database any list order is self-consistent — it IS the history.
 fun refuse_inserted_migration(migrations: List<Migration>, recorded: Set<str>) {
 	mut last_applied = -1;
 	mut index = 0;

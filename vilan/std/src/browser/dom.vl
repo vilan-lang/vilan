@@ -12,8 +12,8 @@ export *;
 
 external struct Element;
 
-/// `document.getElementById(id)` — the element with that id (the mount point a
-/// page provides, e.g. `<div id="app">`).
+/// `document.getElementById(id)` — the element with that id (the mount point a page
+/// provides, e.g. `<div id="app">`).
 [extern("document.getElementById")]
 external fun get_element_by_id(id: str): Element;
 
@@ -22,9 +22,9 @@ external fun get_element_by_id(id: str): Element;
 external fun create_element(tag: str): Element;
 
 /// `document.createElementNS(namespace, tag)` — a fresh element in an explicit
-/// namespace. SVG elements must be created this way: `createElement` produces
-/// an HTML-namespace node whatever the tag says, and an HTML-namespace `<svg>`
-/// renders nothing. `std::ui::view` routes SVG tag names here by itself.
+/// namespace. SVG elements must be created this way: `createElement` produces an
+/// HTML-namespace node whatever the tag says, and an HTML-namespace `<svg>` renders
+/// nothing. `std::ui::view` routes SVG tag names here by itself.
 [extern("document.createElementNS")]
 external fun create_element_ns(namespace: str, tag: str): Element;
 
@@ -36,29 +36,29 @@ external fun create_element_ns(namespace: str, tag: str): Element;
 external fun create_text_node(content: str): Text;
 
 /// `document.createDocumentFragment()` — an empty, unattached container whose
-/// CHILDREN move when it is inserted, leaving it empty. `std::ui` builds a row
-/// in one of these and then plants the whole thing with a single
-/// `insert_before`, which is how content of an unknown shape (A91: a row may be
-/// any `Slot`) reaches a position that is not the parent's end.
+/// CHILDREN move when it is inserted, leaving it empty. `std::ui` builds a row in
+/// one of these and then plants the whole thing with a single `insert_before`,
+/// which is how content of an unknown shape (A91: a row may be any `Slot`) reaches
+/// a position that is not the parent's end.
 ///
-/// It is typed `Element` and it is not one: the DOM's insertion and append
-/// methods take any node, a fragment above all, and giving it a struct of its
-/// own would fork `append`/`append_text`/`insert_before` into two copies each
-/// for a handle that is only ever a staging area. `get_element_by_id` already
-/// spends the same coin (a missing id reads back as `null` typed `Element`).
+/// It is typed `Element` and it is not one: the DOM's insertion and append methods
+/// take any node, a fragment above all, and giving it a struct of its own would
+/// fork `append`/`append_text`/`insert_before` into two copies each for a handle
+/// that is only ever a staging area. `get_element_by_id` already spends the same
+/// coin (a missing id reads back as `null` typed `Element`).
 [extern("document.createDocumentFragment")]
 external fun create_document_fragment(): Element;
 
-/// `document.createRange()` — a live span between two boundary points, used
-/// here for exactly one job: taking a RUN of sibling nodes out of the document
-/// in one call (`extract_contents`).
+/// `document.createRange()` — a live span between two boundary points, used here
+/// for exactly one job: taking a RUN of sibling nodes out of the document in one
+/// call (`extract_contents`).
 ///
 /// A `std::ui` run's rows are delimited by empty text markers, and since A91 a
-/// row's node set is not fixed — a row that is itself a `when` or an `each`
-/// grows and shrinks after it was placed. So "move this row" cannot be a list
-/// of remembered nodes; it is "everything between these two markers", which is
-/// what a range names and what nothing else in the DOM does without walking
-/// the sibling chain node by node.
+/// row's node set is not fixed — a row that is itself a `when` or an `each` grows
+/// and shrinks after it was placed. So "move this row" cannot be a list of
+/// remembered nodes; it is "everything between these two markers", which is what a
+/// range names and what nothing else in the DOM does without walking the sibling
+/// chain node by node.
 [extern("document.createRange")]
 external fun create_range(): Range;
 
@@ -72,14 +72,14 @@ external fun query_selector(selector: str): Element;
 external fun query_selector_all(selector: str): List<Element>;
 
 /// An element's box in VIEWPORT coordinates — what `Element::bounding_rect`
-/// measures, and the one thing in this module that is a VALUE rather than a
-/// handle. That is deliberate: a measurement is a fact about a moment, so it
-/// copies, compares, and can be parked in a signal, where a live host rect
-/// would keep changing under whoever held it.
+/// measures, and the one thing in this module that is a VALUE rather than a handle.
+/// That is deliberate: a measurement is a fact about a moment, so it copies,
+/// compares, and can be parked in a signal, where a live host rect would keep
+/// changing under whoever held it.
 ///
-/// The host's `DOMRect` carries `right`/`bottom` too; they are `left + width`
-/// and `top + height`, so they are methods here rather than fields that could
-/// disagree with the pair they are derived from.
+/// The host's `DOMRect` carries `right`/`bottom` too; they are `left + width` and
+/// `top + height`, so they are methods here rather than fields that could disagree
+/// with the pair they are derived from.
 struct DomRect {
 	/// Distance from the viewport's left edge to the box's left edge.
 	left: f64,
@@ -105,17 +105,17 @@ impl DomRect {
 
 /// The host `ResizeObserver` — the raw class, in the same relation to
 /// `Element::observe_resize` that `on_event`/`off_event` are to `listen`: it is
-/// what the wrapper is built on, and reaching for it means holding the
-/// disconnect yourself. An observer the host holds a callback for outlives
-/// every vilan value that mentions it until `disconnect` runs, so an
-/// unmanaged one is a leak by construction.
+/// what the wrapper is built on, and reaching for it means holding the disconnect
+/// yourself. An observer the host holds a callback for outlives every vilan value
+/// that mentions it until `disconnect` runs, so an unmanaged one is a leak by
+/// construction.
 external struct ResizeObserver;
 
 impl ResizeObserver {
 	/// `new ResizeObserver(callback)`. The host calls `callback` once when
-	/// observation of an element begins and again on every size change; it
-	/// carries no argument here, because the element whose size changed is the
-	/// one the caller passed to `observe`.
+	/// observation of an element begins and again on every size change; it carries
+	/// no argument here, because the element whose size changed is the one the
+	/// caller passed to `observe`.
 	[extern(new, "ResizeObserver", retains)]
 	external fun new(callback: || void): ResizeObserver;
 
@@ -123,9 +123,9 @@ impl ResizeObserver {
 	[extern(method, "observe")]
 	external fun observe(self, target: Element): void;
 
-	/// `observer.disconnect()` — stop watching everything. Idempotent in the
-	/// host, which is what lets `observe_resize`'s `Subscription` be disposed
-	/// twice safely.
+	/// `observer.disconnect()` — stop watching everything. Idempotent in the host,
+	/// which is what lets `observe_resize`'s `Subscription` be disposed twice
+	/// safely.
 	[extern(method, "disconnect")]
 	external fun disconnect(self): void;
 }
@@ -134,15 +134,15 @@ impl ResizeObserver {
 /// step (backlog B271).
 ///
 /// The browser twin of `std::reactive`'s `queue_microtask`, and it lives HERE
-/// rather than beside it because it is a browser API: node has a microtask
-/// queue and no frames, and `std::reactive` is the layer both targets share.
+/// rather than beside it because it is a browser API: node has a microtask queue
+/// and no frames, and `std::reactive` is the layer both targets share.
 ///
 /// The difference is the whole reason this exists. A microtask runs before the
-/// rendering step, so layout, style resolution and every observer that reacts
-/// to them (`ResizeObserver`, `IntersectionObserver`) have not happened yet; a
-/// frame callback runs after the previous rendering step, so what those made
-/// visible is visible. Anything whose precondition is "rendered" — focus, a
-/// measurement, a scroll into view — belongs on this clock and not on a timer.
+/// rendering step, so layout, style resolution and every observer that reacts to
+/// them (`ResizeObserver`, `IntersectionObserver`) have not happened yet; a frame
+/// callback runs after the previous rendering step, so what those made visible is
+/// visible. Anything whose precondition is "rendered" — focus, a measurement, a
+/// scroll into view — belongs on this clock and not on a timer.
 [extern("requestAnimationFrame", retains)]
 external fun request_animation_frame(callback: || void);
 
@@ -168,17 +168,17 @@ impl Element {
 	[extern(method, "removeAttribute")]
 	external fun remove_attribute(self, name: str): void;
 
-	/// Sets a CSS custom property (`element.style.setProperty(name, value)`) —
-	/// the DOM end of the styling system's dynamic-value channel
+	/// Sets a CSS custom property (`element.style.setProperty(name, value)`) — the
+	/// DOM end of the styling system's dynamic-value channel
 	/// (proposal/ui-styling.md §2.1).
 	[extern(method, "style.setProperty")]
 	external fun set_style_property(self, name: str, value: str): void;
 
 	/// One inline CSS property's current value
-	/// (`element.style.getPropertyValue(name)`), or `""` when the element
-	/// declares none. The read half of `set_style_property`: `View::show`
-	/// takes the element's own inline `display` before it starts writing that
-	/// slot, so it can put back exactly what it found.
+	/// (`element.style.getPropertyValue(name)`), or `""` when the element declares
+	/// none. The read half of `set_style_property`: `View::show` takes the
+	/// element's own inline `display` before it starts writing that slot, so it can
+	/// put back exactly what it found.
 	[extern(method, "style.getPropertyValue")]
 	external fun style_property(self, name: str): str;
 
@@ -191,13 +191,13 @@ impl Element {
 	[extern(method, "appendChild")]
 	external fun append_text(self, child: Text): void;
 
-	/// Inserts `child` immediately BEFORE `anchor`, which must be a child of
-	/// this element (`element.insertBefore(child, anchor)`) — the positional
-	/// counterpart to `append`, and what `std::ui`'s `Region` is built on.
+	/// Inserts `child` immediately BEFORE `anchor`, which must be a child of this
+	/// element (`element.insertBefore(child, anchor)`) — the positional counterpart
+	/// to `append`, and what `std::ui`'s `Region` is built on.
 	///
-	/// Like `append`, this MOVES a node that is already in the document
-	/// rather than copying it, so re-inserting a live element is how a run of
-	/// children is re-ordered.
+	/// Like `append`, this MOVES a node that is already in the document rather than
+	/// copying it, so re-inserting a live element is how a run of children is
+	/// re-ordered.
 	///
 	/// The anchor is a `Text` because that is the marker std plants — an
 	/// EMPTY text node, never a comment. The reasons are both about what the
@@ -213,8 +213,8 @@ impl Element {
 	external fun insert_before(self, child: Element, anchor: Text): void;
 
 	/// Inserts a text node immediately before `anchor` — the `Text` overload of
-	/// `insert_before` (the same `insertBefore` binding; the DOM takes any
-	/// node). This is how a run plants and MOVES a row's marker.
+	/// `insert_before` (the same `insertBefore` binding; the DOM takes any node).
+	/// This is how a run plants and MOVES a row's marker.
 	[extern(method, "insertBefore")]
 	external fun insert_text_before(self, child: Text, anchor: Text): void;
 
@@ -231,26 +231,26 @@ impl Element {
 	external fun set_hidden(self, hidden: bool): void;
 
 	/// The element's box in VIEWPORT coordinates
-	/// (`element.getBoundingClientRect()`) — where an anchored overlay reads
-	/// its anchor, and where a drag reads the frame it is dragging inside.
+	/// (`element.getBoundingClientRect()`) — where an anchored overlay reads its
+	/// anchor, and where a drag reads the frame it is dragging inside.
 	///
 	/// Reading it FORCES LAYOUT, so measure once and pass the `DomRect` value
-	/// around rather than re-measuring per field. A DETACHED element measures
-	/// 0×0 — ask `is_connected` first, or position on a rect that says the
-	/// element is nowhere.
+	/// around rather than re-measuring per field. A DETACHED element measures 0×0 —
+	/// ask `is_connected` first, or position on a rect that says the element is
+	/// nowhere.
 	[extern("__dom_bounding_rect")]
 	external fun bounding_rect(self): DomRect;
 
-	/// The element's laid-out width in CSS pixels, borders and scrollbar
-	/// included and ROUNDED to an integer (`element.offsetWidth`) — the cheap
-	/// measurement beside `bounding_rect`'s fractional box, and the one to
-	/// reach for when the question is "how wide is it" rather than "where is
-	/// it". 0 for a detached element and for `display: none`.
+	/// The element's laid-out width in CSS pixels, borders and scrollbar included
+	/// and ROUNDED to an integer (`element.offsetWidth`) — the cheap measurement
+	/// beside `bounding_rect`'s fractional box, and the one to reach for when the
+	/// question is "how wide is it" rather than "where is it". 0 for a detached
+	/// element and for `display: none`.
 	[extern(get, "offsetWidth")]
 	external fun offset_width(self): f64;
 
-	/// The element's laid-out height (`element.offsetHeight`), rounded exactly
-	/// as `offset_width` is.
+	/// The element's laid-out height (`element.offsetHeight`), rounded exactly as
+	/// `offset_width` is.
 	[extern(get, "offsetHeight")]
 	external fun offset_height(self): f64;
 
@@ -258,8 +258,7 @@ impl Element {
 	///
 	/// The guard measurement waits on: a detached element measures 0×0, so
 	/// positioning that runs before the node is in the tree positions against
-	/// nothing and reads as a bug about the layout rather than about the
-	/// timing.
+	/// nothing and reads as a bug about the layout rather than about the timing.
 	[extern(get, "isConnected")]
 	external fun is_connected(self): bool;
 
@@ -267,24 +266,23 @@ impl Element {
 	/// (`element.contains(other)`).
 	///
 	/// The outside-click question: a dismiss handler asks it of the event's
-	/// `target` — "did this click land in my panel" — which is the one question
-	/// a document-level listener cannot answer from coordinates.
+	/// `target` — "did this click land in my panel" — which is the one question a
+	/// document-level listener cannot answer from coordinates.
 	[extern(method, "contains")]
 	external fun contains(self, other: Element): bool;
 
 	/// Every DESCENDANT matching a CSS selector
-	/// (`element.querySelectorAll(selector)`), as a `List` — the scoped form of
-	/// the module-level `query_selector_all`, which searches the whole
-	/// document. A real array like its document twin, so `map`/`for`-in/`len`
-	/// all work; empty when nothing matches, which is why it is the list form
-	/// and not a nullable one.
+	/// (`element.querySelectorAll(selector)`), as a `List` — the scoped form of the
+	/// module-level `query_selector_all`, which searches the whole document. A real
+	/// array like its document twin, so `map`/`for`-in/`len` all work; empty when
+	/// nothing matches, which is why it is the list form and not a nullable one.
 	[extern("__dom_query_all")]
 	external fun query_selector_all(self, selector: str): List<Element>;
 
-	/// Moves keyboard focus to the element (`element.focus()`). HTML's
-	/// `autofocus` attribute only fires on a document's initial parse, so
-	/// anything mounted later — every custom modal — has to ask; this is what
-	/// `View::autofocus` calls.
+	/// Moves keyboard focus to the element (`element.focus()`). HTML's `autofocus`
+	/// attribute only fires on a document's initial parse, so anything mounted
+	/// later — every custom modal — has to ask; this is what `View::autofocus`
+	/// calls.
 	///
 	/// It is a REQUEST with a precondition, not a command: the platform focuses
 	/// only a target that is connected, rendered, visible and not inert AT THE
@@ -305,8 +303,8 @@ impl Element {
 	[extern(method, "matches")]
 	external fun matches(self, selector: str): bool;
 
-	/// The element's current value (`element.value`) — e.g. what the user has
-	/// typed into an `<input>`.
+	/// The element's current value (`element.value`) — e.g. what the user has typed
+	/// into an `<input>`.
 	[extern(get, "value")]
 	external fun value(self): str;
 
@@ -325,12 +323,12 @@ impl Element {
 	[extern(method, "addEventListener", retains)]
 	external fun on_event(self, event: str, handler: |Event| void): void;
 
-	/// `element.removeEventListener(event, handler)` — `listen`'s teardown.
-	/// Removal is IDENTITY-matched: `handler` must be the same value the host
-	/// was handed, so a freshly written closure removes nothing. `listen` is the
-	/// form that holds the pairing for you; reach for this only when you already
-	/// hold both halves. Unmarked by `retains` deliberately — removal keeps
-	/// nothing past the call (`proposal/router.md` §5.2).
+	/// `element.removeEventListener(event, handler)` — `listen`'s teardown. Removal
+	/// is IDENTITY-matched: `handler` must be the same value the host was handed,
+	/// so a freshly written closure removes nothing. `listen` is the form that
+	/// holds the pairing for you; reach for this only when you already hold both
+	/// halves. Unmarked by `retains` deliberately — removal keeps nothing past the
+	/// call (`proposal/router.md` §5.2).
 	[extern(method, "removeEventListener")]
 	external fun off_event(self, event: str, handler: |Event| void): void;
 
@@ -359,15 +357,15 @@ impl Element {
 	[extern(method, "addEventListener", retains)]
 	external fun on_event_capture(self, event: str, handler: |Event| void, capture: bool): void;
 
-	/// `element.removeEventListener(event, handler, true)` — capture's
-	/// teardown. The PHASE is part of the identity the host matches on, so a
-	/// capture listener cannot be removed by the bubble-phase `off_event` and
-	/// vice versa; that is why this is a second pair rather than a flag.
+	/// `element.removeEventListener(event, handler, true)` — capture's teardown.
+	/// The PHASE is part of the identity the host matches on, so a capture listener
+	/// cannot be removed by the bubble-phase `off_event` and vice versa; that is
+	/// why this is a second pair rather than a flag.
 	[extern(method, "removeEventListener")]
 	external fun off_event_capture(self, event: str, handler: |Event| void, capture: bool): void;
 
-	/// `listen`, in the CAPTURE phase — same `[must_use]` `Subscription`
-	/// contract, opposite direction of travel.
+	/// `listen`, in the CAPTURE phase — same `[must_use]` `Subscription` contract,
+	/// opposite direction of travel.
 	///
 	/// Capture runs the ancestors' listeners on the way DOWN to the target,
 	/// before the target's own; bubble runs them on the way back up. Two things
@@ -386,15 +384,14 @@ impl Element {
 	}
 
 	/// Runs `on_resize` whenever this element's size changes — and ONCE when
-	/// observation starts, which is what makes it a first-layout hook as well
-	/// as a change hook: an overlay can position itself from the same callback
-	/// that will re-position it later, instead of racing the first render.
+	/// observation starts, which is what makes it a first-layout hook as well as a
+	/// change hook: an overlay can position itself from the same callback that will
+	/// re-position it later, instead of racing the first render.
 	///
 	/// The wrapper, not the raw `ResizeObserver`, is the form to reach for
-	/// (`[must_use]`, and owned exactly as `listen`'s subscription is): hand it
-	/// to a scope with `get_owner().take(element.observe_resize(..))`, or
-	/// `dispose` it by hand. Disposing disconnects the observer, and disposing
-	/// twice is safe.
+	/// (`[must_use]`, and owned exactly as `listen`'s subscription is): hand it to
+	/// a scope with `get_owner().take(element.observe_resize(..))`, or `dispose` it
+	/// by hand. Disposing disconnects the observer, and disposing twice is safe.
 	[must_use]
 	fun observe_resize(self, on_resize: || void): Subscription {
 		let observer = ResizeObserver::new(on_resize);
@@ -407,12 +404,12 @@ impl Element {
 
 /// The host `window` — a listen TARGET, opaque exactly as `Element` is
 /// (`proposal/router.md` §5.1). It carries the events no element is given:
-/// `resize`, `popstate`, `storage`, `message`, and the pointer stream a drag
-/// needs after the pointer has left the element it started on.
+/// `resize`, `popstate`, `storage`, `message`, and the pointer stream a drag needs
+/// after the pointer has left the element it started on.
 external struct Window;
 
-/// The one `window` object (via a helper — a global property has no function
-/// form, the same reason `std::router`'s `location.pathname` needs one).
+/// The one `window` object (via a helper — a global property has no function form,
+/// the same reason `std::router`'s `location.pathname` needs one).
 [extern("__dom_window")]
 external fun window(): Window;
 
@@ -432,9 +429,9 @@ impl Window {
 	external fun off_event(self, event: str, handler: |Event| void): void;
 
 	/// Registers `handler` on `event` and hands back the `Subscription` that
-	/// unhooks it. This is the form window listeners actually want: nothing
-	/// about the window ever goes away, so a window listener that cannot be
-	/// removed is a leak by construction.
+	/// unhooks it. This is the form window listeners actually want: nothing about
+	/// the window ever goes away, so a window listener that cannot be removed is a
+	/// leak by construction.
 	[must_use]
 	fun listen(self, event: str, handler: |Event| void): Subscription {
 		self.on_event(event, handler);
@@ -453,11 +450,11 @@ impl Window {
 	[extern(method, "removeEventListener")]
 	external fun off_event_capture(self, event: str, handler: |Event| void, capture: bool): void;
 
-	/// `listen`, in the CAPTURE phase. On the WINDOW this is the form that
-	/// hears `scroll` from every scrolling ancestor at once: `scroll` does not
-	/// bubble, so a bubble-phase window listener hears only the document's own
-	/// scrolling and an anchored overlay drifts off its element the moment the
-	/// page's inner panel is what moved.
+	/// `listen`, in the CAPTURE phase. On the WINDOW this is the form that hears
+	/// `scroll` from every scrolling ancestor at once: `scroll` does not bubble, so
+	/// a bubble-phase window listener hears only the document's own scrolling and
+	/// an anchored overlay drifts off its element the moment the page's inner panel
+	/// is what moved.
 	[must_use]
 	fun listen_capture(self, event: str, handler: |Event| void): Subscription {
 		self.on_event_capture(event, handler, true);
@@ -476,9 +473,9 @@ impl Text {
 	[extern(set, "textContent")]
 	external fun set_text(self, text: str): void;
 
-	/// Removes the node from the document (`node.remove()`) — `Element`'s
-	/// `remove` for a text node, which is what a `std::ui` `Region` does with
-	/// its anchor when the boundary holding it is disposed.
+	/// Removes the node from the document (`node.remove()`) — `Element`'s `remove`
+	/// for a text node, which is what a `std::ui` `Region` does with its anchor
+	/// when the boundary holding it is disposed.
 	[extern(method, "remove")]
 	external fun remove(self): void;
 
@@ -497,11 +494,11 @@ impl Text {
 /// A DOM range — two boundary points in one document, and the one operation
 /// `std::ui` needs from them: cut everything between them out as a fragment.
 ///
-/// Both boundaries are `Text` because both are markers std planted: a row's
-/// own leading marker and whatever bounds it on the right (the next row's
-/// marker, or the region's anchor). A range whose boundaries are not siblings
-/// in the order given is not a state this module can reach — the markers are
-/// planted by the same code that reads them, in the order it planted them.
+/// Both boundaries are `Text` because both are markers std planted: a row's own
+/// leading marker and whatever bounds it on the right (the next row's marker, or
+/// the region's anchor). A range whose boundaries are not siblings in the order
+/// given is not a state this module can reach — the markers are planted by the same
+/// code that reads them, in the order it planted them.
 external struct Range;
 
 impl Range {
@@ -515,9 +512,9 @@ impl Range {
 
 	/// Takes every node in the range OUT of the document and returns them as a
 	/// document fragment, in order (`range.extractContents()`). The nodes
-	/// themselves move — identity, listeners and state intact — so a run's
-	/// order pass is a cut and a re-insert, not a rebuild. Typed `Element` for
-	/// the reason `create_document_fragment` records.
+	/// themselves move — identity, listeners and state intact — so a run's order
+	/// pass is a cut and a re-insert, not a rebuild. Typed `Element` for the reason
+	/// `create_document_fragment` records.
 	[extern(method, "extractContents")]
 	external fun extract_contents(self): Element;
 }
@@ -527,8 +524,8 @@ impl Range {
 external struct Event;
 
 impl Event {
-	/// Cancels the event's default action (`event.preventDefault()`) — e.g. stop
-	/// an `<a>` from performing a full-page navigation.
+	/// Cancels the event's default action (`event.preventDefault()`) — e.g. stop an
+	/// `<a>` from performing a full-page navigation.
 	[extern(method, "preventDefault")]
 	external fun prevent_default(self): void;
 
@@ -550,8 +547,8 @@ impl Event {
 	external fun alt_key(self): bool;
 
 	/// The key for a keyboard event (`event.key`): `"Enter"`, `"Escape"`, `"a"`, ….
-	/// This is the CHARACTER the layout produced — what a text-entry handler
-	/// wants, and what changes when the user switches keyboard layouts.
+	/// This is the CHARACTER the layout produced — what a text-entry handler wants,
+	/// and what changes when the user switches keyboard layouts.
 	[extern(get, "key")]
 	external fun key(self): str;
 
@@ -566,9 +563,8 @@ impl Event {
 	/// against `code` does not. A text-entry handler wants `key`, for the
 	/// mirror-image reason: it is the character the user meant to type.
 	///
-	/// The names are the host's own (`KeyboardEvent.code`'s value space), so
-	/// a binding table reads the same in vilan as in the DOM docs it is
-	/// written from.
+	/// The names are the host's own (`KeyboardEvent.code`'s value space), so a
+	/// binding table reads the same in vilan as in the DOM docs it is written from.
 	[extern(get, "code")]
 	external fun code(self): str;
 
@@ -577,9 +573,9 @@ impl Event {
 	///
 	/// Named for the pointer, not for the DOM's coordinate space
 	/// (`proposal/router.md` §5.3): `clientX`'s "client" means *viewport* for
-	/// purely historical reasons, and the transliteration would teach that
-	/// history to every reader. The document-relative pair (`pageX`/`pageY`)
-	/// lands as `page_x`/`page_y` when something reads it.
+	/// purely historical reasons, and the transliteration would teach that history
+	/// to every reader. The document-relative pair (`pageX`/`pageY`) lands as
+	/// `page_x`/`page_y` when something reads it.
 	[extern(get, "clientX")]
 	external fun pointer_x(self): f64;
 
@@ -590,13 +586,13 @@ impl Event {
 	/// pointer or holding the focus (`event.target`).
 	///
 	/// This is the "did it land inside me?" accessor: a document-level click
-	/// listener reads `event.target()` and dismisses the overlay it guards when
-	/// the click landed outside it.
+	/// listener reads `event.target()` and dismisses the overlay it guards when the
+	/// click landed outside it.
 	[extern(get, "target")]
 	external fun target(self): Element;
 
-	/// The element whose LISTENER is running (`event.currentTarget`) — the node
-	/// the handler was registered on, as the event bubbles past it.
+	/// The element whose LISTENER is running (`event.currentTarget`) — the node the
+	/// handler was registered on, as the event bubbles past it.
 	///
 	/// Distinct from `target` and deliberately so, because the two answer
 	/// different questions and coincide only when the event was dispatched
@@ -606,15 +602,15 @@ impl Event {
 	/// handler reads `current_target` to learn which row it is in — reading
 	/// `target` there gets whatever glyph the user happened to hit.
 	///
-	/// It is only meaningful DURING dispatch: the host clears it when the
-	/// handler returns, so a captured `Event` read later hands back null. Read
-	/// it in the handler, not out of one.
+	/// It is only meaningful DURING dispatch: the host clears it when the handler
+	/// returns, so a captured `Event` read later hands back null. Read it in the
+	/// handler, not out of one.
 	[extern(get, "currentTarget")]
 	external fun current_target(self): Element;
 
-	/// The value of the element the event was dispatched to
-	/// (`event.target.value`) — what an `<input>` holds right now, read from
-	/// the EVENT instead of from a captured element.
+	/// The value of the element the event was dispatched to (`event.target.value`)
+	/// — what an `<input>` holds right now, read from the EVENT instead of from a
+	/// captured element.
 	///
 	/// That is the whole point (`proposal/lifetimes.md` §5, V3): a listener that
 	/// reaches for its own element closes an element ↔ listener cycle that

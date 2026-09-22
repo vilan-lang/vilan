@@ -1,10 +1,10 @@
-// `std::http` — a small HTTP server over `node:http`, exposed through an
-// abstract `Server`/`Response` API. The raw `node:http` calls are `[extern]`
-// host bindings used internally (and by `std::rpc_server`, which needs partial
-// writes for SSE); everything else is ordinary Vilan. The routing and protocol
-// machinery for a mounted RPC service lives in `std::rpc_server` — this module
-// only carries `ServerBuilder.services` and folds it in at `build()`
-// (`fullstack-dx.md` §4), so a plain HTTP app never has to know the type exists.
+// `std::http` — a small HTTP server over `node:http`, exposed through an abstract
+// `Server`/`Response` API. The raw `node:http` calls are `[extern]` host bindings
+// used internally (and by `std::rpc_server`, which needs partial writes for SSE);
+// everything else is ordinary Vilan. The routing and protocol machinery for a
+// mounted RPC service lives in `std::rpc_server` — this module only carries
+// `ServerBuilder.services` and folds it in at `build()` (`fullstack-dx.md` §4), so
+// a plain HTTP app never has to know the type exists.
 
 import pkg::build::{ BuildAsset, LegBuild, asset_body, asset_for, load_build };
 import pkg::bytes::{ Bytes, new_text_decoder };
@@ -24,20 +24,20 @@ export impl NodeServer {
 	[extern(method, retains)]
 	external fun listen(self, port: i32, on_ready: || void);
 
-	/// The bound address, once listening — where a port-0 bind's ACTUAL port
-	/// comes from. A TCP server (the only kind this module starts) always
-	/// answers with an address object.
+	/// The bound address, once listening — where a port-0 bind's ACTUAL port comes
+	/// from. A TCP server (the only kind this module starts) always answers with an
+	/// address object.
 	[extern(method, "address")]
 	external fun address(self): NodeAddress;
 
-	/// Subscribe to the server's `upgrade` event — a WebSocket handshake
-	/// arrives as `(request, raw socket, head)` instead of a normal request.
+	/// Subscribe to the server's `upgrade` event — a WebSocket handshake arrives as
+	/// `(request, raw socket, head)` instead of a normal request.
 	[extern(method, "on", retains)]
 	external fun on_upgrade(self, event: str, handler: |NodeRequest, NodeSocket, Bytes| void);
 
-	/// Stop accepting new connections and close once existing ones end (node's
-	/// own `close([callback])`); `on_closed` fires once that has actually
-	/// happened — what `Server::stop` fires `on_stop` from (§9.1).
+	/// Stop accepting new connections and close once existing ones end (node's own
+	/// `close([callback])`); `on_closed` fires once that has actually happened —
+	/// what `Server::stop` fires `on_stop` from (§9.1).
 	[extern(method, "close", retains)]
 	external fun close(self, on_closed: || void);
 }
@@ -66,8 +66,8 @@ export impl NodeRequest {
 	external fun headers(self): JsonValue;
 }
 
-/// A raw TCP socket (`net.Socket`), handed over on a protocol upgrade. Frames
-/// are written as bytes; the handshake response is plain text.
+/// A raw TCP socket (`net.Socket`), handed over on a protocol upgrade. Frames are
+/// written as bytes; the handshake response is plain text.
 export external struct NodeSocket;
 
 export impl NodeSocket {
@@ -85,27 +85,27 @@ export impl NodeSocket {
 	[extern(method, "on", retains)]
 	external fun on_signal(self, event: str, handler: || void);
 
-	/// Emit `"timeout"` after `millis` of inactivity; `0` clears it. Node's
-	/// own `socket.setTimeout` — it does NOT close the socket, it only tells
-	/// you, which is what lets `std::rpc_server` arm a greeting bound and
-	/// disarm it on the first byte.
+	/// Emit `"timeout"` after `millis` of inactivity; `0` clears it. Node's own
+	/// `socket.setTimeout` — it does NOT close the socket, it only tells you, which
+	/// is what lets `std::rpc_server` arm a greeting bound and disarm it on the
+	/// first byte.
 	[extern(method, "setTimeout")]
 	external fun set_timeout(self, millis: i32);
 
 	/// The peer's address as node reports it (`net.Socket.remoteAddress`) —
-	/// `undefined` on a socket that is already destroyed, which reads back as
-	/// the empty string. Behind a proxy this is the PROXY's address; an app
-	/// that trusts a forwarding header must read it off the request instead.
+	/// `undefined` on a socket that is already destroyed, which reads back as the
+	/// empty string. Behind a proxy this is the PROXY's address; an app that trusts
+	/// a forwarding header must read it off the request instead.
 	[extern(get, "remoteAddress")]
 	external fun remote_address_raw(self): JsonValue;
 
 	[extern(method, "destroy")]
 	external fun destroy(self);
 
-	/// Whether `destroy` has already run (`net.Socket.destroyed`). A write to
-	/// a destroyed socket is not an error in node — it is silently dropped —
-	/// so this exists for the paths that must know they have nothing left to
-	/// say, not to make a write safe.
+	/// Whether `destroy` has already run (`net.Socket.destroyed`). A write to a
+	/// destroyed socket is not an error in node — it is silently dropped — so this
+	/// exists for the paths that must know they have nothing left to say, not to
+	/// make a write safe.
 	[extern(get, "destroyed")]
 	external fun destroyed(self): bool;
 
@@ -125,8 +125,8 @@ export impl NodeSocket {
 [extern("node:stream/consumers", "text")]
 async external fun read_request_body(node: NodeRequest): str;
 
-/// The same body as raw bytes (a node `Buffer` IS a Uint8Array) — for frames
-/// that may be binary (`std::rpc_server`'s `/rpc`).
+/// The same body as raw bytes (a node `Buffer` IS a Uint8Array) — for frames that
+/// may be binary (`std::rpc_server`'s `/rpc`).
 [extern("node:stream/consumers", "buffer")]
 async external fun read_request_bytes(node: NodeRequest): Bytes;
 
@@ -142,9 +142,9 @@ export impl NodeResponse {
 	[extern(method, "end")]
 	external fun end(self, body: str);
 
-	/// Write a chunk WITHOUT ending the response — a streaming response (SSE).
-	/// The host silently drops writes to a destroyed response, so a frame sent
-	/// to a just-closed connection is discarded, not an error.
+	/// Write a chunk WITHOUT ending the response — a streaming response (SSE). The
+	/// host silently drops writes to a destroyed response, so a frame sent to a
+	/// just-closed connection is discarded, not an error.
 	[extern(method, "write")]
 	external fun write(self, chunk: str);
 
@@ -182,21 +182,20 @@ export impl Request {
 		new_text_decoder().decode(self.content)
 	}
 
-	/// The same body as raw bytes, for frames that may be binary (an RPC
-	/// codec's POST).
+	/// The same body as raw bytes, for frames that may be binary (an RPC codec's
+	/// POST).
 	fun bytes(self): Bytes {
 		self.content
 	}
 
-	/// The value of a named request header, or `None` when the request did
-	/// not carry it.
+	/// The value of a named request header, or `None` when the request did not
+	/// carry it.
 	///
-	/// Header names are case-insensitive, and node lowercases every name it
-	/// parses off the wire, so `name` is lowered to match: `header("If-None-Match")`
-	/// and `header("if-none-match")` ask the same question, whatever casing the
-	/// client actually sent. `None` means ABSENT, distinctly from `Some("")`
-	/// for a header sent with an empty value — the distinction a conditional
-	/// request needs.
+	/// Header names are case-insensitive, and node lowercases every name it parses
+	/// off the wire, so `name` is lowered to match: `header("If-None-Match")` and
+	/// `header("if-none-match")` ask the same question, whatever casing the client
+	/// actually sent. `None` means ABSENT, distinctly from `Some("")` for a header
+	/// sent with an empty value — the distinction a conditional request needs.
 	///
 	/// A header the client REPEATED reads back as node presents it: joined
 	/// with `", "`, which is the list form ordinary headers already define,
@@ -215,8 +214,8 @@ export impl Request {
 	/// (`header("constructor")`) from reading back as a header.
 	fun header(self, name: str): Option<str> {
 		// An HTTP field name is an ASCII token by RFC 9110, and the
-		// case-insensitive match over it is an ASCII one: the full Unicode
-		// fold would map letters no field name can contain.
+		// case-insensitive match over it is an ASCII one: the full Unicode fold
+		// would map letters no field name can contain.
 		let lowered = name.to_lowercase_ascii();
 		let headers = self.node.headers();
 		if !headers.has_field(lowered) {
@@ -230,15 +229,15 @@ export impl Request {
 
 export struct Response {
 	status: i32,
-	/// `(name, value)` pairs, written in order. An empty list gets the
-	/// default `Content-Type: text/plain`.
+	/// `(name, value)` pairs, written in order. An empty list gets the default
+	/// `Content-Type: text/plain`.
 	headers: List<(str, str)>,
 	body: ResponseBody,
 }
 
-/// What a response carries: a buffered text or binary body, or a live
-/// STREAM — the closure receives the open stream once the status and
-/// headers are written, and the response stays open until closed.
+/// What a response carries: a buffered text or binary body, or a live STREAM — the
+/// closure receives the open stream once the status and headers are written, and
+/// the response stays open until closed.
 export enum ResponseBody {
 	Text(str),
 	Bytes(Bytes),
@@ -264,8 +263,8 @@ export impl ResponseStream {
 		self.node.end("");
 	}
 
-	/// The connection ended (tab closed, network gone) — release
-	/// per-connection state here.
+	/// The connection ended (tab closed, network gone) — release per-connection
+	/// state here.
 	fun on_close(self, handler: || void) {
 		self.node.on_event("close", handler);
 	}
@@ -306,9 +305,9 @@ export impl ResponseBuilder {
 		self
 	}
 
-	/// A STREAMING response: `on_open` receives the live stream once the
-	/// status and headers are written (a suspending `on_open` runs as
-	/// spawned work — the response is already open). SSE's shape.
+	/// A STREAMING response: `on_open` receives the live stream once the status and
+	/// headers are written (a suspending `on_open` runs as spawned work — the
+	/// response is already open). SSE's shape.
 	fun streaming(own self, on_open: |ResponseStream| void): ResponseBuilder {
 		self.body = ResponseBody::Stream(on_open);
 		self
@@ -327,22 +326,21 @@ export impl ResponseBuilder {
 /// `etag_response` per request; hashing per request works too, it just spends
 /// a digest on every hit.
 ///
-/// The truncation to 128 bits is deliberate. A validator's one job is to keep
-/// two DIFFERENT bodies from reading as the same, and defeating this width
-/// against a body you did not choose is a second preimage (~2^128 work); the
-/// birthday-style collision that truncation does cheapen needs an attacker
-/// composing BOTH bodies, who never needs a collision to serve either one.
-/// Half the header weight of the full digest, the same safety where safety is
-/// meant. The quotes are part of the value — an entity-tag is quoted on the
-/// wire (RFC 9110 §8.8.3) — so this string drops into `ETag` and into
-/// comparisons exactly as returned.
+/// The truncation to 128 bits is deliberate. A validator's one job is to keep two
+/// DIFFERENT bodies from reading as the same, and defeating this width against a
+/// body you did not choose is a second preimage (~2^128 work); the birthday-style
+/// collision that truncation does cheapen needs an attacker composing BOTH bodies,
+/// who never needs a collision to serve either one. Half the header weight of the
+/// full digest, the same safety where safety is meant. The quotes are part of the
+/// value — an entity-tag is quoted on the wire (RFC 9110 §8.8.3) — so this string
+/// drops into `ETag` and into comparisons exactly as returned.
 export async fun etag_of(body: Bytes): str {
 	"\"" + sha256(body).to_hex().substring(0, 32) + "\""
 }
 
-/// Whether an `If-None-Match` field value names `etag` — the comparison half
-/// of a conditional request, on its own for a handler that wants to build both
-/// arms itself (`etag_response` is the packaged whole).
+/// Whether an `If-None-Match` field value names `etag` — the comparison half of a
+/// conditional request, on its own for a handler that wants to build both arms
+/// itself (`etag_response` is the packaged whole).
 ///
 /// All three forms RFC 9110 §13.1.2 gives the field are handled: `*` (the
 /// whole value — it matches any current representation, and a caller holding
@@ -352,13 +350,12 @@ export async fun etag_of(body: Bytes): str {
 /// octet-compare, so a client revalidating through a proxy that weakened the
 /// tag it forwarded (nginx's gzip filter does) still gets its 304.
 ///
-/// One documented limit: the list form is split on commas, and an entity-tag
-/// may legally contain one. A tag with no embedded comma — every tag `etag_of`
-/// mints, and every hex- or revision-shaped tag in practice — is matched
-/// exactly, because a fragment split out of some longer comma-bearing tag is
-/// missing a quote and cannot equal it; an `etag` that itself embeds a comma
-/// is the one shape this function cannot find in a list, said here rather
-/// than half-handled silently.
+/// One documented limit: the list form is split on commas, and an entity-tag may
+/// legally contain one. A tag with no embedded comma — every tag `etag_of` mints,
+/// and every hex- or revision-shaped tag in practice — is matched exactly, because
+/// a fragment split out of some longer comma-bearing tag is missing a quote and
+/// cannot equal it; an `etag` that itself embeds a comma is the one shape this
+/// function cannot find in a list, said here rather than half-handled silently.
 export fun if_none_match_matches(header: str, etag: str): bool {
 	if header.trim() == "*" {
 		ret true;
@@ -372,9 +369,9 @@ export fun if_none_match_matches(header: str, etag: str): bool {
 	false
 }
 
-/// An entity-tag without its weakness marker: `W/"x"` reads `"x"`, a strong
-/// tag reads back unchanged. Both sides of a weak comparison pass through
-/// here (RFC 9110 §8.8.3.2).
+/// An entity-tag without its weakness marker: `W/"x"` reads `"x"`, a strong tag
+/// reads back unchanged. Both sides of a weak comparison pass through here (RFC
+/// 9110 §8.8.3.2).
 fun strip_weak(tag: str): str {
 	if tag.starts_with("W/") {
 		ret tag.substring(2, tag.len());
@@ -383,27 +380,27 @@ fun strip_weak(tag: str): str {
 }
 
 /// The conditional-GET answer, whole: `304 Not Modified` when the request's
-/// `If-None-Match` already names `etag`, the full `200` otherwise — returned
-/// as a still-open `ResponseBuilder`, so the chain continues with whatever
-/// policy headers the route wants (`Cache-Control`, `Vary`, …) and ends with
-/// the app's own `.build()`:
+/// `If-None-Match` already names `etag`, the full `200` otherwise — returned as a
+/// still-open `ResponseBuilder`, so the chain continues with whatever policy
+/// headers the route wants (`Cache-Control`, `Vary`, …) and ends with the app's own
+/// `.build()`:
 ///
 ///	etag_response(request, tag, page, "text/html; charset=utf-8")
 ///		.set_header("Cache-Control", "no-cache")
 ///		.build()
 ///
-/// The split of labor is arm-dependence. What DIFFERS between the arms —
-/// status, body, `Content-Type` (the 200 carries all three, the 304 an empty
-/// body and no type) — is bookkeeping RFC 9110 settles, so it lives here; and
-/// `ETag` goes out on both arms, which is what lets the client's NEXT
-/// conditional request match too. What is the SAME on both arms is policy, so
-/// it stays on the chain you write — landing on the 304 as well, exactly as
-/// §15.4.5 wants (a 304 carries the headers its 200 would have carried).
+/// The split of labor is arm-dependence. What DIFFERS between the arms — status,
+/// body, `Content-Type` (the 200 carries all three, the 304 an empty body and no
+/// type) — is bookkeeping RFC 9110 settles, so it lives here; and `ETag` goes out
+/// on both arms, which is what lets the client's NEXT conditional request match
+/// too. What is the SAME on both arms is policy, so it stays on the chain you write
+/// — landing on the 304 as well, exactly as §15.4.5 wants (a 304 carries the
+/// headers its 200 would have carried).
 ///
-/// Only `GET` and `HEAD` revalidate. On any other method a matching
-/// `If-None-Match` means `412 Precondition Failed`, not `304` — a
-/// state-changing route's protocol, no part of serving bytes — so on those
-/// the header is not consulted at all and the full response goes out.
+/// Only `GET` and `HEAD` revalidate. On any other method a matching `If-None-Match`
+/// means `412 Precondition Failed`, not `304` — a state-changing route's protocol,
+/// no part of serving bytes — so on those the header is not consulted at all and
+/// the full response goes out.
 export fun etag_response(
 	request: Request,
 	etag: str,
@@ -425,16 +422,16 @@ export fun etag_response(
 		.body_bytes(body)
 }
 
-/// What `serve_build` should do about caching for ONE artifact — the opt-in
-/// half of kolt.local 025, handed over by `ServerBuilder::cache_build`.
+/// What `serve_build` should do about caching for ONE artifact — the opt-in half of
+/// kolt.local 025, handed over by `ServerBuilder::cache_build`.
 ///
 /// Two axes, because those are the two a static layer actually chooses between
-/// (`fullstack-dx.md` §5.10): a **validator**, which spends a round trip to
-/// save a body, and **`Cache-Control`**, which spends staleness to save the
-/// round trip. They compose — a fingerprinted chunk wants a long `max-age` and
-/// no validator, a shell wants `no-cache` and a validator — and `none()` is
-/// both switched off, which is byte-for-byte what `serve_build` sends when no
-/// policy was installed at all.
+/// (`fullstack-dx.md` §5.10): a **validator**, which spends a round trip to save a
+/// body, and **`Cache-Control`**, which spends staleness to save the round trip.
+/// They compose — a fingerprinted chunk wants a long `max-age` and no validator, a
+/// shell wants `no-cache` and a validator — and `none()` is both switched off,
+/// which is byte-for-byte what `serve_build` sends when no policy was installed at
+/// all.
 ///
 /// A policy is a function of the artifact's ROUTE — the `/<file name>` the
 /// build claimed — and of nothing else. That is the whole shape: "which of my
@@ -446,37 +443,37 @@ export fun etag_response(
 /// the same argument one level down: a policy needs to know which file this
 /// is, and needs nothing else `BuildAsset` carries.
 export struct CachePolicy {
-	/// Answer conditional requests for this artifact: mint an `ETag` over the
-	/// bytes being served and reply `304` when the client already has them.
+	/// Answer conditional requests for this artifact: mint an `ETag` over the bytes
+	/// being served and reply `304` when the client already has them.
 	validate: bool,
-	/// The `Cache-Control` field value. Empty sends no header — the absence is
-	/// a real answer (it leaves the browser's heuristic freshness alone), not a
+	/// The `Cache-Control` field value. Empty sends no header — the absence is a
+	/// real answer (it leaves the browser's heuristic freshness alone), not a
 	/// missing one.
 	cache_control: str,
 }
 
 export impl CachePolicy {
-	/// No validator and no `Cache-Control` — every byte `serve_build` sends
-	/// for this artifact is what it sends with no policy installed. The base
-	/// of a chain (`CachePolicy::none().cache_control(…)`) and the honest
-	/// answer for an artifact a two-tier policy wants to leave alone.
+	/// No validator and no `Cache-Control` — every byte `serve_build` sends for
+	/// this artifact is what it sends with no policy installed. The base of a chain
+	/// (`CachePolicy::none().cache_control(…)`) and the honest answer for an
+	/// artifact a two-tier policy wants to leave alone.
 	fun none(): CachePolicy {
 		CachePolicy { validate = false, cache_control = "" }
 	}
 
-	/// Revalidate: the first response carries an `ETag`, and every later
-	/// request that still names it gets a `304` with no body. Costs a round
-	/// trip per load and saves the artifact's bytes — the shell tier.
+	/// Revalidate: the first response carries an `ETag`, and every later request
+	/// that still names it gets a `304` with no body. Costs a round trip per load
+	/// and saves the artifact's bytes — the shell tier.
 	fun validated(): CachePolicy {
 		CachePolicy { validate = true, cache_control = "" }
 	}
 
-	/// Set the `Cache-Control` field value, on either base: the fingerprinted
-	/// tier is `CachePolicy::none().cache_control("public, max-age=31536000,
-	/// immutable")`, the shell tier is
-	/// `CachePolicy::validated().cache_control("no-cache")`. The value goes out
-	/// verbatim — this is not a directive builder, and a policy vocabulary is
-	/// not something std should be inventing above RFC 9111's.
+	/// Set the `Cache-Control` field value, on either base: the fingerprinted tier
+	/// is
+	/// `CachePolicy::none().cache_control("public, max-age=31536000, immutable")`,
+	/// the shell tier is `CachePolicy::validated().cache_control("no-cache")`. The
+	/// value goes out verbatim — this is not a directive builder, and a policy
+	/// vocabulary is not something std should be inventing above RFC 9111's.
 	fun cache_control(own self, value: str): CachePolicy {
 		self.cache_control = value;
 		self
@@ -497,24 +494,23 @@ export struct Server {
 	/// A WebSocket-style protocol upgrade handler, when the app mounted one
 	/// (`ServerBuilder::on_upgrade`): `(request, raw socket, head bytes)`.
 	///
-	/// The handler MAY suspend, since A40: an rpc service's pre-upgrade
-	/// `authorize` hook has to be able to await (verifying a JWT is a
-	/// WebCrypto call, and WebCrypto is async everywhere). Node neither
-	/// answers the upgrade itself nor waits on this handler — the socket stays
-	/// open until something writes to it — so a handler that settles later
-	/// still owns the socket when it does.
+	/// The handler MAY suspend, since A40: an rpc service's pre-upgrade `authorize`
+	/// hook has to be able to await (verifying a JWT is a WebCrypto call, and
+	/// WebCrypto is async everywhere). Node neither answers the upgrade itself nor
+	/// waits on this handler — the socket stays open until something writes to it —
+	/// so a handler that settles later still owns the socket when it does.
 	upgrade_handler: Option<|NodeRequest, NodeSocket, Bytes| void>,
-	/// The live listener, once bound — what `stop()` closes. `start()`
-	/// populates it on the copy of `Server` it hands to `on_start`, so
-	/// stopping a `Server` value that was never started (or started
-	/// elsewhere) is a no-op rather than an error (§9.1).
+	/// The live listener, once bound — what `stop()` closes. `start()` populates it
+	/// on the copy of `Server` it hands to `on_start`, so stopping a `Server` value
+	/// that was never started (or started elsewhere) is a no-op rather than an
+	/// error (§9.1).
 	node: Option<NodeServer>,
 }
 
 export struct ServerBuilder {
 	port: i32,
-	// Declared `async` (J2's typed channel): the handler may suspend, and
-	// `start()` awaits its response before writing.
+	// Declared `async` (J2's typed channel): the handler may suspend, and `start()`
+	// awaits its response before writing.
 	request_handler: async |Request| Response,
 	on_start: |Server| void,
 	on_stop: |Server| void,
@@ -525,17 +521,17 @@ export struct ServerBuilder {
 	/// what keeps this module's own knowledge of `Service` to one field.
 	services: List<Service>,
 	/// The build artifacts `serve_build` installed, folded in front of
-	/// `request_handler` by `build()` — so these routes answer first however
-	/// the chain was written, and the app's own handler still gets every path
-	/// they do not claim.
+	/// `request_handler` by `build()` — so these routes answer first however the
+	/// chain was written, and the app's own handler still gets every path they do
+	/// not claim.
 	assets: List<BuildAsset>,
-	/// The caching policy `cache_build` installed, `None` until an app hands
-	/// one over. `None` IS the default, and it is a branch rather than a
-	/// neutral policy: with nothing installed the asset routes take the exact
-	/// code path they took before this field existed, so the un-opted response
-	/// is byte-identical by construction and not by a policy that happens to
-	/// add no headers (kolt.local 025b — §5.10's fence is about defaults, and
-	/// this is the hook, not a default).
+	/// The caching policy `cache_build` installed, `None` until an app hands one
+	/// over. `None` IS the default, and it is a branch rather than a neutral
+	/// policy: with nothing installed the asset routes take the exact code path
+	/// they took before this field existed, so the un-opted response is
+	/// byte-identical by construction and not by a policy that happens to add no
+	/// headers (kolt.local 025b — §5.10's fence is about defaults, and this is the
+	/// hook, not a default).
 	asset_cache: Option<|str| CachePolicy>,
 }
 
@@ -553,9 +549,9 @@ export impl Server {
 		}
 	}
 
-	/// The port this server listens on: the requested one before `start`, the
-	/// bound one from `on_start` onward. Bind `0` and read it here to take a
-	/// port the OS knows is free instead of guessing one.
+	/// The port this server listens on: the requested one before `start`, the bound
+	/// one from `on_start` onward. Bind `0` and read it here to take a port the OS
+	/// knows is free instead of guessing one.
 	fun port(self): i32 {
 		self.port
 	}
@@ -565,18 +561,18 @@ export impl Server {
 	}
 
 	fun start(self) {
-		// Adopts asyncness from the `async` field read: the call below
-		// awaits the handler's response before writing.
+		// Adopts asyncness from the `async` field read: the call below awaits the
+		// handler's response before writing.
 		let request_handler = self.request_handler;
 		let on_start = self.on_start;
 		let server = self;
 		let port = self.port;
 		let upgrade_handler = self.upgrade_handler;
 		let node_server = node_create_server(|node_request, node_response| {
-			// Collect the full request body (as BYTES — it may be binary)
-			// before dispatching: `Request` carries a READY body rather than a
-			// stream, so every handler sees one shape and none has to drive a
-			// reader to get at the bytes.
+			// Collect the full request body (as BYTES — it may be binary) before
+			// dispatching: `Request` carries a READY body rather than a stream, so
+			// every handler sees one shape and none has to drive a reader to get at
+			// the bytes.
 			//
 			// This await is also the proof that nothing downstream of it is
 			// synchronous: the callback suspends HERE, before a byte is
@@ -598,8 +594,8 @@ export impl Server {
 			match response.body {
 				ResponseBody::Text(let text) => node_response.end(text),
 				ResponseBody::Bytes(let bytes) => node_response.end_bytes(bytes),
-				// The stream response: status and headers are written; hand
-				// the live stream to the app and leave the response open.
+				// The stream response: status and headers are written; hand the
+				// live stream to the app and leave the response open.
 				ResponseBody::Stream(let on_open) => on_open(ResponseStream {
 					node = node_response,
 				}),
@@ -610,9 +606,9 @@ export impl Server {
 			None => {},
 		}
 		node_server.listen(port, || {
-			// The server handed to `on_start` carries the port it actually
-			// bound, which is the whole point of being allowed to request 0 —
-			// and the live listener `stop()` needs (§9.1).
+			// The server handed to `on_start` carries the port it actually bound,
+			// which is the whole point of being allowed to request 0 — and the live
+			// listener `stop()` needs (§9.1).
 			mut started = server;
 			started.port = bound_port(node_server);
 			started.node = Some(node_server);
@@ -620,9 +616,9 @@ export impl Server {
 		});
 	}
 
-	/// Stop listening and fire `on_stop` once the listener has actually
-	/// closed (§9.1) — a no-op on a `Server` value `start()` never populated
-	/// (built but not started, or a copy taken before `on_start` ran).
+	/// Stop listening and fire `on_stop` once the listener has actually closed
+	/// (§9.1) — a no-op on a `Server` value `start()` never populated (built but
+	/// not started, or a copy taken before `on_start` ran).
 	fun stop(self) {
 		match self.node {
 			Some(let node_server) => {
@@ -637,8 +633,8 @@ export impl Server {
 	}
 }
 
-/// The port `node_server` actually bound, read off its `address()` — which is
-/// how a `port(0)` request becomes a number the app (and its clients) can use.
+/// The port `node_server` actually bound, read off its `address()` — which is how a
+/// `port(0)` request becomes a number the app (and its clients) can use.
 fun bound_port(node_server: NodeServer): i32 {
 	node_server.address().port()
 }
@@ -654,8 +650,8 @@ export impl ServerBuilder {
 		self
 	}
 
-	/// Mount a protocol-upgrade handler (a WebSocket handshake arrives here
-	/// instead of `on_request`): `(request, raw socket, head bytes)`.
+	/// Mount a protocol-upgrade handler (a WebSocket handshake arrives here instead
+	/// of `on_request`): `(request, raw socket, head bytes)`.
 	fun on_upgrade(own self, handler: |NodeRequest, NodeSocket, Bytes| void): ServerBuilder {
 		self.upgrade_handler = Some(handler);
 		self
@@ -675,22 +671,22 @@ export impl ServerBuilder {
 	/// artifact at `/<file name>`, with the content type its extension implies.
 	/// Repeatable — a server may front more than one leg.
 	///
-	/// This is what deletes the three boot reads and the content-type table
-	/// every server in this language used to write. Every part of that block
-	/// was derivable — the url from the artifact's file name, the MIME type
-	/// from its extension, the body from the read — and none of it was a
-	/// decision the application made. `build_of("client")` knows all three.
+	/// This is what deletes the three boot reads and the content-type table every
+	/// server in this language used to write. Every part of that block was
+	/// derivable — the url from the artifact's file name, the MIME type from its
+	/// extension, the body from the read — and none of it was a decision the
+	/// application made. `build_of("client")` knows all three.
 	///
-	/// The routes answer BEFORE `on_request`, independently of the order the
-	/// chain was written, so the app's catch-all still gets every path they do
-	/// not claim — which is what keeps a client-routed SPA's deep links
-	/// working. A leg that gains `split = true` gains its chunk routes here
-	/// with no server edit, which is what the chunk manifest was for.
+	/// The routes answer BEFORE `on_request`, independently of the order the chain
+	/// was written, so the app's catch-all still gets every path they do not claim
+	/// — which is what keeps a client-routed SPA's deep links working. A leg that
+	/// gains `split = true` gains its chunk routes here with no server edit, which
+	/// is what the chunk manifest was for.
 	///
-	/// The artifacts are read at boot; one the build named and did not write
-	/// stops the server rather than 404ing per request. Under `run --watch`
-	/// each is re-read per request instead (`asset_body`), so an edit that
-	/// rebuilt `dist/` is served without a restart.
+	/// The artifacts are read at boot; one the build named and did not write stops
+	/// the server rather than 404ing per request. Under `run --watch` each is
+	/// re-read per request instead (`asset_body`), so an edit that rebuilt `dist/`
+	/// is served without a restart.
 	fun serve_build(own self, build: LegBuild): ServerBuilder {
 		for asset in load_build(build) {
 			self.assets.push(asset);
@@ -698,10 +694,10 @@ export impl ServerBuilder {
 		self
 	}
 
-	/// Opt the served artifacts into caching (kolt.local 025b): `policy` is
-	/// asked, per artifact, what `serve_build` should send beyond the bytes —
-	/// a validator, a `Cache-Control`, or both. The two-tier policy every
-	/// static layer converges on is one expression:
+	/// Opt the served artifacts into caching (kolt.local 025b): `policy` is asked,
+	/// per artifact, what `serve_build` should send beyond the bytes — a validator,
+	/// a `Cache-Control`, or both. The two-tier policy every static layer converges
+	/// on is one expression:
 	///
 	///	.serve_build(build)
 	///	.cache_build(|url| if url.starts_with("/chunk-") {
@@ -710,34 +706,32 @@ export impl ServerBuilder {
 	///		CachePolicy::validated().cache_control("no-cache")
 	///	})
 	///
-	/// **Nothing changes for a server that does not call this.** The default
-	/// stays exactly what it was — one `Content-Type` header and the bytes —
-	/// because `serve_build` serves a build and not a directory, and caching is
-	/// a policy an application owns rather than one std guesses (the
-	/// `fullstack-dx.md` §5.10 fence, which this hook is scoped to leave
-	/// standing). One call opts in; deleting it opts back out; there is no
-	/// third state.
+	/// **Nothing changes for a server that does not call this.** The default stays
+	/// exactly what it was — one `Content-Type` header and the bytes — because
+	/// `serve_build` serves a build and not a directory, and caching is a policy an
+	/// application owns rather than one std guesses (the `fullstack-dx.md` §5.10
+	/// fence, which this hook is scoped to leave standing). One call opts in;
+	/// deleting it opts back out; there is no third state.
 	///
-	/// Repeatable, last-wins, and it covers every artifact of every
-	/// `serve_build` on the chain — order is irrelevant, since the policy is
-	/// consulted per request and the artifacts are matched by url. A validator
-	/// is minted over the bytes ACTUALLY being served, so it stays correct
-	/// under `run --watch`, where an edit changes them between requests; the
-	/// price is one sha-256 per hit on a validating artifact, which is the same
-	/// trade `etag_of` documents for a per-request digest.
+	/// Repeatable, last-wins, and it covers every artifact of every `serve_build`
+	/// on the chain — order is irrelevant, since the policy is consulted per
+	/// request and the artifacts are matched by url. A validator is minted over the
+	/// bytes ACTUALLY being served, so it stays correct under `run --watch`, where
+	/// an edit changes them between requests; the price is one sha-256 per hit on a
+	/// validating artifact, which is the same trade `etag_of` documents for a
+	/// per-request digest.
 	fun cache_build(own self, policy: |str| CachePolicy): ServerBuilder {
 		self.asset_cache = Some(policy);
 		self
 	}
 
-	/// Fold the installed services and build assets in front of
-	/// `request_handler` (`fullstack-dx.md` §4.2 and §5.4) and hand the result
-	/// to `Server`. Services answer first (their mounts are the most specific
-	/// claims and their wire is pinned), then the build's asset routes, then
-	/// the app's own handler for every path neither claims. Both folds are
-	/// pure functions of their fields — with neither installed, the handlers
-	/// come through exactly as the app wrote them, so a plain HTTP app is
-	/// unaffected down to the wire.
+	/// Fold the installed services and build assets in front of `request_handler`
+	/// (`fullstack-dx.md` §4.2 and §5.4) and hand the result to `Server`. Services
+	/// answer first (their mounts are the most specific claims and their wire is
+	/// pinned), then the build's asset routes, then the app's own handler for every
+	/// path neither claims. Both folds are pure functions of their fields — with
+	/// neither installed, the handlers come through exactly as the app wrote them,
+	/// so a plain HTTP app is unaffected down to the wire.
 	fun build(self): Server {
 		let assets = self.assets;
 		let cache = self.asset_cache;
@@ -762,11 +756,11 @@ fun respond_from_build(
 	request: Request,
 ): Response {
 	match asset_for(assets, request.path()) {
-		// Two arms, deliberately, rather than one arm under a neutral policy:
-		// with no `cache_build` on the chain the response is produced by the
-		// same call it always was, so "un-opted is unchanged" is a property of
-		// the control flow and not of what `CachePolicy::none()` happens to add
-		// (kolt.local 025b).
+		// Two arms, deliberately, rather than one arm under a neutral policy: with
+		// no `cache_build` on the chain the response is produced by the same call
+		// it always was, so "un-opted is unchanged" is a property of the control
+		// flow and not of what `CachePolicy::none()` happens to add (kolt.local
+		// 025b).
 		Some(let asset) => match cache {
 			Some(let policy) => cached_asset_response(asset, policy(asset.url), request),
 			None => asset_response(asset),
@@ -776,8 +770,8 @@ fun respond_from_build(
 }
 
 /// One artifact's response: its extension's content type, and the bytes the
-/// dev-mode freshness policy says to serve right now (`asset_body` — the
-/// boot-time copy, or a fresh read while watching).
+/// dev-mode freshness policy says to serve right now (`asset_body` — the boot-time
+/// copy, or a fresh read while watching).
 ///
 /// `body_bytes`, not `body`: the artifact goes out as the build wrote it. This
 /// is the leg that makes the content-type table honest — a table that can name
@@ -796,17 +790,17 @@ fun asset_response(asset: BuildAsset): Response {
 /// `serve_build` (kolt.local 025b).
 ///
 /// It is a composition and nothing more: the validating half is exactly
-/// `etag_response`, the same function an application writes by hand for a page
-/// it renders itself, over the same bytes `asset_response` would have sent and
-/// the same content type the extension named. `etag_response` handing back a
-/// still-open builder is what makes that work — `Cache-Control` chains onto
-/// whichever arm answered, so the `304` carries the policy headers its `200`
-/// would have carried (RFC 9110 §15.4.5), which is the point of returning a
-/// builder rather than a `Response` and is why nothing here re-derives it.
+/// `etag_response`, the same function an application writes by hand for a page it
+/// renders itself, over the same bytes `asset_response` would have sent and the
+/// same content type the extension named. `etag_response` handing back a still-open
+/// builder is what makes that work — `Cache-Control` chains onto whichever arm
+/// answered, so the `304` carries the policy headers its `200` would have carried
+/// (RFC 9110 §15.4.5), which is the point of returning a builder rather than a
+/// `Response` and is why nothing here re-derives it.
 ///
-/// The bytes are taken ONCE and both the validator and the body come from that
-/// one read: under `run --watch` `asset_body` re-reads per request, and hashing
-/// a second read could mint a tag for a file that had already changed again.
+/// The bytes are taken ONCE and both the validator and the body come from that one
+/// read: under `run --watch` `asset_body` re-reads per request, and hashing a
+/// second read could mint a tag for a file that had already changed again.
 fun cached_asset_response(asset: BuildAsset, policy: CachePolicy, request: Request): Response {
 	let body = asset_body(asset);
 	mut response = if policy.validate {

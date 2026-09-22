@@ -557,6 +557,11 @@ const RETIRED_STD_NAMES: &[&str] = &[
 /// The comment lines allowed to name one anyway — each a sentence whose
 /// SUBJECT is the retirement, which is the one thing that cannot be said
 /// without the old name. Keyed on a distinctive run of the line.
+///
+/// A run is kept SHORT on purpose (E215): std's prose is re-filled by
+/// `vilan fmt` now, so a key spanning most of a line stops matching the
+/// moment a word moves across the wrap. A code span is an atom the fill
+/// never breaks, so a run anchored on one survives a reflow.
 const RETIREMENT_NOTES: &[(&str, &str)] = &[
     (
         "browser/ui.vl",
@@ -567,10 +572,7 @@ const RETIREMENT_NOTES: &[(&str, &str)] = &[
         "`bind_each_values`, `bind_each_by` — are retired",
     ),
     ("browser/ui.vl", "Named `each` and not `bind_each`"),
-    (
-        "browser/ui.vl",
-        "where `{bind_each(..)}` read as a setter that had escaped",
-    ),
+    ("browser/ui.vl", "`{bind_each(..)}` read as a setter"),
     (
         "style.vl",
         "all and pushed authors onto the deleted `child_relation` as a",

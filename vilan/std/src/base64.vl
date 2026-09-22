@@ -1,6 +1,6 @@
 // Base64url (RFC 4648 §5, unpadded) over `Bytes` — pure vilan, so it is also
-// available at compile time. The alphabet's `-`/`_` and the absent padding are
-// what JWTs and URL-safe tokens expect.
+// available at compile time. The alphabet's `-`/`_` and the absent padding are what
+// JWTs and URL-safe tokens expect.
 
 import pkg::bytes::Bytes;
 import pkg::option::Option::{ self, None, Some };
