@@ -388,6 +388,15 @@ Its writers take `&mut self` and keep their state in plain fields, like
 Same model as JSON, compact layout. `i53` values ride as f64 bit patterns,
 exact to 2^53.
 
+**The reader validates too**, and the format is schema-ORDERED, so what it
+validates is the bytes rather than a kind: a read past the buffer, a length
+prefix claiming more than the frame holds, an `Option` marker or a `bool` byte
+that is neither `0` nor `1`, and a frame LONGER than the value it declares —
+bytes left over are bytes the two sides disagree about, and reading a prefix as
+the whole is how a caller gets a value that was never sent. Each is a sticky
+failure naming what was expected and what was found, exactly as the JSON
+reader's are.
+
 ## Base64 (`std::base64`)
 
 URL-safe alphabet, no padding (the JWT flavor):

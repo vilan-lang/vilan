@@ -6536,3 +6536,134 @@ fn b373_the_scalar_lanes_still_read_what_they_are_for() {
         "i32:42\ni32:-7\nu32:9\nf64:1.5\n",
     );
 }
+
+// --- N117: the BINARY reader's kind-mismatch audit ---------------------------
+//
+// 2321790e closed the class on the JSON reader — a typed read that never
+// poisoned on the wrong kind or a short list. The binary codec is the other
+// codec, and the audit is the same one. Most of its shapes were already held:
+// the format is schema-ORDERED, so there is no kind on the wire to mismatch,
+// `expect(count)` refuses a read past the buffer, `read_length` refuses a
+// prefix longer than the frame (which is what bounds a hostile list COUNT — a
+// list cannot be read past its declared count, because the count is what the
+// generated rebuild loops on), and an unknown variant tag is poisoned by the
+// derive's own fallback arm, shared with JSON.
+//
+// Three were not, and each is a byte the writer never emits being read as
+// something the schema says is there: an `Option` marker that is neither 0 nor
+// 1 (any non-zero read as "present", so the value was taken one byte on — a
+// shifted read of whatever followed), a `bool` byte that is neither (read as
+// `true`), and a frame LONGER than the value it declares (a prefix read as the
+// whole, so a caller got a value that was never sent). Each answers a reason
+// naming both sides, as the JSON reader's do.
+
+/// The fixture: a two-field Wire type whose bytes are `[marker][i32][bool]`,
+/// with one byte of the encoding replaced. `at` is an index into the frame.
+fn binary_reader_program(mutation: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+        import std::binary::{{ decode_binary, encode_binary }};
+        import std::bytes::Bytes;
+        [derive(Wire)]
+        struct Flagged {{
+            tag: Option<i32>,
+            on: bool,
+        }}
+        fun show(bytes: Bytes): str {{
+            let back: Result<Flagged, str> = decode_binary(bytes);
+            match back {{
+                Ok(let value) => i"read:{{value.tag.is_some()}},{{value.on}}",
+                Err(let reason) => i"refused:{{reason}}",
+            }}
+        }}
+        fun with_byte(bytes: Bytes, at: i32, value: i32): Bytes {{
+            let copy = Bytes::alloc(bytes.len());
+            copy.copy_into(bytes, 0);
+            copy.set(at, value);
+            copy
+        }}
+        fun main() {{
+            let good = encode_binary(Flagged {{ tag = Some(7), on = true }});
+            {mutation}
+        }}
+        "#
+    )
+}
+
+/// The control, first: a well-formed frame still round-trips.
+#[test]
+fn n117_the_binary_reader_still_reads_a_well_formed_frame() {
+    assert_compiles_and_runs(
+        &binary_reader_program("print(show(good));"),
+        "read:true,true\n",
+    );
+}
+
+/// An `Option` marker byte that is neither 0 nor 1.
+#[test]
+fn n117_the_binary_reader_refuses_an_option_marker_that_is_neither_zero_nor_one() {
+    assert_compiles_and_runs(
+        &binary_reader_program("print(show(with_byte(good, 0, 7)));"),
+        "refused:expected an Option marker (0 or 1), found 7\n",
+    );
+}
+
+/// A `bool` byte that is neither 0 nor 1 — the last byte of this encoding.
+#[test]
+fn n117_the_binary_reader_refuses_a_boolean_byte_that_is_neither_zero_nor_one() {
+    assert_compiles_and_runs(
+        &binary_reader_program("print(show(with_byte(good, good.len() - 1, 5)));"),
+        "refused:expected a boolean (0 or 1), found 5\n",
+    );
+}
+
+/// A frame LONGER than the value it declares: the binary twin of the JSON
+/// reader's unread-element check.
+#[test]
+fn n117_the_binary_reader_refuses_a_frame_with_bytes_left_unread() {
+    assert_compiles_and_runs(
+        &binary_reader_program(
+            "let longer = Bytes::alloc(good.len() + 2);\n\
+             longer.copy_into(good, 0);\n\
+             print(show(longer));",
+        ),
+        "refused:frame has 2 byte(s) left unread\n",
+    );
+}
+
+/// And the shape that was already held, pinned so the audit's own claim is
+/// checked rather than asserted: a truncated frame is a decode failure.
+#[test]
+fn n117_the_binary_reader_refuses_a_truncated_frame() {
+    assert_compiles_and_runs(
+        &binary_reader_program("print(show(good.slice(0, good.len() - 1)));"),
+        "refused:unexpected end of frame\n",
+    );
+}
+
+/// A string whose length prefix claims more than the frame holds — the other
+/// shape the audit names, over a type whose encoding is a length-prefixed
+/// string. The prefix is the first four bytes, little-endian.
+#[test]
+fn n117_the_binary_reader_refuses_a_string_length_past_the_frame() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::binary::{ decode_binary, encode_binary };
+        import std::bytes::Bytes;
+        fun main() {
+            let good = encode_binary("ada");
+            let copy = Bytes::alloc(good.len());
+            copy.copy_into(good, 0);
+            copy.set(0, 200);
+            let back: Result<str, str> = decode_binary(copy);
+            match back {
+                Ok(let value) => print(i"read:{value}"),
+                Err(let reason) => print(i"refused:{reason}"),
+            }
+        }
+        "#,
+        "refused:length prefix exceeds frame\n",
+    );
+}

@@ -295,17 +295,27 @@ export impl BinaryReader with Deserialize {
 
 	fun end_variant(&mut self) {}
 
+	/// The `Option` marker is `0x00` or `0x01` and NOTHING ELSE (N117): every
+	/// other byte used to read as "present", so a frame whose marker is `0x07`
+	/// decoded as a `Some` whose value starts one byte later — a shifted read
+	/// of whatever followed, silently, with `failed()` answering `None`. This
+	/// is the binary twin of the JSON reader's kind gate: a frame is not
+	/// trusted just because the schema says what should be at this offset.
 	fun is_null(&mut self): bool {
 		if !self.expect(1) {
 			ret false;
 		}
-		if self.bytes.get(self.cursor) == 0 {
-			true
-		} else {
-			// A present Option: consume the `0x01` marker; the value follows.
-			self.cursor = self.cursor + 1;
-			false
+		let marker = self.bytes.get(self.cursor);
+		if marker == 0 {
+			ret true;
 		}
+		if marker != 1 {
+			self.report(i"expected an Option marker (0 or 1), found {marker}");
+			ret false;
+		}
+		// A present Option: consume the `0x01` marker; the value follows.
+		self.cursor = self.cursor + 1;
+		false
 	}
 
 	fun null_value(&mut self) {
@@ -332,8 +342,17 @@ export impl BinaryReader with Deserialize {
 		self.read_f64()
 	}
 
+	/// A `bool` is `0x00` or `0x01` (N117), for `is_null`'s reason: the writer
+	/// emits exactly those two, so any other byte is a frame that disagrees
+	/// with the schema, and reading it as `true` is a coercion where the
+	/// contract asks for a refusal.
 	fun bool_value(&mut self): bool {
-		self.read_byte() != 0
+		let byte = self.read_byte();
+		if byte > 1 {
+			self.report(i"expected a boolean (0 or 1), found {byte}");
+			ret false;
+		}
+		byte == 1
 	}
 
 	fun fail(&mut self, reason: str) {
@@ -354,9 +373,20 @@ export fun encode_binary<T: Wire>(value: T): Bytes {
 
 /// Decode compact bytes as a `Wire` value; `Err(reason)` names the first
 /// structural failure (truncation, an over-declared length, unknown variant).
+///
+/// A frame LONGER than the value it declares is a failure too (N117), and it is
+/// the binary twin of the JSON reader's unread-element check: the schema says
+/// how many bytes this type occupies, so bytes left over are bytes the two
+/// sides disagree about. Nothing legitimate produces them — `encode_binary`
+/// writes exactly one value — and reading a prefix of a frame as the whole of
+/// it is how a caller gets a value that was never sent.
 export fun decode_binary<T: Wire>(bytes: Bytes): Result<T, str> {
 	mut reader = BinaryReader::new(bytes);
 	let value: T = T::rebuild(&mut reader);
+	if reader.ok() && reader.cursor < bytes.len() {
+		let unread = bytes.len() - reader.cursor;
+		reader.report(i"frame has {unread} byte(s) left unread");
+	}
 	match reader.error {
 		None => Ok(value),
 		Some(let reason) => Err(reason),
