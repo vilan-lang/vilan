@@ -7461,7 +7461,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
         parts.extend(rendered);
         Ok(Self::with_argument_prelude(
             prelude,
-            format!("{}::{}({})", object.name, sanitize(member), parts.join(", ")),
+            format!(
+                "{}::{}({})",
+                object.name,
+                sanitize(member),
+                parts.join(", ")
+            ),
         ))
     }
 

@@ -678,11 +678,10 @@ fun main() {
 
 /// The brief's pin in its own words — a root, a COLD node and a `.cell()` in
 /// one `List<Holder>` of `dyn Source<i32>` — over the S1 probe's real nodes
-/// (`std::reactive_pipeline`, reactive-40's). Those nodes are not on this
-/// lane's base, so the pin waits for the merge; it was run green over
-/// `origin/next`'s two std files (`1 101 10 / 5 105 50`) before it was filed.
+/// (`std::reactive_pipeline`, reactive-40's S1 probe): the root cell, a
+/// `Map` node that owns no value, and a `.cell()` materialising a second chain
+/// — three different types behind one field type.
 #[test]
-#[ignore = "A124: needs std::reactive_pipeline (reactive-40, merged to next after this lane's base) - un-ignore at the dyn-40 merge"]
 fn a_dyn_source_field_holds_a_root_a_map_node_and_a_cell() {
     assert_compiles_and_runs(
         "import std::reactive::{ Source, SignalCell };
