@@ -18547,6 +18547,28 @@ impl<'src> Analyzer<'src> {
     ) {
         let pattern = pattern_id.get_type(self);
         let actual = actual_id.get_type(self);
+        // B371: the CALLER's own parameter is an answer, not a hole. A blanket
+        // reached from inside a generic body — `self.map(f).flatten()` in
+        // `fun switch<U, I: Source<U>>` — matches `flatten`'s
+        // `S: Source<type I: Source<type U>>` against `SignalCell<I>`, and the
+        // bound's argument comes back as the caller's `I`. Declining it left
+        // `flatten`'s `I` unbound in the recorded substitution, so the
+        // instance the caller's instantiation emitted had nothing to resolve
+        // `self.get().get()` through and reached `Source`'s bodyless `get`.
+        // Bound to the caller's parameter, it composes: the caller's instance
+        // grounds that parameter, and the emitter follows a binding to a
+        // binding (B244). Only a bare binder takes it — a written shape
+        // (`Option<type I>`) cannot be read off an abstract type.
+        if let Some(caller_generic) = self.callers_rigid_generic(&actual) {
+            if let Type::Generic(binder) = pattern {
+                let mut pattern_binders = Vec::new();
+                self.collect_subject_binders(pattern_id, &mut pattern_binders);
+                if binder != caller_generic && pattern_binders.contains(&binder) {
+                    bindings.entry(binder).or_insert(actual_id);
+                }
+            }
+            return;
+        }
         if !crate::impl_select::is_resolvable(&actual) {
             return;
         }
@@ -18558,6 +18580,18 @@ impl<'src> Analyzer<'src> {
         let grounded = self.bindings_for_binders(&pattern_binders, pairs);
         for (constraint_id, bound_id) in grounded {
             bindings.entry(constraint_id).or_insert(bound_id);
+        }
+    }
+
+    /// The constraint id when `type_` is a generic parameter the ENCLOSING
+    /// declaration owns at the site being checked — the caller's own `I`,
+    /// rigid in its body (B211) and grounded by every instantiation of it.
+    fn callers_rigid_generic(&self, type_: &Type) -> Option<TypeId> {
+        match type_ {
+            Type::Generic(constraint_id) if self.generic_is_rigid_here(*constraint_id) => {
+                Some(*constraint_id)
+            }
+            _ => None,
         }
     }
 
@@ -18604,14 +18638,27 @@ impl<'src> Analyzer<'src> {
                 continue;
             };
             let concrete = concrete_id.get_type(self);
-            if !crate::impl_select::is_resolvable(&concrete) {
+            // B371: a binder bound to the CALLER's parameter answers its own
+            // bounds from that parameter's DECLARED bounds — `I: Source<U>`
+            // says what `Source` argument the caller's `I` provides, which is
+            // what binds `flatten`'s `U` to the caller's `U`.
+            let caller_generic = self.callers_rigid_generic(&concrete);
+            if caller_generic.is_none() && !crate::impl_select::is_resolvable(&concrete) {
                 continue;
             }
             for (trait_id, bound_arguments) in self.generic_bound_traits(binder) {
                 if bound_arguments.is_empty() {
                     continue;
                 }
-                let Some(provided) = self.trait_args_for(&concrete, trait_id) else {
+                let provided = match caller_generic {
+                    Some(caller_generic) => self
+                        .generic_bound_traits(caller_generic)
+                        .into_iter()
+                        .find(|(declared_trait_id, _)| *declared_trait_id == trait_id)
+                        .map(|(_, arguments)| arguments),
+                    None => self.trait_args_for(&concrete, trait_id),
+                };
+                let Some(provided) = provided else {
                     continue;
                 };
                 if provided.len() != bound_arguments.len() {
