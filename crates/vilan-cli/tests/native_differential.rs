@@ -33,6 +33,22 @@
 //! `vilan-rt` build is shared through one `CARGO_TARGET_DIR` under
 //! `CARGO_TARGET_TMPDIR`, so the runtime compiles ONCE for the whole sweep
 //! rather than once per program.
+//!
+//! # No assertion in this suite reads a clock (N116)
+//!
+//! Nothing here times anything, and that is deliberate — but a probe program
+//! that SLEEPS is the same mistake wearing a different hat. The comparison is
+//! over bytes, and if the ordering of those bytes depends on two deadlines
+//! that a busy box can let expire together, the pin measures the box.
+//!
+//! So a probe whose claim is an ORDER states it with a gap no scheduling stall
+//! on this machine closes: **the later deadline is at least ten times the
+//! earlier one and at least 200 ms in absolute terms**, so the runtime has to
+//! reach its timer phase at least that late before the two can tie. Where the
+//! order is not the claim, a probe does not sleep at all. The alternative — a
+//! virtual clock injected into `vilan-rt`'s deadline list — cannot reach here:
+//! this suite compares two REAL processes, one of them `node`, and node's
+//! clock is not ours to move.
 
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
@@ -1551,8 +1567,13 @@ fn every_async_corpus_program_is_identical_or_named() {
 /// its generics, so the ordering the backend must reproduce is pinned here
 /// instead, on the three rules a reader can check by eye: a spawn is EAGER (its
 /// `enter` prints before the line after the spawn expression), the deadline list
-/// is ordered (the 1 ms task finishes before the 12 ms one that was spawned
+/// is ordered (the 5 ms task finishes before the 500 ms one that was spawned
 /// FIRST), and a join answers the spawned value.
+///
+/// The two deadlines are 5 ms and 500 ms because this probe's claim is an
+/// ORDER, and the suite's rule for one is at the head (N116): a hundredfold
+/// gap, so no scheduling stall on this machine can let the later deadline tie
+/// with the earlier and invert the two runtimes' answers.
 #[test]
 fn the_spawn_and_sleep_ordering_is_byte_identical_on_both_backends() {
     let staged = stage();
@@ -1562,6 +1583,27 @@ fn the_spawn_and_sleep_ordering_is_byte_identical_on_both_backends() {
         compare(&staged, "native_probe_spawn.vl"),
         Verdict::Identical,
         "the executor's spawn and sleep ordering must match the JS turn model"
+    );
+    // N116: and the order the two agree on is the order this probe CLAIMS.
+    //
+    // `compare` asks only whether the two backends print the same bytes, so a
+    // change that inverted the deadline list on BOTH of them would satisfy it
+    // perfectly — and, before the deadlines were widened, a busy box could
+    // invert node's alone, which is what made this pin flaky. Stating the
+    // expected stdout costs one more `vilan run` and turns both of those into
+    // a red that names the rule.
+    let javascript = vilan(&staged)
+        .args(["run", "native_probe_spawn.vl"])
+        .output()
+        .expect("run the JS backend");
+    assert!(javascript.status.success(), "{javascript:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&javascript.stdout),
+        // A spawn is EAGER, so both `enter` lines precede `spawned`; the
+        // deadline list is ordered, so `early` leaves first although `late`
+        // was spawned first; and each join answers its own task's value.
+        "enter late\nenter early\nspawned\nleave early\nearly\nleave late\nlate\n",
+        "the three rules this probe exists for, spelled out"
     );
 }
 
@@ -1639,8 +1681,15 @@ const SPAWN_ORDER_PROBE: &str = concat!(
     "}\n",
     "\n",
     "fun main() {\n",
-    "\tlet late = async step(\"late\", 12);\n",
-    "\tlet early = async step(\"early\", 1);\n",
+    // N116: 1 ms and 12 ms were the deadlines, and under a parallel lane both
+    // could be overdue by the time either runtime reached its timer phase —
+    // at which point node fires them in INSERTION order (`late` first) while
+    // the native executor fires them in DEADLINE order, and the two stdouts
+    // part company over nothing. 5 ms and 500 ms is the same claim with a
+    // stall budget: the ordering inverts only if a runtime takes half a
+    // second to look at its timers.
+    "\tlet late = async step(\"late\", 500);\n",
+    "\tlet early = async step(\"early\", 5);\n",
     "\tprint(\"spawned\");\n",
     "\tprint(await early);\n",
     "\tprint(await late);\n",
