@@ -53431,6 +53431,14 @@ pub(crate) fn service_method_refusals(
     });
     let mut refusals = Vec::new();
     for (node, _span) in nodes {
+        // `export impl` is the same impl under an `Export` wrapper, and the
+        // generator reads through it (B375's `gather_rpc_methods`); a walk
+        // that did not would let every refusal below be dodged by writing
+        // `export` on the block.
+        let mut node = node;
+        while let Node::Export(_, inner) = node {
+            node = &inner.0;
+        }
         let Node::Impl(subject, impl_traits, body) = node else {
             continue;
         };

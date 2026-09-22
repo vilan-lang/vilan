@@ -7143,3 +7143,75 @@ fun main() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// B375's other walk. `gather_rpc_methods` learned to read through `export
+/// impl`, but the attribute's method REFUSALS (`service_method_refusals`:
+/// `mut self`, `async` beside `&mut self`, a `__` parameter, a generated
+/// member's name) walked only the bare `Impl` node — so writing `export` on the
+/// block dodged every one of them, and a `mut self` write was lost in silence
+/// again, the very third state B272 refused. Each refusal must fire through
+/// `export impl` exactly as it does through a plain one.
+#[test]
+fn the_service_method_refusals_read_through_export_impl() {
+    let dir = temp_project("export_impl_refusals");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"[service(DoorClient)]
+struct Door {
+	seed: i32,
+}
+
+export impl Door {
+	[rpc]
+	fun bump(mut self): i32 {
+		self.seed = self.seed + 1;
+		self.seed
+	}
+
+	[rpc]
+	fun tag(self, __request: str): str {
+		__request
+	}
+
+	[rpc]
+	fun verify(self): bool {
+		true
+	}
+}
+
+fun main() {
+}
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["check", dir.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan check");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "an `export impl` must not dodge the service's method refusals:\n{report}"
+    );
+    for head in [
+        "`[rpc]` method `bump` takes `mut self`",
+        "parameter `__request` of `[rpc]` method `tag` starts with `__`",
+        "`[rpc]` method `verify` takes a name the `[service]` expansion generates",
+    ] {
+        assert!(
+            report.contains(head),
+            "`{head}` must be refused through `export impl`:\n{report}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
