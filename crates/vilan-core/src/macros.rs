@@ -46,9 +46,17 @@ use crate::{PackageSpec, Platform, Workspace, analyze_source};
 /// The table survives the generators because the REFUSAL needs it — the name
 /// alone cannot say which module a reader is missing.
 ///
-/// A name that is not here keeps the behaviour it has always had: nothing is
-/// generated and nothing is said, because an unknown `[derive(Foo)]` is a
-/// missing `Foo` macro, which the missing impl reports at the use site.
+/// B376: a name that is not here, with no macro of that name in scope, is
+/// REFUSED at the attribute ([`unknown_derive_refusal`]) — and this table is
+/// what that refusal prints as the derivable set, which is its second job and
+/// the reason `derives_are_the_macros_std_declares` holds it to std's own
+/// `macro fun`s in both directions. It used to expand to nothing and say
+/// nothing, on the reasoning that an unknown `[derive(Foo)]` is a missing
+/// `Foo` macro which the missing impl reports at the use site. It does, and
+/// that is the wrong place to learn it: `[derive(PartialOrd)]` was clean and
+/// the sentence arrived forty lines later, at a `<`, as advice to hand-write
+/// the impl the author believed they had just asked for — and a program with
+/// no comparison in it said nothing at all.
 const STD_DERIVE_MACROS: &[(&str, &str)] = &[
     ("PartialEq", "compare.vl"),
     ("Default", "default.vl"),
@@ -57,6 +65,28 @@ const STD_DERIVE_MACROS: &[(&str, &str)] = &[
     ("Wire", "json.vl"),
     ("Hashable", "hash.vl"),
 ];
+
+/// B376: what to say about `[derive(Name)]` where nothing declares a `Name`
+/// macro — not std, not this file, not an import.
+///
+/// One function, and the ONE place `STD_DERIVE_MACROS` is spelled to a reader:
+/// the refusal has to name what IS derivable or it is a "no" with no next
+/// step, and a hand-written list here would be the table's second copy.
+/// `derives_are_the_macros_std_declares` holds the table to std's own
+/// `macro fun`s, which is the other half of keeping one list.
+fn unknown_derive_refusal(derive: &str) -> String {
+    let derivable: Vec<String> = STD_DERIVE_MACROS
+        .iter()
+        .map(|(name, _)| format!("`{name}`"))
+        .collect();
+    format!(
+        "`{derive}` is not a derivable trait: nothing declares a `{derive}` macro \
+         — not std, not this file, and nothing it imports. std derives {}; a \
+         derive of your own is a `macro fun {derive}` in this file or imported \
+         by name",
+        derivable.join(", ")
+    )
+}
 
 /// The std module declaring `derive`'s macro, or `None` for a name std has
 /// never declared one for.
@@ -1877,6 +1907,33 @@ impl Expander<'_, '_> {
                             span: *name_span,
                             msg,
                         });
+                    } else {
+                        // B376: a name nothing declares a macro for. It used to
+                        // expand to NOTHING and say nothing, on the reasoning
+                        // recorded above `STD_DERIVE_MACROS` — the missing impl
+                        // would surface at the use site. It does, and the use
+                        // site is the wrong place: `[derive(PartialOrd)]` is
+                        // clean, and forty lines later `a < b` says "type `P`
+                        // does not implement the `PartialOrd` operator; add
+                        // `impl P with PartialOrd`", which is advice to write by
+                        // hand the impl the author believed they had just asked
+                        // for. A program with no comparison in it at all says
+                        // nothing whatsoever.
+                        //
+                        // The three states this arm is NOT are each handled
+                        // above and each has its own sentence: a macro in scope
+                        // (expand), a macro world (skip), and a std derive name
+                        // whose module did not register (a toolchain or
+                        // load-order report). What is left is a name, at a
+                        // derive, that expands to nothing — which is the
+                        // author's typo or a missing import, and both are said
+                        // here, at the attribute.
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span: *name_span,
+                            msg: unknown_derive_refusal(name),
+                        });
                     }
                 }
                 self.sweep_expressions(item, text, depth);
@@ -3078,4 +3135,127 @@ fn construct_arguments(arguments: &[Cow<'_, str>]) -> js::Node<'static> {
             .map(|argument| string_literal(argument.trim()))
             .collect(),
     )])
+}
+
+/// B376: the derive table and std's own `macro fun`s are ONE list.
+///
+/// [`STD_DERIVE_MACROS`] exists so a refusal can name the module a reader is
+/// missing, and since B376 it is also what
+/// [`unknown_derive_refusal`] prints as "what IS derivable". Both readings are
+/// wrong the moment the table and std disagree — the first names a module that
+/// declares nothing, and the second offers a name that expands to nothing,
+/// which is the very defect the refusal exists to close. Nothing held them
+/// together: the table was hand-maintained beside a std that moves.
+///
+/// Held in BOTH directions, because either drift is a lie. A table row whose
+/// module declares no such `macro fun` is the first; a `macro fun` in one of
+/// those modules whose name is a derivable trait and is missing from the table
+/// would be the second, and is checked as the exact inverse — every name the
+/// table claims is found, and the count of found rows is the table's length.
+#[cfg(test)]
+mod derive_table_tests {
+    use super::STD_DERIVE_MACROS;
+    use std::path::{Path, PathBuf};
+
+    fn std_src() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std/src")
+    }
+
+    #[test]
+    fn derives_are_the_macros_std_declares() {
+        let mut missing: Vec<String> = Vec::new();
+        for (name, module) in STD_DERIVE_MACROS {
+            let path = std_src().join(module);
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("`{}` is unreadable: {error}", path.display()));
+            let declared = source.lines().any(|line| {
+                let line = line.trim_start();
+                let line = line.strip_prefix("export ").unwrap_or(line);
+                line.strip_prefix("macro fun ")
+                    .and_then(|rest| rest.strip_prefix(*name))
+                    .is_some_and(|rest| rest.starts_with('('))
+            });
+            if !declared {
+                missing.push(format!("`{name}` in `std/src/{module}`"));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "`STD_DERIVE_MACROS` names {} derive(s) std declares no `macro fun` for: {}. \
+             The table is what the refusal PRINTS as the derivable set, so a row std \
+             does not back offers a name that expands to nothing — which is B376.",
+            missing.len(),
+            missing.join(", ")
+        );
+    }
+
+    /// The inverse: a derive-shaped `macro fun` anywhere in std that the table
+    /// does not list. Without this the table could go stale by OMISSION — a
+    /// derive std grows and nothing offers it, refused by name as though it had
+    /// never existed, with the refusal's own list of what IS derivable leaving
+    /// it out.
+    ///
+    /// The walk is over the WHOLE of `std/src`, deliberately, and not over the
+    /// modules the table names: deriving the search set from the table is how
+    /// an omission hides, since dropping a row drops its module from the scan
+    /// with it. (Measured: it does — the first draft of this test passed with
+    /// `Hashable` deleted from the table.)
+    ///
+    /// `[service]` is the one exemption and it is spelled by name: it is an
+    /// attribute macro of the same shape, dispatched by `Node::Service` and
+    /// not by `Node::Derive`, so it is not a derive and must not be offered as
+    /// one.
+    #[test]
+    fn every_derive_shaped_macro_in_std_is_in_the_table() {
+        /// An `Item`-shaped `macro fun` that is deliberately NOT a derive.
+        const NOT_A_DERIVE: &[&str] = &["service"];
+
+        let mut unlisted: Vec<String> = Vec::new();
+        let mut directories = vec![std_src()];
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(&directory).expect("a readable std directory") {
+                let path = entry.expect("a readable entry").path();
+                if path.is_dir() {
+                    directories.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|extension| extension != "vl") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("a readable std module");
+                for line in source.lines() {
+                    let line = line.trim_start();
+                    let line = line.strip_prefix("export ").unwrap_or(line);
+                    let Some(rest) = line.strip_prefix("macro fun ") else {
+                        continue;
+                    };
+                    let Some((name, signature)) = rest.split_once('(') else {
+                        continue;
+                    };
+                    // A derive macro is the one shape `[derive(..)]` dispatches
+                    // to: a single `Item` parameter. `struct_json_impls(target:
+                    // StructItem)` and its three siblings are ordinary macros
+                    // json.vl exports for its own derives to call.
+                    if !signature.starts_with("item: Item)") {
+                        continue;
+                    }
+                    if NOT_A_DERIVE.contains(&name) {
+                        continue;
+                    }
+                    if !STD_DERIVE_MACROS.iter().any(|(listed, _)| *listed == name) {
+                        unlisted.push(format!("`{name}` in `{}`", path.display()));
+                    }
+                }
+            }
+        }
+        unlisted.sort();
+        assert!(
+            unlisted.is_empty(),
+            "std declares {} derive-shaped macro(s) `STD_DERIVE_MACROS` does not list: {}. \
+             An unlisted derive is refused by name as though std had never declared it, \
+             and the refusal's own list of what IS derivable leaves it out.",
+            unlisted.len(),
+            unlisted.join(", ")
+        );
+    }
 }
