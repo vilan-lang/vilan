@@ -1651,6 +1651,25 @@ const BROWSER_ONLY_MODULE: &str = "import std::ui::{ View, view };\n\n\
      export fun attach(): View {\n\tlet root = view(\"div\");\n\t\
      root.element.set_attribute(\"id\", \"app\");\n\troot\n}\n";
 
+/// F27: a module over `std::ui`'s `Region` — every name it imports exists in
+/// BOTH twins, so it has no import evidence at all and takes the process one,
+/// where `anchor` is a field the browser twin alone declares.
+///
+/// Written on ONE line: `cargo fmt` joins a `\`-continued literal and leaves
+/// its indentation inside the string, which is a line of a `.vl` program
+/// pushed seventeen columns inward (`diagnostics_ledger.rs`'s
+/// `no_prose_literal_swallows_a_line_continuation`).
+const REGION_FIELD_MODULE: &str =
+    "import std::ui::Region;\n\nexport fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+
+/// The same over a METHOD the browser twin alone declares.
+const REGION_METHOD_MODULE: &str =
+    "import std::ui::Region;\n\nexport fun host_of(region: Region) {\n\tregion.host();\n}\n";
+
+/// And the control: a member NO twin declares.
+const REGION_TYPO_MODULE: &str =
+    "import std::ui::Region;\n\nexport fun anchor_of(region: Region) {\n\tregion.anchorr;\n}\n";
+
 /// The mirror: the PROCESS `View`'s `tag` field — clean under node, "no field
 /// 'tag'" under `browser`.
 const PROCESS_ONLY_MODULE: &str = "import std::ui::{ View, view };\n\n\
@@ -1984,10 +2003,7 @@ fn a_field_the_other_twin_declares_is_named_as_such() {
         &dir,
         "server",
         &[
-            (
-                "src/slot.vl",
-                "import std::ui::Region;\n\n                 export fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n",
-            ),
+            ("src/slot.vl", REGION_FIELD_MODULE),
             ("src/client.vl", entry),
             ("src/server.vl", entry),
         ],
@@ -2018,10 +2034,7 @@ fn a_method_the_other_twin_declares_is_named_too() {
         &dir,
         "server",
         &[
-            (
-                "src/slot.vl",
-                "import std::ui::Region;\n\n                 export fun host_of(region: Region) {\n\tregion.host();\n}\n",
-            ),
+            ("src/slot.vl", REGION_METHOD_MODULE),
             ("src/client.vl", entry),
             ("src/server.vl", entry),
         ],
@@ -2051,10 +2064,7 @@ fn a_member_neither_twin_declares_is_still_just_a_miss() {
         &dir,
         "server",
         &[
-            (
-                "src/slot.vl",
-                "import std::ui::Region;\n\n                 export fun anchor_of(region: Region) {\n\tregion.anchorr;\n}\n",
-            ),
+            ("src/slot.vl", REGION_TYPO_MODULE),
             ("src/client.vl", entry),
             ("src/server.vl", entry),
         ],
