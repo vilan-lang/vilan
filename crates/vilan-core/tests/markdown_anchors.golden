@@ -132,6 +132,8 @@ guide/services.md h2 the-other-direction-calling-the-client
 guide/services.md h3 what-the-turn-model-owes-you-here
 guide/services.md h3 what-happens-to-a-peer-that-has-not-heard-of-any-of-this
 guide/services.md h2 growing-past-one-service
+guide/services.md h2 reaching-a-service-over-plain-http
+guide/services.md h3 cors-and-the-credential
 guide/services.md h2 traps
 guide/ssr.md h1 server-side-rendering
 guide/ssr.md h2 one-component-both-legs
@@ -421,6 +423,7 @@ std/rpc.md h2 mirrors-remotesourcet
 std/rpc.md h2 keyed-mirrors-keyedsourcek-t
 std/rpc.md h2 keyed-cells-keyedcellk-t
 std/rpc.md h2 errors
+std/rpc.md h3 the-post-mountrpc-legs-statuses
 std/rpc.md h2 connection-state
 std/rpc.md h2 transports
 std/rpc.md h2 server-plumbing-stdrpc_server-process-layer
