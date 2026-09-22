@@ -633,6 +633,72 @@ You'd only call it directly to build your own list-rendering primitive.
 decides, for a surviving key, whether the row is reused or rebuilt;
 they're two questions, so they're two arguments.
 
+The key is `PartialEq + Hashable`. The plan is found through a hash index
+built over the old keys, so a key's hash must agree with its equality —
+`a == b` implies `a.hash() == b.hash()`, which is what `std::hash` already
+asks of a hand-written impl. Two keys that are *not* equal may share a
+hash; that is an ordinary collision and costs a step along the chain. It
+is the other direction — an equality coarser than the hash — that would
+hide a moved row, and the bound is there so it cannot be written.
+
+## Lists that know what changed: `ListCell` and `map_each`
+
+A derived list over a `SignalCell<List<T>>` re-runs its function for
+**every** element when one changes, because a `set` says only "the list is
+this now":
+
+```vilan,fragment
+let rows: SignalCell<List<str>> = Signal::new([]);
+let lengths = rows.map(|list: List<str>| list.map(|text: str| text.len()));
+// N calls of the inner function on every push
+```
+
+`ListCell<T>` is the same list with its writes recorded as *changes*, so a
+derivation can run once for the element that arrived:
+
+```vilan
+import std::reactive::{ ListCell, SequenceCell, map_each };
+
+fun main() {
+	let rows: ListCell<str> = ListCell<str>::new();
+	let lengths = map_each(rows, |text: str| text.len());
+	rows.push("hello");     // ONE call
+	rows.remove_at(0);      // none
+	print(lengths.get().len());
+}
+```
+
+It is an ordinary `Source<List<T>>` besides — `each`, `map`, `effect` all
+take it — and nothing that ignores the changes pays for them.
+
+Its mutators are `push`, `prepend`, `insert_at`, `insert_all`,
+`remove_at`, `remove_range`, `pop`, `extend`, `clear`, `set_all`,
+`truncate` and `is_empty`, and every one of them is a default over a
+single `splice`, which is why none of them can forget to record what it
+did. `edit` batches: hand it a body, make as many mutations as you like,
+and the cell publishes once with one change per mutation.
+
+```vilan
+import std::reactive::{ ListCell, Sequence };
+
+fun main() {
+	let rows: ListCell<str> = ListCell<str>::new();
+	rows.edit(|&mut list| {
+		list.push("a");
+		list.push("b");
+		list.remove_at(0);
+	});   // one notification, three changes
+	print(rows.get().len());
+}
+```
+
+Two things cost more, and say so: `set(whole_list)` records "the list
+became this", which is every element again, and `reconcile_to(whole_list)`
+diffs the ends and records only the span that moved — reach for it when a
+whole list arrives from somewhere (a fetch, a form) and you want the
+derivations to stay cheap. A `g` handed to `map_each` must be pure in its
+element: its result is kept, and nothing re-runs it.
+
 ## Traps
 
 - `sub` gives you a `Subscription` to dispose manually. Prefer `effect`

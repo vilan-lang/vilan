@@ -589,6 +589,7 @@ fn the_ssr_twins_of_the_mount_hook_render_the_same_markup_and_run_nothing() {
 /// channel.vl:54). The build now copies at the assignment, so `old_items` is
 /// the snapshot the keys were taken from.
 const IN_PLACE_REMOVE: &str = r#"import std::compare::PartialEq;
+import std::hash::{ Hash, Hashable };
 import std::io::print;
 import std::reactive::{ Signal, SignalCell };
 import std::ui::{ View, each, mount_root, view };
@@ -603,6 +604,16 @@ struct Row {
 impl Row with PartialEq {
 	fun eq(self, b: Row): bool {
 		self.id == b.id
+	}
+}
+
+// A125's obligation, and the reason `[derive(Hashable)]` is WRONG here: the
+// derive hashes the whole value, and two rows with one id and two labels are
+// `==` above while hashing apart — which is the coarse-`==` key the index
+// cannot place. The hash reads exactly the field the equality reads.
+impl Row with Hashable {
+	fun hash(self): Hash {
+		self.id.hash()
 	}
 }
 

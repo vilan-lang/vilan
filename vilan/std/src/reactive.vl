@@ -1,6 +1,6 @@
 import pkg::compare::PartialEq;
 import pkg::context::Context;
-import pkg::hash::{ Hashable, canonical_hash };
+import pkg::hash::Hashable;
 import pkg::io::panic;
 import pkg::native_map::NativeMap;
 import pkg::option::Option::{ self, None, Some };
@@ -23,10 +23,15 @@ export import pkg::delta::{
 	DeltaCursor,
 	DeltaLog,
 	DeltaSource,
+	ListCell,
 	MapOp,
 	SeqOp,
+	Sequence,
+	SequenceCell,
 	SetOp,
+	Tracked,
 	delta_log_limit,
+	map_each,
 };
 
 /// A resource that can be released. An `Owner` collects `Disposable`s and releases
@@ -1752,6 +1757,12 @@ export impl type S: Source<Option<type T>> {
 // exactly as it always has; `each_by` passes "always the same", which is
 // what lets it take a `T` with no equality at all and update a kept row
 // through its own cell instead of rebuilding it.
+//
+// The KEY is `PartialEq + Hashable` (A125): the plan is found through a hash
+// index, so a key's hash must agree with its equality — `a == b` implies
+// `a.hash() == b.hash()`, which is the obligation `std::hash` states for a
+// hand-written impl. That agreement is what makes a REORDER linear rather than
+// quadratic, and the bound is what makes it true rather than hoped for.
 
 /// One new-position row's fate. `Keep`/`Refresh` carry the OLD row's index.
 export enum RowStep {
@@ -1767,7 +1778,7 @@ export struct ReconcilePlan {
 	removed: List<i32>,
 }
 
-export fun reconcile<T, K: PartialEq>(
+export fun reconcile<T, K: PartialEq + Hashable>(
 	old_keys: List<K>,
 	old_items: List<T>,
 	items: List<T>,
@@ -1779,14 +1790,15 @@ export fun reconcile<T, K: PartialEq>(
 		claimed.push(false);
 	}
 	let held = old_keys.len();
-	// M82: a POSITION INDEX, so a pass stops being quadratic.
+	// M82's POSITION INDEX, on A125's `K: Hashable`: a pass is linear for
+	// every change, a REORDER included.
 	//
 	// The scan this replaces walked `old_keys` from 0 for every new item,
 	// skipping claimed entries — so for a list that did not reorder, item `i`
 	// matched at index `i` after walking `i + 1` entries, and a pass cost
 	// N(N+1)/2 iterations whatever the change was: 500,500 at 1,000 rows for
 	// ONE append. The index is the same thing `KeyedCell` keeps, built per
-	// pass: for each canonical key, the chain of old positions holding it,
+	// pass: for each key's hash, the chain of old positions holding it,
 	// smallest first. `first` is a chain's head and `next_same[i]` is the
 	// position after `i` in `i`'s own chain — one native map of at most N
 	// entries plus one N-element list, no nested containers and no per-key list
@@ -1795,16 +1807,23 @@ export fun reconcile<T, K: PartialEq>(
 	// Built DESCENDING so each head ends up the smallest index in its chain,
 	// which is what makes walking a chain the same order as scanning from 0.
 	//
-	// **The plan is IDENTICAL to the scan's, for every `K`.** The scan's answer
-	// is the smallest unclaimed index whose key `==` the item's, and the index
-	// answers it directly only when the key's `==` agrees with canonical value
-	// identity. A `K` whose equality is COARSER — a case-insensitive string, a
-	// struct comparing a subset of its fields — can have an EARLIER match that
-	// hashes differently, so the earlier stretch is still scanned: from `low`,
-	// the smallest unclaimed index (everything below it is claimed), up to the
-	// candidate the chain named. Where the two agree, which is every key type
-	// in std, the corpus, the book, the examples and kolt, that stretch is
-	// empty and the pass is linear.
+	// **Why the bound, and what it buys (A125).** M82 keyed the index on
+	// `canonical_hash`, which no bound made agree with `K`'s `==`, so an
+	// EARLIER equal key could sit outside the chain and the stretch from the
+	// smallest unclaimed index up to the candidate had to be scanned as well.
+	// That stretch is empty when nothing moved and is the WHOLE prefix when a
+	// list is reversed — `each` on a sorted-in-place list was quadratic.
+	// `K: Hashable` states the obligation `std::hash` already names ("its
+	// obligation is consistency with the equality the key is used under"), so
+	// `a == b` implies `a.hash() == b.hash()`: every key equal to this item's
+	// is somewhere in THIS chain, and the chain's first unclaimed `==` match is
+	// the scan's answer. The scan is gone and the pass is linear.
+	//
+	// A COARSER hash is still fine and still correct — two keys that are not
+	// `==` may share a hash, which is an ordinary collision: the walk below
+	// steps past them along the chain. What the bound forbids is the opposite,
+	// a `==` coarser than the hash, and that is the case the bound refuses to
+	// compile rather than mis-plan.
 	mut first: NativeMap<i32> = NativeMap::new();
 	mut next_same: List<i32> = [];
 	for _ in old_keys {
@@ -1812,7 +1831,7 @@ export fun reconcile<T, K: PartialEq>(
 	}
 	mut build = held - 1;
 	for build >= 0 {
-		let canonical = canonical_hash(old_keys[build]);
+		let canonical = old_keys[build].hash();
 		match first.get(canonical) {
 			Some(let after) => next_same[build] = after,
 			None => {},
@@ -1820,18 +1839,14 @@ export fun reconcile<T, K: PartialEq>(
 		first.insert(canonical, build);
 		build -= 1;
 	}
-	// The smallest index nothing has claimed. It only ever moves forward, so
-	// maintaining it is O(N) across the whole pass, and it is what bounds the
-	// coarse-equality scan below from underneath.
-	mut low = 0;
 	mut steps: List<RowStep> = [];
 	for item in items {
 		let item_key = key_of(item);
-		let canonical = canonical_hash(item_key);
-		// The chain for this key's canonical hash. Entries at its head that are
-		// already claimed are dropped from the chain for good (`first` is
-		// advanced past them), so the total cost of skipping claimed entries
-		// across a whole pass is bounded by the number of claims.
+		let canonical = item_key.hash();
+		// The chain for this key's hash. Entries at its head that are already
+		// claimed are dropped from the chain for good (`first` is advanced past
+		// them), so the total cost of skipping claimed entries across a whole
+		// pass is bounded by the number of claims.
 		mut head = match first.get(canonical) {
 			Some(let at) => at,
 			None => -1,
@@ -1843,31 +1858,17 @@ export fun reconcile<T, K: PartialEq>(
 			head = next_same[head];
 		}
 		first.insert(canonical, head);
-		mut candidate = -1;
+		mut found = -1;
 		mut walk = head;
 		for walk >= 0 {
 			if !claimed[walk] && old_keys[walk] == item_key {
-				candidate = walk;
+				found = walk;
 				jump break;
 			}
-			// Unclaimed, canonically the same value, and yet not `==`: a `K`
-			// whose equality is FINER than value identity. Walk on rather than
-			// advance the head, because a later item may still match here.
+			// Unclaimed, the same hash, and yet not `==`: a COLLISION. Walk on
+			// rather than advance the head, because a later item may still
+			// match here.
 			walk = next_same[walk];
-		}
-		// Anything the chain cannot see lives between `low` and the candidate
-		// (or to the end, when the chain named none). Empty for every key type
-		// whose `==` is value identity, which is what makes the common case one
-		// pass.
-		let ceiling = if candidate < 0 { held } else { candidate };
-		mut found = candidate;
-		mut index = low;
-		for index < ceiling {
-			if !claimed[index] && old_keys[index] == item_key {
-				found = index;
-				jump break;
-			}
-			index += 1;
 		}
 		mut step = RowStep::Fresh;
 		if found >= 0 {
@@ -1877,12 +1878,6 @@ export fun reconcile<T, K: PartialEq>(
 			} else {
 				RowStep::Refresh(found)
 			};
-			for low < held {
-				if !claimed[low] {
-					jump break;
-				}
-				low += 1;
-			}
 		}
 		steps.push(step);
 	}

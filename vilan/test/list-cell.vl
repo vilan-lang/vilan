@@ -1,0 +1,406 @@
+// A112 S2 — `ListCell`, the two sequence traits, and `map_each`, as the item
+// asked for them (proposal/incremental-collections.md §6, §12).
+//
+// The ask, verbatim from the item:
+//
+//     let my_list: Signal<List<str>> = Signal::new(List<str>::new());
+//     let my_nums = my_list.map_collection(|x| { print("ran"); .. });
+//     my_list.push("10.5"); // only one "ran"
+//
+// That is the first block below, spelled as it shipped: `ListCell<str>` is the
+// cell whose writes are its ops, `map_each` is the derivative, and `push` is a
+// trait DEFAULT over the one primitive. What the program asserts, as panics
+// rather than prints, because the corpus gate compares emitted bytes:
+//
+//   1. k pushes -> exactly k calls of `g`; a removal -> zero; `clear` -> zero;
+//   2. THE LAW after every mutation: `derived.get() == source.get().map(g)`,
+//      against a naive rerun;
+//   3. every one of the twelve defaults reaches the one primitive, and each
+//      leaves the list the plain-`List` answer would;
+//   4. four mutations inside ONE `edit` are ONE notification and FOUR ops;
+//   5. a body written against the `Sequence<T>` BOUND runs on the recorder;
+//   6. `set(whole)` records a `Reset` and costs N; `reconcile_to(whole)` costs
+//      only what changed, and an unchanged list costs nothing at all;
+//   7. a `Move` runs `g` zero times and reorders the derived list;
+//   8. a cursor that falls past the log's limit is answered with a `Reset`,
+//      and the law still holds;
+//   9. an out-of-range ask CLAMPS on both surfaces alike — the cell and the
+//      recorder run one splice — and an ask that clamps to nothing records
+//      nothing;
+//  10. THE LAW over a random walk: 300 turns of 1-4 ops each, drawn from the
+//      WHOLE vocabulary (the defaults, `set_at`, `move_range`, `set`,
+//      `reconcile_to`, `edit`), with a SECOND `map_each` chained on the first —
+//      both laws at every settle, one notification per turn, and the two
+//      derivations together costing less than one naive rerun.
+import std::compare::PartialEq;
+import std::io::{ panic, print };
+import std::option::Option::{ self, None, Some };
+import std::reactive::{
+	ListCell,
+	Sequence,
+	SequenceCell,
+	Signal,
+	Source,
+	Tracked,
+	batch,
+	map_each,
+};
+import std::shared::Shared;
+
+let calls: Shared<i32> = Shared::new(0);
+let notifications: Shared<i32> = Shared::new(0);
+
+fun counted(text: str): i32 {
+	calls.write() = calls.read() + 1;
+	text.len()
+}
+
+/// THE LAW, checked against the naive rerun.
+fun law(label: str, source: ListCell<str>, derived: ListCell<i32>) {
+	mut naive: List<i32> = [];
+	for value in source.get() {
+		naive.push(value.len());
+	}
+	let held = derived.get();
+	if held.len() != naive.len() {
+		panic(i"{label}: derived holds {held.len()} where the rerun holds {naive.len()}");
+	}
+	mut index = 0;
+	for index < naive.len() {
+		if held[index] != naive[index] {
+			panic(i"{label}: element {index} is {held[index]}, not {naive[index]}");
+		}
+		index += 1;
+	}
+}
+
+fun expect(label: str, seen: i32, wanted: i32) {
+	if seen != wanted {
+		panic(i"{label}: {seen}, expected {wanted}");
+	}
+}
+
+fun render(values: List<str>): str {
+	mut out = "";
+	for value in values {
+		out = out + i"{value} ";
+	}
+	out
+}
+
+/// A body written against the BOUND rather than against any cell — what the
+/// `&mut self` trait buys (§6.2). It runs on the recorder inside an `edit`.
+fun fill<S: Sequence<str>>(target: &mut S) {
+	target.push("from-fill-1");
+	target.push("from-fill-2");
+}
+
+// === The random walk's instruments (claim 10) ================================
+
+/// A seeded MINSTD Lehmer sequence, as in `delta-law.vl`: deterministic, so the
+/// printed tail is a golden, and still a random walk over the vocabulary.
+let seed: Shared<i53> = Shared::new(7i53);
+
+fun next_random(bound: i32): i32 {
+	let state = (seed.read() * 16807i53) % 2147483647i53;
+	seed.write() = state;
+	(state % bound.as_i53()).as_i32()
+}
+
+let walk_calls: Shared<i32> = Shared::new(0);
+let chain_calls: Shared<i32> = Shared::new(0);
+
+fun doubled(value: i32): i32 {
+	walk_calls.write() = walk_calls.read() + 1;
+	value * 2 + 1
+}
+
+fun shifted(value: i32): i32 {
+	chain_calls.write() = chain_calls.read() + 1;
+	value + 7
+}
+
+fun same(label: str, turn: i32, held: List<i32>, wanted: List<i32>) {
+	if held.len() != wanted.len() {
+		panic(i"turn {turn}: {label} holds {held.len()}, the rerun {wanted.len()}");
+	}
+	mut index = 0;
+	for index < wanted.len() {
+		if held[index] != wanted[index] {
+			panic(i"turn {turn}: {label}[{index}] is {held[index]}, not {wanted[index]}");
+		}
+		index += 1;
+	}
+}
+
+fun main() {
+	// === 1. The ask ==========================================================
+	let my_list: ListCell<str> = ListCell<str>::new();
+	let my_nums = map_each(my_list, |x| {
+		print("ran");
+		x.len()
+	});
+	my_list.push("10.5");
+	print(i"after one push: {my_nums.get()[0]}");
+
+	// === 2. Call counts and the law ==========================================
+	let source: ListCell<str> = ListCell<str>::new();
+	let derived = map_each(source, counted);
+	let _watch = source.on_change(|_list| {
+		notifications.write() = notifications.read() + 1;
+	});
+	expect("seeded calls", calls.read(), 0);
+
+	source.push("aa");
+	source.push("bbb");
+	source.push("c");
+	law("3 pushes", source, derived);
+	expect("3 pushes", calls.read(), 3);
+
+	source.remove_at(1);
+	law("remove_at", source, derived);
+	expect("a removal runs g", calls.read(), 3);
+
+	source.extend(["dddd", "ee"]);
+	law("extend", source, derived);
+	expect("extend x2", calls.read(), 5);
+
+	source.insert_at(1, "zz");
+	law("insert_at", source, derived);
+	expect("insert_at", calls.read(), 6);
+
+	source.prepend("f");
+	law("prepend", source, derived);
+	expect("prepend", calls.read(), 7);
+
+	source.set_at(0, "gggggg");
+	law("set_at", source, derived);
+	expect("set_at", calls.read(), 8);
+
+	source.pop();
+	law("pop", source, derived);
+	expect("pop runs g", calls.read(), 8);
+
+	source.remove_range(0, 2);
+	law("remove_range", source, derived);
+	expect("remove_range runs g", calls.read(), 8);
+
+	source.truncate(1);
+	law("truncate", source, derived);
+	expect("truncate runs g", calls.read(), 8);
+
+	source.insert_all(0, ["h", "ii"]);
+	law("insert_all", source, derived);
+	expect("insert_all x2", calls.read(), 10);
+
+	source.set_all(["jjj"]);
+	law("set_all", source, derived);
+	expect("set_all x1", calls.read(), 11);
+
+	source.clear();
+	law("clear", source, derived);
+	expect("clear runs g", calls.read(), 11);
+	if !source.is_empty() {
+		panic("clear left something behind");
+	}
+	print(i"twelve defaults: calls={calls.read()} notifications={notifications.read()}");
+
+	// === 3. The batch door ===================================================
+	//
+	// Four mutations, ONE notification, FOUR ops — and `g` runs for the two
+	// that inserted something.
+	let before_edit = notifications.read();
+	let before_calls = calls.read();
+	source.edit(|&mut list| {
+		list.push("kk");
+		list.push("lll");
+		list.remove_at(0);
+		list.push("m");
+	});
+	expect("one edit, one notification", notifications.read() - before_edit, 1);
+	expect("one edit, three insertions", calls.read() - before_calls, 3);
+	law("edit", source, derived);
+	print(i"after edit: {render(source.get())}");
+
+	// A body written against the bound, inside an `edit`.
+	source.edit(|&mut list| {
+		fill(&mut list);
+	});
+	law("fill through the bound", source, derived);
+	print(i"after fill: {render(source.get())}");
+
+	// === 4. The compat door ==================================================
+	//
+	// `set` records a `Reset`: N calls of `g`. `reconcile_to` records what
+	// changed: one call for the one element that arrived.
+	let before_set = calls.read();
+	source.set(["n", "oo", "ppp"]);
+	law("set(whole)", source, derived);
+	expect("set(whole) is the honest N", calls.read() - before_set, 3);
+
+	let before_reconcile = calls.read();
+	source.reconcile_to(["n", "oo", "qqqq", "ppp"]);
+	law("reconcile_to", source, derived);
+	expect("reconcile_to runs g once", calls.read() - before_reconcile, 1);
+
+	let quiet = notifications.read();
+	source.reconcile_to(["n", "oo", "qqqq", "ppp"]);
+	expect("an unchanged reconcile_to is silent", notifications.read() - quiet, 0);
+	expect("an unchanged reconcile_to runs g", calls.read() - before_reconcile, 1);
+
+	// === 5. A reorder ========================================================
+	let before_move = calls.read();
+	source.move_range(0, 1, 3);
+	law("move_range", source, derived);
+	expect("a move runs g", calls.read() - before_move, 0);
+	print(i"after move: {render(source.get())}");
+
+	// === 6. One turn, one notification, every op drained =====================
+	let before_batch = notifications.read();
+	batch(|| {
+		source.push("r");
+		source.push("ss");
+		source.remove_at(0);
+	});
+	expect("one batch, one notification", notifications.read() - before_batch, 1);
+	law("batch", source, derived);
+
+	// === 7. A cursor that falls behind the log ===============================
+	//
+	// A three-op log: the derivation's cursor is current at every settle, so
+	// the limit is reached only by writing past it inside ONE turn, where the
+	// consumer cannot drain between writes. The lag fallback is a `Reset`, and
+	// the law is what says it was applied.
+	let lagging: ListCell<str> = ListCell<str>::with_limit(["seed"], 3);
+	let mirror = map_each(lagging, counted);
+	let lag_calls = calls.read();
+	batch(|| {
+		mut round = 0;
+		for round < 8 {
+			lagging.push(i"row-{round}");
+			round += 1;
+		}
+	});
+	law("past the log limit", lagging, mirror);
+	print(i"lagged: held={lagging.logged()} calls={calls.read() - lag_calls}");
+
+	print(i"total: calls={calls.read()} notifications={notifications.read()}");
+
+	// === 8. Out of range: one splice, two surfaces ===========================
+	//
+	// `remove_range(1, 99)` asks for "the rest"; `remove_at(50)` and
+	// `insert_at(-3, ..)` are clamped exactly as the cell clamps them, because
+	// the recorder and the cell run the same splice.
+	let clamped: ListCell<str> = ListCell<str>::of(["a", "bb", "ccc", "dddd"]);
+	let clamped_lengths = map_each(clamped, counted);
+	let clamp_calls = calls.read();
+	clamped.edit(|&mut list| {
+		list.remove_range(1, 99);
+		list.remove_at(50);
+		list.insert_at(-3, "front");
+	});
+	law("clamped edit", clamped, clamped_lengths);
+	clamped.remove_range(1, 99);
+	clamped.remove_at(50);
+	law("clamped cell", clamped, clamped_lengths);
+	expect("clamping ran g for the one insertion", calls.read() - clamp_calls, 1);
+	print(i"clamped: {render(clamped.get())}");
+
+	// === 9. THE LAW over a random walk, with a chained derivation ============
+	let walk: ListCell<i32> = ListCell<i32>::of([1, 2, 3]);
+	let first = map_each(walk, doubled);
+	let second = map_each(first, shifted);
+	let walk_notifications: Shared<i32> = Shared::new(0);
+	let _walk_watch = walk.on_change(|_list| {
+		walk_notifications.write() = walk_notifications.read() + 1;
+	});
+	walk_calls.write() = 0;
+	chain_calls.write() = 0;
+	mut naive = 0;
+	mut silent = 0;
+	mut turn = 1;
+	for turn <= 300 {
+		let before = walk_notifications.read();
+		let op_count = 1 + next_random(4);
+		batch(|| {
+			mut made = 0;
+			for made < op_count {
+				let size = walk.size();
+				let choice = next_random(24);
+				// Biased to GROW: a walk that collapses to two elements proves
+				// nothing about a collection operator.
+				if choice < 8 || size == 0 {
+					walk.push(next_random(100));
+				} else if choice < 11 {
+					walk.insert_at(next_random(size + 1), next_random(100));
+				} else if choice < 13 {
+					walk.remove_at(next_random(size));
+				} else if choice < 15 {
+					walk.set_at(next_random(size), next_random(100));
+				} else if choice < 17 {
+					let from = next_random(size);
+					let count = 1 + next_random(size - from);
+					walk.move_range(from, count, next_random(size - count + 1));
+				} else if choice < 18 {
+					walk.pop();
+				} else if choice < 19 && size > 12 {
+					walk.remove_range(next_random(size), 1 + next_random(4));
+				} else if choice < 20 && size > 20 {
+					walk.truncate(next_random(size));
+				} else if choice < 21 && size > 16 {
+					// The wholesale write: a `Reset`, the honest N.
+					mut fresh: List<i32> = [];
+					mut fill_index = 0;
+					for fill_index < 1 + next_random(6) {
+						fresh.push(next_random(100));
+						fill_index += 1;
+					}
+					walk.set(fresh);
+				} else if choice < 22 {
+					// The compat door: the same list with one element edited
+					// and one appended — one `Splice`, not a `Reset`.
+					mut edited = walk.get();
+					edited[next_random(size)] = next_random(100);
+					edited.push(next_random(100));
+					walk.reconcile_to(edited);
+				} else {
+					// The batch door, inside the batch.
+					let at = next_random(size);
+					walk.edit(|&mut list| {
+						list.insert_at(at, next_random(100));
+						list.remove_at(0);
+						list.push(next_random(100));
+					});
+				}
+				made += 1;
+			}
+		});
+		// At most ONE notification per turn, whatever the op count — and none
+		// for a turn whose every op was a no-op (a `move_range` onto itself).
+		let waves = walk_notifications.read() - before;
+		if waves > 1 {
+			panic(i"turn {turn}: {waves} notifications, expected one per turn");
+		}
+		if waves == 0 {
+			silent += 1;
+		}
+		mut first_wanted: List<i32> = [];
+		mut second_wanted: List<i32> = [];
+		for value in walk.get() {
+			first_wanted.push(value * 2 + 1);
+			second_wanted.push(value * 2 + 8);
+			naive += 1;
+		}
+		same("first", turn, first.get(), first_wanted);
+		same("second", turn, second.get(), second_wanted);
+		turn += 1;
+	}
+	// Both derivations TOGETHER cost less than ONE naive rerun of either —
+	// the claim the slice exists for, over the whole vocabulary.
+	if walk_calls.read() + chain_calls.read() >= naive {
+		panic(i"walk: {walk_calls.read()} + {chain_calls.read()} calls against a rerun of {naive}");
+	}
+	print(i"walk: turns=300 silent={silent} length={walk.get().len()} g={walk_calls.read()} h={chain_calls.read()} rerun={naive}");
+}
+
+main();

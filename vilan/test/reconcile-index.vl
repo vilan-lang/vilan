@@ -11,12 +11,15 @@
 // each end and in the middle, a reversal, a swap, duplicate keys on either
 // side and both, all-fresh), then 600 randomized pairs over a 1-to-5 key
 // alphabet so duplicates and reorders are dense, then 400 randomized pairs of
-// a key type whose `==` is COARSER than value identity — two `Tag`s match when
-// their `group` does and the `serial` is ignored, so the canonical hash the
-// index is built on cannot see the match and the scan from `low` is what finds
-// it. That last set is the one the index is not allowed to get wrong, and it
-// caught a first attempt that let the chain answer outright.
+// a key type whose `==` and `hash` are BOTH coarse — two `Tag`s match when
+// their `group` does and the `serial` is ignored, and `hash` ignores it too —
+// then 400 more of a key whose HASH alone is coarse, so every chain the index
+// walks is full of entries that are not `==` and the walk has to step past
+// them. Those two sets are what A125's bound buys and what it costs: the hash
+// agrees with the equality (so the chain holds every candidate), and a
+// collision is an ordinary collision (so the chain may be long).
 import std::compare::PartialEq;
+import std::hash::{ Hash, Hashable };
 import std::io::{ panic, print };
 import std::option::Option::{ self, None, Some };
 import std::reactive::{ ReconcilePlan, RowStep, reconcile };
@@ -106,8 +109,9 @@ fun compare_int(label: str, old: List<i32>, new_items: List<i32>) {
 }
 
 // A key whose `==` is COARSER than value identity: two `Tag`s match when their
-// `group` matches, and `serial` is ignored. The canonical hash sees both
-// fields, so the index cannot place these — the fallback must.
+// `group` matches, and `serial` is ignored. Its `hash` is coarse in exactly
+// the same way — which is the obligation A125's `K: Hashable` states, and what
+// puts every `==`-equal key in one chain.
 struct Tag {
 	group: i32,
 	serial: i32,
@@ -119,7 +123,43 @@ impl Tag with PartialEq {
 	}
 }
 
+impl Tag with Hashable {
+	fun hash(self): Hash {
+		self.group.hash()
+	}
+}
+
+// The other half of the obligation: a key whose HASH is coarser than its `==`.
+// Two `Pair`s are equal only when BOTH fields match, but they hash by `group`
+// alone, so a chain is full of entries the walk must step past. That is a
+// COLLISION and it is allowed — the plan must still be the scan's.
+struct Pair {
+	group: i32,
+	serial: i32,
+}
+
+impl Pair with PartialEq {
+	fun eq(self, other: Pair): bool {
+		self.group == other.group && self.serial == other.serial
+	}
+}
+
+impl Pair with Hashable {
+	fun hash(self): Hash {
+		self.group.hash()
+	}
+}
+
 fun compare_tags(label: str, old: List<Tag>, new_items: List<Tag>) {
+	let indexed = reconcile(old, old, new_items, |item| item, |_before, _after| true);
+	let scanned = scan_reconcile(old, old, new_items, |item| item, |_before, _after| true);
+	cases.write() = cases.read() + 1;
+	if render(indexed) != render(scanned) {
+		panic(i"{label}: indexed=[{render(indexed)}] scanned=[{render(scanned)}]");
+	}
+}
+
+fun compare_pairs(label: str, old: List<Pair>, new_items: List<Pair>) {
 	let indexed = reconcile(old, old, new_items, |item| item, |_before, _after| true);
 	let scanned = scan_reconcile(old, old, new_items, |item| item, |_before, _after| true);
 	cases.write() = cases.read() + 1;
@@ -186,6 +226,27 @@ fun main() {
 			fill += 1;
 		}
 		compare_tags(i"tags {round}", old, fresh);
+		round += 1;
+	}
+
+	// Colliding keys, randomized: the hash is coarse, the `==` is not.
+	round = 0;
+	for round < 400 {
+		let old_length = next_random(7);
+		let new_length = next_random(7);
+		mut old: List<Pair> = [];
+		mut fill = 0;
+		for fill < old_length {
+			old.push(Pair { group = next_random(3), serial = next_random(4) });
+			fill += 1;
+		}
+		mut fresh: List<Pair> = [];
+		fill = 0;
+		for fill < new_length {
+			fresh.push(Pair { group = next_random(3), serial = next_random(4) });
+			fill += 1;
+		}
+		compare_pairs(i"pairs {round}", old, fresh);
 		round += 1;
 	}
 

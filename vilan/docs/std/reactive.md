@@ -35,7 +35,11 @@ import std::reactive::{
 | `optimistic` | fn | paint → commit → confirm-or-rollback (one shot) |
 | `Optimistic<T>`, `WriteState` | struct/enum | the same lifecycle, observable and overlap-safe |
 | `draft`, `Draft<T>`, `DraftState` | fn/struct/enum | local-first editing cell |
-| `reconcile`, `ReconcilePlan`, `RowStep` | fn/structs | keyed list diffing engine |
+| `reconcile`, `ReconcilePlan`, `RowStep` | fn/structs | keyed list diffing engine (`K: PartialEq + Hashable`) |
+| `SeqOp`, `MapOp`, `SetOp`, `DeltaLog`, `DeltaCursor`, `DeltaSource` | enums/struct/trait | the change structure: a collection's change as a value, and its log |
+| `ListCell<T>` | struct | a `List` cell whose writes ARE its deltas |
+| `SequenceCell<T>`, `Sequence<T>`, `Tracked<T>` | traits/struct | twelve mutators over one `splice` primitive; the `&mut` twin and its recorder |
+| `map_each` | fn | `map g` element-wise and incrementally — one call of `g` per arriving element |
 
 ## Signal and SignalCell
 
@@ -900,6 +904,124 @@ positional ops and translates them into the wire's `Delta<K, T>` in its own
 is NOT a delta source — it keeps no log — so anything derived from one is on the
 `Reset` path by construction, which is exactly today's behaviour.
 
+## ListCell — a list whose writes are its deltas
+
+```vilan,fragment
+struct ListCell<T> { … }            // a SignalCell<List<T>> plus a DeltaLog<SeqOp<T>>
+
+impl ListCell<type T> {
+	fun new(): ListCell<T>
+	fun of(elements: List<T>): ListCell<T>
+	fun with_limit(elements: List<T>, limit: i32): ListCell<T>
+	fun set_at(self, at: i32, value: T)                 // an element changed IN PLACE
+	fun move_range(self, from: i32, count: i32, to: i32)
+	fun edit(self, body: sync |&mut Tracked<T>| void)   // many mutations, ONE notification
+	fun logged(self): i32
+}
+impl ListCell<type T: PartialEq> { fun reconcile_to(self, items: List<T>) }
+// and: Source<List<T>>, Signal<List<T>>, SequenceCell<T>, DeltaSource<List<T>, SeqOp<T>>
+```
+
+`ListCell<T>` is an ordinary `Source<List<T>>` — `each` takes it, `map` takes
+it, an effect takes it — that also records what each write DID. Nothing that
+ignores the ops pays for them.
+
+Its mutators are trait defaults over ONE primitive, so there is one place a
+write is recorded and no method can forget:
+
+```vilan,fragment
+trait SequenceCell<T> {
+	fun size(self): i32;
+	fun splice(self, at: i32, removed: i32, inserted: List<T>);
+	// twelve defaults over those two:
+	// is_empty, push, prepend, insert_at, insert_all, remove_at,
+	// remove_range, pop, extend, clear, set_all, truncate
+}
+```
+
+`Sequence<T>` is the same surface with `&mut self` receivers, and its
+implementor is `Tracked<T>` — a plain list plus the ops that produced it. That
+is what `edit` hands a body, and it is why an algorithm can be written against
+the BOUND rather than against a cell:
+
+```vilan
+import std::reactive::{ ListCell, Sequence };
+
+fun fill<S: Sequence<str>>(target: &mut S) {
+	target.push("first");
+	target.push("second");
+}
+
+fun main() {
+	let rows: ListCell<str> = ListCell<str>::new();
+	rows.edit(|&mut list| {
+		fill(&mut list);
+		list.remove_at(0);
+	});   // ONE notification, three ops
+	print(rows.get().len());
+}
+```
+
+Three doors write a whole list, and they cost differently on purpose:
+
+| | records | a derivation's cost |
+|---|---|---|
+| `splice` and its twelve defaults | one `SeqOp::Splice` | the elements that arrived |
+| `set_all(values)` | one `SeqOp::Splice` over everything | every element (they all arrived) |
+| `set(values)` (the `Signal` impl) | `SeqOp::Reset` | every element, rebuilt |
+| `reconcile_to(values)` | one `Splice` over what changed | the elements that changed |
+
+`reconcile_to` is the compat door: it diffs the common prefix and the common
+suffix and records ONE `Splice` over what is between them, so an append, a
+prepend, an insertion, a removal or an edited span each cost only the elements
+they really touched, and an identical list records nothing and notifies nobody.
+It does not find a REORDER — a rotated list shares no prefix and no suffix, so
+that is one `Splice` over the whole run, which is honest (every element did
+move) and is what `each`'s keyed pass is for. A source that knows it reordered
+says `move_range`.
+
+## map_each — the first derivative
+
+```vilan,fragment
+fun map_each<T, U, S: DeltaSource<List<T>, SeqOp<T>>>(
+	source: S, g: sync |T| U,
+): ListCell<U>
+```
+
+`map_each(source, g)` is `source.get().map(g)` kept up to date by running `g`
+once per element that ARRIVES or CHANGES, and zero times for anything else —
+the derivative of `map g`, where `Splice(at, left, arrived)` becomes
+`Splice(at, left, arrived.map(g))`:
+
+```vilan
+import std::reactive::{ ListCell, SequenceCell, map_each };
+
+fun main() {
+	let raw: ListCell<str> = ListCell<str>::new();
+	let parsed = map_each(raw, |text: str| {
+		print("ran");
+		text.parse_f64().unwrap_or(0f)
+	});
+	raw.push("10.5");      // "ran" — once
+	raw.remove_at(0);      // nothing
+	print(parsed.get().len());
+}
+```
+
+Three pushes are three calls; a removal, a `clear`, a `pop` and a `move_range`
+are none; a `Reset` is the honest N. It takes any `DeltaSource`, so it serves
+`ListCell`, `std::rpc`'s `KeyedCell` and anything an app writes.
+
+The result is itself a `ListCell<U>`, so `map_each` composes: a chain runs one
+call of each `g` per arriving element, at every step.
+
+Two rules to hold on to. The subscription is a DERIVATION and the ambient
+owner's, like every other combinator's, and the cursor goes with it — a
+disposed derivation stops pinning the source's history. And `g` must be pure IN
+THE ELEMENT: its result is kept, so a `g` that reads another signal will not
+re-run when that signal changes. That is `map`'s contract already; here nothing
+re-runs it at all, which makes the contract sharper rather than different.
+
 ## reconcile: keyed list diffing
 
 ```vilan,fragment
@@ -912,7 +1034,7 @@ struct ReconcilePlan {
 	steps: List<RowStep>,  // one per NEW item, in the new order
 	removed: List<i32>,    // old indices gone entirely
 }
-fun reconcile<T, K: PartialEq>(
+fun reconcile<T, K: PartialEq + Hashable>(
 	old_keys: List<K>, old_items: List<T>, items: List<T>, key_of: sync |T| K,
 	same: sync |T, T| bool,
 ): ReconcilePlan
@@ -937,10 +1059,28 @@ under `node --jitless`: **355.1 M → 29.1 M at 1,000 rows**, and 95.1 M → 14.
 at 500 with 1,369.9 M → 58.5 M at 2,000 — 1.97× and 2.01× per doubling where it
 used to be 3.73× and 3.86×, which is linear where it was quadratic.
 
-The plan it produces is unchanged for every key type, and that is gated by a
-differential rather than by a golden: a key whose `==` is *coarser* than value
-identity — a case-insensitive string, a struct comparing a subset of its fields
-— can have an earlier match that the index cannot see, so the stretch below the
-index's candidate is still scanned. Where `==` is value identity, which is
-every key in std, the book, the examples and the shipped apps, that stretch is
-empty.
+**A REORDER is linear too, and `K: Hashable` is what pays for it (tracker
+A125).** The index was keyed on the canonical hash with nothing binding that
+hash to `K`'s equality, so an earlier equal key could sit outside the chain the
+index named and the stretch from the smallest unclaimed index up to the
+candidate had to be scanned as well. That stretch is empty when nothing moved —
+which is why the append case above went linear — and it is the WHOLE prefix
+when a list is reversed: N(N+1)/2 key comparisons, 500,500 at 1,000 rows, on
+every sort-in-place. The bound states the obligation `Hashable` already names,
+`a == b` implies `a.hash() == b.hash()`, so every key equal to this item's is
+somewhere in this item's chain and the scan is gone. A 1,000-row reversal costs
+**1,000** key comparisons, down from 500,500 (`vilan/test/reconcile-reorder.vl`
+counts them); callgrind Ir per reversal under `node --jitless`: **738.4 M → 14.6 M at 1,000
+rows**, a factor of 50.7, and 1.98× then 2.00× per doubling across 500 / 1,000
+/ 2,000 rows where the scan was 3.92× from 500 to 1,000 — linear where it was
+quadratic.
+
+A COLLISION is still fine: two keys that are not `==` may share a hash — a
+hand-written impl hashing a subset of the fields its `eq` reads — and the walk
+steps past them along the chain, which is what any hash container does. What
+the bound forbids is the other direction, an `==` coarser than the hash, which
+would hide a moved row; that is now a compile error rather than a quadratic
+scan. The plan is gated by a differential rather than by a golden: the
+pre-index scan is reproduced verbatim in `vilan/test/reconcile-index.vl` and
+1,415 cases — named shapes, 600 randomized, 400 with a coarse `==` and coarse
+hash, 400 with a coarse hash alone — are compared plan for plan.
