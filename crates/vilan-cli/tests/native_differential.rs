@@ -1903,6 +1903,81 @@ fn the_boxed_binding_count_is_reachable_and_counts_the_right_bindings() {
     );
 }
 
+/// F30: a binding that lives in a CELL, mutated IN PLACE through every spelling
+/// the language has for it.
+///
+/// A module-level binding is a `thread_local!` and a mutably-captured one is a
+/// `Captured` cell; a read of either answers a VALUE, which is right for a value
+/// and silently wrong for a place — the mutation lands in a temporary that is
+/// dropped at the end of the statement. Every line below printed the
+/// UNMUTATED value natively while the JS backend printed the mutated one, and
+/// none of them was visible to the whole-set differential because every mutated
+/// module binding in the corpus holds a `Shared`, whose copy is the same cell.
+///
+/// The last two lines are the borrow's own hazard rather than the copy's: the
+/// cell is borrowed for the whole of the mutating call, so a read of the same
+/// binding among the ARGUMENTS has to happen before the borrow is taken.
+const CELL_PLACE_PROBE: &str = concat!(
+    "struct Counter { n: i32 }\n",
+    "\n",
+    "impl Counter {\n",
+    "\tfun bump(&mut self) { self.n = self.n + 1; }\n",
+    "}\n",
+    "\n",
+    "mut counts: List<i32> = [1, 2];\n",
+    "mut counter: Counter = Counter { n = 0 };\n",
+    "\n",
+    "fun record(value: i32) { counts.push(value); }\n",
+    "\n",
+    "fun grow(xs: &mut List<i32>, by: i32) { xs.push(by); }\n",
+    "\n",
+    "fun main() {\n",
+    "\trecord(7);\n",
+    "\tprint(counts);\n",
+    "\tcounter.bump();\n",
+    "\tcounter.bump();\n",
+    "\tprint(counter.n);\n",
+    "\tcounter.n = 41;\n",
+    "\tprint(counter.n);\n",
+    "\tcounts[0] = 5;\n",
+    "\tprint(counts);\n",
+    "\tgrow(&mut counts, 9);\n",
+    "\tprint(counts);\n",
+    "\tmut seen: List<i32> = [];\n",
+    "\tmut inner: Counter = Counter { n = 0 };\n",
+    "\tlet bump = || { seen.push(seen.len()); inner.bump(); };\n",
+    "\tbump();\n",
+    "\tbump();\n",
+    "\tprint(seen);\n",
+    "\tprint(inner.n);\n",
+    "\tcounts.push(counts.len());\n",
+    "\tprint(counts);\n",
+    "\tgrow(&mut counts, counts.len());\n",
+    "\tprint(counts);\n",
+    "}\n",
+);
+
+/// F30's pin: every cell-resident binding above is mutated IN PLACE, on both
+/// backends, to the same bytes.
+///
+/// It is written as ONE program because it is one defect seen from seven
+/// sides — a mutating intrinsic's receiver, a `&mut self` method, a field
+/// write, an index write, a `&mut` argument, and the two argument orders the
+/// borrow constrains — and because a program that mixes them is the one that
+/// catches a fix applied at only one of them.
+#[test]
+fn a_binding_that_lives_in_a_cell_is_mutated_in_place_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_cell_place.vl"), CELL_PLACE_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_cell_place.vl"),
+        Verdict::Identical,
+        "a module-level or mutably-captured binding mutated in place must be mutated in the CELL, \
+         not in a copy of its value"
+    );
+}
+
 /// `native-apps.md`'s probe, verbatim from
 /// `proposals/projects/vilan/proposal/native-apps-probe/board.vl` — copied
 /// rather than referenced because the proposals repository is not a build

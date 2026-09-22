@@ -2758,11 +2758,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.struct_literal(struct_id, &arguments, &pairs, depth, span)?
             }
             Expr::Reference(operand, mutable) => {
-                let operand_text = self.expression(operand, depth)?;
                 if mutable {
-                    format!("&mut {operand_text}")
+                    // A `&mut` the source wrote names a place the holder will
+                    // WRITE, so a cell-resident binding reaches its cell — see
+                    // [`Emitter::mutable_place`].
+                    format!("&mut {}", self.mutable_place(operand, depth)?)
                 } else {
-                    format!("&{operand_text}")
+                    format!("&{}", self.expression(operand, depth)?)
                 }
             }
             Expr::Dereference(operand) => format!("(*{})", self.expression(operand, depth)?),
@@ -3080,16 +3082,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             if self.module_bindings.contains(&binding) {
                 let cell = self.ensure_module_binding(binding, span)?;
                 let value_text = self.value_of(value, depth)?;
-                return Ok(format!(
-                    "{cell}.with(|cell| *cell.borrow_mut() = {value_text})"
-                ));
+                return Ok(format!("{cell}.with(|cell| cell.set({value_text}))"));
             }
             if self.binding_holds_a_view(binding) {
                 let value_text = self.value_of(value, depth)?;
                 return Ok(format!("*{} = {value_text}", self.binding_name(binding)));
             }
         }
-        let target_text = self.expression(target, depth)?;
+        let target_text = self.mutable_place(target, depth)?;
         let value_text = self.value_of(value, depth)?;
         Ok(format!("{target_text} = {value_text}"))
     }
@@ -3153,7 +3153,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let saved = std::mem::take(&mut self.hoisted);
         let paired = self.pair_places(target, reread, &mut prelude, depth);
         let rendered = paired.and_then(|_| {
-            let target_text = self.expression(target, depth)?;
+            let target_text = self.mutable_place(target, depth)?;
             let value_text = self.value_of(value, depth)?;
             Ok((target_text, value_text))
         });
@@ -3346,7 +3346,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Ok(self.read_binding(binding));
         }
         let cell = self.ensure_module_binding(binding, span)?;
-        Ok(format!("{cell}.with(|cell| cell.borrow().clone())"))
+        Ok(format!("{cell}.with(|cell| cell.get())"))
     }
 
     /// Emits the `thread_local!` for one module-level binding, once, and
@@ -3393,8 +3393,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let _ = writeln!(out, "thread_local! {{");
         let _ = writeln!(
             out,
-            "    static {cell}: std::cell::RefCell<{rendered}> = \
-             std::cell::RefCell::new({value});"
+            "    static {cell}: vilan_rt::Shared<{rendered}> = \
+             vilan_rt::Shared::new({value});"
         );
         let _ = writeln!(out, "}}");
         self.module_binding_cells.insert(binding.0, out);
@@ -3619,8 +3619,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let Some(&member_id) = self.program.binary_op_dispatch.get(&id) {
             let substitution = self.call_substitution(id, member_id, &[]);
             let instance = self.ensure_function(member_id, &substitution)?;
-            let arguments = self.call_arguments(member_id, &[left, right], depth)?;
-            let call = format!("{}({})", instance.name, arguments.join(", "));
+            let mut prelude = String::new();
+            let arguments = self.call_arguments(member_id, &[left, right], depth, &mut prelude)?;
+            let call = Self::with_argument_prelude(
+                prelude,
+                format!("{}({})", instance.name, arguments.join(", ")),
+            );
             // `a != b` dispatches to `eq` and negates: an impl provides `eq`,
             // and `ne` is its `!eq` default.
             return Ok(if matches!(op, BinaryOp::NotEq) {
@@ -6141,12 +6145,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         if Some(target) == self.program.list_push_fn_id {
             // A MUTATING receiver, so a boxed binding reaches its cell — see
-            // [`Emitter::mutable_place`].
+            // [`Emitter::mutable_place`]. The ITEM is rendered first when the
+            // receiver lives in a cell, for the reason
+            // [`Emitter::emit_intrinsic`] states: the borrow outlives the call
+            // and a read of the same binding inside the item would meet it.
+            let item = self.value_argument(&function_call.argument_ids, 1, depth)?;
             let receiver = match function_call.argument_ids.first() {
                 Some(argument) => self.mutable_place(*argument, depth)?,
                 None => "()".to_string(),
             };
-            let item = self.value_argument(&function_call.argument_ids, 1, depth)?;
+            if function_call
+                .argument_ids
+                .first()
+                .is_some_and(|receiver| self.place_lives_in_a_cell(*receiver))
+            {
+                return Ok(format!(
+                    "{{ let __borrowed1 = {item}; {receiver}.push(__borrowed1) }}"
+                ));
+            }
             return Ok(format!("{receiver}.push({item})"));
         }
         if let Some(intrinsic) = self.program.intrinsics.get(&target).copied() {
@@ -6240,8 +6256,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let substitution =
             self.call_substitution(call_id, target, &function_call.generic_argument_ids);
         let name = self.ensure_function(target, &substitution)?.name;
-        let arguments = self.call_arguments(target, &function_call.argument_ids, depth)?;
-        Ok(format!("{name}({})", arguments.join(", ")))
+        let mut prelude = String::new();
+        let arguments =
+            self.call_arguments(target, &function_call.argument_ids, depth, &mut prelude)?;
+        Ok(Self::with_argument_prelude(
+            prelude,
+            format!("{name}({})", arguments.join(", ")),
+        ))
     }
 
     // ------------------------------------------------- arguments by position --
@@ -6257,11 +6278,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// temporary and `side-effect-let.vl` printed `0 0` where the JS backend
     /// printed `1 2`. A borrow is by definition not a copy, so a reference
     /// position never takes one.
+    /// With the `let`s a cell-resident `&mut` argument owes written into
+    /// `prelude` (F30).
+    ///
+    /// A `&mut` argument naming a boxed or module-level binding BORROWS its
+    /// cell, and the borrow lives to the end of the statement — so a read of
+    /// the same binding in a LATER argument meets it and panics, where the JS
+    /// backend (whose `&mut` is a plain reference) prints an answer. The
+    /// by-value arguments are hoisted ahead of the borrow, which is the order
+    /// JS has for free. Reference arguments are left where they are: hoisting
+    /// one would name a borrow rather than a value, and two loans of ONE
+    /// binding where either is mutable is what rule 4 refuses anyway.
     fn call_arguments(
         &mut self,
         target: Id,
         argument_ids: &[Id],
         depth: usize,
+        prelude: &mut String,
     ) -> Result<Vec<String>, Error> {
         let declared: Vec<vilan_core::analyzer::Parameter<'src>> = self
             .program
@@ -6276,6 +6309,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .iter()
             .map(|parameter| self.receiving_form(parameter))
             .collect();
+        // Whether any argument will take a borrow of a cell that the arguments
+        // after it must not be evaluated under.
+        let borrows_a_cell = argument_ids.iter().enumerate().any(|(index, argument)| {
+            matches!(conventions.get(index), Some(Receiving::RefMut))
+                && self.place_lives_in_a_cell(*argument)
+        });
         let mut rendered = Vec::new();
         for (index, argument) in argument_ids.iter().enumerate() {
             // F20: an argument standing in a `lazy` parameter is a cell, not a
@@ -6285,6 +6324,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 continue;
             }
             let wants_a_place = !matches!(conventions.get(index), None | Some(Receiving::ByValue));
+            // A `&mut` parameter (a `&mut self` receiver among them) takes a
+            // place the callee WRITES, so a binding that lives in a cell has to
+            // reach the cell — see [`Emitter::mutable_place`]. A `&` parameter
+            // deliberately does NOT: a shared loan cannot write, so the value
+            // read is indistinguishable from the place and costs no borrow that
+            // could collide with another read in the same statement.
+            let wants_a_mutable_place = matches!(conventions.get(index), Some(Receiving::RefMut));
             let expecting = declared
                 .get(index)
                 .map(|parameter| self.concrete(parameter.type_id));
@@ -6300,7 +6346,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // takes `&f64` and `number-math.vl` hands it `0f`, whose own
                 // record is `f32` (see [`Emitter::number_literal`]).
                 let saved = std::mem::replace(&mut self.expected_type, expecting);
-                let place = self.expression(*argument, depth);
+                let place = if wants_a_mutable_place {
+                    self.mutable_place(*argument, depth)
+                } else {
+                    self.expression(*argument, depth)
+                };
                 self.expected_type = saved;
                 self.expects_async_value = false;
                 place?
@@ -6331,13 +6381,31 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .entity_map
                 .get(argument)
                 .is_some_and(|expr| matches!(expr, Expr::Reference(_, _)));
-            rendered.push(match conventions.get(index) {
+            let text = match conventions.get(index) {
                 Some(Receiving::Ref) if !already_a_reference => format!("&{text}"),
                 Some(Receiving::RefMut) if !already_a_reference => format!("&mut {text}"),
                 _ => text,
-            });
+            };
+            if borrows_a_cell
+                && matches!(conventions.get(index), None | Some(Receiving::ByValue))
+                && !already_a_reference
+            {
+                let name = format!("__borrowed{index}");
+                let _ = write!(prelude, "let {name} = {text}; ");
+                rendered.push(name);
+                continue;
+            }
+            rendered.push(text);
         }
         Ok(rendered)
+    }
+
+    /// A rendered call, wrapped in the block its argument prelude needs (F30).
+    fn with_argument_prelude(prelude: String, rendered: String) -> String {
+        if prelude.is_empty() {
+            return rendered;
+        }
+        format!("{{ {prelude}{rendered} }}")
     }
 
     /// Every argument as a VALUE — a closure call and a variant constructor,
@@ -6589,11 +6657,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // member the name was minted for, so the lookup is by the
                 // instance's own record.
                 let target = self.instance_target(&name);
+                let mut prelude = String::new();
                 let arguments = match target {
-                    Some(target) => self.call_arguments(target, argument_ids, depth)?,
+                    Some(target) => {
+                        self.call_arguments(target, argument_ids, depth, &mut prelude)?
+                    }
                     None => self.value_arguments(argument_ids, depth)?,
                 };
-                Ok(format!("{name}({})", arguments.join(", ")))
+                Ok(Self::with_argument_prelude(
+                    prelude,
+                    format!("{name}({})", arguments.join(", ")),
+                ))
             }
             // The external member a blanket impl selected. Same three tables an
             // ordinary external call goes through, in the same order, so a
@@ -6782,10 +6856,38 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // Argument 0 of an intrinsic is its RECEIVER, and every arm below
         // renders it as a place (`&`, `&mut`, or a method receiver). The rest
         // are values.
+        let mutating = mutates_its_receiver(intrinsic);
+        // F30: a mutating receiver that lives in a CELL holds a borrow of it
+        // for the whole call, and Rust evaluates the receiver BEFORE the
+        // arguments — so `counts.push(counts.len())` met its own live borrow
+        // and panicked where the JS backend prints an answer (JS has no borrow
+        // to collide with: its receiver is a reference). The arguments are
+        // hoisted into `let`s, which puts every read of the cell before the
+        // borrow is taken; the block is an expression, so the call site is
+        // unchanged.
+        if mutating
+            && argument_ids.len() > 1
+            && argument_ids
+                .first()
+                .is_some_and(|receiver| self.place_lives_in_a_cell(*receiver))
+        {
+            let mut prelude = String::new();
+            let mut arguments = Vec::new();
+            for (index, argument) in argument_ids.iter().enumerate().skip(1) {
+                let value = self.value_of(*argument, depth)?;
+                let name = format!("__borrowed{index}");
+                let _ = write!(prelude, "let {name} = {value}; ");
+                arguments.push(name);
+            }
+            let receiver = self.mutable_place(argument_ids[0], depth)?;
+            arguments.insert(0, receiver);
+            let rendered = self.intrinsic(intrinsic, arguments, span)?;
+            return Ok(format!("{{ {prelude}{rendered} }}"));
+        }
         let mut arguments = Vec::new();
         for (index, argument) in argument_ids.iter().enumerate() {
             arguments.push(if index == 0 {
-                if mutates_its_receiver(intrinsic) {
+                if mutating {
                     self.mutable_place(*argument, depth)?
                 } else {
                     self.expression(*argument, depth)?
@@ -6797,24 +6899,89 @@ impl<'a, 'src> Emitter<'a, 'src> {
         self.intrinsic(intrinsic, arguments, span)
     }
 
-    /// A place an intrinsic is about to MUTATE.
+    /// Whether a place's ROOT is a binding that lives in a cell — a boxed
+    /// binding (R3's `Captured`) or a module-level one (F30's `thread_local!`).
+    /// Mutating one takes a borrow that lives to the end of the statement, so a
+    /// second read of the same binding in the same statement has to happen
+    /// first.
+    fn place_lives_in_a_cell(&self, id: Id) -> bool {
+        match self.program.entity_map.get(&id) {
+            Some(Expr::Local(binding)) => {
+                self.boxed.contains(binding) || self.module_bindings.contains(binding)
+            }
+            Some(
+                Expr::Field(subject, _, _)
+                | Expr::Index(subject, _)
+                | Expr::TupleIndex(subject, _, _)
+                | Expr::Reference(subject, _),
+            ) => self.place_lives_in_a_cell(*subject),
+            _ => false,
+        }
+    }
+
+    /// A place the program is about to MUTATE — through an intrinsic's
+    /// receiver, through a `&mut` parameter, through an assignment, or through
+    /// a `&mut` the source wrote.
     ///
-    /// The one shape that differs from [`Self::expression`] is a boxed binding
-    /// (R3's `Captured` cell): a read of one copies out of the cell (`get()`),
-    /// which is right for a value and silently wrong for a receiver —
-    /// `board.vl`'s `mut seen: List<i32> = []` is captured by a subscriber, and
-    /// `seen.push(value)` pushed into a COPY, so the program printed `0 0` where
-    /// the JS backend printed `2 2`. A mutating receiver reaches the cell.
+    /// Two binding shapes differ from [`Self::expression`], and for one reason:
+    /// both live in a CELL, and a read of a cell answers a VALUE. That is right
+    /// for a value and silently wrong for a place, because the mutation then
+    /// lands in a temporary copy that is dropped at the end of the statement.
+    ///
+    /// * a BOXED binding (R3's `Captured` cell): `board.vl`'s
+    ///   `mut seen: List<i32> = []` is captured by a subscriber, and
+    ///   `seen.push(value)` pushed into a COPY, so the program printed `0 0`
+    ///   where the JS backend printed `2 2`.
+    /// * a MODULE-LEVEL binding (F30, the same class at module scope): the
+    ///   `thread_local!` read answers `cell.get()`, so `counts.push(x)` on a
+    ///   module-level `let mut counts: List<i32>` pushed into a temporary and
+    ///   the program printed `0` where the JS backend printed `2`. It was
+    ///   invisible only because every mutated module binding in the estate held
+    ///   a `Shared`, whose copy is the same cell.
+    ///
+    /// The spine is walked rather than only its root: `counter.n = 7` and
+    /// `counts[0] = 5` name the cell through a field and an index, and a place
+    /// is only a place if every node between the root and the write is one.
+    /// `RefMut` derefs both ways, so a field, an index and a `&mut` all reach
+    /// through it the way they reach through the value itself.
     fn mutable_place(&mut self, id: Id, depth: usize) -> Result<String, Error> {
         // `boxed_emitted` is deliberately NOT written here: C15's count measures
         // what the walk EMITTED as a `Captured` cell, which is the DECLARATION's
         // record, and a use cannot precede one.
-        if let Some(Expr::Local(binding)) = self.program.entity_map.get(&id).cloned()
-            && self.boxed.contains(&binding)
-        {
-            return Ok(format!("{}.borrow_mut()", self.binding_name(binding)));
+        match self.program.entity_map.get(&id).cloned() {
+            Some(Expr::Local(binding)) if self.boxed.contains(&binding) => {
+                Ok(format!("{}.borrow_mut()", self.binding_name(binding)))
+            }
+            Some(Expr::Local(binding)) if self.module_bindings.contains(&binding) => {
+                // The handle is COPIED out of the `thread_local!` and borrowed
+                // through the copy, because a borrow of the static itself
+                // cannot outlive the `with` closure it is taken in. The copy is
+                // a refcount bump naming the same cell, and it lives to the end
+                // of the statement, which is exactly as long as the place is
+                // used for.
+                let cell = self.ensure_module_binding(binding, self.span_of(id))?;
+                Ok(format!("{cell}.with(|cell| cell.clone()).borrow_mut()"))
+            }
+            Some(Expr::Field(subject, _, index)) => {
+                let subject_text = self.mutable_place(subject, depth)?;
+                let field = self.field_name(subject, index, self.span_of(id))?;
+                Ok(format!("{subject_text}.{field}"))
+            }
+            Some(Expr::Index(subject, index)) => {
+                let subject_text = self.mutable_place(subject, depth)?;
+                let index_text = self.expression(index, depth)?;
+                Ok(format!("{subject_text}[({index_text}) as usize]"))
+            }
+            Some(Expr::TupleIndex(subject, offset, 1)) => {
+                let subject_text = self.mutable_place(subject, depth)?;
+                Ok(format!("{subject_text}.{offset}"))
+            }
+            Some(Expr::Reference(operand, true)) => {
+                let operand_text = self.mutable_place(operand, depth)?;
+                Ok(format!("&mut {operand_text}"))
+            }
+            _ => self.expression(id, depth),
         }
-        self.expression(id, depth)
     }
 
     fn intrinsic(
