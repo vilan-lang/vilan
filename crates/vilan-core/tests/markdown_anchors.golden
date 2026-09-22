@@ -165,6 +165,7 @@ guide/ui.md h2 inputs
 guide/ui.md h2 lists-each
 guide/ui.md h3 three-forms-one-engine
 guide/ui.md h2 after-the-element-lands-on_mount-autofocus
+guide/ui.md h2 focus-scopes
 guide/ui.md h2 conditionals-show-when-swap
 guide/ui.md h3 position-and-placing-one-at-the-end
 guide/ui.md h3 a-row-a-body-or-a-branch-can-be-anything-slot

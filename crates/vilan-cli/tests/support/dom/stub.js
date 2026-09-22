@@ -264,6 +264,17 @@ class StubElement {
             global.focusLog.push(describe(this) + "!unfocusable");
             return;
         }
+        // B271's rule, and the reason `autofocus` is frame-aware: the target
+        // must be VISIBLE at the call. `visibility` inherits, so this answers
+        // for a hidden ancestor too — which is the overlay's own case, a panel
+        // held hidden until a layout callback places it and flips it.
+        if (
+            global.getComputedStyle &&
+            global.getComputedStyle(this).getPropertyValue("visibility") === "hidden"
+        ) {
+            global.focusLog.push(describe(this) + "!hidden");
+            return;
+        }
         const previous = global.activeElement;
         this.focused = true;
         global.activeElement = this;

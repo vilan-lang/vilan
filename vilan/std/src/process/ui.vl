@@ -268,7 +268,22 @@ export impl View {
 
 	/// Focus, server side: nothing to focus. Dropped like `on_mount`, whose
 	/// one-word form it is on the browser twin. KEEP IN STEP.
+	///
+	/// The browser twin also WRITES the `autofocus` attribute (A121 §6.1),
+	/// and this deliberately does not: a served `autofocus` attribute is
+	/// honored by the browser's own initial parse, which would focus the
+	/// element before the client build ever ran — a real behaviour change to
+	/// every server-rendered page that chains this, and a wider question than
+	/// the focus scope that motivated the write. The client build sets it at
+	/// mount either way.
 	fun autofocus(self): View {
+		self
+	}
+
+	/// Make this element a focus scope, server side: nothing is trapped and
+	/// nothing is focused. Dropped like `autofocus` above, whose clock it
+	/// shares on the browser twin. KEEP IN STEP.
+	fun focus_scope(self, containment: FocusContainment): View {
 		self
 	}
 
@@ -848,10 +863,23 @@ export enum FocusContainment {
 	Wrap,
 }
 
-/// An installed focus scope, server side: an id and a latch, both inert.
+/// An installed focus scope, server side: an id and a latch, both inert. The
+/// browser twin's handle also carries its root element, which a server layer
+/// cannot name — a FIELD may differ between twins where a member may not, and
+/// nothing here ever reads one.
 export struct FocusScope {
 	id: i32,
 	focused: Shared<bool>,
+}
+
+export impl FocusScope {
+	/// Take the initial focus, server side: there is none to take. `false` is
+	/// also what the browser answers for a scope whose subtree holds nothing
+	/// focusable, so a driver that retries on the next frame behaves the same
+	/// on both legs — it simply has no next frame here. KEEP IN STEP.
+	fun focus_initial(self): bool {
+		false
+	}
 }
 
 /// The scope stack, server side: nothing is ever pushed onto it. It is

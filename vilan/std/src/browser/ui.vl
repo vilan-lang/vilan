@@ -407,6 +407,20 @@ export impl View {
 	/// driver runs when it flips visibility, or `<dialog>.showModal()`, whose
 	/// focusing steps run once the dialog is rendered — not a retry.
 	fun autofocus(self): View {
+		// A121 §6.1: WRITE THE ATTRIBUTE TOO. HTML's `autofocus` is inert for
+		// a dynamically inserted element — which is the whole reason this
+		// method exists — so setting it costs nothing at runtime and makes
+		// the author's choice READABLE: to an enclosing `FocusScope`, whose
+		// `focus_initial` prefers an `[autofocus]` descendant over the first
+		// tabbable one; to devtools; and to a test that asserts markup. Both
+		// mechanisms may then fire for one element, and that is harmless —
+		// they focus the same element, and focusing an already-focused
+		// element is a no-op.
+		//
+		// Inside a focus scope, `autofocus` marks which element the scope
+		// should start on; outside one it focuses on its own bounded clock.
+		// It means the same thing in both places.
+		self.element.set_attribute("autofocus", "");
 		self.on_mount(|element| {
 			element.focus();
 			if !element.matches(":focus") {
@@ -414,6 +428,39 @@ export impl View {
 					element.focus();
 					if !element.matches(":focus") {
 						request_animation_frame(|| element.focus());
+					}
+				});
+			}
+		})
+	}
+
+	/// Make this element a FOCUS SCOPE and take the initial focus on
+	/// `autofocus`'s own bounded clock — the chained sugar for the ordinary
+	/// case, the one with no show hook of its own (A121).
+	///
+	/// It stands to `focus_scope` exactly as `autofocus` stands to
+	/// `on_mount`: the same relation, in the same file, so there is one
+	/// pattern and not two. The trap is installed HERE, at build time, which
+	/// it may be because a window listener works whenever it is registered
+	/// and nothing about it needs the element to be in the document. The
+	/// FOCUS is what has a precondition, so it is attempted in `on_mount`'s
+	/// microtask and then, if it did not take, on the next animation frame
+	/// and once more on the frame after — B271's clock, unchanged, and for
+	/// B271's reason.
+	///
+	/// An overlay driver that owns its own visibility flip should install the
+	/// scope with `focus_scope` and call `focus_initial` from the flip
+	/// instead: this form cannot know when a panel it does not own becomes
+	/// visible, and three frames is a bound, not a promise.
+	fun focus_scope(self, containment: FocusContainment): View {
+		let scope = focus_scope(self.element, containment);
+		self.on_mount(|_element| {
+			if !scope.focus_initial() {
+				request_animation_frame(|| {
+					if !scope.focus_initial() {
+						request_animation_frame(|| {
+							let _took = scope.focus_initial();
+						});
 					}
 				});
 			}
@@ -1960,14 +2007,60 @@ export enum FocusContainment {
 
 /// An installed focus scope: the handle the SHOW calls `focus_initial` on.
 ///
-/// It carries an id and a latch, and NOT its root, deliberately — the root
-/// lives in the stack entry the id names, which is what lets the nesting be
-/// read at event time rather than captured at registration, and what lets the
-/// process twin declare this same struct without naming a browser-only
-/// `Element`.
+/// The `id` is what the STACK is read by — the nesting is consulted at event
+/// time rather than captured at registration, which is what lets a nested
+/// scope take over and hand back — and `focused` is the latch that makes
+/// `focus_initial` idempotent.
 export struct FocusScope {
 	id: i32,
+	root: Element,
 	focused: Shared<bool>,
+}
+
+export impl FocusScope {
+	/// Take the INITIAL focus, and answer whether it was taken. The driver
+	/// calls this at the SHOW — when it flips the panel visible — and the
+	/// scope never calls it by itself (B271: `focus()` needs a target that is
+	/// rendered and visible AT THE CALL, and an overlay panel is hidden until
+	/// layout places it, so focus is a consequence of the show and not of the
+	/// mount).
+	///
+	/// The order is: the first `[autofocus]` descendant — the author saying
+	/// which element the scope should start on — else the first tabbable one,
+	/// else the panel itself at `tabindex="-1"` (`focus_first`'s own
+	/// fallback).
+	///
+	/// IDEMPOTENT, and answering `false` rather than latching when the focus
+	/// did not take: a driver whose show hook may fire before layout calls it
+	/// again on the next pass, which is what every overlay's `focused` flag
+	/// was already doing one layer up.
+	///
+	/// `View::autofocus` also WRITES the `autofocus` attribute, so the two
+	/// mechanisms may both fire for one element and that is harmless: they
+	/// focus the same element, and focusing an already-focused element is a
+	/// no-op.
+	fun focus_initial(self): bool {
+		if self.focused.read() {
+			ret true;
+		}
+		mut marked: Option<Element> = None;
+		for candidate in self.root.query_selector_all("*") {
+			if marked.is_none() && candidate.has_attribute("autofocus") {
+				marked = Some(candidate);
+			}
+		}
+		let took = match marked {
+			Some(let target) => {
+				target.focus();
+				target.matches(":focus")
+			},
+			None => self.root.focus_first(),
+		};
+		if took {
+			self.focused.write() = true;
+		}
+		took
+	}
 }
 
 /// The live scopes, outermost first. A scope pushes on install and pops in
@@ -2087,7 +2180,7 @@ export fun focus_scope(root: Element, containment: FocusContainment): FocusScope
 			}
 		}));
 	}
-	FocusScope { id, focused = Shared::new(false) }
+	FocusScope { id, root, focused = Shared::new(false) }
 }
 
 /// Whether `target` lies inside the scope `id` names, or inside any scope

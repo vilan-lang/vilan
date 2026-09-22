@@ -4018,3 +4018,203 @@ fn a121_a_scope_restores_the_focus_it_took_and_not_the_focus_it_was_given() {
          got:\n{stdout}"
     );
 }
+
+// --- A121 S2: the SHOW takes the focus, and `autofocus` says where ----------
+
+/// The overlay's real shape: the scope is installed at mount, the panel is
+/// hidden until something places it, and the DRIVER calls `focus_initial`
+/// when it flips visibility — the `Shared<Option<FocusScope>>` here is the
+/// per-open handle every driver already keeps beside its `focused` flag.
+const SHOW_TAKES_FOCUS: &str = r#"import std::dom::window;
+import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ Signal, SignalCell };
+import std::shared::Shared;
+import std::ui::{ FocusContainment, FocusScope, View, focus_scope, mount_root, view, when };
+
+fun main() {
+	let open: SignalCell<bool> = Signal::new(false);
+	let held: Shared<Option<FocusScope>> = Shared::new(None);
+	let root = mount_root("app", || {
+		view("div")
+			.child(view("input").attr("name", "outside"))
+			.child(when(open, || {
+				view("div")
+					.attr("name", "panel")
+					.on_mount(|element| {
+						element.set_style_property("visibility", "hidden");
+						held.write() = Some(focus_scope(element, FocusContainment::Wrap));
+					})
+					.child(view("input").attr("name", "first"))
+					.child(view("input").attr("name", "marked").autofocus())
+			}))
+	});
+	let _open = root.take(window().listen("open", |_event| {
+		open.set(true);
+	}));
+	let _show = root.take(window().listen("show", |_event| {
+		match held.read() {
+			Some(let scope) => print(i"took={scope.focus_initial()}"),
+			None => print("no scope"),
+		}
+	}));
+	print("built");
+}
+
+main();
+"#;
+
+#[test]
+fn a121_the_show_takes_the_focus_and_autofocus_says_where() {
+    let harness = format!(
+        "{DOM_STUB}{FOCUS_STUB_EXTRAS}\nrequire(\"./app.js\");\n\
+         window.fire(\"open\", {{}});\n\
+         setTimeout(() => {{\n  \
+         console.log(\"markup=\" + JSON.stringify(findByName(\"marked\").attributes));\n  \
+         window.fire(\"show\", {{}});\n  \
+         console.log(\"early=\" + at());\n  \
+         findByName(\"panel\").style.setProperty(\"visibility\", \"visible\");\n  \
+         window.fire(\"show\", {{}});\n  \
+         console.log(\"shown=\" + at());\n  \
+         findByName(\"first\").focus();\n  \
+         window.fire(\"show\", {{}});\n  \
+         console.log(\"latched=\" + at());\n\
+         }}, 0);\n"
+    );
+    let stdout = build_and_run("a121_show", SHOW_TAKES_FOCUS, &harness);
+    let line = |key: &str| -> String {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(key))
+            .unwrap_or_else(|| panic!("no {key:?} line in:\n{stdout}"))
+            .to_string()
+    };
+    assert_eq!(
+        line("markup="),
+        "markup={\"name\":\"marked\",\"autofocus\":\"\"}",
+        "`View::autofocus` WRITES the attribute now (A121 §6.1) — that is how \
+         a scope, devtools and a markup assertion can see which element the \
+         author chose. It moves emitted markup, which is why it is pinned; \
+         got:\n{stdout}"
+    );
+    let takes: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.starts_with("took="))
+        .collect();
+    assert_eq!(
+        takes,
+        vec!["took=false", "took=true", "took=true"],
+        "a show that fires while the panel is still hidden answers FALSE and \
+         focuses nothing (B271: the target must be rendered and visible at \
+         the call), so the driver asks again on its next pass — and the \
+         answer latches once it has taken; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("early="),
+        "early=none",
+        "nothing took focus while the panel was hidden; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("shown="),
+        "shown=marked",
+        "`focus_initial` prefers the `[autofocus]` descendant over the first \
+         tabbable one — the author saying so beats the order; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("latched="),
+        "latched=first",
+        "it is IDEMPOTENT: a second show does not yank focus back off \
+         whatever the user has since moved it to; got:\n{stdout}"
+    );
+}
+
+/// The chained sugar: no show hook, no driver, no handle — the scope installs
+/// itself and takes the focus on `autofocus`'s bounded clock.
+const FOCUS_SCOPE_SUGAR: &str = r#"import std::dom::window;
+import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ FocusContainment, View, mount_root, view, when };
+
+fun main() {
+	let open: SignalCell<bool> = Signal::new(false);
+	let root = mount_root("app", || {
+		view("div")
+			.child(view("input").attr("name", "outside"))
+			.child(when(open, || {
+				view("div")
+					.attr("name", "panel")
+					.focus_scope(FocusContainment::Wrap)
+					.child(view("input").attr("name", "first"))
+					.child(view("input").attr("name", "last"))
+			}))
+	});
+	let _open = root.take(window().listen("open", |_event| {
+		open.set(true);
+	}));
+	print("built");
+}
+
+main();
+"#;
+
+#[test]
+fn a121_the_chained_focus_scope_installs_the_trap_and_takes_the_focus() {
+    let harness = format!(
+        "{DOM_STUB}{FOCUS_STUB_EXTRAS}\nrequire(\"./app.js\");\n\
+         window.fire(\"open\", {{}});\n\
+         setTimeout(() => {{\n  \
+         console.log(\"focused=\" + at());\n  \
+         findByName(\"last\").focus();\n  \
+         const tail = dispatchEvent(findByName(\"last\"), \"keydown\", {{ key: \"Tab\" }});\n  \
+         console.log(\"trapped=\" + at() + \" prevented=\" + !!tail.prevented);\n\
+         }}, 0);\n"
+    );
+    let stdout = build_and_run("a121_sugar", FOCUS_SCOPE_SUGAR, &harness);
+    let line = |key: &str| -> String {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(key))
+            .unwrap_or_else(|| panic!("no {key:?} line in:\n{stdout}"))
+            .to_string()
+    };
+    assert_eq!(
+        line("focused="),
+        "focused=first",
+        "the sugar takes the initial focus itself, on `autofocus`'s clock — \
+         the ordinary case, the one with no show hook of its own; \
+         got:\n{stdout}"
+    );
+    assert_eq!(
+        line("trapped="),
+        "trapped=first prevented=true",
+        "and it installed the TRAP as well: Tab from the last tabbable wraps; \
+         got:\n{stdout}"
+    );
+}
+
+/// The SSR twins of both forms: accepted and dropped, like every event binder
+/// there — except the `autofocus` ATTRIBUTE, which the browser twin now
+/// writes and the server twin deliberately does not (process/ui.vl says why).
+const FOCUS_SSR_TWINS: &str = r#"import std::io::print;
+import std::ui::{ FocusContainment, View, render, view };
+
+fun main() {
+	print(render(view("div").focus_scope(FocusContainment::Contain).child(view("input"))));
+	print(render(view("input").autofocus()));
+}
+
+main();
+"#;
+
+#[test]
+fn a121_the_ssr_twins_render_the_same_markup_and_trap_nothing() {
+    let stdout = build_and_run_process("a121_ssr", FOCUS_SSR_TWINS);
+    assert_eq!(
+        stdout, "<div><input></div>\n<input>\n",
+        "a server render has no focus to trap: both forms serialize exactly \
+         what they would without them, and the `autofocus` attribute stays a \
+         client-side write (a served one would focus the element at the \
+         browser's own initial parse, which is a behaviour change to every \
+         server-rendered page that chains it)"
+    );
+}

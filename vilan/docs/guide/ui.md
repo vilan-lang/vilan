@@ -513,6 +513,67 @@ synchronous build — and the `mount` that finishes it — runs to
 completion before any microtask does. On the SSR twin both methods
 accept and drop, like the event binders: there is no document to be in.
 
+`autofocus` also writes the `autofocus` **attribute**. The attribute is
+inert for an element inserted after the page parsed — that is *why* this
+method exists — so it costs nothing at runtime and makes the choice
+readable: to a focus scope, to devtools, and to a test that asserts
+markup. The SSR twin deliberately does not write it, because a *served*
+`autofocus` is honored by the browser's own initial parse.
+
+## Focus scopes
+
+An overlay usually wants more than one focused input: it wants Tab to
+stay inside it while it is open, and it wants focus back where it was
+when it closes. That is a **focus scope**.
+
+```vilan,fragment
+view("div")
+	.focus_scope(FocusContainment::Wrap)
+	.child(view("input").autofocus())
+	.child(view("button").text("Close"))
+```
+
+`Wrap` is a menu: Tab cycles inside the subtree, and focus that leaves by
+any other route may leave. `Contain` is a modal: it also pulls focus back
+when it lands anywhere else. Neither writes anything outside the panel —
+the rest of the page stays clickable and stays in the accessibility tree,
+which is exactly what a menu needs and what `inert` would take away.
+`inert` is still yours for a true modal (`set_attribute("inert", "")` and
+`remove_attribute`), and it is a bigger hammer: it removes the subtree
+from the accessibility tree and blocks pointer events.
+
+`focus_scope` on a view is the ordinary case. A driver that owns its own
+visibility flip — which is every overlay system that positions a panel
+before showing it — installs the scope and takes the focus as **two
+acts**, because focus has a precondition the mount cannot satisfy:
+
+```vilan,fragment
+// at mount, or wherever the panel element is in hand:
+let scope = focus_scope(panel, FocusContainment::Contain);
+
+// …in the pass that flips it visible:
+let _took = scope.focus_initial();
+```
+
+`focus_initial` focuses the first `[autofocus]` descendant, else the
+first tabbable one, else the panel itself at `tabindex="-1"` — and it
+answers whether the focus was taken, so a show that fired too early is
+simply asked again on the next pass. It is idempotent: once focus has
+been taken, a later call leaves alone whatever the user has since moved
+to.
+
+Scopes NEST as a stack, not by DOM ancestry, because an overlay is a
+portal: a submenu opened from inside a menu mounts beside its parent's
+panel rather than inside it. The topmost `Contain` scope is the one that
+guards. A scope lives as long as the boundary it was installed in — when
+that boundary is disposed the scope pops, and focus goes back to whatever
+held it when the scope opened, unless the app moved focus deliberately in
+the meantime or the remembered element has since left the document.
+
+`Element::tabbable()` is the query underneath, and it is public: a router
+that moves focus to the new page's heading, or a menu that implements
+arrow-key navigation, wants it too.
+
 ## Conditionals: `show`, `when`, `swap`
 
 Three primitives. Pick by what should happen to the content while it's

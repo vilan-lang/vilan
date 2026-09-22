@@ -284,7 +284,8 @@ too.
 | `bind_draft` | `(draft: Draft<str>): View` | local-first input bind ([drafts](reactive.md#draft--local-first-cells)) |
 | `show` | `(condition: S): View`; `S: Source<bool>` | state-PRESERVING visibility toggle — sets the `hidden` attribute AND an inline `display:none`, restoring the element's own inline `display` when it turns true |
 | `on_mount` | `(action: sync \|Element\| void): View` | run `action` with this element once it is in the document |
-| `autofocus` | `(): View` | focus this element once it is mounted AND rendered — the modal-input form HTML's `autofocus` cannot serve |
+| `autofocus` | `(): View` | focus this element once it is mounted AND rendered — the modal-input form HTML's `autofocus` cannot serve; also WRITES the `autofocus` attribute, which is how a focus scope reads the author's choice (the SSR twin writes neither) |
+| `focus_scope` | `(containment: FocusContainment): View` | make this element a focus scope and take the initial focus on `autofocus`'s clock — the sugar for the case with no show hook |
 
 Semantics, choosing between `show`/`when`/`swap`, and examples: the
 [UI guide](../guide/ui.md).
