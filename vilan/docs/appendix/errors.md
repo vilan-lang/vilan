@@ -201,6 +201,29 @@ annotations are not this error and the message names them both: a
 *constraint* on the inferred type — see the next entry.
 → [Data and traits](../tour/data-and-traits.md)
 
+**"'…' cannot be a `dyn` object: '…' is a static — it takes no `self`"**
+Also **"… is generic — one vtable slot cannot hold an unbounded family of
+specializations"** and **"… returns `Self` — the caller would have to know
+the type the object erased"**. An object dispatches through a table of its
+trait's members, so each member the trait *requires* has to fit a slot: it
+takes a receiver, it names no `Self`, and it is not generic. The message
+names the **member** that disqualified the trait and the note points at
+its declaration, because naming the trait would send you to read every
+signature it has. A trait's *default* members never disqualify it — they
+are the trait's own code over the requirements. Where the trait cannot be
+an object, the generic is the answer: `<T: Trait>` keeps the type, needs
+no table, and is what the language does everywhere else.
+→ [Data and traits](../tour/data-and-traits.md)
+
+**"'…' is a resource, so it cannot become a `dyn …`"**
+A `resource` has exactly one owner and a destructor that runs at a known
+point. Erasing it into a trait object would make that destructor dynamic —
+dispatched through the table like everything else — where the rest of the
+language keeps teardown static. Hold the resource in a struct field of
+your own and put *that* behind the object, or take it through a generic
+bound, where its type is still known.
+→ [Memory model](../tour/memory-model.md)
+
 **"'…' does not implement trait '…', required by the annotation on '…'"**
 A `let` binding's annotation named a trait, which reads as a constraint
 on the value's own type — the binding still has the concrete type its

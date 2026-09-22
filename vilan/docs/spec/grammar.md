@@ -642,6 +642,7 @@ recognized between two operands.
 type = "&" [ "mut" ] type                       (* view type *)
      | ( "type" IDENT | "_" ) [ ":" bound-list ] (* impl-subject binder *)
      | [ "async" | "sync" ] closure-type [ context-clause ]
+     | "dyn" type-path                           (* trait object, §5.12 *)
      | type-path                                 (* nominal *)
      | "(" IDENT "in" type ":" type ")"          (* mapped tuple, §5.9 *)
      | "(" [ type { "," type } [ "," ] ] ")"     (* tuple type *)
@@ -670,6 +671,12 @@ With no return type at all the clause is read by the function
 production above instead. Written after the return type it precedes a
 `borrows` clause, and written without one it follows it; the formatter
 prints it where it was written.
+
+`dyn` takes a `type-path` and nothing else: the keyword erases a TRAIT's
+implementation, so a closure type, a tuple, an array or a view after it names
+nothing that could be erased and is a parse error. A `dyn` type stands
+wherever a type stands, nesting included (`List<dyn Source<i32>>`), and the
+trait it names must be object-safe (§5.12).
 
 `sync` is likewise
 contextual (§7.4: the synchronous contract; parameters only). A closure

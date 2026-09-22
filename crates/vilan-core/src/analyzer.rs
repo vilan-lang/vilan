@@ -2317,6 +2317,35 @@ struct PreppedTypePath<'src> {
     source_id: SourceId,
 }
 
+/// Why a trait cannot be a `dyn` object — the message, and the note that points
+/// at the member that disqualified it (trait-objects.md §4's recommendation:
+/// name the member, not the trait).
+struct ObjectSafetyViolation {
+    message: String,
+    note: Option<crate::error::Note>,
+}
+
+/// One written `dyn Trait<..>` annotation, recorded at its walk and resolved
+/// after the type drains ([`Analyzer::resolve_dyn_annotations`]).
+///
+/// The keyword's operand is an ordinary deferred type reference — the same
+/// queue entry `Source<i32>` written anywhere else makes — so the object's own
+/// slot has nothing to hold until that one resolves. Keeping the pair here, and
+/// resolving in one pass, is also what gives the object-safety check a single
+/// site: the trait's members are knowable exactly once, and every `dyn` in the
+/// program asks the same question at the same point.
+#[derive(Clone, Copy, Debug)]
+struct PreppedDyn {
+    /// The `dyn` slot itself — what the annotation's position reads.
+    type_id: TypeId,
+    /// The trait path the keyword wrapped.
+    inner_type_id: TypeId,
+    /// The whole `dyn Trait<..>` spelling, which a refusal underlines.
+    span: Span,
+    /// The file the annotation was walked from (E108).
+    source_id: SourceId,
+}
+
 /// One required trait member the impl provides by NAME, recorded during the
 /// conformance loop so its full SIGNATURE can be checked against the trait's
 /// declaration (B29): receiver convention, arity, per-position conventions and
@@ -4098,7 +4127,30 @@ pub struct Analyzer<'src> {
     /// closure `|a, b| value.call(a, b)`; a struct is a plain JS array, so the
     /// wrap is the whole of the coercion's runtime cost and it is paid only
     /// where one was actually written.
+    /// A124 R3: every method call whose receiver is a trait OBJECT, by the
+    /// call's own expression id, carrying the member's name. The emitter turns
+    /// each into a table call — `receiver[1].name(receiver[0], ..)` — instead of
+    /// a resolved direct call.
+    dyn_method_calls: HashMap<Id, &'src str>,
+    /// A124 R3 / trait-objects.md §6.2: every `(trait, member)` pair some call
+    /// in the program reaches THROUGH an object. The emitted vtable's slot set,
+    /// which is why the object's reachability cost is the members it is
+    /// actually called through rather than the trait's whole surface.
+    dyn_dispatched_members: HashSet<(Id, &'src str)>,
+    /// A124 R3: the traits the program writes a `dyn` over. Empty in every
+    /// program that names none, which is what keeps
+    /// [`Analyzer::record_object_reachable_members`] free for them.
+    dyn_object_traits: HashSet<Id>,
+    /// A124 R3: the expressions a `dyn` refusal has already been raised at, so
+    /// the repeated inference passes over one site report once.
+    dyn_refusals_reported: HashSet<Id>,
     callable_coercions: HashMap<Id, (usize, TypeId)>,
+    /// A124 R3: every expression a concrete value is erased into a trait object
+    /// at — the expression's own id, and the value's own type, which is what the
+    /// emitter builds the vtable from. Recorded by
+    /// [`Analyzer::note_dyn_coercion`]; the `dyn` type itself is the slot's, so
+    /// only the erased side needs keeping.
+    dyn_coercions: HashMap<Id, (TypeId, Id, Vec<TypeId>)>,
     prepped_static_accessors: Vec<(Id, TypeId, &'src str)>,
     // A qualified-generic static subject's impl-binder bindings
     // (`Boxy<i32>::make` -> {impl's T -> i32}), keyed by the accessor expr id.
@@ -4228,6 +4280,15 @@ pub struct Analyzer<'src> {
     // nominal type (`Option<i32>` -> `Enum(option_id, [i32])`); empty for a bare
     // name or a generic parameter.
     prepped_type_locals: Vec<(TypeId, &'src str, Id, Span, Vec<TypeId>, SourceId)>,
+    // A124 R3: every `dyn Trait<..>` annotation, recorded at its walk and
+    // resolved by `resolve_dyn_annotations` after the type drains — the inner
+    // trait path is an ordinary deferred reference, so the object's own slot
+    // cannot be written until that one has landed.
+    prepped_dyn_annotations: Vec<PreppedDyn>,
+    // A124 R3: the written span of every `dyn` slot that RESOLVED, so a
+    // refusal raised later (a coercion carrying a resource, a value that does
+    // not implement the trait) reports at the annotation the reader wrote.
+    dyn_annotation_spans: HashMap<TypeId, (SourceId, Span)>,
     /// The generic parameters each nominal declaration (struct / enum / trait)
     /// WROTE, by its entity id — the record the `prepped_type_locals` drain
     /// checks a written application's arity against (B188).
@@ -5951,6 +6012,11 @@ impl<'src> Analyzer<'src> {
             supertrait_self_at_call: HashMap::default(),
             expected_types: HashMap::default(),
             callable_coercions: HashMap::default(),
+            dyn_coercions: HashMap::default(),
+            dyn_method_calls: HashMap::default(),
+            dyn_dispatched_members: HashSet::default(),
+            dyn_object_traits: HashSet::default(),
+            dyn_refusals_reported: HashSet::default(),
             prepped_static_accessors: Vec::new(),
             static_subject_bindings: HashMap::default(),
             impl_body_subjects: HashMap::default(),
@@ -5974,6 +6040,8 @@ impl<'src> Analyzer<'src> {
             trait_impl_sites: Vec::new(),
             conformance_signature_checks: Vec::new(),
             prepped_type_locals: Vec::new(),
+            prepped_dyn_annotations: Vec::new(),
+            dyn_annotation_spans: HashMap::default(),
             declared_generic_parameters: HashMap::default(),
             written_type_spellings: Vec::new(),
             prepped_type_static_accessors: Vec::new(),
@@ -9902,6 +9970,14 @@ impl<'src> Analyzer<'src> {
                 Type::Generic(constraint) => {
                     Members::Answer(resource_constraints.contains(constraint), true)
                 }
+                // A trait OBJECT holds no resource, and that is enforced rather
+                // than assumed: `check_dyn_coercion` refuses a resource at the
+                // coercion, which is the one place the concrete type is still
+                // known (trait-objects.md §8.3, Q5 answered NO in this scope by
+                // A124 R3). Answering `false` here without that refusal would be
+                // §2.2's destructor suppression in a new carrier, which is why
+                // the two are written as one rule and pinned together.
+                Type::Dyn(..) => Members::Answer(false, true),
                 // Everything else is a non-value or a scalar: never a resource by
                 // containment.
                 Type::Any
@@ -10179,6 +10255,11 @@ impl<'src> Analyzer<'src> {
         let signal_id = self.primitive_struct_ids.get("SignalCell").copied();
         let shared_id = self.primitive_struct_ids.get("Shared").copied();
         match type_id.get_type(self) {
+            // A trait OBJECT carries a vtable of emitted functions — the old
+            // module's functions. Transferring one across an HMR swap would
+            // carry the previous build's code in the new build's value, which
+            // is the one thing `hmr_transfer_form` exists to prevent.
+            Type::Dyn(..) => (false, true),
             Type::Struct(id, arguments) => {
                 // A resource carries no old code but is loan-only, never plain data.
                 if self.type_is_resource(type_id) {
@@ -10375,6 +10456,11 @@ impl<'src> Analyzer<'src> {
                 }
             }
             Type::Trait(id, arguments) => {
+                buf.push_str(self.traits.get(&id).map(|t| t.name).unwrap_or("?"));
+                self.render_type_arguments_canonical(&arguments, depth, visiting, buf);
+            }
+            Type::Dyn(id, arguments) => {
+                buf.push_str("dyn ");
                 buf.push_str(self.traits.get(&id).map(|t| t.name).unwrap_or("?"));
                 self.render_type_arguments_canonical(&arguments, depth, visiting, buf);
             }
@@ -11818,7 +11904,7 @@ impl<'src> Analyzer<'src> {
             Type::Struct(id, arguments) | Type::Enum(id, arguments) => {
                 nominals.contains(&id) || any(self, &arguments, visited)
             }
-            Type::Trait(_, arguments) => any(self, &arguments, visited),
+            Type::Trait(_, arguments) | Type::Dyn(_, arguments) => any(self, &arguments, visited),
             Type::Tuple(members) => any(self, &members, visited),
             Type::Array(element, _length) => any(self, &[element], visited),
             Type::Closure(parameters, return_, _) => {
@@ -18062,6 +18148,76 @@ impl<'src> Analyzer<'src> {
             }
         }
         !decided
+    }
+
+    /// A124 R3: the generic bindings an ERASURE carries.
+    ///
+    /// `dyn Source<List<T>>` meeting a `SignalCell<List<i32>>` binds `T := i32`,
+    /// and without that the parameter is only reachable through the field's
+    /// bound and grounds nowhere — `Held<any>` instead of `Held<i32>`, which is
+    /// exactly the class B251 closed for the written spelling and for B184's
+    /// sugar. The object's arguments are reconciled against the arguments the
+    /// concrete type implements the trait AT, which
+    /// [`Self::instantiated_home_arguments`] already computes for B73's R1 key:
+    /// the `with` clause padded to the trait's arity and then read through the
+    /// impl's own binders bound from this receiver, so std's
+    /// `impl SignalCell<type T> with Source<T>` reads as `Source<List<i32>>` on
+    /// a `SignalCell<List<i32>>` rather than as the abstract `Source<T>` it is
+    /// written as.
+    ///
+    /// Empty when the trait takes no arguments, when no implementation provides
+    /// it (the caller's guard has already answered that), or when the
+    /// instantiation is erased — an unpadded clause says nothing about the
+    /// arguments, and a binding invented from it would be worse than none.
+    fn dyn_erasure_bindings(
+        &mut self,
+        concrete: &Type,
+        trait_id: Id,
+        dyn_arguments: &[TypeId],
+    ) -> Vec<(TypeId, TypeId)> {
+        if dyn_arguments.is_empty() {
+            return Vec::new();
+        }
+        let providers: Vec<(TypeId, Vec<TypeId>)> = self
+            .implementations
+            .iter()
+            .filter(|implementation| implementation.trait_ids.contains(&trait_id))
+            .filter(|implementation| {
+                self.compare_type(
+                    concrete,
+                    implementation.subject.borrow_type(self),
+                    &HashMap::default(),
+                )
+            })
+            .map(|implementation| {
+                let written = implementation
+                    .trait_args
+                    .iter()
+                    .find(|(id, _)| *id == trait_id)
+                    .map(|(_, arguments)| arguments.clone())
+                    .unwrap_or_default();
+                (implementation.subject, written)
+            })
+            .collect();
+        for (provider_subject, written) in providers {
+            let provided =
+                self.instantiated_home_arguments(concrete, trait_id, &written, provider_subject);
+            if provided.len() != dyn_arguments.len() {
+                continue;
+            }
+            let mut bindings = Vec::new();
+            for (wanted, got) in dyn_arguments.iter().zip(provided.iter()) {
+                let wanted_type = wanted.get_type(self);
+                let got_type = got.get_type(self);
+                if let Some((_, argument_bindings)) =
+                    self.reconcile_type(&wanted_type, &got_type, &SubstitutionContext::default())
+                {
+                    bindings.extend(argument_bindings);
+                }
+            }
+            return bindings;
+        }
+        Vec::new()
     }
 
     /// The home trait's arguments as THIS receiver instantiates them — B73's R1
@@ -28547,6 +28703,362 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// A124 R3 / trait-objects.md §4: resolve every written `dyn Trait<..>` to
+    /// [`Type::Dyn`], refusing the spellings that cannot be one.
+    ///
+    /// Two refusals live here, and both are at the SPELLING rather than at a
+    /// use, for the reason §15.1 put the value-position refusal at the
+    /// annotation: the fix goes where the type is written, and a slot that
+    /// resolves to `Unknown` reports once instead of cascading.
+    ///
+    /// 1. **`dyn` over something that is not a trait.** `dyn List<i32>` names a
+    ///    struct; there is no surface to erase.
+    /// 2. **`dyn` over a trait that is not OBJECT-SAFE** — the three
+    ///    disqualifiers of §4, plus the `Self`-in-a-parameter case §4's census
+    ///    did not separate out (see [`Analyzer::object_safety_violation`]). The
+    ///    message names the DISQUALIFYING MEMBER and its reason, per §4's own
+    ///    recommendation: naming the trait sends the reader to read fifteen
+    ///    signatures; naming the member sends them to the line.
+    fn resolve_dyn_annotations(&mut self) {
+        for prepped in std::mem::take(&mut self.prepped_dyn_annotations) {
+            let PreppedDyn {
+                type_id,
+                inner_type_id,
+                span,
+                source_id,
+            } = prepped;
+            let inner = self
+                .type_id_to_type_map
+                .get(&inner_type_id)
+                .cloned()
+                .unwrap_or(Type::Unknown);
+            let (trait_id, arguments) = match inner {
+                Type::Trait(trait_id, arguments) => (trait_id, arguments),
+                // The inner path reported its own mistake (an unknown name, a
+                // wrong arity); one spelling, one report.
+                Type::Unknown | Type::Unresolved => {
+                    self.refused_annotation_slots
+                        .insert(type_id, (source_id, span));
+                    self.write_type_slot(type_id, Type::Unknown);
+                    continue;
+                }
+                other => {
+                    let rendered = self.pretty_print_type(&other, &HashMap::default());
+                    let sort = match other {
+                        Type::Struct(..) => "a struct",
+                        Type::Enum(..) => "an enum",
+                        Type::Generic(..) => "a generic parameter",
+                        _ => "not a trait",
+                    };
+                    self.push_at_written_type(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span,
+                            msg: format!(
+                                "`dyn` erases a TRAIT, and `{rendered}` is {sort}: there is no \
+                                 member surface here to dispatch through. Write `{rendered}` \
+                                 on its own for the type itself, or name the trait the value \
+                                 implements"
+                            ),
+                        },
+                        source_id,
+                        type_id,
+                    );
+                    self.refused_annotation_slots
+                        .insert(type_id, (source_id, span));
+                    self.write_type_slot(type_id, Type::Unknown);
+                    continue;
+                }
+            };
+            if let Some(violation) = self.object_safety_violation(trait_id) {
+                self.push_at_written_type(
+                    Error {
+                        trace: Vec::new(),
+                        note: violation.note,
+                        span,
+                        msg: violation.message,
+                    },
+                    source_id,
+                    type_id,
+                );
+                self.refused_annotation_slots
+                    .insert(type_id, (source_id, span));
+                self.write_type_slot(type_id, Type::Unknown);
+                continue;
+            }
+            self.dyn_annotation_spans.insert(type_id, (source_id, span));
+            self.dyn_object_traits.insert(trait_id);
+            self.write_type_slot(type_id, Type::Dyn(trait_id, arguments));
+        }
+    }
+
+    /// A124 R3: an object written where a concrete type belongs.
+    ///
+    /// Reported once per expression: `infer_type_inner` runs many times over
+    /// one site as constraints settle, and a refusal pushed on every pass
+    /// would tell the reader the same thing a dozen times.
+    fn refuse_dyn_narrowing(&mut self, expr_id: Id, constraint: &Type, inferred: &Type) {
+        if !self.dyn_refusals_reported.insert(expr_id) {
+            return;
+        }
+        let Some(span) = self.span_map.get(&expr_id).map(|span| **span) else {
+            return;
+        };
+        let object = self.pretty_print_type(inferred, &HashMap::default());
+        let expected = self.pretty_print_type(constraint, &HashMap::default());
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span,
+            msg: format!(
+                "Expected {expected}, but got {object} instead: an object does not narrow back \
+                 to the type it erased. `dyn` is where the concrete type went — the program \
+                 cannot ask for it again — so a value that must stay a {expected} is held as \
+                 one, or taken through a generic bound"
+            ),
+        });
+    }
+
+    /// A124 R3 / trait-objects.md §6.2, the second half of the vtable's slot
+    /// set — **the blanket, priced**.
+    ///
+    /// §5 of this lane's brief asks for `impl dyn Trait with Trait` so that
+    /// blankets over `S: Trait` reach the object. Nothing is written: an object
+    /// SATISFIES its trait's bound (`compare_type`'s `Dyn`/`Trait` arm), so
+    /// `fun twice<S: Src<i32>>(s: S)` binds `S := dyn Src<i32>` and its body's
+    /// `s.get()` is an ordinary bound dispatch — which the emitter answers
+    /// through the object's table when the binding turns out to be one
+    /// ([`Dispatch::Object`]).
+    ///
+    /// What that costs is HERE. A bound dispatch's member is recorded against a
+    /// CONSTRAINT, not against a receiver, so at analysis time nothing says
+    /// which instantiation will be an object — and the vtable is built at the
+    /// coercion, which is emitted before the generic body that will call
+    /// through it. So the set is over-approximated once, at the end of the
+    /// walk: if the program names `dyn T` anywhere, every member reached
+    /// through a `T`-bounded generic takes a slot. That is still far short of
+    /// the trait's whole surface (a `Source` object's table is the members the
+    /// program calls, not the eleven it declares), and it is sound in the
+    /// direction that matters — a missing slot is a runtime `TypeError`, an
+    /// extra one is a function the bundle splitter cannot prove dead.
+    fn record_object_reachable_members(&mut self) {
+        if self.dyn_object_traits.is_empty() {
+            return;
+        }
+        let dispatches: Vec<(TypeId, &'src str)> = self
+            .generic_dispatch
+            .values()
+            .filter_map(|dispatch| match dispatch {
+                GenericDispatch::OnConstraint(constraint_id, member) => {
+                    Some((*constraint_id, *member))
+                }
+                GenericDispatch::OnType(..) => None,
+            })
+            .collect();
+        for (constraint_id, member) in dispatches {
+            for (trait_id, _) in self.generic_bound_traits(constraint_id) {
+                for reachable in self.trait_with_supertraits(trait_id) {
+                    if self.dyn_object_traits.contains(&reachable) {
+                        self.dyn_dispatched_members.insert((reachable, member));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Why `trait_id` cannot be a `dyn` object, or `None` when it can.
+    ///
+    /// trait-objects.md §4's disqualifiers, each of which is a property of ONE
+    /// member, which is why the report names that member:
+    ///
+    /// - **no receiver** (a static): there is nothing to select an impl with.
+    ///   B83's finding from the other direction — a vtable has the same problem
+    ///   a qualified `Trait::static()` has;
+    /// - **a generic member**: one slot cannot hold an unbounded family of
+    ///   specializations;
+    /// - **`Self` in the signature**: the caller would have to know the type the
+    ///   object erased. §4 names the RETURN, which is the case its census
+    ///   counted; a `Self` PARAMETER (`fun eq(self, other: Self): bool`) is the
+    ///   same hole in the other direction and is reported with its own wording —
+    ///   see the lane's report, where it is flagged as beyond what §4 priced.
+    ///
+    /// **Only the REQUIRED members are asked.** A vtable slot exists for a
+    /// member an impl must supply; a member with a DEFAULT body is not
+    /// dispatched at all — it is the trait's own code, instantiated at
+    /// `Self := dyn Trait<..>` and calling back through the slots, which is
+    /// exactly what a blanket over `S: Trait` does and is why the blanket
+    /// (§5 of this lane's brief) needs no separate mechanism. §4's census
+    /// classified all 96 members rather than the requirements, so it counts
+    /// `Source` out on `map<U>` — a DEFAULT, six lines of ordinary code over
+    /// `get`/`on_change`. Taking it at its word would refuse the one object
+    /// A124 R3 rules IN, and would make every trait's object-usability
+    /// hostage to conveniences its authors wrote for the bound. The record
+    /// agrees with this reading where it is specific: the pipeline paper calls
+    /// `get`/`on_change` "the object-safe core, exactly today's two
+    /// requirements", and the native shape is priced as "a two-slot vtable" —
+    /// two, which is the requirement count and not the member count.
+    ///
+    /// Supertraits count: a `dyn Ord` must dispatch `PartialOrd`'s members too,
+    /// so an unsafe supertrait disqualifies the sub-trait, reported by the
+    /// member and the trait that declares it.
+    fn object_safety_violation(&self, trait_id: Id) -> Option<ObjectSafetyViolation> {
+        let mut seen: HashSet<Id> = HashSet::default();
+        self.object_safety_violation_in(trait_id, trait_id, &mut seen)
+    }
+
+    fn object_safety_violation_in(
+        &self,
+        trait_id: Id,
+        root_trait_id: Id,
+        seen: &mut HashSet<Id>,
+    ) -> Option<ObjectSafetyViolation> {
+        if !seen.insert(trait_id) {
+            return None;
+        }
+        let trait_ = self.traits.get(&trait_id)?;
+        let trait_name = trait_.name;
+        let root_name = self
+            .traits
+            .get(&root_trait_id)
+            .map(|trait_| trait_.name)
+            .unwrap_or(trait_name);
+        let declarations: Vec<(&'src str, Id)> = trait_.declared_members.clone();
+        let supertraits = trait_.supertraits.clone();
+        for (member_name, member_id) in declarations {
+            let Some(function) = self.functions.get(&member_id) else {
+                continue;
+            };
+            // A default body is the trait's own code, not a slot. See the
+            // doc comment: this is the one place §4's census is narrowed, and
+            // it is narrowed to what a vtable is actually built from.
+            if function.has_body {
+                continue;
+            }
+            let name_span = function.name_span;
+            let has_receiver = function
+                .parameters
+                .first()
+                .and_then(|parameter_id| self.parameters.get(parameter_id))
+                .is_some_and(|parameter| parameter.name == "self");
+            let generic = !function.generic_parameter_constraint_ids.is_empty();
+            let return_type_id = function.return_type_id;
+            let parameter_ids = function.parameters.clone();
+            let reason = if !has_receiver {
+                Some(format!(
+                    "`{trait_name}::{member_name}` is a static — it takes no `self`, so there \
+                     is nothing for a call through the object to select an implementation with"
+                ))
+            } else if generic {
+                Some(format!(
+                    "`{trait_name}::{member_name}` is generic — one vtable slot cannot hold an \
+                     unbounded family of specializations"
+                ))
+            } else if return_type_id
+                .is_some_and(|type_id| self.type_mentions_self_of(type_id, trait_id))
+            {
+                Some(format!(
+                    "`{trait_name}::{member_name}` returns `Self` — the caller would have to \
+                     know the type the object erased in order to receive the result"
+                ))
+            } else {
+                parameter_ids
+                    .iter()
+                    .skip(1)
+                    .filter_map(|parameter_id| self.parameters.get(parameter_id))
+                    .find(|parameter| self.type_mentions_self_of(parameter.type_id, trait_id))
+                    .map(|parameter| {
+                        let parameter_name = parameter.name;
+                        format!(
+                            "`{trait_name}::{member_name}` takes `Self` in its `{parameter_name}` \
+                             parameter — two objects of one trait need not erase the same type, \
+                             so nothing can supply that argument"
+                        )
+                    })
+            };
+            if let Some(reason) = reason {
+                let through = match trait_id == root_trait_id {
+                    true => String::new(),
+                    false => format!(
+                        " `{root_name}` requires `{trait_name}`, so an object over it must \
+                         dispatch that member too."
+                    ),
+                };
+                return Some(ObjectSafetyViolation {
+                    message: format!(
+                        "`{root_name}` cannot be a `dyn` object: {reason}.{through} An object \
+                         dispatches through a table of its trait's members, so every member \
+                         must take a receiver, name no `Self` in its signature, and be \
+                         non-generic. Use a generic parameter (`<T: {root_name}>`) for a value \
+                         whose type is known where it is written"
+                    ),
+                    note: Some(crate::error::Note {
+                        span: name_span,
+                        msg: format!("'{member_name}' is declared here"),
+                        source: self.source_of_id(member_id),
+                    }),
+                });
+            }
+        }
+        for supertrait_type_id in supertraits {
+            if let Type::Trait(supertrait_id, _) = supertrait_type_id.get_type(self)
+                && let Some(violation) =
+                    self.object_safety_violation_in(supertrait_id, root_trait_id, seen)
+            {
+                return Some(violation);
+            }
+        }
+        None
+    }
+
+    /// Whether `type_id` names the abstract `Self` of `trait_id` anywhere inside
+    /// it. `Self` interns as `Type::Trait(trait_id, [])` (§15.2), and so does a
+    /// `= Self`-defaulted parameter of the same trait — both are the erased
+    /// type, so both answer yes. A nested mention counts: `Option<Self>` is no
+    /// more receivable through a vtable than a bare one.
+    fn type_mentions_self_of(&self, type_id: TypeId, trait_id: Id) -> bool {
+        let mut visited: HashSet<TypeId> = HashSet::default();
+        self.type_mentions_self_of_at(type_id, trait_id, &mut visited)
+    }
+
+    fn type_mentions_self_of_at(
+        &self,
+        type_id: TypeId,
+        trait_id: Id,
+        visited: &mut HashSet<TypeId>,
+    ) -> bool {
+        if !visited.insert(type_id) {
+            return false;
+        }
+        let any = |analyzer: &Self, members: &[TypeId], visited: &mut HashSet<TypeId>| {
+            members
+                .iter()
+                .any(|member| analyzer.type_mentions_self_of_at(*member, trait_id, visited))
+        };
+        match type_id.get_type(self) {
+            Type::Trait(id, arguments) => id == trait_id || any(self, &arguments, visited),
+            Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Dyn(_, arguments) => {
+                any(self, &arguments, visited)
+            }
+            Type::Tuple(members) => any(self, &members, visited),
+            Type::Array(element, _) => any(self, &[element], visited),
+            Type::Closure(parameters, return_type_id, _) => {
+                any(self, &parameters, visited) || any(self, &[return_type_id], visited)
+            }
+            Type::Mapped(binder, source, template) => {
+                any(self, &[binder, source, template], visited)
+            }
+            Type::Generic(_)
+            | Type::Any
+            | Type::Never
+            | Type::Void
+            | Type::Function(_)
+            | Type::Module(_)
+            | Type::Unknown
+            | Type::Unresolved => false,
+        }
+    }
+
     /// Whether `scope_id` is `ancestor_scope_id` or lies inside it — the
     /// structural half of "declared by an enclosing binder", for B186's
     /// implicit generics, which have no name to resolve up the chain.
@@ -31677,6 +32189,16 @@ impl<'src> Analyzer<'src> {
                 });
                 Some(Expr::Error)
             }
+            Node::DynType(_) => {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: node.1,
+                    msg: "`dyn Trait` is a type, not a value (expected an expression here)"
+                        .to_string(),
+                });
+                Some(Expr::Error)
+            }
             Node::MappedType { .. } => {
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
@@ -32690,6 +33212,27 @@ impl<'src> Analyzer<'src> {
                 self.record_type_context_clause(type_id, names, scope_id, None);
                 return type_id;
             }
+            // A124 R3 / B4 reopened: `dyn Source<i32>` — a TRAIT OBJECT.
+            //
+            // The trait path inside is walked as a TRAIT POSITION, which is what
+            // keeps §12.2's value-position refusal off it: the name `Source`
+            // here is not a value type mistaken for one, it is the trait whose
+            // surface the object carries. The outer slot cannot be written yet —
+            // the inner one resolves in the `prepped_type_locals` drain, long
+            // after this walk — so the pair is recorded and
+            // `resolve_dyn_annotations` writes `Type::Dyn` once the inner has
+            // landed. That is also where object safety is checked, because that
+            // is the first point at which the trait's members are knowable.
+            Node::DynType(inner) => {
+                let inner_type_id = self.walk_trait_position_type_node(inner, scope_id);
+                self.prepped_dyn_annotations.push(PreppedDyn {
+                    type_id,
+                    inner_type_id,
+                    span: node.1,
+                    source_id: self.current_source_id,
+                });
+                None
+            }
             // A mapped tuple type `(U in T: F<U>)`. Walk the source in this scope;
             // bind `U` in a child scope and walk the template there. Expand now if
             // the source is already a concrete tuple, else stay symbolic until it
@@ -33246,7 +33789,10 @@ impl<'src> Analyzer<'src> {
     fn collect_residual_generics(&self, type_: &Type, out: &mut Vec<TypeId>) {
         match type_ {
             Type::Generic(constraint_id) => out.push(*constraint_id),
-            Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Trait(_, arguments) => {
+            Type::Struct(_, arguments)
+            | Type::Enum(_, arguments)
+            | Type::Trait(_, arguments)
+            | Type::Dyn(_, arguments) => {
                 for argument in arguments {
                     self.collect_residual_generics(&argument.get_type(self), out);
                 }
@@ -33275,11 +33821,12 @@ impl<'src> Analyzer<'src> {
             Type::Unknown | Type::Unresolved | Type::Generic(_) => false,
             // Symbolic until its source tuple lands, so not determined yet.
             Type::Mapped(..) => false,
-            Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Trait(_, arguments) => {
-                arguments
-                    .iter()
-                    .all(|argument| self.type_is_fully_determined(&argument.get_type(self)))
-            }
+            Type::Struct(_, arguments)
+            | Type::Enum(_, arguments)
+            | Type::Trait(_, arguments)
+            | Type::Dyn(_, arguments) => arguments
+                .iter()
+                .all(|argument| self.type_is_fully_determined(&argument.get_type(self))),
             Type::Tuple(items) => items
                 .iter()
                 .all(|item| self.type_is_fully_determined(&item.get_type(self))),
@@ -33765,11 +34312,12 @@ impl<'src> Analyzer<'src> {
     fn type_has_an_unknown_hole(&self, type_: &Type) -> bool {
         match type_ {
             Type::Unknown | Type::Unresolved => true,
-            Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Trait(_, arguments) => {
-                arguments
-                    .iter()
-                    .any(|argument| self.type_has_an_unknown_hole(&argument.get_type(self)))
-            }
+            Type::Struct(_, arguments)
+            | Type::Enum(_, arguments)
+            | Type::Trait(_, arguments)
+            | Type::Dyn(_, arguments) => arguments
+                .iter()
+                .any(|argument| self.type_has_an_unknown_hole(&argument.get_type(self))),
             Type::Tuple(items) => items
                 .iter()
                 .any(|item| self.type_has_an_unknown_hole(&item.get_type(self))),
@@ -33920,6 +34468,7 @@ impl<'src> Analyzer<'src> {
             Type::Enum(_, argument_type_ids)
             | Type::Struct(_, argument_type_ids)
             | Type::Trait(_, argument_type_ids)
+            | Type::Dyn(_, argument_type_ids)
             | Type::Tuple(argument_type_ids) => argument_type_ids
                 .iter()
                 .any(|argument_type_id| self.type_has_hole(*argument_type_id)),
@@ -34401,7 +34950,106 @@ impl<'src> Analyzer<'src> {
             waiting_on.push(expr_id);
         }
         self.note_callable_coercion(expr_id, constraint, &inferred);
+        self.note_dyn_coercion(expr_id, constraint, &inferred);
         inferred
+    }
+
+    /// A124 R3: record an expression at which a concrete value is erased into a
+    /// trait object — the site the emitter builds the `(value, vtable)` pair at.
+    ///
+    /// Beside [`Self::note_callable_coercion`] and for its reason: this is the
+    /// ONE seam where a value's own type and the type its position wants are
+    /// both in hand for every landing the language has — an argument, an
+    /// annotated binding, a field, an element, a return — so the coercion needs
+    /// no second enumeration of "where a value lands". Its allow-list of value
+    /// forms is the same one and for the same reason: inference FORWARDS an
+    /// expectation, so recording every id it reached would wrap a block and its
+    /// tail, one inside the other.
+    ///
+    /// The shape test comes first because this runs on every inference entry
+    /// and a `dyn` expectation is a vanishing minority of them.
+    fn note_dyn_coercion(&mut self, expr_id: Id, constraint: &Type, inferred: &Type) {
+        // The rule's other half: an object never NARROWS. `dyn Trait` is where
+        // the concrete type went, not a view of it, so a `dyn` landing in a
+        // concrete position is refused — here, because this is the one seam
+        // that knows which side is the position and which is the value
+        // (`reconcile_type` is a unifier and does not; see its `Dyn` arms).
+        if matches!(
+            constraint,
+            Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..)
+        ) && matches!(inferred, Type::Dyn(..))
+        {
+            self.refuse_dyn_narrowing(expr_id, constraint, inferred);
+            return;
+        }
+        let Type::Dyn(trait_id, trait_arguments) = constraint else {
+            return;
+        };
+        // An object flowing into a `dyn`-typed position is already one: no pair
+        // is built, and wrapping it would nest.
+        if matches!(inferred, Type::Dyn(..)) {
+            return;
+        }
+        if !matches!(
+            inferred,
+            Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..)
+        ) {
+            return;
+        }
+        if !matches!(
+            self.expr_id_to_expr_map.get(&expr_id),
+            Some(
+                Expr::Local(_)
+                    | Expr::Field(..)
+                    | Expr::Index(..)
+                    | Expr::TupleIndex(..)
+                    | Expr::Call(_)
+                    | Expr::StructInitializer(..)
+                    | Expr::Dereference(_)
+            )
+        ) {
+            return;
+        }
+        if !self.type_implements_trait(inferred, *trait_id) {
+            return;
+        }
+        let subject_type_id = inferred.clone().get_type_id(self);
+        // Q5, RULED NO in this scope (trait-objects.md §8.3): a resource may not
+        // be erased. The refusal is HERE, at the coercion, because this is the
+        // last point at which the concrete type — and so the destructor — is
+        // still known; §8.2's drop glue is the design that makes this a priced
+        // choice rather than a gap. Without it, `compute_resource`'s "a `dyn` is
+        // never a resource" would be §2.2's destructor suppression wearing a
+        // keyword.
+        if self.type_is_resource(subject_type_id) {
+            if !self.dyn_refusals_reported.insert(expr_id) {
+                return;
+            }
+            let rendered = self.pretty_print_type(inferred, &HashMap::default());
+            let object = self.pretty_print_type(constraint, &HashMap::default());
+            if let Some(span) = self.span_map.get(&expr_id).map(|span| **span) {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "`{rendered}` is a resource, so it cannot become a `{object}`: a trait \
+                         object's teardown would have to be dispatched through its table, and \
+                         vilan keeps teardown static (memory.md R7/R10). Holding the resource in \
+                         a struct field of your own is the sanctioned alternative"
+                    ),
+                });
+            }
+            return;
+        }
+        // The OBJECT's own trait and arguments ride with the site: an
+        // `Expr::Local` reference stores no type on its own id (it reads
+        // through the declaration it names), and the emitter needs both halves
+        // — which type is being erased, and into which table.
+        self.dyn_coercions.insert(
+            expr_id,
+            (subject_type_id, *trait_id, trait_arguments.clone()),
+        );
     }
 
     /// B340 Q1: record an expression at which a `Callable` value coerces to a
@@ -34778,7 +35426,46 @@ impl<'src> Analyzer<'src> {
                     }
                     _ => None,
                 };
-                let mut element_type = Type::Unknown;
+                // A124 R3: a `dyn` element type IS seeded, and it is the one
+                // expectation that is. The carve-out is narrow on purpose —
+                // the note above is right that directing every literal's
+                // elements by its expectation moves inference far beyond this
+                // check — and it is what makes the heterogeneous collection
+                // work at all: `let xs: List<dyn Shown> = [a, b]` must erase
+                // each element AT the element, and without the seed the
+                // literal types by its first element and the second is a
+                // mismatch against a concrete type nobody wrote. Nothing else
+                // moves, because no program that predates the keyword can
+                // produce a `Dyn` expectation.
+                // A124 R3: an annotated binding's readiness probe runs the
+                // initializer UNDIRECTED (`resolve_variable`'s first ask, whose
+                // whole point is to answer "has this typed at all" before the
+                // annotation directs it), and `infer_type_path` caches what it
+                // answers — so by the time the directed pass arrives the
+                // literal has already typed by its first element and reported.
+                // `expected_types` is the channel that survives that: the
+                // annotation seeds it at the initializer, and the probe reads
+                // it here.
+                let seeded_element = match expected_element.is_none() {
+                    true => self
+                        .expected_types
+                        .get(&expr_id)
+                        .copied()
+                        .map(|type_id| type_id.get_type(self))
+                        .and_then(|expected| match expected {
+                            Type::Struct(id, arguments)
+                                if Some(id) == self.primitive_struct_ids.get("List").copied() =>
+                            {
+                                arguments.first().map(|argument| argument.get_type(self))
+                            }
+                            _ => None,
+                        }),
+                    false => expected_element.clone(),
+                };
+                let mut element_type = match seeded_element {
+                    Some(expected @ Type::Dyn(..)) => expected,
+                    _ => Type::Unknown,
+                };
                 for item_id in &item_ids {
                     let item_type = self.infer_type_inner(
                         *item_id,
@@ -37154,6 +37841,55 @@ impl<'src> Analyzer<'src> {
                     bindings,
                 )
             }
+            // A124 R3: two objects over the same trait unify argument-wise,
+            // exactly as two instantiations of one nominal type do.
+            (Type::Dyn(l_id, l_arguments), Type::Dyn(r_id, r_arguments)) if l_id == r_id => {
+                let (arguments, bindings) =
+                    self.reconcile_argument_types(l_arguments, r_arguments, substitution_context)?;
+                (Type::Dyn(*l_id, arguments), bindings)
+            }
+            // THE COERCION (trait-objects.md §7.2, Q4). A concrete value meets a
+            // `dyn`-typed position when its type implements the trait, and the
+            // result is the OBJECT: the position's type wins, which is what makes
+            // the erasure happen here and nowhere else. The reverse direction is
+            // deliberately absent — an object never narrows back to the type it
+            // erased, and two concrete types never meet in one.
+            //
+            // The record the emitter needs (which value, which vtable) is not
+            // taken here: `reconcile_type` has no expression in hand.
+            // `note_dyn_coercion` takes it at the one seam where the value's own
+            // type and its position's expectation are both known, which is the
+            // seam B340's `Callable` coercion already uses.
+            (
+                Type::Dyn(trait_id, dyn_arguments),
+                Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..),
+            ) if self.type_implements_trait(b, *trait_id) => {
+                let bindings = self.dyn_erasure_bindings(b, *trait_id, dyn_arguments);
+                (a.clone(), bindings)
+            }
+            (
+                Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..),
+                Type::Dyn(trait_id, dyn_arguments),
+            ) if self.type_implements_trait(a, *trait_id) => {
+                let bindings = self.dyn_erasure_bindings(a, *trait_id, dyn_arguments);
+                (b.clone(), bindings)
+            }
+            // SYMMETRIC, deliberately — and the direction is enforced
+            // elsewhere. `reconcile_type` is a unifier, and its two arguments
+            // are not "expected" and "got": a CALL reconciles parameter-first
+            // (see `argument_mismatch`'s note) while every other position
+            // reconciles value-first, so an arm keyed on the order would admit
+            // the erasure at half the positions and the NARROWING at the other
+            // half. Both orders unify to the OBJECT, which is the honest
+            // answer to "what is the one type these two meet in"; that an
+            // object may not flow BACK into a concrete position is a rule
+            // about landings, and it is checked where a landing's direction is
+            // known — `note_dyn_coercion`, the same seam that records the
+            // erasure.
+            (
+                Type::Dyn(trait_id, _),
+                Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..),
+            ) if self.type_implements_trait(b, *trait_id) => (a.clone(), Vec::new()),
             // The same trait on both sides (e.g. `self` typed `Iterator<T>` in an
             // `impl Iterator<type T>` block, returned where `Iterator<T>` is
             // declared): reconcile like the nominal arms above.
@@ -37417,6 +38153,39 @@ impl<'src> Analyzer<'src> {
             // `Iterator` written without `<T>` — matches any instantiation).
             (Type::Trait(l_id, l_arguments), Type::Trait(r_id, r_arguments)) if l_id == r_id => {
                 self.compare_argument_types(l_arguments, r_arguments, substitution_context, rigid)
+            }
+            // A124 R3, the read-only twin of `reconcile_type`'s three `Dyn`
+            // arms: two objects over one trait compare argument-wise, a
+            // concrete type is compatible with a `dyn`-typed slot when it
+            // implements the trait, and an OBJECT satisfies the trait's own
+            // bound — which is what makes every blanket written over
+            // `S: Source<T>` (`map`, `flatten`, A123's two) apply to the
+            // object with no `impl dyn …` written anywhere. §5's blanket, as
+            // one rule rather than as a synthesized declaration.
+            (Type::Dyn(l_id, l_arguments), Type::Dyn(r_id, r_arguments)) if l_id == r_id => {
+                self.compare_argument_types(l_arguments, r_arguments, substitution_context, rigid)
+            }
+            (
+                Type::Dyn(trait_id, _),
+                Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..),
+            ) => self.type_implements_trait(b, *trait_id),
+            (
+                Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..),
+                Type::Dyn(trait_id, _),
+            ) => self.type_implements_trait(a, *trait_id),
+            (Type::Dyn(dyn_trait_id, dyn_arguments), Type::Trait(trait_id, arguments))
+            | (Type::Trait(trait_id, arguments), Type::Dyn(dyn_trait_id, dyn_arguments)) => {
+                (dyn_trait_id == trait_id
+                    || self
+                        .trait_with_supertraits(*dyn_trait_id)
+                        .contains(trait_id))
+                    && (arguments.is_empty()
+                        || self.compare_argument_types(
+                            dyn_arguments,
+                            arguments,
+                            substitution_context,
+                            rigid,
+                        ))
             }
             // B309: clauses are not compared — see `Type::Closure`'s own note.
             (
@@ -40783,6 +41552,11 @@ impl<'src> Analyzer<'src> {
             // The receiver is a value typed as a bare trait (not `self` in a trait
             // default) — there is no concrete type to dispatch to.
             BareTraitValue(Id),
+            // A124 R3: the member exists on the object's trait but cannot be
+            // reached THROUGH the object — it is generic, or it names `Self`.
+            // The trait is object-safe (its requirements are); this member is
+            // one of the conveniences an object leaves behind.
+            NotThroughObject(String),
         }
         let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
         // A method on a `List::new()` whose element slot is still unknown but has a
@@ -41146,6 +41920,105 @@ impl<'src> Analyzer<'src> {
                         }
                     }
                     found(member)
+                }
+            }
+            // A124 R3: a TRAIT OBJECT receiver. The member is looked up in the
+            // object's trait exactly as the `Type::Trait` arm looks one up —
+            // same walk, same supertrait reach, same parameter substitution —
+            // and the difference is entirely in the dispatch: there is no
+            // concrete type to specialize against, so the call goes through the
+            // object's own table at runtime.
+            //
+            // Two members the trait HAS are still out of reach here, and both
+            // for the reason a vtable slot could not hold them: a generic
+            // member is an unbounded family, and a `Self` position cannot be
+            // supplied or received once the type is gone. They do not
+            // disqualify the TRAIT (see `object_safety_violation`) — a default
+            // `map<U>` is an ordinary convenience written over the two
+            // requirements — so the refusal is per-call and names the fix.
+            Type::Dyn(trait_id, trait_arguments) => {
+                let trait_id = *trait_id;
+                let trait_arguments = trait_arguments.clone();
+                let declared =
+                    self.method_member_in_trait_at(trait_id, &trait_arguments, member_name);
+                match declared {
+                    None => MethodLookup::NoMethod,
+                    Some((member_id, declaring_trait_id, declaring_arguments)) => {
+                        let object = self.pretty_print_type(&subject_type, &HashMap::default());
+                        let unreachable = self.functions.get(&member_id).and_then(|function| {
+                            let trait_name = self
+                                .traits
+                                .get(&declaring_trait_id)
+                                .map(|trait_| trait_.name)
+                                .unwrap_or("this trait");
+                            if !function.generic_parameter_constraint_ids.is_empty() {
+                                return Some(format!(
+                                    "`{trait_name}::{member_name}` is generic, so it is not \
+                                     reachable through `{object}`: one table slot cannot hold an \
+                                     unbounded family of specializations. Take the value as a \
+                                     generic parameter (`<T: {trait_name}>`), where its type is \
+                                     known, and call it there"
+                                ));
+                            }
+                            let mentions_self = function.return_type_id.is_some_and(|type_id| {
+                                self.type_mentions_self_of(type_id, declaring_trait_id)
+                            }) || function
+                                .parameters
+                                .iter()
+                                .skip(1)
+                                .filter_map(|parameter_id| self.parameters.get(parameter_id))
+                                .any(|parameter| {
+                                    self.type_mentions_self_of(
+                                        parameter.type_id,
+                                        declaring_trait_id,
+                                    )
+                                });
+                            mentions_self.then(|| {
+                                format!(
+                                    "`{trait_name}::{member_name}` names `Self` in its \
+                                     signature, so it is not reachable through `{object}`: the \
+                                     type the object erased is exactly what a `Self` position \
+                                     would need. Take the value as a generic parameter (`<T: \
+                                     {trait_name}>`), where its type is known"
+                                )
+                            })
+                        });
+                        match unreachable {
+                            Some(message) => MethodLookup::NotThroughObject(message),
+                            None => {
+                                self.dyn_method_calls.insert(id, member_name);
+                                // §6.2's cost, paid down: a vtable is a NEW
+                                // ROOT SET for monomorphization — every slot
+                                // makes a member reachable whether or not the
+                                // program calls it, which for a 15-member
+                                // trait is 15 functions per coerced type the
+                                // bundle splitter can no longer prove dead.
+                                // The set of members an object can be called
+                                // through is knowable, though: a call on an
+                                // object is a written `.member()` on a
+                                // `dyn`-typed receiver, and this is where each
+                                // one is seen. The table is then built from
+                                // this set rather than from the trait's
+                                // surface, so a `dyn Source<T>` whose program
+                                // only reads carries exactly the slots it uses.
+                                self.dyn_dispatched_members.insert((trait_id, member_name));
+                                // The DECLARING trait's parameters, at the
+                                // arguments the chain passes it — the same
+                                // substitution the `Type::Trait` and
+                                // `Type::Generic` arms make, and for the same
+                                // reason (B164): a member inherited from a
+                                // supertrait is written in that trait's terms.
+                                let substitution = self.trait_parameter_substitution(
+                                    declaring_trait_id,
+                                    &declaring_arguments,
+                                );
+                                if !substitution.is_empty() {
+                                    self.method_call_substitution.insert(id, substitution);
+                                }
+                                MethodLookup::Found(member_id)
+                            }
+                        }
+                    }
                 }
             }
             Type::Generic(constraint_id) => {
@@ -41541,6 +42414,21 @@ impl<'src> Analyzer<'src> {
                 self.expr_id_to_expr_map.insert(id, Expr::Error);
                 Resolution::Failed
             }
+            // A124 R3: the member is the trait's but not the object's.
+            MethodLookup::NotThroughObject(message) => {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: self
+                        .member_name_spans
+                        .get(&id)
+                        .copied()
+                        .unwrap_or(arguments_span),
+                    msg: message,
+                });
+                self.expr_id_to_expr_map.insert(id, Expr::Error);
+                Resolution::Failed
+            }
             MethodLookup::Defer => Resolution::Deferred,
             MethodLookup::NotCallable => {
                 // B182: a receiver that is `Unknown` because its annotation was
@@ -41852,6 +42740,18 @@ impl<'src> Analyzer<'src> {
         // The first value (with the annotation) grounds the variable's type and
         // must be ready. Later values — reassignments — may refer to the variable
         // itself (e.g. `i += 1`), so they are checked only after grounding.
+        // A124 R3: the annotation reaches the initializer through
+        // `expected_types` as well as through the directed ask below, because
+        // the READINESS probe on the next line is undirected and its answer is
+        // cached. A `List<dyn Trait>` literal has to erase each element at the
+        // element, and by the directed pass it is too late. Seeded before the
+        // probe, skipped for an unannotated binding (`seed_expectation`
+        // ignores an `Unknown` constraint) and never overwriting an
+        // expectation something else already recorded.
+        if let Some(&first_value_id) = value_ids.first() {
+            let annotated_type = initial_type_id.get_type(self);
+            self.seed_expectation(first_value_id, &annotated_type);
+        }
         let first_ready = value_ids
             .first()
             .map(|&value_id| {
@@ -42132,6 +43032,7 @@ impl<'src> Analyzer<'src> {
             Type::Enum(_, argument_type_ids)
             | Type::Struct(_, argument_type_ids)
             | Type::Trait(_, argument_type_ids)
+            | Type::Dyn(_, argument_type_ids)
             | Type::Tuple(argument_type_ids) => argument_type_ids
                 .iter()
                 .all(|argument_type_id| self.type_is_ground(*argument_type_id)),
@@ -46252,6 +47153,7 @@ impl<'src> Analyzer<'src> {
             split.push(("locals", split_mark.elapsed()));
             split_mark = crate::PhaseClock::now();
         }
+
         // B184: every struct's hidden parameters, decided before the first
         // mention resolves — see `resolve_hidden_struct_parameters` for why it
         // cannot ride along in the drain below.
@@ -46974,6 +47876,10 @@ impl<'src> Analyzer<'src> {
                 }
             }
         }
+
+        // A124 R3: every `dyn Trait<..>` slot, written once the trait path it
+        // wraps has resolved — which is what both drains above have just done.
+        self.resolve_dyn_annotations();
 
         // Record each `impl … with Trait`'s resolved trait ids (and its `with`
         // reference) BEFORE static access resolves, so the `[trait_only]`
@@ -50747,6 +51653,20 @@ impl<'src> Analyzer<'src> {
                 }
             }
 
+            // The keyword is part of the type's name in every message: a
+            // diagnostic that said `Source<i32>` for an object and for a bound
+            // would be the one-representation-two-meanings confusion
+            // trait-objects.md §0 is about, printed.
+            Type::Dyn(id, trait_arguments) => {
+                let Some(trait_) = self.traits.get(id) else {
+                    buf.push('?');
+                    return;
+                };
+                buf.push_str("dyn ");
+                buf.push_str(trait_.name);
+                self.push_type_arguments(buf, trait_arguments, substitution, depth, visiting);
+            }
+
             Type::Enum(id, arguments) => {
                 let Some(enum_) = self.enums.get(id) else {
                     buf.push('?');
@@ -52179,7 +53099,16 @@ pub struct Program<'src> {
     /// with `call`'s arity — the emitter wraps each as `(a, b) => call(x, a, b)`
     /// (`walk_entity`). A struct is a plain JS array and cannot be applied, so
     /// the wrap is what the coercion IS at runtime.
+    /// A124 R3: the method calls whose receiver is a trait object, by call id
+    /// and member name — each lowers to a call through the object's table.
+    pub dyn_method_calls: HashMap<Id, &'src str>,
+    /// A124 R3: the `(trait, member)` pairs reached through an object anywhere
+    /// in the program — the vtable's slot set (§6.2's reachability).
+    pub dyn_dispatched_members: HashSet<(Id, &'src str)>,
     pub callable_coercions: HashMap<Id, (usize, TypeId)>,
+    /// A124 R3: the recorded `dyn` coercion sites — expression id to the type
+    /// being erased. The emitter builds one `(value, vtable)` pair per entry.
+    pub dyn_coercions: HashMap<Id, (TypeId, Id, Vec<TypeId>)>,
     // The next unused entity id. Post-analysis passes (the context threading
     // pass) mint fresh entities — synthetic parameters and references — from
     // here without colliding with analyzed ones.
@@ -61327,6 +62256,10 @@ fn analyze_over_world<'src>(
             .filter(|(call_id, _, _)| !analyzer.function_calls.contains_key(call_id))
             .collect();
 
+    // A124 R3: the vtable's slot set, completed. See
+    // `record_object_reachable_members`.
+    analyzer.record_object_reachable_members();
+
     Some(Program {
         hidden_impls_pending,
         exported_entities,
@@ -61463,6 +62396,9 @@ fn analyze_over_world<'src>(
         tuple_index_paths: std::mem::take(&mut analyzer.tuple_index_paths),
         spread_elements: std::mem::take(&mut analyzer.spread_elements),
         callable_coercions: std::mem::take(&mut analyzer.callable_coercions),
+        dyn_coercions: std::mem::take(&mut analyzer.dyn_coercions),
+        dyn_method_calls: std::mem::take(&mut analyzer.dyn_method_calls),
+        dyn_dispatched_members: std::mem::take(&mut analyzer.dyn_dispatched_members),
         next_entity_id: analyzer.entity_id,
         async_functions: HashSet::default(),
         drop_method_checks: std::mem::take(&mut analyzer.drop_method_checks),

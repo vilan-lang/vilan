@@ -1326,3 +1326,46 @@ parameter still abstract, so a pattern inside it was not checked at all.
 Both call paths now bind from the non-closure arguments and defer before
 typing any closure, so the substitution has landed by the time the body
 is read.)*
+
+## 5.12 Trait objects (`dyn Trait`)
+
+`dyn Trait` is a **trait object**: a value whose concrete type has been
+erased, carrying its trait's members in a table beside it. It is a type in
+its own right and may stand wherever a type stands — a `let` annotation, a
+parameter, a struct field, an element type, a generic argument.
+
+The keyword is **required**. A bare trait name in a value position is an
+error (§5.11); a trait object is written out, because coercing a value into
+one changes which member a call runs: a vtable holds the trait's tier, and
+an inherent member of the same name outranks the trait's on a concrete
+receiver (§5.7).
+
+**Object safety.** `dyn Trait` is legal only when every member the trait
+*requires* — one with no default body — can occupy a table slot:
+
+- it takes a receiver (`self`). A static has nothing to select an
+  implementation with;
+- it names no `Self` in its signature. Neither side can be supplied or
+  received once the type is gone;
+- it is not generic. One slot cannot hold an unbounded family of
+  specializations.
+
+A trait's **default** members are not slots: a default body is the
+trait's own code and reaches the object through the same two rules a
+blanket over `T: Trait` does. A trait whose supertrait is not
+object-safe is not object-safe either.
+
+A member that is generic, or that names `Self`, is unreachable *through*
+an object even when the trait is object-safe; the call is refused by
+name, and the fix is a generic parameter, where the type is known.
+
+**Coercion is explicit and positional.** A value becomes an object only
+where the position's type is a `dyn`: an annotated binding, a parameter,
+a field, an element of a list whose element type is a `dyn`. There is no
+implicit coercion between two concrete types, and no coercion out of an
+object: a `dyn Trait` never narrows back to the type it erased.
+
+**Resources.** A `resource` value may not be coerced into a trait object.
+Teardown through a table would make the destructor dynamic where the rest
+of the language keeps it static (memory.md R7/R10), so the coercion is
+refused and the resource is held in a struct field of its own.

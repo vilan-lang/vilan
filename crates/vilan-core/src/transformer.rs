@@ -506,6 +506,13 @@ fn rewrite_sibling_node(
     count: &mut usize,
 ) {
     match node {
+        // A vtable's VALUES are references to emitted functions; its keys are
+        // member names and never identifiers this walk may touch.
+        js::Node::Object(entries) => {
+            for (_, value) in entries {
+                rewrite_sibling_node(value, siblings, bound, count);
+            }
+        }
         js::Node::Local(name) => {
             if siblings.contains(name) && !bound.contains(name) {
                 let name = name.clone();
@@ -963,6 +970,11 @@ pub(crate) fn collect_references(nodes: &[js::Node], out: &mut BTreeSet<String>)
 
 fn collect_reference(node: &js::Node, out: &mut BTreeSet<String>) {
     match node {
+        js::Node::Object(entries) => {
+            for (_, value) in entries {
+                collect_reference(value, out);
+            }
+        }
         js::Node::Local(name) => {
             out.insert(name.clone());
         }
@@ -2311,6 +2323,12 @@ enum Dispatch<'src> {
     Extern(Id, ExternBinding<'src>),
     /// A normal emitted function: its JS name and whether it is async.
     Call(String, bool),
+    /// A124 R3: the receiver is a TRAIT OBJECT, so the member is read out of
+    /// the pair's own table at runtime. The blanket, as a dispatch rule: a
+    /// generic body written over `S: Trait` reaches this arm whenever `S` bound
+    /// to a `dyn Trait`, so nothing has to be written as an
+    /// `impl dyn Trait with Trait`.
+    Object(String),
 }
 
 /// One lowered `match` leg, kept in pieces until the whole match is compiled:
@@ -2451,6 +2469,10 @@ struct Transformer<'src> {
     // Trait default methods specialized per concrete type, keyed by
     // (default function, concrete type) so each is emitted once.
     default_instances: HashMap<(Id, String), String>,
+    /// A124 R3: the emitted vtable for each coerced `(trait, type)` pair, by
+    /// its JS name. One table per pair, reachability-driven (§6.2) — a pair
+    /// nothing coerces emits nothing.
+    vtables: HashMap<(Id, String), String>,
     // Per-type `__drop` helpers (destruction.md §7), keyed by `type_key`. `None`
     // records a type whose destruction is a complete no-op (no `Drop` impl, no
     // resource members) so callers skip it; `Some(name)` is the emitted helper.
@@ -2940,6 +2962,7 @@ impl<'src> Transformer<'src> {
             instances: HashMap::default(),
             current_self_type: None,
             default_instances: HashMap::default(),
+            vtables: HashMap::default(),
             drop_helpers: HashMap::default(),
             shared_bodies: HashMap::default(),
             monomorphized: Vec::new(),
@@ -4602,6 +4625,16 @@ impl<'src> Transformer<'src> {
             }
             return Some(node);
         }
+        // A124 R3: a concrete value landing in a `dyn`-typed position. Built
+        // here for the reason the `Callable` wrap above is: this is where the
+        // finished value is, after the copy seams have run on it, and what the
+        // position receives is the pair.
+        if let Some((subject_type_id, trait_id, trait_arguments)) =
+            self.program.dyn_coercions.get(&id).cloned()
+        {
+            let vtable = self.emit_vtable(subject_type_id, trait_id, &trait_arguments);
+            return Some(js::Node::Array(vec![node, js::Node::Local(vtable)]));
+        }
         Some(node)
     }
 
@@ -4956,6 +4989,16 @@ impl<'src> Transformer<'src> {
                     ) {
                         return Some(self.emit_dispatch(dispatch, args, Some(*id)));
                     }
+                }
+
+                // A124 R3: `a.member()` where `a` is a TRAIT OBJECT. Nothing
+                // is resolved here — that is the point of erasure — so the
+                // call reads the member out of the pair's own table. The
+                // receiver is argument 0 and is read TWICE (once for the
+                // table, once for the value), so a receiver that is not a
+                // pure read is bound first; see `emit_object_call`.
+                if let Some(member_name) = self.program.dyn_method_calls.get(id).copied() {
+                    return Some(self.emit_object_call(member_name, args));
                 }
 
                 // `a.member()` where `a`'s type is a trait-bounded generic `T`:
@@ -7518,6 +7561,7 @@ impl<'src> Transformer<'src> {
             | js::Node::Property(_, _)
             | js::Node::PropertyIndex(_, _)
             | js::Node::Array(_)
+            | js::Node::Object(_)
             | js::Node::Closure(_)
             | js::Node::Sequence(_)
             | js::Node::Local(_)
@@ -8867,6 +8911,13 @@ impl<'src> Transformer<'src> {
         preferred_trait: Option<(Id, Vec<TypeId>)>,
     ) -> Option<Dispatch<'src>> {
         let type_id = self.resolve_type_id(type_id);
+        // A124 R3, THE BLANKET: a generic body whose parameter bound to a trait
+        // OBJECT. There is no impl to select — the concrete type is gone — so
+        // the member comes out of the value's own table, which is the same
+        // lowering a written `o.member()` on a `dyn` takes.
+        if let Some(Type::Dyn(..)) = self.program.type_id_to_type_map.get(&type_id) {
+            return Some(Dispatch::Object(member.to_string()));
+        }
         if let Some((trait_id, trait_arguments)) = preferred_trait {
             // Resolve strictly within the trait AND its instantiation (B73 R1).
             // The impl's override first...
@@ -9082,6 +9133,261 @@ impl<'src> Transformer<'src> {
                     call
                 }
             }
+            Dispatch::Object(member_name) => self.emit_object_call(&member_name, args),
+        }
+    }
+
+    /// A124 R3 / trait-objects.md §6.2: the module-level vtable for one coerced
+    /// `(type, trait)` pair, emitted once and shared by every coercion of that
+    /// pair.
+    ///
+    /// ```js
+    /// const $vt = { get: get3, on_change: on_change4 };
+    /// ```
+    ///
+    /// A member name maps to the emitted free function for that pair. **No
+    /// adapter shim is needed** for the common case, which is §6.2's own
+    /// finding: a method is already a free function taking the receiver as
+    /// argument 0, so the slot is the function itself. An intrinsic or an
+    /// `[extern]`-bound member has no such function, so those slots take a
+    /// wrapping arrow — the only shape that needs one.
+    ///
+    /// The slot set is what an object can dispatch, which is NOT the trait's
+    /// whole surface: a generic member (`Source::map<U>`) and one naming `Self`
+    /// are unreachable through an object (the analyzer refuses those calls by
+    /// name) and take no slot. `Source` therefore has exactly two, which is the
+    /// two-slot table A124's cost table prices.
+    ///
+    /// Keyed by `(trait, type key)` so deduplication is free, exactly as §6.2
+    /// asks: two coercions of one pair share one table because the key is
+    /// identical.
+    fn emit_vtable(&mut self, type_id: TypeId, trait_id: Id, trait_arguments: &[TypeId]) -> String {
+        let type_id = self.resolve_type_id(type_id);
+        let key = (trait_id, self.type_key(type_id));
+        if let Some(name) = self.vtables.get(&key) {
+            return name.clone();
+        }
+        let name = self.ng.next_name();
+        // Inserted BEFORE the slots are resolved: a member's body may coerce a
+        // value of this very pair (a node holding a `dyn` of its own kind), and
+        // the recursion has to find the name rather than build a second table.
+        self.vtables.insert(key, name.clone());
+        let members = self.object_dispatchable_members(trait_id);
+        let mut entries: Vec<(String, js::Node<'src>)> = Vec::with_capacity(members.len());
+        for member_name in members {
+            let preferred = Some((trait_id, trait_arguments.to_vec()));
+            let Some(dispatch) = self.resolve_dispatch_with(type_id, member_name, &[], preferred)
+            else {
+                continue;
+            };
+            let slot = match dispatch {
+                // §6.2: the emitted function IS the slot.
+                Dispatch::Call(function_name, false) => js::Node::Local(function_name),
+                // An async member, an intrinsic or an extern has no plain
+                // receiver-first function to name, so the slot is the one-line
+                // arrow that calls it. The arity is the member's, so the
+                // wrapper forwards exactly what the call site passes.
+                other => {
+                    let arity = self.object_member_arity(trait_id, member_name);
+                    let parameters: Vec<js::Parameter> = (0..arity)
+                        .map(|_| js::Parameter {
+                            name: self.ng.next_name(),
+                        })
+                        .collect();
+                    let arguments: Vec<js::Node<'src>> = parameters
+                        .iter()
+                        .map(|parameter| js::Node::Local(parameter.name.clone()))
+                        .collect();
+                    let is_async = matches!(other, Dispatch::Call(_, true));
+                    let call = self.emit_dispatch(other, arguments, None);
+                    js::Node::Closure(js::Closure {
+                        parameters,
+                        body: vec![js::Node::Return(Box::new(call))],
+                        is_async,
+                        origin: None,
+                    })
+                }
+            };
+            entries.push((member_name.to_string(), slot));
+        }
+        self.monomorphized
+            .push(js::Node::ConstVariable(js::Variable {
+                name: name.clone(),
+                value: Box::new(js::Node::Object(entries)),
+            }));
+        name
+    }
+
+    /// The members an object over `trait_id` can dispatch, in declaration order
+    /// (the trait's own, then each supertrait's) — the trait's members minus the
+    /// two shapes no table slot can hold: a generic one, and one naming `Self`.
+    ///
+    /// Shares its filter with the analyzer's per-call refusal, which is what
+    /// keeps the two from drifting: a member this list drops is a member
+    /// `resolve_method_call` reports `NotThroughObject` for, so no call can
+    /// reach a slot that was never built.
+    fn object_dispatchable_members(&self, trait_id: Id) -> Vec<&'src str> {
+        let mut out: Vec<&'src str> = Vec::new();
+        let mut stack = vec![trait_id];
+        let mut seen: HashSet<Id> = HashSet::default();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(trait_) = self.program.traits.get(&id) else {
+                continue;
+            };
+            for (member_name, member_id) in &trait_.declared_members {
+                let Some(function) = self.program.functions.get(member_id) else {
+                    continue;
+                };
+                if !function.generic_parameter_constraint_ids.is_empty() {
+                    continue;
+                }
+                let names_self = |type_id: &TypeId| {
+                    matches!(
+                        self.program.type_id_to_type_map.get(type_id),
+                        Some(Type::Trait(mentioned, _)) if *mentioned == id
+                    )
+                };
+                if function.return_type_id.as_ref().is_some_and(names_self) {
+                    continue;
+                }
+                let receiverless = function
+                    .parameters
+                    .first()
+                    .and_then(|parameter_id| self.program.parameters.get(parameter_id))
+                    .is_none_or(|parameter| parameter.name != "self");
+                if receiverless {
+                    continue;
+                }
+                // §6.2's reachability: a slot for a member no call reaches
+                // through an object would make that member a monomorphization
+                // root for nothing.
+                if !self
+                    .program
+                    .dyn_dispatched_members
+                    .contains(&(trait_id, *member_name))
+                {
+                    continue;
+                }
+                if out.contains(member_name) {
+                    continue;
+                }
+                out.push(member_name);
+            }
+            for supertrait_type_id in &trait_.supertraits {
+                if let Some(Type::Trait(super_id, _)) =
+                    self.program.type_id_to_type_map.get(supertrait_type_id)
+                {
+                    stack.push(*super_id);
+                }
+            }
+        }
+        out
+    }
+
+    /// A trait member's parameter count INCLUDING the receiver — the arity a
+    /// vtable slot's wrapping arrow forwards.
+    fn object_member_arity(&self, trait_id: Id, member: &str) -> usize {
+        let mut stack = vec![trait_id];
+        let mut seen: HashSet<Id> = HashSet::default();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(trait_) = self.program.traits.get(&id) else {
+                continue;
+            };
+            if let Some(member_id) = trait_.declarations.get(member)
+                && let Some(function) = self.program.functions.get(member_id)
+            {
+                return function.parameters.len();
+            }
+            for supertrait_type_id in &trait_.supertraits {
+                if let Some(Type::Trait(super_id, _)) =
+                    self.program.type_id_to_type_map.get(supertrait_type_id)
+                {
+                    stack.push(*super_id);
+                }
+            }
+        }
+        1
+    }
+
+    /// A call through a trait object's table (A124 R3): `o[1].get(o[0], ..)`.
+    ///
+    /// The pair is read twice, so a receiver whose evaluation is observable
+    /// cannot simply be written twice. A PURE receiver — a local, or an index
+    /// or property read reaching one — is duplicated, which is the common case
+    /// (a binding, a parameter, a struct field) and costs nothing; anything
+    /// else is bound by a one-argument arrow applied to it, which evaluates it
+    /// exactly once and keeps the whole thing an expression, so no statement
+    /// slot is needed and no short-circuit context changes meaning.
+    fn emit_object_call(
+        &mut self,
+        member_name: &str,
+        mut args: Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        if args.is_empty() {
+            // The analyzer wires a method call's receiver as argument 0, so an
+            // empty list is a compiler bug rather than a program's mistake.
+            return js::Node::Void;
+        }
+        let receiver = args.remove(0);
+        if Self::node_is_pure_read(&receiver) {
+            return Self::object_call_node(receiver.clone(), receiver, member_name, args);
+        }
+        let binder = self.ng.next_name();
+        let bound = js::Node::Local(binder.clone());
+        let call = Self::object_call_node(bound.clone(), bound, member_name, args);
+        js::Node::Call(
+            Box::new(js::Node::Closure(js::Closure {
+                parameters: vec![js::Parameter { name: binder }],
+                body: vec![js::Node::Return(Box::new(call))],
+                is_async: false,
+                origin: None,
+            })),
+            vec![receiver],
+        )
+    }
+
+    fn object_call_node(
+        table_of: js::Node<'src>,
+        value_of: js::Node<'src>,
+        member_name: &str,
+        rest: Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        let index = |node: js::Node<'src>, slot: &str| {
+            js::Node::PropertyIndex(
+                Box::new(node),
+                Box::new(js::Node::Number(slot.to_string(), None)),
+            )
+        };
+        let mut arguments = vec![index(value_of, "0")];
+        arguments.extend(rest);
+        js::Node::Call(
+            Box::new(js::Node::Property(
+                Box::new(index(table_of, "1")),
+                member_name.to_string(),
+            )),
+            arguments,
+        )
+    }
+
+    /// Whether re-evaluating this node is unobservable — a name, or a read
+    /// chain that bottoms out in one. Deliberately narrow: anything with a
+    /// call, an assignment or an operator in it answers `false` and takes the
+    /// binding arrow.
+    fn node_is_pure_read(node: &js::Node<'src>) -> bool {
+        match node {
+            js::Node::Local(_) => true,
+            js::Node::Property(subject, _) => Self::node_is_pure_read(subject),
+            js::Node::PropertyIndex(subject, index) => {
+                Self::node_is_pure_read(subject)
+                    && matches!(**index, js::Node::Number(..) | js::Node::String(_))
+            }
+            _ => false,
         }
     }
 
@@ -10695,6 +11001,16 @@ impl Formatter {
                     self.array_surround, s_items, self.array_surround, terminator
                 )
             }
+            js::Node::Object(entries) => {
+                let s_entries = entries
+                    .iter()
+                    .map(|(name, value)| {
+                        format!("{}:{}{}", name, self.space, self.node(value, "", level))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(format!(",{}", self.space).as_str());
+                format!("{{{}}}{}", s_entries, terminator)
+            }
             // `(a, b, c)` (B224). Always parenthesized: the comma binds looser
             // than every operator, so an unwrapped sequence would be re-parsed
             // by whatever encloses it — and looser than assignment too, so an
@@ -11538,6 +11854,14 @@ pub mod js {
         LetVariable(Variable<'src>),
         Local(String),
         Null,
+        // `{ name: <value>, … }` — an object literal. The ONE producer is
+        // A124 R3's vtable (`emit_vtable`): a trait object's table maps a
+        // member's name to the emitted function for that `(type, trait)` pair,
+        // and the name is what makes the emitted bundle readable —
+        // `x[1].get(x[0])` says which member is being dispatched, where a
+        // positional `x[1][0](x[0])` would not. Keys are emitted verbatim and
+        // are always vilan identifiers, so no quoting rule is needed.
+        Object(Vec<(String, Self)>),
         Number(String, Option<String>),
         // Object(Vec<(&'src str, Self)>),
         Property(Box<Self>, String),
@@ -12151,6 +12475,11 @@ fn collect_node(
     children: &mut Vec<JsScope>,
 ) {
     match node {
+        js::Node::Object(entries) => {
+            for (_, value) in entries {
+                collect_node(value, renameable, declarations, children);
+            }
+        }
         js::Node::Function(function) => {
             if renameable.contains(&function.name) {
                 declarations.push(function.name.clone());
@@ -12325,6 +12654,11 @@ fn rename_one(name: &mut String, rename: &HashMap<String, String>) {
 
 fn rename_node(node: &mut js::Node, rename: &HashMap<String, String>) {
     match node {
+        js::Node::Object(entries) => {
+            for (_, value) in entries {
+                rename_node(value, rename);
+            }
+        }
         js::Node::Local(name) => rename_one(name, rename),
         js::Node::Function(function) => {
             rename_one(&mut function.name, rename);

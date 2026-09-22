@@ -1144,6 +1144,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let _ = write!(out, "T{}", id.0);
                 self.write_key_arguments(arguments, out);
             }
+            // A124 R3: a trait OBJECT keys apart from the trait it erases and
+            // from every other instantiation of it. The backend refuses to
+            // EMIT one (see `rust_type_inner`), but a key is read before a
+            // type is rendered, and two keys that collided would make the
+            // refusal name the wrong instance.
+            Type::Dyn(id, arguments) => {
+                let _ = write!(out, "D{}", id.0);
+                self.write_key_arguments(arguments, out);
+            }
             Type::Tuple(elements) => {
                 out.push_str("Tup");
                 self.write_key_arguments(elements, out);
@@ -1416,6 +1425,28 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // system, just the value type a heterogeneous list needs where the
             // JS backend has a bare array.
             Type::Any => Ok("vilan_rt::Any".to_string()),
+            // A124 R3 / F1: a `dyn` lowers natively to a FAT POINTER — the
+            // value beside a vtable of the trait's dispatchable members, the
+            // same two words the JS backend emits as a two-element array. It
+            // is not built yet, and the refusal says so by name rather than
+            // letting the generic "unsupported type" arm below say nothing
+            // useful: what is missing is a vilan-rt vtable type and the
+            // lowering that fills it, not a gap in this program.
+            Type::Dyn(trait_id, _) => {
+                let trait_name = self
+                    .program
+                    .traits
+                    .get(&trait_id)
+                    .map(|trait_| trait_.name)
+                    .unwrap_or("this trait");
+                Err(unsupported(
+                    &format!(
+                        "a `dyn {trait_name}` trait object (natively this is a fat pointer \
+                         with the trait's vtable — F1's shape, not built yet)"
+                    ),
+                    span,
+                ))
+            }
             // A generic the substitution did not reach. The refusal names the
             // PARAMETER, because which one went unbound is the whole diagnosis
             // when it happens.
@@ -7835,6 +7866,7 @@ fn describe(resolved: &Type) -> String {
         Type::Never => "never".to_string(),
         Type::Mapped(_, _, _) => "a mapped tuple".to_string(),
         Type::Trait(_, _) => "a trait object".to_string(),
+        Type::Dyn(_, _) => "a `dyn` trait object".to_string(),
         Type::Function(_) => "a function value".to_string(),
         Type::Module(_) => "a module".to_string(),
         Type::Unknown | Type::Unresolved => "an unresolved type".to_string(),

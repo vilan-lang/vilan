@@ -321,6 +321,11 @@ pub const KEYWORD_DOCS: &[(&str, &str, &str)] = &[
         "spec/memory.html#68-resources-and-destruction",
     ),
     (
+        "dyn",
+        "`dyn Trait` is a trait OBJECT: a value whose concrete type is erased, carrying its trait's members in a table. Written explicitly, and only over a trait every one of whose members takes a receiver, names no `Self`, and is non-generic.",
+        "tour/data-and-traits.html#trait-objects--dyn-trait",
+    ),
+    (
         "if",
         "Chooses between branches; `if` is an expression that produces a value.",
         "tour/control-flow.html#if--else",
@@ -458,6 +463,7 @@ pub fn keyword_lexeme(token: &Token) -> Option<&'static str> {
         Token::Borrows => "borrows",
         Token::Ret => "ret",
         Token::Resource => "resource",
+        Token::Dyn => "dyn",
         Token::Struct => "struct",
         Token::Trait => "trait",
         Token::Type => "type",

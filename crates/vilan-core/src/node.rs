@@ -640,6 +640,14 @@ pub enum Node<'src> {
     // keyword (lexes as an identifier; only means the contract directly
     // before a closure type). Wraps the closure type it marks.
     SyncType(Box<Spanned<Node<'src>>>),
+    // `dyn Source<i32>` — a TRAIT OBJECT type (A124 R3, reopening B4 in the
+    // object-safe scope). Wraps the trait path it erases, which is the only
+    // thing that may follow the keyword: a nominal path, applied or not.
+    //
+    // The keyword is REQUIRED (trait-objects.md Q4/P15): coercing a value into
+    // an object changes which member runs where an inherent one outranks the
+    // trait's, so the change of surface must be written, not inferred.
+    DynType(Box<Spanned<Node<'src>>>),
     // `(|| void) context owner_scope` / `context (a, b)` — a closure type
     // carrying a context requirement (proposal/ambient-owner.md §5): the
     // closure defers those contexts' bindings to its CALL sites instead of
@@ -1165,6 +1173,7 @@ impl<'src> Node<'src> {
             }
             Node::AsyncType(inner) => visit(inner),
             Node::SyncType(inner) => visit(inner),
+            Node::DynType(inner) => visit(inner),
             Node::Const(inner) => visit(inner),
             Node::MappedType {
                 source, template, ..

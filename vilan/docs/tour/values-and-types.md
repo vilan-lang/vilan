@@ -33,11 +33,11 @@ prefix on `break` and `continue`), because both are short, ordinary
 English words that make good variable names in every other language.
 
 ```text
-async    await    borrows  const    css      else     enum     export
-external false    for      fun      if       impl     import   in
-is       jump     lazy     let      macro    match    mod      mut
-null     own      resource ret      struct   trait    true     type
-use      with
+async    await    borrows  const    css      dyn      else     enum
+export   external false    for      fun      if       impl     import
+in       is       jump     lazy     let      macro    match    mod
+mut      null     own      resource ret      struct   trait    true
+type     use      with
 ```
 
 A few more words — `self`, `Self`, `void`, `context`, `sync`, `as`, and

@@ -4864,6 +4864,13 @@ impl<'src> Printer<'src> {
                 self.out.push_str("sync ");
                 self.print_type(&inner.0);
             }
+            // `dyn Source<i32>` — a trait object type. One space, exactly as
+            // the source must have written it; the keyword is never elided,
+            // because eliding it would change the type.
+            Node::DynType(inner) => {
+                self.out.push_str("dyn ");
+                self.print_type(&inner.0);
+            }
             // `|A, B| Ret` (or `||` for no parameters) — a closure type.
             Node::ClosureType(parameters, return_type) => {
                 if parameters.0.is_empty() {

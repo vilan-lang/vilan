@@ -355,6 +355,56 @@ the trade the shorter spelling buys.
 Written and implicit generics mix freely, and the implicit ones come last
 in the list, so `f<i32>(..)` still binds the parameter you wrote.
 
+## Trait objects — `dyn Trait`
+
+The two spellings above keep the value's real type. `dyn Trait` is the
+one that gives it up: an object carrying the trait's members in a table,
+whose concrete type the program can no longer see. That is what lets a
+struct field, or one list, hold values of *different* types that share a
+trait.
+
+```vilan
+trait Shape {
+	fun area(self): i32;
+}
+
+struct Square { side: i32 }
+struct Rect { w: i32, h: i32 }
+impl Square with Shape { fun area(self): i32 { self.side * self.side } }
+impl Rect with Shape { fun area(self): i32 { self.w * self.h } }
+
+struct Slot { shape: dyn Shape }
+
+fun main() {
+	// Two different types, one list — the field's type is the object,
+	// so each value is coerced where the literal is built.
+	let slots: List<Slot> = [
+		Slot { shape = Square { side = 3 } },
+		Slot { shape = Rect { w = 2, h = 5 } },
+	];
+	for slot in slots {
+		print(slot.shape.area());
+	}
+}
+```
+
+The keyword is never optional and never inferred. Coercion happens only
+where the position says `dyn` — a field, an annotated binding, a
+parameter, an element type — and never between two concrete types. That
+is deliberate: an object dispatches the *trait's* member, and a type with
+an inherent member of the same name would otherwise change behaviour the
+moment an annotation appeared.
+
+Not every trait can be an object. Each member the trait **requires** has
+to fit a table slot, which means it takes `self`, names no `Self`, and is
+not generic. A trait that fails is refused at the `dyn` with the member
+that disqualified it named — and the fix is usually the generic
+(`<T: Shape>`), which keeps the type and needs no table. A trait's
+*default* members are not slots and never disqualify it.
+
+A `resource` cannot become an object: its teardown would have to be
+dispatched, and vilan keeps teardown static.
+
 ## Associated functions
 
 A trait `fun` with no `self` is an **associated function** — a name in

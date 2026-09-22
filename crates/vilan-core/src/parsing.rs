@@ -5227,6 +5227,9 @@ impl<'a, 'src> Parser<'a, 'src> {
         if self.peek_is(&Token::Type) || self.peek_is(&Token::Ident(ANONYMOUS_TYPE_BINDER)) {
             return self.parse_type_binder();
         }
+        if self.peek_is(&Token::Dyn) {
+            return self.parse_dyn_type();
+        }
         if let Some(closure) = self.parse_closure_type() {
             return Some(closure);
         }
@@ -5243,6 +5246,27 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
         self.note_expected("a type");
         None
+    }
+
+    /// `dyn Source<i32>` — a trait object type (A124 R3).
+    ///
+    /// The keyword takes a PATH TYPE and nothing else. `dyn |i32| str`,
+    /// `dyn [T; 4]`, `dyn &T` and `dyn (A, B)` name no trait, so the grammar
+    /// refuses them here rather than letting the analyzer meet a `dyn` over a
+    /// closure and say something about object safety; the message names what
+    /// may follow, which is the one thing the reader needs.
+    ///
+    /// Nesting is by the ordinary type cycle: `List<dyn Source<i32>>` reaches
+    /// this production through the application's argument walk, so a `dyn`
+    /// stands wherever a type stands.
+    fn parse_dyn_type(&mut self) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        self.expect(&Token::Dyn)?;
+        let Some(inner) = self.parse_path_type() else {
+            self.note_expected("a trait name after `dyn`");
+            return None;
+        };
+        Some((Node::DynType(Box::new(inner)), self.span_from(start)))
     }
 
     /// `[T; length]` — a fixed-length array type; `length` is an integer literal.

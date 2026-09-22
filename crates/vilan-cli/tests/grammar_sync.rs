@@ -950,6 +950,10 @@ const KEYWORD_ROLES: &[(&str, KeywordRole)] = &[
     // (`lazy let database: …`) — a storage modifier beside `const`/`mut`, not a
     // word that names a new item.
     ("lazy", KeywordRole::Modifier),
+    // `dyn` modifies a TYPE (`dyn Source<i32>`) — it names no new item and
+    // heads no statement, so it sits with the other type-position words rather
+    // than in `storage.type`.
+    ("dyn", KeywordRole::Other),
     ("with", KeywordRole::Other),
     ("borrows", KeywordRole::Other),
     // `css` heads an expression rather than declaring or modifying an item, so
