@@ -364,6 +364,23 @@ impl<T> Shared<T> {
         *self.inner.borrow_mut() = value;
     }
 
+    /// `Shared::write()` USED AS A PLACE — `cell.write().push(x)`,
+    /// `cell.write().field = y` (F20).
+    ///
+    /// On the JS backend `read()` and `write()` are the same property access
+    /// (`cell.v`) and the difference is only what the program does with it; here
+    /// they are two different things, because a read COPIES out of the cell
+    /// (`get`) and a write has to reach the slot. `cell.write() = value` is the
+    /// assignment form and the emitter renders it as [`Shared::set`]; every other
+    /// use of the view is this borrow.
+    ///
+    /// A `RefCell` borrow, so an aliasing write — rule 4, which *vilan* checks
+    /// and rustc cannot see — panics at the read instead of reading through it.
+    /// That is R3's ruled residue and the same stance [`Shared::get`] takes.
+    pub fn borrow_mut(&self) -> std::cell::RefMut<'_, T> {
+        self.inner.borrow_mut()
+    }
+
     /// The count, for the measurement C14 S4 will want and for tests here.
     pub fn strong_count(&self) -> usize {
         Rc::strong_count(&self.inner)
@@ -457,6 +474,220 @@ impl<T: Js> Js for Weak<T> {
 /// later item that measurement pays for. This is a plain alias of [`Shared`],
 /// named separately so the emitted source says which rule put it there.
 pub type Captured<T> = Shared<T>;
+
+// ------------------------------------------------------- reference equality ---
+
+/// The equality a value holding a FUNCTION has: JavaScript's `===`, which for a
+/// function value is reference identity (F20).
+///
+/// The emitter writes `Rc::ptr_eq` directly for a field that IS a closure. This
+/// trait is for the ones that merely CONTAIN one — `std::http`'s
+/// `Server.upgrade_handler: Option<|Request| void>`, and an enum payload the
+/// same way — where the derive cannot help because `Rc<dyn Fn>` implements no
+/// `PartialEq` at any depth. The impls are written out rather than blanketed
+/// over `T: PartialEq`, which would overlap; the emitter reaches this only for a
+/// type whose rendering mentions `dyn Fn`, and refuses BY NAME for a shape with
+/// no impl here.
+pub trait ReferenceEq {
+    fn reference_eq(&self, other: &Self) -> bool;
+}
+
+impl<T: ?Sized> ReferenceEq for Rc<T> {
+    fn reference_eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(self, other)
+    }
+}
+
+impl<T: ReferenceEq> ReferenceEq for Option<T> {
+    fn reference_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Some(left), Some(right)) => left.reference_eq(right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+impl<T: ReferenceEq> ReferenceEq for Vec<T> {
+    fn reference_eq(&self, other: &Self) -> bool {
+        self.len() == other.len()
+            && self
+                .iter()
+                .zip(other.iter())
+                .all(|(left, right)| left.reference_eq(right))
+    }
+}
+
+/// [`ReferenceEq::reference_eq`] as a free function, so the emitter can spell it
+/// without naming the trait at the site.
+pub fn reference_eq<T: ReferenceEq + ?Sized>(left: &T, right: &T) -> bool {
+    left.reference_eq(right)
+}
+
+// ------------------------------------------------------------------ lazy ---
+
+/// `proposal/lazy.md` §5's memo cell — the ONE shape both lazy positions share
+/// (a `lazy` parameter and a `lazy let` module binding), and the native twin of
+/// the JS backend's `__lazy` / `__force` pair.
+///
+/// `{ name, state, value, thunk }` is the paper's shape and the states are its
+/// four. `Running` IS the cycle trap: an initializer that transitively touches
+/// its own binding re-enters [`Lazy::force`] and finds its own flag set, which
+/// is a clear panic rather than a silent hang. A panicking thunk POISONS (§6a):
+/// the failure propagates at the touching site and every later touch re-panics
+/// naming the poison, because retrying would turn "at most once" into "at least
+/// once per attempt".
+///
+/// The thunk is dropped after a successful force, so everything it captured is
+/// released once the value exists — the JS helper's `cell.thunk = null`.
+///
+/// Counted, because a `lazy` argument FORWARDED into another lazy position
+/// travels as the same cell however deep the chain: one memo, and the eventual
+/// first read forces the original thunk.
+pub struct Lazy<T> {
+    inner: Rc<LazyCell<T>>,
+}
+
+struct LazyCell<T> {
+    name: Str,
+    state: std::cell::Cell<LazyState>,
+    value: RefCell<Option<T>>,
+    /// The poison's message, kept so every later touch can name it.
+    poison: RefCell<Option<Str>>,
+    thunk: RefCell<Option<Box<dyn FnOnce() -> T>>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LazyState {
+    Pending,
+    Running,
+    Done,
+    Poisoned,
+}
+
+impl<T> Clone for Lazy<T> {
+    fn clone(&self) -> Self {
+        Lazy {
+            inner: Rc::clone(&self.inner),
+        }
+    }
+}
+
+impl<T> Lazy<T> {
+    /// `__lazy(name, thunk)`. The name is carried because the cycle and poison
+    /// messages have to say WHICH binding, and the forcing site has no other way
+    /// to know.
+    pub fn new(name: &str, thunk: impl FnOnce() -> T + 'static) -> Self {
+        Lazy {
+            inner: Rc::new(LazyCell {
+                name: str_new(name),
+                state: std::cell::Cell::new(LazyState::Pending),
+                value: RefCell::new(None),
+                poison: RefCell::new(None),
+                thunk: RefCell::new(Some(Box::new(thunk))),
+            }),
+        }
+    }
+
+    /// An already-evaluated cell — what M81's eager set would build if the
+    /// emitter ever needed a cell for a value it had in hand.
+    pub fn ready(value: T) -> Self {
+        Lazy {
+            inner: Rc::new(LazyCell {
+                name: str_new(""),
+                state: std::cell::Cell::new(LazyState::Done),
+                value: RefCell::new(Some(value)),
+                poison: RefCell::new(None),
+                thunk: RefCell::new(None),
+            }),
+        }
+    }
+
+    /// `__force(cell)` — the read every use of a `lazy` binding goes through,
+    /// which is the whole of "the parameter reads as a plain `T`".
+    pub fn force(&self) -> T
+    where
+        T: Clone,
+    {
+        match self.inner.state.get() {
+            LazyState::Done => {
+                return self
+                    .inner
+                    .value
+                    .borrow()
+                    .clone()
+                    .expect("a forced lazy cell holds its value");
+            }
+            LazyState::Running => {
+                panic_with(&format!("lazy initialization cycle: `{}`", self.inner.name));
+            }
+            LazyState::Poisoned => {
+                let reason = self.inner.poison.borrow().clone();
+                panic_with(&format!(
+                    "lazy `{}` is poisoned: its initializer panicked: {}",
+                    self.inner.name,
+                    reason.unwrap_or_else(|| str_new("panicked"))
+                ));
+            }
+            LazyState::Pending => {}
+        }
+        let thunk = self
+            .inner
+            .thunk
+            .borrow_mut()
+            .take()
+            .expect("a pending lazy cell holds its thunk");
+        self.inner.state.set(LazyState::Running);
+        // The JS helper's `try`/`catch`: the failure is stored, the state goes
+        // to poisoned, and the panic keeps travelling from where it was thrown.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let produced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(thunk));
+        std::panic::set_hook(previous);
+        match produced {
+            Ok(value) => {
+                *self.inner.value.borrow_mut() = Some(value.clone());
+                self.inner.state.set(LazyState::Done);
+                value
+            }
+            Err(payload) => {
+                *self.inner.poison.borrow_mut() = Some(describe_panic(&payload));
+                self.inner.state.set(LazyState::Poisoned);
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+}
+
+/// `__force` as a free function, so the emitter can spell it without naming the
+/// type's own method on a value whose type it is writing inline.
+pub fn force<T: Clone>(cell: &Lazy<T>) -> T {
+    cell.force()
+}
+
+/// A cell is its VALUE wherever one is printed or compared: the cell is the
+/// deferral, not a wrapper the program can see. Both force, which is what
+/// "fully transparent" means.
+impl<T: Js + Clone> Js for Lazy<T> {
+    fn js(&self) -> String {
+        self.force().js()
+    }
+    fn js_nested(&self) -> String {
+        self.force().js_nested()
+    }
+}
+
+impl<T: PartialEq + Clone> PartialEq for Lazy<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.force() == other.force()
+    }
+}
+
+impl<T: Json + Clone> Json for Lazy<T> {
+    fn json(&self) -> String {
+        self.force().json()
+    }
+}
 
 // ------------------------------------------------------------ collections ---
 
@@ -610,6 +841,476 @@ impl<T: std::hash::Hash + Eq + Clone> Clone for Set<T> {
     }
 }
 
+/// Entry-wise, in insertion order.
+///
+/// **This is not reachable from a vilan program**, and it is here because the
+/// emitter derives `PartialEq` for every aggregate it writes: `std::map` gives
+/// `Map` no `impl PartialEq`, so `a == b` on two maps does not type-check, and
+/// `[derive(PartialEq)]` on a struct with a `Map` field is rejected by the
+/// analyzer's all-fields-comparable check. What the derive would mean on the JS
+/// backend is `===` — reference equality on two `Map` objects — and a value
+/// struct has no reference to compare, which is the other half of why this stays
+/// unreachable rather than becoming the answer to a question a program can ask.
+impl<K: std::hash::Hash + Eq + Clone, V: PartialEq> PartialEq for Map<K, V> {
+    fn eq(&self, other: &Self) -> bool {
+        self.live == other.live && self.iter().eq(other.iter())
+    }
+}
+
+impl<T: std::hash::Hash + Eq + Clone> PartialEq for Set<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+    }
+}
+
+/// Node prints a `Map` as `Map(2) { 'a' => 1, 'b' => 2 }` and an empty one as
+/// `Map(0) {}` — NOT as an array, so this cannot go through [`js_tuple`]. The
+/// emitter reaches it through the `Map`/`Set` wrapper structs std writes, whose
+/// single field is the raw JS map (`NativeMap`), so a program that prints a
+/// `Map` prints this inside `[ .. ]`.
+impl<K: Js + std::hash::Hash + Eq + Clone, V: Js> Js for Map<K, V> {
+    fn js(&self) -> String {
+        if self.is_empty() {
+            return format!("Map({}) {{}}", self.len());
+        }
+        let mut out = String::new();
+        let _ = write!(out, "Map({}) {{ ", self.len());
+        for (index, (key, value)) in self.iter().enumerate() {
+            if index > 0 {
+                out.push_str(", ");
+            }
+            let _ = write!(out, "{} => {}", key.js_nested(), value.js_nested());
+        }
+        out.push_str(" }");
+        out
+    }
+}
+
+/// `Set(2) { 1, 2 }`, `Set(0) {}` — node's own rendering, [`Js for Map`]'s
+/// sibling.
+impl<T: Js + std::hash::Hash + Eq + Clone> Js for Set<T> {
+    fn js(&self) -> String {
+        if self.is_empty() {
+            return format!("Set({}) {{}}", self.len());
+        }
+        let mut out = String::new();
+        let _ = write!(out, "Set({}) {{ ", self.len());
+        for (index, value) in self.values().iter().enumerate() {
+            if index > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&value.js_nested());
+        }
+        out.push_str(" }");
+        out
+    }
+}
+
+// --------------------------------------------------------- canonical keys ---
+
+/// `std::hash::Hash` — the opaque canonical key `Hashable` answers (I1,
+/// `proposal/hashable-keys.md`), as the JS backend's `__hash` actually computes
+/// it:
+///
+/// ```js
+/// function __hash(value) {
+///     return (typeof value === "object" && value !== null) ? JSON.stringify(value) : value;
+/// }
+/// ```
+///
+/// So a vilan `Hash` is always a JS PRIMITIVE — a number, a string, a boolean
+/// or `null` — and an aggregate arrives here already flattened into the string
+/// `JSON.stringify` made of it. That is why this enum has four arms and not one
+/// per vilan type, and why collapsing an aggregate into [`Hash::Text`] is
+/// FAITHFUL rather than lossy: on the JS backend a `List<i32>` key and the
+/// string `"[1,2]"` really are the same key.
+///
+/// # The two equalities, which are not the same equality
+///
+/// `NativeMap` is a JS `Map`, whose key comparison is SameValueZero: `NaN`
+/// matches `NaN` and `-0` matches `0`. `hashes_equal` — the body of `impl Hash
+/// with PartialEq` — is `===`, under which `NaN` matches nothing. Both are
+/// observable, so both are here: [`PartialEq`]/[`Eq`]/[`std::hash::Hash`] below
+/// are SameValueZero, because that is what keys the map, and
+/// [`Hash::strict_eq`] is `===`.
+#[derive(Clone, Debug)]
+pub enum Hash {
+    Number(f64),
+    Text(Str),
+    Bool(bool),
+    /// `__hash(null)`: `typeof null` is `"object"` but the `value !== null`
+    /// guard fails, so the helper answers `null` itself.
+    Null,
+}
+
+impl Hash {
+    /// A JS `Map`'s SameValueZero bits for the number arm: `-0` and `0` are one
+    /// key, and every `NaN` is one key.
+    fn number_bits(value: f64) -> u64 {
+        if value.is_nan() {
+            return u64::MAX;
+        }
+        if value == 0.0 {
+            return 0;
+        }
+        value.to_bits()
+    }
+
+    /// `===` on the two canonical keys — `hashes_equal`, the body of `impl Hash
+    /// with PartialEq` (`hashable-keys.md` §3.2). Distinct from the map's own
+    /// key equality at exactly one value: `NaN === NaN` is false.
+    pub fn strict_eq(&self, other: &Hash) -> bool {
+        match (self, other) {
+            // Rust's `f64: PartialEq` IS JavaScript's `===` for numbers — `NaN`
+            // equals nothing and `-0.0 == 0.0`.
+            (Hash::Number(left), Hash::Number(right)) => left == right,
+            (Hash::Text(left), Hash::Text(right)) => left == right,
+            (Hash::Bool(left), Hash::Bool(right)) => left == right,
+            (Hash::Null, Hash::Null) => true,
+            _ => false,
+        }
+    }
+}
+
+impl PartialEq for Hash {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Hash::Number(left), Hash::Number(right)) => {
+                Hash::number_bits(*left) == Hash::number_bits(*right)
+            }
+            (Hash::Text(left), Hash::Text(right)) => left == right,
+            (Hash::Bool(left), Hash::Bool(right)) => left == right,
+            (Hash::Null, Hash::Null) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Hash {}
+
+impl std::hash::Hash for Hash {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // The discriminant is hashed first, so the number `1` and the string
+        // `"1"` land in different buckets the way two different JS primitives
+        // do.
+        match self {
+            Hash::Number(value) => {
+                state.write_u8(0);
+                Hash::number_bits(*value).hash(state);
+            }
+            Hash::Text(text) => {
+                state.write_u8(1);
+                text.hash(state);
+            }
+            Hash::Bool(value) => {
+                state.write_u8(2);
+                value.hash(state);
+            }
+            Hash::Null => state.write_u8(3),
+        }
+    }
+}
+
+/// A `Hash` IS a JS primitive, so printing one prints that primitive — a string
+/// bare at the top level and quoted inside a container, like every other string.
+impl Js for Hash {
+    fn js(&self) -> String {
+        match self {
+            Hash::Number(value) => js_number(*value),
+            Hash::Text(text) => text.js(),
+            Hash::Bool(value) => value.to_string(),
+            Hash::Null => "null".to_string(),
+        }
+    }
+    fn js_nested(&self) -> String {
+        match self {
+            Hash::Text(text) => text.js_nested(),
+            other => other.js(),
+        }
+    }
+}
+
+/// `JSON.stringify`, which is NOT [`Js`].
+///
+/// `Js` is `console.log`: node's inspector, with `[ a, b ]` spacing, bare
+/// top-level strings and `Map(1) { .. }`. `JSON.stringify` is the wire form:
+/// `[a,b]`, always-quoted strings with JSON escapes, `{}` for a `Map`, `null`
+/// for `Infinity`. The canonical hash of an aggregate is its `JSON.stringify`
+/// text, so the two renderings have to exist side by side.
+///
+/// [`Json::canonical_hash`] is `__hash` itself, and its DEFAULT body is the
+/// object branch: an aggregate keys as the string `JSON.stringify` made of it.
+/// Every primitive impl below overrides it to key as itself, which is the other
+/// branch.
+pub trait Json {
+    fn json(&self) -> String;
+    fn canonical_hash(&self) -> Hash {
+        Hash::Text(str_new(&self.json()))
+    }
+}
+
+macro_rules! json_for_integer {
+    ($($type:ty),*) => {
+        $(impl Json for $type {
+            fn json(&self) -> String {
+                self.to_string()
+            }
+            fn canonical_hash(&self) -> Hash {
+                Hash::Number(*self as f64)
+            }
+        })*
+    };
+}
+
+json_for_integer!(i8, u8, i16, u16, i32, u32, i64, u64, usize, isize);
+
+/// `JSON.stringify(Infinity)` and `JSON.stringify(NaN)` are both `null` — the
+/// one place the JSON rendering of a number is not [`js_number`]'s.
+impl Json for f64 {
+    fn json(&self) -> String {
+        if self.is_nan() || self.is_infinite() {
+            return "null".to_string();
+        }
+        js_number(*self)
+    }
+    fn canonical_hash(&self) -> Hash {
+        Hash::Number(*self)
+    }
+}
+
+impl Json for f32 {
+    fn json(&self) -> String {
+        (*self as f64).json()
+    }
+    fn canonical_hash(&self) -> Hash {
+        Hash::Number(*self as f64)
+    }
+}
+
+impl Json for bool {
+    fn json(&self) -> String {
+        self.to_string()
+    }
+    fn canonical_hash(&self) -> Hash {
+        Hash::Bool(*self)
+    }
+}
+
+impl Json for Str {
+    fn json(&self) -> String {
+        json_string(self)
+    }
+    fn canonical_hash(&self) -> Hash {
+        Hash::Text(Rc::clone(self))
+    }
+}
+
+impl Json for str {
+    fn json(&self) -> String {
+        json_string(self)
+    }
+    fn canonical_hash(&self) -> Hash {
+        Hash::Text(str_new(self))
+    }
+}
+
+/// `JSON.stringify(undefined)` answers `undefined` rather than a string, which
+/// no vilan program can observe: a `void` value is never a key and never a
+/// field. `null` is the honest stand-in and it is what `JSON.stringify([void 0])`
+/// writes for a void ELEMENT, which is the only place this arm is reachable.
+impl Json for () {
+    fn json(&self) -> String {
+        "null".to_string()
+    }
+    fn canonical_hash(&self) -> Hash {
+        Hash::Null
+    }
+}
+
+impl<T: Json> Json for Vec<T> {
+    fn json(&self) -> String {
+        json_array(&self.iter().map(Json::json).collect::<Vec<String>>())
+    }
+}
+
+impl<T: Json, const N: usize> Json for [T; N] {
+    fn json(&self) -> String {
+        json_array(&self.iter().map(Json::json).collect::<Vec<String>>())
+    }
+}
+
+/// An `Option` is a vilan ENUM, whose JS value is `[index, ...data]` (the same
+/// reason [`Js for Option`] prints `[ 0, 5 ]`) — so it is an OBJECT there and it
+/// keys as the JSON text of that array, not as its payload.
+impl<T: Json> Json for Option<T> {
+    fn json(&self) -> String {
+        match self {
+            Some(value) => json_array(&["0".to_string(), value.json()]),
+            None => json_array(&["1".to_string()]),
+        }
+    }
+}
+
+impl<T: Json, E: Json> Json for Result<T, E> {
+    fn json(&self) -> String {
+        match self {
+            Ok(value) => json_array(&["0".to_string(), value.json()]),
+            Err(error) => json_array(&["1".to_string(), error.json()]),
+        }
+    }
+}
+
+impl<T: Json> Json for &T {
+    fn json(&self) -> String {
+        (*self).json()
+    }
+    fn canonical_hash(&self) -> Hash {
+        (*self).canonical_hash()
+    }
+}
+
+/// A `Hash` is already a canonical key, so hashing one is the identity — which
+/// is what `impl Hash with Hashable` says in vilan. Its JSON text is the text of
+/// the primitive it holds.
+impl Json for Hash {
+    fn json(&self) -> String {
+        match self {
+            Hash::Number(value) => value.json(),
+            Hash::Text(text) => text.json(),
+            Hash::Bool(value) => value.json(),
+            Hash::Null => "null".to_string(),
+        }
+    }
+    fn canonical_hash(&self) -> Hash {
+        self.clone()
+    }
+}
+
+/// `JSON.stringify(new Map([["a", 1]]))` is `"{}"` — a `Map` has no own
+/// enumerable properties. So is a `Set`'s.
+impl<K, V> Json for Map<K, V> {
+    fn json(&self) -> String {
+        "{}".to_string()
+    }
+}
+
+impl<T> Json for Set<T> {
+    fn json(&self) -> String {
+        "{}".to_string()
+    }
+}
+
+/// A `Shared` is the object the JS backend spells `{ v: value }` (see
+/// [`Js for Shared`]), so that is its JSON too.
+impl<T: Json> Json for Shared<T> {
+    fn json(&self) -> String {
+        format!("{{\"v\":{}}}", self.inner.borrow().json())
+    }
+}
+
+/// `downgrade` is the identity on the JS backend, so a weak handle's JSON is
+/// the cell's — and a dead one is `undefined`, which `JSON.stringify` writes as
+/// `null` in every position a vilan program can put it.
+impl<T: Json> Json for Weak<T> {
+    fn json(&self) -> String {
+        match self.upgrade() {
+            Some(cell) => cell.json(),
+            None => "null".to_string(),
+        }
+    }
+}
+
+/// The four host types the executor IS are opaque objects on the JS backend — a
+/// `Task` is a `Promise` — and `JSON.stringify` of an object with no own
+/// enumerable properties is `{}`. They exist as `Json` only so that a struct
+/// holding one can still carry the `impl Json` the emitter writes beside every
+/// `impl Js`.
+impl<T> Json for executor::Task<T> {
+    fn json(&self) -> String {
+        "{}".to_string()
+    }
+}
+
+impl Json for executor::Nursery {
+    fn json(&self) -> String {
+        "{}".to_string()
+    }
+}
+
+impl Json for executor::CancelSignal {
+    fn json(&self) -> String {
+        "{}".to_string()
+    }
+}
+
+impl Json for executor::TimerHandle {
+    fn json(&self) -> String {
+        "{}".to_string()
+    }
+}
+
+macro_rules! json_for_tuple {
+    ($($name:ident),+) => {
+        impl<$($name: Json),+> Json for ($($name,)+) {
+            fn json(&self) -> String {
+                #[allow(non_snake_case, reason = "the binders are the type parameters' own names")]
+                let ($($name,)+) = self;
+                json_array(&[$($name.json()),+])
+            }
+        }
+    };
+}
+
+json_for_tuple!(A);
+json_for_tuple!(A, B);
+json_for_tuple!(A, B, C);
+json_for_tuple!(A, B, C, D);
+json_for_tuple!(A, B, C, D, E);
+json_for_tuple!(A, B, C, D, E, F);
+
+/// The JSON array an emitted aggregate's `impl Json` builds — `[a,b]`, with NO
+/// spacing, which is where it differs from [`js_tuple`].
+pub fn json_array(parts: &[String]) -> String {
+    format!("[{}]", parts.join(","))
+}
+
+/// A JSON string literal, per ECMA-404: the two mandatory escapes, the five
+/// short ones, and `\u00XX` for every other control character. `JSON.stringify`
+/// leaves every other code point alone (a lone surrogate aside, which a vilan
+/// `str` cannot hold).
+pub fn json_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            control if control < ' ' => {
+                let _ = write!(out, "\\u{:04x}", control as u32);
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `canonical_hash(value)` — the `CanonicalHash` intrinsic, as a free function
+/// so the emitter can spell it without naming the trait.
+pub fn canonical_hash<T: Json + ?Sized>(value: &T) -> Hash {
+    value.canonical_hash()
+}
+
+/// `hashes_equal(a, b)` — the `HashEq` intrinsic. See [`Hash::strict_eq`].
+pub fn hashes_equal(left: &Hash, right: &Hash) -> bool {
+    left.strict_eq(right)
+}
+
 // ----------------------------------------------------------- list helpers ---
 
 /// `List::get` — `__list_get`. Out of range is `None`, never a panic; the index
@@ -638,6 +1339,20 @@ pub fn list_remove<T>(list: &mut Vec<T>, index: i64) -> T {
 }
 
 /// `List::insert` — a past-the-end index appends, as the JS `splice` does.
+/// `List::sort_by` — `__list_sort_by`, which is `list.slice().sort(compare)`: a
+/// COPY, sorted, answered; the receiver is untouched (its vilan signature takes
+/// `own self`).
+///
+/// The comparator answers an `Ordering`, which natively is its BACKING value —
+/// `-1`, `0`, `1` — exactly as it is the number JS `sort` reads. Both sorts are
+/// stable, so equal elements keep their order on both backends, which is what a
+/// byte differential over a sorted list turns on.
+pub fn list_sort_by<T: Clone>(list: &[T], compare: impl Fn(T, T) -> i32) -> Vec<T> {
+    let mut sorted = list.to_vec();
+    sorted.sort_by(|left, right| compare(left.clone(), right.clone()).cmp(&0));
+    sorted
+}
+
 pub fn list_insert<T>(list: &mut Vec<T>, index: i64, value: T) {
     let at = if index < 0 {
         0
@@ -791,5 +1506,103 @@ mod tests {
         assert_eq!(str_substring("abcdef", 1, 3).to_string(), "bc");
         assert_eq!(str_substring("abcdef", 3, 1).to_string(), "bc");
         assert_eq!(str_substring("abc", 0, 99).to_string(), "abc");
+    }
+
+    // -- F20: the canonical key --
+
+    /// `__hash`'s two branches: a primitive keys as ITSELF, an aggregate as the
+    /// string `JSON.stringify` made of it.
+    #[test]
+    fn a_primitive_keys_as_itself_and_an_aggregate_as_its_json() {
+        assert_eq!(canonical_hash(&7i32), Hash::Number(7.0));
+        assert_eq!(canonical_hash(&1.5f64), Hash::Number(1.5));
+        assert_eq!(canonical_hash(&true), Hash::Bool(true));
+        assert_eq!(canonical_hash(&str_new("a")), Hash::Text(str_new("a")));
+        assert_eq!(canonical_hash(&vec![1i32, 2]), Hash::Text(str_new("[1,2]")));
+        // The collapse JavaScript itself performs: a list key and the string of
+        // its JSON really are one key there, so they are one key here.
+        assert_eq!(
+            canonical_hash(&vec![1i32, 2]),
+            canonical_hash(&str_new("[1,2]"))
+        );
+    }
+
+    /// The number `1` and the string `"1"` are two different JS primitives, so
+    /// they are two different keys — the case a canonicalise-everything-to-text
+    /// representation would silently merge.
+    #[test]
+    fn a_number_key_and_a_string_key_that_render_alike_stay_distinct() {
+        assert_ne!(canonical_hash(&1i32), canonical_hash(&str_new("1")));
+        let mut map: Map<Hash, i32> = Map::new();
+        map.insert(canonical_hash(&1i32), 10);
+        map.insert(canonical_hash(&str_new("1")), 20);
+        assert_eq!(map.len(), 2);
+    }
+
+    /// The two equalities, which differ at exactly one value. A JS `Map` keys by
+    /// SameValueZero (`NaN` matches `NaN`, `-0` matches `0`); `hashes_equal` is
+    /// `===`, under which `NaN` matches nothing.
+    #[test]
+    fn the_maps_key_equality_and_strict_equality_part_company_at_nan() {
+        let nan = canonical_hash(&f64::NAN);
+        assert_eq!(nan, canonical_hash(&f64::NAN), "SameValueZero keys NaN");
+        assert!(
+            !hashes_equal(&nan, &canonical_hash(&f64::NAN)),
+            "`===` does not"
+        );
+        let mut map: Map<Hash, i32> = Map::new();
+        map.insert(nan, 1);
+        map.insert(canonical_hash(&f64::NAN), 2);
+        assert_eq!(map.len(), 1, "one NaN key, as a JS `Map` has");
+
+        assert_eq!(canonical_hash(&0.0f64), canonical_hash(&-0.0f64));
+        assert!(hashes_equal(
+            &canonical_hash(&0.0f64),
+            &canonical_hash(&-0.0f64)
+        ));
+    }
+
+    /// `JSON.stringify` is not `console.log`: no spacing, always-quoted strings,
+    /// `null` for a non-finite number, `{}` for a `Map`.
+    #[test]
+    fn json_is_not_the_console_log_rendering() {
+        assert_eq!(vec![str_new("a"), str_new("b")].json(), "[\"a\",\"b\"]");
+        assert_eq!(vec![str_new("a"), str_new("b")].js(), "[ 'a', 'b' ]");
+        assert_eq!(f64::INFINITY.json(), "null");
+        assert_eq!(f64::INFINITY.js(), "Infinity");
+        assert_eq!(f64::NAN.json(), "null");
+        let map: Map<Hash, i32> = Map::new();
+        assert_eq!(map.json(), "{}");
+        // An `Option` is a vilan ENUM, so its JS value is `[index, ...data]`.
+        assert_eq!(Some(5i32).json(), "[0,5]");
+        assert_eq!(None::<i32>.json(), "[1]");
+        assert_eq!(str_new("q\"\n\t\u{1}").json(), "\"q\\\"\\n\\t\\u0001\"");
+    }
+
+    /// Node's own `Map` / `Set` rendering, which is not an array's.
+    #[test]
+    fn a_map_and_a_set_print_the_way_node_prints_them() {
+        let mut map: Map<Hash, i32> = Map::new();
+        assert_eq!(map.js(), "Map(0) {}");
+        map.insert(canonical_hash(&str_new("a")), 1);
+        map.insert(canonical_hash(&str_new("b")), 2);
+        assert_eq!(map.js(), "Map(2) { 'a' => 1, 'b' => 2 }");
+        let mut set: Set<i32> = Set::new();
+        assert_eq!(set.js(), "Set(0) {}");
+        set.insert(1);
+        set.insert(2);
+        assert_eq!(set.js(), "Set(2) { 1, 2 }");
+    }
+
+    /// `Shared::write()` used as a PLACE reaches the cell, where a read copies
+    /// out of it. The two were one call on the JS backend (`cell.v`), which is
+    /// how the place form came to be emitted as a write of `()`.
+    #[test]
+    fn a_shared_write_place_reaches_the_cell_where_a_read_copies() {
+        let cell: Shared<Vec<i32>> = Shared::new(Vec::new());
+        cell.get().push(1);
+        assert_eq!(cell.get().len(), 0, "a read is a copy");
+        cell.borrow_mut().push(1);
+        assert_eq!(cell.get().len(), 1, "the place is the cell");
     }
 }
