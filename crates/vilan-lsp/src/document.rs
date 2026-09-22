@@ -1053,9 +1053,14 @@ pub enum TokenKind {
 /// Token-modifier bits, index-aligned with `TOKEN_MODIFIERS`.
 pub const MODIFIER_DECLARATION: u32 = 1 << 0;
 pub const MODIFIER_READONLY: u32 = 1 << 1;
+/// E213: `[internal("reason")]`. A theme maps it to a DIMMED colour — the
+/// `deprecated` modifier's shape without its strikethrough, because the
+/// declaration is not going away and is not wrong to use; it is one to know
+/// what you are doing with.
+pub const MODIFIER_INTERNAL: u32 = 1 << 2;
 
 /// The modifier legend.
-pub const TOKEN_MODIFIERS: [&str; 2] = ["declaration", "readonly"];
+pub const TOKEN_MODIFIERS: [&str; 3] = ["declaration", "readonly", "internal"];
 
 /// The LSP legend, index-aligned with `TokenKind`.
 pub const TOKEN_TYPES: [&str; 13] = [
@@ -1984,6 +1989,20 @@ impl Document {
                     kind,
                     signature: vilan_ide::signature_label(program, id),
                     call_parameters,
+                    // E213: the resolved index CAN see the label, so the
+                    // keystroke list obeys the same rule the analysis's own
+                    // completion does.
+                    internal: program
+                        .functions
+                        .get(&id)
+                        .and_then(|function| function.internal)
+                        .or_else(|| {
+                            program
+                                .external_functions
+                                .get(&id)
+                                .and_then(|external| external.internal)
+                        })
+                        .map(str::to_string),
                     analysis_epoch: epoch,
                 });
             };
@@ -3330,7 +3349,15 @@ impl Document {
             Some(resolved) => format!("{}\n\n{}", asyncify(declaration), asyncify(resolved)),
             None => asyncify(declaration),
         };
-        let mut out = format!("```vilan\n{declaration}\n```");
+        let mut out = String::new();
+        // E213: hover LEADS with the reason. The declaration is reachable —
+        // that is what visibility already answered — and what the reader needs
+        // before the signature is that reaching for it is a decision.
+        if let Some(lead) = internal_lead(program, declaration_id) {
+            out.push_str(&lead);
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!("```vilan\n{declaration}\n```"));
         if let Some(docs) = self.analysis(program).doc_comment_of(declaration_id) {
             out.push_str("\n\n");
             out.push_str(&docs);
@@ -3526,7 +3553,14 @@ impl Document {
         let type_label = self
             .analysis(program)
             .field_type_label(struct_id, index, field.name)?;
-        let mut out = format!("```vilan\n{}: {type_label}\n```", field.name);
+        let mut out = String::new();
+        // E213: a FIELD is the case visibility cannot serve at all, and the
+        // one the item was filed about.
+        if let Some(reason) = field.internal {
+            out.push_str(&internal_line(reason));
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!("```vilan\n{}: {type_label}\n```", field.name));
         if let Some(docs) = self.struct_field_docs(program, struct_id, index) {
             out.push_str("\n\n");
             out.push_str(&docs);
@@ -3779,13 +3813,32 @@ impl Document {
                 }
             }
         };
+        // E213: the label at any use of a declaration that carries one. Read
+        // through the same two maps hover reads, so an external answers like a
+        // function.
+        let internal_modifier = |target: Id| {
+            let labelled = program
+                .functions
+                .get(&target)
+                .map(|function| function.internal.is_some())
+                .or_else(|| {
+                    program
+                        .external_functions
+                        .get(&target)
+                        .map(|external| external.internal.is_some())
+                })
+                .unwrap_or(false);
+            if labelled { MODIFIER_INTERNAL } else { 0 }
+        };
         // Declaration names.
         for (id, function) in &program.functions {
             if entry(*id) {
                 tokens.push((
                     function.name_span,
                     TokenKind::Function,
-                    MODIFIER_DECLARATION,
+                    // Dimmed at the DECLARATION too (E213): the reader looking
+                    // at the definition is the one most likely to copy it.
+                    MODIFIER_DECLARATION | internal_modifier(*id),
                 ));
             }
         }
@@ -3846,7 +3899,11 @@ impl Document {
                             Some(variable) if !variable.mutable => MODIFIER_READONLY,
                             _ => 0,
                         };
-                        tokens.push((span, classify_target(*target), readonly));
+                        tokens.push((
+                            span,
+                            classify_target(*target),
+                            readonly | internal_modifier(*target),
+                        ));
                     }
                     Expr::Generic(_) => tokens.push((span, TokenKind::TypeParameter, 0)),
                     Expr::Module(_) => tokens.push((span, TokenKind::Namespace, 0)),
@@ -3865,7 +3922,19 @@ impl Document {
             } else {
                 TokenKind::Property
             };
-            tokens.push((*span, kind, 0));
+            // E213 at a MEMBER: the method this call selected, or the field
+            // this read resolved to — both already recorded, so the dimming
+            // asks the record rather than re-resolving the name.
+            let internal = match program.entity_map.get(call_id) {
+                Some(Expr::Field(_, struct_id, index)) => program
+                    .structs
+                    .get(struct_id)
+                    .and_then(|structure| structure.fields.get(*index))
+                    .is_some_and(|field| field.internal.is_some()),
+                Some(Expr::Local(target)) => internal_modifier(*target) != 0,
+                _ => false,
+            };
+            tokens.push((*span, kind, if internal { MODIFIER_INTERNAL } else { 0 }));
         }
         // Type-position references (macro names arrive here too).
         for (source, span, definition, _) in &program.type_references {
@@ -8166,6 +8235,31 @@ fn trailing_semicolon_to_remove(
 /// Whether two spans share at least one byte position — touching counts, so
 /// a zero-width cursor range sitting right at a diagnostic's edge still
 /// overlaps it.
+/// E213: the hover lead line for a declaration carrying
+/// `[internal("reason")]` — a function, a method or an external — or `None`
+/// for the overwhelming majority that carry none.
+fn internal_lead(program: &Program, declaration_id: Id) -> Option<String> {
+    let reason = program
+        .functions
+        .get(&declaration_id)
+        .and_then(|function| function.internal)
+        .or_else(|| {
+            program
+                .external_functions
+                .get(&declaration_id)
+                .and_then(|external| external.internal)
+        })?;
+    Some(internal_line(reason))
+}
+
+/// How the label reads in the editor, in ONE place: hover's lead line and the
+/// field hover's both, so the two cannot drift into two spellings of the same
+/// fact. Deliberately not the word "private" — the item IS reachable, and
+/// saying otherwise would contradict what visibility already answered.
+fn internal_line(reason: &str) -> String {
+    format!("**internal** — {reason}")
+}
+
 fn spans_overlap(a: Span, b: Span) -> bool {
     a.start <= b.end && b.start <= a.end
 }
@@ -10673,6 +10767,203 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── E213: `[internal("reason")]` in the editor ──────────────────────────
+    //
+    // Visibility answers whether a module may NAME an item. This answers
+    // whether a reader should reach for one that is named — `Region.anchor` is
+    // exported because `each` and a hand-written `Slot` need it, and a row
+    // moved through it without `hold_rows` corrupts the reconciler's view.
+    // Nothing warns and nothing refuses: what changes is what the editor does.
+
+    /// A module declaring one labelled function beside an ordinary one, and a
+    /// struct with a labelled field, opened at the position `marker` ends.
+    fn internal_workspace(marker: &str, main: &str) -> (PathBuf, Document, usize) {
+        let (dir, document) = analyze_workspace(&[
+            ("main.vl", main),
+            (
+                "helper.vl",
+                "export struct Region {\n\t[internal(\"place against it, never through it\")] \
+                 anchor: str,\n\tlabel: str,\n}\n\n\
+                 export [internal(\"the reconciler's own bookkeeping\")] fun anchor_row() {}\n\n\
+                 export fun anchor_label(): str {\n\t\"x\"\n}\n",
+            ),
+        ]);
+        let text = document.line_index.text();
+        let offset = text.find(marker).expect("the marker") + marker.len();
+        (dir, document, offset)
+    }
+
+    #[test]
+    fn an_internal_name_is_absent_from_a_bare_completion_list() {
+        let (dir, document, offset) = internal_workspace(
+            "greet();\n\t",
+            "import pkg::helper::{ anchor_row, anchor_label };\n\n\
+             fun greet() {}\n\nfun main() {\n\tgreet();\n\t\n}\n",
+        );
+        let labels: Vec<String> = document
+            .completion(offset)
+            .into_iter()
+            .map(|candidate| candidate.label)
+            .collect();
+        assert!(
+            labels.iter().any(|label| label == "anchor_label"),
+            "the ordinary import is offered: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label == "anchor_row"),
+            "the labelled one is not, at a bare position: {labels:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn three_typed_characters_bring_it_back_carrying_its_reason() {
+        // The other half of the rule, and what keeps it a LABEL and not a
+        // hiding place: a name somebody is spelling out is a name they mean.
+        let (dir, document, offset) = internal_workspace(
+            "\tanc",
+            "import pkg::helper::{ anchor_row, anchor_label };\n\n\
+             fun main() {\n\tanc\n}\n",
+        );
+        let candidate = document
+            .completion(offset)
+            .into_iter()
+            .find(|candidate| candidate.label == "anchor_row")
+            .expect("an exact prefix of three characters offers it");
+        assert_eq!(
+            candidate.internal.as_deref(),
+            Some("the reconciler's own bookkeeping"),
+            "carrying the reason, which is what the popup shows"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_typed_characters_do_not() {
+        // Three characters is the line the ruling drew; two is a browse.
+        let (dir, document, offset) = internal_workspace(
+            "\tan",
+            "import pkg::helper::{ anchor_row, anchor_label };\n\nfun main() {\n\tan\n}\n",
+        );
+        let labels: Vec<String> = document
+            .completion(offset)
+            .into_iter()
+            .map(|candidate| candidate.label)
+            .collect();
+        assert!(
+            labels.iter().any(|label| label == "anchor_label"),
+            "the ordinary name still is: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label == "anchor_row"),
+            "{labels:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_internal_field_is_hidden_after_the_dot_and_returns_on_its_prefix() {
+        // The FIELD case — the one declaration visibility cannot serve at all,
+        // since vilan has no per-field visibility.
+        let main = "import pkg::helper::Region;\n\n\
+                    fun read(region: Region): str {\n\tregion.\n}\n";
+        let (dir, document, offset) = internal_workspace("region.", main);
+        let labels: Vec<String> = document
+            .completion(offset)
+            .into_iter()
+            .map(|candidate| candidate.label)
+            .collect();
+        assert!(
+            labels.iter().any(|label| label == "label"),
+            "the ordinary field is offered: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label == "anchor"),
+            "the labelled one is not: {labels:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let main = "import pkg::helper::Region;\n\n\
+                    fun read(region: Region): str {\n\tregion.anc\n}\n";
+        let (dir, document, offset) = internal_workspace("region.anc", main);
+        let candidate = document
+            .completion(offset)
+            .into_iter()
+            .find(|candidate| candidate.label == "anchor")
+            .expect("three characters of its own name offer it");
+        assert_eq!(
+            candidate.internal.as_deref(),
+            Some("place against it, never through it")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hover_leads_with_the_reason_at_a_use_and_at_the_field() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "struct Region {\n\t[internal(\"place against it, never through it\")] \
+             anchor: str,\n}\n\n\
+             [internal(\"the reconciler's own bookkeeping\")]\n\
+             fun anchor_row(region: Region): str {\n\tregion.anchor\n}\n\n\
+             fun main() {\n\tanchor_row(Region { anchor = \"a\" });\n}\n",
+        )]);
+        let text = document.line_index.text();
+        let at_use = text.rfind("anchor_row(").expect("the call") + 2;
+        let hover = document.hover(at_use).expect("a function hover");
+        assert!(
+            hover.starts_with("**internal** — the reconciler's own bookkeeping"),
+            "the reason LEADS, before the signature: {hover:?}"
+        );
+        let at_field = text.find("anchor: str").expect("the field") + 2;
+        let field_hover = document.hover(at_field).expect("a field hover");
+        assert!(
+            field_hover.starts_with("**internal** — place against it, never through it"),
+            "{field_hover:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_internal_modifier_dims_the_declaration_and_every_use() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            "struct Region {\n\t[internal(\"place against it, never through it\")] \
+             anchor: str,\n\tlabel: str,\n}\n\n\
+             [internal(\"the reconciler's own bookkeeping\")]\n\
+             fun anchor_row(region: Region): str {\n\tregion.anchor\n}\n\n\
+             fun plain(region: Region): str {\n\tregion.label\n}\n",
+        )]);
+        let text = document.line_index.text();
+        let tokens = document.semantic_tokens();
+        let modifier_at = |needle: &str, length: usize| {
+            let at = text.find(needle).expect("the position");
+            tokens
+                .iter()
+                .find(|(span, _, _)| {
+                    let range = span.into_range();
+                    range.start == at && range.end == at + length
+                })
+                .map(|(_, _, modifiers)| *modifiers & MODIFIER_INTERNAL)
+        };
+        assert_eq!(
+            modifier_at("anchor_row(region: Region)", 10),
+            Some(MODIFIER_INTERNAL),
+            "the declaration is dimmed too — the reader at the definition is the \
+             one most likely to copy it: {tokens:?}"
+        );
+        assert_eq!(
+            modifier_at("anchor\n}", 6),
+            Some(MODIFIER_INTERNAL),
+            "and the field at its USE: {tokens:?}"
+        );
+        assert_eq!(
+            modifier_at("label\n}", 5),
+            Some(0),
+            "while the field beside it is not: {tokens:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // E184: the auto-import table is the FOURTH consumer of B318 §1's
     // visibility bit — the one E178 left behind, because its other route parses
     // every module's file once per keystroke (four `overlay_module_reclaim`
@@ -12054,7 +12345,7 @@ pub(crate) mod tests {
     fn a_member_name_off_a_users_own_type_is_not_platform_evidence() {
         let manifest =
             "[package]\nname = \"app\"\n\n[entry.client]\ntarget = \"browser\"\n\n[entry.server]\n";
-        let shared = "struct Marker {\n\tanchor: str,\n}\n\n             fun anchor_of(marker: Marker): str {\n\tmarker.anchor\n}\n";
+        let shared = "struct Marker {\n\tanchor: str,\n}\n\nfun anchor_of(marker: Marker): str {\n\tmarker.anchor\n}\n";
         let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"server\");\n}\n";
         let (dir, _client) = analyze_workspace(&[
             ("src/client.vl", entry),

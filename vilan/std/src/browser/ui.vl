@@ -599,7 +599,7 @@ fun clear_chunk_error() {
 /// them. Nothing in this order changes a signature.
 /// KEEP IN STEP with the process twin's copy (process/ui.vl).
 export struct Region {
-	anchor: Text,
+	[internal("the region's end marker: place against it, never through it")] anchor: Text,
 	live: Shared<List<View>>,
 	rows: Shared<List<Row>>,
 }
@@ -656,6 +656,7 @@ export impl Region {
 
 	/// Places `content` as a NEW ROW at the end of the region, and returns the
 	/// handle the reconciler moves it by (A91).
+	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
 	fun open_row<C: Slot>(self, content: C): Row {
 		self.open_row_before(content, self.anchor)
 	}
@@ -687,6 +688,7 @@ export impl Region {
 	/// being read — the next row's marker, or this region's anchor for the
 	/// last row. The marker itself stays where it is, so a whole run can be cut
 	/// row by row before anything moves: every boundary is still meaningful.
+	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
 	fun cut_row(self, row: Row, end: Text): Element {
 		let range = create_range();
 		range.set_start_after(row.marker);
@@ -705,6 +707,7 @@ export impl Region {
 	/// same answer and costs a move per row whether or not the row went
 	/// anywhere.
 	/// KEEP IN STEP with the process twin's copy (process/ui.vl).
+	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
 	fun insert_row(self, row: Row, content: Element, end: Text) {
 		self.host().insert_text_before(row.marker, end);
 		self.host().insert_before(content, end);
@@ -712,6 +715,7 @@ export impl Region {
 
 	/// Drops a row that is going away: its content has already been cut out,
 	/// so what is left is the marker.
+	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
 	fun drop_row(self, row: Row) {
 		row.marker.remove();
 	}
@@ -731,6 +735,7 @@ export impl Region {
 	}
 
 	/// Records the ROWS that are live in this region, for `close` (A91).
+	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
 	fun hold_rows(self, rows: List<Row>) {
 		self.rows.write() = rows;
 	}

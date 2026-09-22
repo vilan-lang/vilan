@@ -241,6 +241,17 @@ fn to_completion_item(
         }]);
         item.sort_text = Some(format!("|{}{}", auto_import.origin_tier, item.label));
     }
+    // E213: an internal candidate survived the engine's prefix rule, so it is
+    // shown — LAST, and saying why it is one. `~~` sorts after every label
+    // (alphanumeric) and after a construct snippet's single `~`, which is the
+    // ordering the ruling asks for: present, and never in front of a name the
+    // author should be reaching for. The reason REPLACES the signature in
+    // `detail` for the reason an auto-import candidate's module does: what
+    // matters about this candidate is not its shape.
+    if let Some(reason) = completion.internal {
+        item.detail = Some(format!("internal — {reason}"));
+        item.sort_text = Some(format!("~~{}", item.label));
+    }
     // E211: state the prefix this candidate replaces, and the text to filter it
     // by. E194 fixed the hyphenated case from the CLIENT's side, in VS Code's
     // `wordPattern`; every other LSP client has its own word rules and no such
@@ -883,6 +894,7 @@ mod completion_item_tests {
             insert: None,
             filter_text: None,
             replace_span: None,
+            internal: None,
             needs_import: None,
         }
     }
@@ -1023,6 +1035,7 @@ mod completion_item_tests {
             insert: None,
             filter_text: None,
             replace_span: None,
+            internal: None,
             needs_import: None,
         }
     }
@@ -1042,6 +1055,7 @@ mod completion_item_tests {
             insert: None,
             filter_text: None,
             replace_span: None,
+            internal: None,
             needs_import: Some(AutoImport {
                 module_path: module_path.iter().map(|part| part.to_string()).collect(),
                 edit_span: vilan_core::Span { start: 0, end: 0 },

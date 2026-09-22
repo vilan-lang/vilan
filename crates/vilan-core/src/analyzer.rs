@@ -845,6 +845,11 @@ pub struct Function<'src> {
     /// std warns, non-fatally, carrying this replacement steer verbatim
     /// (proposal/deprecation.md §1–§2; `check_deprecated`).
     pub deprecated: Option<&'src str>,
+    /// Declared `[internal("reason")]` (E213): reachable on purpose and
+    /// dangerous on purpose. Read by the EDITOR only — completion hides it
+    /// below an exact prefix, the semantic tokens dim it, and hover leads with
+    /// this reason. Never a diagnostic: it is a label, not a lint.
+    pub internal: Option<&'src str>,
     /// Declared `[rpc]`: callable over the wire as part of a service's surface
     /// (its signature is Wire-checked; `[service(Client)]` generation reads it).
     pub rpc: bool,
@@ -900,6 +905,11 @@ pub struct ExternalFunction<'src> {
     /// std's retire-shaped items are often externals, and the use-site warning
     /// must not depend on which kind the callee is.
     pub deprecated: Option<&'src str>,
+    /// Declared `[internal("reason")]` (E213) — `Function`'s field of the same
+    /// name, here for the same reason `deprecated` is: std's runtime seams are
+    /// often externals, and the editor must not answer differently depending on
+    /// which kind the declaration is.
+    pub internal: Option<&'src str>,
 }
 
 #[derive(Debug, Clone)]
@@ -1407,6 +1417,12 @@ pub struct Field<'src> {
     /// rename). Derived from the start of the field declaration.
     pub name_span: Span,
     pub type_id: TypeId,
+    /// Declared `[internal("reason")]` (E213). A field is the case declaration
+    /// visibility cannot serve at all — vilan has no per-field visibility — and
+    /// it is the motivating one: `Region.anchor` is exported because `each` and
+    /// a user-written `Slot` need it, and moving a row through it without
+    /// `hold_rows` corrupts the reconciler's view.
+    pub internal: Option<&'src str>,
 }
 
 #[derive(Debug, Clone)]
@@ -30041,6 +30057,7 @@ impl<'src> Analyzer<'src> {
                             call_count: 0,
                             is_async: function.is_async,
                             deprecated: function.deprecated,
+                            internal: function.internal,
                         },
                     );
                     let function_type_id = self.new_type_id();
@@ -30204,6 +30221,7 @@ impl<'src> Analyzer<'src> {
                             ),
                             must_use: function.must_use,
                             deprecated: function.deprecated,
+                            internal: function.internal,
                             platform_fence: function
                                 .platform_fence
                                 .iter()
@@ -30836,6 +30854,7 @@ impl<'src> Analyzer<'src> {
                         name: field_name,
                         name_span: field_name_span,
                         type_id,
+                        internal: child.0.3,
                     });
                 }
                 self.structs.insert(

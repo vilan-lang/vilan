@@ -354,7 +354,10 @@ pub const IMPORTANT_HAS_NO_PLACE: &str = "`!important` has no place in a `css` b
 /// for as long as it existed.
 const DOC_HIDDEN_IS_SUPERSEDED: &str = "`[doc(hidden)]` is superseded by visibility: an item its module does not `export` is already \
      reachable and absent from completion, which is the whole of what this marker meant — delete \
-     it, and write `export` on the names consumers are meant to find";
+     it, and write `export` on the names consumers are meant to find. For an item that IS part of \
+     the surface and is dangerous to reach for, `[internal(\"reason\")]` is the other thing this \
+     marker is reached for: it stays exported and callable, and the editor hides it from \
+     completion, dims it and leads its hover with the reason";
 
 /// The rule `export <expression>;` breaks (B321). Curated
 /// (diagnostics-standard.md B6 — the prohibition explains itself and names the
@@ -1086,6 +1089,7 @@ pub const KNOWN_ATTRIBUTE_MARKERS: &[&str] = &[
     "expose",
     "platform",
     "deprecated",
+    "internal",
 ];
 
 /// Whether `name` is one of [`KNOWN_ATTRIBUTE_MARKERS`]. Mirrors the chumsky
@@ -5657,6 +5661,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     fn parse_function(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         let deprecated = self.parse_deprecated_attribute();
+        let internal = self.parse_internal_attribute();
         let (extern_binding, extern_retains) = match self.parse_extern_attribute() {
             Some((binding, retains)) => (Some(binding), retains),
             None => (None, false),
@@ -5850,6 +5855,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 is_async,
                 external,
                 deprecated,
+                internal,
                 extern_binding,
                 extern_retains,
                 must_use,
@@ -6207,10 +6213,13 @@ impl<'a, 'src> Parser<'a, 'src> {
         ))
     }
 
-    /// `[expose]? name (: type)?` — one struct field, carrying the whole-field span
-    /// (the inner name keeps its own span).
+    /// `[internal(..)]? [expose]? name (: type)?` — one struct field, carrying
+    /// the whole-field span (the inner name keeps its own span).
     fn parse_struct_field(&mut self) -> Option<Spanned<StructField<'src>>> {
         let start = self.position;
+        // E213's label leads, as it does on a function: it is about the field
+        // rather than about what crosses the wire.
+        let internal = self.parse_internal_attribute();
         let exposed = self.eat_expose_attribute();
         let name_start = self.position;
         let name = self.eat_ident()?;
@@ -6220,7 +6229,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         } else {
             None
         };
-        Some(((name, type_, exposed), self.span_from(start)))
+        Some(((name, type_, exposed, internal), self.span_from(start)))
     }
 
     /// `resource? enum name generics? { variants }`. There is no `external enum`, so
@@ -7334,6 +7343,34 @@ impl<'a, 'src> Parser<'a, 'src> {
             parser.expect_ctrl(')')?;
             parser.expect_ctrl(']')?;
             Some(steer)
+        })
+    }
+
+    /// `[internal("reason")]` — E213's label for an item that is reachable on
+    /// purpose and dangerous on purpose. Exactly one quoted string, REQUIRED:
+    /// the reason is what hover leads with and what completion shows, and a
+    /// label with no reason is how these rot. `None` when no internal
+    /// attribute leads.
+    ///
+    /// Shaped on [`Self::parse_deprecated_attribute`], and placed beside it in
+    /// the ordered prefix for the same reason: both are labels ABOUT the
+    /// declaration rather than parts of its signature.
+    fn parse_internal_attribute(&mut self) -> Option<&'src str> {
+        self.attempt(|parser| {
+            parser.expect_ctrl('[')?;
+            if parser.peek() != Some(&Token::Ident("internal")) {
+                return None;
+            }
+            parser.bump();
+            parser.expect_ctrl('(')?;
+            let Some(Token::String(reason)) = parser.peek() else {
+                return None;
+            };
+            let reason = *reason;
+            parser.bump();
+            parser.expect_ctrl(')')?;
+            parser.expect_ctrl(']')?;
+            Some(reason)
         })
     }
 
@@ -8723,6 +8760,42 @@ mod tests {
         // `deprecated` is a known marker, so no user-macro reading claims it
         // either: the program declines.
         assert!(declines("[deprecated] fun one() { }"));
+    }
+
+    #[test]
+    fn an_internal_attribute_carries_its_reason_on_a_function_and_on_a_field() {
+        // E213. The shape is `[deprecated(..)]`'s, deliberately: both are
+        // labels ABOUT the declaration rather than parts of its signature.
+        match only_item("[internal(\"row bookkeeping\")] fun cut_row() { }") {
+            Node::Func(function) => assert_eq!(function.internal, Some("row bookkeeping")),
+            other => panic!("expected a labelled Func, got {other:?}"),
+        }
+        match only_item("fun plain() { }") {
+            Node::Func(function) => assert_eq!(function.internal, None),
+            other => panic!("expected a Func, got {other:?}"),
+        }
+        // A FIELD is the case declaration visibility cannot serve at all.
+        match only_item("struct Region { [internal(\"the end marker\")] anchor: str, label: str }")
+        {
+            Node::Struct(_, _, _, _, Some(fields)) => {
+                assert_eq!(fields.0[0].0.3, Some("the end marker"));
+                assert_eq!(fields.0[1].0.3, None);
+            }
+            other => panic!("expected a Struct, got {other:?}"),
+        }
+        // The reason is REQUIRED — a bare `[internal]` is not the attribute,
+        // and `internal` is a known marker, so no user-macro reading claims it
+        // either: the program declines.
+        assert!(declines("[internal] fun one() { }"));
+        // It follows `[deprecated(..)]` in the ordered prefix and precedes
+        // `[extern(..)]`; the other order declines.
+        assert!(matches!(
+            only_item("[deprecated(\"use two()\")] [internal(\"seam\")] fun one() { }"),
+            Node::Func(_)
+        ));
+        assert!(declines(
+            "[extern(\"fs\", \"read\")] [internal(\"seam\")] external fun read();"
+        ));
     }
 
     #[test]

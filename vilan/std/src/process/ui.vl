@@ -337,6 +337,7 @@ export impl Region {
 	/// wherever it was written and needs no marker to keep that place. The
 	/// browser twin plants one, and `Row` is empty here for the same reason
 	/// `Region` plants no anchor. KEEP IN STEP with the browser twin.
+	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
 	fun open_row<C: Slot>(self, content: C): Row {
 		content.place(self.parent);
 		Row {}
@@ -351,15 +352,18 @@ export impl Region {
 
 	/// Cuts a row out of the document — there is no document to cut it out of,
 	/// and nothing that ever moves. Accepted and dropped. KEEP IN STEP.
+	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
 	fun cut_row(self, row: Row, end: Row): Row {
 		row
 	}
 
 	/// Puts a cut row back — see `cut_row`: nothing was ever taken out, and
 	/// A98's `end` bound has nothing to bound. KEEP IN STEP.
+	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
 	fun insert_row(self, row: Row, content: Row, end: Row) {}
 
 	/// Drops a row — a server render has no removal. KEEP IN STEP.
+	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
 	fun drop_row(self, row: Row) {}
 
 	/// Records the live run — accepted and dropped, like the event binders'
@@ -370,6 +374,7 @@ export impl Region {
 	fun hold(self, live: List<View>) {}
 
 	/// Records the live ROWS — accepted and dropped, with `hold`. KEEP IN STEP.
+	[internal("the reconciler's own row bookkeeping; see `hold_rows`")]
 	fun hold_rows(self, rows: List<Row>) {}
 
 	/// Drops the anchor — there is none to drop, and no live content to take

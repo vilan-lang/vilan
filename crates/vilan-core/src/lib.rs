@@ -764,6 +764,7 @@ fn analyze_source_unfenced(
                     is_async: false,
                     external: false,
                     deprecated: None,
+                    internal: None,
                     extern_binding: None,
                     extern_retains: false,
                     must_use: false,
