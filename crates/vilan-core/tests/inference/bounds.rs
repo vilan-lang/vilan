@@ -11729,3 +11729,139 @@ fn b379_the_bound_carries_through_a_struct_built_from_a_blanket_provider() {
         "true\ntrue\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B381 — `==` on a bounded parameter inside a nested `match` arm in a closure
+// ---------------------------------------------------------------------------
+//
+// Filed from collections-39's FIND 4 as "the arm scope loses the enclosing
+// function's bounds". It does not reproduce as filed: on 49de3915 the nested
+// shape checks, two levels deep and in collections-39's own transcription.
+// What collections-39 met was B379 — its `K` bound only through the
+// `DeltaFeed` BLANKET's trait argument, so it never bound at all, and the
+// refusal ("`K` is missing the bound `: PartialEq`") read as a lost bound at
+// whichever comparison it landed on. The nesting was incidental: the same
+// program with the comparison hoisted out of the closure fails identically on
+// 49de3915 (the fourth pin's shape). These pins hold both facts — the nested
+// shapes check, and the blanket-reached parameter compares inside them.
+
+/// The item's shape, verbatim in spirit: never broken, pinned so it stays so.
+#[test]
+fn b381_eq_on_a_bounded_parameter_inside_a_match_arm_inside_a_closure() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        fun count<K: PartialEq>(xs: List<Option<K>>, key: K): i32 {
+            mut hits = 0;
+            xs.for_each(|x| match x {
+                Some(let k) => if k == key { hits += 1; },
+                None => {},
+            });
+            hits
+        }
+
+        fun main() {
+            print(count([Some(1), None, Some(2), Some(1)], 1));
+        }
+        "#,
+        "2\n",
+    );
+}
+
+/// Two levels of `match` inside the closure.
+#[test]
+fn b381_eq_two_match_levels_deep_inside_a_closure() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+
+        fun count<K: PartialEq>(xs: List<Option<Option<K>>>, key: K): i32 {
+            mut hits = 0;
+            xs.for_each(|x| match x {
+                Some(let inner) => match inner {
+                    Some(let k) => if k == key { hits += 1; },
+                    None => {},
+                },
+                None => {},
+            });
+            hits
+        }
+
+        fun main() {
+            print(count([Some(Some(1)), None, Some(None), Some(Some(1))], 1));
+        }
+        "#,
+        "2\n",
+    );
+}
+
+/// What collections-39 actually met: the compared parameter is reachable only
+/// through a BLANKET provider's trait argument (B379), inside the nested arm.
+/// Red on 49de3915 with "`T` is missing the bound `: PartialEq`".
+#[test]
+fn b381_a_blanket_reached_parameter_compares_inside_a_nested_arm() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        trait Feed<T> { fun feeds(self): bool; }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        fun count<T: PartialEq, S: Feed<T>>(source: S, items: List<Option<T>>, key: T): i32 {
+            mut hits = 0;
+            items.for_each(|x| match x {
+                Some(let k) => if k == key { hits += 1; },
+                None => {},
+            });
+            hits
+        }
+
+        fun main() {
+            let cell: SignalCell<List<str>> = Signal::new(["a"]);
+            print(count(cell, [Some("a"), None, Some("b"), Some("a")], "a"));
+        }
+        "#,
+        "2\n",
+    );
+}
+
+/// The control that locates it: the comparison OUTSIDE the closure and the
+/// `match`, same blanket-reached parameter. It failed on 49de3915 exactly as
+/// the nested one did, which is what says the nesting was never the cause.
+#[test]
+fn b381_the_same_comparison_outside_the_closure_is_the_control() {
+    assert_compiles_and_runs(
+        r#"
+        import std::compare::PartialEq;
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        trait Feed<T> { fun feeds(self): bool; }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        fun same<T: PartialEq, S: Feed<T>>(source: S, left: T, right: T): bool {
+            left == right
+        }
+
+        fun main() {
+            let cell: SignalCell<List<str>> = Signal::new(["a"]);
+            print(same(cell, "a", "a"));
+        }
+        "#,
+        "true\n",
+    );
+}
