@@ -3214,7 +3214,9 @@ fn service_http_refusals(
             ),
         ));
     }
-    for ((field_name, _field_type, exposure), _span) in fields.iter().flat_map(|fields| &fields.0) {
+    for ((field_name, _field_type, exposure, _internal), _span) in
+        fields.iter().flat_map(|fields| &fields.0)
+    {
         if !exposure.is_exposed() {
             continue;
         }
