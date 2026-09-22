@@ -8058,10 +8058,17 @@ const HELD_WRITTEN: &str = r#"
     struct Held<T, S: Signal<List<T>>> { list: S }
     "#;
 
-const HELD_HIDDEN: &str = r#"
+/// The one-parameter spelling of `HELD_WRITTEN`, where `T` is reachable ONLY
+/// through the field's bound. It was B184's sugar (`list: Signal<List<T>>`,
+/// a hidden parameter) until A124 R3 withdrew the bare trait at a field on
+/// 2026-09-22; as a `dyn` it is the same solver question — one written
+/// parameter, reachable through the field's type and nowhere else — with one
+/// argument instead of two, which is why the reports below name `Held<i32>`
+/// rather than `Held<i32, SignalCell<List<i32>>>`.
+const HELD_DYN: &str = r#"
     import std::io::print;
-    import std::reactive::{ Signal, SignalCell };
-    struct Held<T> { list: Signal<List<T>> }
+    import std::reactive::{ Source, SignalCell };
+    struct Held<T> { list: dyn Source<List<T>> }
     "#;
 
 #[test]
@@ -8082,21 +8089,20 @@ fn b251_a_parameter_reachable_only_through_a_bound_grounds_at_the_literal() {
 }
 
 #[test]
-fn b251_the_hidden_parameter_form_grounds_it_too() {
-    // B184's sugar spells the same struct — `Signal<List<T>>` in field position
-    // is a hidden parameter bounded by it — so `T` is reachable only through
-    // that hidden parameter's bound, and it is the shape the estate actually
-    // has. Same recovery, same answer.
+fn b251_the_object_field_form_grounds_it_too() {
+    // The one-parameter spelling: `T` is reachable only through the FIELD's
+    // bound, which is the shape the estate actually has. Same recovery, same
+    // answer, one argument.
     assert_fails_with(
         &format!(
-            r#"{HELD_HIDDEN}
+            r#"{HELD_DYN}
             fun main() {{
                 let h: i32 = Held {{ list = SignalCell::new([1, 2]) }};
                 print(h);
             }}
             "#
         ),
-        "but got Held<i32, SignalCell<List<i32>>> instead.",
+        "but got Held<i32> instead.",
     );
 }
 
@@ -8108,12 +8114,12 @@ fn b251_the_grounded_parameter_is_what_a_consumer_is_checked_against() {
     // visible at all.
     assert_fails_with(
         &format!(
-            r#"{HELD_HIDDEN}
+            r#"{HELD_DYN}
             fun count(h: Held<i32>): i32 {{ h.list.get().len() }}
             fun main() {{ print(count(Held {{ list = SignalCell::new(["a"]) }})); }}
             "#
         ),
-        "but got Held<str, SignalCell<List<str>>> instead.",
+        "but got Held<str> instead.",
     );
 }
 
@@ -8123,7 +8129,7 @@ fn b251_the_matching_element_still_compiles_and_runs() {
     // program that agrees.
     assert_compiles_and_runs(
         &format!(
-            r#"{HELD_HIDDEN}
+            r#"{HELD_DYN}
             fun count(h: Held<i32>): i32 {{ h.list.get().len() }}
             fun main() {{ print(count(Held {{ list = SignalCell::new([1, 2, 3]) }})); }}
             main();
@@ -8440,14 +8446,15 @@ fn b262_an_unbounded_enum_parameters_written_argument_is_still_free() {
 
 #[test]
 fn b263_an_impl_body_reads_the_element_through_a_bounded_siblings_bound() {
-    // The filed exhibit, run. `T` is reachable only through the hidden
-    // parameter's bound (B184's sugar spells `list: Signal<List<T>>`), and the
-    // body indexes what `get()` returns.
+    // The filed exhibit, run. `T` is reachable only through the FIELD's bound
+    // (B184's sugar spelled `list: Signal<List<T>>`; since A124 R3 the same
+    // shape is `list: dyn Source<List<T>>`), and the body indexes what `get()`
+    // returns.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, SignalCell };
-        struct Held<T> { list: Signal<List<T>> }
+        import std::reactive::{ Source, SignalCell };
+        struct Held<T> { list: dyn Source<List<T>> }
         impl Held<type T> {
             fun first(self): T { self.list.get()[0] }
         }
@@ -8510,8 +8517,8 @@ fn b263_a_methods_own_generic_still_binds_from_its_argument() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, SignalCell };
-        struct Held<T> { list: Signal<List<T>> }
+        import std::reactive::{ Source, SignalCell };
+        struct Held<T> { list: dyn Source<List<T>> }
         impl Held<type T> {
             fun first(self): T { self.list.get()[0] }
             fun tagged<U>(self, tag: U): U { tag }
@@ -8534,14 +8541,14 @@ fn b263_the_literal_form_is_unchanged() {
     // already had.
     assert_fails_with(
         &format!(
-            r#"{HELD_HIDDEN}
+            r#"{HELD_DYN}
             fun main() {{
                 let h: i32 = Held {{ list = SignalCell::new([1, 2]) }};
                 print(h);
             }}
             "#
         ),
-        "but got Held<i32, SignalCell<List<i32>>> instead.",
+        "but got Held<i32> instead.",
     );
 }
 

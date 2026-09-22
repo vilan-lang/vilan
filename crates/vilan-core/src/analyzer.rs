@@ -28511,198 +28511,6 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// B184's pre-pass: gives every struct whose fields name a trait — or name
-    /// a struct that already carries one — its HIDDEN generic parameters,
-    /// before the `prepped_type_locals` drain resolves a single mention.
-    ///
-    /// It has to run first, and the reason is the drain's ORDER. The drain is
-    /// walk order, and walk order is the entry file and then the modules it
-    /// imports — while a struct's mentions live in the modules that import its
-    /// declaration. So `fun tell(c: C)` in `main.vl` routinely drains before
-    /// `struct C { x: X }` in `store.vl`, and a mention that drained first
-    /// would see a struct with no parameters and erase the field. (That
-    /// erasure is exactly B188's miscompile, in a new carrier.)
-    ///
-    /// Two stages, because the parameter is VIRAL in the way a written one is:
-    ///
-    /// 1. a field annotated with a bare trait mints one hidden parameter on its
-    ///    struct, bounded by that trait — `struct C { x: X }` is
-    ///    `struct C<#0: X> { x: #0 }`;
-    /// 2. a field annotated with a bare struct that carries hidden parameters
-    ///    mints one of its OWN per parameter, with the same bound —
-    ///    `struct Outer { c: C }` is `struct Outer<#0: X> { c: C<#0> }`.
-    ///
-    /// Stage 2 feeds itself (an `Outer` may be held by an `Outermost`), so it
-    /// runs to a fixpoint. It is bounded: each round that changes anything adds
-    /// a parameter to some struct, and a struct gains at most one per field.
-    fn resolve_hidden_struct_parameters(&mut self) {
-        // The field annotations, in walk order — a deterministic order, which
-        // is what makes the parameter LIST a struct ends up with deterministic
-        // too, and with it the arguments a mention's mint zips against.
-        let field_annotations: Vec<(TypeId, &'src str, Id, Vec<TypeId>, Id, Id)> = self
-            .prepped_type_locals
-            .iter()
-            .filter_map(|(type_id, name, scope_id, _span, arguments, _source_id)| {
-                self.field_annotation_type_ids
-                    .get(type_id)
-                    .map(|(struct_id, body_scope_id)| {
-                        (
-                            *type_id,
-                            *name,
-                            *scope_id,
-                            arguments.clone(),
-                            *struct_id,
-                            *body_scope_id,
-                        )
-                    })
-            })
-            .collect();
-        if field_annotations.is_empty() {
-            return;
-        }
-        // A field annotation that is a path head is not an application of the
-        // name it starts with, and one written where a bound belongs is B212's
-        // refusal — neither is this reading.
-        let mut rounds = 0;
-        loop {
-            let mut changed = false;
-            for (type_id, name, scope_id, arguments, struct_id, body_scope_id) in &field_annotations
-            {
-                if self.hidden_annotation_types.contains_key(type_id)
-                    || self.path_head_type_ids.contains(type_id)
-                    || self.attributed_declarations.contains(struct_id)
-                {
-                    continue;
-                }
-                let Some(subject_id) = self
-                    .try_get_type_id_by_name(name, *scope_id)
-                    .or_else(|| self.try_get_expr_id_by_name(name, *scope_id))
-                else {
-                    continue;
-                };
-                // The SORT the name resolved to, read off the entity rather
-                // than off a type. `infer_type` is not available here: the
-                // pre-pass runs before the drain that resolves the ids it would
-                // walk, and a defaulted parameter (`<S = i32>`) is enough to
-                // make it index a slot that has no content yet. Every question
-                // this pass asks — trait or struct, which one, with what
-                // declared arguments — is answerable from the entity map and a
-                // non-panicking read of the type map, which is the same reason
-                // `bare_trait_in_value_position` reads `Self` that way.
-                let sort = self.expr_id_to_expr_map.get(&subject_id).cloned();
-                let declared_type = self
-                    .expr_id_to_type_id_map
-                    .get(&subject_id)
-                    .and_then(|declared_id| self.type_id_to_type_map.get(declared_id))
-                    .cloned();
-                let subject_type = match sort {
-                    Some(Expr::Trait(trait_id)) => Type::Trait(trait_id, Vec::new()),
-                    Some(Expr::Struct(struct_id)) => Type::Struct(struct_id, Vec::new()),
-                    _ => continue,
-                };
-                // An application already refused on its arity is not this
-                // reading either: one report per written spelling (B188).
-                if self
-                    .written_application_arity_error(
-                        subject_id,
-                        &subject_type,
-                        name,
-                        arguments.len(),
-                    )
-                    .is_some()
-                {
-                    continue;
-                }
-                let bounds: Vec<TypeId> = match &subject_type {
-                    // Stage 1. Keyed on the ENTITY, not on the type it produced,
-                    // for the reason the value-position refusal is: `Self` and a
-                    // generic defaulted to a trait resolve to the same
-                    // `Type::Trait` and are neither of them this spelling.
-                    Type::Trait(trait_id, _) => {
-                        let declared_arguments = match declared_type {
-                            Some(Type::Trait(_, declared_arguments)) => declared_arguments,
-                            _ => Vec::new(),
-                        };
-                        let arguments = match arguments.is_empty() {
-                            true => declared_arguments,
-                            false => arguments.clone(),
-                        };
-                        let bound = self.type_id_for_type(Type::Trait(*trait_id, arguments));
-                        if let Some(trait_) = self.traits.get(trait_id) {
-                            let name = trait_.name;
-                            self.generic_constraint_names.insert(bound, name);
-                        }
-                        vec![bound]
-                    }
-                    // Stage 2 — the virality, which is the price §R2.2 named and
-                    // is invisible exactly as intended. The held struct's hidden
-                    // parameters are not shared: this struct mints its own, one
-                    // per, carrying the same bound.
-                    Type::Struct(held_id, _) if arguments.is_empty() && *held_id != *struct_id => {
-                        let held: Vec<TypeId> = self
-                            .hidden_generic_parameters
-                            .get(held_id)
-                            .cloned()
-                            .unwrap_or_default();
-                        if held.is_empty() {
-                            continue;
-                        }
-                        held.into_iter()
-                            .map(|held_constraint_id| {
-                                let bound = held_constraint_id.get_type(self);
-                                let name = self
-                                    .generic_constraint_names
-                                    .get(&held_constraint_id)
-                                    .copied();
-                                let minted = self.type_id_for_type(bound);
-                                if let Some(name) = name {
-                                    self.generic_constraint_names.insert(minted, name);
-                                }
-                                minted
-                            })
-                            .collect()
-                    }
-                    _ => continue,
-                };
-                let mut minted = Vec::new();
-                for bound in bounds {
-                    self.implicit_generic_scopes.insert(bound, *body_scope_id);
-                    if let Some(struct_) = self.structs.get_mut(struct_id) {
-                        struct_.generic_parameter_constraint_ids.push(bound);
-                    }
-                    self.hidden_generic_parameters
-                        .entry(*struct_id)
-                        .or_default()
-                        .push(bound);
-                    minted.push(bound);
-                }
-                // Stage 1's field IS the parameter; stage 2's field is the held
-                // struct APPLIED to the parameters this struct just minted.
-                let field_type = match &subject_type {
-                    Type::Struct(held_id, _) => {
-                        // As at a mention: the held struct's arguments are
-                        // TYPES over this struct's new parameters, not the
-                        // parameters themselves.
-                        let arguments = minted
-                            .iter()
-                            .map(|constraint_id| {
-                                self.type_id_for_type(Type::Generic(*constraint_id))
-                            })
-                            .collect();
-                        Type::Struct(*held_id, arguments)
-                    }
-                    _ => Type::Generic(minted[0]),
-                };
-                self.hidden_annotation_types.insert(*type_id, field_type);
-                changed = true;
-            }
-            rounds += 1;
-            if !changed || rounds > field_annotations.len() {
-                break;
-            }
-        }
-    }
-
     /// A124 R3 / trait-objects.md §4: resolve every written `dyn Trait<..>` to
     /// [`Type::Dyn`], refusing the spellings that cannot be one.
     ///
@@ -40216,11 +40024,33 @@ impl<'src> Analyzer<'src> {
         closest_name::closest_name(name, candidates)
     }
 
+    /// The refusal for a trait written where a VALUE type belongs
+    /// (`trait-objects.md` §12.2), with the steer that says what to write
+    /// instead — and, since A124 R3, that steer names `dyn Trait` at a field.
+    ///
+    /// **The field clause is what changed, and it is BREAKING.** B184 made a
+    /// bare trait at a struct field sugar for a hidden type parameter
+    /// (`struct C { x: X }` ≡ `struct C<#0: X> { x: #0 }`), and the steer
+    /// offered it. A124's probe (g) is the cost of that reading: a `Holder`
+    /// over a root and a `Holder` over a mapped node are `Holder<Root>` and
+    /// `Holder<Dbl<Root>>`, so one list of both is refused, and the parameter
+    /// is viral through every embedding struct. The owner withdrew the sugar
+    /// AT THAT POSITION on 2026-09-22 and ruled the object in its place: a
+    /// field holds `dyn Trait`, which is one type whatever it holds. B186's
+    /// parameter and B161's binding are unchanged and the steer still names
+    /// them.
+    ///
+    /// An ATTRIBUTED declaration takes the same steer now, where it used to
+    /// take a second sentence explaining why the sugar was refused there: the
+    /// sugar is gone everywhere, and `dyn Trait` is a written type a generator
+    /// can spell, so nothing about `[derive]` or `[service]` is special any
+    /// more. The parameter is kept in the signature because the caller still
+    /// distinguishes the two sites and a later rule may want to again.
     fn bare_trait_in_value_position(
         &self,
         trait_id: Id,
         scope_id: Id,
-        attributed_field: bool,
+        _attributed_field: bool,
     ) -> (String, Option<crate::error::Note>) {
         let trait_ = self.traits.get(&trait_id);
         let trait_name = trait_.map(|trait_| trait_.name).unwrap_or("this trait");
@@ -40229,36 +40059,13 @@ impl<'src> Analyzer<'src> {
             msg: format!("'{trait_name}' is declared here, as a trait"),
             source: self.source_of_id(trait_.id),
         });
-        // The steer names the three positions that DO take the spelling — a
-        // parameter (B186's implicit generic), a binding (B161's checked
-        // constraint) and now a struct field (B184's hidden parameter) —
-        // because a reader who wrote a trait here almost always meant one of
-        // them, and the `<T: Trait>` recipe is what is left for a RETURN, the
-        // one value position with no binding source to ground a parameter from.
-        //
-        // The field clause is dropped where a field is NOT one of them: on a
-        // declaration carrying an attribute, where B184's hidden parameter is
-        // refused because a generator cannot spell it. Steering an author into
-        // a second refusal is the failure mode B188's arity message was
-        // rewritten to avoid (audit run 7, F4).
-        let field_clause = match attributed_field {
-            true => String::new(),
-            false => format!(" or `struct S {{ f: {trait_name} }}` for a field"),
-        };
         let mut message = format!(
-            "'{trait_name}' is a trait, not a type: a trait is not a value type (vilan has \
-             no trait objects), so no value can have this type. Here a trait names a \
-             parameter's bound, not a value type; write `fun f(x: {trait_name})` for a \
-             parameter{field_clause}, or a generic for a return — `<T: {trait_name}>`, with \
-             'T' written here."
+            "'{trait_name}' is a trait, not a type: a trait names a bound, and a value needs \
+             a type. Write `fun f(x: {trait_name})` for a parameter, `dyn {trait_name}` for a \
+             field or any other position that holds a value — the trait OBJECT, whose concrete \
+             type is erased — or a generic for a return, `<T: {trait_name}>` with 'T' written \
+             here."
         );
-        if attributed_field {
-            message.push_str(
-                " A field MAY name a trait, but not on a declaration carrying an attribute: \
-                 `[derive]` and `[service]` write code from the types the author wrote, and a \
-                 trait-typed field's type parameter is not written anywhere.",
-            );
-        }
         // `Self` in scope, resolving to this very trait, means the annotation
         // sits inside the trait's own declaration. The lookup is by the type
         // map directly rather than `get_type`, which panics on an id that has
@@ -47153,11 +46960,6 @@ impl<'src> Analyzer<'src> {
             split.push(("locals", split_mark.elapsed()));
             split_mark = crate::PhaseClock::now();
         }
-
-        // B184: every struct's hidden parameters, decided before the first
-        // mention resolves — see `resolve_hidden_struct_parameters` for why it
-        // cannot ride along in the drain below.
-        self.resolve_hidden_struct_parameters();
 
         for (type_id, name, scope_id, span, argument_type_ids, source_id) in
             std::mem::take(&mut self.prepped_type_locals)

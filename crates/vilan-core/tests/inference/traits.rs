@@ -1153,7 +1153,7 @@ fn b186_a_trait_on_a_closure_parameter_is_still_refused() {
 #[test]
 fn b186_the_refusal_at_the_other_positions_steers_to_the_sugar() {
     // One error identity, a steer that now names the position that WORKS.
-    let steer = "a trait names a parameter's bound, not a value type";
+    let steer = "a trait names a bound, and a value needs a type";
     assert_fails_with(
         &format!(
             r#"{GREET}
@@ -1164,10 +1164,13 @@ fn b186_the_refusal_at_the_other_positions_steers_to_the_sugar() {
         ),
         steer,
     );
-    // The FIELD leg left this list with B184 (`b184_a_trait_in_struct_field_
-    // position_is_the_hidden_parameter`), the way the parameter leg left it
-    // with B186. What is left is the return, the nested spelling, and the
-    // CLOSURE parameter — the position that has no generic list to append to.
+    // The FIELD leg left this list with B184 and CAME BACK with A124 R3, which
+    // withdrew the hidden parameter at that position — so a field is a refusal
+    // again, steered to `dyn Greet` rather than to the sugar
+    // (`b184_a_trait_at_a_struct_field_is_refused_and_steers_to_dyn`). The
+    // parameter leg left with B186 and stays gone. What this pins is the
+    // return, the nested spelling, and the CLOSURE parameter — the position
+    // that has no generic list to append to.
     assert_fails_with(
         &format!(
             r#"{GREET}
@@ -2133,71 +2136,59 @@ fn b235_a_defaulted_parameter_the_clause_left_out_is_still_no_bound() {
 }
 
 #[test]
-fn b184_a_trait_in_struct_field_position_is_the_hidden_parameter() {
-    // SUPERSEDED BY B184 (was `a_trait_in_struct_field_position_is_still_refused`).
-    // The field is the third position where a trait annotation is a reading
-    // rather than a mistake, and it reads as a HIDDEN type parameter:
-    // `struct Kennel { inner: Greet }` is `struct Kennel<#0: Greet> { inner: #0 }`,
-    // grounded at the literal. So `.inner` is a `Dog` here — its own field
-    // `name` is readable, which is exactly what the refusal used to deny.
+fn b184_a_trait_at_a_struct_field_is_refused_and_steers_to_dyn() {
+    // A124 R3, RULED 2026-09-22 — **BREAKING**, and the withdrawal of B184's
+    // reading at this one position. A bare trait at a field was sugar for a
+    // hidden type parameter (`struct C { x: X }` = `struct C<#0: X> { x: #0 }`,
+    // grounded per literal), and A124's probe (g) is what it cost: a `Holder`
+    // over a root and a `Holder` over a mapped node were two types, so one list
+    // of both was refused, and the parameter was viral through every embedding
+    // struct. The field takes the OBJECT instead, and the refusal says so.
+    //
+    // B186's parameter and B161's binding are unchanged; the steer still names
+    // them, and `dyn_objects.rs` holds what the field now does.
+    let source = format!(
+        r#"{HIDDEN}
+        fun main() {{ let c = C {{ x = A {{}} }}; print(c.x.who()); }}
+        main();
+        "#
+    );
+    assert_fails_once_with(&source, "'X' is a trait, not a type");
+    assert_fails_with(&source, "`dyn X` for a field");
+    assert_fails_with(&source, "`fun f(x: X)` for a parameter");
+}
+
+#[test]
+fn b184_the_dyn_field_the_steer_names_is_what_to_write() {
+    // Advice that compiles, which is the standing rule for a steer: the very
+    // program above with the steer taken. Two impls in one field type, which is
+    // also what the hidden parameter could not do.
     assert_compiles_and_runs(
-        &format!(
-            r#"{GREET}
-            struct Kennel {{ inner: Greet }}
-            fun main() {{ print(Kennel {{ inner = Dog {{ name = "rex" }} }}.inner.name); }}
-            main();
-            "#
-        ),
-        "rex\n",
+        r#"
+        import std::io::print;
+        trait X { fun who(self): str; }
+        struct A {}
+        impl A with X { fun who(self): str { "A" } }
+        struct B {}
+        impl B with X { fun who(self): str { "B" } }
+        struct C { x: dyn X }
+        fun main() {
+            let a = A {};
+            let b = B {};
+            let cs: List<C> = [ C { x = a }, C { x = b } ];
+            for c in cs { print(c.x.who()); }
+        }
+        main();
+        "#,
+        "A\nB\n",
     );
 }
 
 #[test]
-fn b184_case_1_two_bindings_at_one_type() {
-    // Valid under all three readings of "all instantiations use the same
-    // concrete type", so it decides nothing on its own — it is here because a
-    // rule that refuses the field outright (today's, before this lane) reddens
-    // it, and because it is the shape every other case is measured against.
-    assert_compiles_and_runs(
-        &format!(
-            r#"{HIDDEN}
-            fun main() {{
-                let c1 = C {{ x = A {{}} }};
-                let c2 = C {{ x = A {{}} }};
-                print(c1.x.who() + c2.x.who());
-            }}
-            main();
-            "#
-        ),
-        "AA\n",
-    );
-}
-
-#[test]
-fn b184_case_2_a_mut_reassigned_at_the_same_type() {
-    // The reassignment's type is `C<A>` and the binding's type is `C<A>`, so
-    // they agree. Reddened by a per-MENTION rule that minted a second generic
-    // at the reassignment — the two would then be independent and refuse.
-    assert_compiles_and_runs(
-        &format!(
-            r#"{HIDDEN}
-            fun main() {{
-                mut c1 = C {{ x = A {{}} }};
-                c1 = C {{ x = A {{}} }};
-                print(c1.x.who());
-            }}
-            main();
-            "#
-        ),
-        "A\n",
-    );
-}
-
-#[test]
-fn b184_case_3_as_written_is_a_scope_error_and_only_that() {
-    // The item wrote `c2 = …` with no `let`, which is a plain scope error and
-    // stays one: whatever B184 rules, this program is invalid on its first line
-    // of trouble, and it must not be invalid for a TYPE reason on top.
+fn b184_case_3_as_written_is_a_scope_error_and_it_is_not_the_only_one() {
+    // The item's case 3 kept, with the one assertion the withdrawal moves: the
+    // missing `let` is still a plain scope error, and the field is NOW also
+    // refused — two mistakes, two reports, neither standing in for the other.
     let source = format!(
         r#"{HIDDEN}
         fun main() {{
@@ -2207,275 +2198,20 @@ fn b184_case_3_as_written_is_a_scope_error_and_only_that() {
         main();
         "#
     );
-    assert_fails_once_with(&source, "cannot find 'c2' in this scope");
-    assert_fails_without(&source, "is a trait, not a type");
+    assert_fails_with(&source, "cannot find 'c2' in this scope");
+    assert_fails_once_with(&source, "'X' is a trait, not a type");
     assert_fails_without(&source, "hidden type parameter");
 }
 
 #[test]
-fn b218_case_3_as_intended_names_the_hidden_arguments() {
-    // THE B218 pin, and the owner's ruling on Q3. Under B186's display rule an
-    // implicit generic renders under its TRAIT's name, which here would print
-    // `Expected C, but got C instead.` — a message that reads as a compiler
-    // fault. The hidden argument shows instead, in the desugaring's own
-    // spelling, and the initializer note that grounded the binding comes with
-    // it (the shape B161 already produces one level down).
-    let source = format!(
-        r#"{HIDDEN}
-        fun main() {{
-            mut c1 = C {{ x = A {{}} }};
-            c1 = C {{ x = B {{}} }};
-            print(c1.x.who());
-        }}
-        main();
-        "#
-    );
-    assert_fails_with(&source, "Expected C<A>, but got C<B> instead.");
-    assert_fails_noting(
-        &source,
-        "Expected C<A>, but got C<B> instead.",
-        "C { x = A {} }",
-        "the variable's type was inferred from this initializer (C<A>)",
-    );
-}
-
-#[test]
-fn b184_case_4_two_bindings_at_different_types() {
-    // THE DISCRIMINATING PIN. Two values, two hidden arguments, two
-    // monomorphizations — valid, because the language already answered this at
-    // the `let` position (B161) and at the parameter position (B186), and
-    // ruling it invalid here would make the field the one position where a
-    // trait annotation constrains other people's code. Reddened by the
-    // program-wide rule, which refuses it.
-    assert_compiles_and_runs(
-        &format!(
-            r#"{HIDDEN}
-            fun main() {{
-                let c1 = C {{ x = A {{}} }};
-                let c2 = C {{ x = B {{}} }};
-                print(c1.x.who());
-                print(c2.x.who());
-            }}
-            main();
-            "#
-        ),
-        "A\nB\n",
-    );
-}
-
-#[test]
-fn b184_a_consumer_of_a_trait_typed_struct_is_generic() {
-    // The consequence of case 4 the owner is agreeing to: `fun tell(c: C)` is
-    // `fun tell<#0: X>(c: C<#0>)`, so ONE written function takes a `C<A>` and a
-    // `C<B>` and dispatches each to its own impl. Under the program-wide rule
-    // `tell` would be an ordinary non-generic function and one of the two calls
-    // would refuse.
-    assert_compiles_and_runs(
-        &format!(
-            r#"{HIDDEN}
-            fun tell(c: C): str {{ c.x.who() }}
-            fun main() {{
-                print(tell(C {{ x = A {{}} }}));
-                print(tell(C {{ x = B {{}} }}));
-            }}
-            main();
-            "#
-        ),
-        "A\nB\n",
-    );
-}
-
-#[test]
-fn b184_two_mentions_in_one_signature_are_independent() {
-    // The same "two annotations, two generics" rule B186 pins one level down
-    // (`b186_two_parameters_of_one_trait_are_independent_generics`): `fun
-    // both(p: C, q: C)` accepts a `C<A>` and a `C<B>`, because each mention
-    // minted its own hidden argument.
-    assert_compiles_and_runs(
-        &format!(
-            r#"{HIDDEN}
-            fun both(p: C, q: C): str {{ p.x.who() + q.x.who() }}
-            fun main() {{ print(both(C {{ x = A {{}} }}, C {{ x = B {{}} }})); }}
-            main();
-            "#
-        ),
-        "AB\n",
-    );
-}
-
-#[test]
-fn b184_two_trait_typed_fields_are_two_hidden_parameters() {
-    // One per FIELD, not one per struct — so a struct may hold an `A` and a `B`
-    // at once, which is the multi-parameter edge the rule has to answer.
-    assert_compiles_and_runs(
-        &format!(
-            r#"{HIDDEN}
-            struct P {{ a: X, b: X }}
-            fun main() {{
-                let p = P {{ a = A {{}}, b = B {{}} }};
-                print(p.a.who() + p.b.who());
-            }}
-            main();
-            "#
-        ),
-        "AB\n",
-    );
-}
-
-#[test]
-fn b184_a_nested_holder_gains_a_hidden_parameter_of_its_own() {
-    // The VIRALITY, which is the price the per-binding rule pays and is
-    // invisible exactly as intended: `struct Outer { c: C }` is
-    // `struct Outer<#0: X> { c: C<#0> }`. Reddened by a lane that stops the
-    // hidden parameter at one level — `Outer`'s field would then be `C` with no
-    // argument, which is the erasure B188 closed.
-    assert_compiles_and_runs(
-        &format!(
-            r#"{HIDDEN}
-            struct Outer {{ c: C }}
-            fun read(o: Outer): str {{ o.c.x.who() }}
-            fun main() {{
-                print(read(Outer {{ c = C {{ x = A {{}} }} }}));
-                print(read(Outer {{ c = C {{ x = B {{}} }} }}));
-            }}
-            main();
-            "#
-        ),
-        "A\nB\n",
-    );
-}
-
-#[test]
-fn b184_an_impl_subject_grounds_the_hidden_parameter() {
-    // A struct with methods, which is what makes the sugar usable at all. The
-    // impl is generic over the hidden parameter exactly as `impl C<type S: X>`
-    // would be, so `Self` is `C<S>` and `self.x` is the argument's own type.
-    assert_compiles_and_runs(
-        &format!(
-            r#"{HIDDEN}
-            impl C {{ fun tell(self): str {{ self.x.who() }} }}
-            fun main() {{
-                print(C {{ x = A {{}} }}.tell());
-                print(C {{ x = B {{}} }}.tell());
-            }}
-            main();
-            "#
-        ),
-        "A\nB\n",
-    );
-}
-
-#[test]
-fn b184_a_binding_annotation_is_a_constraint_not_a_type() {
-    // A `let`'s annotation grounds nothing — the initializer does — so it reads
-    // as B161's constraint: the binding keeps `C<A>`, and the annotation only
-    // checks that the value really is one of `C`'s.
-    assert_compiles_and_runs(
-        &format!(
-            r#"{HIDDEN}
-            fun main() {{
-                let c: C = C {{ x = A {{}} }};
-                print(c.x.who());
-            }}
-            main();
-            "#
-        ),
-        "A\n",
-    );
-    assert_fails_with(
-        &format!(
-            r#"{HIDDEN}
-            struct D {{ v: i32 }}
-            fun main() {{ let c: C = D {{ v = 1 }}; }}
-            main();
-            "#
-        ),
-        "Expected C, but got D instead.",
-    );
-}
-
-#[test]
-fn b184_a_value_that_lacks_the_trait_is_refused_at_the_literal() {
-    // The bound is a real bound: the hidden parameter is declared `: X`, and a
-    // field value that does not implement it is refused where every generic
-    // bound is refused — at the literal that binds it.
-    assert_fails_with(
-        &format!(
-            r#"{HIDDEN}
-            struct N {{ v: i32 }}
-            fun main() {{ let c = C {{ x = N {{ v = 1 }} }}; }}
-            main();
-            "#
-        ),
-        "'N' does not implement trait 'X', required by a declared bound of 'C'",
-    );
-}
-
-#[test]
-fn b184_the_return_position_refuses() {
-    // OUT OF SCOPE for v1, deliberately: a return type has no value in it, so
-    // there is nothing to ground the hidden argument from. It is the
-    // existential case (Rust's `-> impl Trait`, a different feature from its
-    // argument position), and it refuses at the ANNOTATION rather than at every
-    // call — which is where the fix goes. Reddened by a lane that quietly makes
-    // returns existential.
-    let source = format!(
-        r#"{HIDDEN}
-        fun get(): C {{ C {{ x = A {{}} }} }}
-        fun main() {{ print(get().x.who()); }}
-        main();
-        "#
-    );
-    assert_fails_with(&source, "carries a hidden type parameter");
-    assert_fails_with(&source, "and nothing here can supply one");
-    // The steer names the positions that DO ground one, and each of them is a
-    // pin above — advice that compiles, not advice.
-    assert_fails_with(&source, "a `fun` parameter (`fun f(c: C)`)");
-}
-
-#[test]
-fn b184_the_type_argument_position_refuses() {
-    // The module-level `Context<C>` of the kolt exhibit: a type argument with
-    // nothing to ground it. This is the one thing the program-wide rule would
-    // have bought, and the honest cost of choosing per-binding instead.
-    assert_fails_with(
-        &format!(
-            r#"{HIDDEN}
-            import std::context::Context;
-            let ctx = Context<C>::new();
-            fun main() {{ print(1); }}
-            main();
-            "#
-        ),
-        "carries a hidden type parameter",
-    );
-}
-
-#[test]
-fn b184_the_hidden_argument_is_not_writable() {
-    // The author never writes it, and the arity check says so: the hidden
-    // parameter is deliberately absent from the DECLARED-parameter table, which
-    // is what the check counts, so `C<A>` is over-supply.
-    assert_fails_with(
-        &format!(
-            r#"{HIDDEN}
-            fun tell(c: C<A>): str {{ c.x.who() }}
-            fun main() {{ print(tell(C {{ x = A {{}} }})); }}
-            main();
-            "#
-        ),
-        "`C` takes 0 type arguments, 1 given",
-    );
-}
-
-#[test]
-fn b184_the_sugar_is_refused_on_an_attributed_declaration() {
-    // The v1 boundary, and its reason is the paper's own §4: macro reflection
-    // is SYNTACTIC — a generator reads the type the author WROTE — so it cannot
-    // spell a parameter that was never written, and `[derive(Wire)]` would emit
-    // `fun from_json_value(..): Kennel` for a `Kennel` that cannot be named in
-    // a return. One report at the annotation beats a page of generated-code
-    // follow-ons (B182's rule), so the field keeps the old refusal there.
+fn b184_an_attributed_declaration_takes_the_same_steer() {
+    // The v1 boundary that no longer needs a boundary. `[derive]` used to get a
+    // second sentence explaining why the sugar was refused on an attributed
+    // declaration (macro reflection is syntactic, so a generator cannot spell a
+    // parameter nobody wrote). The sugar is gone everywhere now, and `dyn X` is
+    // a written type a generator CAN spell, so the ordinary steer is the whole
+    // answer — and it is still one report, not a page of generated-code
+    // follow-ons (B182's rule).
     let source = format!(
         r#"{GREET}
         [derive(Wire)]
@@ -2485,7 +2221,8 @@ fn b184_the_sugar_is_refused_on_an_attributed_declaration() {
         "#
     );
     assert_fails_once_with(&source, "'Greet' is a trait, not a type");
-    assert_fails_with(&source, "not on a declaration carrying an attribute");
+    assert_fails_with(&source, "`dyn Greet` for a field");
+    assert_fails_without(&source, "not on a declaration carrying an attribute");
     assert_fails_without(&source, "from_json_value");
     let diagnostics = failure_diagnostics(&source);
     assert_eq!(
@@ -2496,58 +2233,17 @@ fn b184_the_sugar_is_refused_on_an_attributed_declaration() {
 }
 
 #[test]
-fn b218_a_call_argument_mismatch_names_the_hidden_arguments() {
-    // B218's shape through the sugar: one written generic, two `C`s at two
-    // hidden arguments. Before the hidden argument printed, this read `Expected
-    // C, but got C instead.`
-    assert_fails_with(
-        &format!(
-            r#"{HIDDEN}
-            fun pair<T>(a: T, b: T): str {{ "ok" }}
-            fun main() {{ print(pair(C {{ x = A {{}} }}, C {{ x = B {{}} }})); }}
-            main();
-            "#
-        ),
-        "Expected C<A>, but got C<B> instead.",
-    );
-}
-
-#[test]
-fn b218_the_rotate_shape_names_the_hidden_arguments_on_both_reports() {
-    // B211's three-way rotate, in the carrier B218 was filed against: TWO
-    // reports, and each names which `C` it means. Two reports that both read
-    // `Expected C, but got C` is the diagnostic this replaces.
-    let source = format!(
-        r#"{HIDDEN}
-        fun main() {{
-            mut p = C {{ x = A {{}} }};
-            mut q = C {{ x = B {{}} }};
-            let t = p;
-            p = q;
-            q = t;
-            print(p.x.who());
-        }}
-        main();
-        "#
-    );
-    assert_fails_with(&source, "Expected C<A>, but got C<B> instead.");
-    assert_fails_with(&source, "Expected C<B>, but got C<A> instead.");
-}
-
-#[test]
-fn b184_a_written_parameter_and_a_hidden_one_coexist() {
-    // The mixed form, and the shape the estate actually has: a struct that is
-    // ALREADY generic and whose trait-typed field's bound mentions its own
-    // parameter. Three things have to hold at once and each has its own way to
-    // break — the hidden parameter is APPENDED (so `Held<i32>` still writes one
-    // argument, and it still means the element), the arity check counts only
-    // what the author may write, and the bound is substituted into the
-    // mention's terms (`Signal<List<T>>` at `Held<i32>` is `Signal<List<i32>>`,
-    // not a bound over the struct's own abstract `T`).
+fn b184_a_written_generic_beside_a_trait_typed_field_still_works_as_dyn() {
+    // The mixed form B184 pinned, carried across: a struct that is ALREADY
+    // generic and whose trait-typed field mentions its own parameter. Under the
+    // sugar the hidden parameter was APPENDED, so `Held<i32>` still wrote one
+    // argument; as a `dyn` there is no second parameter at all, which is the
+    // simplification the withdrawal buys — `Held<i32>` is `Held<i32>` whatever
+    // the field holds.
     const HELD: &str = r#"
         import std::io::print;
-        import std::reactive::{ Signal, SignalCell };
-        struct Held<T> { first: T, list: Signal<List<T>> }
+        import std::reactive::{ Source, SignalCell };
+        struct Held<T> { first: T, list: dyn Source<List<T>> }
         "#;
     assert_compiles_and_runs(
         &format!(
@@ -2565,8 +2261,9 @@ fn b184_a_written_parameter_and_a_hidden_one_coexist() {
         ),
         "3\nz\n",
     );
-    // The WRITTEN argument is still checked — only the hidden tail is
-    // unwritable, and the report shows both halves.
+    // The WRITTEN argument is still checked, and it is now the ONLY one: the
+    // report names `Held<i32>` against `Held<str>`, where the sugar's report
+    // had to carry the unwritable tail as well.
     assert_fails_with(
         &format!(
             r#"{HELD}
@@ -2576,55 +2273,7 @@ fn b184_a_written_parameter_and_a_hidden_one_coexist() {
             main();
             "#
         ),
-        "Expected Held<i32>, but got Held<str, SignalCell<List<str>>> instead.",
-    );
-}
-
-#[test]
-fn b184_the_sugar_emits_exactly_what_the_written_generic_emits() {
-    // The claim that makes this sugar and not a new solver mode, checked the
-    // only way it can be: BYTE-IDENTICAL JavaScript for the same program spelled
-    // both ways. The two sources differ in exactly two lines — the struct's
-    // declaration and its consumer's signature — and in nothing the emitter
-    // sees.
-    const BODY: &str = r#"
-        fun main() {
-            let c1 = C { x = A { tag = "aa" } };
-            let c2 = C { x = B { n = 7 } };
-            let c3 = C { x = A { tag = "cc" } };
-            print(tell(c1));
-            print(tell(c2));
-            print(tell(c3));
-        }
-        main();
-        "#;
-    const HEAD: &str = r#"
-        import std::io::print;
-        trait X { fun who(self): str; }
-        struct A { tag: str }
-        impl A with X { fun who(self): str { self.tag } }
-        struct B { n: i32 }
-        impl B with X { fun who(self): str { "b" } }
-        "#;
-    let sugared = compile(&format!(
-        "{HEAD}\nstruct C {{ x: X }}\nfun tell(c: C): str {{ c.x.who() }}\n{BODY}"
-    ))
-    .expect("the sugar compiles");
-    let written = compile(&format!(
-        "{HEAD}\nstruct C<S: X> {{ x: S }}\nfun tell<S: X>(c: C<S>): str {{ c.x.who() }}\n{BODY}"
-    ))
-    .expect("the written generic compiles");
-    assert_eq!(
-        sugared, written,
-        "the sugar must emit what the written generic emits, byte for byte"
-    );
-    // And what they emit is the monomorphized shape, not a dispatched one: two
-    // bodies for `tell`, one per hidden argument, sharing across the two `C<A>`
-    // values. A rule with a runtime component reddens this.
-    assert_eq!(
-        emitted_bodies_containing(&sugared, "(c[0])"),
-        2,
-        "one consumer body per hidden argument:\n{sugared}"
+        "Expected Held<i32>, but got Held<str> instead.",
     );
 }
 
@@ -3165,7 +2814,14 @@ fn a52_an_expose_of_a_trait_typed_source_field_is_refused_at_the_annotation() {
         fun main() { print("store"); }
         main();
         "#;
-    assert_fails_with(
+    // A124 R3: the carve-out's own sentence is gone with the sugar it explained.
+    // An `[expose]`d field naming a trait takes the ordinary refusal and the
+    // ordinary steer — and `dyn Source<List<Task>>` is a written type the
+    // `[service]` generator can spell, which is what made the carve-out
+    // unnecessary rather than merely reworded.
+    assert_fails_with(source, "'Source' is a trait, not a type");
+    assert_fails_with(source, "`dyn Source` for a field");
+    assert_fails_without(
         source,
         "A field MAY name a trait, but not on a declaration carrying an attribute",
     );

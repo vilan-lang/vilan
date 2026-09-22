@@ -186,19 +186,23 @@ An `impl … with Trait` doesn't provide every required method, or a bound
 demands a trait the type never implemented.
 → [Data and traits](../tour/data-and-traits.md)
 
-**"'…' is a trait, not a type: a trait is not a value type (vilan has no trait objects)"**
+**"'…' is a trait, not a type: a trait names a bound, and a value needs a type"**
 A trait's name was written where a type belongs — a return type, a struct
 field, or a generic argument like `List<Display>`. Traits are **bounds**,
-not types, so no value can ever have that type: the impl is fine, the
-signature is not. Write the generic the message spells out —
-`struct Holder<T: A> { v: T }` — or, inside the trait's own declaration,
-write `Self`, which is what a trait naming itself in a return position
-always meant. The note points at the trait, which may live in another
-module. For "one of several things at runtime", use an enum. Two
-annotations are not this error and the message names them both: a
-**parameter**, where a trait is an implicit generic (`fun f(x: A)` is
-`fun f<T: A>(x: T)`), and a `let` binding's own annotation, where it is a
-*constraint* on the inferred type — see the next entry.
+not types, so no value can have that type: the impl is fine, the
+signature is not. Three spellings do what was meant, and the message names
+each. `dyn A` is the **trait object** — a value whose concrete type is
+erased, carrying the trait's members in a table — and it is what a field,
+an element type or any other value position takes when what it holds is
+decided at runtime. A **parameter** needs nothing: `fun f(x: A)` already
+IS `fun f<T: A>(x: T)`. A **return** takes the generic the message spells
+out, `<T: A>` with `T` written in the return position; inside the trait's
+own declaration it takes `Self`, which is what a trait naming itself in a
+return position always meant. A `let` binding's own annotation is not this
+error at all — there a trait is a *constraint* on the inferred type; see
+the next entry. The note points at the trait, which may live in another
+module. For a CLOSED set of alternatives, an enum is still better than an
+object: it is exhaustive, checked, and costs nothing at runtime.
 → [Data and traits](../tour/data-and-traits.md)
 
 **"'…' cannot be a `dyn` object: '…' is a static — it takes no `self`"**
