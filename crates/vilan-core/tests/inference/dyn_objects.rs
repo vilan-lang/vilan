@@ -701,3 +701,24 @@ fun main() {
         "1\n101\n10\n5\n105\n50\n",
     );
 }
+
+/// A slot whose implementation takes a HIDDEN context parameter —
+/// `SignalCell::set` reads the ambient turn — is a dispatch site the context
+/// pass has to thread, exactly as a bound's dispatch is. The object call went
+/// out without the hidden argument and `set` read `undefined[0]`. This is also
+/// the one field the estate census found (`vilan-playground`'s `[expose]
+/// notes: Signal<List<Note>>`), in the spelling the refusal steers it to.
+#[test]
+fn a_slot_whose_implementation_reads_a_context_gets_it_threaded() {
+    assert_compiles_and_runs(
+        "import std::reactive::{ Signal, SignalCell };
+struct Notes { notes: dyn Signal<List<i32>> }
+fun main() {
+\tlet n = Notes { notes = SignalCell::new([1]) };
+\tn.notes.set([1, 2]);
+\tprint(n.notes.get().len());
+}
+",
+        "2\n",
+    );
+}
