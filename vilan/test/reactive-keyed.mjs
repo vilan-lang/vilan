@@ -18,21 +18,24 @@ function __hash(value) {
 function __map_get(map, key) {
 	return map.has(key) ? [ 0, __clone(map.get(key)) ] : [ 1 ];
 }
+function hash(self) {
+	return __hash(self);
+}
 function show(plan) {
 	let out = "";
 	for (const step of plan[0]) {
-		const $i = step;
-		let $j = null;
-		if ($i[0] === 0) {
-			const index = $i[1];
-			$j = "K" + index + " ";
-		} else if ($i[0] === 1) {
-			const index2 = $i[1];
-			$j = "R" + index2 + " ";
+		const $g = step;
+		let $h = null;
+		if ($g[0] === 0) {
+			const index = $g[1];
+			$h = "K" + index + " ";
+		} else if ($g[0] === 1) {
+			const index2 = $g[1];
+			$h = "R" + index2 + " ";
 		} else {
-			$j = "F ";
+			$h = "F ";
 		}
-		const rendered = $j;
+		const rendered = $h;
 		out = out + rendered;
 	}
 	out = out + "| removed:";
@@ -54,7 +57,7 @@ function $a(old_keys, old_items, items, key_of, same) {
 	}
 	let build = held - 1;
 	while (build >= 0) {
-		const canonical = __hash(__at(old_keys, build));
+		const canonical = hash(__at(old_keys, build));
 		const $b = __map_get(first, canonical);
 		let $c = null;
 		if ($b[0] === 0) {
@@ -67,11 +70,10 @@ function $a(old_keys, old_items, items, key_of, same) {
 		first.set(canonical, build);
 		build = build - 1;
 	}
-	let low = 0;
 	let steps = [  ];
 	for (const item of items) {
 		const item_key = key_of(item);
-		const canonical2 = __hash(item_key);
+		const canonical2 = hash(item_key);
 		const $d = __map_get(first, canonical2);
 		let $e = null;
 		if ($d[0] === 0) {
@@ -88,60 +90,35 @@ function $a(old_keys, old_items, items, key_of, same) {
 			head = __at(next_same, head);
 		}
 		first.set(canonical2, head);
-		let candidate = -(1);
+		let found = -(1);
 		let walk = head;
 		while (walk >= 0) {
 			if (!(__at(claimed, walk)) && __at(old_keys, walk) === item_key) {
-				candidate = walk;
+				found = walk;
 				break;
 			}
 			walk = __at(next_same, walk);
 		}
-		let $f = null;
-		if (candidate < 0) {
-			$f = held;
-		} else {
-			$f = candidate;
-		}
-		const ceiling = $f;
-		let found = candidate;
-		let index = low;
-		while (index < ceiling) {
-			if (!(__at(claimed, index)) && __at(old_keys, index) === item_key) {
-				found = index;
-				break;
-			}
-			index = index + 1;
-		}
 		let step = [ 2 ];
-		let $h = null;
 		if (found >= 0) {
 			__at_put(claimed, found, true);
-			let $g = null;
+			let $f = null;
 			if (same(__at(old_items, found), item)) {
-				$g = [ 0, found ];
+				$f = [ 0, found ];
 			} else {
-				$g = [ 1, found ];
+				$f = [ 1, found ];
 			}
-			step = $g;
-			while (low < held) {
-				if (!(__at(claimed, low))) {
-					break;
-				}
-				low = low + 1;
-			}
-			$h = undefined;
+			step = $f;
 		}
-		$h;
 		steps.push(step);
 	}
 	let removed = [  ];
-	let index2 = 0;
-	while (index2 < held) {
-		if (!(__at(claimed, index2))) {
-			removed.push(index2);
+	let index = 0;
+	while (index < held) {
+		if (!(__at(claimed, index))) {
+			removed.push(index);
 		}
-		index2 = index2 + 1;
+		index = index + 1;
 	}
 	return [ steps, removed ];
 }

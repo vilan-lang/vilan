@@ -29,6 +29,7 @@
 // Only available when building for a process platform (node).
 
 import pkg::compare::PartialEq;
+import pkg::hash::Hashable;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{
 	Draft,
@@ -476,20 +477,20 @@ export struct Swap<T: PartialEq, S: Source<T>, C: Slot> {
 }
 
 /// A keyed reactive run as a child — the `each` slot value (A85/A99).
-export struct Each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot> {
+export struct Each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot> {
 	source: S,
 	key: |T| K,
 	render: (|T| C) context owner_scope,
 }
 
 /// A run keyed by the ITEM ITSELF, as a child (A42).
-export struct EachValues<T: PartialEq, S: Source<List<T>>, C: Slot> {
+export struct EachValues<T: PartialEq + Hashable, S: Source<List<T>>, C: Slot> {
 	source: S,
 	render: (|T| C) context owner_scope,
 }
 
 /// A run whose rows update through a cell, as a child (A42).
-export struct EachBy<T, K: PartialEq, S: Source<List<T>>, C: Slot> {
+export struct EachBy<T, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot> {
 	source: S,
 	key: |T| K,
 	render: (|SignalCell<T>| C) context owner_scope,
@@ -514,7 +515,7 @@ export fun swap<T: PartialEq, S: Source<T>, C: Slot>(
 }
 
 /// A keyed reactive run at THIS position, rendered from the current items.
-export fun each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
+export fun each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
 	source: S,
 	key: sync |T| K,
 	render: (sync |T| C) context owner_scope,
@@ -523,7 +524,7 @@ export fun each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
 }
 
 /// A run keyed by the ITEM ITSELF, as a child (A42).
-export fun each_values<T: PartialEq, S: Source<List<T>>, C: Slot>(
+export fun each_values<T: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
 	source: S,
 	render: (sync |T| C) context owner_scope,
 ): EachValues<T, S, C> {
@@ -531,7 +532,7 @@ export fun each_values<T: PartialEq, S: Source<List<T>>, C: Slot>(
 }
 
 /// A run whose rows update through a cell, as a child (A42).
-export fun each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
+export fun each_by<T, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
 	source: S,
 	key: sync |T| K,
 	render: (sync |SignalCell<T>| C) context owner_scope,
@@ -555,19 +556,19 @@ export impl Swap<type T: PartialEq, type S: Source<T>, type C: Slot> with Slot {
 	}
 }
 
-export impl Each<type T: PartialEq, type K: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
+export impl Each<type T: PartialEq, type K: PartialEq + Hashable, type S: Source<List<T>>, type C: Slot> with Slot {
 	fun place(self, parent: View) {
 		place_each(parent, self.source, self.key, self.render);
 	}
 }
 
-export impl EachValues<type T: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
+export impl EachValues<type T: PartialEq + Hashable, type S: Source<List<T>>, type C: Slot> with Slot {
 	fun place(self, parent: View) {
 		place_each(parent, self.source, |item| item, self.render);
 	}
 }
 
-export impl EachBy<type T, type K: PartialEq, type S: Source<List<T>>, type C: Slot> with Slot {
+export impl EachBy<type T, type K: PartialEq + Hashable, type S: Source<List<T>>, type C: Slot> with Slot {
 	fun place(self, parent: View) {
 		place_each_by(parent, self.source, self.key, self.render);
 	}
@@ -592,7 +593,7 @@ fun place_swap<T: PartialEq, S: Source<T>, C: Slot>(
 /// boundary. Nothing a row registers survives, so the owner is discarded.
 /// (`List<T>` is annotated so `get`'s element type resolves — the
 /// two-parameter-generic inference trap.)
-fun place_each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
+fun place_each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
 	parent: View,
 	source: S,
 	key: sync |T| K,
@@ -611,7 +612,7 @@ fun place_each<T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot>(
 /// reconciliation and no later change to follow, so the cell is written once
 /// and never again — but it must exist, because `render` is the same closure
 /// the client runs.
-fun place_each_by<T, K: PartialEq, S: Source<List<T>>, C: Slot>(
+fun place_each_by<T, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
 	parent: View,
 	source: S,
 	key: sync |T| K,

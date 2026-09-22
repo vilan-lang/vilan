@@ -411,8 +411,17 @@ drop one bound:
 | | Signature | Key | Unchanged row | Asks of `T` |
 |---|---|---|---|---|
 | `each(source, key, render)` | `render: \|T\| C` | `key(item)` | reused; changed → rebuilt | `PartialEq` |
-| `each_values(source, render)` | `render: \|T\| C` | the item itself | reused; changed → rebuilt | `PartialEq` |
+| `each_values(source, render)` | `render: \|T\| C` | the item itself | reused; changed → rebuilt | `PartialEq` + `Hashable` |
 | `each_by(source, key, render)` | `render: \|SignalCell<T>\| C` | `key(item)` | **always** reused; the row's cell is rewritten | nothing |
+
+The **key** is always `PartialEq` **and** `Hashable`, in all three forms:
+the reconciler finds a moved row through a hash index, so a key's hash has
+to agree with its equality — `a == b` implies `a.hash() == b.hash()`. Ids
+and strings satisfy it for free. A struct key takes `[derive(Hashable)]`
+when it is equal by all of its fields, and a hand-written
+`impl Key with Hashable` hashing exactly the fields its `eq` reads when it
+is not. That agreement is what makes a reorder cost one comparison per
+row instead of N.
 
 - **`each_values`** is `each(source, |x| x, render)` written
   once. Reach for it whenever the item *is* the identity — every

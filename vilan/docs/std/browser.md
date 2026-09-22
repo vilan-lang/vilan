@@ -292,9 +292,9 @@ written — between siblings, not after them. They are bare names in the
 | `when` | `(condition: S, body: (sync \|\| C) context owner_scope)`; `S: Source<bool>, C: Slot` | `Conditional<S, C>` |
 | `when_some` | `(source: S, render: (sync \|SignalCell<T>\| C) context owner_scope)`; `S: Source<Option<T>>, C: Slot` | `WhenSome<T, S, C>` |
 | `swap` | `(source: S, render: (sync \|T\| C) context owner_scope)`; `T: PartialEq, S: Source<T>, C: Slot` | `Swap<T, S, C>` |
-| `each` | `(source: S, key: sync \|T\| K, render: (sync \|T\| C) context owner_scope)`; `T: PartialEq, K: PartialEq, S: Source<List<T>>, C: Slot` | `Each<T, K, S, C>` |
-| `each_values` | `(source: S, render: (sync \|T\| C) context owner_scope)`; `T: PartialEq, S: Source<List<T>>, C: Slot` | `EachValues<T, S, C>` |
-| `each_by` | `(source: S, key: sync \|T\| K, render: (sync \|SignalCell<T>\| C) context owner_scope)`; `K: PartialEq, S: Source<List<T>>, C: Slot` | `EachBy<T, K, S, C>` |
+| `each` | `(source: S, key: sync \|T\| K, render: (sync \|T\| C) context owner_scope)`; `T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot` | `Each<T, K, S, C>` |
+| `each_values` | `(source: S, render: (sync \|T\| C) context owner_scope)`; `T: PartialEq + Hashable, S: Source<List<T>>, C: Slot` | `EachValues<T, S, C>` |
+| `each_by` | `(source: S, key: sync \|T\| K, render: (sync \|SignalCell<T>\| C) context owner_scope)`; `K: PartialEq + Hashable, S: Source<List<T>>, C: Slot` | `EachBy<T, K, S, C>` |
 
 Each returned struct implements `Slot`, so it fills any child
 position — including a `{hole}` in element syntax. To place one at the

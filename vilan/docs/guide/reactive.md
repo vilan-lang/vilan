@@ -592,6 +592,14 @@ You'd only call it directly to build your own list-rendering primitive.
 decides, for a surviving key, whether the row is reused or rebuilt;
 they're two questions, so they're two arguments.
 
+The key is `PartialEq + Hashable`. The plan is found through a hash index
+built over the old keys, so a key's hash must agree with its equality —
+`a == b` implies `a.hash() == b.hash()`, which is what `std::hash` already
+asks of a hand-written impl. Two keys that are *not* equal may share a
+hash; that is an ordinary collision and costs a step along the chain. It
+is the other direction — an equality coarser than the hash — that would
+hide a moved row, and the bound is there so it cannot be written.
+
 ## Traps
 
 - `sub` gives you a `Subscription` to dispose manually. Prefer `effect`

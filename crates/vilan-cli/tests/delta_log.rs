@@ -22,9 +22,18 @@
 //!    log is trimmed at the next WRITE and not at the drain.
 //! 3. [`reconciles_index_answers_exactly_what_the_scan_answered`] — M82's
 //!    position index inside `reconcile`, held to the scan it replaces over
-//!    1,015 cases, including a key type whose `==` is coarser than value
-//!    identity (which a first attempt got wrong).
-//! 4. [`std_reactive_imports_nothing_from_std_wire`] — the layering the lift
+//!    1,415 cases, including a key whose `==` and hash are both coarser than
+//!    value identity (which a first attempt got wrong) and, since A125, a key
+//!    whose HASH alone is coarse.
+//! 4. [`a_reversal_costs_one_key_comparison_per_row`] — A125's bound, COUNTED:
+//!    the key's `==` tallies every call, so a 1,000-row reversal's cost is a
+//!    number rather than a clock reading. It lives here and not in the corpus
+//!    because the corpus is also the native differential's enumeration, and the
+//!    native backend accepts this program and then emits Rust that does not
+//!    compile (`same(old_items[found], item)` moves out of a `Vec` of a
+//!    non-`Copy` element) — a backend defect reported rather than worked
+//!    around.
+//! 5. [`std_reactive_imports_nothing_from_std_wire`] — the layering the lift
 //!    must not invert. `SeqOp` is a `std::reactive` type, `Delta` a `std::wire`
 //!    one, and the edge between them lives in `std::rpc`. A grep over the two
 //!    reactive-layer files is honest here and costs microseconds: there is no
@@ -200,12 +209,14 @@ main();
 ///
 /// The program carries the pre-index scan verbatim and compares every case
 /// against it, so this gate is a DIFFERENTIAL rather than a golden: it cannot
-/// be satisfied by regenerating anything. 1,015 cases — the named shapes, 600
+/// be satisfied by regenerating anything. 1,415 cases — the named shapes, 600
 /// randomized pairs over a small key alphabet so duplicates and reorders are
-/// dense, and 400 randomized pairs of a key whose equality is coarser than
-/// value identity. Non-vacuous by construction: the first version of the index
-/// answered the chain's candidate outright and this reddened at `tags 22` with
-/// both plans printed.
+/// dense, 400 randomized pairs of a key whose equality AND hash are both
+/// coarser than value identity, and (A125) 400 more of a key whose HASH alone
+/// is coarse, so every chain the index walks is full of entries that are not
+/// `==` and the walk has to step past them. Non-vacuous by construction: the
+/// first version of the index answered the chain's candidate outright and this
+/// reddened at `tags 22` with both plans printed.
 #[test]
 fn reconciles_index_answers_exactly_what_the_scan_answered() {
     let program = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/test/reconcile-index.vl");
@@ -213,11 +224,120 @@ fn reconciles_index_answers_exactly_what_the_scan_answered() {
         .unwrap_or_else(|error| panic!("read {program:?}: {error}"));
     let stdout = build_and_run("reconcile", "reconcile-index.vl", &contents);
     assert_eq!(
-        stdout, "cases=1015 differences=0\n",
+        stdout, "cases=1415 differences=0\n",
         "the reconcile differential moved. A difference is printed as a panic \
          naming the case and both plans; a changed COUNT means the shapes \
          moved, which is a deliberate edit to the program and not a number to \
          update blindly."
+    );
+}
+
+/// A125 — a REORDER is LINEAR, counted rather than timed.
+///
+/// M82's index made every change that did not reorder one pass; a reorder
+/// stayed quadratic, because nothing bound the key's hash to the key's
+/// equality and the stretch from the smallest unclaimed index up to the
+/// candidate had to be scanned with `==` as well. That stretch is empty when
+/// nothing moved and is the WHOLE prefix when a list is reversed — N(N+1)/2 key
+/// comparisons, 500,500 at 1,000 rows. `K: Hashable` states the obligation, so
+/// the chain holds every candidate and the scan is gone.
+///
+/// The count is the assertion: `Row`'s `==` tallies every call, so this reads a
+/// number the machine cannot make faster and a clock cannot make slower. One
+/// comparison per row is the answer and the guard is 4N, so the scan coming
+/// back reds at 250 rows rather than being noticed as a hang — proven by
+/// planting the scan back, which answers 31,375 at 250 rows (250 * 251 / 2).
+/// The plan is checked as well as its cost: a cheaper wrong answer is still
+/// wrong.
+const REORDER_COST: &str = r#"import std::compare::PartialEq;
+import std::hash::{ Hash, Hashable };
+import std::io::{ panic, print };
+import std::reactive::{ RowStep, reconcile };
+import std::shared::Shared;
+
+let comparisons: Shared<i32> = Shared::new(0);
+
+struct Row {
+	id: i32,
+}
+
+impl Row with PartialEq {
+	fun eq(self, other: Row): bool {
+		comparisons.write() = comparisons.read() + 1;
+		self.id == other.id
+	}
+}
+
+impl Row with Hashable {
+	fun hash(self): Hash {
+		self.id.hash()
+	}
+}
+
+/// Reverse `rows` rows, check the plan is the RIGHT one, and answer what the
+/// key comparisons cost.
+fun reversal(rows: i32): i32 {
+	mut old: List<Row> = [];
+	mut at = 0;
+	for at < rows {
+		old.push(Row { id = at });
+		at += 1;
+	}
+	mut fresh: List<Row> = [];
+	at = rows - 1;
+	for at >= 0 {
+		fresh.push(Row { id = at });
+		at -= 1;
+	}
+	comparisons.write() = 0;
+	let plan = reconcile(old, old, fresh, |item| item, |_before, _after| true);
+	// A reversal keeps every row and removes none — new position `i` is old
+	// position `rows - 1 - i`. A cheaper wrong answer is still wrong.
+	if plan.steps.len() != rows {
+		panic(i"{rows}: the plan has {plan.steps.len()} steps");
+	}
+	if plan.removed.len() != 0 {
+		panic(i"{rows}: a reversal removes nothing, not {plan.removed.len()}");
+	}
+	mut index = 0;
+	for step in plan.steps {
+		match step {
+			RowStep::Keep(let held) => {
+				if held != rows - 1 - index {
+					panic(i"{rows}: step {index} kept {held}");
+				}
+			},
+			_ => panic(i"{rows}: step {index} is not a Keep"),
+		}
+		index += 1;
+	}
+	comparisons.read()
+}
+
+fun main() {
+	for size in [250, 500, 1000] {
+		let count = reversal(size);
+		if count > 4 * size {
+			panic(i"{size} rows reversed cost {count} key comparisons — not linear");
+		}
+		print(i"reverse {size}: {count} key comparisons");
+	}
+}
+
+main();
+"#;
+
+#[test]
+fn a_reversal_costs_one_key_comparison_per_row() {
+    let stdout = build_and_run("reorder", "reconcile-reorder.vl", REORDER_COST);
+    assert_eq!(
+        stdout,
+        "reverse 250: 250 key comparisons\n\
+         reverse 500: 500 key comparisons\n\
+         reverse 1000: 1000 key comparisons\n",
+        "a reversal's key-comparison count moved. One per row is the index \
+         answering each key from its own chain; anything growing with the \
+         square is M82's coarse-equality scan back again."
     );
 }
 

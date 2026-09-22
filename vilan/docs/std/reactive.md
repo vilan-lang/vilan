@@ -885,7 +885,7 @@ struct ReconcilePlan {
 	steps: List<RowStep>,  // one per NEW item, in the new order
 	removed: List<i32>,    // old indices gone entirely
 }
-fun reconcile<T, K: PartialEq>(
+fun reconcile<T, K: PartialEq + Hashable>(
 	old_keys: List<K>, old_items: List<T>, items: List<T>, key_of: sync |T| K,
 	same: sync |T, T| bool,
 ): ReconcilePlan
@@ -910,10 +910,28 @@ under `node --jitless`: **355.1 M → 29.1 M at 1,000 rows**, and 95.1 M → 14.
 at 500 with 1,369.9 M → 58.5 M at 2,000 — 1.97× and 2.01× per doubling where it
 used to be 3.73× and 3.86×, which is linear where it was quadratic.
 
-The plan it produces is unchanged for every key type, and that is gated by a
-differential rather than by a golden: a key whose `==` is *coarser* than value
-identity — a case-insensitive string, a struct comparing a subset of its fields
-— can have an earlier match that the index cannot see, so the stretch below the
-index's candidate is still scanned. Where `==` is value identity, which is
-every key in std, the book, the examples and the shipped apps, that stretch is
-empty.
+**A REORDER is linear too, and `K: Hashable` is what pays for it (tracker
+A125).** The index was keyed on the canonical hash with nothing binding that
+hash to `K`'s equality, so an earlier equal key could sit outside the chain the
+index named and the stretch from the smallest unclaimed index up to the
+candidate had to be scanned as well. That stretch is empty when nothing moved —
+which is why the append case above went linear — and it is the WHOLE prefix
+when a list is reversed: N(N+1)/2 key comparisons, 500,500 at 1,000 rows, on
+every sort-in-place. The bound states the obligation `Hashable` already names,
+`a == b` implies `a.hash() == b.hash()`, so every key equal to this item's is
+somewhere in this item's chain and the scan is gone. A 1,000-row reversal costs
+**1,000** key comparisons, down from 500,500 (`vilan/test/reconcile-reorder.vl`
+counts them); callgrind Ir per reversal under `node --jitless`: **738.4 M → 14.6 M at 1,000
+rows**, a factor of 50.7, and 1.98× then 2.00× per doubling across 500 / 1,000
+/ 2,000 rows where the scan was 3.92× from 500 to 1,000 — linear where it was
+quadratic.
+
+A COLLISION is still fine: two keys that are not `==` may share a hash — a
+hand-written impl hashing a subset of the fields its `eq` reads — and the walk
+steps past them along the chain, which is what any hash container does. What
+the bound forbids is the other direction, an `==` coarser than the hash, which
+would hide a moved row; that is now a compile error rather than a quadratic
+scan. The plan is gated by a differential rather than by a golden: the
+pre-index scan is reproduced verbatim in `vilan/test/reconcile-index.vl` and
+1,415 cases — named shapes, 600 randomized, 400 with a coarse `==` and coarse
+hash, 400 with a coarse hash alone — are compared plan for plan.
