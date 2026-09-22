@@ -96,6 +96,12 @@ const NON_KEYWORD_TERMINALS: &[(&str, &str)] = &[
         "the named argument of `[service(.., client = H)]` (transport-rpc.md §9.3, R1)",
     ),
     (
+        "http",
+        "the opt-in marker `[service(.., http)]` — the service is meant to be reached over the \
+         connectionless POST leg, so a handle- or `[expose]`-bearing member is refused at its \
+         declaration (transport-rpc.md §9.7.5, A120 S5)",
+    ),
+    (
         "as",
         "the contextual alias on an import/use path leaf (§3.2, E142)",
     ),
