@@ -280,6 +280,467 @@ fn a_derivation_outside_every_owner_still_tracks_its_source() {
     );
 }
 
+// --- A123: the two DYNAMIC-DEPENDENCY combinators over `Source` --------------
+//
+// `map`/`combine` are static dependencies; `switch` and `and_then` are the
+// dynamic pair — WHICH source the result follows is decided by the current
+// value. Both are blankets written directly over `on_change` rather than as
+// `self.map(select).flatten()`: one derived cell instead of two, and the
+// selector called exactly once per value of the source. The `flatten` pins
+// above are their control — the ownership and detach stories are the same
+// ones, reached through a selector instead of through a held inner.
+
+#[test]
+fn switch_follows_the_source_its_selector_answers_and_detaches_from_the_last() {
+    // The four claims in one run: the initial follow, an inner update reaching
+    // the result, a switch of inner, and the ABANDONED inner no longer driving
+    // it (line four) — then the new inner still does (line five).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+
+        fun main() {
+            let which = Signal::new(0);
+            let first = Signal::new(10);
+            let second = Signal::new(20);
+            let picked = which.switch(|n| if n == 0 { first } else { second });
+            print(picked.get());
+            first.set(11);
+            print(picked.get());
+            which.set(1);
+            print(picked.get());
+            first.set(99);
+            print(picked.get());
+            second.set(21);
+            print(picked.get());
+        }
+
+        main();
+        "#,
+        "10\n11\n20\n20\n21\n",
+    );
+}
+
+#[test]
+fn switch_calls_its_selector_once_per_value_of_the_source() {
+    // The reason this is not `self.map(select).flatten()`: that form evaluates
+    // the selector a SECOND time for the value the derived cell was built from
+    // and orphans the node it answered. One call per value, the initial one
+    // included — three sets, four calls.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+
+        fun main() {
+            let which = Signal::new(0);
+            let first = Signal::new(10);
+            let second = Signal::new(20);
+            let calls: SignalCell<i32> = Signal::new(0);
+            let picked = which.switch(|n| {
+                calls.set(calls.get() + 1);
+                if n == 0 { first } else { second }
+            });
+            print(calls.get());
+            which.set(1);
+            which.set(0);
+            which.set(1);
+            print(calls.get());
+            print(picked.get());
+        }
+
+        main();
+        "#,
+        "1\n4\n20\n",
+    );
+}
+
+#[test]
+fn switch_registers_its_outer_and_live_inner_subscriptions() {
+    // A28's story through a selector: the outer subscription is registered and
+    // whichever inner the selector last answered is deferred, so a disposed
+    // boundary leaves no subscriber behind on the source or on either inner.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Owner, Disposable, owner_scope };
+
+        fun main() {
+            let which = Signal::new(0);
+            let first = Signal::new(10);
+            let second = Signal::new(20);
+            let owner = Owner::new();
+            owner_scope.run(owner, || {
+                let picked = which.switch(|n| if n == 0 { first } else { second });
+                picked.effect(|value| print(value));
+            });
+            which.set(1);
+            owner.dispose();
+            print(which.subscribers.read().len());
+            print(first.subscribers.read().len());
+            print(second.subscribers.read().len());
+        }
+
+        main();
+        "#,
+        "10\n20\n0\n0\n0\n",
+    );
+}
+
+#[test]
+fn and_then_follows_the_selected_source_and_an_outer_none_detaches() {
+    // The Kleisli composition of `Source<Option<T>>`, which is what a model
+    // layer of `SignalCell<Option<T>>` cells composes with: the outer `None`
+    // (nothing selected) and the inner `None` (the followed source has nothing
+    // yet) collapse into one `None`. Line four is the detach — the abandoned
+    // inner's later value does not reach the result — and line six re-follows.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        import std::reactive::{ Signal, SignalCell };
+
+        fun main() {
+            let outer: SignalCell<Option<i32>> = Signal::new(Some(1));
+            let one: SignalCell<Option<i32>> = Signal::new(Some(10));
+            let two: SignalCell<Option<i32>> = Signal::new(None);
+            let followed = outer.and_then(|id| if id == 1 { one } else { two });
+            print(followed.get().unwrap_or(0));
+            outer.set(Some(2));
+            print(followed.get().unwrap_or(0));
+            two.set(Some(20));
+            print(followed.get().unwrap_or(0));
+            outer.set(None);
+            print(followed.get().unwrap_or(0));
+            two.set(Some(99));
+            print(followed.get().unwrap_or(0));
+            outer.set(Some(1));
+            print(followed.get().unwrap_or(0));
+        }
+
+        main();
+        "#,
+        "10\n0\n20\n0\n0\n10\n",
+    );
+}
+
+#[test]
+fn and_then_registers_its_subscriptions_with_the_ambient_owner() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        import std::reactive::{ Signal, SignalCell, Owner, Disposable, owner_scope };
+
+        fun main() {
+            let outer: SignalCell<Option<i32>> = Signal::new(Some(1));
+            let one: SignalCell<Option<i32>> = Signal::new(Some(10));
+            let owner = Owner::new();
+            owner_scope.run(owner, || {
+                let followed = outer.and_then(|id| one);
+                followed.effect(|value| print(value.unwrap_or(0)));
+            });
+            owner.dispose();
+            print(outer.subscribers.read().len());
+            print(one.subscribers.read().len());
+        }
+
+        main();
+        "#,
+        "10\n0\n0\n",
+    );
+}
+
+#[test]
+fn a_switch_is_a_derivation_so_an_effect_reads_its_chain_settled() {
+    // A110 door 2, as a diamond: an effect standing on the ROOT reads a value
+    // two hops away through the switch. Both of `switch`'s attaches are marked
+    // `as_derivation`, so phase 1 pulls the chain to a fixpoint and the effect
+    // reads 21. Drop either mark and the switch's update becomes effect-class:
+    // it runs in the same wave as the watcher, the `map` below it is enqueued
+    // for the NEXT wave, and the effect reads the stale `11`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{
+            FlushPolicy, Owner, Signal, SignalCell, Source, run_with_owner, turn,
+        };
+
+        fun main() {
+            let which: SignalCell<i32> = Signal::new(0);
+            let first: SignalCell<i32> = Signal::new(10);
+            let second: SignalCell<i32> = Signal::new(20);
+            let picked: SignalCell<i32> = which.switch(|n| if n == 0 { first } else { second });
+            let plus: SignalCell<i32> = picked.map(|value| value + 1);
+            let seen: SignalCell<str> = Signal::new("");
+            let watcher = Owner::new();
+            run_with_owner(watcher, || {
+                which.effect_on_change(|value: i32| {
+                    seen.set_with(|log| i"{log}{value}/{plus.get()},");
+                });
+            });
+            turn(FlushPolicy::AtEnd, || {
+                which.set(1);
+            });
+            print(seen.get());
+        }
+
+        main();
+        "#,
+        "1/21,\n",
+    );
+}
+
+#[test]
+fn an_and_then_is_a_derivation_so_an_effect_reads_its_chain_settled() {
+    // The same claim for the `Option` half, same shape, same red when the
+    // marks come off.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        import std::reactive::{
+            FlushPolicy, Owner, Signal, SignalCell, Source, run_with_owner, turn,
+        };
+
+        fun main() {
+            let outer: SignalCell<Option<i32>> = Signal::new(Some(1));
+            let one: SignalCell<Option<i32>> = Signal::new(Some(10));
+            let two: SignalCell<Option<i32>> = Signal::new(Some(20));
+            let followed: SignalCell<Option<i32>> = outer.and_then(|id| if id == 1 { one } else { two });
+            let plus: SignalCell<i32> = followed.map(|value| value.unwrap_or(0) + 1);
+            let seen: SignalCell<str> = Signal::new("");
+            let watcher = Owner::new();
+            run_with_owner(watcher, || {
+                outer.effect_on_change(|value: Option<i32>| {
+                    seen.set_with(|log| i"{log}{value.unwrap_or(0)}/{plus.get()},");
+                });
+            });
+            turn(FlushPolicy::AtEnd, || {
+                outer.set(Some(2));
+            });
+            print(seen.get());
+        }
+
+        main();
+        "#,
+        "2/21,\n",
+    );
+}
+
+#[test]
+fn switch_and_and_then_mint_two_subscribers_where_the_composed_form_mints_three() {
+    // The "one derived cell" claim, counted. `fresh_id` is the program's
+    // subscriber counter, so the delta across a construction is the number of
+    // subscribers it minted — two `fresh_id()` calls of its own included, hence
+    // the `- 1`.
+    //
+    // The pin carries its OWN control: the third line builds the same dynamic
+    // dependency the composed way (`map(select).flatten()`, spelled at a
+    // concrete type because the generic body hits B371) in the same program.
+    // Two subscribers and one cell against three subscribers and two cells is
+    // the whole reason A123 is written over `on_change`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        import std::reactive::{ Signal, SignalCell, fresh_id };
+
+        fun main() {
+            let which = Signal::new(0);
+            let first = Signal::new(10);
+            let second = Signal::new(20);
+
+            let before_switch = fresh_id();
+            let picked = which.switch(|n| if n == 0 { first } else { second });
+            print(fresh_id() - before_switch - 1);
+
+            let outer: SignalCell<Option<i32>> = Signal::new(Some(1));
+            let inner: SignalCell<Option<i32>> = Signal::new(Some(5));
+            let before_and_then = fresh_id();
+            let followed = outer.and_then(|id| inner);
+            print(fresh_id() - before_and_then - 1);
+
+            let before_composed = fresh_id();
+            let composed: SignalCell<i32> =
+                which.map(|n| if n == 0 { first } else { second }).flatten();
+            print(fresh_id() - before_composed - 1);
+
+            // Every one of the three is live, so none of the counts is the
+            // count of a chain that failed to attach.
+            which.set(1);
+            print(picked.get());
+            print(composed.get());
+            print(followed.get().unwrap_or(0));
+        }
+
+        main();
+        "#,
+        "2\n2\n3\n20\n20\n5\n",
+    );
+}
+
+// --- A124 S1: the push-pull pipeline as EVIDENCE ----------------------------
+//
+// `std/src/reactive_pipeline.vl` is the paper's S1 probe
+// (`proposal/reactive-pipeline.md` §7): the cold-node model built over today's
+// `Source` with no compiler change, exported but re-exported nowhere and used
+// by no other std module. These four pins are its numbers — the claims the
+// paper's cost table rests on, run rather than argued. They go with the file if
+// the file goes.
+
+#[test]
+fn a124_s1_a_cold_chain_with_no_subscriber_evaluates_nothing() {
+    // Claim 1: a node allocates no cell and registers nothing, so three writes
+    // to the root of a five-deep chain do no work at all. Today's five `map`
+    // cells would have evaluated fifteen times. One `get()` then pulls the
+    // whole chain — five evaluations, paid by the reader.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+        import std::reactive_pipeline::{ Cold, watch };
+        import std::shared::Shared;
+
+        fun main() {
+            let root: SignalCell<i32> = Signal::new(1);
+            let evals: Shared<i32> = Shared::new(0);
+            let chain = root
+                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 });
+            print(evals.read());
+            root.set(2);
+            root.set(3);
+            root.set(4);
+            print(evals.read());
+            print(chain.get());
+            print(evals.read());
+        }
+
+        main();
+        "#,
+        "0\n0\n9\n5\n",
+    );
+}
+
+#[test]
+fn a124_s1_a_cold_chain_evaluates_once_per_leaf_subscriber() {
+    // Claim 2: N leaves means N evaluations, by design — the cold contract.
+    // One leaf: five. Two leaves on the same chain: ten. The notification
+    // carries no payload, so the hops themselves compute nothing; the count is
+    // exactly the leaves' pulls.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+        import std::reactive_pipeline::{ Cold, watch };
+        import std::shared::Shared;
+
+        fun main() {
+            let root: SignalCell<i32> = Signal::new(1);
+            let evals: Shared<i32> = Shared::new(0);
+            let chain = root
+                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 });
+            let _one = watch(chain, |_value| {});
+            evals.write() = 0;
+            root.set(2);
+            print(evals.read());
+            let _two = watch(chain, |_value| {});
+            evals.write() = 0;
+            root.set(3);
+            print(evals.read());
+        }
+
+        main();
+        "#,
+        "5\n10\n",
+    );
+}
+
+#[test]
+fn a124_s1_a_cell_between_runs_the_segment_above_it_once() {
+    // Claim 3: `.cell()` is one more node, composable anywhere, and it is where
+    // sharing is bought. Two leaves below a cell: the two nodes ABOVE it run
+    // once (2), the three below it run per leaf (3 x 2 = 6).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+        import std::reactive_pipeline::{ Cold, watch };
+        import std::shared::Shared;
+
+        fun main() {
+            let root: SignalCell<i32> = Signal::new(1);
+            let upper: Shared<i32> = Shared::new(0);
+            let lower: Shared<i32> = Shared::new(0);
+            let cached = root
+                .map_node(|x| { upper.write() = upper.read() + 1; x + 1 })
+                .map_node(|x| { upper.write() = upper.read() + 1; x + 1 })
+                .cell();
+            let below = cached
+                .map_node(|x| { lower.write() = lower.read() + 1; x + 1 })
+                .map_node(|x| { lower.write() = lower.read() + 1; x + 1 })
+                .map_node(|x| { lower.write() = lower.read() + 1; x + 1 });
+            let _a = watch(below, |_value| {});
+            let _b = watch(below, |_value| {});
+            upper.write() = 0;
+            lower.write() = 0;
+            root.set(2);
+            print(upper.read());
+            print(lower.read());
+        }
+
+        main();
+        "#,
+        "2\n6\n",
+    );
+}
+
+#[test]
+fn a124_s1_a_diamond_pulls_a_settled_pair_and_fires_twice() {
+    // Claim 4, and the honest half of R2. Two arms over one root, joined: the
+    // leaf is told twice per settle, because each arm's registration mints its
+    // own subscriber id at the root and door 2's dedup is keyed on that id. It
+    // is a duplicate CALL and never a torn pair — both calls pull, so both read
+    // the settled `(20, 102)`. Threading ONE id down a leaf's whole chain is
+    // what would collapse the duplicate, and `observe` mints the id itself, so
+    // that is std work for S2 rather than something this probe can show.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+        import std::reactive_pipeline::{ Cold, watch };
+        import std::shared::Shared;
+
+        fun main() {
+            let source: SignalCell<i32> = Signal::new(1);
+            let seen: Shared<str> = Shared::new("");
+            let diamond = source
+                .map_node(|x| x * 10)
+                .combine_node(source.map_node(|x| x + 100));
+            let _leaf = watch(diamond, |pair| {
+                let (left, right) = pair;
+                seen.write() = i"{seen.read()}({left},{right})";
+            });
+            seen.write() = "";
+            source.set(2);
+            print(seen.read());
+        }
+
+        main();
+        "#,
+        "(20,102)(20,102)\n",
+    );
+}
+
 // --- A29: a disposed session lets its transport forget it --------------------
 
 // `ReactiveClient::new`/`ReactiveServer::new` install an inbound handler that

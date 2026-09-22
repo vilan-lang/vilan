@@ -1591,6 +1591,19 @@ export impl type S: Source<type I: Source<type U>> {
 /// current value, wrapped. The ownership story is `flatten`'s exactly — one
 /// registered outer subscription, one rolling inner one deferred to the
 /// ambient owner.
+///
+/// **What it is, exactly: `sequence` then join** — and the name overpromises
+/// (tracker A123). The outer is a source of `Option<inner>` and the inner is a
+/// plain `Source<U>`, so the `Option` is lifted out of the way and the two
+/// `Source` layers are joined. It is NOT the join of the composite
+/// `Source`-of-`Option`, which would take `Source<Option<Source<Option<U>>>>`
+/// straight to `Source<Option<U>>` — and that third `flatten` cannot be added
+/// beside these two: its subject overlaps this one and there is no overloading
+/// to pick between them. A chain over a model layer of optional cells is
+/// therefore `outer.map(|x| x.map(select)).flatten().map(|x| x.flatten())`,
+/// with the trailing join every time. `and_then` below IS that composite shape
+/// in one node, and is the everyday spelling; reach for this `flatten` when the
+/// inner source is already in hand rather than selected.
 export impl type S: Source<Option<type I: Source<type U>>> {
 	fun flatten(self): SignalCell<Option<U>> {
 		let derived: SignalCell<Option<U>> = SignalCell::new(match self.get() {
@@ -1607,6 +1620,105 @@ export impl type S: Source<Option<type I: Source<type U>>> {
 					as_derivation();
 					inner_subscription.write() = Some(inner.sub(|value| {
 						derived.set(Some(value));
+					}));
+				},
+				None => {
+					inner_subscription.write() = None;
+					derived.set(None);
+				},
+			}
+		}));
+		defer_to_owner(|| {
+			inner_subscription.read()?.dispose();
+			inner_subscription.write() = None;
+		});
+		derived
+	}
+}
+
+/// The DYNAMIC dependency with no `Option` in it (tracker A123) — Rx's
+/// `switchMap`: follow whichever source `select` answers for the value this
+/// one currently holds, and re-follow when it changes.
+///
+/// `map` and `combine` are STATIC dependencies: what the result reads is fixed
+/// by the expression that built it. `switch` is the dynamic half — WHICH
+/// source the result follows is decided by the current value, which is what
+/// "the selected channel's unread count" wants and what every hand-rolled
+/// `map(..).flatten()` chain is spelling. It MEANS `self.map(select).flatten()`
+/// and is written directly over `on_change` instead: ONE derived cell rather
+/// than two, and `select` is called exactly once per value of this source —
+/// the `map` form calls it once more at construction and orphans that node.
+///
+/// The rolling inner subscription is disposed on every switch, so a replaced
+/// inner stops driving the result, and both halves are the ambient owner's
+/// exactly as `flatten`'s are (A28): the outer registered, whichever inner is
+/// live at disposal deferred.
+export impl type S: Source<type T> {
+	fun switch<U, I: Source<U>>(self, select: sync |T| I): SignalCell<U> {
+		// The first inner is HELD rather than re-selected: `self.on_change` is
+		// the lazy attach, so nothing calls `select` a second time for the
+		// value the initial cell was built from.
+		let first = select(self.get());
+		let derived = SignalCell::new(first.get());
+		let inner_subscription: Shared<Option<Subscription>> = Shared::new(None);
+		// Every attach here is a DERIVATION (A110 door 2) — the result
+		// publishes rather than acts, so an effect downstream of it sees the
+		// settled value in one wave. The mark is consumed by the next mint, so
+		// it is left AFTER `select` has run (a `select` body that maps mints
+		// subscribers of its own).
+		as_derivation();
+		inner_subscription.write() = Some(first.on_change(|value| {
+			derived.set(value);
+		}));
+		as_derivation();
+		let _outer = register_with_owner(self.on_change(|value| {
+			inner_subscription.read()?.dispose();
+			let inner = select(value);
+			as_derivation();
+			inner_subscription.write() = Some(inner.sub(|inner_value| {
+				derived.set(inner_value);
+			}));
+		}));
+		defer_to_owner(|| {
+			inner_subscription.read()?.dispose();
+			inner_subscription.write() = None;
+		});
+		derived
+	}
+}
+
+/// The dynamic dependency ON THE TOTAL ENCODING OF A PARTIAL SIGNAL (tracker
+/// A123): `self` holds `Some(value)` or nothing, `select` answers a source
+/// that holds `Some(result)` or nothing, and this follows it — the Kleisli
+/// composition of `Source<Option<T>>`, `Option::and_then` one level up.
+///
+/// It is the everyday spelling of `self.map(|x| x.map(select)).flatten().map(|x| x.flatten())`,
+/// which is what a chain over a model layer of `SignalCell<Option<T>>` cells
+/// otherwise writes by hand: the outer `None` (nothing selected, nothing
+/// loaded) and the inner `None` (the followed source has nothing yet) collapse
+/// into one `None`, and the trailing join disappears.
+///
+/// `None` on the outer DETACHES, exactly as it does in the `Option` `flatten`
+/// above: a later write to the abandoned inner does not reach the result. The ownership story is `flatten`'s exactly — one
+/// registered outer subscription, one rolling inner one deferred to the
+/// ambient owner.
+export impl type S: Source<Option<type T>> {
+	fun and_then<U, I: Source<Option<U>>>(self, select: sync |T| I): SignalCell<Option<U>> {
+		// `sub`'s immediate call wires the first inner and writes the initial
+		// value, so `select` runs once per outer value here too — the cell is
+		// born `None` and settled before this method returns.
+		let derived: SignalCell<Option<U>> = SignalCell::new(None);
+		let inner_subscription: Shared<Option<Subscription>> = Shared::new(None);
+		// DERIVATIONS, both halves, exactly as in the two joins above.
+		as_derivation();
+		let _outer = register_with_owner(self.sub(|held| {
+			inner_subscription.read()?.dispose();
+			match held {
+				Some(let value) => {
+					let inner = select(value);
+					as_derivation();
+					inner_subscription.write() = Some(inner.sub(|inner_value| {
+						derived.set(inner_value);
 					}));
 				},
 				None => {

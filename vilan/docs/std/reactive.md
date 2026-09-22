@@ -87,6 +87,16 @@ impl type S: Source<type I: Source<type U>> {
 impl type S: Source<Option<type I: Source<type U>>> {
 	fun flatten(self): SignalCell<Option<U>>    // `None` detaches; `Some` follows
 }
+// The DYNAMIC pair (A123), written over `on_change` rather than over the join:
+// which source to follow is decided by the value this one currently holds.
+impl type S: Source<type T> {
+	fun switch<U, I: Source<U>>(self, select: sync |T| I): SignalCell<U>
+}
+impl type S: Source<Option<type T>> {
+	fun and_then<U, I: Source<Option<U>>>(
+		self, select: sync |T| I
+	): SignalCell<Option<U>>
+}
 ```
 
 `flatten` is a **blanket over `Source`** rather than a member of
@@ -97,7 +107,24 @@ default cannot add a bound on `T`, and this one needs `T` to be a source — so
 the bound lives in the impl subject. The `Option` form is the second blanket:
 an outer of `Option<inner source>` (a lazily-created signal) answers `None` with
 `None` and detaches from whichever inner was live, and `Some(inner)` follows
-that inner from its current value.
+that inner from its current value. It is `sequence` then join, not the join of
+the composite `Source`-of-`Option` — which is why a chain over optional cells
+ends in a trailing `.map(|x| x.flatten())` and why `and_then` exists.
+
+`switch` and `and_then` are the **dynamic dependencies** (A123). `map` and
+`combine` are static: the expression fixes what the result reads. `switch`
+follows whichever source its selector answers for the current value and
+re-follows on every change — Rx's `switchMap`, meaning
+`self.map(select).flatten()`. `and_then` is the same over `Source<Option<T>>`,
+the total encoding of a signal that may hold nothing: it is the Kleisli
+composition of that encoding (`Option::and_then` one level up), the outer
+`None` and the inner `None` collapse into one, and it replaces the
+`map(|x| x.map(f)).flatten().map(|x| x.flatten())` chain by hand. Both are
+written directly over `on_change` rather than as the two-node `map`-then-join:
+one derived cell, and the selector called exactly once per value of the source
+(the `map` form calls it a second time at construction and orphans the node it
+answered). Both are derivations, and both give the ambient owner the outer
+subscription and whichever inner is live — `flatten`'s story exactly.
 
 `update` is **inherent to the cell**, deliberately: its value is in-place
 mutation with one notification, and a generic default could only

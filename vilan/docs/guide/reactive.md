@@ -148,6 +148,47 @@ fun main() {
 A named function can stand in for the closure (`signal.map(parse)`).
 See [functions & closures](../tour/functions-and-closures.md).
 
+A dependency is **static** when the expression fixes what the result reads —
+that is `map` and `combine` — and **dynamic** when the current value decides
+*which* source to follow next, which is what "the selected channel's unread
+count" needs. `flatten` is the primitive underneath the dynamic half; two
+combinators are its everyday spelling, and each is one derived cell rather
+than a chain:
+
+- `source.switch(select)` follows whichever source `select` answers for the
+  current value and re-follows when this one changes — Rx's `switchMap`. It
+  means `source.map(select).flatten()`.
+- `source.and_then(select)` is the same on a `Source<Option<T>>`, the total
+  encoding of a signal that may hold nothing yet: `None` on the outer is
+  `None` on the result, `Some(value)` follows the `Source<Option<U>>` that
+  `select` answers, and the two absences collapse into one. It is
+  `Option::and_then` one level up, and it replaces the
+  `map(|x| x.map(f)).flatten().map(|x| x.flatten())` a model layer of
+  optional cells otherwise writes by hand.
+
+```vilan
+import std::reactive::{ Signal, SignalCell };
+
+fun main() {
+	let which = Signal::new(0);
+	let first = Signal::new(10);
+	let second = Signal::new(20);
+	let picked = which.switch(|n: i32| if n == 0 { first } else { second });
+	print(picked.get());     // 10
+	first.set(11);
+	print(picked.get());     // 11 — the current inner drives the result
+	which.set(1);
+	print(picked.get());     // 20 — the switch follows the new inner
+	first.set(99);
+	print(picked.get());     // 20 — and detaches from the replaced one
+}
+```
+
+Both are derivations, like `map`: they publish rather than act, so an effect
+downstream of one reads the settled value in a single wave, and both hand
+their subscriptions — the outer one and whichever inner is live — to the
+ambient owner, so a disposed boundary leaves nothing behind.
+
 ### Selection over a list: `selector`
 
 `map` is the wrong tool for one particular shape — "is *this* row the
