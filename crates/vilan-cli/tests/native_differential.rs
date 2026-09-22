@@ -34,6 +34,7 @@
 //! `CARGO_TARGET_TMPDIR`, so the runtime compiles ONCE for the whole sweep
 //! rather than once per program.
 
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -595,6 +596,634 @@ const HASH_PROBE: &str = concat!(
     "\tprint(words.len());\n",
     "\tprint(words.contains(\"b\"));\n",
     "\tprint(words.contains(\"z\"));\n",
+    "}\n",
+);
+
+/// F23: a context-threaded hidden parameter is typed from the flavour the
+/// CONTEXT PASS recorded, and one program carries both readings.
+///
+/// The parameter is deliberately record-less (no `parameters` entry, no span, no
+/// type — editing-dx.md §19.3), so the Rust emitter, which must write a type
+/// down, used to re-derive the flavour from the arguments every call site passes
+/// — a worklist that had to connect clause-typed parameters to every closure
+/// literal that can land there, and that fell back on the strict reading when
+/// nothing settled. `context.rs` knows the answer where it MINTS the parameter:
+/// a node holds the bare value when its provider is strict or a `run` closure,
+/// and `Option<T>` otherwise.
+///
+/// The probe puts a safe reader (`peek`, which `get_safe`s) and a strict one
+/// (`strict_report`, which `get`s and then calls `peek`) in one program, so the
+/// two flavours are asserted against each other rather than one at a time: a
+/// record that is uniformly wrong, or uniformly right for the wrong reason,
+/// cannot pass both halves. Flipping the recorded bool swaps the two signatures,
+/// which is what makes this non-vacuous.
+#[test]
+fn a_context_threaded_parameter_is_typed_from_the_recorded_flavour() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_context_flavour.vl"),
+        CONTEXT_PROBE,
+    )
+    .expect("write the probe program");
+    let emitted = vilan(&staged)
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_context_flavour.vl",
+        ])
+        .output()
+        .expect("build the probe");
+    assert!(
+        emitted.status.success(),
+        "the context-flavour probe was refused:\n{}",
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+    let source = String::from_utf8_lossy(&emitted.stdout);
+    let signature = |prefix: &str| -> String {
+        source
+            .lines()
+            .find(|line| line.starts_with(&format!("fn {prefix}")))
+            .unwrap_or_else(|| panic!("no `fn {prefix}..` in the emitted source:\n{source}"))
+            .to_string()
+    };
+    // The safe region's parameter carries the `Option`; the strict region's
+    // carries the value, because `run` hands it one.
+    let safe = signature("peek_");
+    assert!(
+        safe.contains(": Option<i32>"),
+        "a `get_safe`-reachable region's hidden parameter must be `Option<i32>`: {safe}"
+    );
+    let strict = signature("strict_report_");
+    assert!(
+        strict.contains(": i32") && !strict.contains(": Option<i32>"),
+        "a strict region's hidden parameter must be the bare value: {strict}"
+    );
+    // And the program means the same thing on both backends, which is what the
+    // types have to be right FOR.
+    assert_eq!(
+        compare(&staged, "native_probe_context_flavour.vl"),
+        Verdict::Identical,
+        "the context-threaded program must agree on both backends"
+    );
+}
+
+/// Both context flavours in one program: `peek` is safe (it `get_safe`s, so its
+/// hidden parameter is an `Option`), `strict_report` is strict (it `get`s, so
+/// `run` hands it the bare value) and calls `peek`, which is the covered→safe
+/// boundary that `Some`-wraps.
+const CONTEXT_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::context::Context;\n",
+    "import std::option::Option::{ Some, None };\n",
+    "\n",
+    "let current: Context<i32> = Context::new();\n",
+    "\n",
+    "fun peek(): str {\n",
+    "\tmatch current.get_safe() {\n",
+    "\t\tSome(let value) => i\"peeked {value}\",\n",
+    "\t\tNone => \"nothing\",\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun strict_report() {\n",
+    "\tlet value = current.get();\n",
+    "\tprint(i\"strict {value}\");\n",
+    "\tprint(peek());\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(peek());\n",
+    "\tcurrent.run(9, || {\n",
+    "\t\tstrict_report();\n",
+    "\t});\n",
+    "\tprint(peek());\n",
+    "}\n",
+);
+
+/// A destructuring `let` means the same thing on both backends (F18).
+///
+/// `std::http`'s response loop is what wanted it — `for header in
+/// response.headers { let (name, value) = header; .. }` — and the emitter
+/// refused the form by name. It is not an HTTP construct, so it is pinned as
+/// what it is: a tuple pattern in a `let`, nested, with a wildcard, over a
+/// binding and over a loop binder.
+#[test]
+fn a_destructuring_let_is_byte_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_destructure.vl"),
+        DESTRUCTURE_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_destructure.vl"),
+        Verdict::Identical,
+        "a destructuring `let` must mean the same thing on both backends"
+    );
+}
+
+const DESTRUCTURE_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet pair = (1, \"one\");\n",
+    "\tlet (number, word) = pair;\n",
+    "\tprint(number);\n",
+    "\tprint(word);\n",
+    "\tlet nested = ((2, 3), \"two\");\n",
+    "\tlet ((left, right), label) = nested;\n",
+    "\tprint(left + right);\n",
+    "\tprint(label);\n",
+    "\tlet (_, kept) = pair;\n",
+    "\tprint(kept);\n",
+    "\tlet rows = [(1, \"a\"), (2, \"b\")];\n",
+    "\tfor row in rows {\n",
+    "\t\tlet (index, name) = row;\n",
+    "\t\tprint(i\"{index}={name}\");\n",
+    "\t}\n",
+    "}\n",
+);
+
+/// F18 slice 1: the emitter reaches `vilan_rt::http`.
+///
+/// A `std::http` server program EMITS, and what comes out names the runtime's
+/// own calls rather than a refusal — `create_server`, the bound `listen`, the
+/// request body read, and the response's status/header/end. Twenty-three of
+/// `std::http`'s twenty-five raw `node:http` bindings are answered by
+/// `vilan_rt::http`; the two that are not are `NodeRequest::headers` and
+/// `NodeSocket::remoteAddress`, which answer a `JsonValue` and are Order 40's,
+/// and this program reaches neither.
+///
+/// It asserts the CALLS and not merely that the emit succeeded, because an
+/// emitter that refused every binding under the census's `unimplemented!()`
+/// would also "succeed". The slice's EXIT — the same program built, run, and
+/// answering a GET over a real socket — is
+/// [`a_native_std_http_server_answers_a_get_over_a_real_socket`]; this pin is
+/// the cheap half, and it is what says WHICH bindings the exit went through.
+#[test]
+fn a_std_http_server_emits_calls_into_the_native_runtime() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_http.vl"), HTTP_PROBE)
+        .expect("write the probe program");
+    let output = vilan(&staged)
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_http.vl",
+        ])
+        .output()
+        .expect("build the probe");
+    assert!(
+        output.status.success(),
+        "the http probe was refused:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let source = String::from_utf8_lossy(&output.stdout);
+    for needle in [
+        "vilan_rt::http::create_server",
+        "vilan_rt::http::read_request_bytes",
+        ").listen(",
+        ").address()",
+        ").port()",
+        ").set_status_code(",
+        ").set_header(",
+        ").end(",
+        ").end_bytes(",
+        "vilan_rt::http::Request",
+        "vilan_rt::http::Response",
+        "vilan_rt::http::Bytes",
+    ] {
+        assert!(
+            source.contains(needle),
+            "the emitted server must reach `{needle}`:\n{source}"
+        );
+    }
+    assert!(
+        !source.contains("unimplemented!()"),
+        "a build emit must never carry a census placeholder:\n{source}"
+    );
+}
+
+/// A `std::http` server built from the struct directly, which is the smallest
+/// program that reaches the whole `node:http` surface `Server::start` binds.
+///
+/// `Server::builder()` is the shipped spelling and it is NOT used here: its
+/// `build()` folds the rpc service list, which sorts (a backed enum plus the
+/// `ListSortBy` intrinsic, both other lanes' items) and reaches `serve_build`'s
+/// conditional-GET arm (`std::json`'s host type, Order 40's). The literal
+/// reaches the same server.
+const HTTP_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::http::{ Server, Response };\n",
+    "import std::option::Option::None;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet server = Server {\n",
+    "\t\tport = 0,\n",
+    "\t\trequest_handler = |request| Response::builder()\n",
+    "\t\t\t.set_header(\"Content-Type\", \"text/plain\")\n",
+    "\t\t\t.body(\"hello\\n\")\n",
+    "\t\t\t.build(),\n",
+    "\t\ton_start = |started| print(i\"vilan-test-port={started.port()}\"),\n",
+    "\t\ton_stop = |stopped| {},\n",
+    "\t\tupgrade_handler = None,\n",
+    "\t\tnode = None,\n",
+    "\t};\n",
+    "\tserver.start();\n",
+    "}\n",
+);
+
+/// **F18 slice 1's EXIT**: a `std::http` server compiled with `--backend rust`
+/// runs as a native binary and answers a `GET /` over a real socket, and the JS
+/// twin answers the same thing.
+///
+/// The whole slice is measured here. Everything else about it — the
+/// dependency-free HTTP/1.1 server in `vilan-rt`, the `IoSource` turn, the
+/// twenty-three `node:http` bindings, the executor's free list — exists so that
+/// this program serves a request, and a runtime whose own unit tests pass while
+/// the compiler cannot reach it would be a runtime nobody can use.
+///
+/// **What is compared, and what cannot be.** The status line, the header the
+/// PROGRAM set, and the body, byte for byte on both legs. Not the whole
+/// response: node adds a `Date`, which changes every second, and node and this
+/// server order `Connection` and `Content-Length` differently — two facts
+/// written down rather than normalised away, because a reader deserves to know
+/// the comparison is not the whole wire. stdout IS compared whole, and it is
+/// the port announcement, which is the same line from both.
+///
+/// **The ordering is the harness's own, not a sleep.** The SERVER binds port 0
+/// and announces the number it got; the fetch cannot start before that line has
+/// arrived, because the line is where the number comes from. There is no
+/// bind-release-rebind window (`support/port.rs`'s N40 finding) and no sleep
+/// standing in for a happens-before.
+#[test]
+fn a_native_std_http_server_answers_a_get_over_a_real_socket() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_http.vl"), HTTP_PROBE)
+        .expect("write the probe program");
+
+    // The native leg: build, then run the BINARY rather than `vilan run`, so
+    // the child this test kills is the server itself and not a parent that
+    // would outlive it.
+    let built = vilan(&staged)
+        .args(["build", "--backend", "rust", "native_probe_http.vl"])
+        .output()
+        .expect("build the server natively");
+    assert!(
+        built.status.success(),
+        "the native leg did not build:\n{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let binary = String::from_utf8_lossy(&built.stdout)
+        .lines()
+        .find_map(|line| line.split(" -> ").nth(1).map(str::to_string))
+        .expect("`vilan build` says where the binary is");
+    let native = ServedRequest::take(Command::new(staged.join(&binary)));
+
+    // The JS leg, the same program, the same request.
+    let bundled = vilan(&staged)
+        .args(["build", "native_probe_http.vl"])
+        .output()
+        .expect("build the server for node");
+    assert!(
+        bundled.status.success(),
+        "the JS leg did not build:\n{}",
+        String::from_utf8_lossy(&bundled.stderr)
+    );
+    let mut node = Command::new("node");
+    node.current_dir(&staged).arg("native_probe_http.mjs");
+    let javascript = ServedRequest::take(node);
+
+    assert_eq!(
+        native.status, javascript.status,
+        "the two backends must answer the same status line"
+    );
+    assert_eq!(
+        native.status, "HTTP/1.1 200 OK",
+        "and it is a 200 — a pin that agreed on a 500 would agree about nothing"
+    );
+    assert_eq!(
+        native.body, javascript.body,
+        "the two backends must answer the same body"
+    );
+    assert_eq!(native.body, "hello\n", "and it is the handler's own body");
+    // The header the PROGRAM set goes out on both. Node's `Date` and the order
+    // it writes `Connection`/`Content-Length` in are its own; see this test's
+    // header comment.
+    for leg in [&native, &javascript] {
+        assert!(
+            leg.headers
+                .iter()
+                .any(|line| line == "Content-Type: text/plain"),
+            "the program's header must reach the wire: {:?}",
+            leg.headers
+        );
+        assert!(
+            leg.headers.iter().any(|line| line == "Content-Length: 6"),
+            "a buffered body declares its length: {:?}",
+            leg.headers
+        );
+    }
+    assert_eq!(
+        native.announced_line.split('=').next(),
+        javascript.announced_line.split('=').next(),
+        "both legs announce through the same `on_start`"
+    );
+}
+
+/// One request answered by a spawned server, and the pieces of the answer the
+/// two backends can be held to.
+struct ServedRequest {
+    status: String,
+    headers: Vec<String>,
+    body: String,
+    announced_line: String,
+}
+
+impl ServedRequest {
+    /// Spawns `command`, waits for the port IT bound, fetches `GET /`, and
+    /// reaps the child.
+    ///
+    /// The child is killed on the way out of this function on every path,
+    /// including a panic inside it, because [`ServerUnderTest`] owns it and its
+    /// `Drop` does the kill — a failed assertion must not leak a listener into
+    /// the rest of the suite.
+    fn take(mut command: Command) -> ServedRequest {
+        let server = ServerUnderTest::spawn(&mut command);
+        let port = server.port();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
+            .expect("connect to the port the server announced");
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .expect("send the request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("read the response");
+        let (head, body) = response
+            .split_once("\r\n\r\n")
+            .unwrap_or_else(|| panic!("a response with a head and a body, got {response:?}"));
+        let mut lines = head.split("\r\n");
+        let status = lines.next().unwrap_or_default().to_string();
+        ServedRequest {
+            status,
+            headers: lines.map(str::to_string).collect(),
+            body: body.to_string(),
+            announced_line: server.announcement.clone(),
+        }
+    }
+}
+
+/// A spawned server whose port is the one it actually bound, killed on drop.
+///
+/// `support/port.rs` is the same mechanism for the e2e suites; this binary has
+/// no `mod support`, and the twenty lines are cheaper than giving it one for a
+/// single test.
+struct ServerUnderTest {
+    child: std::process::Child,
+    announcement: String,
+    port: u16,
+}
+
+impl ServerUnderTest {
+    fn spawn(command: &mut Command) -> ServerUnderTest {
+        let mut child = command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("spawn the server");
+        let stdout = child.stdout.take().expect("the server's stdout");
+        let (sender, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut server = ServerUnderTest {
+            child,
+            announcement: String::new(),
+            port: 0,
+        };
+        // A LIVENESS bound, not a claim about how fast a server boots: a green
+        // spawn returns the moment the line lands.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "the server never announced its port");
+            match lines.recv_timeout(remaining) {
+                Ok(line) => {
+                    if let Some(number) = line
+                        .split_whitespace()
+                        .find_map(|field| field.strip_prefix("vilan-test-port="))
+                    {
+                        let port: u16 = number.parse().expect("the announced port is a number");
+                        assert_ne!(
+                            port, 0,
+                            "the server reported the port it ASKED for, not one it bound"
+                        );
+                        server.announcement = line;
+                        server.port = port;
+                        return server;
+                    }
+                }
+                Err(_) => panic!("the server's stdout ended before it announced a port"),
+            }
+        }
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl Drop for ServerUnderTest {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// F25: a program that FAILS answers the same exit code on both backends, and
+/// the native binary does not print Rust's panic banner.
+///
+/// Node prints the error and exits 1; Rust prints
+/// `thread 'main' panicked at src/main.rs:N:M:`, a `note: run with
+/// RUST_BACKTRACE=1` line, and exits 101. stdout is what the differential
+/// compares and it was already identical, so this is about what a SHELL sees —
+/// and a shell reading 101 where the JS build gave it 1 is one program
+/// answering two different things.
+///
+/// Both the synchronous and the `async fun main` paths, because they are two
+/// different emitted shapes: one wraps the body, the other wraps the
+/// `block_on`.
+#[test]
+fn a_failing_program_exits_one_on_both_backends_without_rusts_banner() {
+    let staged = stage();
+    for (file, source, expected_stdout) in [
+        ("native_probe_panic.vl", PANIC_PROBE, "before the panic\n"),
+        (
+            "native_probe_panic_async.vl",
+            ASYNC_PANIC_PROBE,
+            "before the async panic\n",
+        ),
+    ] {
+        std::fs::write(staged.join(file), source).expect("write the probe program");
+        let native = vilan(&staged)
+            .args(["run", "--backend", "rust", file])
+            .output()
+            .expect("run the failing probe natively");
+        let javascript = vilan(&staged)
+            .args(["run", file])
+            .output()
+            .expect("run the failing probe on the JS backend");
+        assert_eq!(
+            native.status.code(),
+            Some(1),
+            "{file}: the native binary must exit 1, not Rust's 101:\n{}",
+            String::from_utf8_lossy(&native.stderr)
+        );
+        assert_eq!(
+            javascript.status.code(),
+            Some(1),
+            "{file}: the JS leg is the oracle and it exits 1"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&native.stdout),
+            String::from_utf8_lossy(&javascript.stdout),
+            "{file}: stdout up to the failure must still be identical"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&native.stdout),
+            expected_stdout,
+            "{file}: the probe must get as far as its own output, or this pin is \
+             asserting nothing about the failure"
+        );
+        let stderr = String::from_utf8_lossy(&native.stderr);
+        assert!(
+            !stderr.contains("panicked at"),
+            "{file}: Rust's panic banner must not reach stderr: {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("RUST_BACKTRACE"),
+            "{file}: Rust's backtrace note must not reach stderr: {stderr:?}"
+        );
+        // ONE line about the failure, and it is the program's own message —
+        // node prints one too. Two was the shape before the executor stopped
+        // reporting the root task as an unobserved failure.
+        let said: Vec<&str> = stderr.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(
+            said.len(),
+            1,
+            "{file}: one line about one failure: {said:?}"
+        );
+        assert!(
+            said[0].contains("boom"),
+            "{file}: and it is the program's own message: {said:?}"
+        );
+    }
+}
+
+const PANIC_PROBE: &str = concat!(
+    "import std::io::{ print, panic };\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(\"before the panic\");\n",
+    "\tpanic(\"boom\");\n",
+    "}\n",
+);
+
+const ASYNC_PANIC_PROBE: &str = concat!(
+    "import std::io::{ print, panic };\n",
+    "import std::time::sleep;\n",
+    "\n",
+    "async fun main() {\n",
+    "\tprint(\"before the async panic\");\n",
+    "\tsleep(1);\n",
+    "\tpanic(\"boom\");\n",
+    "}\n",
+);
+
+/// F25: printing a host handle or a value holding a function is refused where
+/// it is WRITTEN.
+///
+/// Order 38 answered both with a runtime panic carrying the reason, which is
+/// honest and one release too late — what node prints there is its own object
+/// inspection (`Promise { <pending> }`, `[Function (anonymous)]`), so the
+/// program cannot work and nothing is gained by letting it build.
+#[test]
+fn printing_a_host_handle_or_a_function_is_refused_at_compile_time() {
+    let staged = stage();
+    for (file, source, needle) in [
+        (
+            "native_probe_print_task.vl",
+            PRINT_HANDLE_PROBE,
+            "`print` of the host handle `Task`",
+        ),
+        (
+            "native_probe_print_fn.vl",
+            PRINT_FUNCTION_PROBE,
+            "`print` of a value holding a function",
+        ),
+    ] {
+        std::fs::write(staged.join(file), source).expect("write the probe program");
+        let output = vilan(&staged)
+            .args(["build", "--backend", "rust", "--stdout", file])
+            .output()
+            .expect("build the probe");
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{file} must be refused rather than built"
+        );
+        assert!(
+            message.contains(needle),
+            "{file} must be refused by name (`{needle}`); it said:\n{message}"
+        );
+        // Non-vacuous: the JS backend BUILDS the same program, so the refusal
+        // is the native backend's answer and not a defect in the probe.
+        let javascript = vilan(&staged)
+            .args(["build", file])
+            .output()
+            .expect("build the probe on the JS backend");
+        assert!(
+            javascript.status.success(),
+            "{file} must be a program the JS backend accepts:\n{}",
+            String::from_utf8_lossy(&javascript.stderr)
+        );
+    }
+}
+
+const PRINT_HANDLE_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::time::sleep;\n",
+    "\n",
+    "async fun work(): i32 {\n",
+    "\tsleep(1);\n",
+    "\t7\n",
+    "}\n",
+    "\n",
+    "async fun main() {\n",
+    "\tlet task = async work();\n",
+    "\tprint(task);\n",
+    "}\n",
+);
+
+const PRINT_FUNCTION_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet f = |x: i32| x + 1;\n",
+    "\tprint(f);\n",
     "}\n",
 );
 

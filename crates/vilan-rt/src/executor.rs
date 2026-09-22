@@ -43,11 +43,32 @@ use std::time::{Duration, Instant};
 
 use crate::{Str, describe_panic};
 
-/// A task's index in the runtime's slab. Slots are never REUSED (a settled
-/// task's slot becomes `None` and stays `None`), so a wake list still holding
-/// the id of a task that has since been reaped wakes nothing rather than waking
-/// a stranger.
-type TaskId = usize;
+/// A handle into the runtime's slab: a slot index plus the GENERATION that slot
+/// carried when the handle was minted (tracker F24).
+///
+/// Slots are reused — a settled task's slot goes back on the free list — so an
+/// index alone is not an identity: a wake list still holding the id of a task
+/// that has since been reaped would wake whatever took its slot. The generation
+/// is what keeps the guarantee that the index alone used to give by never being
+/// reused: [`reap_settled`] bumps it when it frees the slot, so every handle
+/// minted before that point compares unequal for the rest of the program and
+/// [`task_at`] answers `None`.
+///
+/// Before F24 this was a bare `usize` and the slab grew one slot per spawn for
+/// the program's lifetime. That is fine for a CLI program and unbounded for a
+/// server spawning per request, which is what F18 makes this crate do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct TaskId {
+    index: usize,
+    generation: u64,
+}
+
+/// One slot of the task slab: the live task, or nothing, and the generation
+/// that says which handles still name it.
+struct TaskSlot {
+    node: Option<Rc<TaskNode>>,
+    generation: u64,
+}
 
 /// The type-erased driver of one task.
 type Driver = Pin<Box<dyn Future<Output = ()>>>;
@@ -905,7 +926,16 @@ impl<T> crate::Js for Task<T> {
 /// runtime handle through every emitted signature — would put the executor into
 /// the emitted source, which §10 rules out.
 struct Runtime {
-    tasks: RefCell<Vec<Option<Rc<TaskNode>>>>,
+    tasks: RefCell<Vec<TaskSlot>>,
+    /// F24: slab indices whose task has been reaped, newest first. A spawn takes
+    /// one from here before it grows the slab, which is what keeps a server's
+    /// per-request spawns from growing it without bound.
+    free_slots: RefCell<Vec<usize>>,
+    /// F18: the external readiness sources the loop polls once per turn — a
+    /// listening socket and its connections. Empty for every program that does
+    /// no I/O, which is what keeps the turn model below EXACTLY J6's for all of
+    /// them.
+    io: RefCell<Vec<Rc<dyn IoSource>>>,
     microtasks: RefCell<VecDeque<TaskId>>,
     timers: RefCell<Vec<Rc<TimerSlot>>>,
     current: Cell<Option<TaskId>>,
@@ -916,6 +946,8 @@ thread_local! {
     static RUNTIME: Runtime = const {
         Runtime {
             tasks: RefCell::new(Vec::new()),
+            free_slots: RefCell::new(Vec::new()),
+            io: RefCell::new(Vec::new()),
             microtasks: RefCell::new(VecDeque::new()),
             timers: RefCell::new(Vec::new()),
             current: Cell::new(None),
@@ -963,16 +995,54 @@ fn register_timer(milliseconds: i32, action: impl Fn() + 'static) -> Rc<TimerSlo
     })
 }
 
+/// Puts `node` in a slab slot and answers the handle to it (F24): a freed slot
+/// if there is one, a fresh one otherwise.
 fn register_task(node: Rc<TaskNode>) -> TaskId {
     RUNTIME.with(|runtime| {
+        let reused = runtime.free_slots.borrow_mut().pop();
         let mut tasks = runtime.tasks.borrow_mut();
-        tasks.push(Some(node));
-        tasks.len() - 1
+        match reused {
+            Some(index) => {
+                let slot = &mut tasks[index];
+                slot.node = Some(node);
+                TaskId {
+                    index,
+                    generation: slot.generation,
+                }
+            }
+            None => {
+                tasks.push(TaskSlot {
+                    node: Some(node),
+                    generation: 0,
+                });
+                TaskId {
+                    index: tasks.len() - 1,
+                    generation: 0,
+                }
+            }
+        }
     })
 }
 
+/// The task `id` names, or `None` if the slot was reaped — including the case
+/// where it has since been handed to a different task, which is what the
+/// generation check rules out (F24).
 fn task_at(id: TaskId) -> Option<Rc<TaskNode>> {
-    RUNTIME.with(|runtime| runtime.tasks.borrow().get(id).cloned().flatten())
+    RUNTIME.with(|runtime| {
+        let tasks = runtime.tasks.borrow();
+        let slot = tasks.get(id.index)?;
+        if slot.generation != id.generation {
+            return None;
+        }
+        slot.node.clone()
+    })
+}
+
+/// How many slots the task slab holds — F24's measurement, and the only reason
+/// anything outside the runtime asks.
+#[cfg(test)]
+fn slab_slots() -> usize {
+    RUNTIME.with(|runtime| runtime.tasks.borrow().len())
 }
 
 /// Polls one task once, with the panic fence that latches its failure.
@@ -989,9 +1059,14 @@ fn poll_task(id: TaskId) {
     };
     let previous = RUNTIME.with(|runtime| runtime.current.replace(Some(id)));
     let mut context = Context::from_waker(Waker::noop());
+    // F25: a panic caught HERE is a task's failure latching, not the program
+    // failing, so the process hook stays quiet for it — `report_unobserved`
+    // and the raise out of `block_on` are what say something.
+    crate::enter_caught();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         driver.as_mut().poll(&mut context)
     }));
+    crate::leave_caught();
     RUNTIME.with(|runtime| runtime.current.set(previous));
     match outcome {
         Ok(Poll::Pending) => {
@@ -1017,8 +1092,14 @@ fn drain_microtasks() {
 /// macrotask after it settled, which is "after the current microtask cascade has
 /// finished". Reporting here IS that timing.
 fn report_unobserved_failures() {
-    let nodes: Vec<Rc<TaskNode>> =
-        RUNTIME.with(|runtime| runtime.tasks.borrow().iter().flatten().cloned().collect());
+    let nodes: Vec<Rc<TaskNode>> = RUNTIME.with(|runtime| {
+        runtime
+            .tasks
+            .borrow()
+            .iter()
+            .filter_map(|slot| slot.node.clone())
+            .collect()
+    });
     for node in nodes {
         if node.settled.get() && !node.observed.get() && !node.owned {
             node.report_unobserved();
@@ -1026,16 +1107,26 @@ fn report_unobserved_failures() {
     }
 }
 
-/// Settled tasks leave the slab. Their slots are NOT reused (see [`TaskId`]) and
-/// every `Task` handle keeps its own `Rc`, so this drops the RUNTIME's share of
+/// Settled tasks leave the slab, and their SLOTS go back on the free list (F24).
+/// Every `Task` handle keeps its own `Rc`, so this drops the RUNTIME's share of
 /// a finished task rather than growing the live set for the program's lifetime.
 /// It runs after [`report_unobserved_failures`], so nothing is reaped before its
 /// report was decided.
+///
+/// The generation is bumped as the slot is freed rather than as it is reused, so
+/// every handle minted for the task that just left stops naming the slot AT the
+/// reap — whether or not anything takes it afterwards. A wake list holding one
+/// wakes nothing, which is the guarantee the never-reused slab gave for free and
+/// the only thing the free list could have taken away.
 fn reap_settled() {
     RUNTIME.with(|runtime| {
-        for slot in runtime.tasks.borrow_mut().iter_mut() {
-            if slot.as_ref().is_some_and(|node| node.settled.get()) {
-                *slot = None;
+        let mut tasks = runtime.tasks.borrow_mut();
+        let mut free = runtime.free_slots.borrow_mut();
+        for (index, slot) in tasks.iter_mut().enumerate() {
+            if slot.node.as_ref().is_some_and(|node| node.settled.get()) {
+                slot.node = None;
+                slot.generation += 1;
+                free.push(index);
             }
         }
     });
@@ -1051,25 +1142,128 @@ fn reap_settled() {
 /// Answers whether anything fired — `false` means the deadline list is empty and
 /// the loop is done.
 fn advance_timers() -> bool {
-    let earliest = RUNTIME.with(|runtime| {
-        let mut timers = runtime.timers.borrow_mut();
-        timers.retain(|slot| !slot.cancelled.get() && !slot.fired.get());
-        timers
-            .iter()
-            .min_by_key(|slot| (slot.deadline, slot.sequence))
-            .cloned()
-    });
-    let Some(slot) = earliest else {
+    let Some(slot) = earliest_timer() else {
         return false;
     };
     let now = Instant::now();
     if slot.deadline > now {
         std::thread::sleep(slot.deadline - now);
     }
+    fire_timer(&slot);
+    true
+}
+
+/// The earliest live entry of the deadline list, with the dead ones swept.
+fn earliest_timer() -> Option<Rc<TimerSlot>> {
+    RUNTIME.with(|runtime| {
+        let mut timers = runtime.timers.borrow_mut();
+        timers.retain(|slot| !slot.cancelled.get() && !slot.fired.get());
+        timers
+            .iter()
+            .min_by_key(|slot| (slot.deadline, slot.sequence))
+            .cloned()
+    })
+}
+
+/// Marks one timer fired and runs its action — the macrotask itself, split out
+/// so the I/O turn (F18) can fire a DUE timer without the wait.
+fn fire_timer(slot: &Rc<TimerSlot>) {
     slot.fired.set(true);
     let action = slot.action.borrow_mut().take();
     if let Some(action) = action {
         action();
+    }
+}
+
+// ------------------------------------------------------------------- I/O ---
+
+/// A source of external readiness the loop looks at once per turn (F18).
+///
+/// This is the whole of the executor's I/O story, and it is deliberately a POLL
+/// rather than a readiness notification. `std::net` offers `set_nonblocking` and
+/// nothing else: an `epoll`/`kqueue`/IOCP registration needs libc, which needs a
+/// dependency and `unsafe`, and this crate has neither by rule (Order 37 R8,
+/// Order 39 R1). So a listening socket is a source that ACCEPTS without
+/// blocking, its connections are sources that read and write without blocking,
+/// and the turn model asks each of them "did anything happen" once per turn.
+///
+/// The cost is bounded and named: with nothing ready and no timer due, the loop
+/// waits [`IO_POLL_INTERVAL`] before looking again, so an idle server wakes a
+/// thousand times a second and a request waits at most a millisecond longer than
+/// it would under a readiness notification. That is the price of the rule, and
+/// the shape to replace when a platform layer is allowed a dependency.
+pub trait IoSource {
+    /// Look for work, without blocking. `true` if anything progressed — a
+    /// connection accepted, bytes read, bytes written, a request dispatched.
+    /// A `true` answer sends the loop back to the microtask queue, exactly as a
+    /// fired timer does.
+    fn poll(&self) -> bool;
+
+    /// Whether this source can still produce work. A closed listener with no
+    /// live connections answers `false`, is dropped from the registry, and the
+    /// loop goes back to exiting when the deadline list empties.
+    fn is_live(&self) -> bool;
+}
+
+/// How long the loop waits when no source is ready and no timer is due.
+const IO_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Registers `source` with the loop. A server calls this when it binds.
+pub fn register_io(source: Rc<dyn IoSource>) {
+    RUNTIME.with(|runtime| runtime.io.borrow_mut().push(source));
+}
+
+fn io_registered() -> bool {
+    RUNTIME.with(|runtime| !runtime.io.borrow().is_empty())
+}
+
+/// Polls every registered source once, dropping the dead ones. `true` if any of
+/// them progressed.
+fn poll_io() -> bool {
+    let sources: Vec<Rc<dyn IoSource>> =
+        RUNTIME.with(|runtime| runtime.io.borrow().iter().map(Rc::clone).collect());
+    let mut progressed = false;
+    for source in &sources {
+        if source.poll() {
+            progressed = true;
+        }
+    }
+    RUNTIME.with(|runtime| runtime.io.borrow_mut().retain(|source| source.is_live()));
+    progressed
+}
+
+/// The non-microtask half of one turn.
+///
+/// With no I/O registered this IS [`advance_timers`], unchanged — which is what
+/// keeps every ordering rule J6 pinned true for every program that does no I/O.
+/// With a live source it is the same one-macrotask-per-turn rule extended by one
+/// kind of macrotask: a poll of the sources, then the single earliest DUE timer
+/// (due, so the wait cannot be spent blind to a socket), then a bounded wait.
+fn advance_macrotasks() -> bool {
+    if !io_registered() {
+        return advance_timers();
+    }
+    if poll_io() {
+        return true;
+    }
+    if let Some(slot) = earliest_timer()
+        && slot.deadline <= Instant::now()
+    {
+        fire_timer(&slot);
+        return true;
+    }
+    if !io_registered() {
+        // Every source died in this turn's poll: back to the plain timer step,
+        // which is allowed to sleep and lets the program exit.
+        return advance_timers();
+    }
+    let wait = earliest_timer()
+        .map(|slot| slot.deadline.saturating_duration_since(Instant::now()))
+        .map_or(IO_POLL_INTERVAL, |remaining| {
+            remaining.min(IO_POLL_INTERVAL)
+        });
+    if !wait.is_zero() {
+        std::thread::sleep(wait);
     }
     true
 }
@@ -1181,7 +1375,14 @@ pub fn run_pending() {
         drain_microtasks();
         report_unobserved_failures();
         reap_settled();
-        if !advance_timers() {
+        // [`advance_macrotasks`] rather than [`advance_timers`], for the same
+        // reason `block_on` uses it (F18): a synchronous `fun main` that bound a
+        // SERVER left an I/O source behind, not a timer, and a loop that only
+        // asked the deadline list saw nothing to do and let the process exit
+        // with the listener still open — the socket announced its port and then
+        // refused every connection. With no source registered the two are the
+        // same function.
+        if !advance_macrotasks() {
             break;
         }
     }
@@ -1196,6 +1397,11 @@ pub fn run_pending() {
 /// that point rather than running the timers that were still outstanding.
 pub fn block_on<T: Clone + 'static>(body: impl Future<Output = T> + 'static) -> T {
     let root = spawn(body, "top level");
+    // The root is OBSERVED by definition: the loop below reads its failure and
+    // raises it. Without this it also took the unobserved-report path, so a
+    // failing `async fun main` printed `unhandled task error (spawned in top
+    // level)` and then the message — two lines where node prints one (F25).
+    root.node.observed.set(true);
     loop {
         drain_microtasks();
         report_unobserved_failures();
@@ -1203,7 +1409,7 @@ pub fn block_on<T: Clone + 'static>(body: impl Future<Output = T> + 'static) -> 
             raise(failure);
         }
         reap_settled();
-        if !advance_timers() {
+        if !advance_macrotasks() {
             break;
         }
     }
@@ -1776,5 +1982,137 @@ mod tests {
             Some("boom".to_string())
         );
         assert_eq!(log.taken(), vec!["body", "after"]);
+    }
+
+    // -- rule 13: the slab's free list and its generation counter (F24) --
+
+    /// A node that is already settled, for the slab tests: they are about the
+    /// SLOT bookkeeping, not about driving a body.
+    fn settled_node(origin: &str) -> Rc<TaskNode> {
+        Rc::new(TaskNode {
+            origin: crate::str_new(origin),
+            driver: RefCell::new(None),
+            settled: Cell::new(true),
+            failure: RefCell::new(None),
+            observed: Cell::new(true),
+            owned: false,
+            nursery: None,
+            waiters: RefCell::new(Vec::new()),
+            reported: Cell::new(false),
+        })
+    }
+
+    /// F24's claim: a settled task's slot is REUSED, so a program that spawns
+    /// per unit of work does not grow the slab one word per spawn for its
+    /// lifetime.
+    ///
+    /// Two hundred rounds, each spawning one task, awaiting it and reading the
+    /// slab's length. The high-water mark is what the assertion is about: it was
+    /// `rounds + 1` before the free list existed, because a reaped slot stayed
+    /// `None` forever. The bound is deliberately loose (there is one round of
+    /// lag — a task settles inside a microtask drain and its slot is freed at
+    /// the top of the NEXT turn), and it is two orders of magnitude below the
+    /// unbounded number, which is what makes it non-vacuous.
+    #[test]
+    fn a_settled_tasks_slot_is_reused_so_repeated_spawns_keep_the_slab_bounded() {
+        let rounds = 200;
+        let high_water = Rc::new(Cell::new(0usize));
+        let observed = Rc::clone(&high_water);
+        block_on(async move {
+            for _ in 0..rounds {
+                let task = spawn(
+                    async {
+                        sleep(0, None).await;
+                    },
+                    "test",
+                );
+                task.await;
+                observed.set(observed.get().max(slab_slots()));
+            }
+        });
+        assert!(
+            high_water.get() <= 8,
+            "{rounds} spawn/settle rounds left the slab at {} slots; the free list is not \
+             reclaiming them",
+            high_water.get()
+        );
+    }
+
+    /// The guarantee the never-reused slab gave for free, and the one thing a
+    /// free list could have taken away: a handle to a task that has been reaped
+    /// must not name whatever task takes its slot next.
+    ///
+    /// The slot really IS reused (the index is the same one), and the
+    /// generation is what makes the old handle stop naming it — checked both
+    /// before and after the reuse, because a check only after it would pass on
+    /// an implementation that merely left the slot empty.
+    #[test]
+    fn a_reaped_handle_does_not_name_the_task_that_reuses_its_slot() {
+        let first = settled_node("first");
+        let first_id = register_task(Rc::clone(&first));
+        assert!(task_at(first_id).is_some(), "a fresh handle names its task");
+        reap_settled();
+        assert!(
+            task_at(first_id).is_none(),
+            "a reaped handle must name nothing"
+        );
+
+        let second = settled_node("second");
+        let second_id = register_task(Rc::clone(&second));
+        assert_eq!(
+            second_id.index, first_id.index,
+            "the freed slot must be the one the next spawn takes"
+        );
+        assert_ne!(
+            second_id.generation, first_id.generation,
+            "reuse must move the generation on"
+        );
+        assert!(
+            task_at(first_id).is_none(),
+            "the stale handle named the stranger that took its slot"
+        );
+        assert!(Rc::ptr_eq(
+            &task_at(second_id).expect("the new handle names the new task"),
+            &second
+        ));
+    }
+
+    /// And a WAKE through a stale handle is a no-op rather than a poll of the
+    /// stranger in that slot: `enqueue` takes handles off wake lists that
+    /// outlive their tasks, and `poll_task` is where the check has to hold.
+    #[test]
+    fn a_wake_through_a_stale_handle_polls_nothing() {
+        let first = settled_node("first");
+        let first_id = register_task(Rc::clone(&first));
+        reap_settled();
+        let polled = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&polled);
+        // A live task in the freed slot whose body records that it ran.
+        let second = Rc::new(TaskNode {
+            origin: crate::str_new("second"),
+            driver: RefCell::new(Some(Box::pin(async move {
+                flag.set(true);
+            }))),
+            settled: Cell::new(false),
+            failure: RefCell::new(None),
+            observed: Cell::new(true),
+            owned: false,
+            nursery: None,
+            waiters: RefCell::new(Vec::new()),
+            reported: Cell::new(false),
+        });
+        let second_id = register_task(Rc::clone(&second));
+        assert_eq!(second_id.index, first_id.index);
+        enqueue(first_id);
+        drain_microtasks();
+        assert!(
+            !polled.get(),
+            "a wake through a reaped task's handle polled the task that took its slot"
+        );
+        // The same wake through the RIGHT handle does run it, so the no-op above
+        // is the generation check and not a dead queue.
+        enqueue(second_id);
+        drain_microtasks();
+        assert!(polled.get(), "the live handle must still wake its task");
     }
 }
