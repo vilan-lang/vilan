@@ -980,6 +980,115 @@ impl<T: Js + std::hash::Hash + Eq + Clone> Js for Set<T> {
 
 // --------------------------------------------------------- canonical keys ---
 
+// ------------------------------------------------------------------- any ---
+
+/// `any` — a value whose vilan type is open at the position it fills.
+///
+/// It exists for ONE shape today and the scope is deliberate: `std::db`'s
+/// `Statement::run(parameters: List<any>)`, where a query's bind list is
+/// heterogeneous by nature (`["ada", 1.5]`) and the schema, not the type
+/// system, says what each slot means. On the JS backend such a list is just a
+/// JS array; natively it needs a value type, and this is the smallest one that
+/// covers what a bind list can hold.
+///
+/// Not a dynamic type system. There is no downcast, no reflection and no
+/// `is`-test over it — a program reads an `any` back through the accessor of
+/// the surface that took it (`Row::text`, `Row::integer`), exactly as it does
+/// on the other backend.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Any {
+    Null,
+    Bool(bool),
+    /// An exact integer. Kept apart from [`Any::Float`] because SQLite's
+    /// INTEGER and REAL are different column types and a parameter's Rust type
+    /// is what decides which one a bind writes.
+    Integer(i64),
+    Float(f64),
+    Text(Str),
+}
+
+macro_rules! any_from_integer {
+    ($($type:ty),*) => {
+        $(impl From<$type> for Any {
+            fn from(value: $type) -> Any {
+                Any::Integer(value as i64)
+            }
+        })*
+    };
+}
+
+any_from_integer!(i8, u8, i16, u16, i32, u32, i64, u64, usize, isize);
+
+impl From<f64> for Any {
+    fn from(value: f64) -> Any {
+        Any::Float(value)
+    }
+}
+
+impl From<f32> for Any {
+    fn from(value: f32) -> Any {
+        Any::Float(value as f64)
+    }
+}
+
+impl From<bool> for Any {
+    fn from(value: bool) -> Any {
+        Any::Bool(value)
+    }
+}
+
+impl From<Str> for Any {
+    fn from(value: Str) -> Any {
+        Any::Text(value)
+    }
+}
+
+impl From<&str> for Any {
+    fn from(value: &str) -> Any {
+        Any::Text(str_new(value))
+    }
+}
+
+impl<T: Into<Any>> From<Option<T>> for Any {
+    fn from(value: Option<T>) -> Any {
+        match value {
+            Some(value) => value.into(),
+            None => Any::Null,
+        }
+    }
+}
+
+impl Js for Any {
+    fn js(&self) -> String {
+        match self {
+            Any::Null => "null".to_string(),
+            Any::Bool(value) => value.js(),
+            Any::Integer(value) => value.js(),
+            Any::Float(value) => value.js(),
+            Any::Text(value) => value.js(),
+        }
+    }
+
+    fn js_nested(&self) -> String {
+        match self {
+            Any::Text(value) => value.js_nested(),
+            other => other.js(),
+        }
+    }
+}
+
+impl Json for Any {
+    fn json(&self) -> String {
+        match self {
+            Any::Null => "null".to_string(),
+            Any::Bool(value) => value.json(),
+            Any::Integer(value) => value.json(),
+            Any::Float(value) => value.json(),
+            Any::Text(value) => value.json(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------- bigint ---
 
 /// `BigInt` — an **`i128`**, which is the native backend's documented LIMIT

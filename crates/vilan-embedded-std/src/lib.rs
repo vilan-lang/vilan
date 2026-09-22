@@ -82,6 +82,13 @@ pub fn materialize_rt_into(cache_root: &Path) -> Result<PathBuf, String> {
         .map(|(key, contents)| (staging.join(key), *contents))
         .collect();
     written.push((staging.join("vilan-rt").join("Cargo.toml"), RT_MANIFEST));
+    // F18 slice 2: the SQLite crate materializes beside the runtime, under the
+    // same hash, because the generated cargo manifest reaches it as a sibling
+    // of the runtime path.
+    written.push((
+        staging.join("vilan-rt-sqlite").join("Cargo.toml"),
+        RT_SQLITE_MANIFEST,
+    ));
     for (path, contents) in written {
         let parent = path.parent().expect("every embedded file has a parent");
         fs::create_dir_all(parent)

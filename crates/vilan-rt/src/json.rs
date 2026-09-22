@@ -72,9 +72,18 @@ impl JsonValue {
     /// `value[name]` — the `JsonField` intrinsic.
     ///
     /// A key an object does not carry is `undefined`, and so is a field read of
-    /// anything that is not an object: `(5).x` and `"s".x` are both `undefined`
-    /// in JavaScript, and neither is a shape a decoder is allowed to be in
-    /// without having asked `has_field` first.
+    /// anything that is not an object or an array: `(5).x` and `"s".x` are both
+    /// `undefined` in JavaScript, and neither is a shape a decoder is allowed
+    /// to be in without having asked `has_field` first.
+    ///
+    /// **An ARRAY answers a numeric key, and that is not an extra.** A JS
+    /// array's indices ARE string keys — `[4, 5]["0"]` is `4` — and
+    /// `[derive(Json)]`'s decoder for a multi-payload variant reads exactly
+    /// that: `{"Rect":[4,5]}` comes back as `value.field("Rect").field("0")`
+    /// and `.field("1")`. Answering `undefined` there made every such variant
+    /// fail to decode with "expected a number" while the JS backend round-
+    /// tripped it (`derive-enum.vl` is the pin). `length` is a string key of an
+    /// array too, for the same reason.
     pub fn field(&self, name: &str) -> JsonValue {
         match self {
             JsonValue::Object(entries) => entries
@@ -82,6 +91,11 @@ impl JsonValue {
                 .find(|(key, _)| &**key == name)
                 .map(|(_, value)| value.clone())
                 .unwrap_or(JsonValue::Undefined),
+            JsonValue::Array(items) => match array_key(name) {
+                Some(index) => items.get(index).cloned().unwrap_or(JsonValue::Undefined),
+                None if name == "length" => JsonValue::Number(items.len() as f64),
+                None => JsonValue::Undefined,
+            },
             _ => JsonValue::Undefined,
         }
     }
@@ -149,6 +163,10 @@ impl JsonValue {
     pub fn has_field(&self, name: &str) -> bool {
         match self {
             JsonValue::Object(entries) => entries.iter().any(|(key, _)| &**key == name),
+            // `Object.hasOwn([4, 5], "0")` is true — see [`JsonValue::field`].
+            // `length` is NOT an own property of an array there, so it is not
+            // one here either.
+            JsonValue::Array(items) => array_key(name).is_some_and(|index| index < items.len()),
             _ => false,
         }
     }
@@ -229,6 +247,20 @@ impl JsonValue {
     pub fn object(entries: Vec<(Str, JsonValue)>) -> JsonValue {
         JsonValue::Object(Rc::new(entries))
     }
+}
+
+/// One array index written as a string key, per JavaScript's rule: a canonical
+/// non-negative integer with no leading zero (`"0"`, `"12"`), and nothing else
+/// — `"01"`, `"1.0"`, `"-1"` and `" 1"` are ordinary property names there and
+/// name nothing in an array.
+fn array_key(name: &str) -> Option<usize> {
+    if name.is_empty() || (name.len() > 1 && name.starts_with('0')) {
+        return None;
+    }
+    if !name.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    name.parse::<usize>().ok()
 }
 
 /// `JSON.parse(text)` — TRUSTING, exactly as `std::json`'s `parse_json_value`
@@ -649,6 +681,31 @@ mod tests {
     fn trailing_text_and_trailing_commas_are_refused() {
         for refused in ["{} {}", "[1,]", "{\"a\":1,}", "[1 2]", "", "   "] {
             assert!(try_parse(refused).is_none(), "{refused:?} is not JSON");
+        }
+    }
+
+    /// The class `derive-enum.vl` caught: a multi-payload variant's decoder
+    /// reads `{"Rect":[4,5]}` back as `.field("Rect").field("0")`, because an
+    /// array's indices are string keys in JavaScript.
+    #[test]
+    fn an_array_answers_a_numeric_string_key_the_way_javascript_does() {
+        let value = parsed("[4,5]");
+        assert_eq!(value.field("0").coerce_number(), 4.0);
+        assert_eq!(value.field("1").coerce_number(), 5.0);
+        assert_eq!(&*value.field("2").kind(), "undefined", "past the end");
+        assert_eq!(value.field("length").coerce_number(), 2.0);
+        assert!(value.has_field("0"));
+        assert!(!value.has_field("2"));
+        // `length` is not an OWN property of an array.
+        assert!(!value.has_field("length"));
+        // Only a canonical index is a key.
+        for other in ["01", "1.0", "-1", " 1", "", "x"] {
+            assert_eq!(
+                &*value.field(other).kind(),
+                "undefined",
+                "{other:?} names no element"
+            );
+            assert!(!value.has_field(other));
         }
     }
 

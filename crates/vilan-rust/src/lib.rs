@@ -92,6 +92,10 @@ pub struct Emitted {
     /// nothing compiles it, and the mode exists because "what does this program
     /// still need" is a question one run should answer.
     pub host_gaps: Vec<String>,
+    /// Whether the program reached `std::db`, so the cargo project written for
+    /// it depends on `vilan-rt-sqlite` (F18 slice 2; Order 39's R1). A program
+    /// that does not names the crate nowhere and never builds it.
+    pub reaches_sqlite: bool,
     /// R3's measurement: how many bindings this program had to box into
     /// `vilan_rt::Captured<_>` (an `Rc<RefCell<_>>`) because a closure captures
     /// them and something writes them. C15's by-value capture optimisation is
@@ -274,6 +278,25 @@ struct Emitter<'a, 'src> {
     /// into a future rather than handed over with the wrong type.
     /// `Server::builder()`'s default handler is the shape.
     expects_async_value: bool,
+    /// The DECLARED return type of the function being emitted, threaded to its
+    /// return positions so a generic aggregate built there instantiates at the
+    /// signature's arguments rather than at the ones its own site recorded.
+    ///
+    /// The signature is what the body has to satisfy; a literal's own record
+    /// can be open (`Taken<Self, T>` inside a trait default) and a Rust struct
+    /// cannot be minted over a hole. Consulted only where the recorded
+    /// arguments are NOT grounded and only when the two name the same
+    /// declaration, which is `Emitter::expected_type`'s standing rule.
+    current_return_type: Option<TypeId>,
+    /// Whether this program reached `std::db` (F18 slice 2, Order 39's R1).
+    ///
+    /// SQLite is the one runtime surface with a crates.io dependency, so it is
+    /// a crate of its own and the emitted cargo project names it only when the
+    /// program needs it — a program that does not pays neither the lockfile
+    /// entry nor the C compile of SQLite's amalgamation. The flag is set where
+    /// one of the three host TYPES is rendered, which is the narrowest point
+    /// every reach passes through: a binding takes or answers one.
+    reaches_sqlite: bool,
     /// Whether the function being emitted DECLARES an `async |T| U` return
     /// type (J2's `async_returning`) — so the closure literal it hands back is
     /// a future-answering one.
@@ -331,6 +354,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             declaring_a_view: false,
             expects_async: false,
             expects_async_value: false,
+            current_return_type: None,
+            reaches_sqlite: false,
             returns_an_async_closure: false,
             closure_captures: Vec::new(),
         }
@@ -384,6 +409,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Ok(Emitted {
             source,
             host_gaps: self.host_gaps.iter().cloned().collect(),
+            reaches_sqlite: self.reaches_sqlite,
             boxed_bindings: self.boxed_emitted.len(),
         })
     }
@@ -1254,6 +1280,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             Type::Struct(id, arguments) => self.nominal_struct(id, &arguments, span),
             Type::Enum(id, arguments) => self.nominal_enum(id, &arguments, span),
+            // F18 slice 2: `any`. It exists for `std::db`'s bind list, and
+            // `vilan_rt::Any` says what its scope is — not a dynamic type
+            // system, just the value type a heterogeneous list needs where the
+            // JS backend has a bare array.
+            Type::Any => Ok("vilan_rt::Any".to_string()),
             // A generic the substitution did not reach. The refusal names the
             // PARAMETER, because which one went unbound is the whole diagnosis
             // when it happens.
@@ -1310,6 +1341,73 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
         }
         format!("#{}", constraint_id.0)
+    }
+
+    /// Whether `any` appears ANYWHERE inside a type.
+    ///
+    /// Nested, because the openness that mints a second Rust type need not be
+    /// at the top: `delta-law.vl` instantiates `SeqOp<List<any>>` beside
+    /// `SeqOp<List<i32>>`, and a check that looked only at the outermost
+    /// argument saw a grounded `List` and minted both.
+    fn mentions_any(&self, type_id: TypeId) -> bool {
+        let Some(_guard) = vilan_core::util::RecursionGuard::enter() else {
+            return false;
+        };
+        match self.resolve(type_id) {
+            Some(Type::Any) => true,
+            Some(
+                Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Tuple(arguments),
+            ) => arguments
+                .clone()
+                .iter()
+                .any(|inner| self.mentions_any(*inner)),
+            Some(Type::Array(element, _)) => {
+                let element = *element;
+                self.mentions_any(element)
+            }
+            Some(Type::Closure(parameters, returns, _)) => {
+                let (parameters, returns) = (parameters.clone(), *returns);
+                parameters.iter().any(|inner| self.mentions_any(*inner))
+                    || self.mentions_any(returns)
+            }
+            _ => false,
+        }
+    }
+
+    /// A nominal type instantiated at `any` is REFUSED, even though `any`
+    /// itself now renders (F18 slice 2).
+    ///
+    /// `Type::Any` is the analyzer's "open at this position", and a generic
+    /// whose argument is open is the B357 shape: the site records `SeqOp<any>`
+    /// while the binding beside it is `SeqOp<i32>`, and grounding the open one
+    /// mints a SECOND Rust type where the JS backend has one array. That is
+    /// exactly what `delta-law.vl` and `generic-adapter-dispatch.vl` did the
+    /// moment `any` stopped being a refusal — `Reset(Vec<vilan_rt::Any>)`
+    /// handed a `Vec<i32>`.
+    ///
+    /// The check sits at the two MINT points themselves (`ensure_struct` and
+    /// `ensure_enum`) rather than at `nominal_struct`/`nominal_enum`, because
+    /// a variant CONSTRUCTOR reaches the mint through `variant_path` and would
+    /// otherwise walk past it — which is exactly the site `delta-law.vl`
+    /// failed at.
+    ///
+    /// Asking only where a type is about to be minted is what
+    /// is what makes `List<any>` — the whole reason `any` renders — untouched:
+    /// `List`, `Option` and `Result` are answered by name as `Vec<_>`,
+    /// `Option<_>` and `Result<_, _>` and mint nothing, so `std::db`'s bind
+    /// list works while a user aggregate at an open argument keeps the refusal
+    /// it had.
+    fn refuse_an_any_argument(&self, arguments: &[TypeId], span: Span) -> Result<(), Error> {
+        if arguments
+            .iter()
+            .any(|argument| self.mentions_any(*argument))
+        {
+            return Err(unsupported(
+                "a generic type instantiated at `any` (the site's argument is still open)",
+                span,
+            ));
+        }
+        Ok(())
     }
 
     fn nominal_struct(
@@ -1401,6 +1499,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // answered the same way. The `external` gate is above, so this arm
             // cannot claim a vilan struct that merely shares one of the names.
             _ if let Some(native) = http_host_type(name) => Ok(native.to_string()),
+            // F18 slice 2: `std::db`'s three host types, which are
+            // `vilan-rt-sqlite`'s — a SEPARATE crate (Order 39's R1), linked
+            // only when a program reaches one of them. Naming one is what
+            // records that reach: see [`Emitter::reaches_sqlite`].
+            "Database" | "Statement" | "Row" => {
+                self.reaches_sqlite = true;
+                Ok(format!("vilan_rt_sqlite::{name}"))
+            }
             // F32 (RULED (b), Order 40): `BigInt` is an `i128` natively — the
             // documented LIMIT. `vilan_rt::BigInt` says what that buys and
             // what it costs; it is a newtype and not a bare `i128` because
@@ -1486,6 +1592,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         span: Span,
     ) -> Result<Reserved, Error> {
         let declaration = self.program.structs.get(&id).cloned().unwrap();
+        self.refuse_an_any_argument(arguments, span)?;
         // The refusal comes BEFORE the once-only mark, or a first call that
         // swallowed the error would let a second one through on the mark alone
         // and emit a reference to a type nothing declared.
@@ -1649,6 +1756,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
     fn ensure_enum(&mut self, id: Id, arguments: &[TypeId], span: Span) -> Result<Reserved, Error> {
         let declaration = self.program.enums.get(&id).cloned().unwrap();
+        self.refuse_an_any_argument(arguments, span)?;
         if declaration.resource {
             return Err(unsupported(
                 &format!(
@@ -2151,9 +2259,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             &mut self.returns_an_async_closure,
             self.program.async_returning.contains(&function.id),
         );
+        let declared_return = self
+            .return_type_of(function)
+            .map(|type_id| self.concrete(type_id));
+        let saved_return_type = std::mem::replace(&mut self.current_return_type, declared_return);
         let saved_origin = self.current_origin.replace(function.name);
         let walked = self.emit_block(&function.body.0, function.body.1, &mut body, 1);
         self.current_origin = saved_origin;
+        self.current_return_type = saved_return_type;
         self.returns_an_async_closure = saved_returns_async;
         self.current_returns_view = saved_view;
         walked?;
@@ -2445,11 +2558,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // return position, so a closure literal landing there answers a
             // future. See [`Emitter::returns_an_async_closure`].
             self.expects_async_value = depth == 1 && self.returns_an_async_closure;
+            let saved_expected = if depth == 1 {
+                std::mem::replace(&mut self.expected_type, self.current_return_type)
+            } else {
+                self.expected_type
+            };
             let rendered = if returns_the_loan {
                 self.expression(tail, depth)
             } else {
                 self.value_of(tail, depth)
             };
+            self.expected_type = saved_expected;
             self.expects_async_value = false;
             let rendered = rendered?;
             let _ = writeln!(out, "{pad}{rendered}");
@@ -2564,7 +2683,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
                 Some(value) => {
                     self.expects_async_value = self.returns_an_async_closure;
+                    let saved_expected =
+                        std::mem::replace(&mut self.expected_type, self.current_return_type);
                     let rendered = self.value_of(value, depth);
+                    self.expected_type = saved_expected;
                     self.expects_async_value = false;
                     format!("return {}", rendered?)
                 }
@@ -2706,7 +2828,30 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let saved = std::mem::replace(&mut self.expected_type, expecting);
         let rendered = self.value_of(id, depth);
         self.expected_type = saved;
-        rendered
+        let rendered = rendered?;
+        // F18 slice 2: a value landing in an `any` position is WRAPPED. On the
+        // JS backend there is nothing to do — every value is already a JS
+        // value — so the conversion has no counterpart there and lives at the
+        // one seam that knows both the position's type and the value's.
+        // Already-`any` values pass through, which is what makes a bind list
+        // read out of another one idempotent.
+        if matches!(
+            expecting.and_then(|type_id| self.resolve(type_id)),
+            Some(Type::Any)
+        ) && !matches!(
+            self.type_of(id).and_then(|type_id| self.resolve(type_id)),
+            Some(Type::Any)
+        ) {
+            // The wrap CONSUMES what it is given (`Any::from` takes the value),
+            // and `clone_sites` marks nothing here — on the JS backend there is
+            // no conversion at all — so rule 1's copy is owed at this read the
+            // way it is owed at any other consuming position. Without it,
+            // `run([username, hashed])` moved `username` out of a binding the
+            // next line still reads.
+            let rendered = self.copy_a_consumed_place_read(id, rendered);
+            return Ok(format!("vilan_rt::Any::from({rendered})"));
+        }
+        Ok(rendered)
     }
 
     /// An expression in a VALUE position — rule 1's copy applied where the
@@ -3314,6 +3459,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
+    /// Whether a type is one of the numeric scalar primitives — the set
+    /// [`Emitter::number_literal`] lets a declared POSITION override a
+    /// literal's own record for.
+    fn is_numeric_scalar(&self, type_id: TypeId) -> bool {
+        self.resolve(type_id)
+            .and_then(|resolved| match resolved {
+                Type::Struct(struct_id, _) => self.program.structs.get(struct_id),
+                _ => None,
+            })
+            .and_then(|declaration| scalar_type(declaration.name))
+            .is_some_and(|scalar| scalar != "vilan_rt::Str")
+    }
+
+    /// Whether two types render to the same Rust type — asked of two numeric
+    /// scalars, where it is the question "do these two records agree".
+    fn rust_type_key_matches(&self, left: TypeId, right: TypeId) -> bool {
+        self.type_key(left) == self.type_key(right)
+    }
+
     fn number_literal(
         &mut self,
         id: Id,
@@ -3380,8 +3544,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .and_then(|declaration| scalar_type(declaration.name))
                 .is_some_and(|scalar| scalar != "vilan_rt::Str")
         });
-        let rendered = match self
-            .type_of(id)
+        // Where the POSITION declares a numeric scalar and the literal's own
+        // record says a DIFFERENT one, the position wins. The record for a
+        // literal is advisory — JavaScript has one numeric type, so nothing on
+        // that backend ever had to agree — and the position is a Rust
+        // signature the emission has to satisfy. `number-math.vl`'s
+        // `16f.as_f32().clamp(0f.as_f32(), 4f.as_f32())` is the shape: `0f` is
+        // recorded `f32` (from the clamp argument it eventually fills) while
+        // the `as_f32` instance selected for it takes `f64`, and emitting the
+        // record gave rustc `expected &f64, found &f32`.
+        let own = self.type_of(id).filter(|type_id| {
+            expected_scalar.is_none_or(|expected| {
+                self.rust_type_key_matches(*type_id, expected) || !self.is_numeric_scalar(*type_id)
+            })
+        });
+        let rendered = match own
             .or(expected_scalar)
             .and_then(|type_id| self.rust_type(type_id, span).ok())
         {
@@ -4219,6 +4396,28 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .type_of(expr_id)
             .and_then(|type_id| self.resolve(type_id))
             && *found == struct_id
+            && arguments.iter().all(|argument| self.is_grounded(*argument))
+        {
+            return arguments.clone();
+        }
+        // The position this literal is being emitted into, when it declares the
+        // same struct with its arguments CLOSED — `variant_arguments`' fallback
+        // for a variant constructor, which a struct literal needs for the same
+        // reason: a trait default's `Taken { upstream = self, remaining = count }`
+        // records `Taken<Self, T>` in the DEFAULT's own context, so the literal
+        // and the declared return type minted two Rust structs and the body
+        // handed back the wrong one (`generic-adapter-dispatch.vl`).
+        if let Some(Type::Struct(found, expected)) =
+            self.expected_type.and_then(|type_id| self.resolve(type_id))
+            && *found == struct_id
+            && expected.iter().all(|argument| self.is_grounded(*argument))
+        {
+            return expected.clone();
+        }
+        if let Some(Type::Struct(found, arguments)) = self
+            .type_of(expr_id)
+            .and_then(|type_id| self.resolve(type_id))
+            && *found == struct_id
         {
             return arguments.clone();
         }
@@ -4290,7 +4489,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
     fn for_each(
         &mut self,
-        _id: Id,
+        id: Id,
         iterable: Id,
         item: Option<Id>,
         statements: &[Id],
@@ -4322,13 +4521,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 _ => false,
             });
         if iterates_something_else {
-            return Err(unsupported(
-                concat!(
-                    "a `for` over anything but a `List` ",
-                    "(an `Iterator` impl is a monomorphised generic)"
-                ),
-                span,
-            ));
+            return self.for_each_iterator(id, iterable_place, item, statements, tail, depth, span);
         }
         let iterable_text = self.expression(iterable, depth)?;
         let binder = match item {
@@ -4353,6 +4546,78 @@ impl<'a, 'src> Emitter<'a, 'src> {
             None => format!("({iterable_text}).clone().into_iter()"),
         };
         Ok(format!("for {binder} in {iteration} {{\n{body}{pad}}}"))
+    }
+
+    /// A `for` over an **`Iterator` impl** — the largest refusal class this
+    /// backend had (F18 slice 2; `std::range`'s `Range` is the one every
+    /// counted loop in std goes through, and `Bytes::to_hex` is why the exit
+    /// program needed it).
+    ///
+    /// The lowering is the JS emitter's, expressed in Rust's own `while let`:
+    /// the analyzer records the loop's `next` member on `for_each_next`, so the
+    /// protocol is not re-derived here — it is READ, from the same record the
+    /// other backend reads, which is what keeps the two from having two
+    /// opinions about which `next` a loop calls.
+    ///
+    ///     `for x in r { .. }`  →  `{ let mut it = r; while let Some(x) = next(&mut it) { .. } }`
+    ///
+    /// `next` takes `&mut self`, so the iterator is a `mut` binding of its own
+    /// and the receiver is a borrow of it: the loop ADVANCES the iterator, and
+    /// an iterator advanced through a copy would not terminate. The binding is
+    /// scoped to a block so the name cannot collide with the body's.
+    ///
+    /// An iterator whose `next` resolves to an intrinsic or to a host binding
+    /// is refused by name rather than guessed at — no `Iterator` impl in std is
+    /// either, and one that were would need its own arm.
+    fn for_each_iterator(
+        &mut self,
+        id: Id,
+        iterable: Id,
+        item: Option<Id>,
+        statements: &[Id],
+        tail: Id,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        let Some(_next_id) = self.program.for_each_next.get(&id).copied() else {
+            return Err(unsupported(
+                concat!(
+                    "a `for` over anything but a `List` ",
+                    "(an `Iterator` impl is a monomorphised generic)"
+                ),
+                span,
+            ));
+        };
+        let Some(subject) = self.type_of(iterable).map(|type_id| self.concrete(type_id)) else {
+            return Err(unsupported(
+                "a `for` over an iterator of unresolved type",
+                span,
+            ));
+        };
+        let preferred = self.program.bound_dispatch_traits.get(&id).cloned();
+        let Some(NativeDispatch::Call(next)) =
+            self.resolve_dispatch(subject, "next", &[], preferred, span)?
+        else {
+            return Err(unsupported(
+                "a `for` over an iterator whose `next` is not an ordinary member",
+                span,
+            ));
+        };
+        // The iterable is CONSUMED by the loop (the iterator is advanced), so a
+        // read of a place copies — rule 1's answer at a consuming position.
+        let iterable_text = self.consumed_value_of(iterable, depth)?;
+        let binder = match item {
+            Some(item) => self.binding_name(item),
+            None => "_".to_string(),
+        };
+        let mut body = String::new();
+        self.emit_block(statements, tail, &mut body, depth + 2)?;
+        let pad = Self::indent(depth);
+        let inner = Self::indent(depth + 1);
+        Ok(format!(
+            "{{\n{inner}let mut iterator = {iterable_text};\n\
+             {inner}while let Some({binder}) = {next}(&mut iterator) {{\n{body}{inner}}}\n{pad}}}"
+        ))
     }
 
     fn closure(&mut self, closure_id: Id, depth: usize, span: Span) -> Result<String, Error> {
@@ -4841,6 +5106,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     "vilan_rt::http::read_request_bytes(({request}).clone())"
                 )));
             }
+            // `new TextDecoder()` / `new TextEncoder()` — both stateless for
+            // the one encoding vilan has.
+            ExternBinding::New {
+                module: None,
+                symbol: "TextDecoder",
+            } => return Ok(Some("vilan_rt::http::TextDecoder".to_string())),
+            ExternBinding::New {
+                module: None,
+                symbol: "TextEncoder",
+            } => return Ok(Some("vilan_rt::http::TextEncoder".to_string())),
             ExternBinding::Function {
                 module: Some("node:stream/consumers"),
                 symbol: "text",
@@ -4975,6 +5250,41 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     self.place_argument(argument_ids, 0, depth)?
                 )
             }
+            // F18 slice 2: `std::bytes`'s READ accessors. The three that
+            // MUTATE (`alloc`, `fill`, `copy_into`) are deliberately absent:
+            // a `Uint8Array` is a mutable reference type there and `Bytes` is
+            // an immutable refcounted buffer here, so admitting them wants a
+            // decision about which `Bytes` is — its own item, and a wrong
+            // answer would be a silent miscompile rather than a refusal.
+            ("Bytes", "len") => {
+                format!("({}).len()", self.place_argument(argument_ids, 0, depth)?)
+            }
+            ("Bytes", "get") => format!(
+                "({}).at({})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            ("Bytes", "get_u32") => format!(
+                "(({}).at({}) as u32)",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            ("Bytes", "slice") => format!(
+                "({}).slice({}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?
+            ),
+            ("TextDecoder", "decode") => format!(
+                "({}).decode(&{})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            ("TextEncoder", "encode") => format!(
+                "({}).encode(&{})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
             ("NodeSocket", "destroyed") => format!(
                 "({}).destroyed()",
                 self.place_argument(argument_ids, 0, depth)?
@@ -5048,6 +5358,113 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 span,
             )),
         }
+    }
+
+    /// `std::db`'s ten host seams (F18 slice 2; Order 39's R1).
+    ///
+    /// Keyed on the pair (host symbol, vilan name) for
+    /// [`Emitter::json_host_binding`]'s reason, and here the second half does
+    /// real work twice over: the three column readers SHARE the host helper
+    /// `__db_column` and differ only in the vilan type they read the column
+    /// AT, and `exec`/`prepare` are bare `[extern(method)]`s whose host name
+    /// defaults to their own.
+    ///
+    /// Every arm names `vilan_rt_sqlite`, whose module header says what each
+    /// one is a twin of and where the two genuinely differ (a statement is
+    /// prepared at its first USE, through the connection's own cache).
+    fn db_host_binding(
+        &mut self,
+        name: &str,
+        binding: Option<&ExternBinding<'src>>,
+        argument_ids: &[Id],
+        depth: usize,
+    ) -> Result<Option<String>, Error> {
+        let receiver = |emitter: &mut Self| emitter.place_argument(argument_ids, 0, depth);
+        let rendered = match binding {
+            // `new DatabaseSync(path)`.
+            Some(ExternBinding::New {
+                module: Some("node:sqlite"),
+                symbol: "DatabaseSync",
+            }) => format!(
+                "vilan_rt_sqlite::Database::open({})",
+                self.value_argument(argument_ids, 0, depth)?
+            ),
+            Some(ExternBinding::Method { symbol }) => match symbol.unwrap_or(name) {
+                "exec" => format!(
+                    "({}).exec({})",
+                    receiver(self)?,
+                    self.value_argument(argument_ids, 1, depth)?
+                ),
+                "prepare" => format!(
+                    "({}).prepare({})",
+                    receiver(self)?,
+                    self.value_argument(argument_ids, 1, depth)?
+                ),
+                _ => return Ok(None),
+            },
+            Some(ExternBinding::Function {
+                module: None,
+                symbol,
+            }) => match (*symbol, name) {
+                ("__db_close", _) => format!("({}).close()", receiver(self)?),
+                ("__db_run", _) => format!(
+                    "({}).run({})",
+                    receiver(self)?,
+                    self.value_argument(argument_ids, 1, depth)?
+                ),
+                ("__db_all", _) => format!(
+                    "({}).all({})",
+                    receiver(self)?,
+                    self.value_argument(argument_ids, 1, depth)?
+                ),
+                ("__db_get", _) => format!(
+                    "({}).first({})",
+                    receiver(self)?,
+                    self.value_argument(argument_ids, 1, depth)?
+                ),
+                ("__db_is_null", _) => format!(
+                    "({}).is_null({})",
+                    receiver(self)?,
+                    self.value_argument(argument_ids, 1, depth)?
+                ),
+                ("__db_exec_guarded", _) => format!(
+                    "({}).exec_guarded({})",
+                    receiver(self)?,
+                    self.value_argument(argument_ids, 1, depth)?
+                ),
+                ("__db_run_guarded", _) => format!(
+                    "({}).run_guarded({})",
+                    receiver(self)?,
+                    self.value_argument(argument_ids, 1, depth)?
+                ),
+                // The three readers, told apart by the vilan name because the
+                // host helper cannot tell them apart at all.
+                ("__db_column", "column_text") => format!(
+                    "({}).text({})",
+                    receiver(self)?,
+                    self.value_argument(argument_ids, 1, depth)?
+                ),
+                ("__db_column", "column_integer") => format!(
+                    "({}).integer({})",
+                    receiver(self)?,
+                    self.value_argument(argument_ids, 1, depth)?
+                ),
+                ("__db_column", "column_big_integer") => format!(
+                    "({}).big_integer({})",
+                    receiver(self)?,
+                    self.value_argument(argument_ids, 1, depth)?
+                ),
+                ("__db_column", "column_real") => format!(
+                    "({}).real({})",
+                    receiver(self)?,
+                    self.value_argument(argument_ids, 1, depth)?
+                ),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        self.reaches_sqlite = true;
+        Ok(Some(rendered))
     }
 
     /// The plain `node:fs/promises` set and `std::crypto`'s digest (F18
@@ -5793,6 +6210,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             )? {
                 return Ok(rendered);
             }
+            if let Some(rendered) =
+                self.db_host_binding(name, binding.as_ref(), &function_call.argument_ids, depth)?
+            {
+                return Ok(rendered);
+            }
             let what = format!(
                 "the host binding `{name}`{}",
                 match binding {
@@ -5872,7 +6294,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .get(index)
                 .is_some_and(|parameter| self.program.async_values.contains(&parameter.id));
             let mut text = if wants_a_place {
+                // The declared type is threaded even for a PLACE, because a
+                // numeric LITERAL at a `&`/`&mut` position still has to be
+                // written at the width the signature names — `as_f32(self)`
+                // takes `&f64` and `number-math.vl` hands it `0f`, whose own
+                // record is `f32` (see [`Emitter::number_literal`]).
+                let saved = std::mem::replace(&mut self.expected_type, expecting);
                 let place = self.expression(*argument, depth);
+                self.expected_type = saved;
                 self.expects_async_value = false;
                 place?
             } else {
@@ -5962,6 +6391,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     || self.program.parameters.contains_key(&binding))
                     && !self.binding_holds_a_view(binding)
             }
+            // An INDEX read is a place read too — `xs[i]` names storage, and a
+            // consumed read of it is rule 1's copy. On the JS backend the
+            // element is read out of the array and nothing moves, so
+            // `clone_sites` marks nothing; natively `xs[i]` handed to a callee
+            // is a move out of a `Vec`, which rustc refuses (`reconcile-index.vl`
+            // is the pin, and it was behind the `for`-over-an-`Iterator` wall
+            // until this slice). This is the widening native-b-39's find asked
+            // for, taken at the position the find named: the CALL-ARGUMENT
+            // path, where the position consumes by definition.
+            Some(Expr::Index(_, _)) => true,
             _ => false,
         };
         if reads_a_place {
@@ -6199,6 +6638,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
                 if let Some(rendered) =
                     self.host_module_binding(name, binding.as_ref(), argument_ids, depth)?
+                {
+                    return Ok(rendered);
+                }
+                if let Some(rendered) =
+                    self.db_host_binding(name, binding.as_ref(), argument_ids, depth)?
                 {
                     return Ok(rendered);
                 }
@@ -6586,6 +7030,12 @@ fn http_host_type(name: &str) -> Option<&'static str> {
         "NodeResponse" => "vilan_rt::http::Response",
         "NodeSocket" => "vilan_rt::http::Socket",
         "Bytes" => "vilan_rt::http::Bytes",
+        // F18 slice 2: `std::bytes`'s two codec classes, which live beside
+        // `Bytes` in the runtime for the reason `Bytes` does — the HTTP
+        // surface is what first needs them (`Request::body` decodes the
+        // collected body).
+        "TextDecoder" => "vilan_rt::http::TextDecoder",
+        "TextEncoder" => "vilan_rt::http::TextEncoder",
         _ => return None,
     })
 }
@@ -6838,7 +7288,25 @@ fn form_name(expr: &Expr<'_>) -> &'static str {
 
 /// The `Cargo.toml` of the project the backend writes, pointing at the runtime
 /// crate by path. `edition 2024` matches the workspace's own.
-pub fn cargo_manifest(name: &str, runtime_path: &str) -> String {
+pub fn cargo_manifest(name: &str, runtime_path: &str, reaches_sqlite: bool) -> String {
+    // F18 slice 2, Order 39's R1: `vilan-rt-sqlite` is named only when the
+    // program reached `std::db`. A program that did not pays neither the
+    // lockfile entry nor the C compile of SQLite's amalgamation, which is the
+    // whole reason the surface is a crate apart from the dependency-free
+    // runtime. The path is a SIBLING of the runtime's, because that is how the
+    // two sit in the repository and in the materialized cache alike.
+    let sqlite = if reaches_sqlite {
+        let beside = std::path::Path::new(runtime_path)
+            .parent()
+            .map(|parent| parent.join("vilan-rt-sqlite"))
+            .unwrap_or_else(|| std::path::PathBuf::from("vilan-rt-sqlite"));
+        format!(
+            "vilan-rt-sqlite = {{ path = {:?} }}\n",
+            beside.to_string_lossy()
+        )
+    } else {
+        String::new()
+    };
     format!(
         "[package]\n\
          name = \"{name}\"\n\
@@ -6851,6 +7319,7 @@ pub fn cargo_manifest(name: &str, runtime_path: &str) -> String {
          \n\
          [dependencies]\n\
          vilan-rt = {{ path = {runtime_path:?} }}\n\
+         {sqlite}\
          \n\
          [profile.release]\n\
          panic = \"unwind\"\n\

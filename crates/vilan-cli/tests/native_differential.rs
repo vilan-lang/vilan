@@ -955,8 +955,228 @@ fn a_native_std_http_server_answers_a_get_over_a_real_socket() {
     );
 }
 
+/// **F18 slice 2's EXIT**: a program with the SHAPE of kolt's server leg —
+/// a SQLite store, a hashed password, an `/api/login` route that decodes a POST
+/// body and answers a `[derive(Json)]` outcome, and a shell for every other
+/// path — runs as a native binary and answers a login over a real socket.
+///
+/// **Why a shape and not the file.** Kolt is read-only for this tree and is
+/// never copied into it; what is reproduced is the STRUCTURE the slice had to
+/// carry, which is what the exit is measuring. Everything the slice built is on
+/// the path: `std::json` (the derived encode, and `List<str>::from_json` over
+/// the request body), `std::db` through the separate `vilan-rt-sqlite` crate,
+/// `std::crypto`'s SHA-256, `Bytes` and `TextDecoder`, `std::http` over a real
+/// socket, and a `for` over an `Iterator` impl (`Bytes::to_hex` walks a
+/// `Range`).
+///
+/// **What is compared.** Three exchanges, each byte for byte on both legs: a
+/// good login, a bad one, and the shell — status line, the header the program
+/// set, `Content-Length` and the body. NOT compared, for Order 39's reasons
+/// written at [`a_native_std_http_server_answers_a_get_over_a_real_socket`]:
+/// node's `Date`, and the order the two write `Connection`/`Content-Length`.
+///
+/// **Non-vacuous by its content, not by its exit code.** The bodies are
+/// asserted verbatim, and the two logins differ only in the password — so a
+/// server that answered a constant, or one whose hash comparison always held,
+/// fails on the second exchange.
+#[test]
+fn the_kolt_server_shape_answers_a_login_over_a_real_socket() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_kolt.vl"), KOLT_SHAPE_PROBE)
+        .expect("write the probe program");
+
+    let built = vilan(&staged)
+        .args(["build", "--backend", "rust", "native_probe_kolt.vl"])
+        .output()
+        .expect("build the server natively");
+    assert!(
+        built.status.success(),
+        "the native leg did not build:\n{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    // Order 39's R1, asserted rather than assumed: the SQLite crate is named by
+    // the manifest of a program that reaches `std::db`.
+    let manifest = std::fs::read_to_string(
+        staged
+            .join("dist")
+            .join("native")
+            .join("native_probe_kolt")
+            .join("Cargo.toml"),
+    )
+    .expect("read the generated manifest");
+    assert!(
+        manifest.contains("vilan-rt-sqlite"),
+        "a program reaching `std::db` depends on the SQLite crate:\n{manifest}"
+    );
+    let binary = String::from_utf8_lossy(&built.stdout)
+        .lines()
+        .find_map(|line| line.split(" -> ").nth(1).map(str::to_string))
+        .expect("`vilan build` says where the binary is");
+    let native = ServedLogin::take(Command::new(staged.join(&binary)));
+
+    let bundled = vilan(&staged)
+        .args(["build", "native_probe_kolt.vl"])
+        .output()
+        .expect("build the server for node");
+    assert!(
+        bundled.status.success(),
+        "the JS leg did not build:\n{}",
+        String::from_utf8_lossy(&bundled.stderr)
+    );
+    let mut node = Command::new("node");
+    node.current_dir(&staged).arg("native_probe_kolt.mjs");
+    let javascript = ServedLogin::take(node);
+
+    assert_eq!(
+        native.exchanges, javascript.exchanges,
+        "the two backends must answer the same three exchanges"
+    );
+    let expected = [
+        (
+            "HTTP/1.1 200 OK",
+            "Content-Type: application/json",
+            "{\"ok\":true,\"message\":\"welcome ada\"}",
+        ),
+        (
+            "HTTP/1.1 200 OK",
+            "Content-Type: application/json",
+            "{\"ok\":false,\"message\":\"wrong password\"}",
+        ),
+        (
+            "HTTP/1.1 200 OK",
+            "Content-Type: text/html",
+            "<!doctype html><title>shape</title>",
+        ),
+    ];
+    for (answered, (status, header, body)) in native.exchanges.iter().zip(expected) {
+        assert_eq!(answered.status, status);
+        assert_eq!(answered.body, body);
+        assert!(
+            answered.headers.iter().any(|line| line == header),
+            "the program's header must reach the wire: {:?}",
+            answered.headers
+        );
+        assert!(
+            answered
+                .headers
+                .iter()
+                .any(|line| line == &format!("Content-Length: {}", body.len())),
+            "a buffered body declares its length: {:?}",
+            answered.headers
+        );
+    }
+}
+
+const KOLT_SHAPE_PROBE: &str = concat!(
+    "// THE SHAPE of kolt's server leg (`src/server.vl` + the `KoltAuth` half of\n",
+    "// `src/store.vl`), written here from scratch: one `Server` over a SQLite\n",
+    "// store, an `/api/login` route that reads a POST body, checks a password\n",
+    "// against a hashed row and answers a `[derive(Json)]` outcome, and a shell\n",
+    "// for every other path. Kolt's own files are never copied into this tree.\n",
+    "import std::bytes::encode_utf8;\n",
+    "import std::crypto::sha256;\n",
+    "import std::db::Database;\n",
+    "import std::http::{ Request, Response, Server };\n",
+    "import std::io::print;\n",
+    "import std::json::{ FromJson, Json };\n",
+    "import std::option::Option::None;\n",
+    "\n",
+    "[derive(Json)]\n",
+    "struct LoginOutcome {\n",
+    "\tok: bool,\n",
+    "\tmessage: str,\n",
+    "}\n",
+    "\n",
+    "let store = open_store();\n",
+    "\n",
+    "fun open_store(): Database {\n",
+    "\tlet db = Database::open(\":memory:\");\n",
+    "\tdb.exec(\"CREATE TABLE account (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, hash TEXT NOT NULL)\");\n",
+    "\tdb\n",
+    "}\n",
+    "\n",
+    "async fun hash_password(username: str, password: str): str {\n",
+    "\t// Kolt hashes with node:crypto's PBKDF2; the SHAPE is the same — a salted\n",
+    "\t// digest of the password, stored beside the account.\n",
+    "\tsha256(encode_utf8(username + \":\" + password)).to_hex()\n",
+    "}\n",
+    "\n",
+    "async fun register(username: str, password: str): LoginOutcome {\n",
+    "\tlet hashed = hash_password(username, password);\n",
+    "\tstore.prepare(\"INSERT INTO account (username, hash) VALUES (?, ?)\").run([username, hashed]);\n",
+    "\tLoginOutcome { ok = true, message = \"registered\" }\n",
+    "}\n",
+    "\n",
+    "async fun login(username: str, password: str): LoginOutcome {\n",
+    "\tlet hashed = hash_password(username, password);\n",
+    "\tmatch store.prepare(\"SELECT hash FROM account WHERE username = ?\").first([username]) {\n",
+    "\t\tSome(let row) => if row.text(\"hash\") == hashed {\n",
+    "\t\t\tLoginOutcome { ok = true, message = \"welcome \" + username }\n",
+    "\t\t} else {\n",
+    "\t\t\tLoginOutcome { ok = false, message = \"wrong password\" }\n",
+    "\t\t},\n",
+    "\t\tNone => LoginOutcome { ok = false, message = \"no such account\" },\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "async fun main() {\n",
+    "\tregister(\"ada\", \"lovelace1\");\n",
+    "\tlet server = Server {\n",
+    "\t\tport = 0,\n",
+    "\t\trequest_handler = |request| answer(request),\n",
+    "\t\ton_start = |started| print(i\"vilan-test-port={started.port()}\"),\n",
+    "\t\ton_stop = |stopped| {},\n",
+    "\t\tupgrade_handler = None,\n",
+    "\t\tnode = None,\n",
+    "\t};\n",
+    "\tserver.start();\n",
+    "}\n",
+    "\n",
+    "async fun answer(request: Request): Response {\n",
+    "\tif request.path() == \"/api/login\" && request.method() == \"POST\" {\n",
+    "\t\tlet pair = List<str>::from_json(request.body()).unwrap_or([]);\n",
+    "\t\tlet outcome = if pair.len() == 2 {\n",
+    "\t\t\tlogin(pair.get(0).unwrap_or(\"\"), pair.get(1).unwrap_or(\"\"))\n",
+    "\t\t} else {\n",
+    "\t\t\tLoginOutcome { ok = false, message = \"malformed call\" }\n",
+    "\t\t};\n",
+    "\t\tret Response::builder()\n",
+    "\t\t\t.set_header(\"Content-Type\", \"application/json\")\n",
+    "\t\t\t.body(outcome.to_json())\n",
+    "\t\t\t.build();\n",
+    "\t}\n",
+    "\tResponse::builder()\n",
+    "\t\t.set_header(\"Content-Type\", \"text/html\")\n",
+    "\t\t.body(\"<!doctype html><title>shape</title>\")\n",
+    "\t\t.build()\n",
+    "}\n",
+);
+
+/// The three exchanges the exit drives, over one spawned server.
+struct ServedLogin {
+    exchanges: Vec<ServedRequest>,
+}
+
+impl ServedLogin {
+    fn take(mut command: Command) -> ServedLogin {
+        let server = ServerUnderTest::spawn(&mut command);
+        let port = server.port();
+        let exchanges = [
+            ("POST", "/api/login", "[\"ada\",\"lovelace1\"]"),
+            ("POST", "/api/login", "[\"ada\",\"wrong\"]"),
+            ("GET", "/", ""),
+        ]
+        .into_iter()
+        .map(|(method, path, body)| ServedRequest::exchange(port, method, path, body))
+        .collect();
+        ServedLogin { exchanges }
+    }
+}
+
 /// One request answered by a spawned server, and the pieces of the answer the
 /// two backends can be held to.
+#[derive(Debug, PartialEq, Eq)]
 struct ServedRequest {
     status: String,
     headers: Vec<String>,
@@ -965,6 +1185,51 @@ struct ServedRequest {
 }
 
 impl ServedRequest {
+    /// One request to an ALREADY-RUNNING server, so a test can drive several
+    /// over one process. The body carries a `Content-Length`, which is the
+    /// only framing `vilan_rt::http` accepts on the way in (a chunked request
+    /// is refused with `411`, by design).
+    ///
+    /// `announced_line` is empty here: it belongs to the server, and a caller
+    /// driving several exchanges has it from the spawn.
+    fn exchange(port: u16, method: &str, path: &str, body: &str) -> ServedRequest {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
+            .expect("connect to the port the server announced");
+        stream
+            .write_all(
+                format!(
+                    "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .expect("send the request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("read the response");
+        let (head, body) = response
+            .split_once("\r\n\r\n")
+            .unwrap_or_else(|| panic!("a response with a head and a body, got {response:?}"));
+        let mut lines = head.split("\r\n");
+        let status = lines.next().unwrap_or_default().to_string();
+        ServedRequest {
+            status,
+            // node adds a `Date` of its own and the two backends order
+            // `Connection`/`Content-Length` differently; both are dropped here
+            // so the two legs can be compared whole. See the exit's own
+            // comment for why that is written down rather than normalised
+            // away silently.
+            headers: lines
+                .filter(|line| !line.starts_with("Date:") && !line.starts_with("Connection:"))
+                .map(str::to_string)
+                .collect(),
+            body: body.to_string(),
+            announced_line: String::new(),
+        }
+    }
+
     /// Spawns `command`, waits for the port IT bound, fetches `GET /`, and
     /// reaps the child.
     ///

@@ -63,6 +63,25 @@ fn main() {
         "embedded-std build: {} holds no src/lib.rs — is this a complete checkout?",
         runtime_root.display()
     );
+    // F18 slice 2: `vilan-rt-sqlite` materializes BESIDE the runtime, under the
+    // same hash and the same root, because the generated cargo manifest reaches
+    // it as a sibling of the runtime path (Order 39's R1 keeps it a separate
+    // CRATE; it is not a separate cache). A program that does not reach
+    // `std::db` never names it, so the extra files cost a materialization and
+    // nothing else.
+    let sqlite_root = manifest_dir.join("../vilan-rt-sqlite");
+    collect_rust(
+        &sqlite_root,
+        Path::new("vilan-rt-sqlite"),
+        &mut runtime_files,
+    );
+    assert!(
+        runtime_files
+            .iter()
+            .any(|(key, _)| key == "vilan-rt-sqlite/src/lib.rs"),
+        "embedded-std build: {} holds no src/lib.rs — is this a complete checkout?",
+        sqlite_root.display()
+    );
     runtime_files.sort();
     write_table(
         &mut generated,
@@ -72,6 +91,7 @@ fn main() {
         &runtime_files,
     );
     generated.push_str(&runtime_manifest(&runtime_root));
+    generated.push_str(&sqlite_manifest(&sqlite_root));
 
     let mut out = fs::File::create(&out_path).unwrap();
     out.write_all(generated.as_bytes()).unwrap();
@@ -109,6 +129,40 @@ fn write_table(
         ));
     }
     generated.push_str("];\n\n");
+}
+
+/// The `Cargo.toml` the materialized `vilan-rt-sqlite` carries —
+/// [`runtime_manifest`]'s twin, and the one place the two differ is the point:
+/// this crate HAS dependencies (that is why it is a crate of its own), so its
+/// `[dependencies]` block is copied through from the real manifest rather than
+/// emptied.
+fn sqlite_manifest(sqlite_root: &Path) -> String {
+    let path = sqlite_root.join("Cargo.toml");
+    println!("cargo:rerun-if-changed={}", path.display());
+    let manifest = fs::read_to_string(&path).unwrap();
+    let package = block_of(&manifest, "[package]");
+    let dependencies = block_of(&manifest, "[dependencies]");
+    let generated = format!("{package}\n\n{dependencies}\n\n[workspace]\n");
+    format!(
+        "/// The `Cargo.toml` `vilan-rt-sqlite` is materialized with (F18 slice 2):\n\
+         /// the real crate's `[package]` and `[dependencies]` blocks plus a\n\
+         /// `[workspace]` of its own. Unlike [`RT_MANIFEST`] the dependencies are\n\
+         /// KEPT — having them is why this crate exists apart from the runtime.\n\
+         pub static RT_SQLITE_MANIFEST: &str = {generated:?};\n"
+    )
+}
+
+/// One `[header]` block of a manifest, from the header to the next one.
+fn block_of<'a>(manifest: &'a str, header: &str) -> &'a str {
+    let start = manifest
+        .find(header)
+        .unwrap_or_else(|| panic!("the manifest declares {header}"));
+    let block = &manifest[start..];
+    let end = block[1..]
+        .find("\n[")
+        .map(|offset| offset + 2)
+        .unwrap_or(block.len());
+    block[..end].trim_end()
 }
 
 /// The `Cargo.toml` the materialized runtime carries.
