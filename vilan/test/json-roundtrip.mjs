@@ -20,62 +20,79 @@ function has_field(self, name) {
 	return Object.hasOwn(self, name);
 }
 function from_json_value(value) {
-	let $B = null;
+	let $D = null;
 	if (__json_kind(value) === "string") {
-		$B = [ 0, String(value) ];
+		$D = [ 0, String(value) ];
 	} else {
-		$B = [ 1, "expected a string" ];
+		$D = [ 1, "expected a string" ];
 	}
-	return $B;
+	return $D;
 }
 function from_json_value2(value) {
 	let $f = null;
-	if (__json_kind(value) === "number") {
-		$f = [ 0, Number(value) ];
-	} else {
-		$f = [ 1, "expected a number" ];
+	if (__json_kind(value) !== "number") {
+		return [ 1, "expected a number" ];
 	}
-	return $f;
+	$f;
+	const $g = integer_lane_failure(value, true);
+	let $h = null;
+	if ($g[0] === 0) {
+		const reason = $g[1];
+		$h = [ 1, reason ];
+	} else {
+		$h = [ 0, Number(value) ];
+	}
+	return $h;
+}
+function integer_lane_failure(value, signed) {
+	const number = Number(value);
+	if (number !== Math.floor(number)) {
+		return [ 0, "expected a whole number, found " + number ];
+	}
+	if (!(signed) && number < 0.0) {
+		return [ 0, "expected a non-negative number, found " + number ];
+	}
+	return [ 1 ];
 }
 function to_json(self) {
-	return "{\"name\":" + JSON.stringify(self[0]) + "," + "\"members\":" + $i(self[1]) + "," + "\"captain\":" + $q(self[2]) + "}";
+	return "{\"name\":" + JSON.stringify(self[0]) + "," + "\"members\":" + $k(self[1]) + "," + "\"captain\":" + $s(self[2]) + "}";
 }
 function from_json(text) {
-	const $x = $u(__try_parse_json(text), "not valid JSON");
-	if ($x[0] === 1) {
-		return $x;
+	const $z = $w(__try_parse_json(text), "not valid JSON");
+	if ($z[0] === 1) {
+		return $z;
 	}
-	return from_json_value3($x[1]);
+	return from_json_value3($z[1]);
 }
 function from_json_value3(value) {
-	let $y = null;
+	let $A = null;
 	if (!(has_field(value, "name"))) {
 		return [ 1, "missing field name" ];
 	}
-	$y;
-	let $z = null;
+	$A;
+	let $B = null;
 	if (!(has_field(value, "members"))) {
 		return [ 1, "missing field members" ];
 	}
-	$z;
-	let $A = null;
+	$B;
+	let $C = null;
 	if (!(has_field(value, "captain"))) {
 		return [ 1, "missing field captain" ];
 	}
-	$A;
-	const $C = from_json_value(value["name"]);
-	if ($C[0] === 1) {
-		return $C;
+	$C;
+	const $E = from_json_value(value["name"]);
+	if ($E[0] === 1) {
+		return $E;
 	}
-	const $G = $D(value["members"]);
-	if ($G[0] === 1) {
-		return $G;
+	const $I = $F(value["members"]);
+	if ($I[0] === 1) {
+		return $I;
 	}
-	const $K = $H(value["captain"]);
-	if ($K[0] === 1) {
-		return $K;
+	const $M = $J(value["captain"]);
+	if ($M[0] === 1) {
+		return $M;
 	}
-	return [ 0, [ $C[1], $G[1], $K[1] ] ];
+	return [ 0, [ $E[1], $I[1], $M[1] ] ];
 }
 function $d(value) {
 	let $e = null;
@@ -85,11 +102,11 @@ function $d(value) {
 	$e;
 	let result = [  ];
 	for (const element of value) {
-		const $g = from_json_value2(element);
-		if ($g[0] === 1) {
-			return $g;
+		const $i = from_json_value2(element);
+		if ($i[0] === 1) {
+			return $i;
 		}
-		result.push($g[1]);
+		result.push($i[1]);
 	}
 	return [ 0, result ];
 }
@@ -104,7 +121,7 @@ function $a(text) {
 	}
 	return $c;
 }
-function $i(self) {
+function $k(self) {
 	let result = "[";
 	let first = true;
 	for (const element of self) {
@@ -116,109 +133,109 @@ function $i(self) {
 	}
 	return result + "]";
 }
-function $m(value) {
-	let $n = null;
+function $o(value) {
+	let $p = null;
 	if (value === null) {
-		$n = [ 0, [ 1 ] ];
+		$p = [ 0, [ 1 ] ];
 	} else {
-		const $o = from_json_value2(value);
-		if ($o[0] === 1) {
-			return $o;
+		const $q = from_json_value2(value);
+		if ($q[0] === 1) {
+			return $q;
 		}
-		$n = [ 0, [ 0, $o[1] ] ];
+		$p = [ 0, [ 0, $q[1] ] ];
+	}
+	return $p;
+}
+function $l(text) {
+	const $m = __try_parse_json(text);
+	let $n = null;
+	if ($m[0] === 0) {
+		const value = $m[1];
+		$n = $o(value);
+	} else {
+		$n = [ 1, "not valid JSON" ];
 	}
 	return $n;
 }
-function $j(text) {
-	const $k = __try_parse_json(text);
-	let $l = null;
-	if ($k[0] === 0) {
-		const value = $k[1];
-		$l = $m(value);
+function $s(self) {
+	const $t = self;
+	let $u = null;
+	if ($t[0] === 0) {
+		const value = $t[1];
+		$u = JSON.stringify(value);
 	} else {
-		$l = [ 1, "not valid JSON" ];
+		$u = "null";
 	}
-	return $l;
+	return $u;
 }
-function $q(self) {
-	const $r = self;
-	let $s = null;
-	if ($r[0] === 0) {
-		const value = $r[1];
-		$s = JSON.stringify(value);
+function $w(self, err) {
+	const $x = self;
+	let $y = null;
+	if ($x[0] === 0) {
+		const x = $x[1];
+		$y = [ 0, __clone(x) ];
 	} else {
-		$s = "null";
+		$y = [ 1, __clone(err) ];
 	}
-	return $s;
+	return $y;
 }
-function $u(self, err) {
-	const $v = self;
-	let $w = null;
-	if ($v[0] === 0) {
-		const x = $v[1];
-		$w = [ 0, __clone(x) ];
-	} else {
-		$w = [ 1, __clone(err) ];
-	}
-	return $w;
-}
-function $D(value) {
-	let $E = null;
+function $F(value) {
+	let $G = null;
 	if (__json_kind(value) !== "array") {
 		return [ 1, "expected an array" ];
 	}
-	$E;
+	$G;
 	let result = [  ];
 	for (const element of value) {
-		const $F = from_json_value(element);
-		if ($F[0] === 1) {
-			return $F;
+		const $H = from_json_value(element);
+		if ($H[0] === 1) {
+			return $H;
 		}
-		result.push($F[1]);
+		result.push($H[1]);
 	}
 	return [ 0, result ];
 }
-function $H(value) {
-	let $I = null;
+function $J(value) {
+	let $K = null;
 	if (value === null) {
-		$I = [ 0, [ 1 ] ];
+		$K = [ 0, [ 1 ] ];
 	} else {
-		const $J = from_json_value(value);
-		if ($J[0] === 1) {
-			return $J;
+		const $L = from_json_value(value);
+		if ($L[0] === 1) {
+			return $L;
 		}
-		$I = [ 0, [ 0, $J[1] ] ];
+		$K = [ 0, [ 0, $L[1] ] ];
 	}
-	return $I;
+	return $K;
 }
-function $T(value) {
-	let $U = null;
+function $V(value) {
+	let $W = null;
 	if (__json_kind(value) !== "array") {
 		return [ 1, "expected an array" ];
 	}
-	$U;
+	$W;
 	let result = [  ];
 	for (const element of value) {
-		const $V = from_json_value3(element);
-		if ($V[0] === 1) {
-			return $V;
+		const $X = from_json_value3(element);
+		if ($X[0] === 1) {
+			return $X;
 		}
-		result.push($V[1]);
+		result.push($X[1]);
 	}
 	return [ 0, result ];
 }
-function $Q(text) {
-	const $R = __try_parse_json(text);
-	let $S = null;
-	if ($R[0] === 0) {
-		const value = $R[1];
-		$S = $T(value);
+function $S(text) {
+	const $T = __try_parse_json(text);
+	let $U = null;
+	if ($T[0] === 0) {
+		const value = $T[1];
+		$U = $V(value);
 	} else {
-		$S = [ 1, "not valid JSON" ];
+		$U = [ 1, "not valid JSON" ];
 	}
-	return $S;
+	return $U;
 }
-function $X(self) {
+function $Z(self) {
 	let result = "[";
 	let first = true;
 	for (const element of self) {
@@ -231,17 +248,17 @@ function $X(self) {
 	return result + "]";
 }
 const nums = $a("[1,2,3]");
-const $h = nums;
-console.log($h[0] === 0 && $i($h[1]) === "[1,2,3]");
-const some = $j("7");
-const $p = some;
-console.log($p[0] === 0 && $q($p[1]) === "7");
-const none = $j("null");
-const $t = none;
-console.log($t[0] === 0 && $q($t[1]) === "null");
+const $j = nums;
+console.log($j[0] === 0 && $k($j[1]) === "[1,2,3]");
+const some = $l("7");
+const $r = some;
+console.log($r[0] === 0 && $s($r[1]) === "7");
+const none = $l("null");
+const $v = none;
+console.log($v[0] === 0 && $s($v[1]) === "null");
 const json = "{\"name\":\"Reds\",\"members\":[\"Ada\",\"Bob\"],\"captain\":\"Ada\"}";
-const $L = from_json(json);
-console.log($L[0] === 0 && to_json($L[1]) === json && $i($L[1][1]) === "[\"Ada\",\"Bob\"]");
-const teams = $Q("[" + json + "]");
-const $W = teams;
-console.log($W[0] === 0 && $X($W[1]) === "[" + json + "]");
+const $N = from_json(json);
+console.log($N[0] === 0 && to_json($N[1]) === json && $k($N[1][1]) === "[\"Ada\",\"Bob\"]");
+const teams = $S("[" + json + "]");
+const $Y = teams;
+console.log($Y[0] === 0 && $Z($Y[1]) === "[" + json + "]");
