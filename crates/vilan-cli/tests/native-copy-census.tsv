@@ -21,4 +21,5 @@ derive-json	2	1
 json-roundtrip	2	12
 remainder	0	1
 numeric-types	1	6
+option-view	0	0
 native_probe_board	0	4

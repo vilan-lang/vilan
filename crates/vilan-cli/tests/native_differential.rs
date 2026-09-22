@@ -112,6 +112,11 @@ const DEFAULT_SUITE: &[&str] = &[
     "json-roundtrip.vl",
     "remainder.vl",
     "numeric-types.vl",
+    // F21: a VIEW inside an enum payload (`Option<&mut T>`) — the shape behind
+    // a view-returning `Arena::get`, refused by name since native-b-38. Every
+    // projection in it is matched where it is built, which is the position the
+    // payload view is carried through.
+    "option-view.vl",
 ];
 
 /// The corpus's ASYNC programs (tracker J6, lane native-b-38).

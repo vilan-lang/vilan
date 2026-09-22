@@ -334,6 +334,22 @@ struct Emitter<'a, 'src> {
     /// it at a LAST use, and a last use inside a closure body is not a last use
     /// of the capture.
     closure_captures: Vec<HashSet<Id>>,
+    /// F21: whether the TYPE being rendered is an `Option` whose payload is a
+    /// VIEW, and whether that view is writable.
+    ///
+    /// The type system has no reference form — a payload's type is its
+    /// pointee's and viewness is recorded beside it — so `Option<&mut i32>` and
+    /// `Option<i32>` are one type id and only the position says which. A flag
+    /// rather than a parameter for the same reason
+    /// [`Emitter::expects_async`] is one: the site that knows (a signature's
+    /// return position) is far from the arm that needs it, and it is TAKEN by
+    /// that arm so only the outermost `Option` of a position is affected.
+    expects_payload_view: Option<bool>,
+    /// F21: whether the expression being rendered is a `match` SUBJECT — the
+    /// one position an `Option` with a view payload is carried through today.
+    /// Taken by the call arm that reads it, so only the outermost call of the
+    /// subject is affected.
+    matching_the_subject: bool,
     /// F31: the READS that are their binding's last use in the body they sit
     /// in, so the conservative copy [`Emitter::copy_a_consumed_place_read`]
     /// takes can be downgraded to a move.
@@ -404,6 +420,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             reaches_sqlite: false,
             returns_an_async_closure: false,
             closure_captures: Vec::new(),
+            expects_payload_view: None,
+            matching_the_subject: false,
             last_uses: HashSet::new(),
             liveness_walked: HashSet::new(),
             copies_taken: 0,
@@ -1733,13 +1751,26 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         match name {
             "bool" => Ok("bool".to_string()),
-            "Option" => Ok(format!(
-                "Option<{}>",
-                rendered
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "()".to_string())
-            )),
+            "Option" => {
+                // F21: a VIEW inside the payload. Rust's own `Option` takes a
+                // reference payload without a declaration of its own, and the
+                // lifetime a signature needs is elided from the single input
+                // loan the projection came through — which is why this reaches
+                // `Option` and not the minted enums, whose payload would need a
+                // lifetime parameter written on the declaration.
+                let view = match self.expects_payload_view.take() {
+                    Some(true) => "&mut ",
+                    Some(false) => "&",
+                    None => "",
+                };
+                Ok(format!(
+                    "Option<{view}{}>",
+                    rendered
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "()".to_string())
+                ))
+            }
             "Result" => Ok(format!("Result<{}>", rendered.join(", "))),
             _ => Ok(self.ensure_enum(id, arguments, span)?.name),
         }
@@ -2394,6 +2425,70 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Ok(Reserved { name, slot })
     }
 
+    /// F21: whether this function returns a view inside an enum PAYLOAD, and
+    /// whether that view is writable — the `Option<&mut T>` shape a
+    /// view-returning `Arena::get` needs.
+    ///
+    /// Two records answer the first half between them, and neither alone.
+    /// `borrows` is the projected parameter set — non-empty exactly when what
+    /// comes back ALIASES a parameter — and `returns_view` is the signature's
+    /// own statement that the RETURN TYPE is a view. A function with a
+    /// projection and no view return type is projecting through something else,
+    /// and the payload is the only thing it can be: `fun get_mut(&mut self):
+    /// Option<&mut i32>` records `borrows = {0}` with both view flags false,
+    /// where `fun same(x: &mut i32): &mut i32 borrows x` records `borrows = {0}`
+    /// with both true.
+    ///
+    /// The second half — `&` or `&mut` — is read off the CONSTRUCTION, because
+    /// nothing in the signature's records distinguishes `Option<&i32>` from
+    /// `Option<&mut i32>` (`get` and `get_mut` have identical flags) and the
+    /// receiver's own convention is the wrong answer for a `&mut self` method
+    /// that hands back a read-only projection. A body constructs its return
+    /// type's payload at one permission, since it has one return type.
+    fn payload_view_of(&self, function: &vilan_core::analyzer::Function<'src>) -> Option<bool> {
+        if function.borrows.is_empty() || function.returns_view || function.returns_mut_view {
+            return None;
+        }
+        let mut found = None;
+        let mut visited = HashSet::new();
+        for statement in function
+            .body
+            .0
+            .iter()
+            .copied()
+            .chain(std::iter::once(function.body.1))
+        {
+            self.find_payload_view(statement, &mut found, &mut visited);
+        }
+        found
+    }
+
+    /// The first variant construction in a body whose payload is a `&`/`&mut`,
+    /// and which of the two it is.
+    fn find_payload_view(&self, expr_id: Id, found: &mut Option<bool>, visited: &mut HashSet<Id>) {
+        if found.is_some() || !visited.insert(expr_id) {
+            return;
+        }
+        // The subject of a variant construction is a LOCAL that resolves to the
+        // variant, not the variant itself — the same two hops
+        // [`Emitter::call_expression`] takes.
+        if let Some(Expr::Call(call_id)) = self.program.entity_map.get(&expr_id)
+            && let Some(call) = self.program.function_calls.get(call_id)
+            && let Some(Expr::Local(target)) = self.program.entity_map.get(&call.subject_id)
+            && let Some(Expr::EnumVariant(_, _)) = self.program.entity_map.get(target)
+        {
+            for argument in &call.argument_ids {
+                if let Some(Expr::Reference(_, mutable)) = self.program.entity_map.get(argument) {
+                    *found = Some(*mutable);
+                    return;
+                }
+            }
+        }
+        for child in self.children_of(expr_id) {
+            self.find_payload_view(child, found, visited);
+        }
+    }
+
     /// One instance's signature and body, under the substitution already
     /// installed. Split out so `ensure_function` restores the substitution on
     /// the refusal path as well as the success one.
@@ -2417,8 +2512,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // A function whose DECLARED return type is `async |T| U`
                 // (J2's `async_returning`).
                 self.expects_async = self.program.async_returning.contains(&function.id);
+                // F21: a view inside the returned PAYLOAD (`Option<&mut T>`),
+                // which `returns_view` does not cover — see
+                // [`Emitter::payload_view_of`].
+                self.expects_payload_view = self.payload_view_of(function);
                 let rendered = self.rust_type(type_id, span);
                 self.expects_async = false;
+                self.expects_payload_view = None;
                 let rendered = rendered?;
                 // The type system has no reference form — a `borrows` function's
                 // return type IS its pointee's, and whether a view comes back is
@@ -2940,6 +3040,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // fallback.
                 let struct_id = self
                     .type_of(id)
+                    .or(self.expected_type)
                     .and_then(|type_id| self.resolve(type_id))
                     .and_then(|resolved| match resolved {
                         Type::Struct(struct_id, _) => Some(*struct_id),
@@ -3672,6 +3773,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // HOLDS the view, so the initializer is not read through — see
                 // [`Emitter::declaring_a_view`].
                 let holds_a_view = self.reads_through_a_view(initial);
+                // F21: a view binding initialized from ANOTHER view binding —
+                // `let c: &mut i32 = b;` — is a second live loan of one place,
+                // and natively the two cannot both be read. Named rather than
+                // emitted, and named CONSERVATIVELY: rustc accepts the pair
+                // where only one of them is used afterwards, and this refuses
+                // the shape. The general answer is a model of aliasing views
+                // that the emitter does not have — `transparent-references.vl`
+                // is what wants it, and this is the gap that program names.
+                if let Some(Expr::Local(source)) = self.program.entity_map.get(&initial)
+                    && self.binding_holds_a_view(*source)
+                {
+                    return Err(unsupported(
+                        "a view binding that ALIASES another view binding (`let c = b;` where \
+                         `b` is a view: two live loans of one place, which needs a model of \
+                         aliasing views this backend has not got)",
+                        self.span_of(binding),
+                    ));
+                }
                 let saved = std::mem::replace(&mut self.declaring_a_view, holds_a_view);
                 let value = self.value_of_expecting(initial, Some(variable.type_id), depth);
                 self.declaring_a_view = saved;
@@ -4175,7 +4294,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
         span: Span,
     ) -> Result<String, Error> {
-        let mut subject_text = self.expression(subject, depth)?;
+        let saved_matching = std::mem::replace(&mut self.matching_the_subject, true);
+        let rendered_subject = self.expression(subject, depth);
+        self.matching_the_subject = saved_matching;
+        let mut subject_text = rendered_subject?;
         let subject_type = self.type_of(subject);
         // A leg that DESTRUCTURES moves the payload out of the subject, so a
         // subject that is a PLACE has to be copied first (F20). On the JS
@@ -4629,6 +4751,32 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
     /// The same, for a struct.
     fn struct_arguments_at(&self, expr_id: Id, struct_id: Id) -> Vec<TypeId> {
+        // The POSITION's type, where the recorded one names the same struct but
+        // could not ground it. `struct Handle<T> { index: i32, generation: i32 }`
+        // has a PHANTOM parameter, so `Handle { index, generation }` inside
+        // `impl Arena<T>` gives the analyzer nothing to infer `T` from and the
+        // literal keeps the open argument — the emitter minted the open
+        // instantiation while the signature said the concrete one, and rustc
+        // saw two structs. It can narrow an answer and never change one: the
+        // expectation is consulted only when it names the SAME declaration.
+        if let Some(Type::Struct(expected, expected_arguments)) =
+            self.expected_type.and_then(|type_id| self.resolve(type_id))
+            && *expected == struct_id
+            && expected_arguments.iter().all(|argument| {
+                !matches!(
+                    self.resolve(self.concrete(*argument)),
+                    Some(Type::Generic(_))
+                )
+            })
+        {
+            let grounded: Vec<TypeId> = expected_arguments
+                .iter()
+                .map(|argument| self.concrete(*argument))
+                .collect();
+            if !grounded.is_empty() {
+                return grounded;
+            }
+        }
         if let Some(Type::Struct(found, arguments)) = self
             .type_of(expr_id)
             .and_then(|type_id| self.resolve(type_id))
@@ -4656,7 +4804,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .and_then(|type_id| self.resolve(type_id))
             && *found == struct_id
         {
-            return arguments.clone();
+            // Through the SUBSTITUTION in force: a literal written inside
+            // `impl Arena<T>` records `Handle<T>`, and an instance emitted at
+            // `T = i32` must build `Handle<i32>` rather than the open one — the
+            // body said `Handle { .. }` and the signature said `Handle<i32>`,
+            // so rustc saw two different structs.
+            return arguments
+                .iter()
+                .map(|argument| self.concrete(*argument))
+                .collect();
         }
         self.program
             .structs
@@ -6291,14 +6447,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     Some(Expr::Reference(_, _))
                 )
             }) {
-                let rendered = self.host_gap(
-                    "a view inside an enum payload (`Option<&mut T>`: the payload's type is \
-                     its pointee's, so the emitted variant takes a value)"
-                        .to_string(),
-                    span,
+                let arguments = self.variant_arguments(
+                    call_expr_id,
+                    enum_id,
+                    index,
+                    &function_call.argument_ids,
                 );
-                self.census_walk(&function_call.argument_ids, depth);
-                return rendered;
+                let path = self.variant_path(enum_id, index, &arguments, span)?;
+                let mut rendered = Vec::new();
+                for argument in &function_call.argument_ids {
+                    rendered.push(self.expression(*argument, depth)?);
+                }
+                return Ok(format!("{path}({})", rendered.join(", ")));
             }
             let arguments =
                 self.variant_arguments(call_expr_id, enum_id, index, &function_call.argument_ids);
@@ -6498,6 +6658,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // An ordinary call, monomorphized against whatever binds it.
         let substitution =
             self.call_substitution(call_id, target, &function_call.generic_argument_ids);
+        // F21: an `Option` whose payload is a VIEW is a `&`/`&mut` natively,
+        // and the only position that carries it today is a `match` subject,
+        // where the leg binds the reference and reads through it. Anywhere else
+        // it meets code written against the payload's POINTEE — `arena.vl`
+        // hands one to `unwrap_or`, a generic monomorphised at `Option<i32>` —
+        // so it is named rather than emitted. The general answer is a
+        // monomorphisation keyed on viewness, which is its own slice.
+        let carries_a_payload_view = self
+            .program
+            .functions
+            .get(&target)
+            .is_some_and(|function| self.payload_view_of(function).is_some());
+        if carries_a_payload_view && !std::mem::take(&mut self.matching_the_subject) {
+            return self.host_gap(
+                "an `Option` with a VIEW payload read anywhere but as a `match` subject (the \
+                 payload is a reference natively, and a generic over it monomorphises at the \
+                 pointee)"
+                    .to_string(),
+                span,
+            );
+        }
         let name = self.ensure_function(target, &substitution)?.name;
         let mut prelude = String::new();
         let arguments =
