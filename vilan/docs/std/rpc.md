@@ -407,6 +407,14 @@ declares none: a service with an `[expose]`d field or a handle-returning
 method, or one declaring `client = H`, has no `over_http` and the call is
 refused by name.
 
+`[service(FooClient, http)]` says the same thing at the DECLARATION: the
+`http` marker generates nothing and moves no contract hash, and it refuses
+each of those three shapes at the field, the method or the attribute that
+declared it — in the attribute's own words, rather than as a missing
+`over_http` at a call site far away. It is opt-in, because which transports
+reach a service is a property of its mount and its methods; a service that
+wants both legs simply does not write it.
+
 A transport FAILING is `Err(reason)`, which `call` maps to
 `RpcError::Transport(..)`: an unreachable host, a DNS failure, a connection
 dropped while the body was still arriving. `HttpTransport` answers that for

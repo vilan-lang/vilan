@@ -6872,3 +6872,274 @@ async fun run_client(base: str) {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A120 S5 (`transport-rpc.md` §9.7.5, Q1 RULED: an opt-in MARKER): what
+/// `[service(.., http)]` refuses, each at the member that declared it.
+///
+/// Nothing here is needed for correctness — the generated client's field list
+/// already refuses the first three shapes and `over_http` is simply absent for
+/// the fourth (`over_http_is_not_generated_for_a_client_that_needs_a_connection`
+/// above is that half). What the marker buys is WHERE the author hears it: at
+/// the field, the method or the attribute, instead of at a call site that says
+/// `cannot find 'over_http'` about a client the author never wrote. So each row
+/// asserts the sentence AND its location, and the program calls `over_http`
+/// so that a marker which refused nothing would fail on the far-away message
+/// instead — the thing each row must NOT say.
+#[test]
+fn the_http_marker_refuses_what_the_post_leg_cannot_carry_at_the_member_that_declared_it() {
+    for (tag, source, head, location) in [
+        (
+            "expose",
+            r#"import std::reactive::{ Signal, SignalCell };
+import std::json::json_codec;
+
+[service(TallyClient, http)]
+struct Tally {
+	[expose] count: SignalCell<i32>,
+}
+
+impl Tally {
+	[rpc]
+	fun bump(self): i32 {
+		self.count.get()
+	}
+}
+
+fun main() {
+	let client = TallyClient::over_http("/", json_codec());
+}
+"#,
+            "an `http` service's field `count` is `[expose]`d",
+            "main.vl:6:11",
+        ),
+        (
+            "handle",
+            r#"import std::reactive::{ Signal, SignalCell };
+import std::json::json_codec;
+
+[service(WatchyClient, http)]
+struct Watchy {
+	seed: i32,
+}
+
+impl Watchy {
+	[rpc]
+	fun watch(self, id: str): SignalCell<i32> {
+		Signal::new(self.seed)
+	}
+}
+
+fun main() {
+	let client = WatchyClient::over_http("/", json_codec());
+}
+"#,
+            "an `http` service's method `watch` returns a signal handle (`SignalCell<..>`)",
+            "main.vl:11:6",
+        ),
+        (
+            "keyed_handle",
+            r#"import std::reactive::KeyedCell;
+import std::wire::Keyed;
+import std::json::json_codec;
+
+[derive(Wire)]
+struct Row {
+	id: str,
+	label: str,
+}
+
+impl Row with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+[service(RowsClient, http)]
+struct Rows {
+	seed: i32,
+}
+
+export impl Rows {
+	[rpc]
+	fun rows(self): KeyedCell<str, Row> {
+		KeyedCell::new([])
+	}
+}
+
+fun main() {
+	let client = RowsClient::over_http("/", json_codec());
+}
+"#,
+            "an `http` service's method `rows` returns a signal handle (`KeyedCell<..>`)",
+            "main.vl:24:6",
+        ),
+        (
+            "client_handler",
+            r#"import std::json::json_codec;
+
+[client_service]
+struct Peer {
+	seed: i32,
+}
+
+impl Peer {
+	[rpc]
+	fun ping(self, tag: str) {
+	}
+}
+
+[service(HubClient, http, client = Peer)]
+struct Hub {
+	seed: i32,
+}
+
+impl Hub {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.seed + by
+	}
+}
+
+fun main() {
+	let client = HubClient::over_http("/", json_codec());
+}
+"#,
+            "an `http` service cannot name `client = Peer`",
+            "main.vl:14:1",
+        ),
+    ] {
+        let dir = temp_project(&format!("http_marker_{tag}"));
+        write(
+            &dir,
+            "vilan.toml",
+            "[package]\nname = \"app\"\ntarget = \"node\"\n",
+        );
+        write(&dir, "src/main.vl", source);
+        let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .args(["check", dir.to_str().unwrap()])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run vilan check");
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.status.success(),
+            "the `{tag}` service must be refused under `http`:\n{report}"
+        );
+        assert!(
+            report.contains(head),
+            "the `{tag}` row must be refused in the marker's words:\n{report}"
+        );
+        assert!(
+            report.contains(location),
+            "the `{tag}` refusal must be spanned on the member at {location}:\n{report}"
+        );
+        assert!(
+            !report.contains("cannot find 'over_http'"),
+            "the `{tag}` row must be answered at the member, not at the call:\n{report}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A120 S5's other half: the marker GENERATES nothing. A service that carries
+/// it hashes exactly as the same surface without it (so marking a shipped
+/// service is invisible to every client already talking to it), `http` is
+/// never read as a client NAME (`[service(http)]` keeps `<Struct>Client`), and
+/// the formatter prints the marker back rather than dropping it — a formatter
+/// that dropped it would silently delete the author's refusals.
+#[test]
+fn the_http_marker_generates_nothing_moves_no_hash_and_survives_the_formatter() {
+    let dir = temp_project("http_marker_inert");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::json::json_codec;
+
+[service(MarkedClient, http)]
+struct Marked {
+	seed: i32,
+}
+
+impl Marked {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.seed + by
+	}
+}
+
+[service(UnmarkedClient)]
+struct Unmarked {
+	seed: i32,
+}
+
+impl Unmarked {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.seed + by
+	}
+}
+
+[service(http)]
+struct Door {
+	seed: i32,
+}
+
+impl Door {
+	[rpc]
+	fun add(self, by: i32): i32 {
+		self.seed + by
+	}
+}
+
+fun main() {
+	let marked = Marked { seed = 0 };
+	let unmarked = Unmarked { seed = 0 };
+	let client = MarkedClient::over_http("/", json_codec());
+	let door = DoorClient::over_http("/", json_codec());
+	print(i"marked={marked.contract_hash()}");
+	print(i"unmarked={unmarked.contract_hash()}");
+	print(i"client={client.contract_hash()}");
+	print(i"door={door.contract_hash()}");
+}
+"#,
+    );
+    let formatted = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["fmt", "--check", dir.join("src").to_str().unwrap()])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vilan fmt --check");
+    assert!(
+        formatted.status.success(),
+        "the formatter must print `http` back where it was written:\n{}{}",
+        String::from_utf8_lossy(&formatted.stdout),
+        String::from_utf8_lossy(&formatted.stderr)
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    let hash_of = |label: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(label))
+            .unwrap_or_else(|| panic!("no `{label}` line:\n{stdout}"))
+            .trim()
+            .to_string()
+    };
+    let unmarked = hash_of("unmarked=");
+    for label in ["marked=", "client=", "door="] {
+        assert_eq!(
+            hash_of(label),
+            unmarked,
+            "`{label}` must hash as the unmarked surface — the marker generates nothing:\n{stdout}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

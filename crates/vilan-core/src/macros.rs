@@ -1930,6 +1930,30 @@ impl Expander<'_, '_> {
                     self.sweep_expressions(item, text, depth);
                     return;
                 }
+                // A120 S5: the `http` marker's three refusals, each spanned on
+                // the member that earned it. Answered here, above the
+                // expansion, for the reason the two walks above are: the
+                // expansion's only channel is a `panic`, and the far-away
+                // alternative — a client that cannot be built at the call
+                // site — is exactly what the marker exists to replace.
+                let http_refusals = service_http_refusals(
+                    *attribute,
+                    item,
+                    siblings,
+                    (node.1.start..item.1.start).into(),
+                );
+                if !http_refusals.is_empty() {
+                    for (span, msg) in http_refusals {
+                        self.diagnostics.push(Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span,
+                            msg,
+                        });
+                    }
+                    self.sweep_expressions(item, text, depth);
+                    return;
+                }
                 match self.scope.get("service") {
                     Some(def) => {
                         self.run_service(def, *attribute, item, siblings, text, depth);
@@ -3087,6 +3111,126 @@ pub(crate) fn construct_service(
         ]),
     ]);
     Some((literal, input, surface))
+}
+
+/// What `[service(.., http)]` refuses (A120 S5, `transport-rpc.md` §9.7.5, Q1
+/// RULED: an opt-in MARKER, not a mode) — one refusal per offending member.
+///
+/// Nothing here is needed for CORRECTNESS: the generated client's field list
+/// already refuses the first two shapes structurally (`over_http` is emitted
+/// only for a client that holds nothing but its transport and codec), and the
+/// third is simply not given `over_http`. What the marker buys is WHERE the
+/// author hears it: at the method, the field or the attribute that made the
+/// service unreachable over the connectionless leg, in the attribute's own
+/// vocabulary, instead of at a call site that could not build a client and
+/// names a field the author never wrote. It is opt-in because which transports
+/// reach a service is a property of its mount and its methods, not of the
+/// struct — a service may legitimately want both legs.
+///
+/// The handle test is the WRITTEN return spelling, the one the expansion reads
+/// (`std::rpc`'s `handle_element`): `SignalCell<T>` or `KeyedCell<K, T>`. A
+/// method returning some other `Source` is not a handle there either, and the
+/// `[rpc]` Wire rule refuses it in its own words.
+fn service_http_refusals(
+    attribute: ServiceAttr,
+    item: &Spanned<Node>,
+    nodes: &NodeList,
+    attribute_span: Span,
+) -> Vec<(Span, String)> {
+    if !attribute.http {
+        return Vec::new();
+    }
+    let Node::Struct(name, _generics, _external, _resource, fields) = &item.0 else {
+        return Vec::new();
+    };
+    let service_name = name.0;
+    let mut refusals = Vec::new();
+    if let Some(handler) = attribute.handler_name {
+        refusals.push((
+            attribute_span,
+            format!(
+                "an `http` service cannot name `client = {handler}`: the server calls a client \
+                 back over the CONNECTION that client holds open, and the connectionless POST \
+                 leg holds none, so every notification to `{handler}` would find no channel and \
+                 be dropped in silence. Drop `client = {handler}`, or drop `http` and reach \
+                 this service over the socket transport"
+            ),
+        ));
+    }
+    for ((field_name, _field_type, exposure), _span) in fields.iter().flat_map(|fields| &fields.0) {
+        if !exposure.is_exposed() {
+            continue;
+        }
+        let field = field_name.0;
+        refusals.push((
+            field_name.1,
+            format!(
+                "an `http` service's field `{field}` is `[expose]`d, and a mirror is attached \
+                 over a CONNECTION: the client's `__attach` names a channel in that \
+                 connection's capability table, which the connectionless POST leg has none of. \
+                 Return the value from an `[rpc]` method instead, or drop `http` and reach this \
+                 service over the socket transport"
+            ),
+        ));
+    }
+    for (node, _span) in nodes {
+        let mut node = node;
+        while let Node::Export(_, inner) = node {
+            node = &inner.0;
+        }
+        let Node::Impl(subject, impl_traits, body) = node else {
+            continue;
+        };
+        if !impl_traits.is_empty() {
+            continue;
+        }
+        let Node::Accessor(subject_name) = &subject.0 else {
+            continue;
+        };
+        if *subject_name != service_name {
+            continue;
+        }
+        for (member, _member_span) in &body.0 {
+            let Node::Func(function) = member else {
+                continue;
+            };
+            if !function.rpc {
+                continue;
+            }
+            let Some(spelling) = function
+                .return_type
+                .as_deref()
+                .and_then(|returned| handle_spelling(&returned.0))
+            else {
+                continue;
+            };
+            let method = function.name.0;
+            refusals.push((
+                function.name.1,
+                format!(
+                    "an `http` service's method `{method}` returns a signal handle \
+                     (`{spelling}<..>`), and a handle's reply is a channel id minted in a \
+                     CONNECTION's capability table, which the connectionless POST leg has none \
+                     of: return the value, or drop `http` and reach this service over the \
+                     socket transport"
+                ),
+            ));
+        }
+    }
+    refusals
+}
+
+/// The handle type a written return spelling names, if it names one — the
+/// same test `std::rpc`'s `handle_element` applies at expansion.
+fn handle_spelling(returned: &Node) -> Option<&'static str> {
+    let Node::AccessorWithGenerics(name, arguments) = returned else {
+        return None;
+    };
+    match (*name, arguments.0.len()) {
+        ("SignalCell", 1) => Some("SignalCell"),
+        ("KeyedCell", 2) => Some("KeyedCell"),
+        _ => None,
+    }
 }
 
 /// Every `[rpc]` method declared on `subject` by an inherent impl in `nodes`,

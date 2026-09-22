@@ -4536,6 +4536,10 @@ impl<'src> Printer<'src> {
                         .client_name
                         .map(str::to_string)
                         .into_iter()
+                        // A120 S5's marker, after the client's name (the
+                        // positional argument leads or is absent) and before
+                        // the one named argument.
+                        .chain(attribute.http.then(|| "http".to_string()))
                         .chain(
                             attribute
                                 .handler_name

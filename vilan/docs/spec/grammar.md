@@ -314,7 +314,8 @@ derived-item   = "[" "derive" "(" IDENT { "," IDENT } [ "," ] ")" "]"
                  ( struct | enum ) ;
 service-item   = { service-attr | client-service-attr }- struct ;
 service-attr   = "[" "service" [ "(" service-args ")" ] "]" ;
-service-args   = IDENT [ "," "client" "=" IDENT ] | "client" "=" IDENT ;
+service-args   = service-arg { "," service-arg } ;   (* a client name leads or is absent; each other arg at most once *)
+service-arg    = IDENT | "http" | "client" "=" IDENT ;
 client-service-attr = "[" "client_service" "]" ;
 macro-attributed-item = "[" IDENT [ "(" [ expr-span { "," expr-span } ] ")" ] "]"
                         ( struct | enum | function ) ;
@@ -331,7 +332,9 @@ attribute names (`derive`, `service`, `client_service`, `extern`,
 
 `[service(..)]` and `[client_service]` may be written in either order
 on one struct; a struct carrying both is peer-to-peer and expands
-once (`proposal/transport-rpc.md` §9.3).
+once (`proposal/transport-rpc.md` §9.3). `http` in `[service(..)]` is a
+marker, never a client name: `[service(http)]` keeps the default
+`<Struct>Client` (`transport-rpc.md` §9.7.5).
 
 ## 3.4 Bindings and assignment
 

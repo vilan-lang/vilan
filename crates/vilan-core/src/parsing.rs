@@ -6953,13 +6953,14 @@ impl<'a, 'src> Parser<'a, 'src> {
         let mut attribute = ServiceAttr::default();
         // Either attribute may lead, and a peer-to-peer struct writes both.
         loop {
-            if let Some((client_name, handler_name)) = self.parse_service_attribute() {
+            if let Some((client_name, handler_name, http)) = self.parse_service_attribute() {
                 if attribute.server_side {
                     return None;
                 }
                 attribute.server_side = true;
                 attribute.client_name = client_name;
                 attribute.handler_name = handler_name;
+                attribute.http = http;
             } else if self.parse_client_service_attribute().is_some() {
                 if attribute.client_side {
                     return None;
@@ -6979,12 +6980,12 @@ impl<'a, 'src> Parser<'a, 'src> {
         ))
     }
 
-    /// `[service(Name?, client = Handler?)?]` — a service attribute. The outer
-    /// `Option` is whether this is a service attribute at all (`None` ⇒ not one);
-    /// the pair is the optional client name and the optional `client = H` handler
-    /// name.
+    /// `[service(Name?, http?, client = Handler?)?]` — a service attribute. The
+    /// outer `Option` is whether this is a service attribute at all (`None` ⇒
+    /// not one); the triple is the optional client name, the optional `client =
+    /// H` handler name, and whether the `http` marker was written (A120 S5).
     #[allow(clippy::type_complexity)]
-    fn parse_service_attribute(&mut self) -> Option<(Option<&'src str>, Option<&'src str>)> {
+    fn parse_service_attribute(&mut self) -> Option<(Option<&'src str>, Option<&'src str>, bool)> {
         self.attempt(|parser| {
             parser.expect_ctrl('[')?;
             if parser.peek() != Some(&Token::Ident("service")) {
@@ -6995,7 +6996,24 @@ impl<'a, 'src> Parser<'a, 'src> {
                 parser.expect_ctrl('(')?;
                 let mut client_name = None;
                 let mut handler_name = None;
+                let mut http = false;
                 while !parser.peek_is_ctrl(')') {
+                    // `http` — the marker (A120 S5). A bare word in any
+                    // position, and never a client NAME: a client type spelled
+                    // `http` would be a lowercase type, which nothing in the
+                    // language writes, and reading the word as the marker is
+                    // what lets `[service(http)]` keep the default client name.
+                    if parser.peek() == Some(&Token::Ident("http")) {
+                        if http {
+                            return None;
+                        }
+                        parser.bump();
+                        http = true;
+                        if !parser.eat_ctrl(',') {
+                            break;
+                        }
+                        continue;
+                    }
                     // `client = Handler` — the one named argument; anything else
                     // is the positional client name, which leads or not at all.
                     let named = parser.attempt(|parser| {
@@ -7011,7 +7029,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                     match named {
                         Some(name) => handler_name = Some(name),
                         None => {
-                            if client_name.is_some() || handler_name.is_some() {
+                            if client_name.is_some() || handler_name.is_some() || http {
                                 return None;
                             }
                             client_name = Some(parser.eat_ident()?);
@@ -7022,10 +7040,10 @@ impl<'a, 'src> Parser<'a, 'src> {
                     }
                 }
                 parser.expect_ctrl(')')?;
-                Some((client_name, handler_name))
+                Some((client_name, handler_name, http))
             });
             parser.expect_ctrl(']')?;
-            Some(arguments.unwrap_or((None, None)))
+            Some(arguments.unwrap_or((None, None, false)))
         })
     }
 
@@ -8618,6 +8636,43 @@ mod tests {
                 assert_eq!(attribute.client_name, None);
                 assert!(attribute.server_side && !attribute.client_side);
             }
+            other => panic!("expected Service, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_http_marker_rides_the_service_node_in_any_position_but_first_of_a_name() {
+        // A120 S5: `http` is a MARKER, not a client name — `[service(http)]`
+        // keeps the default client name.
+        for (source, client_name, handler_name) in [
+            ("[service(http)] struct Door { }", None, None),
+            (
+                "[service(DoorClient, http)] struct Door { }",
+                Some("DoorClient"),
+                None,
+            ),
+            (
+                "[service(DoorClient, http, client = Peer)] struct Door { }",
+                Some("DoorClient"),
+                Some("Peer"),
+            ),
+            (
+                "[service(client = Peer, http)] struct Door { }",
+                None,
+                Some("Peer"),
+            ),
+        ] {
+            match only_item(source) {
+                Node::Service(attribute, _) => {
+                    assert!(attribute.http, "{source}");
+                    assert_eq!(attribute.client_name, client_name, "{source}");
+                    assert_eq!(attribute.handler_name, handler_name, "{source}");
+                }
+                other => panic!("expected Service for {source}, got {other:?}"),
+            }
+        }
+        match only_item("[service(DoorClient)] struct Door { }") {
+            Node::Service(attribute, _) => assert!(!attribute.http),
             other => panic!("expected Service, got {other:?}"),
         }
     }

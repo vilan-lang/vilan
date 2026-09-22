@@ -1377,6 +1377,21 @@ call: an HTTP client is unversioned unless you call `verify()`. There are no
 mirrors and no reverse direction over this leg, which is why the constructor
 exists only for a service that declares neither.
 
+A service that is MEANT to be an HTTP API can say so, and hear about a mistake
+where it made it:
+
+```vilan,fragment
+[service(AuthClient, http)]
+struct Auth {}
+```
+
+The `http` marker generates nothing. It refuses, at the member that declared
+it, each thing the connectionless leg cannot carry — a method returning a
+`SignalCell`/`KeyedCell` handle, an `[expose]`d field, a `client = ..`
+handler — so a handle added to the login door a month later is an error on
+that method, not a puzzle at the page that can no longer build its client.
+Leave it off a service that wants both legs.
+
 ### Gating the POST leg: `authorize_request`
 
 A login door is open on purpose. The services after it are not, and a POST

@@ -560,6 +560,12 @@ pub struct ServiceAttr<'src> {
     /// Whether `[client_service]` was written: this struct's `[rpc]` methods are
     /// callable BY a server, and it generates a `<Struct>Proxy`.
     pub client_side: bool,
+    /// Whether `[service(.., http)]` was written: the opt-in MARKER that this
+    /// service is an HTTP API (A120 S5, `transport-rpc.md` §9.7.5, Q1 RULED).
+    /// It generates nothing; it moves the refusal of what the connectionless
+    /// leg cannot carry — a handle return, an `[expose]`d field, `client = H`
+    /// — from a far-away call site to the member that declared it.
+    pub http: bool,
 }
 
 /// The name a [`Node::TypeBinder`] carries when it was written ANONYMOUSLY —
