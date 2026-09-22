@@ -6837,3 +6837,239 @@ fn b310_a_generic_body_whose_parameter_stays_abstract_is_unchanged() {
         "1\n2\n1\n2\n",
     );
 }
+
+// --- B377: the emitter's unused-binding elision and the element shapes -------
+//
+// A tuple comprehension whose mapped tuple is DISCARDED still runs its body per
+// element. The miscompile was one level up from the comprehension — the "may
+// this expression have a side effect" predicate that decides whether an unused
+// `let` may be dropped listed the value shapes and defaulted to "pure", so a
+// block, an `if`, a `match` or a loop element answered pure and the whole
+// binding went, statements and calls with it, with a clean check. The pins
+// below are one per element shape, plus the same class reached WITHOUT a
+// comprehension, because the predicate is shared.
+
+#[test]
+fn b377_a_block_element_in_a_discarded_comprehension_still_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        let tally: Shared<i32> = Shared::new(0);
+
+        fun note(value: i32): i32 {
+            tally.write() = tally.read() + value;
+            value
+        }
+
+        fun over_a_block<T: (2..)>(values: (U in T: U)): i32 {
+            let _mapped = (value in values => {
+                note(1);
+                value
+            });
+            tally.read()
+        }
+
+        fun main() {
+            print(over_a_block((1, 2, 3)));
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b377_a_call_element_in_a_discarded_comprehension_is_unchanged() {
+    // The control: the shape that always worked, so the fix is a no-op here.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        let tally: Shared<i32> = Shared::new(0);
+
+        fun note(value: i32): i32 {
+            tally.write() = tally.read() + value;
+            value
+        }
+
+        fun over_a_call<T: (2..)>(values: (U in T: U)): i32 {
+            let _mapped = (value in values => note(1));
+            tally.read()
+        }
+
+        fun main() {
+            print(over_a_call((1, 2, 3)));
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b377_an_if_element_in_a_discarded_comprehension_still_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        let tally: Shared<i32> = Shared::new(0);
+
+        fun note(value: i32): i32 {
+            tally.write() = tally.read() + value;
+            value
+        }
+
+        fun over_an_if<T: (2..)>(values: (U in T: U)): i32 {
+            let _mapped = (value in values => if tally.read() < 100 { note(1) } else { 0 });
+            tally.read()
+        }
+
+        fun main() {
+            print(over_an_if((1, 2, 3)));
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b377_a_match_element_in_a_discarded_comprehension_still_runs() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        let tally: Shared<i32> = Shared::new(0);
+
+        fun note(value: i32): i32 {
+            tally.write() = tally.read() + value;
+            value
+        }
+
+        fun over_a_match<T: (2..)>(values: (U in T: U)): i32 {
+            let _mapped = (value in values => match tally.read() < 100 {
+                true => note(1),
+                false => 0,
+            });
+            tally.read()
+        }
+
+        fun main() {
+            print(over_a_match((1, 2, 3)));
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn b377_a_pure_element_in_a_discarded_comprehension_is_still_elided() {
+    // The other side of the predicate: a literal element has nothing to run, so
+    // the discarded map is correctly dropped — the fix must not make every
+    // unused binding survive.
+    assert_emits_containing(
+        r#"
+        import std::io::print;
+
+        fun over_a_literal<T: (2..)>(values: (U in T: U)): i32 {
+            let _mapped = (value in values => 7);
+            0
+        }
+
+        fun main() {
+            print(over_a_literal((1, 2, 3)));
+        }
+        "#,
+        "function $a(values) {\n\treturn 0;\n}",
+    );
+}
+
+#[test]
+fn b377_a_comprehensions_source_runs_even_when_its_element_is_pure() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        let tally: Shared<i32> = Shared::new(0);
+
+        fun source<T: (2..)>(values: (U in T: U)): (U in T: U) {
+            tally.write() = tally.read() + 1;
+            values
+        }
+
+        fun over_a_pure_element<T: (2..)>(values: (U in T: U)): i32 {
+            let _mapped = (value in source(values) => 7);
+            tally.read()
+        }
+
+        fun main() {
+            print(over_a_pure_element((1, 2, 3)));
+        }
+        "#,
+        "1\n",
+    );
+}
+
+#[test]
+fn b377_an_unused_binding_over_a_block_still_runs_its_statements() {
+    // The predicate is shared, so the class is wider than the comprehension: a
+    // block, an `if` and a `match` as an unused `let`'s initializer.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        let tally: Shared<i32> = Shared::new(0);
+
+        fun note(value: i32): i32 {
+            tally.write() = tally.read() + value;
+            value
+        }
+
+        fun main() {
+            let _block = {
+                note(1);
+                0
+            };
+            let _if = if tally.read() < 100 { note(10) } else { 0 };
+            let _match = match tally.read() < 100 {
+                true => note(100),
+                false => 0,
+            };
+            print(tally.read());
+        }
+        "#,
+        "111\n",
+    );
+}
+
+#[test]
+fn b377_an_unused_binding_over_a_nested_let_still_runs_it() {
+    // `Expr::Variable` inside the block: the inner `let`'s own initializer is
+    // what carries the effect, and nothing else in the block does.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+
+        let tally: Shared<i32> = Shared::new(0);
+
+        fun note(value: i32): i32 {
+            tally.write() = tally.read() + value;
+            value
+        }
+
+        fun main() {
+            let _outer = {
+                let inner = note(5);
+                inner
+            };
+            print(tally.read());
+        }
+        "#,
+        "5\n",
+    );
+}

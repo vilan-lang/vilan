@@ -1,4 +1,5 @@
 import std::io::print;
+import std::shared::Shared;
 
 // An unused `let` binding is dropped from codegen — but a side-effecting
 // initializer (here a call that mutates through `&mut`) must still run.
@@ -7,10 +8,100 @@ fun bump(xs: &mut List<i32>): i32 {
 	xs.len()
 }
 
+// B377 — the same rule for every OTHER initializer shape. The predicate that
+// decides "may this expression have a side effect" listed the value shapes and
+// defaulted to "pure", so a block, an `if`, a `match` or a tuple comprehension
+// whose element is one of those answered pure and the whole binding went,
+// statements and calls with it, with a clean check and nothing emitted at all.
+// `note(1)` written as a bare call survived, which is how the two halves of
+// each pair below differ.
+let tally: Shared<i32> = Shared::new(0);
+
+fun note(value: i32): i32 {
+	tally.write() = tally.read() + value;
+	value
+}
+
+// The comprehension B377 was found through: the mapped tuple is discarded, and
+// the map over the source is what does the work.
+fun over_a_call<T: (2..)>(values: (U in T: U)): i32 {
+	// witness: values.map((value) => {
+	let _mapped = (value in values => note(1));
+	tally.read()
+}
+
+fun over_a_block<T: (2..)>(values: (U in T: U)): i32 {
+	// witness: note(10);
+	let _mapped = (value in values => {
+		note(10);
+		value
+	});
+	tally.read()
+}
+
+fun over_an_if<T: (2..)>(values: (U in T: U)): i32 {
+	// witness: note(100);
+	let _mapped = (value in values => if tally.read() < 100000 { note(100) } else { 0 });
+	tally.read()
+}
+
+fun over_a_match<T: (2..)>(values: (U in T: U)): i32 {
+	// witness: note(1000);
+	let _mapped = (value in values => match tally.read() < 100000 {
+		true => note(1000),
+		false => 0,
+	});
+	tally.read()
+}
+
+// The control: a PURE element has nothing to run, so dropping the discarded
+// map is correct and the whole body folds to the tally read.
+fun over_a_literal<T: (2..)>(values: (U in T: U)): i32 {
+	let _mapped = (value in values => 7);
+	tally.read()
+}
+
+// And a block element whose mapped tuple IS used — the second comprehension
+// reads the first's elements, so the block runs for its value as well as for
+// its effect.
+fun chained<T: (2..)>(values: (U in T: U)): i32 {
+	let mapped = (value in values => {
+		note(1);
+		2
+	});
+	let _again = (doubled in mapped => note(doubled));
+	tally.read()
+}
+
 fun main() {
 	mut xs: List<i32> = List::new();
 	let a = bump(&mut xs); // used below
 	let b = bump(&mut xs); // UNUSED — its push must still happen
 	print(a); // 1
 	print(xs.len()); // 2
+
+	// The compound initializer shapes, with no comprehension in sight.
+	let _block = {
+		note(1);
+		0
+	};
+	let _if = if tally.read() < 100000 { note(10) } else { 0 };
+	let _match = match tally.read() < 100000 {
+		true => note(100),
+		false => 0,
+	};
+	print(tally.read()); // 111
+
+	tally.write() = 0;
+	print(over_a_call((1, 2, 3))); // 3
+	tally.write() = 0;
+	print(over_a_block((1, 2, 3))); // 30
+	tally.write() = 0;
+	print(over_an_if((1, 2, 3))); // 300
+	tally.write() = 0;
+	print(over_a_match((1, 2, 3))); // 3000
+	tally.write() = 0;
+	print(over_a_literal((1, 2, 3))); // 0 — nothing ran
+	tally.write() = 0;
+	print(chained((4, 5, 6))); // 9
 }

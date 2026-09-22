@@ -4036,44 +4036,139 @@ impl<'src> Transformer<'src> {
     /// assignment, or anything containing one. An unused `let` binding can be
     /// dropped only if its initializer is side-effect-free; a side-effecting one
     /// (e.g. a call that mutates through `&mut self`) must still run.
+    ///
+    /// **The match is EXHAUSTIVE, deliberately (B377).** It was written with a
+    /// `_ => false` catch-all, and the arms it happened to list were the
+    /// *value* shapes — so every COMPOUND shape that is really a statement
+    /// form (a block, an `if`, a `match`, a loop, a `ret`) answered "pure" and
+    /// an unused binding over one was dropped whole, statements and side
+    /// effects with it: `(value in values => { note(1); value })` emitted
+    /// nothing at all while `(value in values => note(1))` emitted the `.map`.
+    /// The default on an unknown shape must be "may have effects", and the only
+    /// way to keep that true as `Expr` grows is to force a new variant through
+    /// this list — so add the variant's arm rather than a catch-all.
     fn expr_has_side_effects(&self, expr_id: Id) -> bool {
-        match self.program.entity_map.get(&expr_id) {
-            Some(Expr::Call(_)) | Some(Expr::Await(_)) | Some(Expr::Assignment(_, _)) => true,
+        let Some(entity) = self.program.entity_map.get(&expr_id) else {
+            return false;
+        };
+        match entity {
+            Expr::Call(_) | Expr::Await(_) | Expr::Assignment(_, _) => true,
             // An `async { .. }` block is an *invoked* async arrow — it starts
             // executing its body immediately, so it is effectful even when its
             // promise is discarded (`let _ = async { pump loop }`).
-            Some(Expr::Async(_)) => true,
-            Some(Expr::Binary(_, lhs, rhs)) => {
+            Expr::Async(_) => true,
+            Expr::Binary(_, lhs, rhs) => {
                 self.expr_has_side_effects(*lhs) || self.expr_has_side_effects(*rhs)
             }
-            Some(Expr::Unary(_, operand))
-            | Some(Expr::Reference(operand, _))
-            | Some(Expr::Dereference(operand)) => self.expr_has_side_effects(*operand),
-            Some(Expr::Field(subject, _, _))
-            | Some(Expr::TupleIndex(subject, _, _))
-            | Some(Expr::ArrayLen(subject, _)) => self.expr_has_side_effects(*subject),
+            Expr::Unary(_, operand)
+            | Expr::Reference(operand, _)
+            | Expr::Dereference(operand)
+            | Expr::Is(operand, _)
+            | Expr::Destructure(operand, _) => self.expr_has_side_effects(*operand),
+            Expr::Field(subject, _, _)
+            | Expr::TupleIndex(subject, _, _)
+            | Expr::ArrayLen(subject, _) => self.expr_has_side_effects(*subject),
             // `[value; n]` evaluates its value expression once.
-            Some(Expr::Repeat(value, _)) => self.expr_has_side_effects(*value),
+            Expr::Repeat(value, _) => self.expr_has_side_effects(*value),
             // A lift region runs its steps and (conditionally) its body.
-            Some(Expr::LiftRegion(steps, body_id)) => {
+            Expr::LiftRegion(steps, body_id) => {
                 steps
                     .iter()
                     .any(|(step_id, _, _)| self.expr_has_side_effects(*step_id))
                     || self.expr_has_side_effects(*body_id)
             }
+            // `a?.b.c` — the subject always runs, the continuation runs when the
+            // subject carries a value.
+            Expr::Lift(subject, _, continuation) => {
+                self.expr_has_side_effects(*subject) || self.expr_has_side_effects(*continuation)
+            }
             // A checked subscript can panic, so an indexing expression is
             // effectful in itself: dropping it would drop its bounds check.
-            Some(Expr::Index(_, _)) => true,
-            Some(Expr::List(ids)) | Some(Expr::Tuple(ids)) => {
+            Expr::Index(_, _) => true,
+            // Control leaving the expression is itself the effect: dropping a
+            // `ret`, a `jump` or a `?` short-circuit changes where the program
+            // goes, not just what it computes.
+            Expr::FunctionReturn(_) | Expr::Jump(_) | Expr::TryAssert(_) => true,
+            // A loop is a statement form: it may not terminate, and "pure body"
+            // does not make an endless `for { .. }` droppable.
+            Expr::For(..) | Expr::ForEach(..) => true,
+            Expr::List(ids) | Expr::Tuple(ids) => {
                 ids.iter().any(|id| self.expr_has_side_effects(*id))
             }
-            Some(Expr::StructInitializer(_, fields)) => {
+            Expr::StructInitializer(_, fields) => {
                 fields.values().any(|id| self.expr_has_side_effects(*id))
             }
             // A comprehension runs its body per element (`combine` subscribes each
-            // source this way), so it inherits the body's side effects.
-            Some(Expr::TupleComprehension(_, _, body_id)) => self.expr_has_side_effects(*body_id),
-            _ => false,
+            // source this way), so it inherits the body's side effects — and its
+            // SOURCE is evaluated once whatever the body does.
+            Expr::TupleComprehension(_, source_id, body_id) => {
+                self.expr_has_side_effects(*source_id) || self.expr_has_side_effects(*body_id)
+            }
+            // The compound shapes B377 was: a block runs its statements, an
+            // `if`/`match` runs the subject plus whichever continuation fires.
+            Expr::Block((statements, tail)) => {
+                statements.iter().any(|id| self.expr_has_side_effects(*id))
+                    || self.expr_has_side_effects(*tail)
+            }
+            Expr::If(branch) => self.if_branch_has_side_effects(branch),
+            Expr::Match(subject, legs) => {
+                self.expr_has_side_effects(*subject)
+                    || legs.iter().any(|leg| {
+                        leg.guard
+                            .is_some_and(|guard| self.expr_has_side_effects(guard))
+                            || self.expr_has_side_effects(leg.body)
+                    })
+            }
+            // A `let` inside a block: the declaration itself does nothing, its
+            // initializer may.
+            Expr::Variable(id) => self
+                .program
+                .variables
+                .get(id)
+                .and_then(|variable| variable.initial)
+                .is_some_and(|value_id| self.expr_has_side_effects(value_id)),
+            // Pure: literals and names, a closure that is defined and not called,
+            // and the declaration forms, which emit nothing here at all.
+            Expr::Bool(_)
+            | Expr::Closure(_)
+            | Expr::Enum(_)
+            | Expr::EnumVariant(_, _)
+            | Expr::Error
+            | Expr::ExternalFunction(_)
+            | Expr::Function(_)
+            | Expr::Generic(_)
+            | Expr::Impl(_)
+            | Expr::LiftBinder
+            | Expr::Local(_)
+            | Expr::Macro
+            | Expr::Module(_)
+            | Expr::MultilineString(_)
+            | Expr::Null
+            | Expr::Number(_, _, _)
+            | Expr::Parameter(_)
+            | Expr::String(_)
+            | Expr::Struct(_)
+            | Expr::Trait(_)
+            | Expr::Void => false,
+        }
+    }
+
+    /// The `if`/`else if`/`else` half of [`Self::expr_has_side_effects`]: a
+    /// condition always runs, and any branch's body may.
+    fn if_branch_has_side_effects(&self, branch: &ExprIfBranch) -> bool {
+        match branch {
+            ExprIfBranch::If(condition, (statements, tail), otherwise) => {
+                self.expr_has_side_effects(*condition)
+                    || statements.iter().any(|id| self.expr_has_side_effects(*id))
+                    || self.expr_has_side_effects(*tail)
+                    || otherwise
+                        .as_ref()
+                        .is_some_and(|next| self.if_branch_has_side_effects(next))
+            }
+            ExprIfBranch::Else((statements, tail)) => {
+                statements.iter().any(|id| self.expr_has_side_effects(*id))
+                    || self.expr_has_side_effects(*tail)
+            }
         }
     }
 
