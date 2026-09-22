@@ -1040,7 +1040,7 @@ fn collect_reference_if(branch: &js::IfBranch, out: &mut BTreeSet<String>) {
 /// line break whatever the file's on-disk encoding, exactly as a triple-quoted
 /// literal already does. An ESCAPED `\r` is unaffected — it is written, not read
 /// from the line ending — and a lone `\r` in the text is preserved.
-fn unescape_string(raw: &str) -> Cow<'_, str> {
+pub fn unescape_string(raw: &str) -> Cow<'_, str> {
     let raw = crate::util::normalize_newlines(raw);
     if !raw.contains('\\') {
         return raw;
@@ -8881,7 +8881,9 @@ impl<'src> Transformer<'src> {
                 ));
             }
             // ...else the trait's own default, specialized for this type.
-            if let Some(default_id) = self.trait_default_member(trait_id, member) {
+            if let Some(default_id) =
+                crate::mono::trait_default_member(self.program, trait_id, member)
+            {
                 let is_async = self.program.async_functions.contains(&default_id);
                 return Some(Dispatch::Call(
                     self.emit_default_instance(default_id, type_id),
@@ -8899,7 +8901,12 @@ impl<'src> Transformer<'src> {
                 own_generic_values,
             ));
         }
-        let default_id = self.resolve_inherited_default(type_id, member)?;
+        let default_id = crate::mono::resolve_inherited_default(
+            self.program,
+            self.current_admitting_file,
+            type_id,
+            member,
+        )?;
         let is_async = self.program.async_functions.contains(&default_id);
         Some(Dispatch::Call(
             self.emit_default_instance(default_id, type_id),
@@ -9150,53 +9157,12 @@ impl<'src> Transformer<'src> {
         default_id: Id,
         type_id: TypeId,
     ) -> HashMap<TypeId, TypeId> {
-        let mut substitution = HashMap::default();
-        // The default's own trait — the one whose declarations hold it. A
-        // supertrait's default reached through a subtrait's impl keeps its own
-        // parameters, so key on the declaring trait, not the implemented one.
-        let Some((trait_id, trait_)) = self
-            .program
-            .traits
-            .iter()
-            .find(|(_, trait_)| trait_.declarations.values().any(|id| *id == default_id))
-        else {
-            return substitution;
-        };
-        if trait_.generic_parameter_constraint_ids.is_empty() {
-            return substitution;
-        }
-        // The impl of THAT trait for this type, selected like every other
-        // dispatch lookup here (the impl subject is in its own generic terms,
-        // the receiver in concrete ones) — so the arguments this default
-        // specializes under are the ones the WINNING impl writes, not the
-        // first-declared one's.
-        let Some(implementation) = impl_select::select_implementation(
+        crate::mono::trait_parameter_substitution(
             self.program,
             self.current_admitting_file,
+            default_id,
             type_id,
-            *trait_id,
-        ) else {
-            return substitution;
-        };
-        self.bind_generics(implementation.subject, type_id, &mut substitution);
-        let Some((_, arguments)) = implementation
-            .trait_args
-            .iter()
-            .find(|(provided, _)| provided == trait_id)
-        else {
-            return substitution;
-        };
-        // A trait argument written in the impl's terms (`with Holder<E>`)
-        // stays keyed to the binder above, so `resolve_type_id` composes the
-        // two hops within this same map.
-        for (parameter_id, argument_id) in trait_
-            .generic_parameter_constraint_ids
-            .iter()
-            .zip(arguments)
-        {
-            substitution.insert(*parameter_id, *argument_id);
-        }
-        substitution
+        )
     }
 
     /// Whether a scope needs `try`/`finally` teardown: some direct statement
@@ -9863,63 +9829,6 @@ impl<'src> Transformer<'src> {
         Some(name)
     }
 
-    /// Resolves `member` as an inherited trait *default* on a concrete type — a
-    /// member none of the type's impls declare, but a (super)trait it implements
-    /// provides with a body. Mirrors the analyzer's Gap E resolution.
-    fn resolve_inherited_default(&self, type_id: TypeId, member: &str) -> Option<Id> {
-        // The impl subject is written in its own generic terms (`SignalCell<T>`),
-        // the receiver in concrete ones (`SignalCell<i32>`), so the search is over
-        // the impls that APPLY to the receiver ([`crate::impl_select`]) — exact
-        // type equality only ever matched non-generic subjects, silently
-        // dropping inherited defaults on generic types (the emitted call then
-        // bound to the trait's abstract member), and a nominal head match
-        // never saw a blanket impl at all (B158).
-        impl_select::applying_trait_ids(self.program, self.current_admitting_file, type_id)
-            .into_iter()
-            .find_map(|trait_id| self.trait_default_member(trait_id, member))
-    }
-
-    /// Searches a trait and its supertraits for a default (bodied) member.
-    fn trait_default_member(&self, trait_id: Id, member: &str) -> Option<Id> {
-        let mut stack = vec![trait_id];
-        let mut seen = HashSet::default();
-        while let Some(id) = stack.pop() {
-            if !seen.insert(id) {
-                continue;
-            }
-            let Some(trait_) = self.program.traits.get(&id) else {
-                continue;
-            };
-            if let Some(&member_id) = trait_.declarations.get(member)
-                && self.function_has_body(member_id)
-            {
-                return Some(member_id);
-            }
-            for supertrait_type_id in &trait_.supertraits {
-                if let Some(Type::Trait(super_id, _)) =
-                    self.program.type_id_to_type_map.get(supertrait_type_id)
-                {
-                    stack.push(*super_id);
-                }
-            }
-        }
-        None
-    }
-
-    /// Whether `member_id` is a function with a source-provided body (a trait
-    /// default, as opposed to a signature-only requirement).
-    fn function_has_body(&self, member_id: Id) -> bool {
-        match self.program.entity_map.get(&member_id) {
-            Some(Expr::Function(function_id)) => self
-                .program
-                .functions
-                .get(function_id)
-                .map(|function| function.has_body)
-                .unwrap_or(false),
-            _ => false,
-        }
-    }
-
     /// The generic binding to monomorphize a call's callee with, drawn from
     /// whichever channel carries it — so the transformer reads a call's binding in
     /// one place and emits through the one [`Self::emit_instance`] path. In
@@ -10127,19 +10036,7 @@ impl<'src> Transformer<'src> {
         if self.current_substitution.is_empty() {
             return HashMap::default();
         }
-        let Some(function) = self.program.functions.get(&target_id) else {
-            return HashMap::default();
-        };
-        let mut generics = Vec::new();
-        for parameter_id in &function.parameters {
-            if let Some(parameter) = self.program.parameters.get(parameter_id) {
-                self.collect_type_generics(parameter.type_id, 0, &mut generics);
-            }
-        }
-        if let Some(return_type_id) = function.return_type_id {
-            self.collect_type_generics(return_type_id, 0, &mut generics);
-        }
-        generics
+        crate::mono::signature_generics(self.program, target_id)
             .into_iter()
             .filter_map(|constraint_id| {
                 self.current_substitution
@@ -10147,40 +10044,6 @@ impl<'src> Transformer<'src> {
                     .map(|type_id| (constraint_id, *type_id))
             })
             .collect()
-    }
-
-    /// Collects the `Generic` constraint ids a type's structure mentions (its own
-    /// id, or those nested in a struct/enum/tuple/closure's arguments).
-    fn collect_type_generics(&self, type_id: TypeId, depth: usize, out: &mut Vec<TypeId>) {
-        if depth > 24 {
-            return;
-        }
-        match self.program.type_id_to_type_map.get(&type_id) {
-            Some(Type::Generic(constraint_id)) => {
-                if !out.contains(constraint_id) {
-                    out.push(*constraint_id);
-                }
-            }
-            Some(
-                Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Tuple(arguments),
-            ) => {
-                for argument in arguments.clone() {
-                    self.collect_type_generics(argument, depth + 1, out);
-                }
-            }
-            Some(Type::Closure(parameters, return_type_id, _)) => {
-                let parameters = parameters.clone();
-                let return_type_id = *return_type_id;
-                for parameter in parameters {
-                    self.collect_type_generics(parameter, depth + 1, out);
-                }
-                self.collect_type_generics(return_type_id, depth + 1, out);
-            }
-            Some(Type::Array(element_id, _)) => {
-                self.collect_type_generics(*element_id, depth + 1, out);
-            }
-            _ => {}
-        }
     }
 
     /// Resolves a type id to its concrete form under the active substitution,

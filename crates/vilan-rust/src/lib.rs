@@ -66,12 +66,13 @@ use std::fmt::Write as _;
 
 use vilan_core::analyzer::{
     AdaptedInstance, Backing, BackingValue, Expr, ExprIfBranch, ExprMatchLeg, ExprPattern,
-    GenericDispatch, Intrinsic, Program, TryDispatch,
+    GenericDispatch, Intrinsic, Program, RENDER_MEMBER, TryDispatch,
 };
 use vilan_core::error::Error;
 use vilan_core::fx::FxHashMap as HashMap;
 use vilan_core::id::Id;
 use vilan_core::impl_select;
+use vilan_core::mono;
 use vilan_core::node::{BinaryOp, Convention, ExternBinding};
 use vilan_core::options::BuildOptions;
 use vilan_core::span::Span;
@@ -123,15 +124,6 @@ pub struct Emitted {
 pub fn emit(program: &Program<'_>, _options: &BuildOptions) -> Result<Emitted, Error> {
     Emitter::new(program).run()
 }
-
-/// The member a concatenation's render dispatch calls (B176).
-///
-/// `analyzer::RENDER_MEMBER` is the source of truth and is `pub(crate)`, so a
-/// backend crate outside `vilan-core` cannot name it. Copied here rather than
-/// widened, because the ownership map for this order gives `analyzer.rs` to
-/// three other lanes and a one-token visibility change is not worth a merge
-/// conflict — the lane's report asks for the widening instead.
-const RENDER_MEMBER: &str = "to_string";
 
 /// The name `async fun main`'s body takes, since `fn main` cannot be `async`
 /// and the executor has to be entered from a synchronous frame.
@@ -1201,15 +1193,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let Some(function) = self.program.functions.get(&target_id) else {
             return HashMap::default();
         };
-        let mut generics = Vec::new();
-        for parameter_id in &function.parameters {
-            if let Some(parameter) = self.program.parameters.get(parameter_id) {
-                self.collect_type_generics(parameter.type_id, 0, &mut generics);
-            }
-        }
-        if let Some(return_type_id) = function.return_type_id {
-            self.collect_type_generics(return_type_id, 0, &mut generics);
-        }
+        let mut generics = mono::signature_generics(self.program, target_id);
         // A generic parameter the SIGNATURE does not mention still has to be
         // bound when the enclosing instantiation can bind it: `fun make<T>():
         // T` is covered by the return type, but `T::describe()` inside a body
@@ -1227,39 +1211,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .map(|type_id| (constraint_id, *type_id))
             })
             .collect()
-    }
-
-    /// The `Generic` constraint ids a type's structure mentions.
-    fn collect_type_generics(&self, type_id: TypeId, depth: usize, out: &mut Vec<TypeId>) {
-        if depth > 24 {
-            return;
-        }
-        match self.program.type_id_to_type_map.get(&type_id) {
-            Some(Type::Generic(constraint_id)) => {
-                if !out.contains(constraint_id) {
-                    out.push(*constraint_id);
-                }
-            }
-            Some(
-                Type::Struct(_, arguments) | Type::Enum(_, arguments) | Type::Tuple(arguments),
-            ) => {
-                for argument in arguments.clone() {
-                    self.collect_type_generics(argument, depth + 1, out);
-                }
-            }
-            Some(Type::Closure(parameters, return_type_id, _)) => {
-                let parameters = parameters.clone();
-                let return_type_id = *return_type_id;
-                for parameter in parameters {
-                    self.collect_type_generics(parameter, depth + 1, out);
-                }
-                self.collect_type_generics(return_type_id, depth + 1, out);
-            }
-            Some(Type::Array(element_id, _)) => {
-                self.collect_type_generics(*element_id, depth + 1, out);
-            }
-            _ => {}
-        }
     }
 
     /// The generic binding to monomorphize a call's callee with, from whichever
@@ -1318,44 +1269,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         default_id: Id,
         type_id: TypeId,
     ) -> HashMap<TypeId, TypeId> {
-        let mut substitution = HashMap::default();
-        let Some((trait_id, trait_)) = self
-            .program
-            .traits
-            .iter()
-            .find(|(_, trait_)| trait_.declarations.values().any(|id| *id == default_id))
-        else {
-            return substitution;
-        };
-        if trait_.generic_parameter_constraint_ids.is_empty() {
-            return substitution;
-        }
-        let Some(implementation) =
-            impl_select::select_implementation(self.program, None, type_id, *trait_id)
-        else {
-            return substitution;
-        };
-        impl_select::bind_subject(
-            self.program,
-            implementation.subject,
-            type_id,
-            &mut substitution,
-        );
-        let Some((_, arguments)) = implementation
-            .trait_args
-            .iter()
-            .find(|(provided, _)| provided == trait_id)
-        else {
-            return substitution;
-        };
-        for (parameter_id, argument_id) in trait_
-            .generic_parameter_constraint_ids
-            .iter()
-            .zip(arguments)
-        {
-            substitution.insert(*parameter_id, *argument_id);
-        }
-        substitution
+        mono::trait_parameter_substitution(self.program, None, default_id, type_id)
     }
 
     /// Composes `entries` onto the substitution in force and installs the
@@ -7109,7 +7023,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .dispatch_to_member(selected, type_id, own_generic_values)
                     .map(Some);
             }
-            if let Some(default_id) = self.trait_default_member(trait_id, member) {
+            if let Some(default_id) = mono::trait_default_member(self.program, trait_id, member) {
                 let name = self.default_instance(default_id, type_id, span)?;
                 return Ok(Some(NativeDispatch::Call(name)));
             }
@@ -7124,7 +7038,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .dispatch_to_member(selected, type_id, own_generic_values)
                 .map(Some);
         }
-        let Some(default_id) = self.resolve_inherited_default(type_id, member) else {
+        let Some(default_id) = mono::resolve_inherited_default(self.program, None, type_id, member)
+        else {
             return Ok(None);
         };
         let name = self.default_instance(default_id, type_id, span)?;
@@ -7394,52 +7309,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
         self.current_self_type = saved_self;
         self.functions.insert(slot, emitted?);
         Ok(name)
-    }
-
-    /// `member` as an INHERITED trait default on a concrete type — a member no
-    /// impl declares but a (super)trait it implements provides with a body.
-    fn resolve_inherited_default(&self, type_id: TypeId, member: &str) -> Option<Id> {
-        impl_select::applying_trait_ids(self.program, None, type_id)
-            .into_iter()
-            .find_map(|trait_id| self.trait_default_member(trait_id, member))
-    }
-
-    /// A trait and its supertraits, searched for a member WITH a body.
-    fn trait_default_member(&self, trait_id: Id, member: &str) -> Option<Id> {
-        let mut stack = vec![trait_id];
-        let mut seen = HashSet::new();
-        while let Some(id) = stack.pop() {
-            if !seen.insert(id) {
-                continue;
-            }
-            let Some(trait_) = self.program.traits.get(&id) else {
-                continue;
-            };
-            if let Some(&member_id) = trait_.declarations.get(member)
-                && self.function_has_body(member_id)
-            {
-                return Some(member_id);
-            }
-            for supertrait_type_id in &trait_.supertraits {
-                if let Some(Type::Trait(super_id, _)) =
-                    self.program.type_id_to_type_map.get(supertrait_type_id)
-                {
-                    stack.push(*super_id);
-                }
-            }
-        }
-        None
-    }
-
-    fn function_has_body(&self, member_id: Id) -> bool {
-        match self.program.entity_map.get(&member_id) {
-            Some(Expr::Function(function_id)) => self
-                .program
-                .functions
-                .get(function_id)
-                .is_some_and(|function| function.has_body),
-            _ => false,
-        }
     }
 
     fn emit_intrinsic(
@@ -7949,33 +7818,15 @@ fn rust_string(text: &str) -> String {
     out
 }
 
-/// The VALUE of a vilan string literal's body — `transformer::unescape_string`,
-/// which is where a literal's value is BUILT on the JS side.
+/// The VALUE of a vilan string literal's body.
+///
+/// F26: `transformer::unescape_string` IS this function and is now `pub`, so
+/// the backend calls it rather than carrying a copy that drifts — a literal's
+/// value must be the same value on both backends, and two implementations of
+/// "what does `\\n` mean" is exactly the shape the differential can only catch
+/// after it has shipped.
 fn unescape_string_value(raw: &str) -> String {
-    let raw = vilan_core::util::normalize_newlines(raw);
-    let mut result = String::with_capacity(raw.len());
-    let mut characters = raw.chars();
-    while let Some(character) = characters.next() {
-        if character != '\\' {
-            result.push(character);
-            continue;
-        }
-        match characters.next() {
-            Some('n') => result.push('\n'),
-            Some('t') => result.push('\t'),
-            Some('r') => result.push('\r'),
-            Some('"') => result.push('"'),
-            Some('\\') => result.push('\\'),
-            Some('0') => result.push('\0'),
-            // An unknown escape keeps both characters.
-            Some(other) => {
-                result.push('\\');
-                result.push(other);
-            }
-            None => result.push('\\'),
-        }
-    }
-    result
+    vilan_core::transformer::unescape_string(raw).into_owned()
 }
 
 fn describe(resolved: &Type) -> String {
