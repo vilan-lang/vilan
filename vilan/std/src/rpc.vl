@@ -27,8 +27,12 @@ import pkg::map::Map;
 import pkg::option::Option::{ self, None, Some };
 import pkg::promise::Promise;
 import pkg::reactive::{
+	DeltaCursor,
+	DeltaLog,
+	DeltaSource,
 	Disposable,
 	FlushPolicy,
+	SeqOp,
 	SignalCell,
 	Source,
 	Subscription,
@@ -3692,22 +3696,6 @@ export impl RemoteSource<type T> {
 
 // --- Server side: the delta-producing cell (A54) -----------------------------
 
-/// How many ops a `KeyedCell` will hold for a forward that has stopped
-/// draining. Past it the history is dropped and every lagging cursor falls
-/// back to a `Reset` — bounded memory, at the cost of one whole-collection
-/// frame to a subscriber that could not keep up. In practice nothing reaches
-/// it: a forward drains at the settle of the turn that wrote, so the log is
-/// as long as one turn's writes and no longer.
-let keyed_log_limit: i32 = 1024;
-
-/// One forward's place in a `KeyedCell`'s op log: the sequence number it has
-/// been told through. Identified rather than compared, because two forwards on
-/// the same channel may legitimately sit at the same sequence.
-export struct KeyedCursor {
-	id: i32,
-	at: Shared<i32>,
-}
-
 /// The SERVER-side twin of `KeyedSource`: a keyed collection whose WRITES are
 /// the deltas (tracker A54).
 ///
@@ -3733,9 +3721,38 @@ export struct KeyedCursor {
 /// is exactly `KeyedSource`'s counterpart: the same `Keyed<K>` bound, the same
 /// delta vocabulary, the same ordering discipline, read best together.
 ///
+/// Since A112 S1 the LOG is not the cell's own: the bounded op log with
+/// per-consumer cursors is `DeltaLog<O>` in `std::reactive`, generic in the op
+/// rather than in the collection, and what this cell records is the POSITIONAL
+/// `SeqOp` every sequence cell records, over `KeyedElement<K, T>`. So the cell
+/// is exactly what the paper says it is — a sequence cell, plus a position
+/// index by key hash, plus the wire translation — and the translation is the
+/// ONE place `SeqOp` meets `Delta`, in `since`, which is where the layering
+/// says it belongs.
+///
 /// **`PartialEq` is not a bound**, and that is the point. `expose_keyed` needs
 /// `T: PartialEq` because a diff can only learn that an element CHANGED by
 /// comparing it; a cell whose writes are the ops never compares anything.
+/// An element paired with the key it projects to — what `KeyedCell`'s log
+/// records in place of the bare element.
+///
+/// The cell has TWO consumers and they address elements differently: a wire
+/// forward wants `Delta<K, T>`, which names elements by KEY, and a local
+/// delta-driven `each` wants `SeqOp<T>`, which names them by POSITION. The key
+/// is already in the writer's hand at every write — `insert` reads it to find
+/// the slot, `remove` and `update` take it as an argument — so carrying it on
+/// the op costs nothing, and it is what keeps A54's headline literally true:
+/// a change re-keys NOTHING, on either side, because the projection happens
+/// once per WRITE and never once per drain (pinned by
+/// `a_keyed_cell_re_keys_nothing_where_the_diff_re_keys_the_whole_collection`).
+///
+/// It is public only because it appears in `log`'s type. Nothing needs to
+/// build one.
+export struct KeyedElement<K, T> {
+	key: K,
+	value: T,
+}
+
 export struct KeyedCell<K, T> {
 	/// The collection, and the one notification every observer rides — the
 	/// `Source<List<T>>` view and the op forwards alike. One signal, so a
@@ -3745,17 +3762,11 @@ export struct KeyedCell<K, T> {
 	/// Where each held key sits in `elements`, by hash. What makes
 	/// `update(key, …)` and `remove(key)` a lookup instead of a scan.
 	positions: Shared<Map<Hash, i32>>,
-	/// The ops still worth keeping, oldest first: sequence numbers
-	/// `base + 1 ..= version`.
-	log: Shared<List<Delta<K, T>>>,
-	/// The sequence number of the newest op the cell has produced.
-	version: Shared<i32>,
-	/// The sequence number BEFORE the oldest op the log still holds. A cursor
-	/// left behind it has lost history and is answered with a `Reset`.
-	base: Shared<i32>,
-	/// One per live op forward. The cell trims its log to the laggiest of
-	/// them, so a channel nobody is watching keeps no history at all.
-	cursors: Shared<List<KeyedCursor>>,
+	/// The positional op log — `DeltaLog`'s cursors, trim and lag fallback
+	/// (A112 S1), at `delta_log_limit`. `since` translates what it holds into
+	/// the `Delta<K, T>` a forward sends; the `DeltaSource` impl strips the
+	/// keys back off for a positional consumer.
+	log: DeltaLog<SeqOp<KeyedElement<K, T>>>,
 }
 
 export impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
@@ -3765,10 +3776,7 @@ export impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
 		let cell = KeyedCell {
 			elements = SignalCell::new(initial),
 			positions = Shared::new(Map::new()),
-			log = Shared::new([]),
-			version = Shared::new(0),
-			base = Shared::new(0),
-			cursors = Shared::new([]),
+			log = DeltaLog<SeqOp<KeyedElement<K, T>>>::new(),
 		};
 		cell.reindex(initial, 0);
 		cell
@@ -3783,14 +3791,23 @@ export impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
 		let wanted = key.hash();
 		match self.positions.read().get(wanted) {
 			Some(let at) => self.elements.update(|&mut list| {
+				// The element that LEAVES, bound before the slot is
+				// overwritten — `SetAt` carries both values, because a group
+				// fold's derivative is "add what arrived, subtract what left"
+				// and a derivative that has to read the collection is the
+				// O(N) rerun the log exists to delete.
+				let previous = list[at];
 				list[at] = value;
-				self.record(Delta::Update(key, value));
+				self.log.record(SeqOp::SetAt(at, KeyedElement { key, value = previous }, KeyedElement {
+					key,
+					value,
+				}));
 			}),
 			None => self.elements.update(|&mut list| {
 				let at = list.len();
 				list.push(value);
 				self.positions.write().insert(wanted, at);
-				self.record(Delta::Insert(key, value, at));
+				self.log.record(SeqOp::Splice(at, [], [KeyedElement { key, value }]));
 			}),
 		}
 	}
@@ -3803,11 +3820,14 @@ export impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
 		match self.positions.read().get(wanted) {
 			None => {},
 			Some(let at) => self.elements.update(|&mut list| {
-				let _dropped = list.remove(at);
+				// The removed VALUE is the op's payload: the wire translation
+				// reads the key off it, and a fold's derivative reads the
+				// element. `remove` hands it back, so this costs nothing.
+				let dropped = list.remove(at);
 				self.positions.write().remove(wanted);
 				// Everything after the hole moved one place left.
 				self.reindex(list, at);
-				self.record(Delta::Remove(key));
+				self.log.record(SeqOp::Splice(at, [KeyedElement { key, value = dropped }], []));
 			}),
 		}
 	}
@@ -3823,8 +3843,15 @@ export impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
 		match self.positions.read().get(wanted) {
 			None => {},
 			Some(let at) => self.elements.update(|&mut list| {
+				// Bound BEFORE the mutation: `list[at]` on the right of a
+				// `let` is a copy of the element (it is the `&mut` view that
+				// `mutate` gets), so `previous` is the element as it was.
+				let previous = list[at];
 				mutate(list[at]);
-				self.record(Delta::Update(key, list[at]));
+				self.log.record(SeqOp::SetAt(at, KeyedElement { key, value = previous }, KeyedElement {
+					key,
+					value = list[at],
+				}));
 			}),
 		}
 	}
@@ -3834,8 +3861,19 @@ export impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
 	/// every mirror is told `Reset`.
 	fun set(self, value: List<T>) {
 		self.positions.write() = Map::new();
-		self.reindex(value, 0);
-		self.record(Delta::Reset(value));
+		// One pass, one projection per element — `reindex`'s cost, not a
+		// second one: the index and the op's keyed elements come off the same
+		// `key()` call.
+		mut seeded: List<KeyedElement<K, T>> = [];
+		mut index = 0;
+		let length = value.len();
+		for index < length {
+			let key = value[index].key();
+			self.positions.write().insert(key.hash(), index);
+			seeded.push(KeyedElement { key, value = value[index] });
+			index += 1;
+		}
+		self.log.record(SeqOp::Reset(seeded));
 		self.elements.set(value);
 	}
 
@@ -3864,103 +3902,89 @@ export impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
 		}
 	}
 
-	/// Append one op to the log and bump the sequence. The trim comes FIRST,
-	/// so a cell whose forwards are all current keeps a log of length one and
-	/// a cell with no forwards keeps none.
-	///
-	/// Past `keyed_log_limit` the history is dropped instead of appended and
-	/// `base` jumps to the new sequence: every cursor behind it now reads as
-	/// lagging, and is answered with a `Reset` on its next drain. The op is
-	/// not lost — it is IN the collection, which is what the `Reset` carries.
-	fun record(self, op: Delta<K, T>) {
-		self.trim();
-		let next = self.version.read() + 1;
-		self.version.write() = next;
-		if self.log.read().len() >= keyed_log_limit {
-			self.log.write() = [];
-			self.base.write() = next;
-		} else {
-			self.log.write().push(op);
-		}
-	}
-
-	/// Drop the ops every live cursor has already been told. With no cursors
-	/// the whole log goes: nothing is watching, so nothing is owed.
-	fun trim(self) {
-		mut lowest = self.version.read();
-		for cursor in self.cursors.read() {
-			let at = cursor.at.read();
-			if at < lowest {
-				lowest = at;
-			}
-		}
-		let base = self.base.read();
-		if lowest > base {
-			let dropped = lowest - base;
-			mut kept: List<Delta<K, T>> = [];
-			mut index = dropped;
-			let held = self.log.read();
-			let length = held.len();
-			for index < length {
-				match held.get(index) {
-					Some(let op) => kept.push(op),
-					None => {},
-				}
-				index += 1;
-			}
-			self.log.write() = kept;
-			self.base.write() = lowest;
-		}
-	}
-
 	/// Register a forward's cursor, at the sequence the cell is at NOW — the
 	/// forward is about to seed from the current collection, so it is owed
 	/// nothing before this point.
-	fun cursor(self): KeyedCursor {
-		let minted = KeyedCursor { id = fresh_id(), at = Shared::new(self.version.read()) };
-		self.cursors.write().push(minted);
-		minted
+	fun cursor(self): DeltaCursor {
+		self.log.cursor()
 	}
 
 	/// Retire a cursor: its forward is gone, so the log no longer has to hold
 	/// anything for it. Called from the forward's `Subscription::release`.
-	fun drop_cursor(self, cursor: KeyedCursor) {
-		mut kept: List<KeyedCursor> = [];
-		for held in self.cursors.read() {
-			if held.id != cursor.id {
-				kept.push(held);
-			}
-		}
-		self.cursors.write() = kept;
+	fun drop_cursor(self, cursor: DeltaCursor) {
+		self.log.drop_cursor(cursor);
 	}
 
-	/// Everything `cursor` has not been told, and advance it. A cursor that
-	/// has fallen behind the log's `base` is answered with a single `Reset` —
-	/// the collection itself, which subsumes every op it missed.
-	fun since(self, cursor: KeyedCursor): List<Delta<K, T>> {
-		let at = cursor.at.read();
-		let version = self.version.read();
-		mut ops: List<Delta<K, T>> = [];
-		if at >= version {
-			ret ops;
+	/// Everything `cursor` has not been told, TRANSLATED to the wire's
+	/// vocabulary, and advance it. A cursor that has fallen behind the log's
+	/// `base` is answered with a single `Reset` — the collection itself, which
+	/// subsumes every op it missed.
+	///
+	/// This is the ONE place `SeqOp<T>` meets `Delta<K, T>`, and it is the
+	/// whole reason the lift moves no wire byte: the log is positional and
+	/// shape-neutral, the frame is keyed, and the cell — which is the only
+	/// thing that knows both the keys and the positions — is the translator.
+	/// The `removed`/`previous` payloads §3.1 of the paper insists on are what
+	/// make it writable at all: a `Remove` needs the key of the element that
+	/// WENT, and only the value carries it.
+	fun since(self, cursor: DeltaCursor): List<Delta<K, T>> {
+		match self.log.since(cursor) {
+			None => {
+				// Lost history: the collection subsumes every missed op.
+				mut lost: List<Delta<K, T>> = [];
+				lost.push(Delta::Reset(self.elements.get()));
+				lost
+			},
+			Some(let recorded) => {
+				mut ops: List<Delta<K, T>> = [];
+				for op in recorded {
+					match op {
+						// Removals are key-addressed, so they may all go
+						// first; the inserts then name their positions in the
+						// list the splice LEFT. The cell only ever records
+						// single-element splices, so the loops run once each
+						// in practice — they are written generally because the
+						// op type is general.
+						SeqOp::Splice(let at, let removed, let inserted) => {
+							for gone in removed {
+								ops.push(Delta::Remove(gone.key));
+							}
+							mut offset = 0;
+							let arriving = inserted.len();
+							for offset < arriving {
+								match inserted.get(offset) {
+									Some(let element) => {
+										ops.push(Delta::Insert(element.key, element.value, at + offset));
+									},
+									None => {},
+								}
+								offset += 1;
+							}
+						},
+						// An element changed in place: keyed addressing does
+						// not care where it sits, so the position is dropped.
+						SeqOp::SetAt(let _at, let _previous, let element) => {
+							ops.push(Delta::Update(element.key, element.value));
+						},
+						SeqOp::Reset(let items) => {
+							mut collection: List<T> = [];
+							for element in items {
+								collection.push(element.value);
+							}
+							ops.push(Delta::Reset(collection));
+						},
+						// A reorder sends the whole collection today, and
+						// `Delta` has no `Move` arm to lower one onto — so the
+						// wire does not move for an op nothing in std emits
+						// (paper §3.1, Q3).
+						SeqOp::Move(let _from, let _count, let _to) => {
+							ops.push(Delta::Reset(self.elements.get()));
+						},
+					}
+				}
+				ops
+			},
 		}
-		cursor.at.write() = version;
-		let base = self.base.read();
-		if at < base {
-			ops.push(Delta::Reset(self.elements.get()));
-			ret ops;
-		}
-		mut index = at - base;
-		let held = self.log.read();
-		let length = held.len();
-		for index < length {
-			match held.get(index) {
-				Some(let op) => ops.push(op),
-				None => {},
-			}
-			index += 1;
-		}
-		ops
 	}
 }
 
@@ -3976,6 +4000,73 @@ export impl KeyedCell<type K: Hashable, type T: Keyed<K>> with Source<List<T>> {
 	[must_use]
 	fun on_change(self, observer: |List<T>| void): Subscription {
 		self.elements.on_change(observer)
+	}
+}
+
+/// And it is a DELTA source (A112 S1): the same log, read POSITIONALLY. This
+/// is what lets a consumer that knows nothing about keys — `each`, a local
+/// derivation — apply what changed instead of diffing what is.
+///
+/// The keys are stripped back off here. That is not waste: they were put on
+/// the op so the WIRE translation costs no projection, and a positional
+/// consumer reading `element.value` costs a field read. The two consumers hold
+/// separate cursors, so each drains the log at its own cadence and the trim
+/// keeps whatever the laggier of them is owed.
+///
+/// The inherent `since` (above) still answers `List<Delta<K, T>>` and is what a
+/// direct `cell.since(cursor)` reaches; the body below is reached through the
+/// bound, which is where a generic delta consumer calls from.
+export impl KeyedCell<type K: Hashable, type T: Keyed<K>> with DeltaSource<List<T>, SeqOp<T>> {
+	fun cursor(self): DeltaCursor {
+		self.log.cursor()
+	}
+
+	fun drop_cursor(self, cursor: DeltaCursor) {
+		self.log.drop_cursor(cursor);
+	}
+
+	fun since(self, cursor: DeltaCursor): List<SeqOp<T>> {
+		match self.log.since(cursor) {
+			// A cursor that lost history is told the collection — the cell
+			// knows what a `Reset` is for its shape and the log does not.
+			None => {
+				mut lost: List<SeqOp<T>> = [];
+				lost.push(SeqOp::Reset(self.elements.get()));
+				lost
+			},
+			Some(let recorded) => {
+				mut ops: List<SeqOp<T>> = [];
+				for op in recorded {
+					match op {
+						SeqOp::Splice(let at, let removed, let inserted) => {
+							mut left: List<T> = [];
+							for element in removed {
+								left.push(element.value);
+							}
+							mut arrived: List<T> = [];
+							for element in inserted {
+								arrived.push(element.value);
+							}
+							ops.push(SeqOp::Splice(at, left, arrived));
+						},
+						SeqOp::SetAt(let at, let previous, let element) => {
+							ops.push(SeqOp::SetAt(at, previous.value, element.value));
+						},
+						SeqOp::Reset(let items) => {
+							mut collection: List<T> = [];
+							for element in items {
+								collection.push(element.value);
+							}
+							ops.push(SeqOp::Reset(collection));
+						},
+						SeqOp::Move(let from, let count, let to) => {
+							ops.push(SeqOp::Move(from, count, to));
+						},
+					}
+				}
+				ops
+			},
+		}
 	}
 }
 

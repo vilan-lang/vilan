@@ -42,7 +42,7 @@ fun main() {
 	// `each_by`'s predicate: a surviving key is ALWAYS kept, so the same
 	// input that refreshed above keeps its row instead — the row's own cell
 	// carries the new item.
-	// witness: if (same(__at(old_items, index), item)) {
+	// witness: if (same(__at(old_items, found), item)) {
 	show(reconcile([1, 2], [10, 20], [10, 21, 35], |item| item / 10, |_a, _b| true));
 }
 

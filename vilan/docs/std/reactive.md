@@ -791,6 +791,88 @@ client.transport.on_reconnect(|| title.repush());
 UI wiring: `View.bind_draft(draft)`; see the [browser reference](browser.md).
 The reconnect hook is in the [rpc reference](rpc.md#connection-state).
 
+## Delta sources: the change structure
+
+A collection's change is a value (tracker A112, `proposal/incremental-collections.md`).
+Every collection shape has an OP type; a cell whose writes RECORD their ops can
+be read by "what changed" instead of "what is now", and an operator over it runs
+once per changed element rather than once per element.
+
+```vilan,fragment
+enum SeqOp<T> {
+	Splice(i32, List<T>, List<T>),  // at: these left, these arrived
+	SetAt(i32, T, T),               // at: was this, is now this
+	Reset(List<T>),                 // the collection BECAME this list
+	Move(i32, i32, i32),            // from, count, to — the same elements, elsewhere
+}
+
+enum MapOp<K: Hashable, V> { Put(K, Option<V>, V), Delete(K, V), Reset(Map<K, V>) }
+enum SetOp<T: Hashable> { Add(T), Remove(T), Reset(Set<T>) }
+```
+
+Every arm carries **what left** as well as what arrived. That is a requirement,
+not a courtesy: the O(1) derivative of a fold over a group (`sum`, `count`,
+`mean`) is "add what arrived, subtract what left", and a payload that only
+counts what left would send the operator back to read the collection — the O(N)
+rerun the whole design deletes.
+
+`SetAt` is deliberately not `Splice(at, [old], [new])` even though the
+collection cannot tell them apart: for a per-element owner the two are
+different events, and the difference is whether that owner survives.
+
+The log and its cursors are the machinery:
+
+```vilan,fragment
+let delta_log_limit: i32 = 1024;
+
+struct DeltaCursor { … }   // one consumer's place in a log
+
+struct DeltaLog<O> { … }
+
+impl DeltaLog<type O> {
+	fun new(): DeltaLog<O>
+	fun with_limit(limit: i32): DeltaLog<O>
+	fun record(self, op: O)                                  // trims first, then appends
+	fun cursor(self): DeltaCursor                            // minted at the current sequence
+	fun drop_cursor(self, cursor: DeltaCursor)
+	fun since(self, cursor: DeltaCursor): Option<List<O>>    // `None` = lost history
+	fun trim(self)
+	fun held(self): i32
+	fun at(self): i32
+	fun oldest(self): i32
+}
+
+trait DeltaSource<C, O> with Source<C> {
+	fun cursor(self): DeltaCursor
+	fun drop_cursor(self, cursor: DeltaCursor)
+	fun since(self, cursor: DeltaCursor): List<O>            // never fails: a lost cursor gets `Reset`
+}
+```
+
+`since` on the LOG answers an `Option` and `since` on the SOURCE does not: the
+log does not know what a `Reset` is for its op type and the cell does, which is
+the only place the two layers need to know about each other.
+
+Writes in one turn coalesce into ONE notification, and a consumer drains every
+op at the settle — so the log is as long as one turn's writes. Two behaviours
+are worth stating because they are easy to state wrongly:
+
+- **A log with no consumers holds one op, not zero.** `record` trims and then
+  pushes.
+- **The log is trimmed at the next WRITE, not at the drain.** A cell written
+  once and then read for ever keeps one op's worth of history.
+
+Past the limit the history is dropped and `base` jumps, so a consumer that
+stopped draining is answered with one `Reset` carrying the collection: bounded
+memory, at the cost of one whole-collection payload to whoever could not keep
+up.
+
+`KeyedCell<K, T>` (`std::rpc`) is the shipped delta source: it records the
+positional ops and translates them into the wire's `Delta<K, T>` in its own
+`since`, which is the one place the two vocabularies meet. `SignalCell<List<T>>`
+is NOT a delta source — it keeps no log — so anything derived from one is on the
+`Reset` path by construction, which is exactly today's behaviour.
+
 ## reconcile: keyed list diffing
 
 ```vilan,fragment
@@ -818,3 +900,20 @@ identity and whether the row moves; `same` decides, for a surviving key, reuse
 against dispose-and-rebuild. `each` passes `|a, b| a == b`;
 `each_by` passes `|_a, _b| true`, which is why it never emits a `Refresh`
 and asks nothing of `T`.
+
+**A pass is one walk, not N of them (tracker M82).** The matcher used to scan
+the old keys from 0 for every new item, so a list that did not reorder cost
+N(N+1)/2 iterations whatever the change was — 500,500 at 1,000 rows, for one
+append. It keeps a position index instead: per canonical key, the chain of old
+positions holding it. Measured over `each`'s scan half, callgrind Ir per change
+under `node --jitless`: **355.1 M → 29.1 M at 1,000 rows**, and 95.1 M → 14.8 M
+at 500 with 1,369.9 M → 58.5 M at 2,000 — 1.97× and 2.01× per doubling where it
+used to be 3.73× and 3.86×, which is linear where it was quadratic.
+
+The plan it produces is unchanged for every key type, and that is gated by a
+differential rather than by a golden: a key whose `==` is *coarser* than value
+identity — a case-insensitive string, a struct comparing a subset of its fields
+— can have an earlier match that the index cannot see, so the stretch below the
+index's candidate is still scanned. Where `==` is value identity, which is
+every key in std, the book, the examples and the shipped apps, that stretch is
+empty.

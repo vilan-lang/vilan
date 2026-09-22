@@ -413,6 +413,7 @@ std/reactive.md h2 optimistic--the-observable-lifecycle
 std/reactive.md h2 draft--local-first-cells
 std/reactive.md h3 debounce--one-commit-per-burst
 std/reactive.md h3 repush--recover-the-edits-an-outage-swallowed
+std/reactive.md h2 delta-sources-the-change-structure
 std/reactive.md h2 reconcile-keyed-list-diffing
 std/rpc.md h1 stdrpc-reference
 std/rpc.md h2 the-generated-surface-service

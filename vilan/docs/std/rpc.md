@@ -244,6 +244,16 @@ correct, just O(N).
 can only learn that an element changed by comparing it, and a cell whose writes
 are the ops never compares anything.
 
+The op log itself is not the cell's own any more: it is `DeltaLog<O>` in
+`std::reactive` (see [Reactive](reactive.md#delta-sources-the-change-structure)),
+generic in the op rather than in the collection, and the cell records the
+POSITIONAL `SeqOp` every sequence cell records. So `KeyedCell` is a sequence
+cell plus a position index by key hash plus the wire translation, and it is a
+`DeltaSource<List<T>, SeqOp<T>>` as well as a `Source<List<T>>` — which is what
+lets a consumer that knows nothing about keys read what changed. `cursor`,
+`drop_cursor` and `since` are unchanged in name and in what they answer; the
+cursor type is `DeltaCursor` (it was `KeyedCursor`, which no longer exists).
+
 ## Errors
 
 ```vilan,fragment

@@ -1,0 +1,195 @@
+// M82 — `reconcile`'s position index, held to the SCAN it replaces.
+//
+// The pass used to walk `old_keys` from 0 for every new item, so a list that
+// did not reorder cost N(N+1)/2 iterations whatever the change was (500,500 at
+// 1,000 rows, for one append). The index makes that one pass. What this program
+// asserts is that it did not buy the speed with a different answer: the
+// pre-index scan is reproduced here VERBATIM and every case is compared plan
+// for plan.
+//
+// The shapes: the named ones (empty either way, append, prepend, removal at
+// each end and in the middle, a reversal, a swap, duplicate keys on either
+// side and both, all-fresh), then 600 randomized pairs over a 1-to-5 key
+// alphabet so duplicates and reorders are dense, then 400 randomized pairs of
+// a key type whose `==` is COARSER than value identity — two `Tag`s match when
+// their `group` does and the `serial` is ignored, so the canonical hash the
+// index is built on cannot see the match and the scan from `low` is what finds
+// it. That last set is the one the index is not allowed to get wrong, and it
+// caught a first attempt that let the chain answer outright.
+import std::compare::PartialEq;
+import std::io::{ panic, print };
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ ReconcilePlan, RowStep, reconcile };
+import std::shared::Shared;
+
+let seed: Shared<i53> = Shared::new(7i53);
+
+fun next_random(bound: i32): i32 {
+	let state = (seed.read() * 16807i53) % 2147483647i53;
+	seed.write() = state;
+	(state % bound.as_i53()).as_i32()
+}
+
+/// The shipped scan, verbatim from before M82.
+fun scan_reconcile<T, K: PartialEq>(
+	old_keys: List<K>,
+	old_items: List<T>,
+	items: List<T>,
+	key_of: sync |T| K,
+	same: sync |T, T| bool,
+): ReconcilePlan {
+	mut claimed: List<bool> = [];
+	for _ in old_keys {
+		claimed.push(false);
+	}
+	mut steps: List<RowStep> = [];
+	for item in items {
+		let item_key = key_of(item);
+		mut step = RowStep::Fresh;
+		mut index = 0;
+		for index < old_keys.len() {
+			if !claimed[index] && old_keys[index] == item_key {
+				claimed[index] = true;
+				step = if same(old_items[index], item) {
+					RowStep::Keep(index)
+				} else {
+					RowStep::Refresh(index)
+				};
+				jump break;
+			}
+			index += 1;
+		}
+		steps.push(step);
+	}
+	mut removed: List<i32> = [];
+	mut index = 0;
+	for index < old_keys.len() {
+		if !claimed[index] {
+			removed.push(index);
+		}
+		index += 1;
+	}
+	ReconcilePlan { steps, removed }
+}
+
+fun render_step(step: RowStep): str {
+	match step {
+		RowStep::Keep(let index) => i"K{index} ",
+		RowStep::Refresh(let index) => i"R{index} ",
+		RowStep::Fresh => "F ",
+	}
+}
+
+fun render(plan: ReconcilePlan): str {
+	mut out = "";
+	for step in plan.steps {
+		out = out + render_step(step);
+	}
+	out = out + "| ";
+	for index in plan.removed {
+		out = out + i"{index} ";
+	}
+	out
+}
+
+let cases: Shared<i32> = Shared::new(0);
+
+fun compare_int(label: str, old: List<i32>, new_items: List<i32>) {
+	let indexed = reconcile(old, old, new_items, |item| item, |before, after| before == after);
+	let scanned = scan_reconcile(old, old, new_items, |item| item, |before, after| {
+		before == after
+	});
+	cases.write() = cases.read() + 1;
+	if render(indexed) != render(scanned) {
+		panic(i"{label}: indexed=[{render(indexed)}] scanned=[{render(scanned)}]");
+	}
+}
+
+// A key whose `==` is COARSER than value identity: two `Tag`s match when their
+// `group` matches, and `serial` is ignored. The canonical hash sees both
+// fields, so the index cannot place these — the fallback must.
+struct Tag {
+	group: i32,
+	serial: i32,
+}
+
+impl Tag with PartialEq {
+	fun eq(self, other: Tag): bool {
+		self.group == other.group
+	}
+}
+
+fun compare_tags(label: str, old: List<Tag>, new_items: List<Tag>) {
+	let indexed = reconcile(old, old, new_items, |item| item, |_before, _after| true);
+	let scanned = scan_reconcile(old, old, new_items, |item| item, |_before, _after| true);
+	cases.write() = cases.read() + 1;
+	if render(indexed) != render(scanned) {
+		panic(i"{label}: indexed=[{render(indexed)}] scanned=[{render(scanned)}]");
+	}
+}
+
+fun main() {
+	// Named shapes first.
+	compare_int("empty->empty", [], []);
+	compare_int("empty->three", [], [1, 2, 3]);
+	compare_int("three->empty", [1, 2, 3], []);
+	compare_int("append", [1, 2, 3], [1, 2, 3, 4]);
+	compare_int("prepend", [1, 2, 3], [0, 1, 2, 3]);
+	compare_int("remove-front", [1, 2, 3], [2, 3]);
+	compare_int("remove-back", [1, 2, 3], [1, 2]);
+	compare_int("remove-middle", [1, 2, 3], [1, 3]);
+	compare_int("reverse", [1, 2, 3, 4], [4, 3, 2, 1]);
+	compare_int("swap", [1, 2, 3], [1, 3, 2]);
+	compare_int("dup-old", [1, 1, 2], [1, 2]);
+	compare_int("dup-new", [1, 2], [1, 1, 2]);
+	compare_int("dup-both", [1, 1, 2, 2], [2, 1, 2, 1]);
+	compare_int("all-fresh", [1, 2, 3], [7, 8, 9]);
+	compare_int("dup-only", [5, 5, 5], [5, 5, 5, 5]);
+
+	// Randomized: small key alphabets, so duplicates are common.
+	mut round = 0;
+	for round < 600 {
+		let old_length = next_random(9);
+		let new_length = next_random(9);
+		let alphabet = 1 + next_random(5);
+		mut old: List<i32> = [];
+		mut fill = 0;
+		for fill < old_length {
+			old.push(next_random(alphabet));
+			fill += 1;
+		}
+		mut fresh: List<i32> = [];
+		fill = 0;
+		for fill < new_length {
+			fresh.push(next_random(alphabet));
+			fill += 1;
+		}
+		compare_int(i"random {round}", old, fresh);
+		round += 1;
+	}
+
+	// Coarser-`==` keys, randomized.
+	round = 0;
+	for round < 400 {
+		let old_length = next_random(7);
+		let new_length = next_random(7);
+		mut old: List<Tag> = [];
+		mut fill = 0;
+		for fill < old_length {
+			old.push(Tag { group = next_random(3), serial = next_random(50) });
+			fill += 1;
+		}
+		mut fresh: List<Tag> = [];
+		fill = 0;
+		for fill < new_length {
+			fresh.push(Tag { group = next_random(3), serial = next_random(50) });
+			fill += 1;
+		}
+		compare_tags(i"tags {round}", old, fresh);
+		round += 1;
+	}
+
+	print(i"cases={cases.read()} differences=0");
+}
+
+main();
