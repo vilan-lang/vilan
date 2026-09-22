@@ -96,6 +96,7 @@ guide/reactive.md h3 one-commit-per-burst-not-per-keystroke
 guide/reactive.md h3 surviving-a-dropped-connection
 guide/reactive.md h3 watching-an-optimistic-write-land
 guide/reactive.md h2 keyed-reconciliation
+guide/reactive.md h2 lists-that-know-what-changed-listcell-and-map_each
 guide/reactive.md h2 traps
 guide/routing.md h1 routing
 guide/routing.md h2 the-route-model
@@ -414,6 +415,8 @@ std/reactive.md h2 draft--local-first-cells
 std/reactive.md h3 debounce--one-commit-per-burst
 std/reactive.md h3 repush--recover-the-edits-an-outage-swallowed
 std/reactive.md h2 delta-sources-the-change-structure
+std/reactive.md h2 listcell--a-list-whose-writes-are-its-deltas
+std/reactive.md h2 map_each--the-first-derivative
 std/reactive.md h2 reconcile-keyed-list-diffing
 std/rpc.md h1 stdrpc-reference
 std/rpc.md h2 the-generated-surface-service

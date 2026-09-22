@@ -119,6 +119,7 @@ macro_rules! corpus_manifest {
             json_roundtrip => "json-roundtrip.vl",
             lift_chain => "lift-chain.vl",
             list_build_infer => "list-build-infer.vl",
+            list_cell => "list-cell.vl",
             list_element_type => "list-element-type.vl",
             list_get_pop => "list-get-pop.vl",
             list_join => "list-join.vl",

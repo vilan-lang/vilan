@@ -31,10 +31,20 @@
 // Coalescing is free and is already how the turn scheduler behaves: writes in
 // one turn produce ONE notification and the consumer drains every op at the
 // settle, so the log is as long as one turn's writes.
+import pkg::compare::PartialEq;
 import pkg::hash::Hashable;
 import pkg::map::Map;
 import pkg::option::Option::{ self, None, Some };
-import pkg::reactive::{ Source, fresh_id };
+import pkg::reactive::{
+	Signal,
+	SignalCell,
+	Source,
+	Subscription,
+	as_derivation,
+	defer_to_owner,
+	fresh_id,
+	register_with_owner,
+};
 import pkg::set::Set;
 import pkg::shared::Shared;
 
@@ -321,4 +331,606 @@ export trait DeltaSource<C, O> with Source<C> {
 	/// never fails: a cursor that lost history is answered with the shape's
 	/// `Reset`, carrying the collection.
 	fun since(self, cursor: DeltaCursor): List<O>;
+}
+
+// === The sequence cell, and the first operator (A112 S2) =====================
+//
+// S1 built the LOG half. This is the CELL half: a collection whose writes are
+// its ops, a surface over it that is written ONCE per receiver kind, and the
+// first derivative — `map g`, whose `Splice(at, removed, arrived)` becomes
+// `Splice(at, removed, arrived.map(g))`, so `g` runs once per arriving element
+// and nothing else is looked at. Not N cache checks: zero.
+//
+// **Why two traits and not one.** `List`'s mutators take `&mut self`; a cell
+// handle's take `self` — a `ListCell<T>` is two `Shared`s, so a copy of the
+// handle is the same cell and `my_list.push(x)` on a plain `let` is right.
+// One trait cannot have both receivers, and it does not need to: `SequenceCell`
+// is the everyday surface and `Sequence` is the one a BODY is written against
+// (`fun fill<S: Sequence<str>>(target: &mut S)`), reached through `edit`. Both
+// stand on the same single primitive — `splice` — so the twelve method names
+// each of them offers are defaults, written twice and implemented never
+// (incremental-collections.md §6, §13 Q2: two hand lists, no macro).
+//
+// **I5.** Every position and count below is `i32` and is marked `// I5`: the
+// index-type paper's S1 moves the family to `usize` as one breaking train, and
+// these are its census.
+
+/// The everyday sequence surface: `self` receivers, one primitive.
+///
+/// An implementor writes exactly TWO members — `size` and `splice` — and
+/// inherits the rest. `splice` is the primitive because every other mutation
+/// IS one: `push` is a splice at the end, `remove_at` a splice of one, `clear`
+/// a splice of everything. Recording one op per call is then automatic rather
+/// than a rule each method has to remember.
+export trait SequenceCell<T> {
+	/// How many elements the sequence holds.
+	fun size(self): i32; // I5
+
+	/// THE primitive: `removed` elements leave at `at` and `inserted` arrive
+	/// there, as ONE op and ONE notification.
+	fun splice(self, at: i32, removed: i32, inserted: List<T>); // I5 (at, removed)
+
+	/// Nothing held.
+	fun is_empty(self): bool {
+		self.size() == 0
+	}
+
+	/// One element at the end.
+	fun push(self, value: T) {
+		self.splice(self.size(), 0, [value]) // I5
+	}
+
+	/// One element at the front.
+	fun prepend(self, value: T) {
+		self.splice(0, 0, [value]) // I5
+	}
+
+	/// One element at `at`, moving everything from there along.
+	// I5: a POSITION parameter
+	fun insert_at(self, at: i32, value: T) {
+		self.splice(at, 0, [value]) // I5
+	}
+
+	/// Several elements at `at`, in order.
+	// I5: a POSITION parameter
+	fun insert_all(self, at: i32, values: List<T>) {
+		self.splice(at, 0, values) // I5
+	}
+
+	/// The element at `at` leaves.
+	// I5: a POSITION parameter
+	fun remove_at(self, at: i32) {
+		self.splice(at, 1, []) // I5
+	}
+
+	/// `count` elements leave, starting at `at`.
+	// I5: a POSITION parameter
+	fun remove_range(self, at: i32, count: i32) {
+		self.splice(at, count, []) // I5
+	}
+
+	/// The last element leaves; an empty sequence is left alone.
+	fun pop(self) {
+		let size = self.size();
+		if size > 0 {
+			self.splice(size - 1, 1, []) // I5
+		}
+	}
+
+	/// Several elements at the end, in order.
+	fun extend(self, values: List<T>) {
+		self.splice(self.size(), 0, values) // I5
+	}
+
+	/// Everything leaves.
+	fun clear(self) {
+		self.splice(0, self.size(), []) // I5
+	}
+
+	/// Everything leaves and `values` arrive — the wholesale write expressed
+	/// as ONE op, which is what makes it cheaper than `set`: a consumer sees a
+	/// `Splice` it can apply rather than a `Reset` it has to rebuild from.
+	fun set_all(self, values: List<T>) {
+		self.splice(0, self.size(), values) // I5
+	}
+
+	/// Keep the first `length` elements.
+	// I5: a POSITION parameter
+	fun truncate(self, length: i32) {
+		let size = self.size();
+		if size > length {
+			self.splice(length, size - length, []) // I5
+		}
+	}
+}
+
+/// The same sequence surface with `&mut self` receivers — the shape a BODY is
+/// written against, and the one `ListCell::edit` hands out.
+///
+/// Its implementor is `Tracked<T>`, the recorder: a plain list plus the ops
+/// that produced it. What this buys over `SequenceCell` is that an algorithm
+/// bounded on it (`fun fill<S: Sequence<str>>(target: &mut S)`) is not tied to
+/// the reactive graph at all — the same body fills a recorder inside an `edit`
+/// and, once B359's fix admits `List<T>` among the implementors, a plain list
+/// outside one.
+///
+/// `size` takes `self` and the mutators take `&mut self`, deliberately: asking
+/// for a writable view to answer a question would refuse a read on a shared
+/// value for no reason.
+export trait Sequence<T> {
+	/// How many elements the sequence holds.
+	fun size(self): i32; // I5
+
+	/// THE primitive, as in `SequenceCell` — `removed` leave at `at` and
+	/// `inserted` arrive there.
+	fun splice(&mut self, at: i32, removed: i32, inserted: List<T>); // I5
+
+	/// Nothing held.
+	fun is_empty(self): bool {
+		self.size() == 0
+	}
+
+	/// One element at the end.
+	fun push(&mut self, value: T) {
+		self.splice(self.size(), 0, [value]) // I5
+	}
+
+	/// One element at the front.
+	fun prepend(&mut self, value: T) {
+		self.splice(0, 0, [value]) // I5
+	}
+
+	/// One element at `at`, moving everything from there along.
+	// I5: a POSITION parameter
+	fun insert_at(&mut self, at: i32, value: T) {
+		self.splice(at, 0, [value]) // I5
+	}
+
+	/// Several elements at `at`, in order.
+	// I5: a POSITION parameter
+	fun insert_all(&mut self, at: i32, values: List<T>) {
+		self.splice(at, 0, values) // I5
+	}
+
+	/// The element at `at` leaves.
+	// I5: a POSITION parameter
+	fun remove_at(&mut self, at: i32) {
+		self.splice(at, 1, []) // I5
+	}
+
+	/// `count` elements leave, starting at `at`.
+	// I5: a POSITION parameter
+	fun remove_range(&mut self, at: i32, count: i32) {
+		self.splice(at, count, []) // I5
+	}
+
+	/// The last element leaves; an empty sequence is left alone.
+	fun pop(&mut self) {
+		let size = self.size();
+		if size > 0 {
+			self.splice(size - 1, 1, []) // I5
+		}
+	}
+
+	/// Several elements at the end, in order.
+	fun extend(&mut self, values: List<T>) {
+		self.splice(self.size(), 0, values) // I5
+	}
+
+	/// Everything leaves.
+	fun clear(&mut self) {
+		self.splice(0, self.size(), []) // I5
+	}
+
+	/// Everything leaves and `values` arrive, as ONE op.
+	fun set_all(&mut self, values: List<T>) {
+		self.splice(0, self.size(), values) // I5
+	}
+
+	/// Keep the first `length` elements.
+	// I5: a POSITION parameter
+	fun truncate(&mut self, length: i32) {
+		let size = self.size();
+		if size > length {
+			self.splice(length, size - length, []) // I5
+		}
+	}
+}
+
+// === The one splice ==========================================================
+//
+// Both surfaces run THIS — `Tracked` on its own list, `ListCell` inside its
+// cell's `update` — so the two cannot disagree about what an out-of-range ask
+// means or about what the op records.
+//
+// Out-of-range asks are CLAMPED, where `List::insert` and `List::remove` panic.
+// The difference is deliberate: `List`'s index is a caller's claim about a list
+// it holds, while a sequence surface is reached through a dozen defaults over
+// ONE primitive, and `remove_range(at, 99)` asking for "the rest" or a
+// `truncate` past the end should mean what it says rather than abort the turn.
+// A clamped splice that takes nothing and inserts nothing is no op at all, and
+// both callers check for it before they record or publish anything.
+
+/// Where a splice at `at` starts in a sequence of `held` elements: `at`, pulled
+/// into `0..=held`.
+fun splice_start(held: i32, at: i32): i32 {
+	// I5
+	if at < 0 {
+		0
+	} else if at > held {
+		held
+	} else {
+		at
+	}
+}
+
+/// How many of the `removed` asked for a splice from `start` can take.
+fun splice_count(held: i32, start: i32, removed: i32): i32 {
+	// I5
+	if removed < 0 {
+		0
+	} else if start + removed > held {
+		held - start
+	} else {
+		removed
+	}
+}
+
+/// Apply an already-clamped splice to `list` and answer the op it made. The op
+/// carries what LEFT as well as what arrived — §3.1's requirement, and what
+/// makes a group fold's derivative O(1).
+// I5: a POSITION parameter
+fun splice_in_place<T>(list: &mut List<T>, start: i32, taking: i32, inserted: List<T>): SeqOp<T> {
+	mut left: List<T> = [];
+	mut taken = 0; // I5
+	for taken < taking {
+		left.push(list.remove(start));
+		taken += 1;
+	}
+	mut offset = 0; // I5
+	let arriving = inserted.len(); // I5
+	for offset < arriving {
+		match inserted.get(offset) {
+			Some(let value) => list.insert(start + offset, value),
+			None => {},
+		}
+		offset += 1;
+	}
+	SeqOp::Splice(start, left, inserted)
+}
+
+/// A plain list plus the ops that produced it — what `ListCell::edit` hands a
+/// body, and the only implementor of `Sequence<T>` std ships.
+///
+/// It is NOT reactive and holds no cell: the whole point is that a body may
+/// make a dozen mutations on it at no notification cost, and the cell publishes
+/// the result once when the body returns.
+export struct Tracked<T> {
+	/// The elements, mutated in place.
+	elements: List<T>,
+	/// One op per mutation, in the order they were made.
+	ops: List<SeqOp<T>>,
+}
+
+export impl Tracked<type T> {
+	/// A recorder over `elements`, with nothing recorded yet.
+	fun new(elements: List<T>): Tracked<T> {
+		Tracked { elements, ops = [] }
+	}
+}
+
+export impl Tracked<type T> with Sequence<T> {
+	fun size(self): i32 {
+		// I5
+		self.elements.len()
+	}
+
+	// I5: a POSITION parameter
+	fun splice(&mut self, at: i32, removed: i32, inserted: List<T>) {
+		let held = self.elements.len(); // I5
+		let start = splice_start(held, at); // I5
+		let taking = splice_count(held, start, removed); // I5
+		if taking == 0 && inserted.len() == 0 {
+			ret;
+		}
+		self.ops.push(splice_in_place(&mut self.elements, start, taking, inserted));
+	}
+}
+
+/// A `List<T>` whose WRITES ARE ITS DELTAS: a signal cell over the list plus
+/// the op log that says what each write did.
+///
+/// This is the cell A112 exists for. `list.push(x)` is one op, so a derivation
+/// over it (`map_each`) runs its function once — for `x` — rather than once per
+/// element, and `each` over it builds one row rather than reconciling the run.
+/// Everything else about it is an ordinary `Source<List<T>>`: `each` takes it,
+/// `map` takes it, an effect takes it, and a consumer that knows nothing about
+/// ops pays nothing for them.
+///
+/// `set(whole_list)` records a `Reset` and costs what a `SignalCell` costs —
+/// the honest compat path. `reconcile_to(whole_list)` is the door that turns a
+/// wholesale write back into ops.
+export struct ListCell<T> {
+	elements: SignalCell<List<T>>,
+	log: DeltaLog<SeqOp<T>>,
+}
+
+export impl ListCell<type T> {
+	/// An empty cell.
+	fun new(): ListCell<T> {
+		ListCell { elements = SignalCell::new([]), log = DeltaLog<SeqOp<T>>::new() }
+	}
+
+	/// A cell holding `elements`. Nothing is recorded: a cursor minted after
+	/// this reads the collection as its own starting point.
+	fun of(elements: List<T>): ListCell<T> {
+		ListCell { elements = SignalCell::new(elements), log = DeltaLog<SeqOp<T>>::new() }
+	}
+
+	/// A cell whose log has a ceiling other than `delta_log_limit` — what a
+	/// test that wants to reach the lag path without writing a thousand ops
+	/// asks for.
+	fun with_limit(elements: List<T>, limit: i32): ListCell<T> {
+		// I5
+		ListCell {
+			elements = SignalCell::new(elements),
+			log = DeltaLog<SeqOp<T>>::with_limit(limit),
+		}
+	}
+
+	/// The element at `at` becomes `value` — an element changed IN PLACE.
+	///
+	/// Deliberately not a `splice` of one: to a per-element consumer the two
+	/// are different events (`SeqOp::SetAt`'s comment), and the difference is
+	/// whether the row's owner survives. Out of range is a no-op, like every
+	/// other bounds question in this module.
+	// I5: a POSITION parameter
+	fun set_at(self, at: i32, value: T) {
+		match self.elements.get().get(at) {
+			Some(let previous) => {
+				self.elements.update(|&mut list| {
+					list[at] = value;
+					self.log.record(SeqOp::SetAt(at, previous, value));
+				});
+			},
+			None => {},
+		}
+	}
+
+	/// `count` elements starting at `from` move to `to`, unchanged.
+	///
+	/// The one op nothing else in std emits (§3.1) — it is here so a consumer
+	/// that wants to preserve a moved element's identity has a way to say so,
+	/// and so `map_each` has something to forward.
+	// I5: a POSITION parameter
+	fun move_range(self, from: i32, count: i32, to: i32) {
+		if count <= 0 || from == to {
+			ret;
+		}
+		self.elements.update(|&mut list| {
+			mut lifted: List<T> = [];
+			mut taken = 0; // I5
+			for taken < count {
+				lifted.push(list.remove(from));
+				taken += 1;
+			}
+			mut offset = 0; // I5
+			for offset < lifted.len() {
+				match lifted.get(offset) {
+					Some(let value) => list.insert(to + offset, value),
+					None => {},
+				}
+				offset += 1;
+			}
+			self.log.record(SeqOp::Move(from, count, to));
+		});
+	}
+
+	/// The BATCH door: hand `body` a recorder, then publish its whole run as
+	/// ONE value write and one op per mutation it made.
+	///
+	/// Four mutations inside one `edit` are one notification and four ops —
+	/// which is the point: a consumer wakes once and learns everything that
+	/// happened, instead of waking four times.
+	fun edit(self, body: sync |&mut Tracked<T>| void) {
+		mut recorder = Tracked::new(self.elements.get());
+		body(&mut recorder);
+		let produced = recorder.elements;
+		let recorded = recorder.ops;
+		self.elements.update(|&mut list| {
+			list = produced;
+			for op in recorded {
+				self.log.record(op);
+			}
+		});
+	}
+
+	/// How many ops the log is holding — what a pin on the trim reads.
+	fun logged(self): i32 {
+		// I5
+		self.log.held()
+	}
+}
+
+export impl ListCell<type T: PartialEq> {
+	/// The COMPAT DOOR: take a whole list and record what CHANGED, instead of
+	/// recording a `Reset` the way `set` does.
+	///
+	/// The diff is the cheap one — the common prefix, the common suffix, and
+	/// ONE `Splice` over what is left between them — so an append, a prepend,
+	/// an insertion, a removal and an in-place edit of a span each cost the
+	/// elements they actually touch and nothing more. It is O(N) compares and
+	/// zero derivations for every retained element.
+	///
+	/// What it does NOT do is find a REORDER: a rotated list shares no prefix
+	/// and no suffix, so it is one `Splice` over the whole run, which is
+	/// honest (every element really did move) and is what `each`'s keyed pass
+	/// is for. A source that knows it reordered says `move_range`.
+	fun reconcile_to(self, items: List<T>) {
+		let held = self.elements.get();
+		let old_length = held.len(); // I5
+		let new_length = items.len(); // I5
+		mut prefix = 0; // I5
+		for prefix < old_length && prefix < new_length {
+			if held[prefix] != items[prefix] {
+				jump break;
+			}
+			prefix += 1;
+		}
+		mut suffix = 0; // I5
+		for prefix + suffix < old_length && prefix + suffix < new_length {
+			if held[old_length - 1 - suffix] != items[new_length - 1 - suffix] {
+				jump break;
+			}
+			suffix += 1;
+		}
+		let removed = old_length - prefix - suffix; // I5
+		mut arriving: List<T> = [];
+		mut index = prefix; // I5
+		for index < new_length - suffix {
+			match items.get(index) {
+				Some(let value) => arriving.push(value),
+				None => {},
+			}
+			index += 1;
+		}
+		// Identical lists: no op, no notification. `set` would publish anyway
+		// (it never compares); this door exists precisely to compare.
+		if removed == 0 && arriving.len() == 0 {
+			ret;
+		}
+		self.splice(prefix, removed, arriving);
+	}
+}
+
+export impl ListCell<type T> with Source<List<T>> {
+	fun get(self): List<T> {
+		self.elements.get()
+	}
+
+	[must_use]
+	fun on_change(self, observer: |List<T>| void): Subscription {
+		self.elements.on_change(observer)
+	}
+}
+
+export impl ListCell<type T> with Signal<List<T>> {
+	/// The wholesale write: the collection BECAME this list, and the log says
+	/// exactly that. Every delta consumer falls back to a rebuild, which is
+	/// what `Reset` means and why `reconcile_to` exists beside it.
+	fun set(self, value: List<T>) {
+		self.elements.update(|&mut list| {
+			list = value;
+			self.log.record(SeqOp::Reset(value));
+		});
+	}
+
+	/// Publish the current value without changing it — and record NOTHING: a
+	/// consumer draining the log after a bare notify is owed no ops, because
+	/// nothing happened.
+	fun notify(self) {
+		self.elements.notify();
+	}
+}
+
+export impl ListCell<type T> with SequenceCell<T> {
+	fun size(self): i32 {
+		// I5
+		self.elements.get().len()
+	}
+
+	/// The op is recorded INSIDE `update`, before `update`'s single notify, so
+	/// an observer that wakes reads a log that already explains the list it is
+	/// about to see. (`KeyedCell`'s discipline, verbatim.) A splice that
+	/// changes nothing — clamped to nothing taken and nothing arriving —
+	/// records nothing and publishes nothing.
+	// I5: a POSITION parameter
+	fun splice(self, at: i32, removed: i32, inserted: List<T>) {
+		let held = self.size(); // I5
+		let start = splice_start(held, at); // I5
+		let taking = splice_count(held, start, removed); // I5
+		if taking == 0 && inserted.len() == 0 {
+			ret;
+		}
+		self.elements.update(|&mut list| {
+			self.log.record(splice_in_place(&mut list, start, taking, inserted));
+		});
+	}
+}
+
+export impl ListCell<type T> with DeltaSource<List<T>, SeqOp<T>> {
+	fun cursor(self): DeltaCursor {
+		self.log.cursor()
+	}
+
+	fun drop_cursor(self, cursor: DeltaCursor) {
+		self.log.drop_cursor(cursor);
+	}
+
+	fun since(self, cursor: DeltaCursor): List<SeqOp<T>> {
+		match self.log.since(cursor) {
+			// A cursor that lost history is told the collection: the cell
+			// knows what a `Reset` is for its shape and the log does not.
+			None => {
+				mut lost: List<SeqOp<T>> = [];
+				lost.push(SeqOp::Reset(self.elements.get()));
+				lost
+			},
+			Some(let recorded) => recorded,
+		}
+	}
+}
+
+/// THE FIRST DERIVATIVE: `map g`, element-wise and incrementally.
+///
+/// `map_each(source, g)` is `source.get().map(g)` kept up to date by running
+/// `g` once per element that ARRIVES or CHANGES, and zero times for anything
+/// else. Three pushes are three calls; a removal is none; a `Reset` — a
+/// wholesale `set`, or a cursor that fell behind the log — is the honest N.
+///
+///     let raw: ListCell<str> = ListCell<str>::new();
+///     let parsed = map_each(raw, |text| text.parse_f64().unwrap_or(0f));
+///     raw.push("10.5");   // `g` runs ONCE
+///
+/// It takes any `S: DeltaSource<List<T>, SeqOp<T>>`, not a `ListCell`, so it
+/// serves a local cell, `std::rpc`'s `KeyedCell` and anything an app writes.
+///
+/// **Ownership.** A DERIVATION (A110 door 2): it publishes rather than acts, so
+/// an effect on the result reads it settled. The subscription is the ambient
+/// owner's like every other combinator's (A28), and the cursor goes with it —
+/// a disposed derivation stops pinning the source's history.
+///
+/// **Purity.** `g` runs once per element and its result is kept, so it must be
+/// pure IN THE ELEMENT: a `g` that reads another signal will not re-run when
+/// that signal changes. That is the same contract `map` has always had, made
+/// sharper by the fact that nothing re-runs it.
+export fun map_each<T, U, S: DeltaSource<List<T>, SeqOp<T>>>(
+	source: S,
+	g: sync |T| U,
+): ListCell<U> {
+	// The cursor is minted BEFORE the seed is read, so the seed is exactly the
+	// state the cursor names and nothing can fall between them.
+	let cursor = source.cursor();
+	let out: ListCell<U> = ListCell<U>::of(source.get().map(g));
+	as_derivation();
+	let _owned = register_with_owner(source.on_change(|_published| {
+		for op in source.since(cursor) {
+			match op {
+				// The derivative of `map g`: what arrived, mapped. Nothing
+				// else is read, and `g` runs exactly `inserted.len()` times.
+				SeqOp::Splice(let at, let removed, let inserted) => {
+					out.splice(at, removed.len(), inserted.map(g)); // I5
+				},
+				SeqOp::SetAt(let at, let _was, let value) => out.set_at(at, g(value)),
+				// The honest N: the collection became something else, so the
+				// derived collection does too.
+				SeqOp::Reset(let items) => out.set(items.map(g)),
+				// A reorder maps to a reorder — no element changed, so `g`
+				// runs zero times.
+				SeqOp::Move(let from, let count, let to) => out.move_range(from, count, to),
+			}
+		}
+	}));
+	defer_to_owner(|| source.drop_cursor(cursor));
+	out
 }

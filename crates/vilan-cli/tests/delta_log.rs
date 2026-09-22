@@ -33,7 +33,12 @@
 //!    compile (`same(old_items[found], item)` moves out of a `Vec` of a
 //!    non-`Copy` element) — a backend defect reported rather than worked
 //!    around.
-//! 5. [`std_reactive_imports_nothing_from_std_wire`] — the layering the lift
+//! 5. [`a_list_cell_runs_its_derivation_once_per_arriving_element`] — A112 S2:
+//!    `ListCell`, the two sequence traits and `map_each`, over the corpus
+//!    program `vilan/test/list-cell.vl`. Its own `panic`s are the assertions
+//!    and the byte gate does not run them, so — exactly as for the law above —
+//!    the program is RUN here and its exit code read.
+//! 6. [`std_reactive_imports_nothing_from_std_wire`] — the layering the lift
 //!    must not invert. `SeqOp` is a `std::reactive` type, `Delta` a `std::wire`
 //!    one, and the edge between them lives in `std::rpc`. A grep over the two
 //!    reactive-layer files is honest here and costs microseconds: there is no
@@ -338,6 +343,59 @@ fn a_reversal_costs_one_key_comparison_per_row() {
         "a reversal's key-comparison count moved. One per row is the index \
          answering each key from its own chain; anything growing with the \
          square is M82's coarse-equality scan back again."
+    );
+}
+
+/// A112 S2 — `ListCell`, `SequenceCell`, `Sequence`/`Tracked` and `map_each`.
+///
+/// The program is `vilan/test/list-cell.vl`, so the byte gate compiles it on
+/// every run; what the byte gate cannot do is READ its assertions, which are
+/// `panic`s. Ten claims, in the program's own order: the item's original ask
+/// (one `ran` for one push), k pushes -> k calls of `g` with a removal and a
+/// `clear` costing none, THE LAW after every mutation against a naive rerun,
+/// the twelve defaults each reaching the one primitive, four mutations in one
+/// `edit` being ONE notification and FOUR ops, a body written against the
+/// `Sequence<T>` BOUND running on the recorder, `set(whole)` costing N where
+/// `reconcile_to(whole)` costs what changed (and an unchanged
+/// `reconcile_to` costing nothing at all), a `Move` costing zero, a cursor
+/// past the log's limit answered with a `Reset` whose application the law
+/// checks, an out-of-range ask CLAMPED alike by the cell and by the recorder
+/// (they run one splice), and THE LAW over a 300-turn random walk of the whole
+/// vocabulary with a second `map_each` CHAINED on the first — both laws at
+/// every settle, at most one notification per turn, and the two derivations
+/// together cheaper than one naive rerun (1,081 + 1,081 calls against 4,196).
+///
+/// Non-vacuous, proven by planting the bugs the slice is against:
+/// `map_each`'s `Splice` arm re-mapping the whole list reds at
+/// `3 pushes: 6, expected 3`; `edit` publishing per op instead of once reds
+/// at `one edit, one notification: 5, expected 1`; `map_each`'s `Move` arm
+/// forwarding a count of one reds ONLY in the walk (the fixed claims move one
+/// element), at `turn 7: first[2] is 61, not 107`; and the recorder's splice
+/// without the shared clamp reds at the clamped `edit` with
+/// `index out of bounds: the length is 1 but the index is 1`.
+#[test]
+fn a_list_cell_runs_its_derivation_once_per_arriving_element() {
+    let program = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vilan/test/list-cell.vl");
+    let contents = std::fs::read_to_string(&program)
+        .unwrap_or_else(|error| panic!("read {program:?}: {error}"));
+    let stdout = build_and_run("listcell", "list-cell.vl", &contents);
+    assert_eq!(
+        stdout,
+        "ran\n\
+         after one push: 4\n\
+         twelve defaults: calls=11 notifications=14\n\
+         after edit: lll m \n\
+         after fill: lll m from-fill-1 from-fill-2 \n\
+         after move: oo qqqq ppp n \n\
+         lagged: held=0 calls=9\n\
+         total: calls=32 notifications=20\n\
+         clamped: front \n\
+         walk: turns=300 silent=1 length=5 g=1081 h=1081 rerun=4196\n",
+        "A112 S2's counts moved. `ran` printed once is the item's own ask; the \
+         call counts are `g` running per ARRIVING element and not per element; \
+         `notifications` is one per write and one per `edit`, whatever the \
+         `edit` did. A changed number here is a semantics change, not a \
+         golden."
     );
 }
 

@@ -23,10 +23,15 @@ export import pkg::delta::{
 	DeltaCursor,
 	DeltaLog,
 	DeltaSource,
+	ListCell,
 	MapOp,
 	SeqOp,
+	Sequence,
+	SequenceCell,
 	SetOp,
+	Tracked,
 	delta_log_limit,
+	map_each,
 };
 
 /// A resource that can be released. An `Owner` collects `Disposable`s and releases
