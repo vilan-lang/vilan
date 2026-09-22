@@ -47622,8 +47622,58 @@ impl<'src> Analyzer<'src> {
                         span: check.span,
                     });
             }
+            // A BLANKET's subject bound IS an implementation of the bound
+            // trait and of everything above it. `impl type S: Base<type T> with
+            // Feed<T>`, under `trait Feed<T> with Base<T>`, admits only
+            // subjects that already implement `Base<T>` — so `Base`'s members
+            // are provided for every subject the impl can ever reach, and
+            // demanding them here ("'S' does not implement trait 'Feed<T>':
+            // missing 'read'") refused the one spelling that states the
+            // requirement outright. Asked at the ARGUMENTS the requirement is
+            // reached with, so a bound on `Base<i32>` does not answer a
+            // `Feed<str>` that needs `Base<str>`.
+            let reached_requirements: Vec<(Id, Vec<TypeId>)> =
+                self.trait_with_supertraits_at(trait_id, &check.trait_arguments);
+            let mut bound_provides: Vec<(Id, Vec<TypeId>)> = Vec::new();
+            let subject_binder = match check.subject_type_id.get_type(self) {
+                Type::Generic(constraint_id) => Some(constraint_id),
+                Type::Trait(..) => Some(check.subject_type_id),
+                _ => None,
+            };
+            for (bound_trait_id, bound_arguments) in subject_binder
+                .map(|binder| self.generic_bound_traits(binder))
+                .unwrap_or_default()
+            {
+                bound_provides
+                    .extend(self.trait_with_supertraits_at(bound_trait_id, &bound_arguments));
+            }
             for (member_name, declaring_trait_id) in required {
                 if check.declarations.contains_key(member_name) {
+                    continue;
+                }
+                let provided_by_the_subjects_bound = reached_requirements
+                    .iter()
+                    .filter(|(reached_id, _)| *reached_id == declaring_trait_id)
+                    .any(|(_, reached_arguments)| {
+                        bound_provides
+                            .iter()
+                            .any(|(provided_id, provided_arguments)| {
+                                *provided_id == declaring_trait_id
+                                    && provided_arguments.len() == reached_arguments.len()
+                                    && provided_arguments.iter().zip(reached_arguments).all(
+                                        |(provided, reached)| {
+                                            let provided = provided.get_type(self);
+                                            let reached = reached.get_type(self);
+                                            self.compare_type(
+                                                &provided,
+                                                &reached,
+                                                &HashMap::default(),
+                                            )
+                                        },
+                                    )
+                            })
+                    });
+                if provided_by_the_subjects_bound {
                     continue;
                 }
                 // A supertrait member may be provided by a SEPARATE impl of

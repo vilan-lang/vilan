@@ -161,10 +161,56 @@ fn provides_trait(program: &Program, type_id: TypeId, trait_id: Id) -> bool {
     if !is_resolvable(type_) {
         return true;
     }
+    // A question already being asked further up this proof is NOT evidence
+    // for itself. `trait Feed<T> with Source<List<T>>` beside
+    // `impl type S: Source<List<type T>> with Feed<T>` makes the blanket a
+    // provider of `Source` (a supertrait comes with the trait), and whether
+    // it applies to a type is whether that type provides `Source` — the
+    // question that reached it. Asked again it recursed until the stack was
+    // gone, aborting every program that imported the module declaring the
+    // pair. The cycle proves nothing, so it answers no, and the type's OTHER
+    // providers decide: a cell with its own `Source` impl still provides it,
+    // and a type with none still does not.
+    let Some(_proving) = ProvingGuard::enter(type_id, trait_id) else {
+        return false;
+    };
     program.implementations.iter().any(|implementation| {
         provided_trait_ids(program, implementation).contains(&trait_id)
             && subject_applies(program, implementation.subject, type_id)
     })
+}
+
+thread_local! {
+    /// The `(type, trait)` questions [`provides_trait`] is answering on this
+    /// thread, innermost last — the proof's own stack, so a question that
+    /// reaches itself is seen as the cycle it is.
+    static PROVING: std::cell::RefCell<Vec<(TypeId, Id)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One `(type, trait)` question held open on [`PROVING`] for as long as the
+/// guard lives; `None` when that question is already open further up.
+struct ProvingGuard;
+
+impl ProvingGuard {
+    fn enter(type_id: TypeId, trait_id: Id) -> Option<ProvingGuard> {
+        PROVING.with(|proving| {
+            let mut proving = proving.borrow_mut();
+            if proving.contains(&(type_id, trait_id)) {
+                return None;
+            }
+            proving.push((type_id, trait_id));
+            Some(ProvingGuard)
+        })
+    }
+}
+
+impl Drop for ProvingGuard {
+    fn drop(&mut self) {
+        PROVING.with(|proving| {
+            proving.borrow_mut().pop();
+        });
+    }
 }
 
 /// Whether `subject` — an impl subject, in the impl's own generic terms —

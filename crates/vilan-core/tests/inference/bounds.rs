@@ -11865,3 +11865,207 @@ fn b381_the_same_comparison_outside_the_closure_is_the_control() {
         "true\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// A trait whose SUPERTRAIT is the bound of its own blanket impl
+// ---------------------------------------------------------------------------
+//
+// `trait Feed<T> with Source<List<T>>` beside `impl type S: Source<List<type
+// T>> with Feed<T>` — A112 S3's `DeltaFeed`, and the most direct way to write
+// "a capability every source has". Two defects, one per face (collections-40's
+// finds, both pre-existing on 49de3915):
+//
+// - With std's `Source` it overflowed the compiler's stack. Whether a type
+//   provides `Source` asked every impl providing it; the blanket provides
+//   `Source` (a supertrait comes with the trait), and whether the blanket
+//   applies is whether the type provides `Source` — the question itself,
+//   asked again until the stack was gone. With the pair in std, EVERY program
+//   importing `std::reactive` aborted. A question already open further up the
+//   proof is no evidence for itself now (`impl_select::provides_trait`).
+// - With a user trait the recursion never started and the impl was REFUSED:
+//   "'S' does not implement trait 'Feed<T>': missing 'read'" — conformance
+//   wanted the supertrait's members from the impl or from a separate impl on
+//   the same subject, and a blanket's subject is a binder BOUNDED by that very
+//   supertrait, which provides them for every type the impl can reach.
+
+/// The std face, collections-40's repro: an abort before, runs now.
+#[test]
+fn a_supertrait_that_is_its_blankets_own_bound_does_not_overflow() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        trait Feed<T> with Source<List<T>> {
+            fun feeds(self): bool;
+        }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun feeds(self): bool { false }
+        }
+
+        fun direct<T, S: Feed<T>>(source: S): bool {
+            source.feeds()
+        }
+
+        fun main() {
+            let cell: SignalCell<List<str>> = Signal::new(["a"]);
+            print(i"direct={direct(cell)} method={cell.feeds()}");
+        }
+        "#,
+        "direct=false method=false\n",
+    );
+}
+
+/// The std-free face: accepted, and it answers for a type that implements the
+/// bound.
+#[test]
+fn a_blankets_subject_bound_provides_its_supertraits_members() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base<T> { fun read(self): T; }
+        trait Feed<T> with Base<T> { fun feeds(self): bool; }
+
+        impl type S: Base<type T> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        struct Cell { n: i32 }
+        impl Cell with Base<i32> {
+            fun read(self): i32 { self.n }
+        }
+
+        fun both<T, S: Feed<T>>(source: S): T {
+            source.feeds();
+            source.read()
+        }
+
+        fun main() {
+            print(both(Cell { n = 3 }));
+        }
+        "#,
+        "3\n",
+    );
+}
+
+/// The bound answers AT ITS ARGUMENTS: `Feed<str>` needs `Base<str>`, and a
+/// subject bounded on `Base<i32>` is not one — still refused.
+#[test]
+fn a_subject_bound_at_other_arguments_does_not_provide_the_supertrait() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        trait Base<T> { fun read(self): T; }
+        trait Feed<T> with Base<T> { fun feeds(self): bool; }
+
+        impl type S: Base<i32> with Feed<str> {
+            fun feeds(self): bool { false }
+        }
+
+        fun main() { print("hello"); }
+        "#,
+        "'S' does not implement trait 'Feed<str>': missing 'read'",
+    );
+}
+
+/// The cycle answers NO, not yes: a type with no `Base` of its own does not
+/// become a `Feed` through the blanket that requires one.
+#[test]
+fn a_type_without_the_bound_does_not_reach_the_blanket_through_the_cycle() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Source };
+
+        trait Feed<T> with Source<List<T>> {
+            fun feeds(self): bool;
+        }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun feeds(self): bool { true }
+        }
+
+        struct Bare { n: i32 }
+
+        fun main() {
+            print(Bare { n = 1 }.feeds());
+        }
+        "#,
+        "Bare has no method 'feeds'",
+    );
+}
+
+/// A112 S3's whole shape, std-free of `std::ui`: the supertrait form of the
+/// optional capability, a "no feed" blanket over `Source` and a real one over
+/// `DeltaSource` (B378 ranks the second), reached through ONE bound.
+#[test]
+fn the_a112_optional_capability_takes_the_supertrait_form() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{
+            DeltaCursor,
+            DeltaLog,
+            DeltaSource,
+            SeqOp,
+            Signal,
+            SignalCell,
+            Source,
+            Subscription,
+        };
+
+        struct Logged { elements: SignalCell<List<i32>>, log: DeltaLog<SeqOp<i32>> }
+
+        impl Logged with Source<List<i32>> {
+            fun get(self): List<i32> { self.elements.get() }
+
+            [must_use]
+            fun on_change(self, observer: |List<i32>| void): Subscription {
+                self.elements.on_change(observer)
+            }
+        }
+
+        impl Logged with DeltaSource<List<i32>, SeqOp<i32>> {
+            fun cursor(self): DeltaCursor { self.log.cursor() }
+
+            fun drop_cursor(self, cursor: DeltaCursor) { self.log.drop_cursor(cursor); }
+
+            fun since(self, cursor: DeltaCursor): List<SeqOp<i32>> {
+                mut none: List<SeqOp<i32>> = [];
+                none
+            }
+        }
+
+        trait Feed<T> with Source<List<T>> {
+            fun has_feed(self): bool;
+        }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun has_feed(self): bool { false }
+        }
+
+        impl type S: DeltaSource<List<type T>, SeqOp<T>> with Feed<T> {
+            fun has_feed(self): bool { true }
+        }
+
+        fun consume<T, S: Feed<T>>(source: S): str {
+            i"feed={source.has_feed()} len={source.get().len()}"
+        }
+
+        fun main() {
+            let logged = Logged {
+                elements = Signal::new([1, 2]),
+                log = DeltaLog<SeqOp<i32>>::new(),
+            };
+            let plain: SignalCell<List<i32>> = Signal::new([1, 2, 3]);
+            print(consume(logged));
+            print(consume(plain));
+        }
+        "#,
+        "feed=true len=2\nfeed=false len=3\n",
+    );
+}
