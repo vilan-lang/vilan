@@ -255,6 +255,17 @@
         }
       }
     },
+    "fmt": {
+      "type": "object",
+      "description": "`vilan fmt`'s knobs for this package.",
+      "additionalProperties": false,
+      "properties": {
+        "wrap_comments": {
+          "type": "boolean",
+          "description": "Re-fill a paragraph of `//` / `///` comment lines to the line width, the way code is already laid out (default false)."
+        }
+      }
+    },
     "macro": {
       "type": "object",
       "description": "The compile-time interpreter's budget.",

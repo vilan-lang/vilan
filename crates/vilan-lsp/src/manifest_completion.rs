@@ -461,6 +461,16 @@ pub const TABLES: &[Table] = &[
         ],
     },
     Table {
+        path: "fmt",
+        documentation: "`vilan fmt`'s knobs for this package.",
+        keys: &[Key {
+            name: "wrap_comments",
+            documentation: "Re-fill a paragraph of `//` / `///` comment lines to the line \
+                            width, the way code is already laid out (default false).",
+            values: ValueSet::Boolean,
+        }],
+    },
+    Table {
         path: "macro",
         documentation: "The compile-time interpreter's budget.",
         keys: &[
@@ -490,6 +500,7 @@ pub const HEADERS: &[&str] = &[
     "project",
     "project.dependencies",
     "build",
+    "fmt",
     "macro",
 ];
 
@@ -1142,7 +1153,7 @@ mod tests {
     fn schema_and_listing_agree() {
         let schema = schema();
         let root = &schema["properties"];
-        for table in ["package", "library", "project", "build", "macro"] {
+        for table in ["package", "library", "project", "build", "fmt", "macro"] {
             assert_eq!(
                 properties(&root[table]),
                 listed(table),
