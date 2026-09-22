@@ -27,6 +27,10 @@ use crate::analysis::{
     Analysis, binding_type_id, call_parameter_names, nominal_type_id, signature_label,
 };
 
+/// N115: the engine's own pins, driven without a protocol layer.
+#[cfg(test)]
+mod tests;
+
 /// A scope-position construct snippet's insertion text (E14). The server
 /// renders `body` for a snippet-capable client and falls back to `fallback` (the
 /// bare keyword) otherwise — a `${1:…}` body would surface as literal text on a
