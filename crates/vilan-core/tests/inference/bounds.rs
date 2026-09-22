@@ -12076,3 +12076,180 @@ fn the_a112_optional_capability_takes_the_supertrait_form() {
         "feed=true len=2\nfeed=false len=3\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// The supertrait blanket must not PROVE ITS OWN BOUND (UNSOUND on 3e4e6c51)
+// ---------------------------------------------------------------------------
+//
+// Once `impl type S: Base<type T> with Feed<T>` under `trait Feed<T> with
+// Base<T>` was accepted (the conformance rule above), the analyzer's bound
+// check took the blanket as a provider of `Base` for ANY type: `Other: Base?`
+// -> the blanket provides `Base` through `Feed` -> does `Other` meet the
+// blanket's subject bound `Base`? -> the same question, recursing until the
+// depth cap, whose lenient answer was YES. `takes<S: Base<T>>(Other)` checked
+// clean; with A112's `DeltaFeed` in std every `S: Source<T>` bound admitted a
+// plain struct and an `i32`. A question already open further up the proof is
+// no evidence for itself, and the cap no longer answers yes.
+
+/// The std-free repro: `Other` implements nothing.
+#[test]
+fn a_supertrait_blanket_does_not_satisfy_its_own_bound_for_a_stranger() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        trait Base<T> { fun read(self): T; }
+        trait Feed<T> with Base<T> { fun feeds(self): bool; }
+
+        impl type S: Base<type T> with Feed<T> {
+            fun feeds(self): bool { false }
+        }
+
+        struct Other { n: i32 }
+
+        fun takes<T, S: Base<T>>(source: S): i32 { 1 }
+
+        fun main() {
+            print(takes(Other { n = 1 }));
+        }
+        "#,
+        "does not implement",
+    );
+}
+
+/// Nor its own subtrait: `Other` is not a `Feed` either, the blanket's
+/// promise notwithstanding.
+#[test]
+fn a_supertrait_blanket_does_not_make_a_stranger_its_subtrait() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+
+        trait Base<T> { fun read(self): T; }
+        trait Feed<T> with Base<T> { fun feeds(self): bool; }
+
+        impl type S: Base<type T> with Feed<T> {
+            fun feeds(self): bool { false }
+        }
+
+        struct Other { n: i32 }
+
+        fun fed<T, S: Feed<T>>(source: S): bool { source.feeds() }
+
+        fun main() {
+            print(fed(Other { n = 1 }));
+        }
+        "#,
+        "does not implement",
+    );
+}
+
+/// The std shape: with A112's `DeltaFeed` declared, a `Source` bound still
+/// refuses a plain struct...
+#[test]
+fn the_delta_feed_shape_does_not_make_a_plain_struct_a_source() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Source };
+
+        trait DeltaFeed<T> with Source<List<T>> {
+            fun has_feed(self): bool;
+        }
+
+        impl type S: Source<List<type T>> with DeltaFeed<T> {
+            fun has_feed(self): bool { false }
+        }
+
+        struct Plain { n: i32 }
+
+        fun src<T, S: Source<T>>(source: S): i32 { 1 }
+
+        fun main() {
+            print(src(Plain { n = 1 }));
+        }
+        "#,
+        "does not implement",
+    );
+}
+
+/// ...and an `i32`.
+#[test]
+fn the_delta_feed_shape_does_not_make_an_integer_a_source() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Source };
+
+        trait DeltaFeed<T> with Source<List<T>> {
+            fun has_feed(self): bool;
+        }
+
+        impl type S: Source<List<type T>> with DeltaFeed<T> {
+            fun has_feed(self): bool { false }
+        }
+
+        fun src<T, S: Source<T>>(source: S): i32 { 1 }
+
+        fun main() {
+            print(src(7));
+        }
+        "#,
+        "does not implement",
+    );
+}
+
+/// ...and a `DeltaFeed` bound refuses a plain struct, while a real cell still
+/// satisfies both (the control the S3 landing needs).
+#[test]
+fn the_delta_feed_shape_admits_a_real_source_and_refuses_a_plain_struct() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        trait DeltaFeed<T> with Source<List<T>> {
+            fun has_feed(self): bool;
+        }
+
+        impl type S: Source<List<type T>> with DeltaFeed<T> {
+            fun has_feed(self): bool { false }
+        }
+
+        struct Plain { n: i32 }
+
+        fun fed<T, S: DeltaFeed<T>>(source: S): bool { source.has_feed() }
+
+        fun main() {
+            let cell: SignalCell<List<i32>> = Signal::new([1]);
+            print(fed(cell));
+            print(fed(Plain { n = 1 }));
+        }
+        "#,
+        "does not implement",
+    );
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        trait DeltaFeed<T> with Source<List<T>> {
+            fun has_feed(self): bool;
+        }
+
+        impl type S: Source<List<type T>> with DeltaFeed<T> {
+            fun has_feed(self): bool { false }
+        }
+
+        fun fed<T, S: DeltaFeed<T>>(source: S): bool { source.has_feed() }
+        fun src<T, S: Source<T>>(source: S): T { source.get() }
+
+        fun main() {
+            let cell: SignalCell<List<i32>> = Signal::new([1, 2]);
+            print(fed(cell));
+            print(src(cell).len());
+        }
+        "#,
+        "false\n2\n",
+    );
+}

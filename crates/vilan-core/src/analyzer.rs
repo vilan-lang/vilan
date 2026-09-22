@@ -3491,6 +3491,13 @@ pub struct Analyzer<'src> {
     // refusal the program never had. On a stalled fixpoint the door commits
     // with what it has, which is exactly what it did before it deferred.
     fixpoint_stalled: bool,
+    // The `(value, trait, arguments)` bound questions `satisfies_trait_bound`
+    // is answering right now, innermost last. A question that reaches itself
+    // is a cycle, and a cycle proves nothing: a supertrait blanket (`impl type
+    // S: Base<type T> with Feed<T>` under `trait Feed<T> with Base<T>`) offers
+    // itself as a provider of `Base` for ANY type, on the condition that the
+    // type is already a `Base` — which is the question being asked.
+    bound_proofs_in_progress: Vec<(TypeId, Id, Vec<TypeId>)>,
     // `std_sources` projected onto entity-id space: the sorted, disjoint
     // `[start, end)` ranges of frozen entities, sealed once after `build()`
     // (`seal_frozen_ranges`) so `frozen_entity` is a binary search — the
@@ -5895,6 +5902,7 @@ impl<'src> Analyzer<'src> {
             dependency_sources: HashSet::default(),
             type_map_writes: 0,
             fixpoint_stalled: false,
+            bound_proofs_in_progress: Vec::new(),
             frozen_ranges: Vec::new(),
             world_ranges: Vec::new(),
             reused_sources: Vec::new(),
@@ -6294,11 +6302,15 @@ impl<'src> Analyzer<'src> {
     ) -> bool {
         // Conditional impls recurse through their arguments; a pathological
         // impl graph could recurse forever, so cap like rustc's recursion
-        // limit. Past the cap the bound counts as satisfied — leniency keeps
-        // the cap itself from manufacturing errors.
+        // limit. Past the cap the bound is NOT satisfied: a cap that answers
+        // yes when it gives up is a proof manufactured from nothing, and it
+        // was exactly the hole the supertrait blanket's cycle fell through
+        // (every type became a `Base`). A genuine cycle is stopped earlier and
+        // exactly by `bound_proofs_in_progress`; the cap is only the backstop
+        // for a chain that grows without repeating.
         const MAX_DEPTH: u32 = 32;
         if depth > MAX_DEPTH {
-            return true;
+            return false;
         }
         // An ABSTRACT value's declared bounds are the ONLY answer — never an
         // impl (B173, RULED refused; spec §5.4). A blanket `impl type T with
@@ -6346,6 +6358,100 @@ impl<'src> Analyzer<'src> {
                     );
             }
         }
+        // A question already open further up this proof is no evidence for
+        // itself (`bound_proofs_in_progress`): answering it NO rejects the
+        // candidate that led back here, and the value's OTHER impls decide —
+        // a type with its own `Base` impl still satisfies `Base`, a type with
+        // none does not become one through the blanket that requires it.
+        let question = (
+            value_type.clone().get_type_id(self),
+            required_trait_id,
+            required_arguments.to_vec(),
+        );
+        // STRUCTURALLY: the recursion re-substitutes the bound's arguments on
+        // every round, which mints fresh ids for the same type, so an id
+        // comparison never sees the question come back.
+        let reached_itself = self.bound_proofs_in_progress.iter().any(
+            |(open_value, open_trait_id, open_arguments)| {
+                *open_trait_id == question.1
+                    && open_arguments.len() == question.2.len()
+                    && self.same_type_structure(*open_value, question.0, 0)
+                    && open_arguments
+                        .iter()
+                        .zip(&question.2)
+                        .all(|(open, asked)| self.same_type_structure(*open, *asked, 0))
+            },
+        );
+        if reached_itself {
+            return false;
+        }
+        self.bound_proofs_in_progress.push(question);
+        let satisfied = self.satisfies_trait_bound_by_impls(
+            value_type,
+            required_trait_id,
+            required_arguments,
+            depth,
+        );
+        self.bound_proofs_in_progress.pop();
+        satisfied
+    }
+
+    /// Whether two type ids name the same type, compared through their
+    /// arguments rather than by id — substitution mints a fresh id for every
+    /// type it builds, so equal types routinely carry unequal ids. A generic
+    /// is its constraint id, which IS canonical. Past a nesting depth no real
+    /// type reaches the answer is "not shown equal", which for its one caller
+    /// (the cycle check) only means the depth cap stops the chain instead.
+    fn same_type_structure(&self, left: TypeId, right: TypeId, depth: u32) -> bool {
+        if left == right {
+            return true;
+        }
+        if depth > 24 {
+            return false;
+        }
+        let all = |lefts: &[TypeId], rights: &[TypeId]| {
+            lefts.len() == rights.len()
+                && lefts
+                    .iter()
+                    .zip(rights)
+                    .all(|(left, right)| self.same_type_structure(*left, *right, depth + 1))
+        };
+        match (left.get_type(self), right.get_type(self)) {
+            (Type::Struct(left_id, lefts), Type::Struct(right_id, rights))
+            | (Type::Enum(left_id, lefts), Type::Enum(right_id, rights))
+            | (Type::Trait(left_id, lefts), Type::Trait(right_id, rights))
+            | (Type::Dyn(left_id, lefts), Type::Dyn(right_id, rights)) => {
+                left_id == right_id && all(&lefts, &rights)
+            }
+            (Type::Tuple(lefts), Type::Tuple(rights)) => all(&lefts, &rights),
+            (Type::Array(left_element, left_length), Type::Array(right_element, right_length)) => {
+                left_length == right_length
+                    && self.same_type_structure(left_element, right_element, depth + 1)
+            }
+            (
+                Type::Closure(left_parameters, left_return, left_contexts),
+                Type::Closure(right_parameters, right_return, right_contexts),
+            ) => {
+                left_contexts == right_contexts
+                    && all(&left_parameters, &right_parameters)
+                    && self.same_type_structure(left_return, right_return, depth + 1)
+            }
+            (Type::Mapped(left_a, left_b, left_c), Type::Mapped(right_a, right_b, right_c)) => {
+                all(&[left_a, left_b, left_c], &[right_a, right_b, right_c])
+            }
+            (left, right) => left == right,
+        }
+    }
+
+    /// [`Self::satisfies_trait_bound`]'s impl scan, run with the question
+    /// held open on `bound_proofs_in_progress`.
+    fn satisfies_trait_bound_by_impls(
+        &mut self,
+        value_type: &Type,
+        required_trait_id: Id,
+        required_arguments: &[TypeId],
+        depth: u32,
+    ) -> bool {
         // Each candidate keeps the arguments it provides for the required
         // trait — written on the clause when it names the trait DIRECTLY
         // (`with Feed<i32>`), and THREADED THROUGH THE SUPERTRAIT CHAIN when it
