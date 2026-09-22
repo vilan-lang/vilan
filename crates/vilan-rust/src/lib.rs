@@ -66,7 +66,7 @@ use std::fmt::Write as _;
 
 use vilan_core::analyzer::{
     Backing, BackingValue, Expr, ExprIfBranch, ExprMatchLeg, ExprPattern, GenericDispatch,
-    Intrinsic, Program,
+    Intrinsic, Program, TryDispatch,
 };
 use vilan_core::error::Error;
 use vilan_core::fx::FxHashMap as HashMap;
@@ -1352,6 +1352,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // answered the same way. The `external` gate is above, so this arm
             // cannot claim a vilan struct that merely shares one of the names.
             _ if let Some(native) = http_host_type(name) => Ok(native.to_string()),
+            // F18 slice 2: `std::json`'s opaque host value. It stands apart
+            // from the HTTP table because it is a different module's host
+            // surface and because two of the HTTP bindings (`headers`,
+            // `remoteAddress`) ANSWER one — the dependency runs this way and
+            // not the other.
+            "JsonValue" => Ok("vilan_rt::json::JsonValue".to_string()),
             _ => {
                 let what = format!("the host type `{name}`");
                 self.host_gap(what, span).map(|_| "()".to_string())
@@ -2599,6 +2605,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let arguments = self.enum_arguments_at(id, enum_id);
                 self.variant_path(enum_id, index, &arguments, span)?
             }
+            Expr::TryAssert(receiver) => self.try_assert(id, receiver, depth, span)?,
             Expr::Function(_)
             | Expr::Struct(_)
             | Expr::Enum(_)
@@ -3370,6 +3377,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // `console.log` form, which is what makes the substitution sound for a
         // scalar; anything else goes through a user `render`, which is refused
         // rather than guessed at.
+        // An `is`-test that CAPTURES, to the left of `&&`. See
+        // [`Emitter::conjunction`].
+        if matches!(op, BinaryOp::And) {
+            let mut conjuncts = Vec::new();
+            self.flatten_conjunction(id, &mut conjuncts);
+            if conjuncts
+                .iter()
+                .any(|conjunct| self.is_condition_captures(*conjunct).is_some())
+            {
+                return self.conjunction(&conjuncts, depth);
+            }
+        }
         let concatenates = matches!(op, BinaryOp::Add)
             && (self.is_str_expr(left) || self.is_str_expr(right) || self.is_str(id));
         if concatenates {
@@ -3407,6 +3426,80 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let left_text = self.value_of(left, depth)?;
         let right_text = self.value_of(right, depth)?;
         Ok(format!("({left_text} {symbol} {right_text})"))
+    }
+
+    /// The conjuncts of a `&&` chain, left to right.
+    ///
+    /// `&&` is left-associative, so `a && b && c` is `((a && b) && c)` and the
+    /// conjuncts are the leaves of that spine.
+    fn flatten_conjunction(&self, id: Id, out: &mut Vec<Id>) {
+        match self.program.entity_map.get(&id) {
+            Some(Expr::Binary(BinaryOp::And, left, right))
+                if !self.program.binary_op_dispatch.contains_key(&id) =>
+            {
+                let (left, right) = (*left, *right);
+                self.flatten_conjunction(left, out);
+                self.flatten_conjunction(right, out);
+            }
+            _ => out.push(id),
+        }
+    }
+
+    /// A `&&` chain in which some conjunct is an `is`-test that CAPTURES.
+    ///
+    /// `matches!` binds nothing, so the emission `is_test` writes dropped every
+    /// capture on the floor and the reads to its right named a binding rustc
+    /// had never seen — an emitted program that does not build, which is worse
+    /// than a refusal (`derive-json.vl` and `json-roundtrip.vl` both write the
+    /// shape, and both were held behind an earlier refusal until `std::json`
+    /// went native). `if` had the same problem and answers it with `if let`;
+    /// this is the same answer one level down:
+    ///
+    ///     `p is Ok(let v) && f(v)`  →  `match p { Ok(v) => f(v), _ => false }`
+    ///
+    /// which is exactly what `&&` means when its left operand binds — the
+    /// short-circuit IS the `_` arm, and B215's rule ("a capture binds nothing
+    /// after the test that made it") is the scope of the arm.
+    ///
+    /// Everything to the RIGHT of a capturing conjunct goes inside that arm,
+    /// which is why this takes the whole flattened chain rather than one
+    /// `Binary` node: `a is P(let x) && b && x.f` is `((a is P && b) && x.f)`
+    /// as a tree, and nesting per node would have left `x.f` outside.
+    fn conjunction(&mut self, conjuncts: &[Id], depth: usize) -> Result<String, Error> {
+        let Some((&first, rest)) = conjuncts.split_first() else {
+            return Ok("true".to_string());
+        };
+        if rest.is_empty() {
+            return self.expression(first, depth);
+        }
+        let Some((subject, pattern, bindings)) = self.is_condition_captures(first) else {
+            let left = self.expression(first, depth)?;
+            let right = self.conjunction(rest, depth)?;
+            return Ok(format!("({left} && {right})"));
+        };
+        // The same copy `if let` takes (F20): a pattern over a PLACE binds its
+        // captures by reference under Rust's default binding modes, and a
+        // capture is a copy by rule 1.
+        let mut subject_text = self.expression(subject, depth)?;
+        if matches!(
+            self.program.entity_map.get(&subject),
+            Some(Expr::Local(_) | Expr::Parameter(_) | Expr::Field(_, _, _))
+        ) {
+            subject_text = format!("({subject_text}).clone()");
+        }
+        let subject_type = self.type_of(subject);
+        let pattern_text = self.pattern(&pattern, subject_type, self.span_of(first))?;
+        for binding in &bindings {
+            self.is_captures.insert(*binding);
+        }
+        let rest_text = self.conjunction(rest, depth);
+        for binding in &bindings {
+            self.is_captures.remove(binding);
+        }
+        Ok(format!(
+            "match {subject_text} {{ {pattern_text} => {}, _ => false }}",
+            rest_text?
+        ))
     }
 
     /// One operand of a concatenation, rendered as a `str`.
@@ -4757,6 +4850,142 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Ok(Some(rendered))
     }
 
+    /// `expr!` — try-and-lift's assertion (`proposal/try-and-lift.md` §4), which
+    /// `std::json`'s derived decoders are written in and which therefore stood
+    /// between the JSON surface and a program that decodes anything.
+    ///
+    /// The JS emitter hoists the receiver, tests its tag and RETURNS THE
+    /// RECEIVER ITSELF for the bad half — byte-identical at any success type,
+    /// because a vilan enum there is `[tag, ..payload]` and `None` is `None`
+    /// whatever the `Option` was over. Natively the two halves are two types, so
+    /// the bad half is REBUILT (`return None`, `return Err(error)`) rather than
+    /// passed through. The `match` evaluates its subject once, which is what the
+    /// JS temp is for.
+    ///
+    /// Only the `Option`/`Result` dispatch is emitted. A user `Try` impl
+    /// (`TryDispatch::Trait`) is refused by name: its `verdict`/`from_bad` pair
+    /// is two more dispatches and no program on the native path writes one.
+    fn try_assert(
+        &mut self,
+        id: Id,
+        receiver: Id,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        if !matches!(
+            self.program.try_dispatch.get(&id),
+            Some(TryDispatch::Std) | None
+        ) {
+            return Err(unsupported(
+                "a `!` assertion through a user `Try` impl (the `Option`/`Result` form is emitted)",
+                span,
+            ));
+        }
+        let Some(Type::Enum(enum_id, _)) = self
+            .type_of(receiver)
+            .map(|type_id| self.concrete(type_id))
+            .and_then(|type_id| self.resolve(type_id))
+            .cloned()
+        else {
+            return Err(unsupported(
+                "a `!` assertion on an unresolved receiver",
+                span,
+            ));
+        };
+        let name = self
+            .program
+            .enums
+            .get(&enum_id)
+            .map(|declaration| declaration.name);
+        // The binder carries the expression's own id, so a `!` inside the
+        // receiver of another `!` cannot shadow the outer one's payload.
+        let good = format!("try_good_{}", id.0);
+        let bad = format!("try_bad_{}", id.0);
+        let subject = self.consumed_value_of(receiver, depth)?;
+        match name {
+            Some("Option") => Ok(format!(
+                "match {subject} {{ Some({good}) => {good}, None => return None }}"
+            )),
+            Some("Result") => Ok(format!(
+                "match {subject} {{ Ok({good}) => {good}, Err({bad}) => return Err({bad}) }}"
+            )),
+            _ => Err(unsupported(
+                "a `!` assertion on something that is neither an `Option` nor a `Result`",
+                span,
+            )),
+        }
+    }
+
+    /// The host bindings `vilan-rt`'s JSON value answers (F18 slice 2).
+    ///
+    /// **The key is the pair (host symbol, vilan name)**, for the reason
+    /// [`Emitter::http_host_binding`] keys on its own pair and more sharply:
+    /// three of these symbols are `String`, `Boolean` and `Number`, which
+    /// `std::number` also binds — `label_i32(value: f64)` is `[extern("Number")]`
+    /// and is not a JSON coercion at all. A symbol alone would claim it and
+    /// emit a method no `f64` has. Both halves of the key are static facts
+    /// about the declaration, so nothing at a call site can confuse them.
+    ///
+    /// `Ok(None)` means "not one of ours" and the caller refuses by name.
+    fn json_host_binding(
+        &mut self,
+        name: &str,
+        binding: Option<&ExternBinding<'src>>,
+        argument_ids: &[Id],
+        depth: usize,
+    ) -> Result<Option<String>, Error> {
+        let Some(ExternBinding::Function {
+            module: None,
+            symbol,
+        }) = binding
+        else {
+            return Ok(None);
+        };
+        let rendered = match (*symbol, name) {
+            // TRUSTING, as `std::json` documents it: malformed text is a host
+            // exception, which natively is the abort every host throw takes.
+            // The guarded parse is the `TryParseJson` INTRINSIC, not this.
+            ("JSON.parse", "parse_json_value") => {
+                format!(
+                    "vilan_rt::json::parse(&{})",
+                    self.value_argument(argument_ids, 0, depth)?
+                )
+            }
+            // The scalar half of the `Json` trait: `impl i32 with Json` binds
+            // `to_json` straight to `JSON.stringify`, and a DERIVED struct's
+            // `to_json` calls it per field. `vilan_rt::Json` is that rendering
+            // and already existed — it is what `canonical_hash` keys on (F20) —
+            // so this arm is a rename, not a second stringifier.
+            ("JSON.stringify", "to_json") => format!(
+                "vilan_rt::str_new(&vilan_rt::Json::json(&{}))",
+                self.place_argument(argument_ids, 0, depth)?
+            ),
+            ("Object.hasOwn", "has_json_field") => format!(
+                "({}).has_field(&{})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            ("String", "coerce_str") => format!(
+                "({}).coerce_str()",
+                self.place_argument(argument_ids, 0, depth)?
+            ),
+            ("Boolean", "coerce_bool") => format!(
+                "({}).coerce_bool()",
+                self.place_argument(argument_ids, 0, depth)?
+            ),
+            // The twelve `Number` coercions differ only in the vilan type they
+            // label the result with, and `json.vl` reaches every one of them
+            // only past a `kind() == Number` check — so the cast is over a
+            // number that is already a number.
+            ("Number", _) if let Some(scalar) = json_coercion_target(name) => format!(
+                "(({}).coerce_number() as {scalar})",
+                self.place_argument(argument_ids, 0, depth)?
+            ),
+            _ => return Ok(None),
+        };
+        Ok(Some(rendered))
+    }
+
     /// The host type an `[extern(method|get|set)]`'s RECEIVER is declared at —
     /// the discriminator [`Emitter::http_host_binding`] keys on.
     ///
@@ -5147,6 +5376,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             )? {
                 return Ok(rendered);
             }
+            // F18 slice 2: and `std::json`'s host seams in `vilan_rt::json`.
+            if let Some(rendered) =
+                self.json_host_binding(name, binding.as_ref(), &function_call.argument_ids, depth)?
+            {
+                return Ok(rendered);
+            }
             let what = format!(
                 "the host binding `{name}`{}",
                 match binding {
@@ -5386,7 +5621,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 impl_select::select_member(self.program, None, type_id, member, Some(wanted))
             {
                 return self
-                    .dispatch_to_member(selected, type_id, own_generic_values, span)
+                    .dispatch_to_member(selected, type_id, own_generic_values)
                     .map(Some);
             }
             if let Some(default_id) = self.trait_default_member(trait_id, member) {
@@ -5401,7 +5636,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 impl_select::select_member(self.program, None, type_id, member, None)
         {
             return self
-                .dispatch_to_member(selected, type_id, own_generic_values, span)
+                .dispatch_to_member(selected, type_id, own_generic_values)
                 .map(Some);
         }
         let Some(default_id) = self.resolve_inherited_default(type_id, member) else {
@@ -5446,17 +5681,22 @@ impl<'a, 'src> Emitter<'a, 'src> {
         selected: impl_select::SelectedMember,
         type_id: TypeId,
         own_generic_values: &[TypeId],
-        span: Span,
     ) -> Result<NativeDispatch, Error> {
         let member_id = selected.member_id;
         if let Some(intrinsic) = self.program.intrinsics.get(&member_id).copied() {
             return Ok(NativeDispatch::Intrinsic(intrinsic));
         }
-        if let Some(external) = self.program.external_functions.get(&member_id) {
-            let what = format!("the host binding `{}`", external.name);
-            return self
-                .host_gap(what, span)
-                .map(|_| NativeDispatch::Call("unimplemented!()".to_string()));
+        // An EXTERNAL member reached generically — `element.to_json()` inside
+        // `impl List<type T: Json> with Json`, where `T` binds to `str` and the
+        // selected member is `impl str with Json`'s `[extern("JSON.stringify")]`
+        // one. The id is carried rather than refused here: the host tables are
+        // keyed on the declaration and take the call's ARGUMENTS, neither of
+        // which this function has, so the decision belongs at
+        // [`Emitter::emit_dispatch`]. Refusing here refused every host binding
+        // a blanket impl can reach, which is what stood between `std::json`'s
+        // scalar impls and any generic that walks them.
+        if self.program.external_functions.contains_key(&member_id) {
+            return Ok(NativeDispatch::Host(member_id));
         }
         let mut substitution = HashMap::default();
         impl_select::bind_subject(
@@ -5504,6 +5744,41 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     None => self.value_arguments(argument_ids, depth)?,
                 };
                 Ok(format!("{name}({})", arguments.join(", ")))
+            }
+            // The external member a blanket impl selected. Same three tables an
+            // ordinary external call goes through, in the same order, so a
+            // binding reached generically and one reached directly emit the
+            // same text — and one the tables do not answer is refused by the
+            // same name it would be refused by at a direct call site.
+            NativeDispatch::Host(member_id) => {
+                let Some(external) = self.program.external_functions.get(&member_id) else {
+                    return Err(unsupported("an unresolved host binding", span));
+                };
+                let name = external.name;
+                let binding = external.extern_binding.clone();
+                if let Some(rendered) =
+                    self.runtime_host_binding(name, binding.as_ref(), argument_ids, depth, span)?
+                {
+                    return Ok(rendered);
+                }
+                if let Some(rendered) =
+                    self.http_host_binding(member_id, binding.as_ref(), argument_ids, depth)?
+                {
+                    return Ok(rendered);
+                }
+                if let Some(rendered) =
+                    self.json_host_binding(name, binding.as_ref(), argument_ids, depth)?
+                {
+                    return Ok(rendered);
+                }
+                let what = format!(
+                    "the host binding `{name}`{}",
+                    match binding {
+                        Some(ExternBinding::Function { symbol, .. }) => format!(" (`{symbol}`)"),
+                        _ => String::new(),
+                    }
+                );
+                self.host_gap(what, span)
             }
         }
     }
@@ -5772,6 +6047,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Intrinsic::HashEq => {
                 format!("vilan_rt::hashes_equal(&{}, &{})", next(), next())
             }
+            // F18 slice 2: `std::json`'s six intrinsics — the four walkers, the
+            // normalized kind, and the guarded parse. Each is one method on
+            // `vilan_rt::json::JsonValue`, whose doc comment names the JS
+            // helper it is the twin of. `kind` answers a `str` because
+            // `JsonKind` is a BACKED enum and a backed enum IS its backing
+            // value on both backends.
+            Intrinsic::JsonField => format!("({}).field(&{})", next(), next()),
+            Intrinsic::JsonTag => format!("({}).tag()", next()),
+            Intrinsic::JsonElements => format!("({}).elements()", next()),
+            Intrinsic::JsonIsNull => format!("({}).is_null()", next()),
+            Intrinsic::JsonKind => format!("({}).kind()", next()),
+            Intrinsic::TryParseJson => format!("vilan_rt::json::try_parse(&{})", next()),
             other => return self.host_gap(format!("the intrinsic `{other:?}`"), span),
         };
         Ok(rendered)
@@ -5785,6 +6072,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
 enum NativeDispatch {
     Intrinsic(Intrinsic),
     Call(String),
+    /// An `external fun` member: the DECLARATION's id, resolved against the
+    /// host tables at [`Emitter::emit_dispatch`] where the call's arguments are
+    /// in hand.
+    Host(Id),
 }
 
 /// Whether an intrinsic MUTATES the value its receiver names — the set whose
@@ -5858,6 +6149,18 @@ fn http_host_type(name: &str) -> Option<&'static str> {
         "Bytes" => "vilan_rt::http::Bytes",
         _ => return None,
     })
+}
+
+/// F18 slice 2: the vilan type one `[extern("Number")]` JSON coercion labels
+/// its result with, as a Rust scalar.
+///
+/// A table rather than a parse of the name's suffix, because `i53`/`u53` are
+/// `i64`/`u64` natively and a suffix read would mint a type that does not
+/// exist. The names are `std::json`'s own; [`scalar_type`] is the same mapping
+/// for a type POSITION and this is it for a coercion's RESULT.
+fn json_coercion_target(name: &str) -> Option<&'static str> {
+    let labelled = name.strip_prefix("coerce_")?;
+    scalar_type(labelled).filter(|rendered| *rendered != "vilan_rt::Str")
 }
 
 /// One census row from a refusal: the construct, without the boilerplate

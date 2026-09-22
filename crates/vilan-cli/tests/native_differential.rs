@@ -60,6 +60,15 @@ use std::process::Command;
 /// binding read and WRITTEN plus B105's hoist (`compound-index.vl`), and a
 /// string literal's escapes (`interpolated-multiline-string.vl` — the class
 /// S1a got wrong for every escape there is).
+///
+/// F18 slice 2 adds the two JSON rows: `derive-json.vl` (a `[derive(Json)]`
+/// struct in both directions, a nested struct, a missing field and a
+/// wrong-typed one) and `json-roundtrip.vl` (the `List`/`Option` blankets,
+/// which reach a scalar's `[extern("JSON.stringify")]` member through a
+/// generic dispatch). They were refused for four separate reasons before
+/// `vilan_rt::json` existed, and every one of them is a row of the slice: the
+/// host type, the six intrinsics, the `!` assertion the derived decoders are
+/// written in, and a capturing `is`-test to the left of `&&`.
 const DEFAULT_SUITE: &[&str] = &[
     "bool.vl",
     "recursion.vl",
@@ -77,6 +86,8 @@ const DEFAULT_SUITE: &[&str] = &[
     "mut-parameters.vl",
     "compound-index.vl",
     "interpolated-multiline-string.vl",
+    "derive-json.vl",
+    "json-roundtrip.vl",
 ];
 
 /// The corpus's ASYNC programs (tracker J6, lane native-b-38).
