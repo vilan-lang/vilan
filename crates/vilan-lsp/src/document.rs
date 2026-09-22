@@ -12233,13 +12233,50 @@ pub(crate) mod tests {
     /// The hover text at the cursor marked `|` in `src` (a bare manifest-less
     /// file, like `completions_at_cursor` — keep the sources closure-free, the
     /// marker would collide with closure pipes).
+    ///
+    /// N114: the helper REFUSES a fixture with a second `|`, and that guard is
+    /// the point of it. `replace('|', "")` strips every pipe, not just the
+    /// marker, so a fixture carrying a closure type or a union-shaped comment
+    /// was analyzed as a DIFFERENT program from the one written in the test —
+    /// `fun with_owner(body: (|| void) context owner_scope)` became
+    /// `fun with_owner(body: ( void) context owner_scope)`, and E9's pin on the
+    /// rendered clause passed by asserting a string only the stale append E207
+    /// had deleted could produce. That is a pin that reads as coverage and is
+    /// not. A fixture that needs a pipe of its own takes
+    /// [`hover_at_marker`](hover_at_marker) and picks a marker character
+    /// instead; the panic below names the fixture so the swap is one edit.
     fn hover_at_cursor(src: &str) -> Option<String> {
+        let markers = src.matches('|').count();
+        assert_eq!(
+            markers, 1,
+            "a `hover_at_cursor` fixture carries EXACTLY ONE `|`, the cursor — \
+             this one carries {markers}, and every one of them is stripped \
+             before the analysis, so the program analyzed is not the program \
+             written. Use `hover_at_marker(src, '¦')` for a fixture with pipes \
+             of its own. The fixture: {src:?}"
+        );
         let offset = src
             .find('|')
             .expect("test source needs a `|` cursor marker");
         let text = src.replace('|', "");
         let document = Document::analyze(&text, &std_root(), Path::new("test.vl"));
         document.hover(offset)
+    }
+
+    /// N114's guard, shown to fire: the mangling fixture — E9's own, as it was
+    /// written before the pin moved to `hover_at_marker` — is refused by the
+    /// helper rather than silently analyzed with its closure type flattened.
+    ///
+    /// Non-vacuous by construction: the same fixture with its closure type
+    /// removed carries one pipe and passes through, which is the `assert_eq!`
+    /// above discriminating on the count rather than on the shape.
+    #[test]
+    #[should_panic(expected = "carries EXACTLY ONE `|`")]
+    fn n114_a_fixture_with_a_second_pipe_is_refused_by_the_helper() {
+        let _ = hover_at_cursor(
+            "import std::reactive::{ owner_scope, Owner };\n\nfun with_o|wner(body: (|| void) \
+             context owner_scope) {\n\tlet _b = body;\n}\n\nfun main() {}\n",
+        );
     }
 
     // --- E128: `Self` in a TRAIT declaration renders as `Self` ---------------
