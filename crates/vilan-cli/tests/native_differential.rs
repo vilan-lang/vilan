@@ -91,6 +91,12 @@ use std::process::Command;
 /// 39 caught the narrowing miscompile behind them (`9007199254740993n` had been
 /// emitting `…993i32`). They print `1n` and `3n` on both backends now, which is
 /// the whole of what the `i128` ruling claims.
+///
+/// A124 R3 adds `dyn-objects.vl`: trait objects on both backends — a
+/// heterogeneous `List` behind a struct field, a supertrait member and a
+/// parameterized trait through the table, a blanket and a generic over the
+/// bound, printing a struct that holds one (`[ value, {} ]` on both sides),
+/// and a cold node over a `dyn Source<i32>` notified through its upstream.
 const DEFAULT_SUITE: &[&str] = &[
     "bool.vl",
     "recursion.vl",
@@ -117,6 +123,7 @@ const DEFAULT_SUITE: &[&str] = &[
     // projection in it is matched where it is built, which is the position the
     // payload view is carried through.
     "option-view.vl",
+    "dyn-objects.vl",
 ];
 
 /// The corpus's ASYNC programs (tracker J6, lane native-b-38).
@@ -1690,6 +1697,75 @@ const PRINT_FUNCTION_PROBE: &str = concat!(
     "\tlet f = |x: i32| x + 1;\n",
     "\tprint(f);\n",
     "}\n",
+);
+
+/// A124 R3: the two object shapes the native backend does not lower are
+/// refused BY NAME, and the JS backend builds both — so each refusal is the
+/// native answer, not a broken probe. A `&mut self` slot would write through a
+/// counted pointer every copy of the object shares (the JS backend copies the
+/// pair instead); an async member's slot would answer a future no object slot
+/// is built to carry.
+#[test]
+fn an_object_the_native_backend_cannot_lower_is_refused_by_name() {
+    let staged = stage();
+    for (file, source, needle) in [
+        (
+            "native_probe_dyn_mut.vl",
+            DYN_MUT_SELF_PROBE,
+            "`Counter::bump` through a `dyn` object (a `&mut self` slot",
+        ),
+        (
+            "native_probe_dyn_async.vl",
+            DYN_ASYNC_PROBE,
+            "the async member `Fetch::get` through a `dyn` object",
+        ),
+    ] {
+        std::fs::write(staged.join(file), source).expect("write the probe program");
+        let output = vilan(&staged)
+            .args(["build", "--backend", "rust", "--stdout", file])
+            .output()
+            .expect("build the probe");
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{file} must be refused rather than built"
+        );
+        assert!(
+            message.contains(needle),
+            "{file} must be refused by name (`{needle}`); it said:\n{message}"
+        );
+        let javascript = vilan(&staged)
+            .args(["build", file])
+            .output()
+            .expect("build the probe on the JS backend");
+        assert!(
+            javascript.status.success(),
+            "{file} must be a program the JS backend accepts:\n{}",
+            String::from_utf8_lossy(&javascript.stderr)
+        );
+    }
+}
+
+const DYN_MUT_SELF_PROBE: &str = concat!(
+    "trait Counter { fun get(self): i32; fun bump(&mut self): void; }\n",
+    "struct C { n: i32 }\n",
+    "impl C with Counter {\n",
+    "\tfun get(self): i32 { self.n }\n",
+    "\tfun bump(&mut self): void { self.n = self.n + 1; }\n",
+    "}\n",
+    "fun main() {\n",
+    "\tmut a: dyn Counter = C { n = 1 };\n",
+    "\ta.bump();\n",
+    "\tprint(a.get());\n",
+    "}\n",
+);
+
+const DYN_ASYNC_PROBE: &str = concat!(
+    "trait Fetch { async fun get(self): str; }\n",
+    "struct Local { u: str }\n",
+    "impl Local with Fetch { fun get(self): str { \"local\" } }\n",
+    "fun show(f: dyn Fetch) { print(f.get()); }\n",
+    "fun main() { show(Local { u = \"b\" }); }\n",
 );
 
 /// S1b's monomorphisation, held to the shape rather than to one program: a
