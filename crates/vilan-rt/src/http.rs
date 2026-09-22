@@ -46,6 +46,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::executor::{Boxed, IoSource, register_io, spawn};
+use crate::json::JsonValue;
 use crate::{Js, Str, str_new};
 
 /// One read of a connection. 8 KiB is node's own default highWaterMark for a
@@ -89,6 +90,44 @@ impl Bytes {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// `bytes.at(index)` — `std::bytes`'s `get`/`get_u32`.
+    ///
+    /// JavaScript's `at` answers `undefined` out of range, and the vilan
+    /// signature types the result an integer, so there is no `undefined` to
+    /// hand back: `0` is the answer, and `std::bytes` documents the index as
+    /// the caller's contract exactly as `str::code_at` does. A NEGATIVE index
+    /// counts from the end there, and does here.
+    pub fn at(&self, index: i32) -> i32 {
+        let length = self.0.len() as i64;
+        let resolved = if index < 0 {
+            length + index as i64
+        } else {
+            index as i64
+        };
+        if resolved < 0 || resolved >= length {
+            return 0;
+        }
+        self.0[resolved as usize] as i32
+    }
+
+    /// `bytes.slice(from, to)` — a COPY of the half-open range, with
+    /// JavaScript's clamping: an out-of-range bound is pulled to the nearest
+    /// end and a reversed pair answers empty (which is where `slice` differs
+    /// from `str::substring`, whose host swaps them).
+    pub fn slice(&self, from: i32, to: i32) -> Bytes {
+        let length = self.0.len() as i64;
+        let resolve = |index: i32| {
+            let index = index as i64;
+            if index < 0 { length + index } else { index }.clamp(0, length) as usize
+        };
+        let start = resolve(from);
+        let end = resolve(to);
+        if end <= start {
+            return Bytes::from_vec(Vec::new());
+        }
+        Bytes::from_vec(self.0[start..end].to_vec())
+    }
 }
 
 impl Js for Bytes {
@@ -119,6 +158,54 @@ impl crate::Json for Bytes {
         }
         out.push('}');
         out
+    }
+}
+
+/// `TextDecoder` / `TextEncoder` — `std::bytes`'s two host classes.
+///
+/// They live beside [`Bytes`] for the reason [`Bytes`] lives here: the HTTP
+/// surface is what first needs them (`Request::body` decodes the collected
+/// body). Both are unit structs because both host classes are stateless for
+/// the one encoding vilan has — a vilan `str` is UTF-8, so `new TextDecoder()`
+/// carries nothing a native twin has to keep.
+///
+/// **Decoding is LOSSY, as the host's is.** `new TextDecoder()` without
+/// `{ fatal: true }` replaces malformed input with U+FFFD rather than
+/// throwing, and `std::bytes` constructs it exactly that way — so
+/// `from_utf8_lossy` is the same function, not a shortcut past an error.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct TextDecoder;
+
+impl TextDecoder {
+    pub fn decode(&self, bytes: &Bytes) -> Str {
+        str_new(&String::from_utf8_lossy(bytes.as_slice()))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct TextEncoder;
+
+impl TextEncoder {
+    pub fn encode(&self, text: &str) -> Bytes {
+        Bytes::from_vec(text.as_bytes().to_vec())
+    }
+}
+
+impl Js for TextDecoder {
+    fn js(&self) -> String {
+        crate::panic_with(
+            "printing a `TextDecoder` is a host object's own inspection, which the native backend \
+             does not reproduce",
+        )
+    }
+}
+
+impl Js for TextEncoder {
+    fn js(&self) -> String {
+        crate::panic_with(
+            "printing a `TextEncoder` is a host object's own inspection, which the native backend \
+             does not reproduce",
+        )
     }
 }
 
@@ -530,6 +617,19 @@ impl Socket {
         str_new(&self.0.peer)
     }
 
+    /// `socket.remoteAddress` AS the host value `std::http` declares it at
+    /// (`remote_address_raw(self): JsonValue`), which is what its
+    /// `remote_address` flattens: node answers `undefined` on a destroyed
+    /// socket, and the vilan side tests `kind() == String` before coercing.
+    /// `remote_address` above is the same fact already flattened, kept because
+    /// it is what this runtime's own code reads.
+    pub fn remote_address_raw(&self) -> JsonValue {
+        if self.destroyed() {
+            return JsonValue::Undefined;
+        }
+        JsonValue::Text(str_new(&self.0.peer))
+    }
+
     /// `socket.destroy()`.
     pub fn destroy(&self) {
         self.0.destroy();
@@ -603,6 +703,25 @@ impl Request {
     /// The whole body as bytes.
     pub fn bytes(&self) -> Bytes {
         self.0.body.clone()
+    }
+
+    /// `request.headers` — the whole field set as the opaque host object
+    /// `std::http` declares it at, which `Request::header` reads named entries
+    /// out of with `std::json`'s accessors (dynamic property access has no
+    /// plain extern shape, which is why the binding answers a `JsonValue` and
+    /// not a map).
+    ///
+    /// The names are already lowercased and repeats already joined, by the
+    /// parser above, for the reason node lowercases and joins: `Request::header`
+    /// is documented against that shape.
+    pub fn headers(&self) -> JsonValue {
+        JsonValue::object(
+            self.0
+                .fields
+                .iter()
+                .map(|(name, value)| (str_new(name), JsonValue::Text(str_new(value))))
+                .collect(),
+        )
     }
 }
 

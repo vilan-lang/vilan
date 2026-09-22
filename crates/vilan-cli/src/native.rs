@@ -45,6 +45,16 @@ pub fn record_host_gaps(gaps: Vec<String>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = gaps;
 }
 
+/// Whether the last emit reached `std::db`, and so whether the cargo project
+/// written for it depends on `vilan-rt-sqlite` (F18 slice 2; Order 39's R1).
+/// Recorded on the same terms as the two above, for the same reason: the fact
+/// belongs to the COMPILE and the manifest is written after it.
+static REACHES_SQLITE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn record_reaches_sqlite(reaches: bool) {
+    REACHES_SQLITE.store(reaches, Ordering::Relaxed);
+}
+
 /// Where the runtime crate lives (tracker F19).
 ///
 /// THREE roots, in a fixed order, and the order is B346's one-root rule applied
@@ -187,7 +197,11 @@ fn write_project(
         );
         return Err(ExitCode::FAILURE);
     }
-    let manifest = vilan_rust::cargo_manifest(&name, &runtime.to_string_lossy());
+    let manifest = vilan_rust::cargo_manifest(
+        &name,
+        &runtime.to_string_lossy(),
+        REACHES_SQLITE.load(Ordering::Relaxed),
+    );
     if let Err(error) = std::fs::write(directory.join("Cargo.toml"), manifest) {
         eprintln!(
             "{} cannot write the cargo manifest: {error}",

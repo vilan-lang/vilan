@@ -1,0 +1,30 @@
+# `std::db` on the native backend (tracker F18 slice 2; Order 39's R1).
+#
+# SEPARATE from `vilan-rt`, and that separation IS the ruling. `vilan-rt` takes
+# no crates.io dependencies (Order 37's R8), which is what lets `--backend rust`
+# work from a machine carrying nothing but a Rust toolchain — and SQLite does
+# not fit inside that rule the way HTTP/1.1 and JSON did. So the one surface
+# that needs a real dependency lives in its own crate, and the cargo project
+# `vilan build --backend rust` writes depends on it ONLY when the program
+# reaches `std::db`. A program that does not pays nothing: not a build, not a
+# lockfile entry, not the C compile of SQLite's amalgamation.
+#
+# `bundled`, deliberately: the alternative is linking whatever `libsqlite3` the
+# machine happens to carry, which makes a native build's behaviour depend on
+# the host's system packages — the opposite of what a self-contained binary is
+# for. The price is one C compile, cached by cargo like any other.
+[package]
+name = "vilan-rt-sqlite"
+version = "0.40.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "The SQLite half of the runtime for programs the vilan compiler emits as Rust."
+publish = false
+
+[dependencies]
+vilan-rt = { path = "../vilan-rt" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# The workspace clippy exception list (root Cargo.toml, backlog N21).
+[lints]
+workspace = true

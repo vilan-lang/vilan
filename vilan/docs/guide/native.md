@@ -65,6 +65,18 @@ language promises, and a program that round-trips through both backends behaves
 the same only inside that range. Every other numeric type is its own width on
 both backends.
 
+**`BigInt` is an `i128` here, and that is a limit rather than a promise.** On
+the JS backend a `BigInt` is arbitrary precision; natively it is a 128-bit
+signed integer — ±170,141,183,460,469,231,731,687,303,715,884,105,727 — because
+the runtime this backend links against takes no dependencies and so has no
+bignum to lower one to. The limit is enforced at both ends rather than papered
+over: a literal past it is **refused at compile time**, naming the value and the
+range, and an operation that leaves the range **traps at run time** with the
+same sentence instead of wrapping to a wrong number. Inside the range the two
+backends agree exactly, printing included — node writes a `BigInt` with its
+suffix, so `7n / 2n` is `3n` on both. If you need arbitrary precision as the
+SUBJECT of a program — RSA, a big factorial — that is the JS backend today.
+
 ## Where the emitted Rust goes
 
 `dist/native/<entry>/`, with `src/main.rs` the emitted program and `Cargo.toml`

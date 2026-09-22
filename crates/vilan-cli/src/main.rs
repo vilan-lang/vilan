@@ -6883,6 +6883,7 @@ fn compile_to_js(
                     vilan_rust::emit(&program, options).map(|emitted| {
                         native::record_boxed_bindings(emitted.boxed_bindings);
                         native::record_host_gaps(emitted.host_gaps);
+                        native::record_reaches_sqlite(emitted.reaches_sqlite);
                         emitted.source
                     })
                 }

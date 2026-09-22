@@ -15,6 +15,10 @@ members = [
     # a path dependency on this directory.
     "crates/vilan-rust",
     "crates/vilan-rt",
+    # F18 slice 2, Order 39's R1: the ONE runtime surface that needs a crates.io
+    # dependency (SQLite) lives apart from the dependency-free `vilan-rt`, and a
+    # program that does not reach `std::db` never links it.
+    "crates/vilan-rt-sqlite",
 ]
 
 # The clippy gate's exception list (backlog N21). `cargo clippy --workspace

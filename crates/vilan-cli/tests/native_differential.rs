@@ -76,6 +76,21 @@ use std::process::Command;
 /// binding read and WRITTEN plus B105's hoist (`compound-index.vl`), and a
 /// string literal's escapes (`interpolated-multiline-string.vl` — the class
 /// S1a got wrong for every escape there is).
+///
+/// F18 slice 2 adds the two JSON rows: `derive-json.vl` (a `[derive(Json)]`
+/// struct in both directions, a nested struct, a missing field and a
+/// wrong-typed one) and `json-roundtrip.vl` (the `List`/`Option` blankets,
+/// which reach a scalar's `[extern("JSON.stringify")]` member through a
+/// generic dispatch). They were refused for four separate reasons before
+/// `vilan_rt::json` existed, and every one of them is a row of the slice: the
+/// host type, the six intrinsics, the `!` assertion the derived decoders are
+/// written in, and a capturing `is`-test to the left of `&&`.
+///
+/// F32 adds the two `BigInt` rows. `remainder.vl` and `numeric-types.vl` are
+/// the corpus's only `n` literals, and both were refused by name after Order
+/// 39 caught the narrowing miscompile behind them (`9007199254740993n` had been
+/// emitting `…993i32`). They print `1n` and `3n` on both backends now, which is
+/// the whole of what the `i128` ruling claims.
 const DEFAULT_SUITE: &[&str] = &[
     "bool.vl",
     "recursion.vl",
@@ -93,6 +108,10 @@ const DEFAULT_SUITE: &[&str] = &[
     "mut-parameters.vl",
     "compound-index.vl",
     "interpolated-multiline-string.vl",
+    "derive-json.vl",
+    "json-roundtrip.vl",
+    "remainder.vl",
+    "numeric-types.vl",
 ];
 
 /// The corpus's ASYNC programs (tracker J6, lane native-b-38).
@@ -952,8 +971,228 @@ fn a_native_std_http_server_answers_a_get_over_a_real_socket() {
     );
 }
 
+/// **F18 slice 2's EXIT**: a program with the SHAPE of kolt's server leg —
+/// a SQLite store, a hashed password, an `/api/login` route that decodes a POST
+/// body and answers a `[derive(Json)]` outcome, and a shell for every other
+/// path — runs as a native binary and answers a login over a real socket.
+///
+/// **Why a shape and not the file.** Kolt is read-only for this tree and is
+/// never copied into it; what is reproduced is the STRUCTURE the slice had to
+/// carry, which is what the exit is measuring. Everything the slice built is on
+/// the path: `std::json` (the derived encode, and `List<str>::from_json` over
+/// the request body), `std::db` through the separate `vilan-rt-sqlite` crate,
+/// `std::crypto`'s SHA-256, `Bytes` and `TextDecoder`, `std::http` over a real
+/// socket, and a `for` over an `Iterator` impl (`Bytes::to_hex` walks a
+/// `Range`).
+///
+/// **What is compared.** Three exchanges, each byte for byte on both legs: a
+/// good login, a bad one, and the shell — status line, the header the program
+/// set, `Content-Length` and the body. NOT compared, for Order 39's reasons
+/// written at [`a_native_std_http_server_answers_a_get_over_a_real_socket`]:
+/// node's `Date`, and the order the two write `Connection`/`Content-Length`.
+///
+/// **Non-vacuous by its content, not by its exit code.** The bodies are
+/// asserted verbatim, and the two logins differ only in the password — so a
+/// server that answered a constant, or one whose hash comparison always held,
+/// fails on the second exchange.
+#[test]
+fn the_kolt_server_shape_answers_a_login_over_a_real_socket() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_kolt.vl"), KOLT_SHAPE_PROBE)
+        .expect("write the probe program");
+
+    let built = vilan(&staged)
+        .args(["build", "--backend", "rust", "native_probe_kolt.vl"])
+        .output()
+        .expect("build the server natively");
+    assert!(
+        built.status.success(),
+        "the native leg did not build:\n{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    // Order 39's R1, asserted rather than assumed: the SQLite crate is named by
+    // the manifest of a program that reaches `std::db`.
+    let manifest = std::fs::read_to_string(
+        staged
+            .join("dist")
+            .join("native")
+            .join("native_probe_kolt")
+            .join("Cargo.toml"),
+    )
+    .expect("read the generated manifest");
+    assert!(
+        manifest.contains("vilan-rt-sqlite"),
+        "a program reaching `std::db` depends on the SQLite crate:\n{manifest}"
+    );
+    let binary = String::from_utf8_lossy(&built.stdout)
+        .lines()
+        .find_map(|line| line.split(" -> ").nth(1).map(str::to_string))
+        .expect("`vilan build` says where the binary is");
+    let native = ServedLogin::take(Command::new(staged.join(&binary)));
+
+    let bundled = vilan(&staged)
+        .args(["build", "native_probe_kolt.vl"])
+        .output()
+        .expect("build the server for node");
+    assert!(
+        bundled.status.success(),
+        "the JS leg did not build:\n{}",
+        String::from_utf8_lossy(&bundled.stderr)
+    );
+    let mut node = Command::new("node");
+    node.current_dir(&staged).arg("native_probe_kolt.mjs");
+    let javascript = ServedLogin::take(node);
+
+    assert_eq!(
+        native.exchanges, javascript.exchanges,
+        "the two backends must answer the same three exchanges"
+    );
+    let expected = [
+        (
+            "HTTP/1.1 200 OK",
+            "Content-Type: application/json",
+            "{\"ok\":true,\"message\":\"welcome ada\"}",
+        ),
+        (
+            "HTTP/1.1 200 OK",
+            "Content-Type: application/json",
+            "{\"ok\":false,\"message\":\"wrong password\"}",
+        ),
+        (
+            "HTTP/1.1 200 OK",
+            "Content-Type: text/html",
+            "<!doctype html><title>shape</title>",
+        ),
+    ];
+    for (answered, (status, header, body)) in native.exchanges.iter().zip(expected) {
+        assert_eq!(answered.status, status);
+        assert_eq!(answered.body, body);
+        assert!(
+            answered.headers.iter().any(|line| line == header),
+            "the program's header must reach the wire: {:?}",
+            answered.headers
+        );
+        assert!(
+            answered
+                .headers
+                .iter()
+                .any(|line| line == &format!("Content-Length: {}", body.len())),
+            "a buffered body declares its length: {:?}",
+            answered.headers
+        );
+    }
+}
+
+const KOLT_SHAPE_PROBE: &str = concat!(
+    "// THE SHAPE of kolt's server leg (`src/server.vl` + the `KoltAuth` half of\n",
+    "// `src/store.vl`), written here from scratch: one `Server` over a SQLite\n",
+    "// store, an `/api/login` route that reads a POST body, checks a password\n",
+    "// against a hashed row and answers a `[derive(Json)]` outcome, and a shell\n",
+    "// for every other path. Kolt's own files are never copied into this tree.\n",
+    "import std::bytes::encode_utf8;\n",
+    "import std::crypto::sha256;\n",
+    "import std::db::Database;\n",
+    "import std::http::{ Request, Response, Server };\n",
+    "import std::io::print;\n",
+    "import std::json::{ FromJson, Json };\n",
+    "import std::option::Option::None;\n",
+    "\n",
+    "[derive(Json)]\n",
+    "struct LoginOutcome {\n",
+    "\tok: bool,\n",
+    "\tmessage: str,\n",
+    "}\n",
+    "\n",
+    "let store = open_store();\n",
+    "\n",
+    "fun open_store(): Database {\n",
+    "\tlet db = Database::open(\":memory:\");\n",
+    "\tdb.exec(\"CREATE TABLE account (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, hash TEXT NOT NULL)\");\n",
+    "\tdb\n",
+    "}\n",
+    "\n",
+    "async fun hash_password(username: str, password: str): str {\n",
+    "\t// Kolt hashes with node:crypto's PBKDF2; the SHAPE is the same — a salted\n",
+    "\t// digest of the password, stored beside the account.\n",
+    "\tsha256(encode_utf8(username + \":\" + password)).to_hex()\n",
+    "}\n",
+    "\n",
+    "async fun register(username: str, password: str): LoginOutcome {\n",
+    "\tlet hashed = hash_password(username, password);\n",
+    "\tstore.prepare(\"INSERT INTO account (username, hash) VALUES (?, ?)\").run([username, hashed]);\n",
+    "\tLoginOutcome { ok = true, message = \"registered\" }\n",
+    "}\n",
+    "\n",
+    "async fun login(username: str, password: str): LoginOutcome {\n",
+    "\tlet hashed = hash_password(username, password);\n",
+    "\tmatch store.prepare(\"SELECT hash FROM account WHERE username = ?\").first([username]) {\n",
+    "\t\tSome(let row) => if row.text(\"hash\") == hashed {\n",
+    "\t\t\tLoginOutcome { ok = true, message = \"welcome \" + username }\n",
+    "\t\t} else {\n",
+    "\t\t\tLoginOutcome { ok = false, message = \"wrong password\" }\n",
+    "\t\t},\n",
+    "\t\tNone => LoginOutcome { ok = false, message = \"no such account\" },\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "async fun main() {\n",
+    "\tregister(\"ada\", \"lovelace1\");\n",
+    "\tlet server = Server {\n",
+    "\t\tport = 0,\n",
+    "\t\trequest_handler = |request| answer(request),\n",
+    "\t\ton_start = |started| print(i\"vilan-test-port={started.port()}\"),\n",
+    "\t\ton_stop = |stopped| {},\n",
+    "\t\tupgrade_handler = None,\n",
+    "\t\tnode = None,\n",
+    "\t};\n",
+    "\tserver.start();\n",
+    "}\n",
+    "\n",
+    "async fun answer(request: Request): Response {\n",
+    "\tif request.path() == \"/api/login\" && request.method() == \"POST\" {\n",
+    "\t\tlet pair = List<str>::from_json(request.body()).unwrap_or([]);\n",
+    "\t\tlet outcome = if pair.len() == 2 {\n",
+    "\t\t\tlogin(pair.get(0).unwrap_or(\"\"), pair.get(1).unwrap_or(\"\"))\n",
+    "\t\t} else {\n",
+    "\t\t\tLoginOutcome { ok = false, message = \"malformed call\" }\n",
+    "\t\t};\n",
+    "\t\tret Response::builder()\n",
+    "\t\t\t.set_header(\"Content-Type\", \"application/json\")\n",
+    "\t\t\t.body(outcome.to_json())\n",
+    "\t\t\t.build();\n",
+    "\t}\n",
+    "\tResponse::builder()\n",
+    "\t\t.set_header(\"Content-Type\", \"text/html\")\n",
+    "\t\t.body(\"<!doctype html><title>shape</title>\")\n",
+    "\t\t.build()\n",
+    "}\n",
+);
+
+/// The three exchanges the exit drives, over one spawned server.
+struct ServedLogin {
+    exchanges: Vec<ServedRequest>,
+}
+
+impl ServedLogin {
+    fn take(mut command: Command) -> ServedLogin {
+        let server = ServerUnderTest::spawn(&mut command);
+        let port = server.port();
+        let exchanges = [
+            ("POST", "/api/login", "[\"ada\",\"lovelace1\"]"),
+            ("POST", "/api/login", "[\"ada\",\"wrong\"]"),
+            ("GET", "/", ""),
+        ]
+        .into_iter()
+        .map(|(method, path, body)| ServedRequest::exchange(port, method, path, body))
+        .collect();
+        ServedLogin { exchanges }
+    }
+}
+
 /// One request answered by a spawned server, and the pieces of the answer the
 /// two backends can be held to.
+#[derive(Debug, PartialEq, Eq)]
 struct ServedRequest {
     status: String,
     headers: Vec<String>,
@@ -962,6 +1201,51 @@ struct ServedRequest {
 }
 
 impl ServedRequest {
+    /// One request to an ALREADY-RUNNING server, so a test can drive several
+    /// over one process. The body carries a `Content-Length`, which is the
+    /// only framing `vilan_rt::http` accepts on the way in (a chunked request
+    /// is refused with `411`, by design).
+    ///
+    /// `announced_line` is empty here: it belongs to the server, and a caller
+    /// driving several exchanges has it from the spawn.
+    fn exchange(port: u16, method: &str, path: &str, body: &str) -> ServedRequest {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
+            .expect("connect to the port the server announced");
+        stream
+            .write_all(
+                format!(
+                    "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .expect("send the request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("read the response");
+        let (head, body) = response
+            .split_once("\r\n\r\n")
+            .unwrap_or_else(|| panic!("a response with a head and a body, got {response:?}"));
+        let mut lines = head.split("\r\n");
+        let status = lines.next().unwrap_or_default().to_string();
+        ServedRequest {
+            status,
+            // node adds a `Date` of its own and the two backends order
+            // `Connection`/`Content-Length` differently; both are dropped here
+            // so the two legs can be compared whole. See the exit's own
+            // comment for why that is written down rather than normalised
+            // away silently.
+            headers: lines
+                .filter(|line| !line.starts_with("Date:") && !line.starts_with("Connection:"))
+                .map(str::to_string)
+                .collect(),
+            body: body.to_string(),
+            announced_line: String::new(),
+        }
+    }
+
     /// Spawns `command`, waits for the port IT bound, fetches `GET /`, and
     /// reaps the child.
     ///
@@ -1082,6 +1366,166 @@ impl Drop for ServerUnderTest {
 /// Both the synchronous and the `async fun main` paths, because they are two
 /// different emitted shapes: one wraps the body, the other wraps the
 /// `block_on`.
+/// **F32 (RULED (b), Order 40)**: `BigInt` is an `i128` natively, and the limit
+/// is enforced at BOTH ends.
+///
+/// The two corpus programs that hold the inside of the range are in
+/// [`DEFAULT_SUITE`]; this pin is the two edges, which no corpus program can
+/// carry because each one fails on purpose. A literal past `i128` is refused at
+/// COMPILE time naming the value and the range (and the JS backend builds the
+/// same program, which is what makes the refusal a backend limit rather than a
+/// language one). An operation that leaves the range TRAPS at run time with the
+/// same sentence, where the JS backend — arbitrary precision — simply answers
+/// the bigger number; the pin reads both, so a native build that wrapped to a
+/// negative would red.
+#[test]
+fn a_bigint_past_the_native_limit_is_refused_and_an_overflow_traps() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_bigint.vl"), BIGINT_LIMIT_PROBE)
+        .expect("write the probe");
+    let refused = vilan(&staged)
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_bigint.vl",
+        ])
+        .output()
+        .expect("build the literal probe natively");
+    assert!(!refused.status.success(), "the literal must be refused");
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        message.contains("is outside the native backend's range"),
+        "the refusal names the rule: {message}"
+    );
+    assert!(
+        message.contains("170141183460469231731687303715884105728"),
+        "and the value it refused: {message}"
+    );
+    // The same program on the JS backend, where a `BigInt` really is arbitrary
+    // precision — so this is a BACKEND limit and the message is honest.
+    let javascript = vilan(&staged)
+        .args(["run", "native_probe_bigint.vl"])
+        .output()
+        .expect("run the literal probe on the JS backend");
+    assert!(javascript.status.success(), "the JS backend builds it");
+    assert_eq!(
+        String::from_utf8_lossy(&javascript.stdout),
+        "170141183460469231731687303715884105728n\n"
+    );
+
+    std::fs::write(
+        staged.join("native_probe_bigint_trap.vl"),
+        BIGINT_TRAP_PROBE,
+    )
+    .expect("write the trap probe");
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "native_probe_bigint_trap.vl"])
+        .output()
+        .expect("run the trap probe natively");
+    assert!(!native.status.success(), "the overflow ends the program");
+    assert!(
+        String::from_utf8_lossy(&native.stderr).contains("left the native backend's range"),
+        "the trap names the rule: {}",
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "170141183460469231731687303715884105727n\n",
+        "the value INSIDE the range printed first, with node's `n`"
+    );
+    let javascript = vilan(&staged)
+        .args(["run", "native_probe_bigint_trap.vl"])
+        .output()
+        .expect("run the trap probe on the JS backend");
+    assert!(
+        javascript.status.success(),
+        "arbitrary precision does not trap"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&javascript.stdout),
+        "170141183460469231731687303715884105727n\n\
+         170141183460469231731687303715884105728n\n"
+    );
+}
+
+const BIGINT_LIMIT_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(170141183460469231731687303715884105728n);\n",
+    "}\n",
+);
+
+const BIGINT_TRAP_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet near = 170141183460469231731687303715884105727n;\n",
+    "\tprint(near);\n",
+    "\tprint(near + 1n);\n",
+    "}\n",
+);
+
+/// **F18 slice 2**: a closure declared SYNCHRONOUS, answering nothing, whose
+/// body awaits.
+///
+/// node drops the promise such a callback returns — the call site does not
+/// wait, and the body finishes later — so the native backend SPAWNS the body
+/// and the closure answers `()`. `std::http`'s `upgrade_handler` is the shape
+/// this was built for (`|NodeRequest, NodeSocket, Bytes| void`, with A40's
+/// `authorize` hook awaiting inside it).
+///
+/// The pin is the ORDER, which is the whole claim: `before`, `after`, then the
+/// handler's line, because the call returns before the awaited body resumes.
+/// A backend that simply ran the body to completion at the call would print
+/// them in a different order and still "work".
+///
+/// Non-vacuous by its neighbour: `adapt.vl`, whose closures answer a VALUE,
+/// stays refused by name in [`every_async_corpus_program_is_identical_or_named`]
+/// — and the first spelling of the void test floated those three too and was
+/// caught there by `expected i32, found ()`.
+#[test]
+fn a_void_closure_whose_body_awaits_floats_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_float.vl"), FLOAT_PROBE).expect("write the probe");
+    assert_eq!(
+        compare(&staged, "native_probe_float.vl"),
+        Verdict::Identical
+    );
+    let javascript = vilan(&staged)
+        .args(["run", "native_probe_float.vl"])
+        .output()
+        .expect("run the JS backend");
+    assert_eq!(
+        String::from_utf8_lossy(&javascript.stdout),
+        "before\nafter\nhandled 7\n",
+        "the call returns BEFORE the awaited body resumes"
+    );
+}
+
+const FLOAT_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::time::sleep;\n",
+    "\n",
+    "struct Sink {\n",
+    "\ton_event: |i32| void,\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet sink = Sink {\n",
+    "\t\ton_event = |value| {\n",
+    "\t\t\tsleep(1);\n",
+    "\t\t\tprint(i\"handled {value}\");\n",
+    "\t\t},\n",
+    "\t};\n",
+    "\tprint(\"before\");\n",
+    "\t(sink.on_event)(7);\n",
+    "\tprint(\"after\");\n",
+    "}\n",
+);
+
 #[test]
 fn a_failing_program_exits_one_on_both_backends_without_rusts_banner() {
     let staged = stage();

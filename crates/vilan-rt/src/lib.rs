@@ -35,8 +35,11 @@ use std::fmt::Write as _;
 use std::rc;
 use std::rc::Rc;
 
+pub mod crypto;
 pub mod executor;
+pub mod fs;
 pub mod http;
+pub mod json;
 
 // ---------------------------------------------------------------- strings ---
 
@@ -977,6 +980,209 @@ impl<T: Js + std::hash::Hash + Eq + Clone> Js for Set<T> {
 
 // --------------------------------------------------------- canonical keys ---
 
+// ------------------------------------------------------------------- any ---
+
+/// `any` — a value whose vilan type is open at the position it fills.
+///
+/// It exists for ONE shape today and the scope is deliberate: `std::db`'s
+/// `Statement::run(parameters: List<any>)`, where a query's bind list is
+/// heterogeneous by nature (`["ada", 1.5]`) and the schema, not the type
+/// system, says what each slot means. On the JS backend such a list is just a
+/// JS array; natively it needs a value type, and this is the smallest one that
+/// covers what a bind list can hold.
+///
+/// Not a dynamic type system. There is no downcast, no reflection and no
+/// `is`-test over it — a program reads an `any` back through the accessor of
+/// the surface that took it (`Row::text`, `Row::integer`), exactly as it does
+/// on the other backend.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Any {
+    Null,
+    Bool(bool),
+    /// An exact integer. Kept apart from [`Any::Float`] because SQLite's
+    /// INTEGER and REAL are different column types and a parameter's Rust type
+    /// is what decides which one a bind writes.
+    Integer(i64),
+    Float(f64),
+    Text(Str),
+}
+
+macro_rules! any_from_integer {
+    ($($type:ty),*) => {
+        $(impl From<$type> for Any {
+            fn from(value: $type) -> Any {
+                Any::Integer(value as i64)
+            }
+        })*
+    };
+}
+
+any_from_integer!(i8, u8, i16, u16, i32, u32, i64, u64, usize, isize);
+
+impl From<f64> for Any {
+    fn from(value: f64) -> Any {
+        Any::Float(value)
+    }
+}
+
+impl From<f32> for Any {
+    fn from(value: f32) -> Any {
+        Any::Float(value as f64)
+    }
+}
+
+impl From<bool> for Any {
+    fn from(value: bool) -> Any {
+        Any::Bool(value)
+    }
+}
+
+impl From<Str> for Any {
+    fn from(value: Str) -> Any {
+        Any::Text(value)
+    }
+}
+
+impl From<&str> for Any {
+    fn from(value: &str) -> Any {
+        Any::Text(str_new(value))
+    }
+}
+
+impl<T: Into<Any>> From<Option<T>> for Any {
+    fn from(value: Option<T>) -> Any {
+        match value {
+            Some(value) => value.into(),
+            None => Any::Null,
+        }
+    }
+}
+
+impl Js for Any {
+    fn js(&self) -> String {
+        match self {
+            Any::Null => "null".to_string(),
+            Any::Bool(value) => value.js(),
+            Any::Integer(value) => value.js(),
+            Any::Float(value) => value.js(),
+            Any::Text(value) => value.js(),
+        }
+    }
+
+    fn js_nested(&self) -> String {
+        match self {
+            Any::Text(value) => value.js_nested(),
+            other => other.js(),
+        }
+    }
+}
+
+impl Json for Any {
+    fn json(&self) -> String {
+        match self {
+            Any::Null => "null".to_string(),
+            Any::Bool(value) => value.json(),
+            Any::Integer(value) => value.json(),
+            Any::Float(value) => value.json(),
+            Any::Text(value) => value.json(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------- bigint ---
+
+/// `BigInt` — an **`i128`**, which is the native backend's documented LIMIT
+/// (tracker F32, RULED (b) 2026-09-22).
+///
+/// JavaScript's `BigInt` is arbitrary precision and this runtime takes no
+/// dependencies, so there is no bignum to lower one to. The ruling is a limit
+/// rather than a lie: a literal past `i128` is refused at COMPILE time by name,
+/// and an operation that leaves the range TRAPS here rather than wrapping. A
+/// program inside the range behaves identically on both backends, including
+/// its printing — node writes a `BigInt` with the `n` back on (`7n / 2n` is
+/// `3n`, not `3`), which is why this is a newtype and not a bare `i128`.
+///
+/// `i128` covers ±1.7×10^38, which is every hash, id, fixed-point amount and
+/// nanosecond timestamp a program reaches for a `BigInt` to hold. What it does
+/// not cover is arbitrary-precision arithmetic as a SUBJECT — RSA, a big
+/// factorial — and the ruling says so: a bignum lands when a real program asks
+/// for one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct BigInt(pub i128);
+
+/// The one sentence every trapping arm below raises, so a reader meets the
+/// rule and not an arithmetic accident.
+fn bigint_overflow(operation: &str) -> ! {
+    panic_with(&format!(
+        "a `BigInt` {operation} left the native backend's range: `BigInt` is an `i128` \
+         here (±1.7e38), which is F32's documented limit — the JS backend's is \
+         arbitrary precision"
+    ))
+}
+
+impl BigInt {
+    /// `Number(big)` — `std::number`'s `BigInt::as_f64`, which is lossy past
+    /// 2^53 exactly as JavaScript's is.
+    pub fn to_f64(self) -> f64 {
+        self.0 as f64
+    }
+}
+
+impl Js for BigInt {
+    /// node prints a `BigInt` with its suffix, at the top level and nested:
+    /// `console.log(1n)` is `1n` and `console.log([1n])` is `[ 1n ]`.
+    fn js(&self) -> String {
+        format!("{}n", self.0)
+    }
+}
+
+/// `JSON.stringify(1n)` throws a `TypeError` in JavaScript rather than writing
+/// a number, so the twin throws too instead of inventing a rendering.
+impl Json for BigInt {
+    fn json(&self) -> String {
+        panic_with("TypeError: Do not know how to serialize a BigInt")
+    }
+}
+
+macro_rules! bigint_operator {
+    ($($trait:ident, $method:ident, $checked:ident, $what:literal;)*) => {
+        $(impl std::ops::$trait for BigInt {
+            type Output = BigInt;
+            fn $method(self, other: BigInt) -> BigInt {
+                match self.0.$checked(other.0) {
+                    Some(value) => BigInt(value),
+                    None if other.0 == 0 && $what != "addition" && $what != "subtraction"
+                        && $what != "multiplication" =>
+                    {
+                        // JavaScript answers a `RangeError` for `1n / 0n`, which
+                        // is a different failure from leaving the range.
+                        panic_with("RangeError: Division by zero")
+                    }
+                    None => bigint_overflow($what),
+                }
+            }
+        })*
+    };
+}
+
+bigint_operator! {
+    Add, add, checked_add, "addition";
+    Sub, sub, checked_sub, "subtraction";
+    Mul, mul, checked_mul, "multiplication";
+    Div, div, checked_div, "division";
+    Rem, rem, checked_rem, "remainder";
+}
+
+impl std::ops::Neg for BigInt {
+    type Output = BigInt;
+    fn neg(self) -> BigInt {
+        match self.0.checked_neg() {
+            Some(value) => BigInt(value),
+            None => bigint_overflow("negation"),
+        }
+    }
+}
+
 /// `std::hash::Hash` — the opaque canonical key `Hashable` answers (I1,
 /// `proposal/hashable-keys.md`), as the JS backend's `__hash` actually computes
 /// it:
@@ -1500,6 +1706,62 @@ pub fn str_substring(text: &str, start: i32, end: i32) -> Str {
     )
 }
 
+/// `Math.round` — JavaScript's, which rounds a half UP (toward `+∞`) where
+/// Rust's `f64::round` rounds a half AWAY FROM ZERO.
+///
+/// `Math.round(-2.5)` is `-2` and `(-2.5f64).round()` is `-3`. The differential
+/// compares bytes, so the divergence is a wrong answer and not a nuance; this
+/// is the one arm of the `Math` family that cannot be a method call.
+pub fn js_math_round(value: f64) -> f64 {
+    if !value.is_finite() {
+        return value;
+    }
+    let floor = value.floor();
+    if value - floor >= 0.5 {
+        floor + 1.0
+    } else {
+        floor
+    }
+}
+
+/// `Math.sign` — `-1`, `0` or `1`, with `NaN` and both zeros passed THROUGH.
+///
+/// `f64::signum` answers `1.0` for `+0.0` and `-1.0` for `-0.0`, which is a
+/// different function: JavaScript's `Math.sign(0)` is `0`.
+pub fn js_math_sign(value: f64) -> f64 {
+    if value.is_nan() || value == 0.0 {
+        return value;
+    }
+    value.signum()
+}
+
+/// `str::code_at` — JavaScript's `charCodeAt`, which indexes UTF-16 CODE
+/// UNITS, not characters and not bytes.
+///
+/// [`str_len`] counts the same units, so the two agree about what "within
+/// `len()`" means, which is the contract `string.vl` states at the binding.
+/// Out of range is `NaN` in JavaScript, which is not a `u32`; the binding is
+/// declared `u32` and the vilan side documents the index as the caller's
+/// contract, so `0` is the answer here — the one value a hash or a parser
+/// treats as "nothing", and the same thing `NaN | 0` gives on the other side
+/// wherever the result is used arithmetically.
+pub fn str_code_at(text: &str, index: i32) -> u32 {
+    if index < 0 {
+        return 0;
+    }
+    let mut remaining = index as usize;
+    for character in text.chars() {
+        let width = character.len_utf16();
+        if remaining < width {
+            let mut units = [0u16; 2];
+            let encoded = character.encode_utf16(&mut units);
+            return encoded[remaining] as u32;
+        }
+        remaining -= width;
+    }
+    0
+}
+
 pub fn parse_i32(text: &str) -> Option<i32> {
     text.trim().parse::<i32>().ok()
 }
@@ -1511,6 +1773,35 @@ pub fn parse_f64(text: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn math_round_and_math_sign_are_javascripts_and_not_rusts() {
+        // Rust's `round` would answer -3 and -2 here.
+        assert_eq!(js_math_round(-2.5), -2.0);
+        assert_eq!(js_math_round(-1.5), -1.0);
+        assert_eq!(js_math_round(2.5), 3.0);
+        assert_eq!(js_math_round(2.4), 2.0);
+        assert!(js_math_round(f64::NAN).is_nan());
+        // Rust's `signum` would answer 1 and -1 for the two zeros.
+        assert_eq!(js_math_sign(0.0), 0.0);
+        assert_eq!(js_math_sign(-0.0), -0.0);
+        assert_eq!(js_math_sign(-3.0), -1.0);
+        assert_eq!(js_math_sign(3.0), 1.0);
+        assert!(js_math_sign(f64::NAN).is_nan());
+    }
+
+    #[test]
+    fn code_at_indexes_utf16_code_units_the_way_char_code_at_does() {
+        assert_eq!(str_code_at("abc", 0), 97);
+        assert_eq!(str_code_at("abc", 2), 99);
+        // A code point outside the BMP is TWO units, and both are readable —
+        // which is also why `str_len` counts units rather than characters.
+        assert_eq!(str_len("\u{1f600}"), 2);
+        assert_eq!(str_code_at("\u{1f600}", 0), 0xd83d);
+        assert_eq!(str_code_at("\u{1f600}", 1), 0xde00);
+        assert_eq!(str_code_at("abc", 3), 0, "past the end");
+        assert_eq!(str_code_at("abc", -1), 0, "before the start");
+    }
 
     #[test]
     fn numbers_print_the_way_javascript_prints_them() {
