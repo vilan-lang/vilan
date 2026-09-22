@@ -2348,7 +2348,13 @@ fn every_async_corpus_program_is_identical_or_named() {
     // child, and a join that must wait for a child list which GREW while it was
     // draining. If either stops being identical the executor or the emitter's
     // async arms have moved.
-    for required in ["await-postfix.vl", "nursery.vl"] {
+    // F22: `adapt.vl` joins them. It is the corpus's ADAPTED-INSTANCE program
+    // — one `map` called with an async closure at one site and a synchronous
+    // one at another, and a `run` the same way — so it is the pin that this
+    // emitter monomorphises on asyncness as well as on types. Two instances of
+    // each callee come out, one `async fn` and one plain, and the program that
+    // proves it is the one whose two answers must be the same bytes.
+    for required in ["await-postfix.vl", "nursery.vl", "adapt.vl"] {
         assert!(
             identical_programs.iter().any(|program| program == required),
             "{required} must be byte-identical on both backends; the census was:\n{}",

@@ -65,8 +65,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
 use vilan_core::analyzer::{
-    Backing, BackingValue, Expr, ExprIfBranch, ExprMatchLeg, ExprPattern, GenericDispatch,
-    Intrinsic, Program, TryDispatch,
+    AdaptedInstance, Backing, BackingValue, Expr, ExprIfBranch, ExprMatchLeg, ExprPattern,
+    GenericDispatch, Intrinsic, Program, TryDispatch,
 };
 use vilan_core::error::Error;
 use vilan_core::fx::FxHashMap as HashMap;
@@ -350,6 +350,18 @@ struct Emitter<'a, 'src> {
     /// Taken by the call arm that reads it, so only the outermost call of the
     /// subject is affected.
     matching_the_subject: bool,
+    /// F22 (async-polymorphism.md A.1): the ADAPTED INSTANCE being emitted —
+    /// which of the callee's closure parameters arrive async at this instance,
+    /// and the emission decisions the analyzer already made for that pairing.
+    ///
+    /// This emitter monomorphises on TYPES, and asyncness is not one: a callee
+    /// handed an async closure at one call site and a synchronous one at
+    /// another is two functions natively, exactly as it is two on the JS
+    /// backend. The bits are independent of the type substitution, so one
+    /// `AdaptedInstance` serves every type instantiation and the instance key
+    /// carries both.
+    current_adapted_bits: Vec<Id>,
+    current_instance: Option<AdaptedInstance>,
     /// F31: the READS that are their binding's last use in the body they sit
     /// in, so the conservative copy [`Emitter::copy_a_consumed_place_read`]
     /// takes can be downgraded to a move.
@@ -422,6 +434,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             closure_captures: Vec::new(),
             expects_payload_view: None,
             matching_the_subject: false,
+            current_adapted_bits: Vec::new(),
+            current_instance: None,
             last_uses: HashSet::new(),
             liveness_walked: HashSet::new(),
             copies_taken: 0,
@@ -2365,6 +2379,22 @@ impl<'a, 'src> Emitter<'a, 'src> {
         id: Id,
         substitution: &HashMap<TypeId, TypeId>,
     ) -> Result<Reserved, Error> {
+        self.ensure_function_with_bits(id, substitution, &[])
+    }
+
+    /// [`Self::ensure_function`] for an ADAPTED instance (F22): the same
+    /// monomorphisation path, keyed on the async bits as well as the types.
+    ///
+    /// The bits join the type key rather than sitting beside it, so one lookup
+    /// still answers "have I emitted this instance", and a function reached
+    /// with no bits keys exactly as it did before — which is what leaves every
+    /// program that writes no async closure byte-identical.
+    fn ensure_function_with_bits(
+        &mut self,
+        id: Id,
+        substitution: &HashMap<TypeId, TypeId>,
+        bits: &[Id],
+    ) -> Result<Reserved, Error> {
         let function =
             self.program.functions.get(&id).cloned().ok_or_else(|| {
                 unsupported("a call to a function with no body", self.span_of(id))
@@ -2377,10 +2407,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // ([`Self::enter_substitution`]) without keying on them, which is what
         // stops one body per caller.
         let entries: Vec<(TypeId, TypeId)> = self.resolved_entries(substitution);
-        let key: Vec<String> = entries
+        let mut key: Vec<String> = entries
             .iter()
             .map(|(_, type_id)| self.type_key(*type_id))
             .collect();
+        if !bits.is_empty() {
+            key.push(format!(
+                "async({})",
+                bits.iter()
+                    .map(|bit| bit.0.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
         if let Some(reserved) = self.instances.get(&(id, key.clone())) {
             return Ok(Reserved {
                 name: reserved.name.clone(),
@@ -2418,11 +2457,46 @@ impl<'a, 'src> Emitter<'a, 'src> {
         );
 
         let saved = self.enter_substitution(entries);
+        let saved_instance = self.enter_instance(id, bits.to_vec());
         let emitted = self.function_body(&function, span, is_main, &name);
+        self.restore_instance(saved_instance);
         self.current_substitution = saved;
         let out = emitted?;
         self.functions.insert(slot, out);
         Ok(Reserved { name, slot })
+    }
+
+    /// F22: swaps in the adapted-instance context a body is about to be
+    /// emitted under, and answers the one it displaced.
+    fn enter_instance(
+        &mut self,
+        function_id: Id,
+        bits: Vec<Id>,
+    ) -> (Vec<Id>, Option<AdaptedInstance>) {
+        let info = self
+            .program
+            .adapted_instances
+            .get(&(function_id, bits.clone()))
+            .cloned();
+        (
+            std::mem::replace(&mut self.current_adapted_bits, bits),
+            std::mem::replace(&mut self.current_instance, info),
+        )
+    }
+
+    fn restore_instance(&mut self, saved: (Vec<Id>, Option<AdaptedInstance>)) {
+        self.current_adapted_bits = saved.0;
+        self.current_instance = saved.1;
+    }
+
+    /// F22: the async bits the CALLEE of `call_expr_id` must be emitted at, as
+    /// this instance recorded them.
+    fn callee_bits(&self, call_expr_id: Id) -> Vec<Id> {
+        self.current_instance
+            .as_ref()
+            .and_then(|instance| instance.callee_bits.get(&call_expr_id))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// F21: whether this function returns a view inside an enum PAYLOAD, and
@@ -2502,7 +2576,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // J6: asyncness is the INFERRED set, not the declared keyword — a
         // function whose body awaits is async whether or not it says so, and
         // `async_functions` is what the JS emitter reads for the same reason.
-        let is_async = self.program.async_functions.contains(&function.id);
+        // F22: an ADAPTED instance is async because an async closure reached
+        // it, whether or not the declaration says so — the same question the
+        // JS emitter asks of `AdaptedInstance::is_async`.
+        let is_async = self.program.async_functions.contains(&function.id)
+            || self
+                .current_instance
+                .as_ref()
+                .is_some_and(|instance| instance.is_async);
         let mut parameters = Vec::new();
         for parameter_id in &function.parameters {
             parameters.push(self.parameter_declaration(*parameter_id, span)?);
@@ -2715,8 +2796,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ));
         }
         // A parameter declared `async |T| U` (J2's `async_values`, which the
-        // inference also fills for an unannotated binding that holds one).
-        self.expects_async = self.program.async_values.contains(&id);
+        // inference also fills for an unannotated binding that holds one) —
+        // or, F22, one THIS INSTANCE adapts: `fun run(f: || i32)` is declared
+        // synchronous and its adapted instance takes a future-answering
+        // closure, which is the whole of what an adapted instance is.
+        self.expects_async =
+            self.program.async_values.contains(&id) || self.current_adapted_bits.contains(&id);
         let rendered = self.rust_type(parameter.type_id, span);
         self.expects_async = false;
         let rendered = rendered?;
@@ -5036,6 +5121,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // backend, and this emitter monomorphizes on types, of which asyncness
         // is not one.
         let wants_a_future = std::mem::take(&mut self.expects_async_value);
+        // F22: a closure the analyzer marked async UNDER THIS INSTANCE's bits
+        // — `|url| { sleep(1); url.len() }` handed to `map` is one, and the
+        // instance it lands in is the async one.
+        let adapted_async = self
+            .current_instance
+            .as_ref()
+            .is_some_and(|instance| instance.async_closures.contains(&closure_id));
+        let wants_a_future = wants_a_future || adapted_async;
         // F18 slice 2: an inferred-async closure at a position declared
         // SYNCHRONOUS and answering `void` is a FLOATING body, and that is not
         // an adapted instance — it is the shape node has when it drops the
@@ -6367,6 +6460,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
         {
             return true;
         }
+        // F22: this instance's own await set — a call that is awaited BECAUSE
+        // the callee was emitted as an async adapted instance, which the
+        // declaration cannot say.
+        if self
+            .current_instance
+            .as_ref()
+            .is_some_and(|instance| instance.awaited_calls.contains(&call_expr_id))
+        {
+            return true;
+        }
         let Some(call) = self.program.function_calls.get(&call_id) else {
             return false;
         };
@@ -6679,10 +6782,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 span,
             );
         }
-        let name = self.ensure_function(target, &substitution)?.name;
+        // F22: the instance this call must reach — the async bits this
+        // instance recorded for it, which are empty for every call in a
+        // program that writes no async closure.
+        let bits = self.callee_bits(call_expr_id);
+        let name = self
+            .ensure_function_with_bits(target, &substitution, &bits)?
+            .name;
         let mut prelude = String::new();
-        let arguments =
-            self.call_arguments(target, &function_call.argument_ids, depth, &mut prelude)?;
+        let arguments = self.call_arguments_adapting(
+            target,
+            &function_call.argument_ids,
+            depth,
+            &mut prelude,
+            &bits,
+        )?;
         Ok(Self::with_argument_prelude(
             prelude,
             format!("{name}({})", arguments.join(", ")),
@@ -6719,6 +6833,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
         argument_ids: &[Id],
         depth: usize,
         prelude: &mut String,
+    ) -> Result<Vec<String>, Error> {
+        self.call_arguments_adapting(target, argument_ids, depth, prelude, &[])
+    }
+
+    /// [`Self::call_arguments`], told which of the callee's parameters this
+    /// call hands an ASYNC closure (F22).
+    fn call_arguments_adapting(
+        &mut self,
+        target: Id,
+        argument_ids: &[Id],
+        depth: usize,
+        prelude: &mut String,
+        callee_bits: &[Id],
     ) -> Result<Vec<String>, Error> {
         let declared: Vec<vilan_core::analyzer::Parameter<'src>> = self
             .program
@@ -6760,9 +6887,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .map(|parameter| self.concrete(parameter.type_id));
             // A parameter declared `async |T| U` takes a future-answering
             // closure, so a sync literal at the call site is wrapped.
-            self.expects_async_value = declared
-                .get(index)
-                .is_some_and(|parameter| self.program.async_values.contains(&parameter.id));
+            // F22: an argument standing in a parameter this INSTANCE adapts is
+            // a future-answering closure too, which the declaration does not
+            // say (`fun run(f: || i32)` is declared sync and reached with an
+            // async closure at one of its two call sites).
+            self.expects_async_value = declared.get(index).is_some_and(|parameter| {
+                self.program.async_values.contains(&parameter.id)
+                    || callee_bits.contains(&parameter.id)
+            });
             let mut text = if wants_a_place {
                 // The declared type is threaded even for a PLACE, because a
                 // numeric LITERAL at a `&`/`&mut` position still has to be
