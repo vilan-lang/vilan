@@ -280,6 +280,255 @@ fn a_derivation_outside_every_owner_still_tracks_its_source() {
     );
 }
 
+// --- A123: the two DYNAMIC-DEPENDENCY combinators over `Source` --------------
+//
+// `map`/`combine` are static dependencies; `switch` and `and_then` are the
+// dynamic pair — WHICH source the result follows is decided by the current
+// value. Both are blankets written directly over `on_change` rather than as
+// `self.map(select).flatten()`: one derived cell instead of two, and the
+// selector called exactly once per value of the source. The `flatten` pins
+// above are their control — the ownership and detach stories are the same
+// ones, reached through a selector instead of through a held inner.
+
+#[test]
+fn switch_follows_the_source_its_selector_answers_and_detaches_from_the_last() {
+    // The four claims in one run: the initial follow, an inner update reaching
+    // the result, a switch of inner, and the ABANDONED inner no longer driving
+    // it (line four) — then the new inner still does (line five).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+
+        fun main() {
+            let which = Signal::new(0);
+            let first = Signal::new(10);
+            let second = Signal::new(20);
+            let picked = which.switch(|n| if n == 0 { first } else { second });
+            print(picked.get());
+            first.set(11);
+            print(picked.get());
+            which.set(1);
+            print(picked.get());
+            first.set(99);
+            print(picked.get());
+            second.set(21);
+            print(picked.get());
+        }
+
+        main();
+        "#,
+        "10\n11\n20\n20\n21\n",
+    );
+}
+
+#[test]
+fn switch_calls_its_selector_once_per_value_of_the_source() {
+    // The reason this is not `self.map(select).flatten()`: that form evaluates
+    // the selector a SECOND time for the value the derived cell was built from
+    // and orphans the node it answered. One call per value, the initial one
+    // included — three sets, four calls.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell };
+
+        fun main() {
+            let which = Signal::new(0);
+            let first = Signal::new(10);
+            let second = Signal::new(20);
+            let calls: SignalCell<i32> = Signal::new(0);
+            let picked = which.switch(|n| {
+                calls.set(calls.get() + 1);
+                if n == 0 { first } else { second }
+            });
+            print(calls.get());
+            which.set(1);
+            which.set(0);
+            which.set(1);
+            print(calls.get());
+            print(picked.get());
+        }
+
+        main();
+        "#,
+        "1\n4\n20\n",
+    );
+}
+
+#[test]
+fn switch_registers_its_outer_and_live_inner_subscriptions() {
+    // A28's story through a selector: the outer subscription is registered and
+    // whichever inner the selector last answered is deferred, so a disposed
+    // boundary leaves no subscriber behind on the source or on either inner.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Owner, Disposable, owner_scope };
+
+        fun main() {
+            let which = Signal::new(0);
+            let first = Signal::new(10);
+            let second = Signal::new(20);
+            let owner = Owner::new();
+            owner_scope.run(owner, || {
+                let picked = which.switch(|n| if n == 0 { first } else { second });
+                picked.effect(|value| print(value));
+            });
+            which.set(1);
+            owner.dispose();
+            print(which.subscribers.read().len());
+            print(first.subscribers.read().len());
+            print(second.subscribers.read().len());
+        }
+
+        main();
+        "#,
+        "10\n20\n0\n0\n0\n",
+    );
+}
+
+#[test]
+fn and_then_follows_the_selected_source_and_an_outer_none_detaches() {
+    // The Kleisli composition of `Source<Option<T>>`, which is what a model
+    // layer of `SignalCell<Option<T>>` cells composes with: the outer `None`
+    // (nothing selected) and the inner `None` (the followed source has nothing
+    // yet) collapse into one `None`. Line four is the detach — the abandoned
+    // inner's later value does not reach the result — and line six re-follows.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        import std::reactive::{ Signal, SignalCell };
+
+        fun main() {
+            let outer: SignalCell<Option<i32>> = Signal::new(Some(1));
+            let one: SignalCell<Option<i32>> = Signal::new(Some(10));
+            let two: SignalCell<Option<i32>> = Signal::new(None);
+            let followed = outer.and_then(|id| if id == 1 { one } else { two });
+            print(followed.get().unwrap_or(0));
+            outer.set(Some(2));
+            print(followed.get().unwrap_or(0));
+            two.set(Some(20));
+            print(followed.get().unwrap_or(0));
+            outer.set(None);
+            print(followed.get().unwrap_or(0));
+            two.set(Some(99));
+            print(followed.get().unwrap_or(0));
+            outer.set(Some(1));
+            print(followed.get().unwrap_or(0));
+        }
+
+        main();
+        "#,
+        "10\n0\n20\n0\n0\n10\n",
+    );
+}
+
+#[test]
+fn and_then_registers_its_subscriptions_with_the_ambient_owner() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        import std::reactive::{ Signal, SignalCell, Owner, Disposable, owner_scope };
+
+        fun main() {
+            let outer: SignalCell<Option<i32>> = Signal::new(Some(1));
+            let one: SignalCell<Option<i32>> = Signal::new(Some(10));
+            let owner = Owner::new();
+            owner_scope.run(owner, || {
+                let followed = outer.and_then(|id| one);
+                followed.effect(|value| print(value.unwrap_or(0)));
+            });
+            owner.dispose();
+            print(outer.subscribers.read().len());
+            print(one.subscribers.read().len());
+        }
+
+        main();
+        "#,
+        "10\n0\n0\n",
+    );
+}
+
+#[test]
+fn a_switch_is_a_derivation_so_an_effect_reads_its_chain_settled() {
+    // A110 door 2, as a diamond: an effect standing on the ROOT reads a value
+    // two hops away through the switch. Both of `switch`'s attaches are marked
+    // `as_derivation`, so phase 1 pulls the chain to a fixpoint and the effect
+    // reads 21. Drop either mark and the switch's update becomes effect-class:
+    // it runs in the same wave as the watcher, the `map` below it is enqueued
+    // for the NEXT wave, and the effect reads the stale `11`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{
+            FlushPolicy, Owner, Signal, SignalCell, Source, run_with_owner, turn,
+        };
+
+        fun main() {
+            let which: SignalCell<i32> = Signal::new(0);
+            let first: SignalCell<i32> = Signal::new(10);
+            let second: SignalCell<i32> = Signal::new(20);
+            let picked: SignalCell<i32> = which.switch(|n| if n == 0 { first } else { second });
+            let plus: SignalCell<i32> = picked.map(|value| value + 1);
+            let seen: SignalCell<str> = Signal::new("");
+            let watcher = Owner::new();
+            run_with_owner(watcher, || {
+                which.effect_on_change(|value: i32| {
+                    seen.set_with(|log| i"{log}{value}/{plus.get()},");
+                });
+            });
+            turn(FlushPolicy::AtEnd, || {
+                which.set(1);
+            });
+            print(seen.get());
+        }
+
+        main();
+        "#,
+        "1/21,\n",
+    );
+}
+
+#[test]
+fn an_and_then_is_a_derivation_so_an_effect_reads_its_chain_settled() {
+    // The same claim for the `Option` half, same shape, same red when the
+    // marks come off.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, Some, None };
+        import std::reactive::{
+            FlushPolicy, Owner, Signal, SignalCell, Source, run_with_owner, turn,
+        };
+
+        fun main() {
+            let outer: SignalCell<Option<i32>> = Signal::new(Some(1));
+            let one: SignalCell<Option<i32>> = Signal::new(Some(10));
+            let two: SignalCell<Option<i32>> = Signal::new(Some(20));
+            let followed: SignalCell<Option<i32>> = outer.and_then(|id| if id == 1 { one } else { two });
+            let plus: SignalCell<i32> = followed.map(|value| value.unwrap_or(0) + 1);
+            let seen: SignalCell<str> = Signal::new("");
+            let watcher = Owner::new();
+            run_with_owner(watcher, || {
+                outer.effect_on_change(|value: Option<i32>| {
+                    seen.set_with(|log| i"{log}{value.unwrap_or(0)}/{plus.get()},");
+                });
+            });
+            turn(FlushPolicy::AtEnd, || {
+                outer.set(Some(2));
+            });
+            print(seen.get());
+        }
+
+        main();
+        "#,
+        "2/21,\n",
+    );
+}
+
 // --- A29: a disposed session lets its transport forget it --------------------
 
 // `ReactiveClient::new`/`ReactiveServer::new` install an inbound handler that
