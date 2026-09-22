@@ -16,6 +16,8 @@ fun create_element_ns(namespace: str, tag: str): Element   // createElementNS
 fun create_text_node(content: str): Text                   // a fresh text node
 fun query_selector(selector: str): Element
 fun query_selector_all(selector: str): List<Element>
+fun active_element(): Element                              // document.activeElement — who holds focus
+fun is_null(handle: Element): bool                         // the peek a nullable read needs
 fun request_animation_frame(callback: || void)             // requestAnimationFrame
 
 struct DomRect { left: f64, top: f64, width: f64, height: f64 }   // a VALUE, not a handle
@@ -41,6 +43,10 @@ impl Element {
 	fun offset_width(self): f64                        // offsetWidth — laid out, rounded
 	fun offset_height(self): f64                       // offsetHeight
 	fun is_connected(self): bool                       // attached to the document?
+	fun tab_index(self): i32                           // tabIndex — the sequential focus order, per-tag default
+	fun parent(self): Element                          // parentElement — null at the root
+	fun has_attribute(self, name: str): bool           // hasAttribute — a boolean attribute's read
+	fun computed_style(self, name: str): str           // getComputedStyle — the RESOLVED value; forces layout
 	fun contains(self, other: Element): bool           // other is this element or inside it
 	fun query_selector_all(self, selector: str): List<Element>   // scoped to this subtree
 	fun focus(self)                                    // move keyboard focus here
@@ -94,6 +100,7 @@ impl Event {
 	fun code(self): str          // "KeyE", "Digit1", "Escape" — the PHYSICAL key
 	fun target(self): Element    // the node the event was dispatched to
 	fun current_target(self): Element  // the node whose listener is running
+	fun related_target(self): Element  // relatedTarget — where focus went (or came from); null off-document
 	fun target_value(self): str  // event.target.value — the input's text
 	fun target(self): Element    // event.target — what contains() is asked about
 	fun pointer_x(self): f64     // clientX — where the pointer is, in the viewport

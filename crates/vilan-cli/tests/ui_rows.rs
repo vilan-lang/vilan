@@ -3426,3 +3426,128 @@ fn b369_an_inferred_generic_constructor_places_its_slot_in_the_live_tree() {
          its own hole, between the two static siblings; got:\n{stdout}"
     );
 }
+
+// --- A121: the DOM reads a focus scope is written on -------------------------
+//
+// `proposal/focus-scope.md` §7 named the reads `std::dom` did not have, and §8
+// named what the test harness would need before any of them could be pinned.
+// Both landed together, and this is the pin that the HARNESS half is not
+// silently load-bearing: every addition is asserted here through a program
+// that reads it, so a stub that stopped answering reds here rather than
+// leaving a focus walk quietly finding nothing.
+
+/// Every new read at once, over the tree that separates them: a natively
+/// focusable tag beside a bare one (the per-tag `tabIndex` default), a written
+/// `tabindex`, a boolean attribute absent then present, an INHERITED
+/// `visibility: hidden`, the parent link and its null at the root,
+/// `document.activeElement` before and after a focus, and the `focusin` that
+/// focus dispatches — carrying `related_target`, where focus came FROM.
+const FOCUS_READS: &str = r#"import std::dom::{ active_element, create_element, get_element_by_id, is_null, window };
+import std::io::print;
+
+fun main() {
+	let root = get_element_by_id("app");
+	let native = create_element("input");
+	native.set_attribute("tabindex", "3");
+	root.append(native);
+	let plain = create_element("div");
+	plain.set_attribute("tabindex", "7");
+	root.append(plain);
+	let inner = create_element("button");
+	plain.append(inner);
+	let shy = create_element("section");
+	root.append(shy);
+	let shy_child = create_element("input");
+	shy.append(shy_child);
+	shy.set_style_property("visibility", "hidden");
+
+	print(i"tabindex bare={shy.tab_index()} native={inner.tab_index()} written={plain.tab_index()}");
+	print(i"parent of_inner={inner.parent().tab_index()} root_has_none={is_null(root.parent())}");
+	print(i"attribute before={plain.has_attribute("hidden")}");
+	plain.set_attribute("hidden", "");
+	print(i"attribute after={plain.has_attribute("hidden")}");
+	print(i"visibility own={shy.computed_style("visibility")} inherited={shy_child.computed_style("visibility")} elsewhere={native.computed_style("visibility")}");
+	print(i"active before={is_null(active_element())}");
+	native.focus();
+	print(i"active after={active_element().tab_index()}");
+	let _heard = window().listen_capture("focusin", |event| {
+		print(i"focusin at={event.target().tab_index()} from={event.related_target().tab_index()}");
+	});
+	inner.focus();
+	print(i"descendants={root.query_selector_all("*").len()}");
+}
+
+main();
+"#;
+
+#[test]
+fn a121_the_dom_reads_a_focus_scope_needs_answer_off_the_host() {
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("a121_reads", FOCUS_READS, &harness);
+    let line = |key: &str| -> String {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(key))
+            .unwrap_or_else(|| panic!("no {key:?} line in:\n{stdout}"))
+            .to_string()
+    };
+    assert_eq!(
+        line("tabindex "),
+        "tabindex bare=-1 native=0 written=7",
+        "`tab_index` is the attribute reflected with a PER-TAG default: -1 for \
+         a tag that is not focusable, 0 for one that is, the written value \
+         when there is one; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("parent "),
+        "parent of_inner=7 root_has_none=true",
+        "`parent` is the parent ELEMENT, and it is null at the root — which is \
+         where an ancestor walk terminates; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("attribute before="),
+        "attribute before=false",
+        "`has_attribute` reads presence, and the attribute is not there yet; \
+         got:\n{stdout}"
+    );
+    assert_eq!(
+        line("attribute after="),
+        "attribute after=true",
+        "`has_attribute` reads presence — the write is what it sees; \
+         got:\n{stdout}"
+    );
+    assert_eq!(
+        line("visibility "),
+        "visibility own=hidden inherited=hidden elsewhere=visible",
+        "`computed_style` is the RESOLVED value, so `visibility: hidden` \
+         answers for the subtree that inherits it and for nothing else — the \
+         one predicate a 0x0 measurement cannot make, since a hidden element \
+         keeps its box; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("active before="),
+        "active before=true",
+        "`active_element` is null while nothing has focus; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("active after="),
+        "active after=3",
+        "`active_element` names the element that took focus — the read \
+         `matches(\":focus\")` cannot make about a element you do not hold; \
+         got:\n{stdout}"
+    );
+    assert_eq!(
+        line("focusin "),
+        "focusin at=0 from=3",
+        "a focus that takes DISPATCHES `focusin`, in the capture phase a \
+         containment guard listens in, and `related_target` is where focus \
+         came FROM; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("descendants="),
+        "descendants=5",
+        "`query_selector_all(\"*\")` is every DESCENDANT element in document \
+         order — the walk's enumeration, with the predicates left per-element; \
+         got:\n{stdout}"
+    );
+}

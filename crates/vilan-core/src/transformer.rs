@@ -1101,6 +1101,8 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__local_get",
         "__session_get",
         "__dom_window",
+        "__dom_active_element",
+        "__dom_computed_style",
         "__dom_bounding_rect",
         "__dom_query_all",
         "__router_path",
@@ -1349,6 +1351,23 @@ fn helper_source(name: &str) -> &'static str {
         // `__router_path` exists. This is what makes `window` a listen TARGET
         // with the same verbs `Element` carries (`proposal/router.md` §5.1).
         "__dom_window" => "function __dom_window() {\n\treturn window;\n}",
+        // `std::dom::active_element`: the SAME reason `__dom_window` exists —
+        // `document.activeElement` is a global PROPERTY, and the
+        // function-extern form addresses only callables, so
+        // `[extern("document.activeElement")]` emits a CALL to it (A121; the
+        // refusal that says so is `check_global_property_externs`).
+        "__dom_active_element" => {
+            "function __dom_active_element() {\n\treturn document.activeElement;\n}"
+        }
+        // `Element::computed_style`: the RESOLVED value of one property. Two
+        // host calls behind one binding — `getComputedStyle` hands back a live
+        // declaration block and the value is read off it — which is why this
+        // is a helper and not a property path.
+        "__dom_computed_style" => {
+            "function __dom_computed_style(element, name) {\n\
+             \treturn getComputedStyle(element).getPropertyValue(name);\n\
+             }"
+        }
         // `Element::bounding_rect`: ONE `getBoundingClientRect()` (which forces
         // layout) read into the four numbers `std::dom`'s `DomRect` carries.
         // The array IS the struct's runtime form — a struct is an array in

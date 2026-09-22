@@ -99,8 +99,32 @@ class StubElement {
     set hidden(on) { this._hidden = on; }
     get hidden() { return this._hidden; }
     get parentNode() { return this.parent; }
+    // A121: the parent ELEMENT — the step `Element::tabbable`'s ancestor walk
+    // takes. The stub has no `<body>`/`<html>` split, so the document root's
+    // parent is null, which is the rule the walk terminates on.
+    get parentElement() { return this.parent; }
     setAttribute(name, value) { this.attributes[name] = value; notifyMutation(); }
     removeAttribute(name) { delete this.attributes[name]; notifyMutation(); }
+    // A121: presence, which is the whole meaning of a boolean attribute.
+    hasAttribute(name) { return name in this.attributes; }
+    // A121: `tabIndex` is the attribute reflected with a PER-TAG DEFAULT, and
+    // the default is the half a walk cannot do without — `-1` for a bare
+    // `<div>`, `0` for a natively focusable tag. The table is the HTML
+    // specification's focusable set, reduced to the tags a test writes;
+    // `<a>` counts only with an `href`, as in the platform.
+    get tabIndex() {
+        const written = this.attributes.tabindex;
+        if (written !== undefined) {
+            const parsed = Number.parseInt(written, 10);
+            return Number.isNaN(parsed) ? -1 : parsed;
+        }
+        if ("contenteditable" in this.attributes) return 0;
+        const tag = String(this.tagName).toLowerCase();
+        if (tag === "a" || tag === "area") return "href" in this.attributes ? 0 : -1;
+        if (tag === "audio" || tag === "video") return "controls" in this.attributes ? 0 : -1;
+        return ["button", "input", "select", "textarea", "summary", "iframe", "object", "embed"]
+            .includes(tag) ? 0 : -1;
+    }
     appendChild(child) {
         // A DOM insertion SPLICES a document fragment: its children move and
         // the fragment is left empty. A91 builds a row inside one, so this is
@@ -190,7 +214,15 @@ class StubElement {
         const found = [];
         const walk = (node) => {
             for (const child of node.children) {
-                if (child.tagName === selector) found.push(child);
+                // A121: `*` is the UNIVERSAL selector — every descendant
+                // element, in document order. It is not a predicate, which is
+                // why the walk `Element::tabbable` does may be written over it
+                // while its predicates stay per-element reads (the `matches`
+                // below still knows only `:focus`). Text nodes are not
+                // elements and are skipped, as in the DOM.
+                if (selector === "*" ? child.tagName[0] !== "#" : child.tagName === selector) {
+                    found.push(child);
+                }
                 walk(child);
             }
         };
@@ -212,7 +244,24 @@ class StubElement {
     }
     get offsetWidth() { return Math.round(this.getBoundingClientRect().width); }
     get offsetHeight() { return Math.round(this.getBoundingClientRect().height); }
-    focus() { this.focused = true; global.activeElement = this; global.focusLog.push(describe(this)); }
+    // A121: a focus that takes DISPATCHES `focusin` — the event a containment
+    // guard hears, and without it the guard cannot fire at all. The host
+    // dispatches `blur`/`focusout` on the old holder and `focus`/`focusin` on
+    // the new one; the stub models the one a scope listens for, in the phase
+    // it listens in (`dispatchEvent` runs the window's capture listeners
+    // first). `relatedTarget` carries the element focus LEFT, as it does in
+    // the platform, so an S3 `focusout` path reads the same shape.
+    focus() {
+        const previous = global.activeElement;
+        this.focused = true;
+        global.activeElement = this;
+        global.focusLog.push(describe(this));
+        // `global.window` is the dispatch's own precondition: a `focus()` before
+        // `installStubDocument` has no window to run capture listeners on.
+        if (previous !== this && global.window) {
+            dispatchEvent(this, "focusin", { relatedTarget: previous || null });
+        }
+    }
     // `element.matches(":focus")` is how `View::autofocus` reads back whether
     // its request was honored (B271); the stub answers the one selector it is
     // ever asked for.
@@ -429,6 +478,25 @@ function installStubDocument(options = {}) {
             global.historyEntries[global.historyEntries.length - 1] = path;
         },
     };
+    // A121: the resolved style. The stub has no cascade, so a value comes from
+    // the element's own `computedStyle` table when a harness set one, then
+    // from its inline declarations, then from the defaults below — and
+    // `visibility` INHERITS, which is the one cascade rule
+    // `Element::computed_style` exists to read, so it walks up for that
+    // property exactly as the engine's inheritance would.
+    global.computedDefaults = { visibility: "visible", display: "block" };
+    global.getComputedStyle = (element) => ({
+        getPropertyValue(name) {
+            for (let walk = element; walk; walk = walk.parent) {
+                const table = walk.computedStyle;
+                if (table && table[name] !== undefined) return table[name];
+                const inline = walk.style ? walk.style.getPropertyValue(name) : "";
+                if (inline !== "") return inline;
+                if (name !== "visibility") break;
+            }
+            return global.computedDefaults[name] || "";
+        },
+    });
     global.documentRoot = documentRoot;
     global.inDocument = inDocument;
     global.describe = describe;

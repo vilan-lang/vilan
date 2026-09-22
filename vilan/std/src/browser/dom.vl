@@ -263,6 +263,62 @@ impl Element {
 	[extern(get, "isConnected")]
 	external fun is_connected(self): bool;
 
+	/// The element's place in the SEQUENTIAL FOCUS ORDER
+	/// (`element.tabIndex`) — the DOM's own answer to "is this in the tab
+	/// order", and the predicate `tabbable` is written on.
+	///
+	/// It is the ATTRIBUTE reflected with a PER-TAG DEFAULT, which is what
+	/// makes it a whole answer rather than half of one: `-1` for an element
+	/// that is not focusable at all (a bare `<div>`), `0` for one that is
+	/// natively focusable (`<a href>`, `<button>`, `<input>`, `<select>`,
+	/// `<textarea>`, `<summary>`, `[contenteditable]`) or opted in with
+	/// `tabindex="0"`, and the written value otherwise. So a focus walk needs
+	/// no tag table: the host already has one.
+	///
+	/// A NEGATIVE value is the opt-out that KEEPS programmatic focus —
+	/// `tabindex="-1"` is focusable by `focus()` and skipped by Tab, which is
+	/// what `focus_first` writes onto a panel with nothing tabbable inside it.
+	[extern(get, "tabIndex")]
+	external fun tab_index(self): i32;
+
+	/// The element's parent ELEMENT (`element.parentElement`), or null at the
+	/// document's root element — `Text::parent_element`'s twin on an element,
+	/// and the step an ancestor walk takes.
+	///
+	/// `inert` and `hidden` disable a whole SUBTREE, so "can this take focus"
+	/// is never a question about one element; it is answered by walking up. A
+	/// selector cannot express that honestly — `[inert] *` still misses a
+	/// scope root that is itself inside an inert ancestor — which is why
+	/// `tabbable` walks (A121).
+	[extern(get, "parentElement")]
+	external fun parent(self): Element;
+
+	/// Whether the element carries `name` AT ALL
+	/// (`element.hasAttribute(name)`) — the read half of a BOOLEAN attribute,
+	/// whose meaning is presence and not value, and whose write half is the
+	/// `set_attribute` / `remove_attribute` pair. `disabled`, `inert`,
+	/// `hidden`, `open`, `controls`: each is on when the attribute is there,
+	/// whatever it was set to.
+	[extern(method, "hasAttribute")]
+	external fun has_attribute(self, name: str): bool;
+
+	/// One RESOLVED CSS property — what the cascade, the inherited
+	/// declarations and the user agent's own sheet finally say
+	/// (`getComputedStyle(element).getPropertyValue(name)`), where
+	/// `style_property` reads only what THIS element declares inline.
+	///
+	/// The read `visibility: hidden` needs, and the reason it needs one: a
+	/// `visibility: hidden` element KEEPS ITS BOX, so `offset_width` and
+	/// `offset_height` see it as laid out and only the resolved value says
+	/// otherwise. `visibility` INHERITS, so the resolved value answers for a
+	/// hidden ANCESTOR too, with no walk of its own.
+	///
+	/// It FORCES LAYOUT, exactly as `bounding_rect` does, and costs more than
+	/// an attribute read — ask it last, of the elements a cheaper predicate
+	/// has already kept.
+	[extern("__dom_computed_style")]
+	external fun computed_style(self, name: str): str;
+
 	/// Whether `other` IS this element or lies inside it
 	/// (`element.contains(other)`).
 	///
@@ -415,6 +471,30 @@ external struct Window;
 /// form, the same reason `std::router`'s `location.pathname` needs one).
 [extern("__dom_window")]
 external fun window(): Window;
+
+/// `document.activeElement` — the element that currently has focus, or the
+/// document's `<body>` when nothing does. Through a helper for `window()`'s
+/// reason: a global PROPERTY has no function form, and the function-extern
+/// form addresses only callables.
+///
+/// Distinct from `Element::matches(":focus")`, and the difference is worth
+/// knowing both ways round. `:focus` does not match when the DOCUMENT itself
+/// is not focused — another window holds it — while `activeElement` still
+/// names the element focus would return to. "Is the focus still MINE?" is
+/// `:focus`'s question, asked of one element; "where was focus before I
+/// opened?" is this one's, and a scope opened by a keyboard shortcut while
+/// the window was unfocused would remember nothing from `:focus`.
+[extern("__dom_active_element")]
+external fun active_element(): Element;
+
+/// Whether a host handle is JS `null`/`undefined` — the peek the NULLABLE
+/// reads in this module need. `get_element_by_id`, `query_selector`,
+/// `Element::parent` and `Event::related_target` all answer `null` rather
+/// than an `Option` (A24, `fullstack-dx.md` §9.5 — giving them one is a wider
+/// API question, deliberately not taken here), and an ancestor walk has to
+/// stop somewhere: `parent()` at the document's root element is where.
+[extern("__is_null")]
+external fun is_null(handle: Element): bool;
 
 impl Window {
 	/// Registers `handler` to run on `event` (e.g. `"resize"`, `"popstate"`) —
@@ -594,6 +674,18 @@ impl Event {
 	/// the click landed outside it.
 	[extern(get, "target")]
 	external fun target(self): Element;
+
+	/// The event's OTHER element (`event.relatedTarget`) — on a `focusout`,
+	/// where focus WENT; on a `focusin`, where it came FROM. Null when there
+	/// is no other element, which is the case that matters: focus leaving the
+	/// document entirely (to the browser's chrome) reads as null, and a guard
+	/// that pulled focus back there would be yanking it into a page the user
+	/// has left.
+	///
+	/// It is also the `mouseover`/`mouseout` pair's "from where / to where",
+	/// which is the same accessor and the same null rule.
+	[extern(get, "relatedTarget")]
+	external fun related_target(self): Element;
 
 	/// The element whose LISTENER is running (`event.currentTarget`) — the node
 	/// the handler was registered on, as the event bubbles past it.
