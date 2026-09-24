@@ -45,6 +45,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use crate::bytes::Bytes;
 use crate::executor::{Boxed, IoSource, register_io, spawn};
 use crate::json::JsonValue;
 use crate::{Js, Str, str_new};
@@ -60,154 +61,6 @@ const MAX_HEAD: usize = 64 * 1024;
 
 /// The largest body this accepts before answering `413`, for the same reason.
 const MAX_BODY: usize = 16 * 1024 * 1024;
-
-// ------------------------------------------------------------------ bytes ---
-
-/// `Bytes` — `std::bytes`'s host type, which on the JS backend is a
-/// `Uint8Array`. Immutable and refcounted for the same reason [`Str`] is: rule
-/// 1's copy is a refcount bump.
-///
-/// It lives here rather than in a `bytes` module of its own because the HTTP
-/// surface is the first thing that needs one (`Request::bytes`, the response's
-/// binary body, a socket frame) and a second customer is what would justify the
-/// module. The text codecs (`TextDecoder`/`TextEncoder`) are NOT here.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct Bytes(Rc<Vec<u8>>);
-
-impl Bytes {
-    pub fn from_vec(bytes: Vec<u8>) -> Bytes {
-        Bytes(Rc::new(bytes))
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        &self.0
-    }
-
-    pub fn len(&self) -> i32 {
-        self.0.len() as i32
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    /// `bytes.at(index)` — `std::bytes`'s `get`/`get_u32`.
-    ///
-    /// JavaScript's `at` answers `undefined` out of range, and the vilan
-    /// signature types the result an integer, so there is no `undefined` to
-    /// hand back: `0` is the answer, and `std::bytes` documents the index as
-    /// the caller's contract exactly as `str::code_at` does. A NEGATIVE index
-    /// counts from the end there, and does here.
-    pub fn at(&self, index: i32) -> i32 {
-        let length = self.0.len() as i64;
-        let resolved = if index < 0 {
-            length + index as i64
-        } else {
-            index as i64
-        };
-        if resolved < 0 || resolved >= length {
-            return 0;
-        }
-        self.0[resolved as usize] as i32
-    }
-
-    /// `bytes.slice(from, to)` — a COPY of the half-open range, with
-    /// JavaScript's clamping: an out-of-range bound is pulled to the nearest
-    /// end and a reversed pair answers empty (which is where `slice` differs
-    /// from `str::substring`, whose host swaps them).
-    pub fn slice(&self, from: i32, to: i32) -> Bytes {
-        let length = self.0.len() as i64;
-        let resolve = |index: i32| {
-            let index = index as i64;
-            if index < 0 { length + index } else { index }.clamp(0, length) as usize
-        };
-        let start = resolve(from);
-        let end = resolve(to);
-        if end <= start {
-            return Bytes::from_vec(Vec::new());
-        }
-        Bytes::from_vec(self.0[start..end].to_vec())
-    }
-}
-
-impl Js for Bytes {
-    /// Node renders a `Uint8Array` as `Uint8Array(3) [ 1, 2, 3 ]`, which is its
-    /// own object inspection rather than anything the language defines. Printing
-    /// one is refused at run time by name, as printing a `Task` is.
-    fn js(&self) -> String {
-        crate::panic_with(
-            "printing a `Bytes` is a host object's own inspection, which the native backend \
-             does not reproduce",
-        )
-    }
-}
-
-/// `JSON.stringify(new Uint8Array([1, 2]))` is `{"0":1,"1":2}` — a typed array
-/// has its indices as own enumerable properties, so it stringifies as an OBJECT
-/// and not as an array. Reproduced rather than refused, because unlike the
-/// handles below a `Bytes` really does have a JSON rendering on the other
-/// backend.
-impl crate::Json for Bytes {
-    fn json(&self) -> String {
-        let mut out = String::from("{");
-        for (index, byte) in self.0.iter().enumerate() {
-            if index > 0 {
-                out.push(',');
-            }
-            out.push_str(&format!("\"{index}\":{byte}"));
-        }
-        out.push('}');
-        out
-    }
-}
-
-/// `TextDecoder` / `TextEncoder` — `std::bytes`'s two host classes.
-///
-/// They live beside [`Bytes`] for the reason [`Bytes`] lives here: the HTTP
-/// surface is what first needs them (`Request::body` decodes the collected
-/// body). Both are unit structs because both host classes are stateless for
-/// the one encoding vilan has — a vilan `str` is UTF-8, so `new TextDecoder()`
-/// carries nothing a native twin has to keep.
-///
-/// **Decoding is LOSSY, as the host's is.** `new TextDecoder()` without
-/// `{ fatal: true }` replaces malformed input with U+FFFD rather than
-/// throwing, and `std::bytes` constructs it exactly that way — so
-/// `from_utf8_lossy` is the same function, not a shortcut past an error.
-#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
-pub struct TextDecoder;
-
-impl TextDecoder {
-    pub fn decode(&self, bytes: &Bytes) -> Str {
-        str_new(&String::from_utf8_lossy(bytes.as_slice()))
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
-pub struct TextEncoder;
-
-impl TextEncoder {
-    pub fn encode(&self, text: &str) -> Bytes {
-        Bytes::from_vec(text.as_bytes().to_vec())
-    }
-}
-
-impl Js for TextDecoder {
-    fn js(&self) -> String {
-        crate::panic_with(
-            "printing a `TextDecoder` is a host object's own inspection, which the native backend \
-             does not reproduce",
-        )
-    }
-}
-
-impl Js for TextEncoder {
-    fn js(&self) -> String {
-        crate::panic_with(
-            "printing a `TextEncoder` is a host object's own inspection, which the native backend \
-             does not reproduce",
-        )
-    }
-}
 
 // ---------------------------------------------------------------- parsing ---
 
@@ -572,7 +425,7 @@ impl Socket {
 
     /// `socket.write(bytes)`.
     pub fn write_bytes(&self, data: &Bytes) {
-        self.0.enqueue(data.as_slice());
+        self.0.enqueue(&data.as_slice());
     }
 
     /// `socket.on("data", handler)`.
@@ -844,10 +697,10 @@ impl Response {
         let length = if self.0.head_sent.get() {
             None
         } else {
-            Some(body.as_slice().len())
+            Some(body.len() as usize)
         };
         self.send_head(length);
-        self.0.connection.enqueue(body.as_slice());
+        self.0.connection.enqueue(&body.as_slice());
         self.0.connection.stage.set(Stage::Closing);
     }
 
@@ -1469,7 +1322,7 @@ mod tests {
             let handler: Handler = Rc::new(move |request: Request, response: Response| {
                 crate::executor::pin_future(async move {
                     let body = request.bytes();
-                    let text = String::from_utf8_lossy(body.as_slice()).into_owned();
+                    let text = String::from_utf8_lossy(&body.as_slice()).into_owned();
                     let host = request
                         .header("HOST")
                         .map(|value| value.to_string())
@@ -1621,7 +1474,7 @@ mod tests {
                     *seen.borrow_mut() = format!(
                         "{} head={}",
                         request.url(),
-                        String::from_utf8_lossy(head.as_slice())
+                        String::from_utf8_lossy(&head.as_slice())
                     );
                     socket.write_text("HTTP/1.1 101 Switching Protocols\r\n\r\n");
                     socket.destroy();

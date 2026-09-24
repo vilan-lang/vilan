@@ -92,6 +92,9 @@ use std::process::Command;
 /// emitting `…993i32`). They print `1n` and `3n` on both backends now, which is
 /// the whole of what the `i128` ruling claims.
 ///
+/// F33 adds `bytes-aliasing.vl`: the mutable `Bytes` the ruling chose, read
+/// through every kind of alias a program can make.
+///
 /// A124 R3 adds `dyn-objects.vl`: trait objects on both backends — a
 /// heterogeneous `List` behind a struct field, a supertrait member and a
 /// parameterized trait through the table, a blanket and a generic over the
@@ -130,6 +133,11 @@ const DEFAULT_SUITE: &[&str] = &[
     // I5 S1 + B389: the literal law at `usize`, all 21 measured positions in one
     // program — the literals' native widths are the record B389 writes.
     "usize-literals.vl",
+    // F33 (RULED (a)): `Bytes` is one shared, mutable buffer behind every
+    // holder — two bindings, a parameter, a struct copy, a list and a closure
+    // capture all write into the same bytes, as a `Uint8Array` does; `slice`
+    // and `concat` are the two that make a new one.
+    "bytes-aliasing.vl",
 ];
 
 /// Corpus programs that are OUTSIDE this differential by construction, named
@@ -914,7 +922,7 @@ fn a_std_http_server_emits_calls_into_the_native_runtime() {
         ").end_bytes(",
         "vilan_rt::http::Request",
         "vilan_rt::http::Response",
-        "vilan_rt::http::Bytes",
+        "vilan_rt::bytes::Bytes",
     ] {
         assert!(
             source.contains(needle),

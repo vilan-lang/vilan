@@ -58,6 +58,12 @@ const EXCLUDED: &[(&str, &str)] = &[
          time`, dyn-40) — the JS and native backends are the program's two \
          observers",
     ),
+    (
+        "bytes-aliasing.vl",
+        "host `Uint8Array` (`new Uint8Array`, `fill`, `set`) — the macro world's \
+         evaluator has no typed array; the JS and native backends are the \
+         program's two observers (F33)",
+    ),
     ("async-await.vl", "async"),
     ("async-promise-all.vl", "async"),
     (

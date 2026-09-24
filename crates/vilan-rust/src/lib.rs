@@ -5589,14 +5589,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             // `new TextDecoder()` / `new TextEncoder()` — both stateless for
             // the one encoding vilan has.
+            // `new Uint8Array(size)` — `std::bytes`'s `alloc` (F33). Keyed on
+            // the vilan NAME as well as the symbol, because `bytes_of_buffer`
+            // is `new Uint8Array(buffer)` over an `ArrayBuffer`, which has no
+            // native twin and stays refused by name.
+            ExternBinding::New {
+                module: None,
+                symbol: "Uint8Array",
+            } if name == "alloc" => {
+                return Ok(Some(format!(
+                    "vilan_rt::bytes::Bytes::alloc({})",
+                    self.value_argument(argument_ids, 0, depth)?
+                )));
+            }
             ExternBinding::New {
                 module: None,
                 symbol: "TextDecoder",
-            } => return Ok(Some("vilan_rt::http::TextDecoder".to_string())),
+            } => return Ok(Some("vilan_rt::bytes::TextDecoder".to_string())),
             ExternBinding::New {
                 module: None,
                 symbol: "TextEncoder",
-            } => return Ok(Some("vilan_rt::http::TextEncoder".to_string())),
+            } => return Ok(Some("vilan_rt::bytes::TextEncoder".to_string())),
             ExternBinding::Function {
                 module: Some("node:stream/consumers"),
                 symbol: "text",
@@ -5731,12 +5744,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     self.place_argument(argument_ids, 0, depth)?
                 )
             }
-            // F18 slice 2: `std::bytes`'s READ accessors. The three that
-            // MUTATE (`alloc`, `fill`, `copy_into`) are deliberately absent:
-            // a `Uint8Array` is a mutable reference type there and `Bytes` is
-            // an immutable refcounted buffer here, so admitting them wants a
-            // decision about which `Bytes` is — its own item, and a wrong
-            // answer would be a silent miscompile rather than a refusal.
+            // F18 slice 2: `std::bytes`'s READ accessors, and since F33 (RULED
+            // (a)) the two that MUTATE in place. A `Uint8Array` is a mutable
+            // reference type on the other backend and `vilan_rt::bytes::Bytes`
+            // is the same thing natively — one shared buffer behind every
+            // holder — so a write through one binding is seen through every
+            // alias, and `fill` answers the SAME buffer (the host's `this`).
+            // `fill` and `fill_u32` widen their value to `i64` so the runtime
+            // takes the host's `ToUint8` (the low eight bits) from one width.
+            ("Bytes", "fill" | "fill_u32") => format!(
+                "({}).fill(({}) as i64, {}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?,
+                self.value_argument(argument_ids, 3, depth)?
+            ),
+            ("Bytes", "copy_into") => format!(
+                "({}).copy_into(&{}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?
+            ),
             ("Bytes", "len") => {
                 format!("({}).len()", self.place_argument(argument_ids, 0, depth)?)
             }
@@ -8194,8 +8222,9 @@ fn scalar_type(name: &str) -> Option<&'static str> {
 /// executor's four handles are one: these are host types, so nothing in the
 /// source says what they are made of, and the mapping is the whole of what the
 /// backend knows about them. `NodeAddress` is `std::http`'s private
-/// `address()` result; `Bytes` is `std::bytes`'s, and it is here because the
-/// HTTP surface is the first thing that needs one.
+/// `address()` result; `Bytes` and the two codecs are `std::bytes`'s, and they
+/// are in this table because the HTTP surface was the first thing to need them
+/// (their runtime home is `vilan_rt::bytes` since F33).
 fn http_host_type(name: &str) -> Option<&'static str> {
     Some(match name {
         "NodeServer" => "vilan_rt::http::Server",
@@ -8203,13 +8232,12 @@ fn http_host_type(name: &str) -> Option<&'static str> {
         "NodeRequest" => "vilan_rt::http::Request",
         "NodeResponse" => "vilan_rt::http::Response",
         "NodeSocket" => "vilan_rt::http::Socket",
-        "Bytes" => "vilan_rt::http::Bytes",
+        "Bytes" => "vilan_rt::bytes::Bytes",
         // F18 slice 2: `std::bytes`'s two codec classes, which live beside
-        // `Bytes` in the runtime for the reason `Bytes` does — the HTTP
-        // surface is what first needs them (`Request::body` decodes the
-        // collected body).
-        "TextDecoder" => "vilan_rt::http::TextDecoder",
-        "TextEncoder" => "vilan_rt::http::TextEncoder",
+        // `Bytes` in the runtime — the HTTP surface is what first needed them
+        // (`Request::body` decodes the collected body).
+        "TextDecoder" => "vilan_rt::bytes::TextDecoder",
+        "TextEncoder" => "vilan_rt::bytes::TextEncoder",
         _ => return None,
     })
 }
@@ -8290,7 +8318,7 @@ fn host_handle_name(rendered: &str) -> Option<&'static str> {
         ("vilan_rt::http::Request", "NodeRequest"),
         ("vilan_rt::http::Response", "NodeResponse"),
         ("vilan_rt::http::Socket", "NodeSocket"),
-        ("vilan_rt::http::Bytes", "Bytes"),
+        ("vilan_rt::bytes::Bytes", "Bytes"),
     ];
     HANDLES
         .iter()

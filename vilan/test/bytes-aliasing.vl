@@ -1,0 +1,62 @@
+// `Bytes` is ONE shared, mutable buffer behind every holder (F33, RULED (a)):
+// the host `Uint8Array` is a reference type, so a copy of a `Bytes` is an
+// alias, and a write through any holder is seen through all of them. `slice`
+// and `concat` are the two that make a NEW buffer.
+import std::bytes::Bytes;
+import std::io::print;
+
+struct Frame {
+	label: str,
+	payload: Bytes,
+}
+
+fun poke(target: Bytes, index: i32, value: i32) {
+	target.set(index, value);
+}
+
+fun main() {
+	// Two bindings, one buffer.
+	let a = Bytes::alloc(4);
+	let b = a;
+	a.set(0, 7);
+	b.set(1, 300);
+	poke(a, 2, 9);
+	print(i"{a.to_hex()} {b.to_hex()} {a.len()}");
+
+	// `slice` copies.
+	let c = a.slice(0, 2);
+	c.set(0, 1);
+	print(i"{a.to_hex()} {c.to_hex()}");
+
+	// `fill` answers the SAME buffer.
+	let filled = a.fill(255, 3, 4);
+	filled.set(2, 0);
+	print(i"{a.to_hex()} {filled.to_hex()}");
+
+	// `copy_into` writes in place; reads see it through the alias, and a
+	// negative index counts from the end.
+	a.copy_into(c, 2);
+	print(i"{b.to_hex()} {b.get(3)} {b.get(-1)}");
+
+	// `concat` is a new buffer.
+	let joined = Bytes::concat(a, c);
+	joined.set(0, 0);
+	print(i"{a.to_hex()} {joined.to_hex()}");
+
+	// A struct copy copies the struct, and its buffer is still shared.
+	let first = Frame { label = "first", payload = Bytes::alloc(2) };
+	mut second = first;
+	second.label = "second";
+	second.payload.set(0, 0xAB);
+	print(i"{first.label} {first.payload.to_hex()} {second.label} {second.payload.to_hex()}");
+
+	// A list of holders, and a closure that writes through its capture.
+	let shared = Bytes::alloc(3);
+	let holders = [shared, shared.slice(0, 3), shared];
+	let write = |index: i32| shared.set_u32(index, 0x1FF);
+	write(1);
+	for holder in holders {
+		print(holder.to_hex());
+	}
+	print(i"{shared.get_u32(1)}");
+}

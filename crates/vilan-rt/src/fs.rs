@@ -33,7 +33,7 @@
 
 use std::path::Path;
 
-use crate::http::Bytes;
+use crate::bytes::Bytes;
 use crate::{Str, str_new};
 
 /// node's message shape for a failed call, so a native failure reads like the
@@ -82,7 +82,7 @@ pub async fn write_text(path: Str, contents: Str) {
 
 /// `writeFile(path, bytes)`.
 pub async fn write_bytes(path: Str, contents: Bytes) {
-    if let Err(error) = std::fs::write(Path::new(&*path), contents.as_slice()) {
+    if let Err(error) = std::fs::write(Path::new(&*path), &*contents.as_slice()) {
         fail("open", &path, &error);
     }
 }
@@ -188,8 +188,8 @@ mod tests {
             );
             write_bytes(bytes_path.clone(), Bytes::from_vec(vec![0, 1, 255])).await;
             assert_eq!(
-                read_bytes(bytes_path.clone()).await.as_slice(),
-                &[0, 1, 255]
+                read_bytes(bytes_path.clone()).await.to_vec(),
+                vec![0, 1, 255]
             );
             // A directory lists what was written into it, in one order.
             let listed = read_dir(directory_path.clone()).await;

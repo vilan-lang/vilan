@@ -109,8 +109,8 @@ fn compress(state: &mut [u32; 8], block: &[u8]) {
 /// WebCrypto's `subtle.digest` is a promise on the other backend. There is
 /// nothing to await here; the `async fn` exists so the emitted call site is
 /// the same `.await` on both.
-pub async fn sha256_bytes(data: crate::http::Bytes) -> crate::http::Bytes {
-    crate::http::Bytes::from_vec(sha256(data.as_slice()).to_vec())
+pub async fn sha256_bytes(data: crate::bytes::Bytes) -> crate::bytes::Bytes {
+    crate::bytes::Bytes::from_vec(sha256(&data.as_slice()).to_vec())
 }
 
 #[cfg(test)]

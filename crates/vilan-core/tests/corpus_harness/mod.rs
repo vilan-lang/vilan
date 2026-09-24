@@ -73,6 +73,7 @@ macro_rules! corpus_manifest {
             bool => "bool.vl",
             borrows_inferred => "borrows-inferred.vl",
             borrows => "borrows.vl",
+            bytes_aliasing => "bytes-aliasing.vl",
             capture_clones => "capture-clones.vl",
             closure_param_inference => "closure-param-inference.vl",
             compound_index => "compound-index.vl",
