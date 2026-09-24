@@ -223,6 +223,15 @@ struct Emitter<'a, 'src> {
     /// that expectation — never while the argument itself is walked, where the
     /// caller's substitution is the one in force.
     argument_substitution: Option<HashMap<TypeId, TypeId>>,
+    /// How deep [`Emitter::pattern`] is inside a variant's payload or a tuple,
+    /// and the guards a `match` leg collects from the string literals it finds
+    /// there. A `str` literal at the TOP of a leg is matched against the
+    /// subject read as `&str`; one NESTED in a payload (`Some("api")` over an
+    /// `Option<str>`) cannot be — the payload is an `Rc<str>` — so it binds a
+    /// name and the leg gains `if &*name == "api"`. `None` outside a `match`,
+    /// where there is no guard to carry it and the pattern is refused by name.
+    pattern_nesting: usize,
+    literal_guards: Option<Vec<String>>,
     /// R3: the bindings boxed into a counted cell, and why they had to be.
     /// Computed over EVERY closure the program loaded, std's unreached ones
     /// included — it is a lookup the walk consults, not a measurement.
@@ -446,6 +455,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             current_returns_view: false,
             expected_type: None,
             argument_substitution: None,
+            pattern_nesting: 0,
+            literal_guards: None,
             boxed: HashSet::new(),
             boxed_emitted: HashSet::new(),
             module_bindings: HashSet::new(),
@@ -818,8 +829,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     }
                     Expr::ForEach(_, item, _) => declared.extend(item.iter().copied()),
                     Expr::Closure(closure_id) => {
+                        // A NESTED closure's destructured parameters too
+                        // (`|(k, _)| k == key` inside `get_post_var`): they are
+                        // not in `parameters`, and read as captures of the
+                        // OUTER closure they were cloned before they existed.
                         if let Some(closure) = self.program.closures.get(closure_id) {
-                            declared.extend(closure.parameters.iter().copied());
+                            declared.extend(self.closure_parameter_bindings(closure));
                         }
                     }
                     _ => {}
@@ -2769,6 +2784,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let Some(type_id) = function.return_type_id {
             return Some(type_id);
         }
+        // The analyzer's own answer for an unannotated function, where it
+        // reached an exact one. A tail the walk below cannot type — a bare
+        // `true`, which carries no expression type — emitted `-> ()` for
+        // kolt's `is_fingerprinted`, and every `ret false` in it was refused.
+        if let Some(type_id) = self.program.inferred_return_types.get(&function.id) {
+            return Some(*type_id);
+        }
         let from_tail = self.value_type_of(function.body.1);
         if from_tail.is_some() {
             return from_tail;
@@ -3056,6 +3078,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Ok(name.clone());
         }
         let span = self.span_of(id);
+        // A `const` expression's COMPUTED value replaces the whole subtree
+        // (const-eval.md §1), exactly as the JS emitter serializes it in place:
+        // `const asset::read("server-head.html")` is the file's text at build
+        // time, and the call itself — a compile-time-only channel — has no
+        // runtime body on either backend.
+        if let Some(value) = self.program.const_results.get(&id).cloned() {
+            // The const expression's own type where it records one, else the
+            // POSITION's (`let folded = const 1 + 2 * 3;` records nothing on
+            // the `const` node, and the binding's `i32` is the answer).
+            let type_id = self.type_of(id).or(self.expected_type);
+            return self.const_value(&value, type_id, span);
+        }
         let Some(expr) = self.program.entity_map.get(&id).cloned() else {
             return Ok("()".to_string());
         };
@@ -4483,6 +4517,61 @@ impl<'a, 'src> Emitter<'a, 'src> {
         ))
     }
 
+    /// A computed `const` value as a Rust expression of `type_id`'s type.
+    ///
+    /// Plain data only: a string, a boolean, a number at the declared width,
+    /// and a `List` of those. Everything else a const result can be — a
+    /// `Map`/`Set`, `undefined`, a `BigInt`, G24's closure snapshot — is refused
+    /// by name until a program on the native path reaches one.
+    fn const_value(
+        &mut self,
+        value: &vilan_core::interpreter::ConstValue,
+        type_id: Option<TypeId>,
+        span: Span,
+    ) -> Result<String, Error> {
+        use vilan_core::interpreter::ConstValue;
+        match value {
+            ConstValue::Str(text) => Ok(format!("vilan_rt::str_new({text:?})")),
+            ConstValue::Bool(value) => Ok(value.to_string()),
+            ConstValue::Number(number) => {
+                // With no type anywhere, the literal's own default: an integral
+                // value is an `i32` and a fractional one an `f64`, as an
+                // unsuffixed literal is.
+                let rendered = match type_id {
+                    Some(type_id) => self.rust_type(type_id, span)?,
+                    None if number.fract() == 0.0 => "i32".to_string(),
+                    None => "f64".to_string(),
+                };
+                if scalar_type(&rendered).is_none()
+                    && !is_integer_type(&rendered)
+                    && rendered != "f64"
+                    && rendered != "f32"
+                {
+                    return Err(unsupported("a `const` number of a non-scalar type", span));
+                }
+                Ok(format!("(({number:?}f64) as {rendered})"))
+            }
+            ConstValue::Array(items) => {
+                let element =
+                    type_id
+                        .and_then(|type_id| self.resolve(type_id))
+                        .and_then(|resolved| match resolved {
+                            Type::Struct(_, arguments) => arguments.first().copied(),
+                            _ => None,
+                        });
+                let mut parts = Vec::new();
+                for item in items {
+                    parts.push(self.const_value(item, element, span)?);
+                }
+                Ok(format!("vec![{}]", parts.join(", ")))
+            }
+            _ => Err(unsupported(
+                "a `const` value that is not plain data (a string, a boolean, a number or a list of those)",
+                span,
+            )),
+        }
+    }
+
     /// Whether an expression is a `str` — by its resolved type where it has
     /// one, and structurally where it does not (a literal, or a concatenation
     /// whose left half is one). The concatenation chain an interpolation
@@ -4649,7 +4738,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
             if leg.guard.is_some() {
                 return Err(unsupported("a guarded `match` leg", span));
             }
-            let pattern = self.pattern(&leg.pattern, subject_type, span)?;
+            let saved_guards = self.literal_guards.replace(Vec::new());
+            let pattern = self.pattern(&leg.pattern, subject_type, span);
+            let guards =
+                std::mem::replace(&mut self.literal_guards, saved_guards).unwrap_or_default();
+            let pattern = if guards.is_empty() {
+                pattern?
+            } else {
+                format!("{} if {}", pattern?, guards.join(" && "))
+            };
             if matches!(leg.pattern, ExprPattern::Wildcard | ExprPattern::Binding(_))
                 || self.pattern_is_bool(&leg.pattern)
             {
@@ -4727,9 +4824,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // `&str` ([`Emitter::match_expr`]), so the pattern is the bare Rust
             // literal, which is what a `&str` pattern is.
             ExprPattern::Literal(id) if Self::string_pattern_text(self.program, *id).is_some() => {
-                Ok(rust_string(
-                    Self::string_pattern_text(self.program, *id).expect("just tested"),
-                ))
+                let literal =
+                    rust_string(Self::string_pattern_text(self.program, *id).expect("just tested"));
+                if self.pattern_nesting == 0 {
+                    return Ok(literal);
+                }
+                let Some(guards) = self.literal_guards.as_mut() else {
+                    return Err(unsupported(
+                        "a `str` literal nested inside a pattern anywhere but a `match` leg",
+                        span,
+                    ));
+                };
+                let name = format!("__literal{}", guards.len());
+                guards.push(format!("&*{name} == {literal}"));
+                Ok(name)
             }
             ExprPattern::Literal(id) => self.expression(*id, 0),
             ExprPattern::Variant(enum_id, index, payload) => {
@@ -4770,7 +4878,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let payload_types = self.variant_payload_types(*enum_id, *index, &arguments);
                 let mut parts = Vec::new();
                 for (slot, sub) in payload.iter().enumerate() {
-                    parts.push(self.pattern(sub, payload_types.get(slot).copied(), span)?);
+                    self.pattern_nesting += 1;
+                    let part = self.pattern(sub, payload_types.get(slot).copied(), span);
+                    self.pattern_nesting -= 1;
+                    parts.push(part?);
                 }
                 Ok(format!("{path}({})", parts.join(", ")))
             }
@@ -4781,7 +4892,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 };
                 let mut parts = Vec::new();
                 for (slot, (element, _)) in elements.iter().enumerate() {
-                    parts.push(self.pattern(element, element_types.get(slot).copied(), span)?);
+                    self.pattern_nesting += 1;
+                    let part = self.pattern(element, element_types.get(slot).copied(), span);
+                    self.pattern_nesting -= 1;
+                    parts.push(part?);
                 }
                 Ok(format!("({},)", parts.join(", ")))
             }

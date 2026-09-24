@@ -1,0 +1,256 @@
+// THE SHAPE of kolt's server leg (`src/server.vl` + `src/store.vl`), written
+// here from scratch: an auth door that answers `/api/login` and
+// `/api/register` from a SQLite store, a per-connection rpc store behind a
+// handshake gate, the build served from its own description, and the
+// generated shell for every other path. Kolt's own files are never copied
+// into this tree.
+import std::asset;
+import std::build::require_build;
+import std::bytes::encode_utf8;
+import std::crypto::sha256;
+import std::db::Database;
+import std::document::Document;
+import std::http::{ CachePolicy, Request, Response, Server };
+import std::io::print;
+import std::json::{ FromJson, Json, json_codec };
+import std::map::Map;
+import std::option::Option::{ self, None, Some };
+import std::range::Range;
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Err, Ok };
+import std::rpc_server::{ Connection, Handshake, Reject, Service, Session };
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq, Debug)]
+struct Message {
+	id: str,
+	author: str,
+	body: str,
+}
+
+impl Message with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+[derive(Json)]
+struct AuthOutcome {
+	ok: bool,
+	token: str,
+	message: str,
+}
+
+let db = open_store();
+
+let messages: SignalCell<Map<str, Message>> = Signal::new(Map::new());
+
+fun open_store(): Database {
+	let database = Database::open(":memory:");
+	database.exec("CREATE TABLE account (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password_hash TEXT)");
+	database.exec("CREATE TABLE session (token TEXT PRIMARY KEY, username TEXT)");
+	database
+}
+
+async fun digest(text: str): str {
+	sha256(encode_utf8(text)).to_hex()
+}
+
+mod KoltAuth {
+	export async fun register(username: str, password: str): AuthOutcome {
+		if username.len() < 2 || password.len() < 8 {
+			ret AuthOutcome { ok = false, token = "", message = "username or password too short" };
+		}
+		match db.prepare("SELECT id FROM account WHERE username = ?").first([username]) {
+			Some(let _row) => AuthOutcome { ok = false, token = "", message = "username taken" },
+			None => {
+				let hashed = digest(username + ":" + password);
+				db
+					.prepare("INSERT INTO account (username, password_hash) VALUES (?, ?)")
+					.run([username, hashed]);
+				open_session(username)
+			},
+		}
+	}
+
+	export async fun login(username: str, password: str): AuthOutcome {
+		match db.prepare("SELECT password_hash FROM account WHERE username = ?").first([username]) {
+			Some(let row) => {
+				if row.text("password_hash") == digest(username + ":" + password) {
+					open_session(username)
+				} else {
+					AuthOutcome { ok = false, token = "", message = "wrong password" }
+				}
+			},
+			None => AuthOutcome { ok = false, token = "", message = "no such account" },
+		}
+	}
+}
+
+async fun open_session(username: str): AuthOutcome {
+	let token = digest(username + ":session").substring(0, 16);
+	db
+		.prepare("INSERT OR REPLACE INTO session (token, username) VALUES (?, ?)")
+		.run([token, username]);
+	AuthOutcome { ok = true, token, message = "welcome " + username }
+}
+
+[service(KoltClient)]
+struct KoltStore {
+	user: str,
+	[expose(keyed)] messages: SignalCell<Map<str, Message>>,
+}
+
+impl KoltStore {
+	[rpc]
+	fun post(self, id: str, body: str): i32 {
+		let author = self.user;
+		self.messages.update(|&mut store| {
+			store.insert(id, Message { id, author, body });
+		});
+		self.messages.get().len()
+	}
+
+	[rpc]
+	fun whoami(self): str {
+		self.user
+	}
+}
+
+fun store_for(connection: Connection): KoltStore {
+	KoltStore { user = connection.session.identity, messages }
+}
+
+fun authorize_connection(handshake: Handshake): Result<Session, Reject> {
+	match handshake.token() {
+		Some(let token) => match session_user(token) {
+			Some(let username) => Ok(Session::of(username)),
+			None => Err(Reject::Forbidden),
+		},
+		None => Err(Reject::Unauthorized),
+	}
+}
+
+fun session_user(token: str): Option<str> {
+	db
+		.prepare("SELECT username FROM session WHERE token = ?")
+		.first([token])
+		.map(|row| row.text("username"))
+}
+
+async fun main() {
+	let build = require_build("client");
+	let page = Document::of(build).title("Kolt").head(const asset::read("server-head.html")).html();
+	Server::builder()
+		.port(0)
+		.with_service(Service::factory(|connection| store_for(connection), json_codec())
+			.authorize(|handshake| authorize_connection(handshake)))
+		.serve_build(build)
+		.cache_build(|url| {
+			if is_fingerprinted(url) {
+				ret CachePolicy::none().cache_control("public, max-age=31536000, immutable");
+			}
+			CachePolicy::validated().cache_control("no-cache")
+		})
+		.on_request(|request| {
+			match parse_path(request) {
+				ApiRoute::Login(let username, let password) => {
+					let outcome = KoltAuth::login(username, password);
+					Response::builder()
+						.set_header("Content-Type", "application/json")
+						.set_header("Cache-Control", "no-cache")
+						.body(outcome.to_json())
+						.build()
+				},
+				ApiRoute::Register(let username, let password) => {
+					let outcome = KoltAuth::register(username, password);
+					Response::builder()
+						.set_header("Content-Type", "application/json")
+						.set_header("Cache-Control", "no-cache")
+						.body(outcome.to_json())
+						.build()
+				},
+				ApiRoute::Malformed => {
+					Response::builder()
+						.set_header("Content-Type", "text/plain")
+						.set_header("Cache-Control", "no-cache")
+						.code(400)
+						.body("malformed call")
+						.build()
+				},
+				_ => Response::builder()
+					.set_header("Content-Type", "text/html")
+					.set_header("Cache-Control", "no-cache")
+					.body(page)
+					.build(),
+			}
+		})
+		.on_start(|server| print(i"vilan-test-port={server.port()}"))
+		.build()
+		.start();
+}
+
+fun is_fingerprinted(path: str) {
+	let parts = path.split(".");
+	if parts.len() < 3 {
+		ret false;
+	}
+	let hash = parts.get(parts.len() - 2).unwrap_or("");
+	if hash.len() != 8 {
+		ret false;
+	}
+	for i in Range::new(0, 8) {
+		let c = hash.code_at(i);
+		let is_digit = c >= 48 && c <= 57;
+		let is_af = c >= 97 && c <= 102;
+		if !is_digit && !is_af {
+			ret false;
+		}
+	}
+	true
+}
+
+fun parse_path(request: Request): ApiRoute {
+	let parts = request.path().split("/").filter(|x| !x.is_empty());
+	match parts.get(0) {
+		Some("api") => match parts.get(1) {
+			Some(let x) => {
+				let post_body = if request.method() == "POST" {
+					let list = List<List<str>>::from_json(request.body()).unwrap_or([]);
+					list.filter_map(|pair| pair.get(0).zip(pair.get(1)))
+				} else {
+					[]
+				};
+				let get_post_var = |key: str| {
+					post_body.find(|(k, _)| k == key).map(|(_, v)| v)
+				};
+				if x.starts_with("login") {
+					let username = get_post_var("username");
+					let password = get_post_var("password");
+					username
+						.zip(password)
+						.map(|(username, password)| ApiRoute::Login(username, password))
+						.unwrap_or(ApiRoute::Malformed)
+				} else if x.starts_with("register") {
+					let username = get_post_var("username");
+					let password = get_post_var("password");
+					username
+						.zip(password)
+						.map(|(username, password)| ApiRoute::Register(username, password))
+						.unwrap_or(ApiRoute::Malformed)
+				} else {
+					ApiRoute::Malformed
+				}
+			}
+			_ => ApiRoute::Malformed,
+		},
+		_ => ApiRoute::Unknown,
+	}
+}
+
+enum ApiRoute {
+	Login(str, str),
+	Register(str, str),
+	Malformed,
+	Unknown,
+}

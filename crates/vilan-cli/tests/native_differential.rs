@@ -1730,6 +1730,65 @@ const OPEN_BINDING_PROBE: &str = concat!(
     "}\n",
 );
 
+/// Four lowering gaps kolt's server shape reached, each general: a `const`
+/// expression's COMPUTED value in place of its subtree (`const
+/// asset::read(..)`, as the JS emitter serializes it); a `str` literal NESTED in
+/// a `match` pattern (`Some("api")` over an `Option<str>`, now a binding and a
+/// guard); an unannotated function's return type from the analyzer's own
+/// inference (`is_fingerprinted`'s bare `true` tail had emitted `-> ()`); and a
+/// NESTED closure's destructured parameters kept out of the outer closure's
+/// captures (`|(k, _)| k == key` inside `get_post_var`).
+#[test]
+fn the_kolt_shapes_lowering_gaps_build_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_lowering.vl"), KOLT_LOWERING_PROBE)
+        .expect("write the probe program");
+    std::fs::write(staged.join("native-head.txt"), "baked at build time")
+        .expect("write the asset the probe reads at build time");
+    assert_eq!(
+        compare(&staged, "native_probe_lowering.vl"),
+        Verdict::Identical,
+        "the four shapes print the same on both backends"
+    );
+}
+
+const KOLT_LOWERING_PROBE: &str = concat!(
+    "import std::asset;\n",
+    "import std::io::print;\n",
+    "import std::option::Option::{ self, None, Some };\n",
+    "\n",
+    "fun is_short(text: str) {\n",
+    "\tif text.len() > 3 {\n",
+    "\t\tret false;\n",
+    "\t}\n",
+    "\ttrue\n",
+    "}\n",
+    "\n",
+    "fun route(parts: List<str>): str {\n",
+    "\tmatch parts.get(0) {\n",
+    "\t\tSome(\"api\") => match parts.get(1) {\n",
+    "\t\t\tSome(\"login\") => \"login\",\n",
+    "\t\t\tSome(let other) => \"api:\" + other,\n",
+    "\t\t\tNone => \"api\",\n",
+    "\t\t},\n",
+    "\t\tSome(let first) => \"page:\" + first,\n",
+    "\t\tNone => \"root\",\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet pairs = [(\"a\", 1), (\"b\", 2)];\n",
+    "\tlet find = |key: str| pairs.find(|(k, _)| k == key).map(|(_, v)| v);\n",
+    "\tprint(i\"{is_short(\"ab\")} {is_short(\"abcd\")}\");\n",
+    "\tprint(route([\"api\", \"login\"]));\n",
+    "\tprint(route([\"api\", \"x\"]));\n",
+    "\tprint(route([\"home\"]));\n",
+    "\tprint(route([]));\n",
+    "\tprint(find(\"b\").unwrap_or(0));\n",
+    "\tprint(const asset::read(\"native-head.txt\"));\n",
+    "}\n",
+);
+
 /// Builds `program` (already staged) natively and for node, and answers the
 /// two commands that START each leg's server: the native binary and `node
 /// <program>.mjs`, both run from the staging directory so a relative `dist/`
@@ -1895,6 +1954,162 @@ fn the_keyed_rpc_service_answers_a_node_client_the_same_from_a_native_server() {
             .any(|line| line == format!("hash:{native_contract}")),
         "the client's contract hash is the server's own ({native_contract}):\n{native}"
     );
+}
+
+/// **F18 slice 3's EXIT** — a program with the SHAPE of kolt's server leg,
+/// `Server::builder()` as kolt writes it, built natively: an auth door
+/// (`/api/register`, `/api/login`) decoding kolt's `List<List<str>>` POST body
+/// through `parse_path` as kolt writes it and checking a hashed password in
+/// SQLite; a per-connection rpc store (`Service::factory`) behind a handshake
+/// gate (`authorize`) that looks the session token up in the same database; the
+/// build served from its own description with kolt's fingerprint-aware
+/// `cache_build`; and the `Document` shell (`const asset::read` in its head) for
+/// every other path. The program lives in `native/kolt_shape_server.vl` and is
+/// written from scratch — kolt is never copied into this tree.
+///
+/// Over ONE server: six HTTP exchanges, each byte for byte against node's
+/// (status line, the headers the program and std set, the body): a register, a
+/// good login (whose answer carries the session token), a wrong password, a
+/// malformed call, a deep link answered by the shell, and the client bundle
+/// with its validator. Then two node clients over the WebSocket upgrade: one
+/// with the token — `whoami` is the identity the handshake settled, a PER-KEY
+/// subscription sees its key's writes and no other — and one with a bogus
+/// token, refused at the handshake. Both clients' stdout compared whole.
+///
+/// Non-vacuous by content: the bodies and the client's lines are asserted
+/// verbatim, and the two logins differ only in the password.
+#[test]
+fn the_kolt_server_shape_serves_a_login_and_a_keyed_subscription_from_a_native_build() {
+    let staged = stage();
+    for (name, contents) in [
+        (
+            "native_kolt_server.vl",
+            include_str!("native/kolt_shape_server.vl"),
+        ),
+        (
+            "native_kolt_client.vl",
+            include_str!("native/kolt_shape_client.vl"),
+        ),
+        ("server-head.html", include_str!("native/server-head.html")),
+    ] {
+        std::fs::write(staged.join(name), contents).expect("stage the exit program");
+    }
+    let dist = staged.join("dist");
+    std::fs::create_dir_all(&dist).expect("create the build directory");
+    std::fs::write(dist.join("client.js"), "console.log(\"client\");\n")
+        .expect("write the artifact");
+    std::fs::write(
+        dist.join("client.chunks.json"),
+        "{\"leg\":\"client\",\"entry\":\"client.js\",\"styles\":null,\
+         \"classic_script\":false,\"chunks\":[],\"assets\":[]}",
+    )
+    .expect("write the build manifest");
+    build_client(&staged, "native_kolt_client.vl");
+    let (mut native_command, mut node_command) = both_servers(&staged, "native_kolt_server.vl");
+
+    let serve = |command: &mut Command| {
+        let server = ServerUnderTest::spawn(command);
+        let port = server.port();
+        let credentials = "[[\"username\",\"ada\"],[\"password\",\"lovelace1\"]]";
+        let exchanges = vec![
+            ServedRequest::exchange(port, "POST", "/api/register", credentials),
+            ServedRequest::exchange(port, "POST", "/api/login", credentials),
+            ServedRequest::exchange(
+                port,
+                "POST",
+                "/api/login",
+                "[[\"username\",\"ada\"],[\"password\",\"wrong-one\"]]",
+            ),
+            ServedRequest::exchange(port, "POST", "/api/login", "[[\"username\",\"ada\"]]"),
+            ServedRequest::exchange(port, "GET", "/some/deep/link", ""),
+            ServedRequest::exchange(port, "GET", "/client.js", ""),
+        ];
+        let token = exchanges[1]
+            .body
+            .split("\"token\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_default()
+            .to_string();
+        let authorized = run_client(
+            &staged,
+            "native_kolt_client.vl",
+            &[("KOLT_PORT", port.to_string()), ("KOLT_TOKEN", token)],
+        );
+        let refused = run_client(
+            &staged,
+            "native_kolt_client.vl",
+            &[
+                ("KOLT_PORT", port.to_string()),
+                ("KOLT_TOKEN", "bogus".to_string()),
+            ],
+        );
+        (exchanges, authorized, refused)
+    };
+    let native = serve(&mut native_command);
+    let javascript = serve(&mut node_command);
+    assert_eq!(
+        native.0, javascript.0,
+        "the six HTTP exchanges must be the same from both servers"
+    );
+    assert_eq!(
+        native.1, javascript.1,
+        "the authorized client must see the same wire from both servers"
+    );
+    assert_eq!(
+        native.2, javascript.2,
+        "the refused client must be refused the same way by both servers"
+    );
+
+    let bodies: Vec<&str> = native
+        .0
+        .iter()
+        .map(|exchange| exchange.body.as_str())
+        .collect();
+    assert_eq!(
+        bodies[..4],
+        [
+            "{\"ok\":true,\"token\":\"81ff4294f07c6f3c\",\"message\":\"welcome ada\"}",
+            "{\"ok\":true,\"token\":\"81ff4294f07c6f3c\",\"message\":\"welcome ada\"}",
+            "{\"ok\":false,\"token\":\"\",\"message\":\"wrong password\"}",
+            "malformed call",
+        ]
+    );
+    assert_eq!(native.0[3].status, "HTTP/1.1 400 Bad Request");
+    assert!(
+        bodies[4].contains("<title>Kolt</title>")
+            && bodies[4].contains("<meta name=\"shape\" content=\"kolt\">"),
+        "the shell, with the head `const asset::read` baked in:\n{}",
+        bodies[4]
+    );
+    assert_eq!(bodies[5], "console.log(\"client\");\n");
+    assert!(
+        native.0[5]
+            .headers
+            .iter()
+            .any(|line| line == "Cache-Control: no-cache"),
+        "an unfingerprinted artifact is validated, not immutable: {:?}",
+        native.0[5].headers
+    );
+    for line in [
+        "who:ada",
+        "post:1",
+        "m2:ada:world",
+        "m2:ada:world again",
+        "fault:false",
+    ] {
+        assert!(
+            native.1.lines().any(|answered| answered == line),
+            "the authorized client's `{line}` over the native server:\n{}",
+            native.1
+        );
+    }
+    assert!(
+        !native.1.contains("m1"),
+        "a per-key subscription sees ITS key and no other:\n{}",
+        native.1
+    );
+    assert_eq!(native.2.trim(), "err:Unauthorized");
 }
 
 /// The three exchanges the exit drives, over one spawned server.

@@ -15,34 +15,46 @@ the way that is kept honest is a differential: every program the backend accepts
 must print **byte-identical** output under both backends, and a gate in the
 compiler's own suite proves it over the test corpus.
 
-## This is a first cut, and it says what it cannot do
+## What it reaches, and what it refuses by name
 
-The native backend is the first slice of a longer arc, and it is deliberately
-narrow. What it reaches today:
+What the backend reaches today:
 
-- structs, enums, `Option` and `Result`
-- `str`, `List`, `Map`, `Set`
-- closures, `impl` blocks, `match`, loops, recursion
-- `print` and `panic`
+- structs, enums, `Option` and `Result`, generics (monomorphised per type
+  argument), traits, trait objects (`dyn`), overloaded operators
+- `str`, `List`, `Map`, `Set`, closures, `impl` blocks, `match`, loops,
+  recursion, module-level bindings, `lazy`
+- `async`, `await`, `Task` and `Nursery`, on a single-threaded executor of the
+  runtime's own
+- `std::json`, `std::db` (SQLite, through a separate runtime crate that a
+  program links only when it reaches `std::db`), `std::bytes`, `std::crypto`'s
+  SHA-256, `std::time`'s clock, and the plain `std::fs` reads and writes
+- **servers**: `std::http` — `Server::builder()` with `serve_build`,
+  `cache_build` and its conditional GET, `on_request`, `on_start` — and
+  `std::rpc_server`: a `[service]` mounted with `Service::new` or
+  `Service::factory`, the WebSocket upgrade with its handshake gate
+  (`authorize`), and `[expose]`/`[expose(keyed)]` mirrors a vilan client
+  subscribes to, byte-for-byte on the wire with the node build
 
 What it does **not** reach yet — each refused by name, with the construct in the
-message, rather than silently mis-compiled:
-
-- **generic functions and generic types.** Monomorphisation is the next slice,
-  and it is the single largest gap: most of what the standard library offers
-  beyond the list above goes through one.
-- **module-level bindings** (`let` at the top of a file).
-- **`async`, `await`, `Task` and `Nursery`.** Natively these need an executor,
-  which is designed but not built.
-- **anything with a host binding** — `std::fs`, `std::http`, `std::db`,
-  `std::fetch`, `std::dom`, `std::ui`, `std::rpc`, the whole platform surface.
-- **`resource` types.** Deterministic teardown natively is its own slice.
-- **`--watch`.** A native round is a full `cargo build`; the dev loop's
-  hot-swap belongs to the JS backend.
+message, rather than silently mis-compiled: the browser platform (`std::dom`,
+`std::ui`, `std::web`, `std::router`), `resource` types (deterministic
+teardown natively is its own slice), a handful of host bindings (SHA-512 and
+PBKDF2, `random_bytes`, the `fs` calls that take an options object), and
+`--watch` (a native round is a full `cargo build`; the dev loop's hot-swap
+belongs to the JS backend).
 
 If your program uses one of these, `--backend rust` tells you which and stops.
-Build it with `--backend js`, which is still the default and still where every
-shipping feature lives.
+Build it with `--backend js`, which is still the default.
+
+**`Bytes` is shared.** A `Bytes` is one buffer behind every holder, exactly as
+the `Uint8Array` it is on the JS backend: `let b = a` is an alias, and a
+`set`, `fill` or `copy_into` through either is seen through both. `slice` and
+`Bytes::concat` are the two that make a new buffer.
+
+**A server is compared on the wire, not by its bytes alone.** The native HTTP
+server answers `Connection: close` on every response and sends no `Date`; node
+keeps connections alive and dates every answer. Everything a program sets — the
+status, its headers, its body — is the same on both.
 
 ## Debug by default
 
@@ -109,5 +121,4 @@ the point of emitting a language rather than machine code. `vilan build
 
 Native **windows and UI** are not in this backend and are not close: how UI code
 should be written once and run on both native and the web is a design question
-being settled first. Native **servers** — the `@process` family on this backend
-— are the next thing after the gaps above are closed.
+being settled first.

@@ -68,7 +68,7 @@ guide/dev-loop.md h3 is-it-worth-it
 guide/dev-loop.md h3 the-rest-of-the-rules
 guide/dev-loop.md h2 cleaning-up-strays
 guide/native.md h1 native-binaries
-guide/native.md h2 this-is-a-first-cut-and-it-says-what-it-cannot-do
+guide/native.md h2 what-it-reaches-and-what-it-refuses-by-name
 guide/native.md h2 debug-by-default
 guide/native.md h2 numbers
 guide/native.md h2 where-the-emitted-rust-goes
