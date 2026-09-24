@@ -12956,3 +12956,160 @@ fn a_fractional_left_literal_already_divided_as_floats() {
         "0.25\n3\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// E218: a numeric mismatch names its conversion
+// ---------------------------------------------------------------------------
+//
+// "Expected u53, but got i32 instead." was the whole message wherever a value
+// met a declared numeric type of another width, while the binary-operator path
+// (ledger 357) already said "there are no implicit conversions". Every
+// position that reports the plain mismatch now appends the conversion by name,
+// `.as_<expected>()` — the method every numeric width carries — and the editor
+// offers it as a quick fix. One pin per position, and the two shapes that must
+// NOT carry it: a non-numeric side, and a `BigInt` target (no `as_BigInt`).
+
+const E218_STEER: &str = "There are no implicit numeric conversions; convert with";
+
+#[test]
+fn e218_a_let_annotation_names_the_conversion() {
+    assert_fails_spanning(
+        r#"
+        fun main() {
+        	let xs = [1, 2];
+        	let n: u53 = xs.len();
+        	print(i"{n}");
+        }
+        "#,
+        "xs.len()",
+        "Expected u53, but got i32 instead. There are no implicit numeric conversions; \
+         convert with `.as_u53()`",
+    );
+}
+
+#[test]
+fn e218_a_call_argument_names_the_conversion() {
+    assert_fails_spanning(
+        r#"
+        fun take(count: i32): i32 { count }
+
+        fun main() {
+        	print(take(7u53));
+        }
+        "#,
+        "7u53",
+        "Expected i32, but got u53 instead. There are no implicit numeric conversions; \
+         convert with `.as_i32()`",
+    );
+}
+
+#[test]
+fn e218_a_closure_call_argument_names_the_conversion() {
+    // A closure-typed value called directly — `(serializer.begin_list)(n)` is
+    // std's own shape — against a DECLARED parameter type.
+    assert_fails_with(
+        concat!(
+            "fun main() {\n",
+            "\tlet describe: |i32| i32 = |count: i32| count;\n",
+            "\tprint(describe(7u53));\n",
+            "}\n",
+        ),
+        "Expected i32, but got u53 instead. There are no implicit numeric conversions; \
+         convert with `.as_i32()`",
+    );
+}
+
+#[test]
+fn e218_a_method_argument_names_the_conversion() {
+    assert_fails_with(
+        r#"
+        fun main() {
+        	let xs = ["a", "b"];
+        	let at: u53 = 1u53;
+        	print(xs.get(at).unwrap_or("none"));
+        }
+        "#,
+        "Expected i32, but got u53 instead. There are no implicit numeric conversions; \
+         convert with `.as_i32()`",
+    );
+}
+
+#[test]
+fn e218_a_return_position_names_the_conversion() {
+    assert_fails_with(
+        r#"
+        fun count(xs: List<str>): u53 {
+        	xs.len()
+        }
+
+        fun main() {
+        	print(i"{count(["a"])}");
+        }
+        "#,
+        "Expected u53, but got i32 instead. There are no implicit numeric conversions; \
+         convert with `.as_u53()`",
+    );
+}
+
+#[test]
+fn e218_a_struct_field_names_the_conversion() {
+    assert_fails_with(
+        r#"
+        struct Cursor { at: u53 }
+
+        fun main() {
+        	let xs = [1, 2];
+        	let cursor = Cursor { at = xs.len() };
+        	print(i"{cursor.at}");
+        }
+        "#,
+        "Expected u53, but got i32 instead. There are no implicit numeric conversions; \
+         convert with `.as_u53()`",
+    );
+}
+
+#[test]
+fn e218_a_reassignment_names_the_conversion() {
+    assert_fails_with(
+        r#"
+        fun main() {
+        	let xs = [1, 2];
+        	mut n: f64 = 0.5;
+        	n = xs.len();
+        	print(i"{n}");
+        }
+        "#,
+        "Expected f64, but got i32 instead. There are no implicit numeric conversions; \
+         convert with `.as_f64()`",
+    );
+}
+
+#[test]
+fn e218_a_non_numeric_side_carries_no_conversion() {
+    assert_fails_without(
+        r#"
+        fun main() {
+        	let at: u53 = 1u53;
+        	let text: str = at;
+        	print(text);
+        }
+        "#,
+        E218_STEER,
+    );
+}
+
+#[test]
+fn e218_a_bigint_target_carries_no_conversion() {
+    // No width converts INTO `BigInt` by an `as_*` method, so naming one
+    // would steer to a call that does not exist.
+    assert_fails_without(
+        r#"
+        fun main() {
+        	let at: u53 = 1u53;
+        	let big: BigInt = at;
+        	print(i"{big}");
+        }
+        "#,
+        E218_STEER,
+    );
+}

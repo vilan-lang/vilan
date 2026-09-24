@@ -5352,6 +5352,23 @@ const NATIVE_OPERATOR_PRIMITIVES: &[&str] = &[
 /// trait with `Display` as a supertrait, or a program's own.
 pub const RENDER_MEMBER: &str = "to_string";
 
+/// E218: the sentence a numeric-to-numeric mismatch appends, up to the
+/// conversion's name — `Expected u53, but got i32 instead. There are no
+/// implicit numeric conversions; convert with `.as_u53()``. The language
+/// server reads the name back off the message for its quick fix, so the head
+/// is shared rather than spelled twice; [`Analyzer::type_mismatch_message`]
+/// writes the whole sentence literally (the diagnostics ledger searches the
+/// tree for it), and the server's quick-fix pin reds if the two drift apart.
+pub const NUMERIC_CONVERSION_STEER: &str =
+    "There are no implicit numeric conversions; convert with `.";
+
+/// E218: the numeric widths an `as_*` method converts INTO — every numeric
+/// primitive but `BigInt`, which no width converts to by method. Each of the
+/// eleven numeric types carries the whole row (`number.vl`).
+const CONVERTIBLE_NUMERIC_NAMES: &[&str] = &[
+    "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64",
+];
+
 fn is_overloadable_operator(op: BinaryOp) -> bool {
     operator_trait_method(op).is_some()
 }
@@ -40342,6 +40359,53 @@ impl<'src> Analyzer<'src> {
         Ok(Some(collected))
     }
 
+    /// The general type mismatch, "Expected A, but got B instead." — with the
+    /// conversion named when both sides are numeric widths (E218).
+    ///
+    /// There are no implicit conversions between the widths, and a value of
+    /// the wrong one is fixed by exactly one call, `.as_<expected>()`, which
+    /// every numeric type carries. The binary-operator refusal said so
+    /// (ledger 357); the positions that type a value against a DECLARED type
+    /// — an argument, a `let` annotation, a reassignment, a return, a field —
+    /// said only the plain sentence, which every index conversion meets (I5).
+    /// `BigInt` is left out as a target: nothing converts into it by method.
+    fn type_mismatch_message(
+        &self,
+        expected_type: &Type,
+        got_type: &Type,
+        substitution_context: &SubstitutionContext,
+    ) -> String {
+        let expected = self.pretty_print_type(expected_type, substitution_context);
+        let got = self.pretty_print_type(got_type, substitution_context);
+        match self.numeric_conversion_target(expected_type, got_type) {
+            Some(target) => format!(
+                "Expected {expected}, but got {got} instead. There are no implicit numeric \
+                 conversions; convert with `.as_{target}()`"
+            ),
+            None => format!("Expected {expected}, but got {got} instead."),
+        }
+    }
+
+    /// The width a value of `got_type` converts to with `.as_<width>()` to fit
+    /// `expected_type`, when both are distinct numeric widths and the target
+    /// has such a method (E218).
+    fn numeric_conversion_target(
+        &self,
+        expected_type: &Type,
+        got_type: &Type,
+    ) -> Option<&'static str> {
+        let numeric_name = |type_: &Type, names: &[&'static str]| match type_ {
+            Type::Struct(id, _) => names
+                .iter()
+                .find(|name| self.primitive_struct_ids.get(**name) == Some(id))
+                .copied(),
+            _ => None,
+        };
+        let target = numeric_name(expected_type, CONVERTIBLE_NUMERIC_NAMES)?;
+        let source = numeric_name(got_type, crate::type_::NUMERIC_PRIMITIVE_NAMES)?;
+        (target != source).then_some(target)
+    }
+
     /// Records a resolved call: a `FunctionCall` plus the `Expr::Call` entity.
     /// The diagnostic for an argument that does not fit its declared parameter
     /// — with the BARE TRAIT case steered (B72).
@@ -40370,9 +40434,8 @@ impl<'src> Analyzer<'src> {
         argument_type: &Type,
         substitution_context: &SubstitutionContext,
     ) -> (String, Option<crate::error::Note>) {
-        let expected = self.pretty_print_type(parameter_type, substitution_context);
         let got = self.pretty_print_type(argument_type, substitution_context);
-        let plain = format!("Expected {expected}, but got {got} instead.");
+        let plain = self.type_mismatch_message(parameter_type, argument_type, substitution_context);
         let Type::Trait(trait_id, _) = parameter_type else {
             return (plain, None);
         };
@@ -41112,11 +41175,23 @@ impl<'src> Analyzer<'src> {
                             ),
                             None => (String::new(), None),
                         };
+                    // A DECLARED parameter type is the E218 position: the
+                    // conversion is the fix. An inferred one keeps the
+                    // annotate-it steer, which is the more useful sentence.
+                    let msg = if origin.is_empty() {
+                        self.type_mismatch_message(
+                            &parameter_type,
+                            &argument_type,
+                            &substitution_context,
+                        )
+                    } else {
+                        format!("Expected {expected}, but got {got} instead.{origin}")
+                    };
                     self.diagnostics.push(Error {
                         trace: Vec::new(),
                         note,
                         span: **self.span_map.get(&argument_id).unwrap(),
-                        msg: format!("Expected {}, but got {} instead.{}", expected, got, origin),
+                        msg,
                     });
                 }
             }
@@ -41223,14 +41298,16 @@ impl<'src> Analyzer<'src> {
                             self.reconcile_type(&argument_type, &data_type, &substitution_context);
                         self.inferable_generics = previously_inferable;
                         if reconciled.is_none() {
-                            let expected =
-                                self.pretty_print_type(&data_type, &substitution_context);
-                            let got = self.pretty_print_type(&argument_type, &substitution_context);
+                            let msg = self.type_mismatch_message(
+                                &data_type,
+                                &argument_type,
+                                &substitution_context,
+                            );
                             self.diagnostics.push(Error {
                                 trace: Vec::new(),
                                 note: None,
                                 span: **self.span_map.get(&argument_id).unwrap(),
-                                msg: format!("Expected {}, but got {} instead.", expected, got),
+                                msg,
                             });
                         }
                     }
@@ -42828,13 +42905,13 @@ impl<'src> Analyzer<'src> {
                 .reconcile_type(&argument_type, &slot_type, &HashMap::default())
                 .is_none()
             {
-                let expected = self.pretty_print_type(&slot_type, &HashMap::default());
-                let got = self.pretty_print_type(&argument_type, &HashMap::default());
+                let msg =
+                    self.type_mismatch_message(&slot_type, &argument_type, &HashMap::default());
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&argument_id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!("Expected {}, but got {} instead.", expected, got),
+                    msg,
                 });
                 return Resolution::Failed;
             }
@@ -42969,13 +43046,16 @@ impl<'src> Analyzer<'src> {
                 .reconcile_type(&argument_type, &parameter_type, &HashMap::default())
                 .is_none()
             {
-                let expected = self.pretty_print_type(&parameter_type, &HashMap::default());
-                let got = self.pretty_print_type(&argument_type, &HashMap::default());
+                let msg = self.type_mismatch_message(
+                    &parameter_type,
+                    &argument_type,
+                    &HashMap::default(),
+                );
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&argument_id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!("Expected {}, but got {} instead.", expected, got),
+                    msg,
                 });
             }
         }
@@ -43171,14 +43251,16 @@ impl<'src> Analyzer<'src> {
                     }
                 }
                 None => {
-                    let expected_str =
-                        self.pretty_print_type(&variable_type, &substitution_context);
-                    let got_str = self.pretty_print_type(&value_type, &substitution_context);
+                    let msg = self.type_mismatch_message(
+                        &variable_type,
+                        &value_type,
+                        &substitution_context,
+                    );
                     self.diagnostics.push(Error {
                         trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&first_value_id).unwrap(),
-                        msg: format!("Expected {}, but got {} instead.", expected_str, got_str),
+                        msg,
                     });
                 }
             }
@@ -43210,7 +43292,6 @@ impl<'src> Analyzer<'src> {
                 None => {
                     let expected_str =
                         self.pretty_print_type(&variable_type, &substitution_context);
-                    let got_str = self.pretty_print_type(&value_type, &substitution_context);
                     // The type the reassignment broke was inferred, not
                     // written — name the origin (B3).
                     let note = inferred_origin.map(|span| {
@@ -43221,11 +43302,16 @@ impl<'src> Analyzer<'src> {
                             ),
                         )
                     });
+                    let msg = self.type_mismatch_message(
+                        &variable_type,
+                        &value_type,
+                        &substitution_context,
+                    );
                     self.diagnostics.push(Error {
                         trace: Vec::new(),
                         note,
                         span: **self.span_map.get(&value_id).unwrap(),
-                        msg: format!("Expected {}, but got {} instead.", expected_str, got_str),
+                        msg,
                     });
                 }
             }
@@ -43773,9 +43859,7 @@ impl<'src> Analyzer<'src> {
                 "Expected {expected}, but got void instead: an `if` with no `else` produces void."
             )
         } else {
-            let expected = self.pretty_print_type(target_return_type, substitution_context);
-            let got = self.pretty_print_type(&body_type, substitution_context);
-            format!("Expected {}, but got {} instead.", expected, got)
+            self.type_mismatch_message(target_return_type, &body_type, substitution_context)
         };
         ReturnPositionCheck::Mismatched(msg)
     }
@@ -46350,11 +46434,7 @@ impl<'src> Analyzer<'src> {
                     trace: Vec::new(),
                     note: None,
                     span: value_span,
-                    msg: format!(
-                        "Expected {}, but got {} instead.",
-                        self.pretty_print_type(field_type, substitution_context),
-                        self.pretty_print_type(&value_type, substitution_context),
-                    ),
+                    msg: self.type_mismatch_message(field_type, &value_type, substitution_context),
                 });
                 FieldValueVerdict::Refused
             }
