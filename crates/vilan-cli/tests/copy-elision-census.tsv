@@ -1,7 +1,7 @@
 # Emitted `__clone` call sites per corpus golden — the copy-elision
 # census (lifetimes.md §11, slice S2). Regenerate with
 # VILAN_REGENERATE_COPY_ELISION_CENSUS=1 cargo test -p vilan-cli --test copy_elision_census
-# total	406
+# total	412
 adapt	0
 arena	6
 asset_bundle	0
@@ -129,6 +129,8 @@ try-assert	2
 tuple-access	1
 tuple-spread	10
 unary-minus	0
+usize	6
+usize-underflow	0
 value-semantics	3
 vec2	0
 view-basic	1

@@ -8177,6 +8177,9 @@ fn scalar_type(name: &str) -> Option<&'static str> {
         "u32" => "u32",
         "i53" => "i64",
         "u53" => "u64",
+        // I5: an index is the platform word natively (ruling 1). Its RANGE
+        // guarantee is still the JS one, like `u53`'s (§11 Q3).
+        "usize" => "usize",
         "f32" => "f32",
         "f64" => "f64",
         "str" => "vilan_rt::Str",
@@ -8298,7 +8301,7 @@ fn host_handle_name(rendered: &str) -> Option<&'static str> {
 fn is_integer_type(rendered: &str) -> bool {
     matches!(
         rendered,
-        "i8" | "u8" | "i16" | "u16" | "i32" | "u32" | "i64" | "u64"
+        "i8" | "u8" | "i16" | "u16" | "i32" | "u32" | "i64" | "u64" | "usize"
     )
 }
 

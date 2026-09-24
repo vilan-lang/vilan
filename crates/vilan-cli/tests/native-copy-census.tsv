@@ -23,4 +23,5 @@ remainder	0	1
 numeric-types	1	6
 option-view	0	0
 dyn-objects	1	4
+usize	6	9
 native_probe_board	0	4

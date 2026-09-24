@@ -1,0 +1,81 @@
+// `usize`, the index type (tracker I5 S1, proposal/index-type.md): a DISTINCT
+// numeric type — `u53` on the JS targets, the platform word natively — whose
+// range guarantee is the JS one on every backend. This program is the family's
+// surface as both backends must print it; the underflow it deliberately
+// avoids is `usize-underflow.vl`, which the native differential names out.
+import std::debug::Debug;
+import std::display::{ Display, format };
+import std::json::{ FromJson, Json, decode_json, encode_json };
+import std::map::Map;
+import std::operators::Div;
+
+// Generic dispatch reaches `usize`'s operator impl, and division through
+// `T: Div` truncates like the direct form.
+fun halve<T: Div>(value: T, divisor: T): T {
+	value / divisor
+}
+
+fun main() {
+	// A literal takes `usize` from an annotation; the suffix names it outright.
+	let count: usize = 42;
+	let step = 5usize;
+	let total = count + step;
+	let left = count - step;
+	let scaled = count * step;
+	let quotient = count / step;
+	let remainder = count.rem(step);
+	print(i"{total} {left} {scaled} {quotient} {remainder}");
+	let halved = halve(count, 4usize);
+	print(i"{halved}");
+	// The suffix on `42usize` is a finding, not the style: natively a
+	// comparison's unsuffixed literal is emitted at `i32` whatever the left
+	// operand's width (every sized width, not only `usize`), which rustc refuses.
+	print(i"{count > step} {count == 42usize} {count != step}");
+
+	// The bounds are the JS guarantee on every backend (§11 Q3).
+	let top = usize::max_value();
+	let bottom = usize::min_value();
+	print(i"{top} {bottom}");
+
+	// The defined answers to a subtraction past zero.
+	let floor = step.saturating_sub(count);
+	print(i"{floor}");
+	print(step.checked_sub(count).is_none());
+	let back: usize = count.checked_sub(step).unwrap_or(0usize);
+	print(i"{back}");
+
+	// Conversions in, and back out.
+	let from_i32 = 12.as_usize();
+	let from_f64 = 7.9f.as_usize();
+	let from_u8 = 200u8.as_usize();
+	let to_i32 = count.as_i32();
+	let to_u8 = 300usize.as_u8();
+	print(i"{from_i32} {from_f64} {from_u8} {to_i32} {to_u8}");
+
+	// An index: the subscript takes a `usize` beside an `i32` until S2.
+	let letters = ["a", "b", "c", "d"];
+	let at: usize = 2;
+	print(letters[at]);
+
+	// The family's traits, each through its own door.
+	print(format(count));
+	print(count.debug());
+	print(count.to_json());
+	match usize::from_json("17") {
+		Ok(let parsed) => print(i"{parsed}"),
+		Err(let reason) => print(reason),
+	}
+	mut rows: Map<usize, str> = Map::new();
+	rows.insert(3usize, "three");
+	print(rows.get(3usize).unwrap_or("none"));
+
+	// A list of them serializes and parses through each element's own impl.
+	let positions: List<usize> = [0usize, 3usize, 2147483647usize];
+	let encoded = positions.to_json();
+	print(encoded);
+	let decoded: Result<List<usize>, str> = List::from_json(encoded);
+	match decoded {
+		Ok(let back) => print(i"{back.len()} {back[2]}"),
+		Err(let reason) => print(reason),
+	}
+}

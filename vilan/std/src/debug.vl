@@ -138,6 +138,11 @@ impl u53 with Debug {
 	external fun debug(self): str;
 }
 
+impl usize with Debug {
+	[extern("JSON.stringify")]
+	external fun debug(self): str;
+}
+
 impl f32 with Debug {
 	[extern("JSON.stringify")]
 	external fun debug(self): str;

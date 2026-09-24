@@ -517,8 +517,9 @@ through it, and `lt`/`le`/`gt`/`ge` come free as defaults).
 → [Data and traits](../tour/data-and-traits.md)
 
 **"the literal `…` is out of range for `…` (…)"**
-The number doesn't fit the type. For `i53`/`u53` the range is ±2^53,
-JavaScript's exact-integer window. Bigger integers take `BigInt` (`7n`).
+The number doesn't fit the type. For `i53`/`u53`/`usize` the range is
+±2^53 (non-negative for the unsigned two), JavaScript's exact-integer
+window. Bigger integers take `BigInt` (`7n`).
 → [Values and types](../tour/values-and-types.md)
 
 **"unknown numeric suffix `…`"**

@@ -134,8 +134,8 @@ the full shape.
 Everything that travels — an rpc's parameters, the values a call answers
 with, mirrored payloads — must be serializable, which Vilan calls
 **Wire**. The scalars
-are Wire (`bool`, every integer width from `i8` to `u53`, both floats,
-`str`). `List`, `Option`, `Result` and `Map` of Wire types are Wire — so a
+are Wire (`bool`, every integer width from `i8` to `u53`, `usize`, both
+floats, `str`). `List`, `Option`, `Result` and `Map` of Wire types are Wire — so a
 fallible reply, `Result<Row, str>`, is an ordinary return type. And your own
 types opt in with a derive:
 

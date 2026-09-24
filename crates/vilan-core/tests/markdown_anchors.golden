@@ -378,6 +378,7 @@ std/net.md h2 stdws
 std/numbers.md h1 numbers-reference
 std/numbers.md h2 the-family
 std/numbers.md h2 methods
+std/numbers.md h2 usize-the-index-type
 std/numbers.md h2 conversions-as_
 std/numbers.md h2 stdmath
 std/numbers.md h2 stdrandom

@@ -156,7 +156,7 @@ and is destroyed deterministically after its last use (a `Database`, an
 
 <a id="safe-integer"></a>**safe integer**: an integer JavaScript's 64-bit floats represent
 exactly: anything within ±2^53. Vilan's `i53`/`u53` are named for this
-window. [Values and types](../tour/values-and-types.md).
+window, and `usize` promises it too. [Values and types](../tour/values-and-types.md).
 
 <a id="service"></a>**service**: a server struct whose `[rpc]` methods clients call and
 whose `[expose]`d signals clients [mirror](#mirror).

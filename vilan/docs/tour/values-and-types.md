@@ -53,6 +53,10 @@ are ordinary identifiers everywhere else. Spec
 - Signed integers `i8 i16 i32 i53` and unsigned `u8 u16 u32 u53`. A bare
   literal like `42` is `i32`. Other widths take a suffix: `0xFFu8`,
   `60000u16`, `9007199254740992i53`.
+- `usize`, the index type: a position, a length, a count. It is its own
+  type (convert with `as_usize()` / `as_i32()`), and subtracting one past
+  zero is unspecified — reach for `checked_sub` when zero is possible.
+  [Numbers](../std/numbers.md#usize-the-index-type) has the whole story.
 - Floats: `f64` (a bare `2.5`, or the `f` suffix) and `f32` (`2.5f32`).
 - `BigInt`: arbitrary precision, with the `n` suffix (`7n`).
 

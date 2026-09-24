@@ -117,6 +117,12 @@ impl u53 with Display {
 	}
 }
 
+impl usize with Display {
+	fun to_string(self): str {
+		i"{self}"
+	}
+}
+
 impl f32 with Display {
 	fun to_string(self): str {
 		i"{self}"

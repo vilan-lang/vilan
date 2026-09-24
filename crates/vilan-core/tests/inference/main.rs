@@ -25,6 +25,7 @@ mod const_eval;
 mod dyn_objects;
 mod generics;
 mod hmr;
+mod index_type;
 mod iterators;
 mod lazy;
 mod lifetimes;

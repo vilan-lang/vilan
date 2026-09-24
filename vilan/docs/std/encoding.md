@@ -197,12 +197,16 @@ The codec-agnostic serialization protocol under `derive(Wire)` and rpc:
   method on `&mut self` — a visitor is *written to* as a value narrates
   itself. The
   wire scalars are `str`, `bool` and the whole sized numeric family —
-  `i8`, `u8`, `i16`, `u16`, `i32`, `u32`, `i53`, `u53`, `f32`, `f64` —
-  plus lists, options, results, maps, structs and enum variants. The
-  visitor itself has six scalar lanes and the sized widths ride the one
-  that holds them exactly (`i8`/`i16` on `i32`, `u8`/`u16` on `u32`,
+  `i8`, `u8`, `i16`, `u16`, `i32`, `u32`, `i53`, `u53`, `usize`, `f32`,
+  `f64` — plus lists, options, results, maps, structs and enum variants.
+  The visitor itself has six scalar lanes and the sized widths ride the
+  one that holds them exactly (`i8`/`i16` on `i32`, `u8`/`u16` on `u32`,
   `u53` on `i53`, `f32` on `f64`), so every round trip is lossless and
-  no codec grows a method per width.
+  no codec grows a method per width. `usize` is the exception, and a
+  deliberate one: it rides the **`i32`** lane, the width a length or a
+  position has always had on the wire, so a frame does not grow by four
+  bytes a position when a position is respelled `usize`. A `usize` past
+  `i32::MAX` cannot be described.
 - `Frame`: one encoded message.
 - `Codec`: a matched writer/reader pair, `json_codec()` (`std::json`,
   readable) or `binary_codec()` (`std::binary`, compact). Client and

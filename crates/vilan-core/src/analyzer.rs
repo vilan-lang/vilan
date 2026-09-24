@@ -3088,7 +3088,7 @@ pub struct Scope<'src> {
 /// an unsigned id (`u53`) could not cross the wire and `std::json` — which
 /// carries the same family — was a strictly wider door than `std::wire`.
 const WIRE_SCALAR_NAMES: &[&str] = &[
-    "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64",
+    "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "usize", "f32", "f64",
 ];
 
 /// The scalars `Hashable` is satisfied by outright — the fast path
@@ -3098,7 +3098,8 @@ const WIRE_SCALAR_NAMES: &[&str] = &[
 /// accepts and the other rejects — a field the derive admits and a key the
 /// return check refuses, or the reverse — is no longer expressible.
 const HASHABLE_SCALAR_NAMES: &[&str] = &[
-    "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64", "Hash",
+    "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "usize", "f32", "f64",
+    "Hash",
 ];
 
 /// A `[derive(Wire)]` type awaiting the all-fields-Wire check: its name, its
@@ -5018,9 +5019,8 @@ fn removed_std_alias(root: &str, name: &str, at_std_root: bool) -> Option<String
         "print" | "panic" | "assert" => "io",
         "Default" => "default",
         "str" => "string",
-        "BigInt" | "f32" | "f64" | "i8" | "i16" | "i32" | "i53" | "u8" | "u16" | "u32" | "u53" => {
-            "number"
-        }
+        "BigInt" | "f32" | "f64" | "i8" | "i16" | "i32" | "i53" | "u8" | "u16" | "u32" | "u53"
+        | "usize" => "number",
         _ => return None,
     };
     // The primitives are ambient with no prelude at all (spec §4.7), so
@@ -5342,7 +5342,7 @@ fn contains_try_assert(node: &Node) -> bool {
 /// minus `null`, which has no operators. `bool` belongs to the same class but
 /// is a numeric *enum*, so it is handled beside this list, never in it.
 const NATIVE_OPERATOR_PRIMITIVES: &[&str] = &[
-    "i32", "u32", "f64", "BigInt", "str", "i8", "u8", "i16", "u16", "i53", "u53", "f32",
+    "i32", "u32", "f64", "BigInt", "str", "i8", "u8", "i16", "u16", "i53", "u53", "usize", "f32",
 ];
 
 /// The member a `str` concatenation routes a non-native operand through —
@@ -5366,7 +5366,7 @@ pub const NUMERIC_CONVERSION_STEER: &str =
 /// primitive but `BigInt`, which no width converts to by method. Each of the
 /// eleven numeric types carries the whole row (`number.vl`).
 const CONVERTIBLE_NUMERIC_NAMES: &[&str] = &[
-    "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64",
+    "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "usize", "f32", "f64",
 ];
 
 fn is_overloadable_operator(op: BinaryOp) -> bool {
@@ -10490,7 +10490,8 @@ impl<'src> Analyzer<'src> {
         visiting: &mut HashSet<TypeId>,
     ) -> (bool, bool) {
         const SCALARS: &[&str] = &[
-            "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64",
+            "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "usize", "f32",
+            "f64",
         ];
         let signal_id = self.primitive_struct_ids.get("SignalCell").copied();
         let shared_id = self.primitive_struct_ids.get("Shared").copied();
@@ -35450,7 +35451,8 @@ impl<'src> Analyzer<'src> {
             // (`0` against an `f64` field), defaulting to `i32`.
             Expr::Number(_, fraction, suffix) => {
                 const NUMERIC_PRIMITIVES: &[&str] = &[
-                    "f64", "u32", "i32", "BigInt", "i8", "u8", "i16", "u16", "i53", "u53", "f32",
+                    "f64", "u32", "i32", "BigInt", "i8", "u8", "i16", "u16", "i53", "u53", "usize",
+                    "f32",
                 ];
                 let name = match *suffix {
                     Some("u32") => "u32",
@@ -35464,6 +35466,7 @@ impl<'src> Analyzer<'src> {
                     Some("u16") => "u16",
                     Some("i53") => "i53",
                     Some("u53") => "u53",
+                    Some("usize") => "usize",
                     _ => {
                         // Unsuffixed: a fractional literal is a float (`f32`
                         // only by expectation); an integer takes the expected
@@ -47096,6 +47099,18 @@ impl<'src> Analyzer<'src> {
         if index_type == expected {
             return true;
         }
+        // I5 S1: `usize` is admitted BESIDE `i32`, at the subscript only — a
+        // two-type admission for the one release in which both spellings are
+        // an index. The expectation above stays `i32`, so a literal index and
+        // every emitted subscript are unchanged; the message below keeps
+        // naming `i32` because it steers to the type `xs.get(i)` takes, which
+        // is still `i32` until S2. S2 (the std signatures move to `usize`)
+        // DELETES this admission and makes `usize` the expectation.
+        if let Some(usize_struct_id) = self.primitive_struct_ids.get("usize").copied()
+            && index_type == Type::Struct(usize_struct_id, Vec::new())
+        {
+            return true;
+        }
         let index_str = self.pretty_print_type(&index_type, &HashMap::default());
         self.diagnostics.push(Error {
             trace: Vec::new(),
@@ -50549,9 +50564,11 @@ impl<'src> Analyzer<'src> {
                         self.division_generic_lhs.insert(binary_id, *constraint_id);
                     }
                     (_, Type::Struct(id, _))
-                        if ["i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53"]
-                            .iter()
-                            .any(|name| self.primitive_struct_ids.get(*name) == Some(id)) =>
+                        if [
+                            "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "usize",
+                        ]
+                        .iter()
+                        .any(|name| self.primitive_struct_ids.get(*name) == Some(id)) =>
                     {
                         self.integer_division.insert(binary_id);
                     }
@@ -51680,6 +51697,7 @@ impl<'src> Analyzer<'src> {
                 ("u32", 4_294_967_295, false),
                 ("i32", 2_147_483_648, true),
                 ("u53", 9_007_199_254_740_992, false),
+                ("usize", 9_007_199_254_740_992, false),
                 ("i53", 9_007_199_254_740_992, true),
             ];
             let Some((name, bound, signed)) = BOUNDS
@@ -51696,7 +51714,7 @@ impl<'src> Analyzer<'src> {
             if value.map(|value| value <= bound).unwrap_or(false) {
                 continue;
             }
-            let range = if matches!(name, "i53" | "u53") {
+            let range = if matches!(name, "i53" | "u53" | "usize") {
                 "exact integers span ±2^53 on the JS backend; use `BigInt` for larger values"
                     .to_string()
             } else if signed {
@@ -61284,6 +61302,7 @@ fn analyze_inner<'src>(
         ("u16", "number"),
         ("i53", "number"),
         ("u53", "number"),
+        ("usize", "number"),
         ("f32", "number"),
     ] {
         let id = module_scopes

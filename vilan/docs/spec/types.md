@@ -9,7 +9,7 @@ The type forms (grammar §3.9) denote:
   equal iff they name the same declaration and their arguments are
   equal. There is no structural typing of nominals.
 - **Primitives**: `bool`, `str`, `i8 i16 i32 i53 u8 u16 u32 u53`,
-  `f32 f64`, `BigInt`. Declared in std as external structs; nominally
+  `usize`, `f32 f64`, `BigInt`. Declared in std as external structs; nominally
   distinct (no implicit numeric conversions, §5.8).
 - **Tuples**: `(T, U, …)`; structural: equal iff element-wise equal.
   `()` and one-element tuples do not exist as distinct types (`(T)` is

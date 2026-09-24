@@ -175,6 +175,8 @@ external fun coerce_i53(value: JsonValue): i53;
 [extern("Number")]
 external fun coerce_u53(value: JsonValue): u53;
 [extern("Number")]
+external fun coerce_usize(value: JsonValue): usize;
+[extern("Number")]
 external fun coerce_f32(value: JsonValue): f32;
 [extern("Number")]
 external fun coerce_f64(value: JsonValue): f64;
@@ -1438,6 +1440,27 @@ export impl u53 with FromJson {
 	fun from_json_value(value: JsonValue): Result<u53, str> {
 		if value.kind() == JsonKind::Number {
 			Ok(coerce_u53(value))
+		} else {
+			Err("expected a number")
+		}
+	}
+}
+
+export impl usize with Json {
+	[extern("JSON.stringify")]
+	external fun to_json(self): str;
+}
+
+export impl usize with FromJson {
+	fun from_json(text: str): Result<usize, str> {
+		match text.try_parse_json() {
+			Some(let value) => usize::from_json_value(value),
+			None => Err("not valid JSON"),
+		}
+	}
+	fun from_json_value(value: JsonValue): Result<usize, str> {
+		if value.kind() == JsonKind::Number {
+			Ok(coerce_usize(value))
 		} else {
 			Err("expected a number")
 		}
