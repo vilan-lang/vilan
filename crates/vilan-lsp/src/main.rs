@@ -62,6 +62,15 @@ struct Config {
     inlay_hints_enabled: bool,
     semantic_tokens_enabled: bool,
     completion_function_call: CompletionFunctionCall,
+    /// E222: the client pairs a generic `<` ITSELF — it asked
+    /// [`OPENS_A_GENERIC_LIST`] before placing a `>`, and it types over that
+    /// `>` when the author reaches it — so `onTypeFormatting` must not place
+    /// a second one. Declared by the VS Code extension as
+    /// `autoClosing.generics` while its `type` override is installed; a
+    /// client that never sends it keeps today's `onTypeFormatting` answer,
+    /// which is the whole of the pairing an LSP client that cannot move the
+    /// caret gets.
+    client_closes_generics: bool,
 }
 
 impl Default for Config {
@@ -70,6 +79,7 @@ impl Default for Config {
             inlay_hints_enabled: true,
             semantic_tokens_enabled: true,
             completion_function_call: CompletionFunctionCall::Full,
+            client_closes_generics: false,
         }
     }
 }
@@ -105,6 +115,12 @@ impl Config {
                 // `full` and any unrecognized value keep the default.
                 _ => CompletionFunctionCall::Full,
             };
+        }
+        if let Some(closes) = root
+            .pointer("/autoClosing/generics")
+            .and_then(|v| v.as_bool())
+        {
+            config.client_closes_generics = closes;
         }
         config
     }
@@ -774,6 +790,25 @@ mod config_tests {
         assert_eq!(
             config.completion_function_call,
             CompletionFunctionCall::None
+        );
+    }
+
+    // E222: the declaration is the client's, and only a client that makes it
+    // stands `onTypeFormatting` down — absent, it is off.
+    #[test]
+    fn the_client_declares_that_it_closes_generics() {
+        assert!(!Config::default().client_closes_generics);
+        assert!(
+            Config::from_settings(&json!({ "autoClosing": { "generics": true } }))
+                .client_closes_generics
+        );
+        assert!(
+            Config::from_settings(&json!({ "vilan": { "autoClosing": { "generics": true } } }))
+                .client_closes_generics
+        );
+        assert!(
+            !Config::from_settings(&json!({ "autoClosing": { "generics": "yes" } }))
+                .client_closes_generics
         );
     }
 
@@ -2256,6 +2291,24 @@ impl Backend {
         }
     }
 
+    /// E222: [`OPENS_A_GENERIC_LIST`] — the rule `onTypeFormatting` applies,
+    /// asked as a question so the client can place the `>` and type over it
+    /// (which an edit cannot do). LIVE coordinates, for `on_type_formatting`'s
+    /// reason: the position is the one the client just typed into.
+    ///
+    /// Fenced like every other request, and `false` is the fallback: an answer
+    /// the client cannot get must leave the `<` alone, since a wrong `>` is
+    /// worse than a missing one.
+    async fn opens_a_generic_list(&self, params: TextDocumentPositionParams) -> Result<bool> {
+        self.fenced("opensAGenericList", Ok(false), || {
+            let Some(document) = self.documents.get(&params.text_document.uri) else {
+                return Ok(false);
+            };
+            let offset = document.line_index.offset(params.position);
+            Ok(document.opens_a_generic_list(offset))
+        })
+    }
+
     /// The session summary as this server would write it now: the request
     /// profile, the retained-state cardinalities, the analysis counts and
     /// E166's memory reading.
@@ -2750,6 +2803,28 @@ impl Backend {
 /// The extension sends this name from `editors/vscode/src/extension.ts`; the
 /// two spellings are gated against each other in `book_sync`.
 pub const LOG_SESSION_SUMMARY: &str = "vilan.logSessionSummary";
+
+/// E222: the server's first CUSTOM request — "does the `<` just before this
+/// position open a generic list?" — answered by
+/// [`Document::opens_a_generic_list`], the rule `onTypeFormatting` already
+/// applies (E202).
+///
+/// It exists because an edit is the only thing `onTypeFormatting` can answer
+/// with, and an edit cannot move the caret: VS Code types over a closing
+/// character only when it auto-inserted that character itself, so the `>` the
+/// server placed was doubled whenever the author typed their own
+/// (`List<i32>>`). A client that can move the caret — the VS Code extension's
+/// `type` override — asks this instead, places the `>` itself, and swallows
+/// the next `>` typed onto it; it says so in `initializationOptions`
+/// (`autoClosing.generics`), and `onTypeFormatting` then stands down for `<`.
+///
+/// Params are `TextDocumentPositionParams` in LIVE coordinates — the
+/// position just past the `<` the client has already typed, which is what
+/// `onTypeFormatting` receives too. The answer is a bare `bool`.
+///
+/// The extension spells this name in `editors/vscode/src/extension.ts`; the
+/// two spellings are gated against each other in `book_sync`.
+pub const OPENS_A_GENERIC_LIST: &str = "vilan/opensAGenericList";
 
 fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
@@ -3734,6 +3809,17 @@ impl LanguageServer for Backend {
         params: DocumentOnTypeFormattingParams,
     ) -> Result<Option<Vec<TextEdit>>> {
         self.fenced("onTypeFormatting", Ok(None), || {
+            // E222: a client that pairs `<` itself has said so, and a second
+            // `>` from here would be exactly the character it swallows once.
+            if params.ch == "<"
+                && self
+                    .config
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .client_closes_generics
+            {
+                return Ok(None);
+            }
             let uri = params.text_document_position.text_document.uri;
             let position = params.text_document_position.position;
             let Some(document) = self.documents.get(&uri) else {
@@ -6216,7 +6302,8 @@ async fn main() {
     apply_base_cache_budget_from_env();
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
-    let (service, socket) = LspService::new(|client| Backend {
+    // E222: the one custom request, beside the standard surface.
+    let (service, socket) = LspService::build(|client| Backend {
         client,
         documents: Arc::new(DashMap::new()),
         semantic_token_cache: Arc::new(DashMap::new()),
@@ -6234,13 +6321,161 @@ async fn main() {
         union_tokens: Arc::new(DashMap::new()),
         focus: Arc::new(std::sync::Mutex::new(Vec::new())),
         formatting_declines: Arc::new(DashMap::new()),
-    });
+    })
+    .custom_method(OPENS_A_GENERIC_LIST, Backend::opens_a_generic_list)
+    .finish();
     Server::new(stdin, stdout, socket).serve(service).await;
 }
 
 /// B39b: the delta path's protocol contract — a full answer carries a
 /// `result_id`, a delta request echoing it gets EDITS (zero for an unchanged
 /// document), and an unknown baseline re-synchronizes with a full stream.
+/// E222: a client that pairs `<` itself declares it, and the server then
+/// answers the QUESTION and stops placing the `>` — while every other client
+/// keeps today's `onTypeFormatting` edit. Driven through the real `Backend`,
+/// because the stand-down is the handler's, not the document's.
+#[cfg(test)]
+mod generic_pairing_tests {
+    use super::snapshot_consistency_tests::backend;
+    use super::*;
+    use crate::document::tests::std_root;
+
+    /// `List<` just typed: the caret one past the `<`, on line 1.
+    const TYPED: &str = "fun main() {\n\tlet xs: List<\n}\n";
+    /// The caret sits after `\tlet xs: List<` — fourteen characters in.
+    const CARET: Position = Position {
+        line: 1,
+        character: 14,
+    };
+
+    fn open(backend: &Backend, text: &str) -> Url {
+        let uri = Url::parse("file:///pairing/main.vl").expect("a url");
+        backend.documents.insert(
+            uri.clone(),
+            Document::analyze(text, &std_root(), Path::new("pairing.vl")),
+        );
+        uri
+    }
+
+    fn typed_params(uri: &Url, ch: &str) -> DocumentOnTypeFormattingParams {
+        DocumentOnTypeFormattingParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: CARET,
+            },
+            ch: ch.to_string(),
+            options: FormattingOptions {
+                tab_size: 4,
+                insert_spaces: false,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn declare(backend: &Backend, settings: serde_json::Value) {
+        *backend
+            .config
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Config::from_settings(&settings);
+    }
+
+    #[tokio::test]
+    async fn a_client_that_declares_nothing_keeps_the_on_type_edit() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open(backend, TYPED);
+        let edits = backend
+            .on_type_formatting(typed_params(&uri, "<"))
+            .await
+            .expect("answers")
+            .expect("the `>` for `List<`");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, ">");
+        assert_eq!(edits[0].range, Range::new(CARET, CARET));
+    }
+
+    #[tokio::test]
+    async fn a_client_that_closes_generics_itself_gets_no_on_type_edit() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open(backend, TYPED);
+        declare(
+            backend,
+            serde_json::json!({ "autoClosing": { "generics": true } }),
+        );
+        assert_eq!(
+            backend
+                .on_type_formatting(typed_params(&uri, "<"))
+                .await
+                .expect("answers"),
+            None,
+            "the client places the `>` itself; a second one from here is the \
+             character it swallows once and the author deletes by hand"
+        );
+        // …and a client that turns its override OFF (the setting, live) gets
+        // the edit back.
+        declare(
+            backend,
+            serde_json::json!({ "vilan": { "autoClosing": { "generics": false } } }),
+        );
+        assert!(
+            backend
+                .on_type_formatting(typed_params(&uri, "<"))
+                .await
+                .expect("answers")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_question_is_the_on_type_rule() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        // Declared or not, the question answers — it is the client's to ask.
+        declare(
+            backend,
+            serde_json::json!({ "autoClosing": { "generics": true } }),
+        );
+        for (text, position, expected) in [
+            (TYPED, CARET, true),
+            // The comparison the whole item turns on.
+            (
+                "fun main() {\n\tlet a = 1;\n\tlet _c = a <\n}\n",
+                Position::new(2, 13),
+                false,
+            ),
+            // A declaration's own list, which the program cannot know yet.
+            ("struct Pair<\n", Position::new(0, 12), true),
+        ] {
+            let uri = open(backend, text);
+            let answer = backend
+                .opens_a_generic_list(TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position,
+                })
+                .await
+                .expect("answers");
+            assert_eq!(answer, expected, "{text:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_document_answers_no() {
+        let (service, _socket) = backend();
+        let answer = service
+            .inner()
+            .opens_a_generic_list(TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: Url::parse("file:///nowhere.vl").expect("a url"),
+                },
+                position: Position::new(0, 0),
+            })
+            .await
+            .expect("answers");
+        assert!(!answer, "no document, no `>`");
+    }
+}
+
 #[cfg(test)]
 mod semantic_token_delta_protocol_tests {
     use super::snapshot_consistency_tests::{SOURCE, backend, open_with_live_edit};

@@ -2999,8 +2999,10 @@ impl Document {
     }
 
     /// Whether the `<` ending at `offset` opens a generic argument or
-    /// type-parameter list — [`on_type_edits`](Self::on_type_edits)'s rule.
-    fn opens_a_generic_list(&self, offset: usize) -> bool {
+    /// type-parameter list — [`on_type_edits`](Self::on_type_edits)'s rule,
+    /// and the whole answer to the `vilan/opensAGenericList` request (E222),
+    /// which asks it for a client that places the `>` itself.
+    pub fn opens_a_generic_list(&self, offset: usize) -> bool {
         let text = &self.text;
         let Some(open) = offset.checked_sub(1) else {
             return false;

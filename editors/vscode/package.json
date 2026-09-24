@@ -123,6 +123,11 @@
           "default": "full",
           "description": "How completion inserts a function or method call."
         },
+        "vilan.autoClosing.generics": {
+          "type": "boolean",
+          "default": true,
+          "description": "Pair a generic `<` with its `>` as you type it (`List<`, `fun pair<`, never `a < b` — the language server decides), and type over that `>` when you reach it. A setting because it takes over VS Code's `type` command, which only one extension can own: turn it off to coexist with Vim emulation (VSCodeVim), and the server then places the `>` alone, without the type-over. Applies live."
+        },
         "vilan.organizeImports.onSave": {
           "type": "boolean",
           "default": false,

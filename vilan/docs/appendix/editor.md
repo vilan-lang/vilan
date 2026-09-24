@@ -89,8 +89,13 @@ comparison operator, and `a < b` must not grow a `>` — so the server
 decides, on what the name before the `<` means: a struct, an enum, a
 trait or a generic function, or a declaration's own name right after
 `fun`, `struct`, `enum`, `trait`, `impl` or `type`. Everything else is
-left alone. Selecting text and typing `<` wraps it either way, and so
-does a backtick, which pairs everywhere except inside a string.
+left alone. In VS Code the placed `>` is also typed over when you reach
+it, so `List<i32>` never becomes `List<i32>>` — which takes over the
+editor's `type` command, and only one extension can own that: turn
+`vilan.autoClosing.generics` off to coexist with Vim emulation, and the
+server places the `>` without the type-over. Selecting text and typing
+`<` wraps it either way, and so does a backtick, which pairs everywhere
+except inside a string.
 
 **Dead code, faded.** Code nothing uses is dimmed rather than warned
 about: it does not enter the Problems count, does not badge the file, and
@@ -331,6 +336,7 @@ plain go-to-definition, and no pull diagnostics — diagnostics are pushed.
 | `vilan.inlayHints.enabled` | `true` | |
 | `vilan.semanticTokens.enabled` | `true` | off falls back to the TextMate grammar |
 | `vilan.completion.functionCall` | `full` | `parensOnly`, or `none` |
+| `vilan.autoClosing.generics` | `true` | pair a generic `<` and type over its `>`; off for Vim emulation |
 | `vilan.organizeImports.onSave` | `false` | |
 
 Everything but the two paths applies live. **Vilan: Restart Language
