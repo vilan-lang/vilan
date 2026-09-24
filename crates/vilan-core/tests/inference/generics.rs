@@ -6477,14 +6477,15 @@ fn b227_the_enclosing_call_still_types_a_printed_parameter() {
 
 #[test]
 fn b227_an_any_call_as_a_closures_sole_use_leaves_the_slot_open() {
-    // The deliberate edge. Skipping without deferring means a closure whose
-    // ONLY use is an `any` call gets no type from anywhere — and that is the
-    // right answer, reported by the message that already covers it. Deferring
-    // instead would deadlock: the body waits for the parameter, and nothing
-    // else is ever going to fill it. Note this is the same verdict a GENERIC
-    // sink (`fun sink<T>(m: T)`) has always produced for the same program.
-    assert_fails_with(
-        r#"
+    // The deliberate edge. Skipping without deferring means the `any` sink
+    // does not type the parameter — it tells the hole nothing, so `v` is never
+    // `any`. Until B392 nothing else typed it either and the program ended in
+    // "could not be resolved"; since B392 a let-bound closure's parameter
+    // takes its FIRST CALL SITE's type when the fixpoint stalls (`f(1)` makes
+    // `v` an `i32`), so the error is now the true one about the body. What
+    // this pins is B227's half: the sink is still not where the type came
+    // from.
+    let source = r#"
         fun sink(m: any): void {}
 
         fun main() {
@@ -6492,9 +6493,9 @@ fn b227_an_any_call_as_a_closures_sole_use_leaves_the_slot_open() {
             f(1);
         }
         main();
-        "#,
-        "could not be resolved",
-    );
+        "#;
+    assert_fails_with(source, "i32 has no method 'no_such_method'");
+    assert_fails_without(source, "on any");
 }
 
 #[test]
