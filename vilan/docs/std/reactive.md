@@ -925,12 +925,13 @@ is NOT a delta source — it keeps no log — so anything derived from one is on
 ## ListCell — a list whose writes are its deltas
 
 ```vilan,fragment
-struct ListCell<T> { … }            // a SignalCell<List<T>> plus a DeltaLog<SeqOp<T>>
+struct ListCell<T> { … }            // the list, a DeltaLog<SeqOp<T>>, one notification
 
 impl ListCell<type T> {
 	fun new(): ListCell<T>
 	fun of(elements: List<T>): ListCell<T>
 	fun with_limit(elements: List<T>, limit: i32): ListCell<T>
+	fun peek<U>(self, read: sync |&List<T>| U): U      // read IN PLACE, no copy of the run
 	fun set_at(self, at: i32, value: T)                 // an element changed IN PLACE
 	fun move_range(self, from: i32, count: i32, to: i32)
 	fun edit(self, body: sync |&mut Tracked<T>| void)   // many mutations, ONE notification
@@ -944,6 +945,25 @@ impl ListCell<type T: PartialEq> { fun reconcile_to(self, items: List<T>) }
 it, an effect takes it — that also records what each write DID. Nothing that
 ignores the ops pays for them, and the three `each` runs do not ignore them:
 over a `ListCell` they build only the rows a write names.
+
+A write copies nothing it does not have to. The cell holds its list itself
+rather than inside a `SignalCell`, so `size` and every write read it in place;
+`get` still hands out a VALUE — a copy of the run, as a `SignalCell`'s `get`
+does — and `peek` is the read that does not copy: the closure is lent the
+cell's own list for the length of the call.
+
+```vilan
+import std::reactive::{ ListCell, SequenceCell };
+
+fun main() {
+	let rows: ListCell<str> = ListCell<str>::of(["a", "b", "c"]);
+	let length = rows.peek(|list| list.len());       // no copy of the run
+	let second = rows.peek(|list| list.get(1));      // copies ONE element
+	print(i"{length} {second.unwrap_or("none")}");
+}
+```
+
+`peek` is for reading: its closure must not write the cell it is peeking at.
 
 Its mutators are trait defaults over ONE primitive, so there is one place a
 write is recorded and no method can forget:

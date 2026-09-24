@@ -4890,3 +4890,151 @@ fn a112_s3b_a_list_cell_under_each_by_builds_only_the_rows_its_ops_name() {
          run; a plain `SignalCell` keeps the pass; got:\n{stdout}"
     );
 }
+
+// --- M86: a `ListCell` write copies no whole list -----------------------------
+
+/// A 1,000-row `ListCell` with a `map_each`, an `each` and an `each_by` on it,
+/// driven through the vocabulary; after each write the program prints how many
+/// WHOLE-LIST copies the write made. A deep copy of a list is the emitted
+/// `__clone`, which is `value.map(__clone)`, so the harness counts
+/// `Array.prototype.map` calls on arrays of 1,000 elements or more — a row's
+/// own copy (a two-element array) is not counted, a copy of the run is.
+const M86_COPIES: &str = r#"import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ ListCell, SequenceCell, Signal, SignalCell, Source, map_each };
+import std::ui::{ View, each, each_by, mount_root, view };
+
+[derive(PartialEq, Hashable)]
+struct Row {
+	id: i32,
+	text: str,
+}
+
+fun row(id: i32, text: str): Row {
+	Row { id = id, text = text }
+}
+
+fun main() {
+	mut many: List<Row> = [];
+	mut index = 0;
+	for index < 1000 {
+		many.push(row(index, "r"));
+		index += 1;
+	}
+	let cell: ListCell<Row> = ListCell<Row>::of(many);
+	let ids = map_each(cell, |item: Row| item.id);
+	let _root = mount_root("app", || {
+		view("div")
+			.child(view("ol").child(each(cell, |item: Row| item.id, |item: Row| view("li").text(item.text))))
+			.child(view("ol").child(each_by(cell, |item: Row| item.id, |held: SignalCell<Row>| {
+				view("li").bind_text(held.map(|item: Row| item.text))
+			})))
+	});
+	let _mounted = wholes();
+	cell.push(row(1000, "pushed"));
+	print(i"push wholes={wholes()}");
+	cell.insert_at(10, row(1001, "inserted"));
+	print(i"insert_at wholes={wholes()}");
+	cell.remove_at(20);
+	print(i"remove_at wholes={wholes()}");
+	cell.set_at(30, row(30, "changed"));
+	print(i"set_at wholes={wholes()}");
+	cell.move_range(0, 2, 5);
+	print(i"move_range wholes={wholes()}");
+	let size = cell.size();
+	print(i"size={size} wholes={wholes()}");
+	let total: i32 = cell.peek(|list| list.len());
+	let third: Option<Row> = cell.peek(|list| list.get(2));
+	let text = match third {
+		Some(let found) => found.text,
+		None => "none",
+	};
+	print(i"peek={total} third={text} wholes={wholes()}");
+	cell.edit(|&mut list| {
+		list.push(row(1002, "edited"));
+		list.remove_at(0);
+	});
+	print(i"edit wholes={wholes()}");
+	mut edited = cell.get();
+	print(i"get wholes={wholes()}");
+	edited[40] = row(edited[40].id, "reconciled");
+	cell.reconcile_to(edited);
+	print(i"reconcile_to wholes={wholes()}");
+	print(i"size={cell.size()} ids={ids.size()} rows={rows()}");
+}
+
+[extern("__wholes")]
+external fun wholes(): i32;
+
+[extern("__rows")]
+external fun rows(): str;
+
+main();
+"#;
+
+/// Counts whole-list copies (see `M86_COPIES`) and reads the two runs' lengths.
+const M86_HARNESS_TAIL: &str = r#"
+global.__wholes = (() => {
+    let wholes = 0;
+    const map = Array.prototype.map;
+    Array.prototype.map = function (...args) {
+        if (this.length >= 1000) wholes += 1;
+        return map.apply(this, args);
+    };
+    return () => { const seen = wholes; wholes = 0; return seen; };
+})();
+global.__rows = () => {
+    const out = [];
+    const visit = (node) => {
+        if (node.tagName === "ol") out.push(node.children.filter((child) => child.tagName === "li").length);
+        node.children.forEach(visit);
+    };
+    visit(documentRoot);
+    return out.join("/");
+};
+require("./app.js");
+"#;
+
+/// M86: a write to a 1,000-row `ListCell` copies no whole list — not the cell's
+/// own, not a derived `map_each` cell's, and not on its way to `each` or
+/// `each_by` — and `peek`, the read that borrows (R-e), answers a length and one
+/// element without copying the run.
+///
+/// Before M86 every `splice` read the cell's length through `get()`, which is a
+/// deep copy of the run, and the everyday defaults (`push`, `insert_at`) read it
+/// twice — once to find the end, once inside `splice` — so a push into 1,000
+/// rows copied the run twice and a `map_each` over it copied ITS run once more
+/// (6.27 M of the 6.30 M Ir a push cost under `each`). `set_at` copied the run
+/// to read one element, and `reconcile_to` copied it to diff it. What still
+/// copies is what must, and the pin states it rather than hiding it: `get()`
+/// hands out a value (one); `edit` hands its body a recorder over a list of its
+/// own and takes the result back (two, per batch, however many mutations it
+/// holds); and a `Move` is still the whole-list PASS in both `each` and
+/// `each_by` (A112 S3's fallback), whose own copies of the run are the eleven —
+/// the `ListCell` and the `map_each` make none of them.
+///
+/// Non-vacuity: on the tree before M86 this reads `push wholes=3`,
+/// `insert_at wholes=2`, `remove_at wholes=2`, `set_at wholes=2`,
+/// `size=1001 wholes=1`, `edit wholes=6` and `reconcile_to wholes=3`.
+#[test]
+fn m86_a_list_cell_write_copies_no_whole_list() {
+    let harness = format!("{DOM_STUB}{M86_HARNESS_TAIL}");
+    let stdout = build_and_run("m86_copies", M86_COPIES, &harness);
+    assert_eq!(
+        stdout,
+        concat!(
+            "push wholes=0\n",
+            "insert_at wholes=0\n",
+            "remove_at wholes=0\n",
+            "set_at wholes=0\n",
+            "move_range wholes=11\n",
+            "size=1001 wholes=0\n",
+            "peek=1001 third=r wholes=0\n",
+            "edit wholes=2\n",
+            "get wholes=1\n",
+            "reconcile_to wholes=0\n",
+            "size=1001 ids=1001 rows=1001/1001\n",
+        ),
+        "M86: a `ListCell` write must copy no whole list; got:\n{stdout}"
+    );
+}

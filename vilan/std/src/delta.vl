@@ -707,8 +707,8 @@ export impl Tracked<type T> with Sequence<T> {
 	}
 }
 
-/// A `List<T>` whose WRITES ARE ITS DELTAS: a signal cell over the list plus the op
-/// log that says what each write did.
+/// A `List<T>` whose WRITES ARE ITS DELTAS: the list, the op log that says what
+/// each write did, and the one notification both ride.
 ///
 /// This is the cell A112 exists for. `list.push(x)` is one op, so a derivation
 /// over it (`map_each`) runs its function once — for `x` — rather than once per
@@ -720,31 +720,71 @@ export impl Tracked<type T> with Sequence<T> {
 /// `set(whole_list)` records a `Reset` and costs what a `SignalCell` costs — the
 /// honest compat path. `reconcile_to(whole_list)` is the door that turns a
 /// wholesale write back into ops.
+///
+/// **Why the list is held HERE and not in a `SignalCell<List<T>>` (M86).** A
+/// write has to know how long the list is, and the only read a `SignalCell`
+/// offers is `get`, which hands back a VALUE — a deep copy of the run. Every
+/// `splice` paid one, and `push` two (once to find the end, once inside
+/// `splice`): 5.8 M of the 6.3 M Ir a push into 1,000 rows cost under `each`,
+/// against ~30 K for everything `each` did with the op. Held in its own
+/// `Shared`, the list is read in place — `items.read().len()` copies nothing —
+/// and the signal carries only the notification, so there is still exactly ONE
+/// notification per write and every observer, the op consumers and the
+/// `Source<List<T>>` view alike, wakes on it.
 export struct ListCell<T> {
-	elements: SignalCell<List<T>>,
+	/// The elements. Mutated in place by every write, before `published` fires.
+	items: Shared<List<T>>,
+	/// The notification every observer rides, holding the log's sequence number as
+	/// of the last write. One signal, so an observer that wakes always sees the
+	/// list the ops it is about to drain produced (`KeyedCell`'s discipline).
+	published: SignalCell<i32>,
 	log: DeltaLog<SeqOp<T>>,
+}
+
+/// The one constructor body: every `ListCell` is a list, a notification and a log,
+/// and the three public constructors differ only in the list and the log.
+fun list_cell<T>(elements: List<T>, log: DeltaLog<SeqOp<T>>): ListCell<T> {
+	ListCell { items = Shared::new(elements), published = SignalCell::new(0), log }
+}
+
+/// Fire a write's one notification, carrying the sequence the log is now at. Every
+/// write calls it LAST — after the list is mutated and the op recorded — so an
+/// observer that wakes reads a log that already explains the list it sees.
+fun publish<T>(cell: ListCell<T>) {
+	cell.published.set(cell.log.at());
 }
 
 export impl ListCell<type T> {
 	/// An empty cell.
 	fun new(): ListCell<T> {
-		ListCell { elements = SignalCell::new([]), log = DeltaLog<SeqOp<T>>::new() }
+		list_cell([], DeltaLog<SeqOp<T>>::new())
 	}
 
 	/// A cell holding `elements`. Nothing is recorded: a cursor minted after this
 	/// reads the collection as its own starting point.
 	fun of(elements: List<T>): ListCell<T> {
-		ListCell { elements = SignalCell::new(elements), log = DeltaLog<SeqOp<T>>::new() }
+		list_cell(elements, DeltaLog<SeqOp<T>>::new())
 	}
 
 	/// A cell whose log has a ceiling other than `delta_log_limit` — what a test
 	/// that wants to reach the lag path without writing a thousand ops asks for.
 	fun with_limit(elements: List<T>, limit: i32): ListCell<T> {
 		// I5
-		ListCell {
-			elements = SignalCell::new(elements),
-			log = DeltaLog<SeqOp<T>>::with_limit(limit),
-		}
+		list_cell(elements, DeltaLog<SeqOp<T>>::with_limit(limit))
+	}
+
+	/// Read the list IN PLACE: `read` is lent the cell's own list for the length of
+	/// the call and its answer is handed back — where `get` hands out a copy of the
+	/// whole run (M86).
+	///
+	///     let total = rows.peek(|list| list.len());
+	///     let third = rows.peek(|list| list.get(2));   // copies ONE element
+	///
+	/// `read` is for READING: it must not write this cell. The list it is lent is
+	/// the list the cell holds, so a write made through the cell inside it is not a
+	/// write to a copy.
+	fun peek<U>(self, read: sync |&List<T>| U): U {
+		read(self.items.read())
 	}
 
 	/// The element at `at` becomes `value` — an element changed IN PLACE.
@@ -755,12 +795,12 @@ export impl ListCell<type T> {
 	/// other bounds question in this module.
 	// I5: a POSITION parameter
 	fun set_at(self, at: i32, value: T) {
-		match self.elements.get().get(at) {
+		// `.get(at)` on the slot copies the one element, not the run.
+		match self.items.read().get(at) {
 			Some(let previous) => {
-				self.elements.update(|&mut list| {
-					list[at] = value;
-					self.log.record(SeqOp::SetAt(at, previous, value));
-				});
+				self.items.write()[at] = value;
+				self.log.record(SeqOp::SetAt(at, previous, value));
+				publish(self);
 			},
 			None => {},
 		}
@@ -776,23 +816,22 @@ export impl ListCell<type T> {
 		if count <= 0 || from == to {
 			ret;
 		}
-		self.elements.update(|&mut list| {
-			mut lifted: List<T> = [];
-			mut taken = 0; // I5
-			for taken < count {
-				lifted.push(list.remove(from));
-				taken += 1;
+		mut lifted: List<T> = [];
+		mut taken = 0; // I5
+		for taken < count {
+			lifted.push(self.items.write().remove(from));
+			taken += 1;
+		}
+		mut offset = 0; // I5
+		for offset < lifted.len() {
+			match lifted.get(offset) {
+				Some(let value) => self.items.write().insert(to + offset, value),
+				None => {},
 			}
-			mut offset = 0; // I5
-			for offset < lifted.len() {
-				match lifted.get(offset) {
-					Some(let value) => list.insert(to + offset, value),
-					None => {},
-				}
-				offset += 1;
-			}
-			self.log.record(SeqOp::Move(from, count, to));
-		});
+			offset += 1;
+		}
+		self.log.record(SeqOp::Move(from, count, to));
+		publish(self);
 	}
 
 	/// The BATCH door: hand `body` a recorder, then publish its whole run as ONE
@@ -802,16 +841,17 @@ export impl ListCell<type T> {
 	/// is the point: a consumer wakes once and learns everything that happened,
 	/// instead of waking four times.
 	fun edit(self, body: sync |&mut Tracked<T>| void) {
-		mut recorder = Tracked::new(self.elements.get());
+		// The recorder works on a list of its OWN — the one copy a batch pays,
+		// once for the whole batch.
+		mut recorder = Tracked::new(self.items.read());
 		body(&mut recorder);
 		let produced = recorder.elements;
 		let recorded = recorder.ops;
-		self.elements.update(|&mut list| {
-			list = produced;
-			for op in recorded {
-				self.log.record(op);
-			}
-		});
+		self.items.write() = produced;
+		for op in recorded {
+			self.log.record(op);
+		}
+		publish(self);
 	}
 
 	/// How many ops the log is holding — what a pin on the trim reads.
@@ -829,26 +869,26 @@ export impl ListCell<type T: PartialEq> {
 	/// ONE `Splice` over what is left between them — so an append, a prepend,
 	/// an insertion, a removal and an in-place edit of a span each cost the
 	/// elements they actually touch and nothing more. It is O(N) compares and
-	/// zero derivations for every retained element.
+	/// zero derivations for every retained element, and it reads the held list
+	/// in place rather than copying it (M86).
 	///
 	/// What it does NOT do is find a REORDER: a rotated list shares no prefix and
 	/// no suffix, so it is one `Splice` over the whole run, which is honest (every
 	/// element really did move) and is what `each`'s keyed pass is for. A source
 	/// that knows it reordered says `move_range`.
 	fun reconcile_to(self, items: List<T>) {
-		let held = self.elements.get();
-		let old_length = held.len(); // I5
+		let old_length = self.size(); // I5
 		let new_length = items.len(); // I5
 		mut prefix = 0; // I5
 		for prefix < old_length && prefix < new_length {
-			if held[prefix] != items[prefix] {
+			if self.items.read()[prefix] != items[prefix] {
 				jump break;
 			}
 			prefix += 1;
 		}
 		mut suffix = 0; // I5
 		for prefix + suffix < old_length && prefix + suffix < new_length {
-			if held[old_length - 1 - suffix] != items[new_length - 1 - suffix] {
+			if self.items.read()[old_length - 1 - suffix] != items[new_length - 1 - suffix] {
 				jump break;
 			}
 			suffix += 1;
@@ -873,13 +913,17 @@ export impl ListCell<type T: PartialEq> {
 }
 
 export impl ListCell<type T> with Source<List<T>> {
+	/// The whole list, as a value — a copy of the run. `peek` is the read that does
+	/// not copy.
 	fun get(self): List<T> {
-		self.elements.get()
+		self.items.read()
 	}
 
+	/// The observer is handed the list as it stands when the notification is
+	/// delivered, which is what a `SignalCell`'s observer is handed too.
 	[must_use]
 	fun on_change(self, observer: |List<T>| void): Subscription {
-		self.elements.on_change(observer)
+		self.published.on_change(|_sequence| observer(self.items.read()))
 	}
 }
 
@@ -888,31 +932,31 @@ export impl ListCell<type T> with Signal<List<T>> {
 	/// exactly that. Every delta consumer falls back to a rebuild, which is what
 	/// `Reset` means and why `reconcile_to` exists beside it.
 	fun set(self, value: List<T>) {
-		self.elements.update(|&mut list| {
-			list = value;
-			self.log.record(SeqOp::Reset(value));
-		});
+		self.items.write() = value;
+		self.log.record(SeqOp::Reset(value));
+		publish(self);
 	}
 
 	/// Publish the current value without changing it — and record NOTHING: a
 	/// consumer draining the log after a bare notify is owed no ops, because
 	/// nothing happened.
 	fun notify(self) {
-		self.elements.notify();
+		self.published.notify();
 	}
 }
 
 export impl ListCell<type T> with SequenceCell<T> {
+	/// Read in place — the length, not a copy of the run (M86).
 	fun size(self): i32 {
 		// I5
-		self.elements.get().len()
+		self.items.read().len()
 	}
 
-	/// The op is recorded INSIDE `update`, before `update`'s single notify, so
-	/// an observer that wakes reads a log that already explains the list it is
-	/// about to see. (`KeyedCell`'s discipline, verbatim.) A splice that
-	/// changes nothing — clamped to nothing taken and nothing arriving —
-	/// records nothing and publishes nothing.
+	/// The op is recorded BEFORE the write's single notification, so an observer
+	/// that wakes reads a log that already explains the list it is about to see.
+	/// (`KeyedCell`'s discipline, verbatim.) A splice that changes nothing —
+	/// clamped to nothing taken and nothing arriving — records nothing and
+	/// publishes nothing.
 	// I5: a POSITION parameter
 	fun splice(self, at: i32, removed: i32, inserted: List<T>) {
 		let held = self.size(); // I5
@@ -921,9 +965,8 @@ export impl ListCell<type T> with SequenceCell<T> {
 		if taking == 0 && inserted.len() == 0 {
 			ret;
 		}
-		self.elements.update(|&mut list| {
-			self.log.record(splice_in_place(&mut list, start, taking, inserted));
-		});
+		self.log.record(splice_in_place(self.items.write(), start, taking, inserted));
+		publish(self);
 	}
 }
 
@@ -942,7 +985,7 @@ export impl ListCell<type T> with DeltaSource<List<T>, SeqOp<T>> {
 			// what a `Reset` is for its shape and the log does not.
 			None => {
 				mut lost: List<SeqOp<T>> = [];
-				lost.push(SeqOp::Reset(self.elements.get()));
+				lost.push(SeqOp::Reset(self.items.read()));
 				lost
 			},
 			Some(let recorded) => recorded,

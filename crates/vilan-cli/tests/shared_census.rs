@@ -51,13 +51,16 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "delta.vl",
-        9,
+        10,
         "E: the delta log's ops/version/base/cursors (twice — `new` and \
          `with_limit`) plus a cursor's own sequence. Every one of them is \
          minted by the CELL that holds the log and read by the CONSUMERS that \
          hold cursors into it, which is the E class exactly; they are A54's \
          five cells, lifted out of `rpc.vl` and spelled once per constructor \
-         (A112 S1).",
+         (A112 S1). +1 at M86: a `ListCell`'s own list, held in a cell of its \
+         own rather than inside a `SignalCell` so a write can read its length \
+         in place — E for the same reason (minted by the cell, read and \
+         written through every copy of the handle).",
     ),
     (
         "memo.vl",
@@ -224,7 +227,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 139,
+        total, 140,
         "the total number of `Shared` construction sites in std changed"
     );
 
