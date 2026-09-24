@@ -12253,3 +12253,290 @@ fn the_delta_feed_shape_admits_a_real_source_and_refuses_a_plain_struct() {
         "false\n2\n",
     );
 }
+
+// --- B395: a supertrait DEFAULT on a type that implements the supertrait at
+// --- OTHER arguments than a subtrait's blanket bounds it at. The default is
+// --- reached through both the type's own impl and the blanket (its subject is
+// --- a hole); the blanket used to carry it because it registered first, and the
+// --- call was then refused at the blanket's bound. The blanket's bound is now
+// --- read at its arguments (B268) and a blanket it does not hold for does not
+// --- carry the member.
+
+/// The item's repro: `Cell` is a `Base<i32>`, the blanket is over
+/// `Base<List<T>>`, and `twice` is `Base`'s default. Red before the fix:
+/// "'Cell' does not implement trait 'Base<List<T>>'".
+#[test]
+fn b395_a_supertrait_default_on_other_arguments_reaches_the_types_own_impl() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base<T> {
+            fun read(self): T;
+            fun twice(self): i32 { 2 }
+        }
+
+        trait Feed<T> with Base<List<T>> { fun feeds(self): bool; }
+
+        impl type S: Base<List<type T>> with Feed<T> {
+            fun feeds(self): bool { false }
+        }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Base<i32> {
+            fun read(self): i32 { self.n }
+        }
+
+        fun main() {
+            let cell = Cell { n = 1 };
+            print(cell.twice());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+/// The same pair with the type's own impl declared FIRST — ordering-sensitive
+/// by construction, since the old answer was the first registered impl. Green
+/// before the fix too; it holds that the fix is not an order flip.
+#[test]
+fn b395_the_same_default_with_the_types_impl_declared_first() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base<T> {
+            fun read(self): T;
+            fun twice(self): i32 { 2 }
+        }
+
+        trait Feed<T> with Base<List<T>> { fun feeds(self): bool; }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Base<i32> {
+            fun read(self): i32 { self.n }
+        }
+
+        impl type S: Base<List<type T>> with Feed<T> {
+            fun feeds(self): bool { false }
+        }
+
+        fun main() {
+            let cell = Cell { n = 1 };
+            print(cell.twice());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+/// The item's control: the supertrait at the SAME arguments as the blanket's
+/// bound (`Base<T>`) — the blanket's bound holds, so it may carry the default
+/// and the answer is the same. Green before the fix.
+#[test]
+fn b395_the_control_at_matching_arguments() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base<T> {
+            fun read(self): T;
+            fun twice(self): i32 { 2 }
+        }
+
+        trait Feed<T> with Base<T> { fun feeds(self): bool; }
+
+        impl type S: Base<type T> with Feed<T> {
+            fun feeds(self): bool { false }
+        }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Base<i32> {
+            fun read(self): i32 { self.n }
+        }
+
+        fun main() {
+            let cell = Cell { n = 1 };
+            print(cell.twice());
+            print(cell.feeds());
+        }
+        "#,
+        "2\nfalse\n",
+    );
+}
+
+/// A112 S3's ruled shape, as std will declare it: a feed trait `with
+/// Source<List<T>>` and BOTH its blankets — the "no log" one over every list
+/// source and the forwarding one over every `DeltaSource`. `Source`'s defaults
+/// (`sub`, `map`) must reach a custom `Source<i32>` (`reactive-on-change.vl`'s
+/// `Stored`) and a `SignalCell<i32>`, a list-valued custom source must still
+/// map, and the feed must still answer per source kind through the
+/// supertrait. Red before the fix at `stored.sub` ("'Stored<i32>' does not
+/// implement trait 'Source<List<T>>'").
+#[test]
+fn b395_the_ruled_delta_feed_shape_leaves_source_defaults_on_other_arguments() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ DeltaCursor, DeltaSource, ListCell, SeqOp, Signal, SignalCell, Source, Subscription };
+
+        trait Feed<T> with Source<List<T>> {
+            fun cursor_of(self): Option<DeltaCursor>;
+        }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun cursor_of(self): Option<DeltaCursor> { None }
+        }
+
+        impl type S: DeltaSource<List<type T>, SeqOp<T>> with Feed<T> {
+            fun cursor_of(self): Option<DeltaCursor> { Some(self.cursor()) }
+        }
+
+        struct Stored<T> { inner: SignalCell<T> }
+
+        impl Stored<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+
+            [must_use]
+            fun on_change(self, observer: |T| void): Subscription {
+                self.inner.on_change(observer)
+            }
+        }
+
+        fun fed<T, S: Feed<T>>(source: S): str {
+            match source.cursor_of() {
+                Some(let _cursor) => i"log over {source.get().len()}",
+                None => i"none over {source.get().len()}",
+            }
+        }
+
+        fun main() {
+            let stored = Stored { inner = Signal::new(10) };
+            let eagerly = stored.sub(|value| print(i"eager {value}"));
+            eagerly.dispose();
+            let labelled = stored.map(|value| i"n={value}");
+            print(labelled.get());
+            let number: SignalCell<i32> = Signal::new(3);
+            print(number.map(|value| value * 2).get());
+            let listed = Stored { inner = Signal::new([1, 2]) };
+            print(listed.map(|items| items.len() * 10).get());
+            let cell: ListCell<str> = ListCell<str>::of(["a"]);
+            let plain: SignalCell<List<str>> = Signal::new(["a", "b"]);
+            print(i"{fed(cell)} / {fed(plain)} / {fed(listed)}");
+            print(plain.map(|items| items.len()).get());
+        }
+        "#,
+        "eager 10\nn=10\n6\n20\nlog over 1 / none over 2 / none over 2\n2\n",
+    );
+}
+
+/// The soundness half of the same shape: carrying the default through the
+/// type's own impl must not make a `Source<i32>` a feed. Green before the fix
+/// (B394's guard); held here beside the fix that reads the blanket's bound.
+#[test]
+fn b395_the_ruled_shape_still_refuses_a_scalar_source_as_a_feed() {
+    let source = r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ DeltaCursor, Signal, SignalCell, Source, Subscription };
+
+        trait Feed<T> with Source<List<T>> {
+            fun cursor_of(self): Option<DeltaCursor>;
+        }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun cursor_of(self): Option<DeltaCursor> { None }
+        }
+
+        struct Stored<T> { inner: SignalCell<T> }
+
+        impl Stored<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+
+            [must_use]
+            fun on_change(self, observer: |T| void): Subscription {
+                self.inner.on_change(observer)
+            }
+        }
+
+        fun fed<T, S: Feed<T>>(source: S): bool { source.cursor_of().is_none() }
+
+        fun main() {
+            let stored = Stored { inner = Signal::new(10) };
+            print(stored.map(|value| value + 1).get());
+            print(fed(stored));
+        }
+        "#;
+    let errors = compile(source).expect_err("a `Source<i32>` must not be a feed");
+    assert_eq!(
+        errors.len(),
+        1,
+        "the ONE refusal is the feed bound; `stored.map` must check clean: {errors:#?}"
+    );
+    assert!(
+        errors[0].contains("'Stored<i32>' does not implement trait 'Feed<T>'"),
+        "{errors:#?}"
+    );
+}
+
+/// `reactive_channels`' keyed mirror in miniature: a source over
+/// `Option<List<T>>` whose impl binds `T: Keyed<K>` — a bound whose ARGUMENT
+/// is another of the impl's binders, itself bounded (`K: PartialEq`; an
+/// unbounded `K` compares as a hole and hides the defect). The receiver's own
+/// impl must be read as holding for it (`Keyed<K>` at `K := str`, which `Row`
+/// provides), or the
+/// only impl left to carry `Source`'s default is the feed blanket, refused at
+/// `Source<List<T>>`. Red with the raw argument read: "'Mirror<str, Row>' does
+/// not implement trait 'Source<List<T>>'".
+#[test]
+fn b395_an_impl_whose_bound_names_another_binder_carries_the_default() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::PartialEq;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+
+        trait Feed<T> with Source<List<T>> { fun feeds(self): bool; }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun feeds(self): bool { false }
+        }
+
+        trait Keyed<K> { fun key(self): K; }
+
+        struct Row { id: str }
+
+        impl Row with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+
+        struct Mirror<K, T> { inner: SignalCell<Option<List<T>>>, last: SignalCell<Option<K>> }
+
+        impl Mirror<type K: PartialEq, type T: Keyed<K>> with Source<Option<List<T>>> {
+            fun get(self): Option<List<T>> { self.inner.get() }
+
+            [must_use]
+            fun on_change(self, observer: |Option<List<T>>| void): Subscription {
+                self.inner.on_change(observer)
+            }
+        }
+
+        fun main() {
+            let seeded: Option<List<Row>> = Some([Row { id = "a" }]);
+            let nothing: Option<str> = None;
+            let mirror = Mirror { inner = Signal::new(seeded), last = Signal::new(nothing) };
+            let shown = mirror.sub(|value| match value {
+                Some(let rows) => print(i"rows:{rows.len()}"),
+                None => print("rows:none"),
+            });
+            shown.dispose();
+        }
+        "#,
+        "rows:1\n",
+    );
+}
