@@ -21,7 +21,8 @@ import std::reactive::{
 
 | Item | Kind | One line |
 |---|---|---|
-| `Source<T>` | trait | anything readable + subscribable (requires `get`/`on_change`; `sub`/`effect`/`effect_on_change`/`scoped_effect`/`scoped_effect_on_change`/`map` are defaults) |
+| `Source<T>` | trait | anything readable + subscribable (requires `get`/`on_change`; `on_settle`/`sub`/`effect`/`effect_on_change`/`scoped_effect`/`scoped_effect_on_change`/`map` are defaults) |
+| `Subscriber` | struct | one observer's record — its id (a turn's dedup key), `notify`, liveness and class; what `on_settle` carries |
 | `Signal<T>` | trait | the writable half (`set`/`notify`/`set_with`); `Source` is its supertrait |
 | `SignalCell<T>` | struct | the canonical cell — mutable value plus subscribers |
 | `MaybeSignal<T>` | trait | a component value that may be static OR reactive |
@@ -252,6 +253,8 @@ trait Source<T> {
 	[must_use]
 	fun on_change(self, observer: |T| void): Subscription   // required; no first call
 	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription  // default; no payload — for node authors
+	[must_use]
 	fun sub(self, observer: |T| void): Subscription         // default; + one immediate call
 	fun effect_on_change(self, observer: |T| void)          // default; owner-registered
 	fun effect(self, observer: |T| void)                    // default; owner-registered, eager
@@ -335,6 +338,85 @@ alike. `ReactiveServer`'s `expose` is generic the same way, and so are the
 its own `set` drives them. `Optimistic::over` takes any `Signal<T>` too — the
 cell STORES it in a field, and a field must name a real type, so the cell names
 it: `Optimistic<T, S>` carries the signal's type as a second parameter.
+
+### on_settle — the attach a node author writes
+
+`on_change` is the subscription every application writes. `on_settle` is the one
+a **node** writes: a `Source` that holds no value of its own and computes it
+from an upstream when read — `get` pulls through the chain. It attaches a
+`Subscriber` and hands it **no value**: the subscriber is told that this source
+*may* have changed and reads `get()` if it wants to know what to.
+
+That is what makes a chain of nodes cost nothing per hop. A node implements
+`on_settle` by **forwarding** the subscriber to its upstream untouched — no
+subscriber minted, nothing computed — so an observer reading a five-deep chain
+puts one record on the root cell, and when two arms of one observer's chain
+reach the same root (a diamond), the root holds that one record twice. Its id is
+the observer's, and a turn's queue is keyed on it, so inside a `turn` or a
+`batch` the diamond's two notifications are one call — reading a settled value,
+because every read is a pull of state that has already been written.
+
+```vilan
+import std::reactive::{
+	FlushPolicy, Signal, SignalCell, Source, Subscriber, Subscription, fresh_id,
+	turn,
+};
+import std::shared::Shared;
+
+/// A node: the upstream, doubled when read. It stores nothing.
+struct Doubled<S> {
+	up: S,
+}
+
+impl Doubled<type S: Source<i32>> with Source<i32> {
+	fun get(self): i32 {
+		self.up.get() * 2
+	}
+
+	/// The observer's ONE subscriber: its notification pulls this node.
+	[must_use]
+	fun on_change(self, observer: |i32| void): Subscription {
+		self.on_settle(Subscriber {
+			id = fresh_id(),
+			notify = || observer(self.get()),
+			live = Shared::new(true),
+			derived = false,
+		})
+	}
+
+	/// Forwarded, not wrapped.
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.up.on_settle(subscriber)
+	}
+}
+
+fun main() {
+	let count = Signal::new(1);
+	let doubled = Doubled { up = count };
+	let watch = doubled.on_change(|value| print(value));
+	turn(FlushPolicy::AtEnd, || {
+		count.set(2);
+		count.set(3);
+	});                        // 6 — once, for the settled value
+	watch.dispose();
+}
+```
+
+The handle `on_settle` returns has one obligation: **disposing it retires the
+subscriber** — it never fires again. Forwarding meets that for free, because the
+root cell's handle carries the subscriber's own liveness cell. A node that has
+to keep a registration of its own (one that re-selects which upstream to follow,
+the way `switch` does) registers a subscriber of its own upstream and never
+forwards the one it was handed to a registration it will dispose by itself —
+disposing that would retire the observer below it.
+
+The **default** is a bridge over `on_change`: attach, discard the value, wake the
+subscriber through the turn. It is right for a root — a cell of your own, a
+mirror over a transport, `Stored` above — where `on_change` is where the value
+lives anyway, and every source gets it without writing a line. It is wrong for a
+node, which would compute a value only to throw it away, once per hop; a node
+overrides it. `SignalCell` overrides it with the direct attach.
 
 ### scoped_effect — an owner per run
 

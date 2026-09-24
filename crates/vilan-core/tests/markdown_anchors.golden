@@ -407,6 +407,7 @@ std/reactive.md h1 stdreactive-reference
 std/reactive.md h2 at-a-glance
 std/reactive.md h2 signal-and-signalcell
 std/reactive.md h2 source
+std/reactive.md h3 on_settle--the-attach-a-node-author-writes
 std/reactive.md h3 scoped_effect--an-owner-per-run
 std/reactive.md h2 selector--per-key-selection
 std/reactive.md h2 writing-a-signal

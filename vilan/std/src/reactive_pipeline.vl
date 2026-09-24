@@ -12,47 +12,43 @@
 //   * A node is COLD and STATELESS. `Map` holds its upstream and its transform
 //     and nothing else; `get()` PULLS through the chain; a node allocates no
 //     cell and computes nothing until someone reads or subscribes.
-//   * A notification carries NO PAYLOAD (R2). `Cold::on_settle` tells a
-//     downstream THAT something changed; the leaf pulls the value through
-//     `get()`. That is what lets a chain of nodes forward one closure to the
-//     root — one subscriber for a linear chain, minted where the root mints it
-//     — instead of minting a subscriber and evaluating a transform at every
-//     hop. A `Combine` still mints one per arm; R2's threaded id, which would
-//     make that one too, is S2's and is not reachable from here.
-//   * `Source`'s own `on_change` is still there, and a node implements it by
-//     pulling in the observer: `self.on_settle(|| observer(self.get()))`. So
-//     every node is a `Source` today, and `effect`/`sub`/`bind` work on one
-//     unchanged. The no-payload attach is the TWIN, not a replacement.
+//   * A notification carries NO PAYLOAD (R2). `Source::on_settle` — the
+//     protocol itself since A124 S2a, on the read trait and no longer a twin
+//     trait here — tells a downstream THAT something changed; the leaf pulls the
+//     value through `get()`. A node FORWARDS the subscriber it is handed, so a
+//     linear chain puts ONE record on its root however deep it is, and a
+//     diamond puts the same record there twice, which a turn's dedup collapses
+//     (the id is the leaf's — `Subscriber`).
+//   * A node's own `on_change` is the leaf: mint one subscriber that pulls,
+//     attach it through `on_settle`. So every node is a `Source`, and
+//     `effect`/`sub`/`bind` work on one unchanged.
 //   * State lives at the ends: the root cell, and `.cell()` — one more node,
 //     composable anywhere, that materialises what is above it into a cached
 //     `SignalCell` for an efficient shared or hot-read value (R2's note).
 import pkg::option::Option::{ self, None, Some };
-import pkg::reactive::{ SignalCell, Source, Subscription, as_derivation, register_with_owner };
+import pkg::reactive::{
+	SignalCell,
+	Source,
+	Subscriber,
+	Subscription,
+	fresh_id,
+	register_with_owner,
+};
 import pkg::shared::Shared;
 
-/// The no-payload half of the protocol (A124 R2) — a `Source` that can be told
-/// "something upstream settled" WITHOUT being handed a value.
+/// The LEAF, and every node's `on_change`: ONE subscriber, minted here, whose
+/// notification pulls `source`; `on_settle` carries it to the root untouched.
 ///
-/// It is a trait and not a blanket for one reason: a `Map` must forward the
-/// observer to its upstream untouched. A blanket over `S: Source<T>` could only
-/// write `self.on_change(|_value| observer())`, and for a node that is the
-/// payload path — the transform runs to produce a value the blanket then throws
-/// away, once per hop. The requirement lets each node say how it forwards, and
-/// the root says how it mints.
-export trait Cold<T> with Source<T> {
-	/// Attach WITHOUT a payload and without an immediate call. The observer is told
-	/// that this source may have changed; it reads `get()` if it wants to know what
-	/// to.
-	[must_use]
-	fun on_settle(self, observer: || void): Subscription;
+/// Minted BY HAND from the public record, because the probe is a module of its own
+/// and `std::reactive`'s minting helper is private to it — which is also why
+/// `derived` is an argument: `.cell()` below is the one derivation-class leaf.
+fun leaf<T, S: Source<T>>(source: S, derived: bool, notify: || void): Subscription {
+	source.on_settle(minted(notify, derived))
 }
 
-/// The root of every chain is today's cell — the one place a value is stored,
-/// and the one place a subscriber is minted.
-export impl SignalCell<type T> with Cold<T> {
-	fun on_settle(self, observer: || void): Subscription {
-		self.on_change(|_value| observer())
-	}
+/// One observer's record: a fresh id and its own liveness cell.
+fun minted(notify: || void, derived: bool): Subscriber {
+	Subscriber { id = fresh_id(), notify, live = Shared::new(true), derived }
 }
 
 /// `map` as a NODE: the upstream, the transform, nothing else.
@@ -65,7 +61,7 @@ export struct Map<S, T, U> {
 	transform: |T| U,
 }
 
-export impl Map<type S: Cold<type T>, T, type U> with Source<U> {
+export impl Map<type S: Source<type T>, T, type U> with Source<U> {
 	/// The PULL: one call up the chain, one application of the transform. A cold
 	/// node's whole cost, paid by the reader.
 	fun get(self): U {
@@ -75,14 +71,12 @@ export impl Map<type S: Cold<type T>, T, type U> with Source<U> {
 	/// The payload form, derived from the no-payload one — this is where a leaf
 	/// that wants values re-enters.
 	fun on_change(self, observer: |U| void): Subscription {
-		self.on_settle(|| observer(self.get()))
+		leaf(self, false, || observer(self.get()))
 	}
-}
 
-export impl Map<type S: Cold<type T>, T, type U> with Cold<U> {
 	/// FORWARDED, not wrapped: no subscriber minted here, no transform run.
-	fun on_settle(self, observer: || void): Subscription {
-		self.up.on_settle(observer)
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.up.on_settle(subscriber)
 	}
 }
 
@@ -91,33 +85,33 @@ export impl Map<type S: Cold<type T>, T, type U> with Cold<U> {
 ///
 /// The rolling registration is the one thing a cold `Switch` cannot avoid
 /// keeping: a downstream told "something settled" must be told again when the
-/// NEW inner changes, and only a live registration can do that.
+/// NEW inner changes, and only a live registration can do that. Here it is the
+/// PAYLOAD shape — its own two registrations over `on_change` — and it takes
+/// `Source::on_settle`'s default, the bridge that wakes a downstream through
+/// the turn: a relay has to wake through the turn to dedup, and the waking
+/// helper is private to `std::reactive`.
 export struct Switch<S, T, I> {
 	up: S,
 	select: |T| I,
 }
 
-export impl Switch<type S: Cold<type T>, T, type I: Cold<type U>> with Source<U> {
+export impl Switch<type S: Source<type T>, T, type I: Source<type U>> with Source<U> {
 	fun get(self): U {
 		(self.select)(self.up.get()).get()
 	}
 
 	fun on_change(self, observer: |U| void): Subscription {
-		self.on_settle(|| observer(self.get()))
-	}
-}
-
-export impl Switch<type S: Cold<type T>, T, type I: Cold<type U>> with Cold<U> {
-	fun on_settle(self, observer: || void): Subscription {
 		let inner_subscription: Shared<Option<Subscription>> = Shared::new(None);
 		let attach = || {
 			inner_subscription.read()?.dispose();
-			inner_subscription.write() = Some((self.select)(self.up.get()).on_settle(observer));
+			inner_subscription.write() = Some((self.select)(self.up.get()).on_change(|_value| {
+				observer(self.get());
+			}));
 		};
 		attach();
-		let outer = self.up.on_settle(|| {
+		let outer = self.up.on_change(|_value| {
 			attach();
-			observer();
+			observer(self.get());
 		});
 		Subscription::teardown(|| {
 			inner_subscription.read()?.dispose();
@@ -135,28 +129,35 @@ export struct Combine<A, B> {
 	right: B,
 }
 
-export impl Combine<type A: Cold<type X>, type B: Cold<type Y>> with Source<(X, Y)> {
+export impl Combine<type A: Source<type X>, type B: Source<type Y>> with Source<(X, Y)> {
 	fun get(self): (X, Y) {
 		(self.left.get(), self.right.get())
 	}
 
+	/// The leaf, minted by hand and attached through `attach_arms` DIRECTLY — not
+	/// through `leaf`'s `on_settle` dispatch. A default overridden by an impl whose
+	/// trait argument is a TUPLE is not selected through a generic bound: the call
+	/// lands on `Source::on_settle`'s default, whose bridge calls back into this
+	/// `on_change`, and the two recurse until the stack is gone. Found building S2a
+	/// and filed; written around here the way A123 wrote `switch` over `on_change`.
 	fun on_change(self, observer: |(X, Y)| void): Subscription {
-		self.on_settle(|| observer(self.get()))
+		self.attach_arms(minted(|| observer(self.get()), false))
+	}
+
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.attach_arms(subscriber)
 	}
 }
 
-export impl Combine<type A: Cold<type X>, type B: Cold<type Y>> with Cold<(X, Y)> {
-	/// TWO registrations, one per input, each forwarding the SAME observer — so
-	/// a diamond standing on one root reaches its leaf TWICE per settle, and
-	/// reads a settled pair both times (the pull is what makes the pair whole;
-	/// the duplicate is a duplicate CALL and never a torn read). It is not
-	/// collapsed here and cannot be: `observe` mints a fresh id per attach and
-	/// `enqueue`'s dedup is keyed on that id, so the two arms are two
-	/// subscribers. R2's one-id-per-leaf-chain is what would collapse it, and
-	/// it is S2's work on `reactive.vl` — `proposal/reactive-pipeline.md` §2.3.
-	fun on_settle(self, observer: || void): Subscription {
-		let left = self.left.on_settle(observer);
-		let right = self.right.on_settle(observer);
+export impl Combine<type A: Source<type X>, type B: Source<type Y>> {
+	/// The SAME subscriber forwarded to both inputs — so a diamond standing on one
+	/// root puts ONE observer's record on it twice. Inline (no turn) that is two
+	/// calls, each reading a settled pair; in a turn `enqueue`'s dedup keys on the
+	/// leaf's id and it is one (A124 S2a). The handle disposes both arms, and each
+	/// retires the same subscriber.
+	fun attach_arms(self, subscriber: Subscriber): Subscription {
+		let left = self.left.on_settle(subscriber);
+		let right = self.right.on_settle(subscriber);
 		Subscription::teardown(|| {
 			left.dispose();
 			right.dispose();
@@ -164,43 +165,40 @@ export impl Combine<type A: Cold<type X>, type B: Cold<type Y>> with Cold<(X, Y)
 	}
 }
 
-/// The combinators — blanket methods over the cold trait, each returning a concrete
-/// node. Named with a `_node`/`_cold` suffix ONLY so this file can live beside
-/// today's `map`/`switch`/`combine` in one program; the surface S2 would ship keeps
-/// the plain names (R4).
-export impl type S: Cold<type T> {
+/// The combinators — blanket methods over the read trait, each returning a concrete
+/// node. Named with a `_node` suffix ONLY so this file can live beside today's
+/// `map`/`switch`/`combine` in one program; the surface S2 would ship keeps the
+/// plain names (R4).
+export impl type S: Source<type T> {
 	fun map_node<U>(self, transform: sync |T| U): Map<S, T, U> {
 		Map<S, T, U> { up = self, transform }
 	}
 
-	fun switch_node<U, I: Cold<U>>(self, select: sync |T| I): Switch<S, T, I> {
+	fun switch_node<U, I: Source<U>>(self, select: sync |T| I): Switch<S, T, I> {
 		Switch<S, T, I> { up = self, select }
 	}
 
-	fun combine_node<Y, B: Cold<Y>>(self, other: B): Combine<S, B> {
+	fun combine_node<Y, B: Source<Y>>(self, other: B): Combine<S, B> {
 		Combine<S, B> { left = self, right = other }
 	}
 
 	/// `.cell()` (R2, the owner's name) — the ONE stateful node: materialise what
-	/// is above into a cached cell with an ambient-owner-tied registration, marked
-	/// a DERIVATION so door 2 settles it before any effect. Composable anywhere:
-	/// the result is a `SignalCell`, which is a `Cold` again, so a chain continues
-	/// through it.
+	/// is above into a cached cell with an ambient-owner-tied registration, a
+	/// DERIVATION-class leaf so door 2 settles it before any effect. Composable
+	/// anywhere: the result is a `SignalCell`, a `Source` again, so a chain
+	/// continues through it.
 	fun cell(self): SignalCell<T> {
 		let cached = SignalCell::new(self.get());
-		as_derivation();
-		let _owned = register_with_owner(self.on_settle(|| {
+		let _owned = register_with_owner(leaf(self, true, || {
 			cached.set(self.get());
 		}));
 		cached
 	}
 }
 
-/// The LEAF. `observer` is handed to `on_settle`, which every node forwards
-/// untouched, so a LINEAR chain mints exactly one `Subscriber`, at the root,
-/// however deep it is — and the value is PULLED here, once per settle. A
-/// branching chain (a `Combine`) mints one per arm, which is the half of R2
-/// this probe cannot reach; see `Combine::on_settle` above.
-export fun watch<T, S: Cold<T>>(source: S, observer: |T| void): Subscription {
-	source.on_settle(|| observer(source.get()))
+/// The LEAF, as a free function: the observer gets the pulled value once per
+/// settle. A LINEAR chain puts exactly one record on its root however deep it is; a
+/// diamond puts the same record there once per arm, and a turn calls it once.
+export fun watch<T, S: Source<T>>(source: S, observer: |T| void): Subscription {
+	leaf(source, false, || observer(source.get()))
 }

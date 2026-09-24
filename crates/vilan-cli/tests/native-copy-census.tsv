@@ -22,5 +22,5 @@ json-roundtrip	2	12
 remainder	0	1
 numeric-types	1	6
 option-view	0	0
-dyn-objects	1	4
-native_probe_board	0	4
+dyn-objects	2	6
+native_probe_board	1	6

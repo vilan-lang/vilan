@@ -43,6 +43,14 @@ export trait Disposable {
 
 /// A registered observer of a signal: `notify` re-runs it when the signal's value
 /// changes; `id` lets a `Subscription` find and remove it.
+///
+/// The id is the OBSERVER's, not the registration's (A124 R2). A leaf reading a
+/// chain of cold nodes mints ONE subscriber and every node forwards it to its
+/// upstream untouched (`Source::on_settle`), so a diamond puts the same record on a
+/// root's list twice, or on two roots' lists once each — and `enqueue`'s dedup,
+/// keyed on this id, collapses the duplicate notify into one call. Nothing is lost
+/// by the collapse: every copy of one record is the same record, the same `notify`,
+/// the same liveness cell.
 export struct Subscriber {
 	id: i32,
 	notify: || void,
@@ -85,7 +93,8 @@ export struct Subscriber {
 	/// A plain field and not a cell, deliberately, where `live` above is a
 	/// cell: liveness CHANGES after the subscriber is made and every copy must
 	/// see the change, and a class never changes at all. It is decided by the
-	/// one thing that mints a subscriber (`observe`) from the mark
+	/// one thing that mints an observer's subscriber (`mint_subscriber`, reached
+	/// from `observe` and from a cold chain's leaf) from the mark
 	/// `as_derivation` leaves, and it is read at exactly one place (`enqueue`,
 	/// to pick the bucket).
 	derived: bool,
@@ -163,6 +172,33 @@ export fun fresh_id(): i32 {
 	let id = next_subscriber_id.read();
 	next_subscriber_id.write() = id + 1;
 	id
+}
+
+/// Mint the subscriber for ONE observer — a fresh id, its own liveness cell, and
+/// the class the derivation mark left (A110 door 2), spent here.
+///
+/// Every observer std subscribes is minted here: `observe`'s payload observer and,
+/// since the protocol split the mint from the attach (A124 S2a), the no-payload
+/// leaf a chain of cold nodes is read through. That keeps this the one place the
+/// mark is spent, as `observe` was: an attach no longer mints, it pushes a record
+/// it was HANDED, so a leaf standing on three registrations spends the mark once.
+fun mint_subscriber(notify: || void): Subscriber {
+	let derived = minting_derivation.read();
+	minting_derivation.write() = false;
+	subscriber_of(notify, derived)
+}
+
+/// A subscriber of a known class, mark untouched. The RELAY shape: a node that must
+/// keep a registration of its OWN — a `Switch`'s rolling inner, a `Distinct`'s
+/// comparison, the payload bridge `Source::on_settle` defaults to — registers one
+/// of these upstream and re-notifies its downstream through `wake`, so the
+/// downstream's id is still the one the turn dedups on.
+///
+/// A relay is always a DERIVATION: it decides whether (and which) downstream to
+/// wake, and that has to happen in the wave's first phase, where a derivation it
+/// wakes still joins the fixpoint and an effect it wakes still runs after it.
+fun subscriber_of(notify: || void, derived: bool): Subscriber {
+	Subscriber { id = fresh_id(), notify, live = Shared::new(true), derived }
 }
 
 // === Turn scheduler (`proposal/reactive-turns.md`) ===
@@ -502,16 +538,69 @@ fun defer_to_turn(turn: Option<Turn>, id: i32, action: || void) {
 	// action acts, it does not publish, so it belongs after the derivations have
 	// settled — which is what "when the turn settles" means. Its position among the
 	// effects is its `id`'s, exactly like a notification's.
-	let deferred = [Subscriber { id, notify = action, live = always_live, derived = false }];
+	defer_subscriber(turn, Subscriber { id, notify = action, live = always_live, derived = false });
+}
+
+/// Hand one subscriber to `turn` if there is one, else to the currently DRAINING
+/// turn, else notify it now — the resolution `SignalCell::notify` makes for a
+/// whole list, made for one record. Inline, the record's liveness is read first,
+/// exactly as `notify`'s inline arm reads it (A110 door 1); queued, `drain` reads
+/// it when the record's turn comes.
+fun defer_subscriber(turn: Option<Turn>, subscriber: Subscriber) {
 	match turn {
-		Some(let ambient) => enqueue(ambient, deferred),
+		Some(let ambient) => enqueue(ambient, [reissued(subscriber)]),
 		None => {
 			match draining_turns.read().last() {
-				Some(let draining) => enqueue(draining, deferred),
-				None => action(),
+				Some(let draining) => enqueue(draining, [reissued(subscriber)]),
+				None => {
+					if subscriber.live.read() {
+						(subscriber.notify)();
+					}
+				},
 			}
 		},
 	}
+}
+
+/// `subscriber` as a fresh record of the same four fields — for a record that has
+/// to go INTO a list (a subscriber list, a turn's queue) from a parameter.
+///
+/// A parameter placed in a list is a rule-1 copy (`__clone`), and on the attach
+/// path that is one per subscription in the program, where `observe` used to build
+/// its record in place and pay none. Every field is a scalar, a closure or a
+/// `Shared`, none of which a copy duplicates (spec §6.9), so the reissued record IS
+/// the original: the same id, the same notify, the same liveness cell.
+fun reissued(subscriber: Subscriber): Subscriber {
+	Subscriber {
+		id = subscriber.id,
+		notify = subscriber.notify,
+		live = subscriber.live,
+		derived = subscriber.derived,
+	}
+}
+
+/// Re-notify a DOWNSTREAM subscriber from a relay (A124 R2): a node that keeps a
+/// registration of its own — `Switch`, `Distinct`, `Source::on_settle`'s payload
+/// bridge — is told first, decides, and then wakes the observer below it.
+///
+/// Through the TURN, not by a direct call, and that is the whole reason this
+/// exists: in a turn the downstream is enqueued under its own id, so a relay's
+/// wake and the same observer's direct registration elsewhere in its chain (the
+/// diamond's other arm) collapse into one call in `enqueue`'s dedup, and the
+/// observer keeps its own class and its own place in the effect order. With no
+/// turn anywhere it is a call, as every inline notification is.
+///
+/// The turn is the DRAINING one, and the ambient turn is not asked — which is both
+/// correct and load-bearing. Correct, because a relay is a subscriber and is only
+/// ever run by a list walk: under an ambient turn `SignalCell::notify` QUEUES a
+/// relay rather than calling it, so a relay runs either inside that turn's drain or
+/// inline with no turn at all, and those are exactly the two answers this gives.
+/// Load-bearing, because reading `turn_scope` here would give `Source::on_settle`'s
+/// default a hidden context parameter that `SignalCell`'s override does not take,
+/// and one table signature cannot carry a parameter only some implementations
+/// declare: every `dyn Source` would stop building natively.
+fun wake(subscriber: Subscriber) {
+	defer_subscriber(None, subscriber);
 }
 
 /// Establish a FRESH turn for `body`'s dynamic extent, and settle it when the
@@ -627,24 +716,72 @@ export impl Subscription {
 	/// The one-shot is the `release` cell's, so an owner releasing a handle the app
 	/// already disposed by hand cannot unhook twice.
 	fun teardown(release: || void): Subscription {
-		mut subscribers: List<Subscriber> = [];
-		// There is no signal here, so there is no subscriber list to alias: the
-		// cell dies with this frame and the weak handle answers `None` once
-		// anything counts (C14 S4). `dispose`'s `None` arm is the right answer for
-		// exactly this case — nothing to detach, and `release` still runs, which is
-		// the whole of this shape's teardown.
-		let empty: Shared<List<Subscriber>> = Shared::new(subscribers);
-		Subscription {
-			subscribers = empty.downgrade(),
-			id = fresh_id(),
-			// Its own cell, not the module-level `always_live`: this handle IS
-			// disposable, and lowering a shared flag would retire every deferred
-			// action in the program. Nothing reads it (there is no subscriber to
-			// skip) and it stays for the uniform representation.
-			live = Shared::new(true),
-			release = Shared::new(Some(release)),
-		}
+		// Its own liveness cell, not the module-level `always_live`: this handle IS
+		// disposable, and lowering a shared flag would retire every deferred action
+		// in the program. Nothing reads it (there is no subscriber to skip) and it
+		// stays for the uniform representation.
+		detached(fresh_id(), Shared::new(true), release)
 	}
+}
+
+/// The handle a cold node hands back when it could not simply FORWARD its
+/// downstream's subscriber (A124 R2) — a `Combine`'s arms, a `Switch`'s own
+/// registrations, `Source::on_settle`'s payload bridge. Disposing it retires
+/// `subscriber` itself: its liveness goes down (so a copy already queued in a turn,
+/// or in flight in a wave, never fires — A110 door 1), the ambient turn is scrubbed
+/// of its id, and `release` then takes down the registrations the node made.
+///
+/// That is the one obligation `on_settle` puts on the handle it returns — "when
+/// this is disposed, `subscriber` never fires again" — and a node that forwards
+/// meets it for free, because the root's handle carries the subscriber's own
+/// liveness cell.
+fun retiring(subscriber: Subscriber, release: || void): Subscription {
+	detached(subscriber.id, subscriber.live, release)
+}
+
+/// `handle`, made to retire `subscriber` as well when it is disposed — the payload
+/// bridge's handle (`Source::on_settle`'s default), which is the relay's own and
+/// must also lower the liveness of the observer the relay wakes, so a wake already
+/// queued for it is skipped (A110 door 1).
+///
+/// The retirement is CHAINED onto the handle's release rather than wrapped in a
+/// second handle whose release disposes this one, and that is not an economy.
+/// A closure that calls `dispose` reads the ambient turn (`dispose` scrubs it),
+/// so the default body that made one would take a hidden context parameter that
+/// `SignalCell`'s override does not — and a `dyn Source` cannot carry a table
+/// slot whose implementations disagree about their parameters natively. Lowering
+/// a flag and calling the release the handle already had (a mirror's lease)
+/// reads no context at all.
+fun retiring_also(handle: Subscription, subscriber: Subscriber): Subscription {
+	let previous = handle.release.read();
+	handle.release.write() = Some(|| {
+		subscriber.live.write() = false;
+		match previous {
+			Some(let release) => release(),
+			None => {},
+		}
+	});
+	// Rebuilt rather than returned: a parameter handed back is a rule-1 copy.
+	Subscription {
+		subscribers = handle.subscribers,
+		id = handle.id,
+		live = handle.live,
+		release = handle.release,
+	}
+}
+
+/// A handle over NO subscriber list, whose disposal runs `release` once: the shape
+/// `Subscription::teardown` and `retiring` share, which differ only in whose id and
+/// whose liveness the handle carries.
+fun detached(id: i32, live: Shared<bool>, release: || void): Subscription {
+	mut subscribers: List<Subscriber> = [];
+	// There is no signal here, so there is no subscriber list to alias: the cell
+	// dies with this frame and the weak handle answers `None` once anything counts
+	// (C14 S4). `dispose`'s `None` arm is the right answer for exactly this case —
+	// nothing to detach, and `release` still runs, which is the whole of this
+	// shape's teardown.
+	let empty: Shared<List<Subscriber>> = Shared::new(subscribers);
+	Subscription { subscribers = empty.downgrade(), id, live, release = Shared::new(Some(release)) }
 }
 
 export impl Subscription with Disposable {
@@ -1037,6 +1174,41 @@ export trait Source<T> {
 	[must_use]
 	fun on_change(self, observer: |T| void): Subscription;
 
+	/// The NO-PAYLOAD attach (A124 R2) — the node author's member, where
+	/// `on_change` is the one every application writes.
+	///
+	/// `subscriber` is told that this source MAY have changed, and is handed no
+	/// value: it reads `get()` if it wants one. That is what lets a chain of cold
+	/// nodes cost nothing per hop. A node that transforms its upstream (`map`)
+	/// or joins several (`combine`) implements this by FORWARDING `subscriber` to
+	/// each upstream untouched — no subscriber minted, no transform run — so a
+	/// leaf reading a five-deep chain puts ONE record on the root, and a diamond
+	/// puts the same record on the root twice, which a turn's dedup collapses
+	/// into one call (the id is the leaf's; see `Subscriber`).
+	///
+	/// The handle this returns must RETIRE `subscriber` when it is disposed — after
+	/// it, the subscriber never fires. Forwarding meets that for free. A node that
+	/// has to keep a registration of its OWN (a `switch` re-selecting its inner)
+	/// registers a relay of its own id upstream, wakes `subscriber` from it through
+	/// the turn, and hands back a handle that retires `subscriber` — it never
+	/// forwards `subscriber` to a registration it disposes by itself, because
+	/// disposing that would retire the observer below it.
+	///
+	/// The DEFAULT is the payload bridge, right for a ROOT — a cell, a mirror, a
+	/// storage-backed wrapper — whose `on_change` is where a value is stored and a
+	/// subscriber is minted anyway: attach through `on_change`, discard the value,
+	/// wake `subscriber`. It is exactly WRONG for a node, which would run its
+	/// transform to produce a value only to throw it away, once per hop (the S1
+	/// probe measured 15 evaluations where forwarding costs 5); so every node in
+	/// `std::reactive` overrides it, and `SignalCell` overrides it with the direct
+	/// attach. The bridge is a DERIVATION (A110 door 2): it wakes in the wave's
+	/// first phase, so the observer it wakes keeps its own class.
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		as_derivation();
+		retiring_also(self.on_change(|_value| wake(subscriber)), subscriber)
+	}
+
 	/// Subscribe: `observer` fires ONCE NOW with the value the source already
 	/// holds, then once per change. The eager form, derived — attach lazily,
 	/// then make that one call.
@@ -1210,6 +1382,15 @@ export impl SignalCell<type T> with Source<T> {
 		observer(self.get());
 		subscription
 	}
+
+	/// The protocol's root (A124 R2): push the record a leaf minted, AS GIVEN,
+	/// onto this cell's list. No subscriber is minted here and no value is read —
+	/// the id, the class and the liveness cell are the leaf's, which is what lets
+	/// every registration in one leaf's chain dedup as one.
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		attach(self, subscriber)
+	}
 }
 
 /// Attach `observer` to `signal`'s subscriber list and hand back the handle that
@@ -1239,39 +1420,42 @@ export impl SignalCell<type T> with Source<T> {
 /// makes. There is no `Source` spelling for that, so `map`, which is built on it,
 /// stays a `Signal` method too.
 export fun observe<T>(signal: SignalCell<T>, observer: |T| void): Subscription {
-	let id = fresh_id();
 	let cell = signal.value.downgrade();
-	// The liveness cell (A110 door 1). ONE per subscriber, held by the `Subscriber`
-	// the list carries and by the `Subscription` handed back, so `dispose` lowers
-	// it in O(1) without having to find the entry again.
-	let live: Shared<bool> = Shared::new(true);
-	// The CLASS (A110 door 2), read off the mark `as_derivation` left and CLEARED
-	// here: this is the one place a `Subscriber` is minted, so it is the one place
-	// the mark can be spent, and spending it is what keeps the mark from reaching a
-	// second attach further down the same call.
-	let derived = minting_derivation.read();
-	minting_derivation.write() = false;
-	signal.subscribers.write().push(Subscriber {
-		id,
-		live,
-		derived,
-		notify = || {
-			match cell.upgrade() {
-				// `upgrade` rather than `get`: `observer` takes a VALUE, and
-				// `read()` is the spelling that copies one out of the cell (spec
-				// §6.1). A `get` view would have to be dereferenced to the same
-				// copy, and would say the weaker thing — that this only touches the
-				// cell — where a notification genuinely holds it for the length of
-				// the call.
-				Some(let live) => observer(live.read()),
-				None => {},
-			}
-		},
-	});
+	attach(signal, mint_subscriber(|| {
+		match cell.upgrade() {
+			// `upgrade` rather than `get`: `observer` takes a VALUE, and `read()`
+			// is the spelling that copies one out of the cell (spec §6.1). A `get`
+			// view would have to be dereferenced to the same copy, and would say
+			// the weaker thing — that this only touches the cell — where a
+			// notification genuinely holds it for the length of the call.
+			Some(let live) => observer(live.read()),
+			None => {},
+		}
+	}))
+}
+
+/// Push `subscriber` onto `signal`'s list and hand back the handle that detaches it
+/// — the ATTACH half of `observe`, split from the mint (A124 S2a) so a leaf's one
+/// record can stand on several lists.
+///
+/// The handle carries the subscriber's OWN liveness cell (A110 door 1): one per
+/// observer, held by the record every list carries and by every handle to it,
+/// so `dispose` lowers it in O(1) without having to find an entry again — and a
+/// leaf whose record stands on two lists (a diamond) is retired by disposing
+/// either, which is the one-observer truth the shared id already says. The
+/// class was decided at the mint and is not touched here.
+fun attach<T>(signal: SignalCell<T>, subscriber: Subscriber): Subscription {
+	// The push comes FIRST, and the order is forced. `reissued` keeps the JS
+	// backend from deep-copying a parameter into the list; natively the record is
+	// still read again below, so the push copies it. The other order — the handle
+	// built first, the push as the record's last use — would move it, and the
+	// native emitter then moves `live` out of the record for the handle and hands
+	// rustc a use of a partially moved value (filed at A124 S2a).
+	signal.subscribers.write().push(reissued(subscriber));
 	Subscription {
 		subscribers = signal.subscribers.downgrade(),
-		id,
-		live,
+		id = subscriber.id,
+		live = subscriber.live,
 		release = Shared::new(None),
 	}
 }

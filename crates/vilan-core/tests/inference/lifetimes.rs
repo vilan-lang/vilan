@@ -600,7 +600,7 @@ fn a124_s1_a_cold_chain_with_no_subscriber_evaluates_nothing() {
         r#"
         import std::io::print;
         import std::reactive::{ Signal, SignalCell, Source };
-        import std::reactive_pipeline::{ Cold, watch };
+        import std::reactive_pipeline::{ watch };
         import std::shared::Shared;
 
         fun main() {
@@ -637,7 +637,7 @@ fn a124_s1_a_cold_chain_evaluates_once_per_leaf_subscriber() {
         r#"
         import std::io::print;
         import std::reactive::{ Signal, SignalCell, Source };
-        import std::reactive_pipeline::{ Cold, watch };
+        import std::reactive_pipeline::{ watch };
         import std::shared::Shared;
 
         fun main() {
@@ -674,7 +674,7 @@ fn a124_s1_a_cell_between_runs_the_segment_above_it_once() {
         r#"
         import std::io::print;
         import std::reactive::{ Signal, SignalCell, Source };
-        import std::reactive_pipeline::{ Cold, watch };
+        import std::reactive_pipeline::{ watch };
         import std::shared::Shared;
 
         fun main() {
@@ -706,18 +706,18 @@ fn a124_s1_a_cell_between_runs_the_segment_above_it_once() {
 
 #[test]
 fn a124_s1_a_diamond_pulls_a_settled_pair_and_fires_twice() {
-    // Claim 4, and the honest half of R2. Two arms over one root, joined: the
-    // leaf is told twice per settle, because each arm's registration mints its
-    // own subscriber id at the root and door 2's dedup is keyed on that id. It
-    // is a duplicate CALL and never a torn pair — both calls pull, so both read
-    // the settled `(20, 102)`. Threading ONE id down a leaf's whole chain is
-    // what would collapse the duplicate, and `observe` mints the id itself, so
-    // that is std work for S2 rather than something this probe can show.
+    // Claim 4, and the honest half of R2. Two arms over one root, joined: with
+    // NO turn the leaf is told twice per settle. Since S2a both arms carry the
+    // SAME record (the leaf's id), but an inline notification walks the root's
+    // list and calls what it finds — there is no queue to dedup in, which is
+    // what "inline, eager, depth-first" has always meant. It is a duplicate
+    // CALL and never a torn pair: both calls pull, so both read the settled
+    // `(20, 102)`. The turn is where the one id pays — the S2a pin below.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         import std::reactive::{ Signal, SignalCell, Source };
-        import std::reactive_pipeline::{ Cold, watch };
+        import std::reactive_pipeline::{ watch };
         import std::shared::Shared;
 
         fun main() {
@@ -738,6 +738,148 @@ fn a124_s1_a_diamond_pulls_a_settled_pair_and_fires_twice() {
         main();
         "#,
         "(20,102)(20,102)\n",
+    );
+}
+
+// --- A124 S2a: the no-payload protocol on the read trait ---------------------
+//
+// `Source::on_settle` is the protocol now (the S1 probe carried it as a twin
+// trait), and a leaf's ONE subscriber id is threaded down its whole chain: the
+// probe's nodes forward the record they are handed, `SignalCell::on_settle`
+// pushes it as given, and a turn's dedup — keyed on that id — collapses a
+// diamond's duplicate. The probe module uses only std's PUBLIC surface, so these
+// pins are also the claim that a node written outside `std::reactive` takes part.
+
+#[test]
+fn a124_s2a_a_diamond_in_a_turn_fires_once_with_the_settled_pair() {
+    // The COUNT claim S1 could not make. Red when `SignalCell::on_settle`
+    // mints a fresh id per registration instead of pushing the leaf's record:
+    // `(30,103)(30,103)`. The leaf is the node's own `on_change`, called
+    // DIRECTLY: through a generic bound (`watch`) a pair's override is not
+    // selected — its trait argument is a tuple — and the call takes the
+    // default bridge, whose own dedup would hide the root's.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ FlushPolicy, Signal, SignalCell, Source, turn };
+        import std::reactive_pipeline::{ Combine };
+        import std::shared::Shared;
+
+        fun main() {
+            let source: SignalCell<i32> = Signal::new(1);
+            let seen: Shared<str> = Shared::new("");
+            let diamond = source
+                .map_node(|x| x * 10)
+                .combine_node(source.map_node(|x| x + 100));
+            let _leaf = diamond.on_change(|pair| {
+                let (left, right) = pair;
+                seen.write() = i"{seen.read()}({left},{right})";
+            });
+            turn(FlushPolicy::AtEnd, || {
+                source.set(3);
+            });
+            print(seen.read());
+        }
+
+        main();
+        "#,
+        "(30,103)\n",
+    );
+}
+
+#[test]
+fn a124_s2a_a_leaf_disposed_by_an_earlier_effect_in_its_wave_does_not_fire() {
+    // Door 1 through the protocol. Both observers are queued in one wave; the
+    // first (lower id) disposes the cold chain's leaf, whose record is already
+    // OUT of the queue — only its liveness cell can stop it now, and that cell
+    // is the one `attach` shares with the handle. Red when the root's handle
+    // carries a liveness cell of its own: `leaf saw 20`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{
+            FlushPolicy, Signal, SignalCell, Source, Subscription, turn,
+        };
+        import std::reactive_pipeline::{ watch };
+        import std::shared::Shared;
+
+        fun main() {
+            let source: SignalCell<i32> = Signal::new(1);
+            let held: Shared<Option<Subscription>> = Shared::new(None);
+            let _first = source.on_change(|_value| {
+                held.read()?.dispose();
+                print("first disposed the leaf");
+            });
+            held.write() = Some(watch(source.map_node(|x| x * 10), |value| {
+                print(i"leaf saw {value}");
+            }));
+            turn(FlushPolicy::AtEnd, || {
+                source.set(2);
+            });
+            print("done");
+        }
+
+        main();
+        "#,
+        "first disposed the leaf\ndone\n",
+    );
+}
+
+#[test]
+fn a124_s2a_the_default_bridge_dedups_a_diamond_over_a_root_that_only_has_on_change() {
+    // A root that is not a `SignalCell` — `get` and `on_change` and nothing
+    // else, the `Stored` of the reference page — takes `Source::on_settle`'s
+    // DEFAULT, the payload bridge. Each arm's forward reaches the root
+    // separately and mints a bridge of its own, and each bridge WAKES the leaf
+    // through the turn rather than calling it, so the leaf's id is still the
+    // one the dedup sees. Red when the bridge calls the leaf directly:
+    // `(30,103)(30,103)`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{
+            FlushPolicy, Signal, SignalCell, Source, Subscription, turn,
+        };
+        import std::reactive_pipeline::{ watch };
+        import std::shared::Shared;
+
+        struct Stored<T> {
+            inner: SignalCell<T>,
+        }
+
+        impl Stored<type T> with Source<T> {
+            fun get(self): T {
+                self.inner.get()
+            }
+
+            fun on_change(self, observer: |T| void): Subscription {
+                self.inner.on_change(observer)
+            }
+        }
+
+        fun main() {
+            let cell: SignalCell<i32> = Signal::new(1);
+            let root = Stored { inner = cell };
+            let seen: Shared<str> = Shared::new("");
+            let diamond = root
+                .map_node(|x| x * 10)
+                .combine_node(root.map_node(|x| x + 100));
+            let _leaf = watch(diamond, |pair| {
+                let (left, right) = pair;
+                seen.write() = i"{seen.read()}({left},{right})";
+            });
+            turn(FlushPolicy::AtEnd, || {
+                cell.set(3);
+            });
+            print(seen.read());
+            seen.write() = "";
+            cell.set(4);
+            print(seen.read());
+        }
+
+        main();
+        "#,
+        "(30,103)\n(40,104)(40,104)\n",
     );
 }
 

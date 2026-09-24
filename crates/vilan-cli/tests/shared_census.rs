@@ -85,9 +85,10 @@ const CENSUS: &[(&str, usize, &str)] = &[
         "reactive.vl",
         35,
         "R + O + E: turns, owners, cells, drafts, the subscriber liveness flag \
-         (A110 door 1 — `observe`'s per-subscriber cell, shared with the \
-         `Subscription`; `Subscription::teardown`'s own; the module-level \
-         `always_live` every deferral subscriber shares) and door 2's three: a \
+         (A110 door 1 — one per OBSERVER, minted by `subscriber_of` and \
+         shared with every handle to it, since A124 S2a split `observe` into \
+         the mint and the attach; `Subscription::teardown`'s own; the \
+         module-level `always_live` every deferral subscriber shares) and door 2's three: a \
          `Turn`'s second queue and its second dedup map (O, per turn) plus the \
          module-level `minting_derivation` mark (R — one bit for the program, \
          set at a derivation's attach and spent by the `observe` it reaches); \
@@ -98,9 +99,13 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "reactive_pipeline.vl",
-        1,
+        2,
         "O: the S1 probe's `Switch` node holds its rolling inner subscription \
-         exactly as `switch` does (A124 S1 — evidence, not surface)",
+         exactly as `switch` does (A124 S1 — evidence, not surface); +1 at A124 \
+         S2a: the probe's leaf mints its observer's liveness cell by hand from \
+         the public `Subscriber` record (O — it lives exactly as long as the \
+         subscription it is shared with), because `std::reactive`'s minting \
+         helper is private to that module",
     ),
     (
         "rpc.vl",
@@ -223,7 +228,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 140,
+        total, 141,
         "the total number of `Shared` construction sites in std changed"
     );
 

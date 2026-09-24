@@ -685,7 +685,7 @@ fun main() {
 fn a_dyn_source_field_holds_a_root_a_map_node_and_a_cell() {
     assert_compiles_and_runs(
         "import std::reactive::{ Source, SignalCell };
-import std::reactive_pipeline::{ Cold };
+import std::reactive_pipeline::{ Map };
 struct Holder { s: dyn Source<i32> }
 fun main() {
 \tlet root = SignalCell::new(1);
