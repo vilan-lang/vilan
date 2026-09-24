@@ -225,7 +225,13 @@ Rust workspace, nine crates, plus the language's own tree:
   server, a watcher, an editor surface) fences at its own boundary —
   catch, degrade to an honest internal-error answer, details left to
   stderr; a new one-shot entry takes the CLI's stance. Either way,
-  write which and why at the site.
+  write which and why at the site. A fence catches PANICS, and a stack
+  overflow is not one — it aborts the process from any thread (N121) — so a
+  long-lived thread that runs the analysis also DECLARES its stack
+  (`vilan_core::stack_guard::with_declared_stack`, first thing in the thread,
+  with the size it was spawned with): the analyzer's recursion funnels probe
+  that declaration and panic short of the guard page, which the fence then
+  catches. An undeclared thread's probe is inert.
 - **Every lock RECOVERS from poisoning — no exceptions, and a test
   holds the line** (E97, ruled 2026-08-28: "do the safe thing, prevent
   a poisoned cache"). `.lock()`, `.read()` and `.write()` are followed

@@ -364,6 +364,7 @@ impl RecursionGuard {
     /// Enters one level of recursion; `None` once the depth limit is reached, so
     /// the caller can return a graceful fallback instead of recursing.
     pub fn enter() -> Option<RecursionGuard> {
+        crate::stack_guard::ensure_sufficient_stack("a type walk");
         RECURSION_DEPTH.with(|depth| {
             let current = depth.get();
             if current >= 2048 {

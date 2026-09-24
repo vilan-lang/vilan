@@ -38,6 +38,7 @@ pub mod owned_modules;
 pub mod parsing;
 pub mod platform_color;
 pub mod span;
+pub mod stack_guard;
 pub mod target;
 pub mod token;
 pub mod transformer;
@@ -641,14 +642,26 @@ pub fn analyze_source_reclaimable(
     }))
     .unwrap_or_else(|_| AnalyzedEntry {
         program: None,
-        diagnostics: vec![Error { trace: Vec::new(),
-            note: None,
-            span: crate::span::Span::new((), 0..0),
-            msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)".to_string(),
-        }],
+        diagnostics: vec![panicked_analysis()],
         ast: None,
         owned_modules: OwnedModules::none(),
     })
+}
+
+/// The one diagnostic both fences in this file answer a caught panic with —
+/// the outer one around lex/parse/lift and the inner one around the analysis.
+/// ONE constructor, because until N121 the inner fence answered with NOTHING:
+/// a panicked analysis came back as no program and no diagnostic at all, so
+/// the playground and the language server showed a file that had silently
+/// stopped being analyzed. `stack_guard`'s probe made that the common panic
+/// (a runaway recursion refused on a declared stack), which is how it showed.
+fn panicked_analysis() -> Error {
+    Error {
+        trace: Vec::new(),
+        note: None,
+        span: crate::span::Span::new((), 0..0),
+        msg: "internal error: the compiler panicked analyzing this file (this is a bug; the details are on stderr)".to_string(),
+    }
 }
 
 /// [`analyze_source_reclaimable`] with the M9 opt-in active (`leak-soak.md`
@@ -912,10 +925,14 @@ fn analyze_source_unfenced(
         },
         // The analysis unwound inside its fence: every analyzer local went
         // with it and nothing global borrowed the tree (leak-soak.md §7.2),
-        // so the handle is still the caller's to reclaim.
+        // so the handle is still the caller's to reclaim. The parse's own
+        // diagnostics stand, and the panic is SAID, not swallowed (N121).
         Err(_) => AnalyzedEntry {
             program: None,
-            diagnostics,
+            diagnostics: {
+                diagnostics.push(panicked_analysis());
+                diagnostics
+            },
             ast: Some(ast),
             owned_modules: OwnedModules::none(),
         },
