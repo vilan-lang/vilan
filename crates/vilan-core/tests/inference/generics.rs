@@ -8713,3 +8713,65 @@ fn b372_a_let_bound_closure_still_compiles_when_its_wait_cannot_be_answered() {
         "8\n",
     );
 }
+
+// --- B392: a LET-BOUND closure whose unannotated parameter feeds a generic
+// --- position waited on its own call site, which waited on the closure's
+// --- type, which waited on the body — which waited on the parameter. A
+// --- stationary fixpoint now fills the parameter from its first call site.
+
+const B392_PRELUDE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Holder<T> { value: T }\n",
+    "\n",
+    "fun wrap<T>(value: T): Holder<T> { Holder { value } }\n",
+    "\n",
+);
+
+/// The bare-parameter call. Red before the fix: "type of variable 'f' could not
+/// be resolved".
+#[test]
+fn b392_a_let_bound_closure_passing_its_parameter_to_a_generic_call() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B392_PRELUDE}fun main() {{\n\tlet f = |m| wrap(m);\n\tprint(f(4).value);\n\tprint(f(9).value + 1);\n}}\n"
+        ),
+        "4\n10\n",
+    );
+}
+
+/// B288's struct literal over the parameter. Red before the fix: "type of
+/// variable 'g' could not be resolved".
+#[test]
+fn b392_a_let_bound_closure_building_a_generic_struct_from_its_parameter() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B392_PRELUDE}fun main() {{\n\tlet g = |m| Holder {{ value = m * 2 }};\n\tprint(g(4).value);\n}}\n"
+        ),
+        "8\n",
+    );
+}
+
+/// The first call site decides; a second at another type is ITS mismatch,
+/// naming the call that typed the parameter. Red before the fix (the variable
+/// was unresolved instead).
+#[test]
+fn b392_a_second_call_at_another_type_is_refused_against_the_first() {
+    assert_fails_with(
+        &format!(
+            "{B392_PRELUDE}fun main() {{\n\tlet f = |m| wrap(m);\n\tprint(f(4).value);\n\tprint(f(\"x\").value);\n}}\n"
+        ),
+        "Expected i32, but got str instead.",
+    );
+}
+
+/// The control: the annotated parameter, which always resolved.
+#[test]
+fn b392_the_annotated_parameter_control() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B392_PRELUDE}fun main() {{\n\tlet h = |m: i32| wrap(m);\n\tprint(h(5).value);\n}}\n"
+        ),
+        "5\n",
+    );
+}

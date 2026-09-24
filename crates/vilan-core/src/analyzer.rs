@@ -34845,6 +34845,67 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// B392 — the stall's fill for closures called by NAME: each deferred call
+    /// whose callee is a closure literal (through `let` bindings) gives every
+    /// parameter of it that is still an unfilled `Unknown` its argument's
+    /// type, when that type is fully determined. Calls are taken in source
+    /// order and a filled slot is no longer `Unknown`, so the FIRST call site
+    /// wins exactly as at `resolve_call_subject`'s B13 fill, and a later
+    /// call that disagrees is reported against it there. Answers whether
+    /// anything was filled.
+    fn fill_let_bound_closures_from_call_sites(&mut self) -> bool {
+        let mut calls: Vec<(Id, Id, Vec<Id>)> = self
+            .deferred
+            .iter()
+            .filter_map(|(constraint, _)| match constraint {
+                Constraint::CallSubject(call) => {
+                    Some((call.call_id, call.subject_id, call.argument_ids.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        calls.sort_by_key(|(call_id, ..)| call_id.0);
+        let mut filled = false;
+        for (_, subject_id, argument_ids) in calls {
+            let Some(closure_id) = self.closure_behind_callee(subject_id) else {
+                continue;
+            };
+            let Some(parameters) = self
+                .closures
+                .get(&closure_id)
+                .map(|closure| closure.parameters.clone())
+            else {
+                continue;
+            };
+            if parameters.len() != argument_ids.len() {
+                continue;
+            }
+            for (parameter_id, argument_id) in parameters.iter().zip(&argument_ids) {
+                let Some(slot) = self
+                    .parameters
+                    .get(parameter_id)
+                    .map(|parameter| parameter.type_id)
+                else {
+                    continue;
+                };
+                if !matches!(slot.get_type(self), Type::Unknown) {
+                    continue;
+                }
+                let argument_type =
+                    self.infer_type(*argument_id, &Type::Unknown, &HashMap::default());
+                if !self.type_is_fully_determined(&argument_type) {
+                    continue;
+                }
+                self.write_type_slot(slot, argument_type);
+                if let Some(span) = self.span_map.get(argument_id) {
+                    self.closure_parameter_fill_sites.insert(slot, **span);
+                }
+                filled = true;
+            }
+        }
+        filled
+    }
+
     /// Fill an unannotated closure parameter's shared type slot in place
     /// (B13's channel): the slot id is shared with the closure literal's
     /// type, so every deferred use of the parameter retypes on retry.
@@ -49601,6 +49662,20 @@ impl<'src> Analyzer<'src> {
                 if !self.discover_literal_let_expectations() {
                     self.literal_lets_wait = false;
                 }
+                fruitless_backstops = 0;
+                self.constraints
+                    .extend(self.deferred.drain(..).map(|(constraint, _)| constraint));
+                continue;
+            }
+            // B392: a let-bound closure whose unannotated parameter nothing
+            // typed is waiting on its OWN call site, which waits on the
+            // closure's type, which waits on the body — which waits on the
+            // parameter. A stationary fixpoint is where that cycle is broken:
+            // the parameter takes its first call site's argument type (B13's
+            // rule, applied before the closure's type exists), and the body
+            // resolves on the next pass. Before B372's door, which would
+            // commit the body's calls with the parameter still open.
+            if fruitless_backstops >= 2 && self.fill_let_bound_closures_from_call_sites() {
                 fruitless_backstops = 0;
                 self.constraints
                     .extend(self.deferred.drain(..).map(|(constraint, _)| constraint));
