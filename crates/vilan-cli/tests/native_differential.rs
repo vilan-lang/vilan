@@ -1462,6 +1462,60 @@ fn a_bigint_past_the_native_limit_is_refused_and_an_overflow_traps() {
     );
 }
 
+/// N120: a program whose arithmetic rustc can see overflowing at compile time
+/// is refused by the native build — `deny(arithmetic_overflow)` — and the CLI
+/// says so as the PROGRAM's overflow, naming the expression rustc underlined,
+/// rather than accusing the backend. A conforming program does not overflow
+/// (spec §7.2a; I5's ruling 2), and the JS backend runs on past one: the second
+/// half of this pin is that very program printing on the JS backend.
+///
+/// Red before N120: the refusal ended in "`cargo build` refused the emitted
+/// Rust. That is a BACKEND defect, not a defect in the vilan program".
+#[test]
+fn a_constant_overflow_is_reported_as_the_programs_not_the_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_overflow.vl"), OVERFLOW_PROBE)
+        .expect("write the probe");
+    let native = vilan(&staged)
+        .args(["build", "--backend", "rust", "native_probe_overflow.vl"])
+        .output()
+        .expect("build the overflow probe natively");
+    assert!(
+        !native.status.success(),
+        "rustc refuses the constant overflow"
+    );
+    let message = String::from_utf8_lossy(&native.stderr);
+    assert!(
+        message.contains("the PROGRAM overflows: rustc evaluated `((a_")
+            && message.contains("+ (1i32)))` (the emitted Rust, src/main.rs:")
+            && message.contains("attempt to compute `i32::MAX + 1_i32`, which would overflow")
+            && message.contains("the JavaScript backend would have run on past it"),
+        "the refusal names the program's overflow and the expression: {message}"
+    );
+    assert!(
+        !message.contains("BACKEND defect"),
+        "an overflow the program wrote is not a backend defect: {message}"
+    );
+    let javascript = vilan(&staged)
+        .args(["run", "native_probe_overflow.vl"])
+        .output()
+        .expect("run the overflow probe on the JS backend");
+    assert!(
+        javascript.status.success(),
+        "the JS backend runs on past it"
+    );
+    assert_eq!(String::from_utf8_lossy(&javascript.stdout), "2147483648\n");
+}
+
+const OVERFLOW_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet a: i32 = 2147483647;\n",
+    "\tprint(a + 1);\n",
+    "}\n",
+);
+
 const BIGINT_LIMIT_PROBE: &str = concat!(
     "import std::io::print;\n",
     "\n",
