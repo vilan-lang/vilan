@@ -189,6 +189,59 @@ downstream of one reads the settled value in a single wave, and both hand
 their subscriptions — the outer one and whichever inner is live — to the
 ambient owner, so a disposed boundary leaves nothing behind.
 
+### Where a derivation lives: `.cell()` and `dyn Source<T>`
+
+A derivation is a *description* of a value: the source it reads and what it does
+to it. It does not have to be stored anywhere. Read it with `get()` and it pulls
+through its chain; subscribe to it and it tells you when the source changed, and
+you pull. A chain nobody reads costs nothing, and a chain one reader reads costs
+one evaluation per change. Three rules cover where one should live:
+
+- **A chain is cold.** Leave a derivation with one reader as it is — no cell, no
+  cache, nothing to keep in step.
+- **`.cell()` where you share it or read it hot.** Two readers of a cold chain
+  each evaluate it; below a `.cell()` the chain above runs once and the readers
+  share the cached value. A `get()` in a loop pulls the whole chain every time;
+  after a `.cell()` it is one read. `.cell()` is a source again, so a chain can
+  go on through it, and it can sit anywhere in one — after the expensive part,
+  not at every step.
+- **`dyn Source<T>` where you store it.** A struct field names a type, and two
+  derivations built differently are two types. A field of type `dyn Source<T>`
+  holds any of them — a cell, a derivation, a mirror — and a list of such structs
+  mixes them freely.
+
+```vilan
+import std::reactive::{ Signal, SignalCell, Source };
+
+struct Label {
+	text: dyn Source<str>,
+}
+
+fun main() {
+	let count = Signal::new(2);
+	let total = count.map(|n: i32| n * 100).cell();   // shared below: cache it
+	let labels: List<Label> = [
+		Label { text = Signal::new("fixed") },
+		Label { text = total.map(|cents: i32| i"{cents} cents") },
+	];
+	count.set(3);
+	for label in labels {
+		print(label.text.get());
+	}
+	print(total.get());
+}
+```
+
+`.cell()` does not compare: every change above it is a write, and a write always
+notifies. When an unchanged value should stay quiet, `.distinct()` is the node
+that compares (it asks `T: PartialEq`, and nothing else in the chain does).
+
+In this release `map`, `combine`, `flatten`, `switch` and `and_then` still hand
+back a `SignalCell` — every step of a chain is still a cell, as it always was.
+v0.41.0 makes them return the cold nodes. Writing `.cell()` today where a value
+is shared or read hot, and `dyn Source<T>` where one is stored, is the code that
+is right on both sides of that change.
+
 ### Selection over a list: `selector`
 
 `map` is the wrong tool for one particular shape — "is *this* row the

@@ -1090,6 +1090,66 @@ fn a110_door2_an_effect_reads_a_derivation_chains_final_value_once() {
     );
 }
 
+/// The same claim with COLD arms (A124 S2a, `proposal/reactive-pipeline.md`
+/// §2.3), and with the count made the claim. The derivation chain is two
+/// `map_node`s — nodes, which store nothing and are READ by pulling — and the
+/// effect stands on a diamond: the root joined with that chain. Under pull the
+/// VALUE half holds by construction (every read is of settled state, so `5/3`
+/// cannot happen). The COUNT half is what the threaded id buys: both arms
+/// forward the effect's ONE subscriber record to the root, so the root's list
+/// holds it twice, and the turn's dedup — keyed on that id — calls it once.
+///
+/// Red when `SignalCell::on_settle` mints a fresh id per registration instead
+/// of pushing the leaf's record: `fixpoint=5/11,5/11,`.
+const A124_S2A_COLD_DIAMOND: &str = r#"import std::io::print;
+import std::reactive::{
+	FlushPolicy, Owner, Signal, SignalCell, Source, combine_node, run_with_owner, turn,
+};
+
+fun main() {
+	let root: SignalCell<i32> = Signal::new(1);
+	let twice = root.map_node(|value| value * 2).map_node(|value| value + 1);
+	let arms: (dyn Source<i32>, dyn Source<i32>) = (root, twice);
+	let pair = combine_node(arms);
+	let seen: SignalCell<str> = Signal::new("");
+	let watcher = Owner::new();
+	run_with_owner(watcher, || {
+		pair.effect_on_change(|both: (i32, i32)| {
+			let (left, right) = both;
+			seen.set_with(|log| i"{log}{left}/{right},");
+		});
+	});
+	print(i"before root={root.get()} twice={twice.get()}");
+	turn(FlushPolicy::AtEnd, || {
+		root.set(5);
+	});
+	print(i"fixpoint={seen.get()}");
+	watcher.dispose();
+	turn(FlushPolicy::AtEnd, || {
+		root.set(6);
+	});
+	print(i"disposed={seen.get()}");
+}
+"#;
+
+#[test]
+fn a124_s2a_door2_a_cold_diamond_fires_its_effect_once_with_the_settled_pair() {
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run(
+        "a124_s2a_cold_diamond",
+        A124_S2A_COLD_DIAMOND,
+        &harness,
+        &[],
+    );
+    let lines: Vec<&str> = stdout.lines().map(str::trim).collect();
+    assert_eq!(
+        lines,
+        vec!["before root=1 twice=3", "fixpoint=5/11,", "disposed=5/11,"],
+        "an effect standing on a cold diamond must fire once per settle, on the \
+         settled pair, and not at all once its owner is gone; got:\n{stdout}"
+    );
+}
+
 // --- A114: an effect with an OWNER PER RUN ----------------------------------
 
 /// `Source::scoped_effect` and the free `on_cleanup` (tracker A114, R2 at Order

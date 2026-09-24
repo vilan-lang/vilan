@@ -677,15 +677,14 @@ fun main() {
 }
 
 /// The brief's pin in its own words — a root, a COLD node and a `.cell()` in
-/// one `List<Holder>` of `dyn Source<i32>` — over the S1 probe's real nodes
-/// (`std::reactive_pipeline`, reactive-40's S1 probe): the root cell, a
+/// one `List<Holder>` of `dyn Source<i32>` — over `std::reactive`'s own nodes
+/// (reactive-40's S1 probe until A124 S2b moved them in): the root cell, a
 /// `Map` node that owns no value, and a `.cell()` materialising a second chain
 /// — three different types behind one field type.
 #[test]
 fn a_dyn_source_field_holds_a_root_a_map_node_and_a_cell() {
     assert_compiles_and_runs(
         "import std::reactive::{ Source, SignalCell };
-import std::reactive_pipeline::{ Cold };
 struct Holder { s: dyn Source<i32> }
 fun main() {
 \tlet root = SignalCell::new(1);
@@ -719,5 +718,48 @@ fun main() {
 }
 ",
         "2\n",
+    );
+}
+
+/// dyn-40's ruling, pinned where A124 S2c will flip it: `map` is a GENERIC
+/// DEFAULT on `Source` today, so it has no table slot and a call through a
+/// `dyn Source` is refused by name. The flip moves `map` to a blanket over
+/// `S: Source<T>`, which an object satisfies — and this pin becomes a pass in
+/// the saved S2c patch.
+#[test]
+fn a124_map_through_a_dyn_source_is_refused_until_the_flip() {
+    assert_fails_with(
+        "import std::reactive::{ Source, SignalCell };
+fun main() {
+\tlet cell = SignalCell::new(1);
+\tlet object: dyn Source<i32> = cell;
+\tlet mapped = object.map(|n| n + 1);
+\tprint(mapped.get());
+}
+",
+        "`Source::map` is generic, so it is not reachable through `dyn Source<i32>`",
+    );
+}
+
+/// ...while the BLANKET spelling of the same node already reaches the object —
+/// the shape S2c gives `map` itself (`proposal/reactive-pipeline.md` §3.4): a
+/// cold node over a `dyn Source<i32>` upstream, read by pull, notified through
+/// the object's `on_settle` slot, and materialised by `.cell()`.
+#[test]
+fn a124_the_blanket_node_spelling_reaches_through_a_dyn_source() {
+    assert_compiles_and_runs(
+        "import std::reactive::{ Source, SignalCell };
+fun main() {
+\tlet cell = SignalCell::new(1);
+\tlet object: dyn Source<i32> = cell;
+\tlet mapped = object.map_node(|n| n + 1);
+\tlet cached = mapped.cell();
+\tlet watch = mapped.on_change(|n| print(i\"saw {n}\"));
+\tcell.set(5);
+\tprint(i\"{mapped.get()} {cached.get()}\");
+\twatch.dispose();
+}
+",
+        "saw 6\n6 6\n",
     );
 }
