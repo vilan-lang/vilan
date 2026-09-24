@@ -961,6 +961,10 @@ fn the_to_string_steer_covers_every_display_impl_subject() {
         ("true", "bool"),
         ("1.5f", "f64"),
         ("7n", "BigInt"),
+        // A126: the sized family implements `Display` too.
+        ("200u8", "u8"),
+        ("3u53", "u53"),
+        ("1.5f32", "f32"),
     ] {
         let source = format!(
             r#"
@@ -6795,4 +6799,73 @@ fn an_i32_index_still_reads_a_list_an_array_and_a_write() {
         "#,
         "a\nb\nz\n5\n15\n",
     );
+}
+
+// --- A126: `Display` on the sized numeric family ------------------------------
+//
+// `display.vl` implemented `Display` for `str`, `i32`, `f64`, `bool`, `u32` and
+// `BigInt` only, so a `T: Display` bound refused every sized width while
+// interpolation of the same value worked (index-type.md §12 F-f). One pin per
+// width, each THROUGH the bound — interpolation alone never asked the trait.
+// The item named `i64`/`u64`, which are not types (renamed to `i53`/`u53`,
+// numeric-types.md §3); the width it missed is `f32`.
+
+#[track_caller]
+fn assert_displays_through_a_bound(type_name: &str, literal: &str, expected: &str) {
+    let source = format!(
+        r#"
+        import std::{{ io::print, display::{{ Display, format }} }};
+
+        fun show<T: Display>(value: T): str {{
+            value.to_string()
+        }}
+
+        fun main() {{
+            let value: {type_name} = {literal};
+            print(show(value));
+            print(format(value));
+            let values: List<{type_name}> = [value, value];
+            print(values.join("|"));
+        }}
+        "#
+    );
+    assert_compiles_and_runs(
+        &source,
+        &format!("{expected}\n{expected}\n{expected}|{expected}\n"),
+    );
+}
+
+#[test]
+fn a126_i8_displays_through_a_bound() {
+    assert_displays_through_a_bound("i8", "-5i8", "-5");
+}
+
+#[test]
+fn a126_u8_displays_through_a_bound() {
+    assert_displays_through_a_bound("u8", "200u8", "200");
+}
+
+#[test]
+fn a126_i16_displays_through_a_bound() {
+    assert_displays_through_a_bound("i16", "-300i16", "-300");
+}
+
+#[test]
+fn a126_u16_displays_through_a_bound() {
+    assert_displays_through_a_bound("u16", "65535u16", "65535");
+}
+
+#[test]
+fn a126_i53_displays_through_a_bound() {
+    assert_displays_through_a_bound("i53", "-9007199254740992i53", "-9007199254740992");
+}
+
+#[test]
+fn a126_u53_displays_through_a_bound() {
+    assert_displays_through_a_bound("u53", "9007199254740992u53", "9007199254740992");
+}
+
+#[test]
+fn a126_f32_displays_through_a_bound() {
+    assert_displays_through_a_bound("f32", "1.5f32", "1.5");
 }

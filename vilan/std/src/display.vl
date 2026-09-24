@@ -76,3 +76,49 @@ impl BigInt with Display {
 		i"{self}"
 	}
 }
+
+// The sized family (numeric-types.md §5, A126): the same interpolation the compiler
+// already renders each width with, reached through the trait so a `T: Display`
+// bound admits them too.
+
+impl i8 with Display {
+	fun to_string(self): str {
+		i"{self}"
+	}
+}
+
+impl u8 with Display {
+	fun to_string(self): str {
+		i"{self}"
+	}
+}
+
+impl i16 with Display {
+	fun to_string(self): str {
+		i"{self}"
+	}
+}
+
+impl u16 with Display {
+	fun to_string(self): str {
+		i"{self}"
+	}
+}
+
+impl i53 with Display {
+	fun to_string(self): str {
+		i"{self}"
+	}
+}
+
+impl u53 with Display {
+	fun to_string(self): str {
+		i"{self}"
+	}
+}
+
+impl f32 with Display {
+	fun to_string(self): str {
+		i"{self}"
+	}
+}

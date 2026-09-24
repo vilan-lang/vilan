@@ -193,7 +193,11 @@ fun format<T: Display>(value: T): str
 ```
 
 Implement `Display` for values that have a natural user-facing rendering;
-`format(value)` (from `std::display`) is the generic entry point.
+`format(value)` (from `std::display`) is the generic entry point. std
+implements it for `str`, `bool`, `BigInt` and every numeric width — `i8`,
+`u8`, `i16`, `u16`, `i32`, `u32`, `i53`, `u53`, `f32` and `f64` — each
+rendering exactly what interpolation renders, so a `T: Display` bound admits
+any number.
 Concatenation and interpolation accept only what already has a string
 form — a `str`, a number, a `bool` — and refuse everything else by name,
 so `format`/`to_string` on a custom type is a call you write rather than
