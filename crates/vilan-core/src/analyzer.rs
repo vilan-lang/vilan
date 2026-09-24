@@ -37094,9 +37094,31 @@ impl<'src> Analyzer<'src> {
                 let Some(impl_arguments) = provided else {
                     continue;
                 };
+                // B396: an argument still abstract in a binder the RECEIVER does
+                // not carry is a provider that could not ground it — a blanket
+                // (`impl type S: Source<List<type T>> with DeltaFeed<T>`) that
+                // `trait_args_for` answers with as its fallback although its
+                // bound does not hold for this receiver. Binding the caller's
+                // parameter to that foreign binder is no evidence, and it is
+                // permanent: the parameter no longer binds from the argument
+                // that DOES determine it (`each`'s key closure), and every bound
+                // is then reported against an abstract `T`. A binder the
+                // receiver mentions (`Box<T>` inside a generic body) is the
+                // caller's own and still binds.
+                let mut receiver_generics = Vec::new();
+                self.collect_generics(&concrete, 0, &mut receiver_generics);
                 for (trait_argument, impl_argument) in trait_arguments.iter().zip(impl_arguments) {
                     let trait_argument_type = trait_argument.get_type(self);
                     let impl_argument_type = impl_argument.get_type(self);
+                    let mut argument_generics = Vec::new();
+                    self.collect_generics(&impl_argument_type, 0, &mut argument_generics);
+                    if !matches!(concrete, Type::Generic(_))
+                        && argument_generics
+                            .iter()
+                            .any(|generic| !receiver_generics.contains(generic))
+                    {
+                        continue;
+                    }
                     if let Some((_, bindings)) =
                         self.reconcile_type(&trait_argument_type, &impl_argument_type, substitution)
                     {

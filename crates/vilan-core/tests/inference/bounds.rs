@@ -12807,3 +12807,110 @@ fn b389_the_thirteen_passing_positions_stay_passing_u32() {
 fn b389_the_thirteen_passing_positions_stay_passing_f64() {
     b389_controls("f64");
 }
+
+// --- B396: a SECOND bound over `T` on a generic function's `S` stopped the
+// --- argument that determines `T` from binding it. `trait_args_for` answers a
+// --- blanket's still-abstract arguments as its fallback, and
+// --- `derive_generics_from_bounds` bound the caller's `T` to that foreign
+// --- binder first; the key closure could no longer bind it and every bound
+// --- was reported against an abstract `T`.
+
+/// The source that is NOT a list source (an rpc mirror's shape), and a feed
+/// trait declared the way std's `DeltaFeed` is — a blanket over every
+/// `Source<List<T>>`. `BOUNDS` is the two-bound clause under test.
+const B396_PROGRAM: &str = concat!(
+    "import std::compare::PartialEq;\n",
+    "import std::io::print;\n",
+    "import std::option::Option::{ self, None, Some };\n",
+    "import std::reactive::{ Signal, SignalCell, Source, Subscription };\n",
+    "\n",
+    "trait Feed<T> { fun feeds(self): bool; }\n",
+    "\n",
+    "impl type S: Source<List<type T>> with Feed<T> {\n",
+    "\tfun feeds(self): bool { false }\n",
+    "}\n",
+    "\n",
+    "[derive(PartialEq)]\n",
+    "struct Todo { id: i32, label: str }\n",
+    "\n",
+    "struct Mirror<T> { inner: SignalCell<Option<List<T>>> }\n",
+    "\n",
+    "impl Mirror<type T> with Source<Option<List<T>>> {\n",
+    "\tfun get(self): Option<List<T>> { self.inner.get() }\n",
+    "\n",
+    "\t[must_use]\n",
+    "\tfun on_change(self, observer: |Option<List<T>>| void): Subscription {\n",
+    "\t\tself.inner.on_change(observer)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun run<T: PartialEq, K: PartialEq, BOUNDS>(source: S, key: |T| K): i32 {\n",
+    "\tmut total = 0;\n",
+    "\tfor item in source.get() {\n",
+    "\t\tif key(item) == key(item) { total += 1; }\n",
+    "\t}\n",
+    "\ttotal\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tBODY\n",
+    "}\n",
+);
+
+fn b396_refusal(bounds: &str) {
+    let program = B396_PROGRAM.replace("BOUNDS", bounds).replace(
+        "BODY",
+        "let seeded: Option<List<Todo>> = None;\n\tlet remote = Mirror { inner = Signal::new(seeded) };\n\tprint(run(remote, |todo: Todo| todo.id));",
+    );
+    let errors = compile(&program).expect_err("a mirror is not a list source");
+    assert_eq!(
+        errors.len(),
+        2,
+        "one refusal per bound, each at `Todo`, with `{bounds}`: {errors:#?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error
+                .contains("'Mirror<Todo>' does not implement trait 'Source<List<Todo>>'")),
+        "{errors:#?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("'Mirror<Todo>' does not implement trait 'Feed<Todo>'")),
+        "{errors:#?}"
+    );
+}
+
+/// Red before the fix: three errors, `Feed<T>`, `Source<List<T>>` and "generic
+/// parameter 'T' is missing the bound ': PartialEq'".
+#[test]
+fn b396_a_second_bound_does_not_unbind_the_key_closures_parameter() {
+    b396_refusal("S: Source<List<T>> + Feed<T>");
+}
+
+/// The same in the other order (red before the fix, the same three errors).
+#[test]
+fn b396_a_second_bound_written_first_does_not_unbind_it_either() {
+    b396_refusal("S: Feed<T> + Source<List<T>>");
+}
+
+/// The control: a real list source satisfies both bounds, with the key
+/// closure's parameter unannotated, in either order — green before and after.
+#[test]
+fn b396_a_list_source_under_both_bounds_runs_in_either_order() {
+    for bounds in [
+        "S: Source<List<T>> + Feed<T>",
+        "S: Feed<T> + Source<List<T>>",
+    ] {
+        let program = B396_PROGRAM.replace("BOUNDS", bounds).replace(
+            "BODY",
+            "let todos: SignalCell<List<Todo>> = Signal::new([Todo { id = 1, label = \"a\" }]);\n\tprint(run(todos, |todo| todo.id));",
+        );
+        match compile_and_run(&program) {
+            Ok(stdout) => assert_eq!(stdout, "1\n", "with `{bounds}`"),
+            Err(errors) => panic!("with `{bounds}`: {errors:#?}"),
+        }
+    }
+}
