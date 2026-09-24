@@ -388,6 +388,7 @@ trait Transport {
 |---|---|---|
 | `SocketTransport` | WebSocket (reconnecting) | what `connect` gives you, the production client transport |
 | `HttpTransport` | one POST per call | stateless calls, no mirrors, no handles |
+| `HeaderedHttpTransport` | one POST per call, with headers | the same, carrying a header credential |
 | `LocalTransport` | in-process | tests: client and service in one process; handles need a stamped connection |
 
 A `[service]` an HTTP client can hold gets a constructor for this leg:
@@ -395,6 +396,9 @@ A `[service]` an HTTP client can hold gets a constructor for this leg:
 ```vilan,fragment
 impl FooClient<HttpTransport> {
 	fun over_http(mount: str, codec: Codec): FooClient<HttpTransport>
+}
+impl FooClient<HeaderedHttpTransport> {
+	fun over_http_with(mount: str, codec: Codec, headers: List<(str, str)>): FooClient<HeaderedHttpTransport>
 }
 ```
 
@@ -406,6 +410,21 @@ handles and no reverse direction, so it is generated only for a service that
 declares none: a service with an `[expose]`d field or a handle-returning
 method, or one declaring `client = H`, has no `over_http` and the call is
 refused by name.
+
+`over_http_with` is the same constructor for a client that has to CARRY
+something: its headers are sent on every POST the client makes, after the
+leg's own media type. That is how a page that keeps its credential in storage
+rather than in a cookie reaches a service gated by `authorize_request` — a
+cookie rides a same-origin POST on its own, a header token has to be written:
+
+```vilan,fragment
+let client = AuthClient::over_http_with("/auth/", json_codec(), [("Authorization", i"Bearer {token}")]);
+```
+
+It builds a `HeaderedHttpTransport { url, headers }` rather than widening
+`HttpTransport`, so every `HttpTransport { url }` written today still means
+what it meant. The media type is the transport's to set; a `Content-Type` does
+not belong among the headers.
 
 `[service(FooClient, http)]` says the same thing at the DECLARATION: the
 `http` marker generates nothing and moves no contract hash, and it refuses

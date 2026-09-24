@@ -13,6 +13,7 @@ fun get(url: str): Request
 fun post(url: str, body: str): Request
 fun post_bytes(url: str, body: Bytes): Response   // one-shot binary POST
 fun post_bytes_typed(url: str, body: Bytes, media_type: str): Response
+fun post_bytes_with_headers(url: str, body: Bytes, headers: List<Header>): Response
 
 impl Request {
 	fun header(own self, name: str, value: str): Request   // chainable
@@ -28,7 +29,9 @@ impl Response {
 ```
 
 `post_bytes` sends no `Content-Type` (the host's default for a byte body is
-none); `post_bytes_typed` is the same call with one. `Response::header` reads
+none); `post_bytes_typed` is the same call with one, and
+`post_bytes_with_headers` writes the whole list (`Header { name, value }`) —
+a media type and a credential together. `Response::header` reads
 one header back — a header present with an empty value reads `None`, which is
 the same fact to every caller.
 

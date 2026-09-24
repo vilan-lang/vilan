@@ -1434,6 +1434,16 @@ The SSE pair is a connection, so it follows the upgrade's column. A
 `Service::factory` service stays `501` on the POST leg whatever the hook says:
 the instance, not the identity, is what a POST cannot supply.
 
+The client end of a bearer is `over_http_with`, which sends its headers on
+every POST the client makes:
+
+```vilan,fragment
+let billing = BillingClient::over_http_with("/billing/", json_codec(), [("Authorization", i"Bearer {token}")]);
+```
+
+A cookie rides a same-origin POST without being asked; a token the page keeps
+in storage does not, and `over_http` carries no header at all.
+
 ### CORS, and the credential
 
 std does no CORS. The mechanism is already on the builder, a service's mount is
