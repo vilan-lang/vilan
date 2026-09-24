@@ -942,8 +942,8 @@ impl ListCell<type T: PartialEq> { fun reconcile_to(self, items: List<T>) }
 
 `ListCell<T>` is an ordinary `Source<List<T>>` — `each` takes it, `map` takes
 it, an effect takes it — that also records what each write DID. Nothing that
-ignores the ops pays for them, and `each` does not ignore them: over a
-`ListCell` it builds only the rows a write names.
+ignores the ops pays for them, and the three `each` runs do not ignore them:
+over a `ListCell` they build only the rows a write names.
 
 Its mutators are trait defaults over ONE primitive, so there is one place a
 write is recorded and no method can forget:

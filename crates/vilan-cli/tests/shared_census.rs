@@ -38,7 +38,7 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ("browser/router.vl", 1, "R: the module-level `wired` latch"),
     (
         "browser/ui.vl",
-        26,
+        25,
         "O + R: per-boundary row/owner bookkeeping (+3 at Order 39: `when_some`'s \
          row, owner and payload cell — A119), plus A121's focus scopes at Order \
          40 — the scope STACK and its id source are R (module bindings, program \
@@ -46,7 +46,8 @@ const CENSUS: &[(&str, usize, &str)] = &[
          the nesting cannot be read off the DOM), and a `FocusScope`'s `focused` \
          latch is O (it dies with the boundary that installed the scope). −1 at \
          A112 S3: `each`'s row list IS its region's (`region.rows`), not a \
-         second cell kept in step with it",
+         second cell kept in step with it; −1 at A112 S3b: `each_by`'s, the \
+         same way",
     ),
     (
         "delta.vl",
@@ -223,7 +224,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 140,
+        total, 139,
         "the total number of `Shared` construction sites in std changed"
     );
 
