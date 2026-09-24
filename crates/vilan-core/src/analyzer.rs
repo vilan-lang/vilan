@@ -6537,6 +6537,10 @@ impl<'src> Analyzer<'src> {
             .collect();
         'candidates: for (subject_id, provided_arguments) in candidates {
             let subject_type = subject_id.get_type(self);
+            // B390: a refused subject provides nothing (`impl_subject_admits`).
+            if matches!(subject_type, Type::Unknown | Type::Unresolved) {
+                continue;
+            }
             if matches!(value_type, Type::Dyn(..)) && !matches!(subject_type, Type::Generic(_)) {
                 continue;
             }
@@ -7874,6 +7878,16 @@ impl<'src> Analyzer<'src> {
         impl_subject: &Type,
         substitution_context: &SubstitutionContext,
     ) -> bool {
+        // B390: an impl whose SUBJECT was refused (`impl Leaf<i32, str>` for a
+        // one-parameter `Leaf`) resolved to `Unknown`, and `Unknown` compares
+        // equal to everything — so the refused block entered every type's
+        // candidate set and every later call of its trait's members was
+        // reported ambiguous "between `Root` and `unknown`", at a call site
+        // the author did nothing wrong at. The refusal at the subject is the
+        // one report; the block provides nothing to anyone.
+        if matches!(impl_subject, Type::Unknown | Type::Unresolved) {
+            return false;
+        }
         if matches!(subject_type, Type::Dyn(..))
             && !matches!(impl_subject, Type::Generic(_) | Type::Dyn(..))
         {
@@ -36908,6 +36922,10 @@ impl<'src> Analyzer<'src> {
         let mut first_match: Option<Vec<TypeId>> = None;
         for (subject_id, arguments) in candidates {
             let subject = subject_id.get_type(self);
+            // B390: a refused subject provides nothing (`impl_subject_admits`).
+            if matches!(subject, Type::Unknown | Type::Unresolved) {
+                continue;
+            }
             if let Some((_, bindings)) = self.reconcile_declaration(concrete, &subject, &subject) {
                 let mut binders = Vec::new();
                 self.collect_subject_binders(subject_id, &mut binders);
