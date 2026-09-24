@@ -123,62 +123,65 @@ function reissued(subscriber) {
 	return [ subscriber[0], subscriber[1], subscriber[2], subscriber[3] ];
 }
 function dispose(self, $l) {
-	self[2].v = false;
-	const $m = [ 0, self[0] ];
+	const $m = $l;
 	let $n = null;
 	if ($m[0] === 0) {
-		const subscribers = $m[1];
+		const established = $m[1];
+		$n = [ 0, established ];
+	} else {
+		$n = $o(draining_turns.v);
+	}
+	const ambient = $n;
+	release_under(self, ambient);
+}
+function release_under(handle, ambient) {
+	handle[2].v = false;
+	const $p = [ 0, handle[0] ];
+	let $q = null;
+	if ($p[0] === 0) {
+		const subscribers = $p[1];
 		let kept = [  ];
 		for (const subscriber of subscribers.v) {
-			if (subscriber[0] !== self[1]) {
+			if (subscriber[0] !== handle[1]) {
 				kept.push(__clone(subscriber));
 			}
 		}
 		subscribers.v = kept;
-		$n = undefined;
+		$q = undefined;
 	} else {
-		$n = undefined;
+		$q = undefined;
 	}
-	$n;
-	const $o = $l;
-	let $p = null;
-	if ($o[0] === 0) {
-		const established = $o[1];
-		$p = [ 0, established ];
-	} else {
-		$p = $q(draining_turns.v);
-	}
-	const ambient = $p;
+	$q;
 	const $r = ambient;
 	let $s = null;
 	if ($r[0] === 0) {
 		const turn = $r[1];
 		let kept_pending = [  ];
 		for (const subscriber2 of turn[0].v) {
-			if (subscriber2[0] !== self[1]) {
+			if (subscriber2[0] !== handle[1]) {
 				kept_pending.push(__clone(subscriber2));
 			}
 		}
 		turn[0].v = kept_pending;
-		turn[2].v.delete(hash(self[1]));
+		turn[2].v.delete(hash(handle[1]));
 		let kept_derived = [  ];
 		for (const subscriber3 of turn[1].v) {
-			if (subscriber3[0] !== self[1]) {
+			if (subscriber3[0] !== handle[1]) {
 				kept_derived.push(__clone(subscriber3));
 			}
 		}
 		turn[1].v = kept_derived;
-		turn[3].v.delete(hash(self[1]));
+		turn[3].v.delete(hash(handle[1]));
 		$s = undefined;
 	} else {
 		$s = undefined;
 	}
 	$s;
-	const $t = self[3].v;
+	const $t = handle[3].v;
 	let $u = null;
 	if ($t[0] === 0) {
 		const release = $t[1];
-		self[3].v = [ 1 ];
+		handle[3].v = [ 1 ];
 		releasing_turns.v.push(ambient);
 		__with_finally(release, () => {
 			__list_pop(releasing_turns.v);
@@ -232,7 +235,7 @@ function $c(value) {
 function $h(self) {
 	return __clone(self[0].v);
 }
-function $q(self) {
+function $o(self) {
 	return __list_get(self, self.length - 1);
 }
 function $C(self) {
@@ -245,7 +248,7 @@ function $x(self, $y) {
 		const turn = $z[1];
 		$A = enqueue(turn, self[1].v);
 	} else {
-		const $D = $q(draining_turns.v);
+		const $D = $o(draining_turns.v);
 		let $E = null;
 		if ($D[0] === 0) {
 			const draining = $D[1];
@@ -360,7 +363,7 @@ function $ab(self, $y) {
 		const turn = $ac[1];
 		$ad = enqueue(turn, self[1].v);
 	} else {
-		const $ae = $q(draining_turns.v);
+		const $ae = $o(draining_turns.v);
 		let $af = null;
 		if ($ae[0] === 0) {
 			const draining = $ae[1];

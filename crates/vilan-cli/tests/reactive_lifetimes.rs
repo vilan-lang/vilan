@@ -1103,14 +1103,14 @@ fn a110_door2_an_effect_reads_a_derivation_chains_final_value_once() {
 /// of pushing the leaf's record: `fixpoint=5/11,5/11,`.
 const A124_S2A_COLD_DIAMOND: &str = r#"import std::io::print;
 import std::reactive::{
-	FlushPolicy, Owner, Signal, SignalCell, Source, run_with_owner, turn,
+	FlushPolicy, Owner, Signal, SignalCell, Source, combine_node, run_with_owner, turn,
 };
-import std::reactive_pipeline::{ watch };
 
 fun main() {
 	let root: SignalCell<i32> = Signal::new(1);
 	let twice = root.map_node(|value| value * 2).map_node(|value| value + 1);
-	let pair = root.combine_node(twice);
+	let arms: (dyn Source<i32>, dyn Source<i32>) = (root, twice);
+	let pair = combine_node(arms);
 	let seen: SignalCell<str> = Signal::new("");
 	let watcher = Owner::new();
 	run_with_owner(watcher, || {

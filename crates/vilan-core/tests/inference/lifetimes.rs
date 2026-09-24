@@ -583,12 +583,11 @@ fn switch_and_and_then_mint_two_subscribers_where_the_composed_form_mints_three(
 
 // --- A124 S1: the push-pull pipeline as EVIDENCE ----------------------------
 //
-// `std/src/reactive_pipeline.vl` is the paper's S1 probe
-// (`proposal/reactive-pipeline.md` §7): the cold-node model built over today's
-// `Source` with no compiler change, exported but re-exported nowhere and used
-// by no other std module. These four pins are its numbers — the claims the
-// paper's cost table rests on, run rather than argued. They go with the file if
-// the file goes.
+// The paper's S1 probe (`proposal/reactive-pipeline.md` §7) measured the
+// cold-node model over today's `Source` in a module of its own. Its nodes are
+// `std::reactive`'s since S2b and the probe file is gone; these four pins are
+// its numbers, now held against the real nodes (built through the `[internal]`
+// `_node` spellings until the flip, S2c).
 
 #[test]
 fn a124_s1_a_cold_chain_with_no_subscriber_evaluates_nothing() {
@@ -600,7 +599,6 @@ fn a124_s1_a_cold_chain_with_no_subscriber_evaluates_nothing() {
         r#"
         import std::io::print;
         import std::reactive::{ Signal, SignalCell, Source };
-        import std::reactive_pipeline::{ watch };
         import std::shared::Shared;
 
         fun main() {
@@ -637,7 +635,6 @@ fn a124_s1_a_cold_chain_evaluates_once_per_leaf_subscriber() {
         r#"
         import std::io::print;
         import std::reactive::{ Signal, SignalCell, Source };
-        import std::reactive_pipeline::{ watch };
         import std::shared::Shared;
 
         fun main() {
@@ -649,11 +646,11 @@ fn a124_s1_a_cold_chain_evaluates_once_per_leaf_subscriber() {
                 .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
                 .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
                 .map_node(|x| { evals.write() = evals.read() + 1; x + 1 });
-            let _one = watch(chain, |_value| {});
+            let _one = chain.on_change(|_value| {});
             evals.write() = 0;
             root.set(2);
             print(evals.read());
-            let _two = watch(chain, |_value| {});
+            let _two = chain.on_change(|_value| {});
             evals.write() = 0;
             root.set(3);
             print(evals.read());
@@ -674,7 +671,6 @@ fn a124_s1_a_cell_between_runs_the_segment_above_it_once() {
         r#"
         import std::io::print;
         import std::reactive::{ Signal, SignalCell, Source };
-        import std::reactive_pipeline::{ watch };
         import std::shared::Shared;
 
         fun main() {
@@ -689,8 +685,8 @@ fn a124_s1_a_cell_between_runs_the_segment_above_it_once() {
                 .map_node(|x| { lower.write() = lower.read() + 1; x + 1 })
                 .map_node(|x| { lower.write() = lower.read() + 1; x + 1 })
                 .map_node(|x| { lower.write() = lower.read() + 1; x + 1 });
-            let _a = watch(below, |_value| {});
-            let _b = watch(below, |_value| {});
+            let _a = below.on_change(|_value| {});
+            let _b = below.on_change(|_value| {});
             upper.write() = 0;
             lower.write() = 0;
             root.set(2);
@@ -716,17 +712,18 @@ fn a124_s1_a_diamond_pulls_a_settled_pair_and_fires_twice() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, SignalCell, Source };
-        import std::reactive_pipeline::{ watch };
+        import std::reactive::{ Signal, SignalCell, Source, combine_node };
         import std::shared::Shared;
 
         fun main() {
             let source: SignalCell<i32> = Signal::new(1);
             let seen: Shared<str> = Shared::new("");
-            let diamond = source
-                .map_node(|x| x * 10)
-                .combine_node(source.map_node(|x| x + 100));
-            let _leaf = watch(diamond, |pair| {
+            let arms: (dyn Source<i32>, dyn Source<i32>) = (
+                source.map_node(|x| x * 10),
+                source.map_node(|x| x + 100)
+            );
+            let diamond = combine_node(arms);
+            let _leaf = diamond.on_change(|pair| {
                 let (left, right) = pair;
                 seen.write() = i"{seen.read()}({left},{right})";
             });
@@ -745,32 +742,32 @@ fn a124_s1_a_diamond_pulls_a_settled_pair_and_fires_twice() {
 //
 // `Source::on_settle` is the protocol now (the S1 probe carried it as a twin
 // trait), and a leaf's ONE subscriber id is threaded down its whole chain: the
-// probe's nodes forward the record they are handed, `SignalCell::on_settle`
-// pushes it as given, and a turn's dedup — keyed on that id — collapses a
-// diamond's duplicate. The probe module uses only std's PUBLIC surface, so these
-// pins are also the claim that a node written outside `std::reactive` takes part.
+// nodes forward the record they are handed, `SignalCell::on_settle` pushes it as
+// given, and a turn's dedup — keyed on that id — collapses a diamond's
+// duplicate.
 
 #[test]
 fn a124_s2a_a_diamond_in_a_turn_fires_once_with_the_settled_pair() {
     // The COUNT claim S1 could not make. Red when `SignalCell::on_settle`
     // mints a fresh id per registration instead of pushing the leaf's record:
     // `(30,103)(30,103)`. The leaf is the node's own `on_change`, called
-    // DIRECTLY: through a generic bound (`watch`) a pair's override is not
-    // selected — its trait argument is a tuple — and the call takes the
-    // default bridge, whose own dedup would hide the root's.
+    // DIRECTLY: through a generic bound a `Combine`'s override is not selected
+    // — its trait argument is a tuple — and the call takes the default
+    // bridge, whose own dedup would hide the root's.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ FlushPolicy, Signal, SignalCell, Source, turn };
-        import std::reactive_pipeline::{ Combine };
+        import std::reactive::{ FlushPolicy, Signal, SignalCell, Source, combine_node, turn };
         import std::shared::Shared;
 
         fun main() {
             let source: SignalCell<i32> = Signal::new(1);
             let seen: Shared<str> = Shared::new("");
-            let diamond = source
-                .map_node(|x| x * 10)
-                .combine_node(source.map_node(|x| x + 100));
+            let arms: (dyn Source<i32>, dyn Source<i32>) = (
+                source.map_node(|x| x * 10),
+                source.map_node(|x| x + 100)
+            );
+            let diamond = combine_node(arms);
             let _leaf = diamond.on_change(|pair| {
                 let (left, right) = pair;
                 seen.write() = i"{seen.read()}({left},{right})";
@@ -800,7 +797,6 @@ fn a124_s2a_a_leaf_disposed_by_an_earlier_effect_in_its_wave_does_not_fire() {
         import std::reactive::{
             FlushPolicy, Signal, SignalCell, Source, Subscription, turn,
         };
-        import std::reactive_pipeline::{ watch };
         import std::shared::Shared;
 
         fun main() {
@@ -810,7 +806,7 @@ fn a124_s2a_a_leaf_disposed_by_an_earlier_effect_in_its_wave_does_not_fire() {
                 held.read()?.dispose();
                 print("first disposed the leaf");
             });
-            held.write() = Some(watch(source.map_node(|x| x * 10), |value| {
+            held.write() = Some(source.map_node(|x| x * 10).on_change(|value| {
                 print(i"leaf saw {value}");
             }));
             turn(FlushPolicy::AtEnd, || {
@@ -838,9 +834,8 @@ fn a124_s2a_the_default_bridge_dedups_a_diamond_over_a_root_that_only_has_on_cha
         r#"
         import std::io::print;
         import std::reactive::{
-            FlushPolicy, Signal, SignalCell, Source, Subscription, turn,
+            FlushPolicy, Signal, SignalCell, Source, Subscription, combine_node, turn,
         };
-        import std::reactive_pipeline::{ watch };
         import std::shared::Shared;
 
         struct Stored<T> {
@@ -861,10 +856,12 @@ fn a124_s2a_the_default_bridge_dedups_a_diamond_over_a_root_that_only_has_on_cha
             let cell: SignalCell<i32> = Signal::new(1);
             let root = Stored { inner = cell };
             let seen: Shared<str> = Shared::new("");
-            let diamond = root
-                .map_node(|x| x * 10)
-                .combine_node(root.map_node(|x| x + 100));
-            let _leaf = watch(diamond, |pair| {
+            let arms: (dyn Source<i32>, dyn Source<i32>) = (
+                root.map_node(|x| x * 10),
+                root.map_node(|x| x + 100)
+            );
+            let diamond = combine_node(arms);
+            let _leaf = diamond.on_change(|pair| {
                 let (left, right) = pair;
                 seen.write() = i"{seen.read()}({left},{right})";
             });
@@ -880,6 +877,305 @@ fn a124_s2a_the_default_bridge_dedups_a_diamond_over_a_root_that_only_has_on_cha
         main();
         "#,
         "(30,103)\n(40,104)(40,104)\n",
+    );
+}
+
+// --- A124 S2b: the nodes, `.cell()`, `.distinct()` and `Resource<T>` ---------
+//
+// The node types are `std::reactive`'s; `map`/`switch`/`combine` still return
+// cells until the flip (S2c), so the nodes are built through the `[internal]`
+// `map_node`/`switch_node`/`combine_node` spellings, and `.cell()` and
+// `.distinct()` are public.
+
+#[test]
+fn a124_s2b_a_cell_does_not_compare_and_a_distinct_does() {
+    // Q3. Three settles of the root, the second and third to values the
+    // derivation maps to the SAME answer: below `.cell()` the leaf fires every
+    // time (a `set` never compares); below `.distinct()` only for the change.
+    // Red when `Distinct`'s relay wakes without comparing: `distinct=0,1,1,`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+        import std::shared::Shared;
+
+        fun main() {
+            let root: SignalCell<i32> = Signal::new(1);
+            let cell_log: Shared<str> = Shared::new("");
+            let distinct_log: Shared<str> = Shared::new("");
+            let cached = root.map_node(|x| x / 10).cell();
+            let _c = cached.on_change(|value| {
+                cell_log.write() = i"{cell_log.read()}{value},";
+            });
+            let _d = root.map_node(|x| x / 10).distinct().on_change(|value| {
+                distinct_log.write() = i"{distinct_log.read()}{value},";
+            });
+            root.set(2);
+            root.set(15);
+            root.set(19);
+            print(i"cell={cell_log.read()}");
+            print(i"distinct={distinct_log.read()}");
+        }
+
+        main();
+        "#,
+        "cell=0,1,1,\ndistinct=1,\n",
+    );
+}
+
+#[test]
+fn a124_s2b_a_cell_is_a_derivation_an_effect_reads_settled() {
+    // `.cell()` is marked `as_derivation()` (A110 door 2): an effect standing
+    // on the root, lower in id than the cell, reads the cell SETTLED in the
+    // same wave. Red with the mark removed: `seen 5/3`, the cell's value from
+    // before the write.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ FlushPolicy, Signal, SignalCell, Source, turn };
+        import std::shared::Shared;
+
+        fun main() {
+            let root: SignalCell<i32> = Signal::new(1);
+            let seen: Shared<str> = Shared::new("");
+            let holder: Shared<Option<SignalCell<i32>>> = Shared::new(None);
+            let _effect = root.on_change(|value| {
+                match holder.read() {
+                    Some(let cached) => {
+                        seen.write() = i"{seen.read()}{value}/{cached.get()}";
+                    },
+                    None => {},
+                }
+            });
+            holder.write() = Some(root.map_node(|x| x * 2 + 1).cell());
+            turn(FlushPolicy::AtEnd, || {
+                root.set(5);
+            });
+            print(i"seen {seen.read()}");
+        }
+
+        main();
+        "#,
+        "seen 5/11\n",
+    );
+}
+
+#[test]
+fn a124_s2b_a_cell_made_under_an_owner_releases_its_upstream_with_it() {
+    // Owner-tied like every derivation (A28): the cell's registration on the
+    // root is the ambient owner's, so disposing the owner leaves the root with
+    // no subscriber and the cell frozen at its last value. Red when `.cell()`
+    // does not register with the owner: `after=1 cell=30`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
+
+        fun main() {
+            let root: SignalCell<i32> = Signal::new(1);
+            let owner = Owner::new();
+            let cached = run_with_owner(owner, || root.map_node(|x| x * 10).cell());
+            root.set(2);
+            print(i"before={root.subscribers.read().len()} cell={cached.get()}");
+            owner.dispose();
+            root.set(3);
+            print(i"after={root.subscribers.read().len()} cell={cached.get()}");
+        }
+
+        main();
+        "#,
+        "before=1 cell=20\nafter=0 cell=20\n",
+    );
+}
+
+#[test]
+fn a124_s2b_the_owners_disposal_releases_a_switchs_rolling_inner_registration() {
+    // A28's story for the cold `Switch`: an effect on the node, made under an
+    // owner, follows the current inner and re-follows at every switch without
+    // retiring itself (the rolling registration is the node's own relay, not
+    // the effect's record). Disposing the owner leaves NO subscriber on the
+    // outer or on either inner. Red when the handle forgets the live inner:
+    // `after 0/1/0`.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
+        import std::shared::Shared;
+
+        fun main() {
+            let which: SignalCell<i32> = Signal::new(0);
+            let first: SignalCell<i32> = Signal::new(10);
+            let second: SignalCell<i32> = Signal::new(20);
+            let log: Shared<str> = Shared::new("");
+            let owner = Owner::new();
+            run_with_owner(owner, || {
+                which
+                    .switch_node(|n| if n == 0 { first } else { second })
+                    .effect_on_change(|value| {
+                        log.write() = i"{log.read()}{value},";
+                    });
+            });
+            first.set(11);
+            which.set(1);
+            first.set(99);
+            second.set(21);
+            which.set(0);
+            first.set(100);
+            print(log.read());
+            let counts = || i"{which.subscribers.read().len()}/{first.subscribers.read().len()}/{second.subscribers.read().len()}";
+            print(i"before {counts()}");
+            owner.dispose();
+            first.set(1);
+            second.set(2);
+            which.set(1);
+            print(i"after {counts()}");
+            print(log.read());
+        }
+
+        main();
+        "#,
+        "11,20,21,99,100,\nbefore 1/1/0\nafter 0/0/0\n11,20,21,99,100,\n",
+    );
+}
+
+#[test]
+fn a124_s2b_a_default_inherited_by_a_node_types_its_observer_from_the_node() {
+    // `sub`, `effect` and `map` are `Source` DEFAULTS, reached on a node through
+    // its impl. Each node's value type is a DIRECT binder of its impl subject
+    // (`Switch<.., type I: Source<U>, type U>`, `Distinct<.., type T>`), so the
+    // observer's parameter is the node's `i32` and `value + 1` checks. Red with
+    // `Switch` binding `U` out of `I`'s bound (`type I: Source<type U>`): `+` on
+    // an unbounded `T`. And each node's upstream is bound on `Upstream`, not on
+    // `Source`: bound on `Source`, the default on a type-changing `map_node` is
+    // refused as "`SignalCell<i32>` does not implement `Source<str>`".
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        fun main() {
+            let which: SignalCell<i32> = Signal::new(0);
+            let first: SignalCell<i32> = Signal::new(10);
+            let _switched = which.switch_node(|n| first).sub(|value| print(value + 1));
+            let _distinct = which.distinct().sub(|value| print(value + 2));
+            let labelled = which.map_node(|n| i"n{n}").map(|label| label.len());
+            print(labelled.get());
+        }
+
+        main();
+        "#,
+        "11\n2\n2\n",
+    );
+}
+
+#[test]
+fn a124_s2b_combine_over_the_tuple_bound_joins_three_kinds_of_source() {
+    // The n-ary `Combine` over `(U in T: dyn Source<U>)`: a root cell, a cold
+    // node and a `.cell()`, three element types, one node — read by pull and
+    // notified once per settle in a turn however many of its inputs stand on
+    // the written root.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ FlushPolicy, Signal, SignalCell, Source, combine_node, turn };
+
+        fun main() {
+            let count: SignalCell<i32> = Signal::new(1);
+            let arms: (dyn Source<i32>, dyn Source<str>, dyn Source<bool>) = (
+                count,
+                count.map_node(|n| i"n{n}"),
+                count.map_node(|n| n > 2).cell()
+            );
+            let all = combine_node(arms);
+            let _leaf = all.on_change(|triple| {
+                let (n, label, big) = triple;
+                print(i"{n} {label} {big}");
+            });
+            turn(FlushPolicy::AtEnd, || {
+                count.set(3);
+            });
+            let (n, label, big) = all.get();
+            print(i"get {n} {label} {big}");
+        }
+
+        main();
+        "#,
+        "3 n3 true\nget 3 n3 true\n",
+    );
+}
+
+#[test]
+fn a124_s2b_pending_or_zero_reads_zero_before_completion_and_the_value_after() {
+    // The item's pin, with a REAL load: a resource over `id` loads on a timer,
+    // `.or(0)` reads 0 while it is out, and the `map` below the fallback is
+    // written on `i32` — no `Option` anywhere downstream. A change of `id`
+    // re-pends it and `.or` RESETS to the default until the new load lands
+    // (Q2). Red when `.or` holds the last settled value instead: the re-pend
+    // is invisible, `shown 11` repeats and `shown 1` never comes.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Resource, Signal, SignalCell, Source };
+        import std::result::Result::{ self, Ok };
+        import std::time::sleep;
+
+        fun main() {
+            let id: SignalCell<i32> = Signal::new(1);
+            let user: Resource<i32> = id.resource_node(|n| {
+                sleep(5);
+                Ok(n * 10)
+            });
+            let shown = user.or(0).map(|n| n + 1);
+            print(i"before {shown.get()}");
+            let _log = shown.on_change(|value| {
+                print(i"shown {value}");
+                if value == 11 {
+                    id.set(2);
+                }
+            });
+        }
+
+        main();
+        "#,
+        "before 1\nshown 11\nshown 1\nshown 21\n",
+    );
+}
+
+#[test]
+fn a124_s2b_a_resource_state_machine_and_its_four_fallbacks() {
+    // R5's machine by hand — pending, settled, pending again, failed — read
+    // through all four fallbacks. `.or` resets on every re-pend and on the
+    // failure; `.latest` holds the last settled value across both and shows
+    // its default only before the first settle; `.optional` is `None` except
+    // while settled; `.is_pending` is true only while pending. Red when
+    // `.latest` resets like `.or`: `latest=-1` on the third and fourth lines.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Resource, Source };
+
+        fun line(r: Resource<i32>): str {
+            let optional = match r.optional().get() {
+                Some(let value) => i"{value}",
+                None => "none",
+            };
+            i"or={r.or(0).get()} latest={r.latest(-1).get()} optional={optional} pending={r.is_pending().get()}"
+        }
+
+        fun main() {
+            let r: Resource<i32> = Resource::pending();
+            print(line(r));
+            r.settle(41);
+            print(line(r));
+            r.pend();
+            print(line(r));
+            r.fail("offline");
+            print(line(r));
+        }
+
+        main();
+        "#,
+        "or=0 latest=-1 optional=none pending=true\nor=41 latest=41 optional=41 pending=false\nor=0 latest=41 optional=none pending=true\nor=0 latest=41 optional=none pending=false\n",
     );
 }
 

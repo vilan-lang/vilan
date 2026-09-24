@@ -23,6 +23,9 @@ import std::reactive::{
 |---|---|---|
 | `Source<T>` | trait | anything readable + subscribable (requires `get`/`on_change`; `on_settle`/`sub`/`effect`/`effect_on_change`/`scoped_effect`/`scoped_effect_on_change`/`map` are defaults) |
 | `Subscriber` | struct | one observer's record — its id (a turn's dedup key), `notify`, liveness and class; what `on_settle` carries |
+| `.cell()`, `.distinct()` | blanket methods | on any `Source`: materialise into a cached cell (no comparison); pass a change on only when the value differs (`T: PartialEq`) |
+| `Map`, `Switch`, `Combine`, `Distinct` | structs | the cold pipeline nodes (A124): hold their upstream, compute when read; built by `map`/`switch`/`combine` from v0.41.0 |
+| `Resource<T>`, `ResourceState<T>` | struct/enum | a value that may still be loading — pending, settled, failed — and its fallbacks; std-internal until v0.41.0 |
 | `Signal<T>` | trait | the writable half (`set`/`notify`/`set_with`); `Source` is its supertrait |
 | `SignalCell<T>` | struct | the canonical cell — mutable value plus subscribers |
 | `MaybeSignal<T>` | trait | a component value that may be static OR reactive |
@@ -417,6 +420,53 @@ mirror over a transport, `Stored` above — where `on_change` is where the value
 lives anyway, and every source gets it without writing a line. It is wrong for a
 node, which would compute a value only to throw it away, once per hop; a node
 overrides it. `SignalCell` overrides it with the direct attach.
+
+### cell and distinct — the stateful node and the comparing one
+
+A derivation can be a *description* rather than state: a node that holds its
+upstream and computes its value when read. Two of those nodes are public on every
+`Source`:
+
+```vilan,fragment
+impl type S: Source<type T> {
+	fun cell(self): SignalCell<T>          // materialise: one cached value
+}
+impl type S: Source<type T: PartialEq> {
+	fun distinct(self): Distinct<S, T>     // pass a change on only when it differs
+}
+```
+
+**`.cell()`** caches what is above it in a `SignalCell` and keeps it current. It
+is the one stateful node, and where it belongs is a question of readers: two
+consumers of a chain of nodes each evaluate the chain, and below a `.cell()` the
+chain above it runs once; a `get()` in a hot loop pulls a whole chain every time,
+and a `.cell()` makes it one read. It is a derivation like `map` — made inside an
+owner it dies with the owner, and a turn settles it before any effect reads it —
+and it is a source again, so a chain continues through it.
+
+`.cell()` **does not compare**: every change above it is a `set`, and a `set`
+always notifies. **`.distinct()`** is the node that compares — it asks
+`T: PartialEq` and nothing else does — and passes a change on only when the
+value differs from the last one it passed on:
+
+```vilan
+import std::reactive::{ Signal, SignalCell, Source };
+
+fun main() {
+	let width = Signal::new(320);
+	let wide = width.distinct();
+	let watch = wide.on_change(|value| print(i"now {value}"));
+	width.set(320);            // nothing: the same value
+	width.set(1024);           // now 1024
+	watch.dispose();
+}
+```
+
+Until v0.41.0, `map`, `switch` and `combine` still return a `SignalCell`, so
+`.cell()` on one of their results copies a cell that already caches. The flip
+makes them return the cold nodes (`Map`, `Switch`, `Combine`), and `.cell()` is
+then what you write where you want the cache — the
+[guide](../guide/reactive.md#derived-state-map-combine-flatten) has the rule.
 
 ### scoped_effect — an owner per run
 

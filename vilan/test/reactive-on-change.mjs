@@ -131,62 +131,65 @@ function reissued(subscriber) {
 	return [ subscriber[0], subscriber[1], subscriber[2], subscriber[3] ];
 }
 function dispose(self, $u) {
-	self[2].v = false;
-	const $v = [ 0, self[0] ];
+	const $v = $u;
 	let $w = null;
 	if ($v[0] === 0) {
-		const subscribers = $v[1];
+		const established = $v[1];
+		$w = [ 0, established ];
+	} else {
+		$w = $r(draining_turns.v);
+	}
+	const ambient = $w;
+	release_under(self, ambient);
+}
+function release_under(handle, ambient) {
+	handle[2].v = false;
+	const $x = [ 0, handle[0] ];
+	let $y = null;
+	if ($x[0] === 0) {
+		const subscribers = $x[1];
 		let kept = [  ];
 		for (const subscriber of subscribers.v) {
-			if (subscriber[0] !== self[1]) {
+			if (subscriber[0] !== handle[1]) {
 				kept.push(__clone(subscriber));
 			}
 		}
 		subscribers.v = kept;
-		$w = undefined;
+		$y = undefined;
 	} else {
-		$w = undefined;
+		$y = undefined;
 	}
-	$w;
-	const $x = $u;
-	let $y = null;
-	if ($x[0] === 0) {
-		const established = $x[1];
-		$y = [ 0, established ];
-	} else {
-		$y = $r(draining_turns.v);
-	}
-	const ambient = $y;
+	$y;
 	const $z = ambient;
 	let $A = null;
 	if ($z[0] === 0) {
 		const turn = $z[1];
 		let kept_pending = [  ];
 		for (const subscriber2 of turn[0].v) {
-			if (subscriber2[0] !== self[1]) {
+			if (subscriber2[0] !== handle[1]) {
 				kept_pending.push(__clone(subscriber2));
 			}
 		}
 		turn[0].v = kept_pending;
-		turn[2].v.delete(hash(self[1]));
+		turn[2].v.delete(hash(handle[1]));
 		let kept_derived = [  ];
 		for (const subscriber3 of turn[1].v) {
-			if (subscriber3[0] !== self[1]) {
+			if (subscriber3[0] !== handle[1]) {
 				kept_derived.push(__clone(subscriber3));
 			}
 		}
 		turn[1].v = kept_derived;
-		turn[3].v.delete(hash(self[1]));
+		turn[3].v.delete(hash(handle[1]));
 		$A = undefined;
 	} else {
 		$A = undefined;
 	}
 	$A;
-	const $B = self[3].v;
+	const $B = handle[3].v;
 	let $C = null;
 	if ($B[0] === 0) {
 		const release = $B[1];
-		self[3].v = [ 1 ];
+		handle[3].v = [ 1 ];
 		releasing_turns.v.push(ambient);
 		__with_finally(release, () => {
 			__list_pop(releasing_turns.v);
