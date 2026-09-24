@@ -3237,7 +3237,7 @@ fn service_http_refusals(
         while let Node::Export(_, inner) = node {
             node = &inner.0;
         }
-        let Node::Impl(subject, impl_traits, body) = node else {
+        let Node::Impl(subject, impl_traits, body, _) = node else {
             continue;
         };
         if !impl_traits.is_empty() {
@@ -3315,7 +3315,7 @@ fn gather_rpc_methods(
         while let Node::Export(_, inner) = node {
             node = &inner.0;
         }
-        let Node::Impl(impl_subject, impl_traits, body) = node else {
+        let Node::Impl(impl_subject, impl_traits, body, _) = node else {
             continue;
         };
         if !impl_traits.is_empty() {

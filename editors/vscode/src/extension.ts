@@ -14,6 +14,8 @@ import {
     ExtensionContext,
     Range,
     Selection,
+    StatusBarAlignment,
+    StatusBarItem,
     TextDocument,
     TextDocumentChangeEvent,
     TextEdit,
@@ -404,6 +406,77 @@ async function closeGenericList(editor: TextEditor): Promise<void> {
     placedClosers.set(key, closers);
 }
 
+// --- F27 R1/R6: the platform a file is analyzed under -------------------------
+//
+// The platform decides which `std` twin a file's types come from, so a file
+// analyzed under the wrong one is full of errors about members that "do not
+// exist". The overlay note on such an error says why the file is where it is;
+// this says it BEFORE any error: `analyzed as: browser — declared` in the
+// status bar, the full reason in its tooltip, for the vilan file in front of
+// the author. The server answers from its last analysis
+// (`vilan/analysisPlatform`), so the line follows the file as it is edited —
+// type `[platform("browser")];` at the top and it turns to `declared`.
+
+/// The server's status request, spelled exactly as `vilan-lsp`'s
+/// `ANALYSIS_PLATFORM` declares it; `book_sync` gates the two spellings.
+const ANALYSIS_PLATFORM = 'vilan/analysisPlatform';
+
+/// How long after an edit the line asks again — past the server's own
+/// analysis debounce, so it asks about the analysis the edit produced.
+const PLATFORM_REFRESH_MS = 600;
+
+let platformStatus: StatusBarItem | undefined;
+let platformRefresh: ReturnType<typeof setTimeout> | undefined;
+
+interface AnalysisPlatform {
+    platform: string;
+    kind: string | null;
+    reason: string | null;
+}
+
+/// Ask the server about the active editor's file and show the answer, or hide
+/// the line for anything that is not a vilan file.
+async function refreshPlatformStatus(): Promise<void> {
+    const editor = window.activeTextEditor;
+    if (!platformStatus) {
+        return;
+    }
+    if (!client || !editor || editor.document.languageId !== 'vilan') {
+        platformStatus.hide();
+        return;
+    }
+    let answer: AnalysisPlatform | null = null;
+    try {
+        answer = await client.sendRequest<AnalysisPlatform | null>(ANALYSIS_PLATFORM, {
+            uri: editor.document.uri.toString(),
+        });
+    } catch {
+        answer = null;
+    }
+    if (!answer || window.activeTextEditor !== editor) {
+        platformStatus.hide();
+        return;
+    }
+    platformStatus.text = answer.kind
+        ? `analyzed as: ${answer.platform} — ${answer.kind}`
+        : `analyzed as: ${answer.platform}`;
+    platformStatus.tooltip = answer.reason
+        ? `This file is analyzed under ${answer.platform}: ${answer.reason}`
+        : `This file is analyzed under ${answer.platform}`;
+    platformStatus.show();
+}
+
+/// Ask again once the edits have settled into an analysis.
+function schedulePlatformRefresh(): void {
+    if (platformRefresh !== undefined) {
+        clearTimeout(platformRefresh);
+    }
+    platformRefresh = setTimeout(() => {
+        platformRefresh = undefined;
+        void refreshPlatformStatus();
+    }, PLATFORM_REFRESH_MS);
+}
+
 /// Keep every placed `>` at its character through edits; one an edit replaces
 /// is gone.
 function trackClosers(changed: TextDocumentChangeEvent): void {
@@ -642,7 +715,21 @@ export function activate(context: ExtensionContext): void {
         ),
     );
 
-    void startClient(context);
+    // F27 R1/R6: the platform status line.
+    platformStatus = window.createStatusBarItem(StatusBarAlignment.Right, 100);
+    platformStatus.name = 'Vilan analysis platform';
+    context.subscriptions.push(
+        platformStatus,
+        { dispose: () => platformRefresh !== undefined && clearTimeout(platformRefresh) },
+        window.onDidChangeActiveTextEditor(() => void refreshPlatformStatus()),
+        workspace.onDidChangeTextDocument((event) => {
+            if (event.document === window.activeTextEditor?.document) {
+                schedulePlatformRefresh();
+            }
+        }),
+    );
+
+    void startClient(context).then(() => schedulePlatformRefresh());
 
     context.subscriptions.push(
         commands.registerCommand('vilan.restartServer', async () => {

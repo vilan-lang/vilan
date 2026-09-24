@@ -2212,3 +2212,110 @@ fn file_mode_does_not_ask_a_module_for_a_main() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── F27 R1: the file says which platform it is analyzed under ─────────────
+//
+// R6 answered the owner's question on the spot; R1 is the line that makes the
+// answer unnecessary. The owner's own case is a module nothing reaches in a
+// package whose `default-entry` is the server: it takes the server's colour,
+// and `default-entry` OUTRANKS inference, so R2's member evidence could not
+// reach it. A declaration outranks both.
+
+/// The owner's shape, declared.
+const DECLARED_REGION_MODULE: &str = "[platform(\"browser\")];\n\nimport std::ui::Region;\n\nexport fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+
+/// The same body under a function FENCE — which, before R1, changed nothing
+/// about how its body resolved.
+const FENCED_REGION_MODULE: &str = "import std::ui::Region;\n\nexport [platform(\"browser\")]\nfun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+
+fn f27_package(tag: &str, slot: &str, server: &str) -> PathBuf {
+    let dir = temp_project(tag);
+    let client = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+    write_fullstack_package(
+        &dir,
+        "server",
+        &[
+            ("src/slot.vl", slot),
+            ("src/client.vl", client),
+            ("src/server.vl", server),
+        ],
+    );
+    dir
+}
+
+const PLAIN_SERVER: &str = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+
+#[test]
+fn f27_a_declared_module_is_analyzed_under_its_platform_over_the_default_entry() {
+    let dir = f27_package("f27_declared_module", DECLARED_REGION_MODULE, PLAIN_SERVER);
+    let output = vilan_plain(&["check", dir.join("src/slot.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        output.status.success() && !text.contains("has no field"),
+        "the declaration outranks `default-entry = \"server\"`:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn f27_a_function_fence_resolves_its_body_under_its_platform() {
+    let dir = f27_package("f27_fenced_module", FENCED_REGION_MODULE, PLAIN_SERVER);
+    let output = vilan_plain(&["check", dir.join("src/slot.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        output.status.success() && !text.contains("has no field"),
+        "the fence gains the declaration's resolution meaning:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn f27_reaching_a_declared_module_from_a_server_entry_reports_the_chain() {
+    // A module that types under both twins, so the only thing wrong with the
+    // server reaching it is the reach.
+    let declared = "[platform(\"browser\")];\n\nexport fun when_value(): str {\n\t\"x\"\n}\n";
+    let server = "import std::io::print;\nimport pkg::slot::when_value;\n\nfun render(): str {\n\twhen_value()\n}\n\nfun main() {\n\tprint(render());\n}\nmain();\n";
+    let dir = f27_package("f27_chain", declared, server);
+    let output = vilan_plain(&["check", dir.join("src/server.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("`when_value` requires the `browser` platform its file declares")
+            && text.contains("main → render → when_value"),
+        "the colouring chain, from the server's `main`:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn f27_a_bare_files_declaration_is_its_platform_on_the_terminal_too() {
+    // No package at all: the CLI's `node` default used to answer, while the
+    // editor inferred. A declaration is the one answer both give.
+    let dir = temp_project("f27_bare_file");
+    write(
+        &dir,
+        "slot.vl",
+        "[platform(\"browser\")];\n\nimport std::ui::Region;\n\nfun anchor_of(region: Region) {\n\tregion.anchor;\n}\n\nfun main() {}\n",
+    );
+    let output = vilan_plain(&["check", dir.join("slot.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        output.status.success() && !text.contains("has no field"),
+        "{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn f27_the_twin_note_names_the_attribute_that_moves_the_file() {
+    let dir = f27_package("f27_note_attribute", REGION_FIELD_MODULE, PLAIN_SERVER);
+    let output = vilan_plain(&["check", dir.join("src/slot.vl").to_str().unwrap()]);
+    let text = combined(&output);
+    assert!(
+        text.contains(
+            "`[platform(\"browser\")];` at the top of the file analyzes it under that platform"
+        ),
+        "R6's note now names the line R1 added:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -4405,7 +4405,7 @@ impl<'src> Printer<'src> {
                 | Node::Func(_)
                 | Node::Struct(..)
                 | Node::Enum(..)
-                | Node::Impl(_, _, _)
+                | Node::Impl(..)
                 | Node::Trait(..)
                 | Node::Module(_, _)
                 | Node::Derive(_, _)
@@ -4573,8 +4573,9 @@ impl<'src> Printer<'src> {
             // the shape `fun`'s parameter list takes. Before this the header
             // had no split form at all, so a hand-wrapped one reprinted to a
             // different token stream and the file declined.
-            Node::Impl(subject, traits, body) => {
+            Node::Impl(subject, traits, body, labels) => {
                 let split = std::mem::take(&mut self.split);
+                self.print_item_labels(labels);
                 self.out.push_str("impl ");
                 if traits.is_empty() {
                     self.print_type_splitting_the_tail(&subject.0, split);
@@ -4661,6 +4662,8 @@ impl<'src> Printer<'src> {
             // `needs_semicolon` leaves it out of its exclusion list and the
             // statement printer supplies the `;`.
             Node::ExportAll => self.out.push_str("export *"),
+            // F27 R1: the file's platform; its `;` is the statement loop's.
+            Node::ModulePlatform(patterns) => self.print_platform_attribute(patterns),
             // `mod name { items }`.
             Node::Module(name, body) => {
                 self.out.push_str("mod ");
@@ -5265,6 +5268,21 @@ impl<'src> Printer<'src> {
             self.out.push_str("\")]");
             self.line();
         }
+        if !labels.platform.is_empty() {
+            self.print_platform_attribute(&labels.platform);
+            self.line();
+        }
+    }
+
+    /// `[platform("a", "b")]`, the patterns as written — a function's fence, an
+    /// item's label and a file's platform (F27 R1) all print through here.
+    fn print_platform_attribute(&mut self, patterns: &[Spanned<&'src str>]) {
+        let patterns = patterns
+            .iter()
+            .map(|(pattern, _)| format!("\"{pattern}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.out.push_str(&format!("[platform({patterns})]"));
     }
 
     fn print_func(&mut self, func: &Func<'src>) {
@@ -5297,13 +5315,7 @@ impl<'src> Printer<'src> {
             self.line();
         }
         if !func.platform_fence.is_empty() {
-            let patterns = func
-                .platform_fence
-                .iter()
-                .map(|(pattern, _)| format!("\"{pattern}\""))
-                .collect::<Vec<_>>()
-                .join(", ");
-            self.out.push_str(&format!("[platform({patterns})]"));
+            self.print_platform_attribute(&func.platform_fence);
             self.line();
         }
         if func.is_async {
@@ -8708,6 +8720,21 @@ mod idempotency {
             "and a function's leads the ordered prefix:\n{formatted}"
         );
         assert_fixed_point("internal", source);
+    }
+
+    #[test]
+    fn a_platform_declaration_survives_the_reprint_at_every_f27_position() {
+        // F27 R1: the file's own line, an impl's label and a nominal's.
+        let source = concat!(
+            "[platform(\"browser\")];\n\n",
+            "import std::ui::Region;\n\n",
+            "[platform(\"browser\")]\n",
+            "struct Slot {}\n\n",
+            "[platform(\"browser\", \"@process\")]\n",
+            "impl Slot {\n\tfun f(self) {}\n}\n",
+        );
+        assert_eq!(format(source), source);
+        assert_fixed_point("platform_f27", source);
     }
 
     #[test]

@@ -33,6 +33,78 @@ fn a_platform_fence_rejects_an_off_platform_reach() {
     );
 }
 
+// --- F27 R1: a file's and an impl's own `[platform(..)]` -------------------
+
+/// A file's `[platform("browser")];` makes everything in it require browser:
+/// reached from a node entry, the reach is the chain error, anchored at the
+/// user's call — here the entry itself is in the file, so `main` is refused.
+#[test]
+fn a_file_declared_browser_refuses_a_node_build_that_reaches_it() {
+    assert_fails_with(
+        concat!(
+            "[platform(\"browser\")];\n\n",
+            "fun greet(): str {\n\t\"hi\"\n}\n\n",
+            "fun main() {\n\tlet _ = greet();\n}\n",
+        ),
+        "requires the `browser` platform its file declares and cannot run on `node",
+    );
+    // …and a browser build of the same file is clean.
+    assert!(
+        compile_browser(concat!(
+            "[platform(\"browser\")];\n\n",
+            "fun greet(): str {\n\t\"hi\"\n}\n\n",
+            "fun main() {\n\tlet _ = greet();\n}\n",
+        ))
+        .is_ok()
+    );
+}
+
+/// It is also the fence on each of the file's functions — a promise checked on
+/// every compile, entry or not — and every function under ONE declaration makes
+/// ONE promise: the off-platform call reached from two of them reports once.
+#[test]
+fn a_file_declaration_fences_its_functions_as_one_promise() {
+    assert_fails_once_with(
+        concat!(
+            "[platform(\"browser\")];\n\n",
+            "import std::fs::stat;\n\n",
+            "fun probe(): bool {\n\tstat(\"cache\").is_some()\n}\n\n",
+            "fun probe_twice(): bool {\n\tprobe()\n}\n",
+        ),
+        "which its declaration `[platform(\"browser\")]` fences",
+    );
+}
+
+/// On an `impl`, the members require it — and nothing else in the file does.
+#[test]
+fn an_impl_declared_browser_requires_it_of_its_members_alone() {
+    let source = concat!(
+        "struct Slot {}\n\n",
+        "[platform(\"browser\")]\n",
+        "impl Slot {\n\tfun place(self): i32 {\n\t\t1\n\t}\n}\n\n",
+        "fun plain(): i32 {\n\t2\n}\n\n",
+        "fun main() {\n\tlet _ = plain();\n\tlet _ = Slot {}.place();\n}\n",
+    );
+    assert_fails_with(
+        source,
+        "`place` requires the `browser` platform its `impl` declares",
+    );
+    assert_fails_without(source, "`plain` requires");
+}
+
+/// A pattern no platform answers to is reported ONCE, where it is written —
+/// not once per function the declaration covers.
+#[test]
+fn an_unknown_pattern_in_a_file_declaration_is_reported_once() {
+    assert_fails_once_with(
+        concat!(
+            "[platform(\"browsr\")];\n\n",
+            "fun a() {}\n\nfun b() {}\n\nfun main() {}\n",
+        ),
+        "unknown platform pattern `browsr`",
+    );
+}
+
 #[test]
 fn a_satisfied_fence_compiles_on_every_build_target() {
     let source = r#"

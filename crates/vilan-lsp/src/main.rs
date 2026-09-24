@@ -2309,6 +2309,23 @@ impl Backend {
         })
     }
 
+    /// F27 R1/R6: [`ANALYSIS_PLATFORM`] — the status line's one question.
+    async fn analysis_platform(
+        &self,
+        params: TextDocumentIdentifier,
+    ) -> Result<Option<serde_json::Value>> {
+        self.fenced("analysisPlatform", Ok(None), || {
+            let Some(document) = self.documents.get(&params.uri) else {
+                return Ok(None);
+            };
+            Ok(document
+                .analysis_platform()
+                .map(|(platform, kind, reason)| {
+                    serde_json::json!({ "platform": platform, "kind": kind, "reason": reason })
+                }))
+        })
+    }
+
     /// The session summary as this server would write it now: the request
     /// profile, the retained-state cardinalities, the analysis counts and
     /// E166's memory reading.
@@ -2825,6 +2842,16 @@ pub const LOG_SESSION_SUMMARY: &str = "vilan.logSessionSummary";
 /// The extension spells this name in `editors/vscode/src/extension.ts`; the
 /// two spellings are gated against each other in `book_sync`.
 pub const OPENS_A_GENERIC_LIST: &str = "vilan/opensAGenericList";
+
+/// F27 R1/R6: "which platform is this file analyzed under, and why?" — what
+/// the editor's status line shows (`analyzed as: browser — declared`) so the
+/// answer is visible before any error is. Params are a
+/// `TextDocumentIdentifier`; the answer is `{ platform, kind, reason }` from
+/// the document's last analysis, or `null` before there is one.
+///
+/// The extension spells this name in `editors/vscode/src/extension.ts`; the
+/// two spellings are gated against each other in `book_sync`.
+pub const ANALYSIS_PLATFORM: &str = "vilan/analysisPlatform";
 
 fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
@@ -6323,6 +6350,7 @@ async fn main() {
         formatting_declines: Arc::new(DashMap::new()),
     })
     .custom_method(OPENS_A_GENERIC_LIST, Backend::opens_a_generic_list)
+    .custom_method(ANALYSIS_PLATFORM, Backend::analysis_platform)
     .finish();
     Server::new(stdin, stdout, socket).serve(service).await;
 }
@@ -6457,6 +6485,30 @@ mod generic_pairing_tests {
                 .expect("answers");
             assert_eq!(answer, expected, "{text:?}");
         }
+    }
+
+    /// F27 R1/R6: the status line's request answers from the document's last
+    /// analysis, and `null` for a document the server does not have.
+    #[tokio::test]
+    async fn the_status_lines_request_names_the_platform_and_why() {
+        let (service, _socket) = backend();
+        let backend = service.inner();
+        let uri = open(backend, "[platform(\"browser\")];\n\nfun main() {}\n");
+        let answer = backend
+            .analysis_platform(TextDocumentIdentifier { uri })
+            .await
+            .expect("answers")
+            .expect("an analysed document");
+        assert_eq!(answer["platform"], "browser");
+        assert_eq!(answer["kind"], "declared");
+        assert_eq!(answer["reason"], "it declares `[platform(\"browser\")]`");
+        let nothing = backend
+            .analysis_platform(TextDocumentIdentifier {
+                uri: Url::parse("file:///nowhere.vl").expect("a url"),
+            })
+            .await
+            .expect("answers");
+        assert_eq!(nothing, None);
     }
 
     #[tokio::test]

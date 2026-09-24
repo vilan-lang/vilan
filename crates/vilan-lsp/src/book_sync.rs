@@ -1309,7 +1309,7 @@ fn the_servers_declared_commands_are_the_ones_the_extension_sends() {
 /// pairing — so the extension's spelling is read out of its source and held to
 /// the server's constant.
 #[test]
-fn the_servers_custom_request_is_the_one_the_extension_asks() {
+fn the_servers_custom_requests_are_the_ones_the_extension_asks() {
     let extension = read(&repo_root().join(EXTENSION_SOURCE));
     assert!(
         extension.contains(&format!(
@@ -1318,6 +1318,15 @@ fn the_servers_custom_request_is_the_one_the_extension_asks() {
         )),
         "{EXTENSION_SOURCE} must spell the server's `{}` as its OPENS_A_GENERIC_LIST",
         crate::OPENS_A_GENERIC_LIST
+    );
+    // F27 R1/R6: the status line's request, the same two-languages hazard.
+    assert!(
+        extension.contains(&format!(
+            "const ANALYSIS_PLATFORM = '{}';",
+            crate::ANALYSIS_PLATFORM
+        )),
+        "{EXTENSION_SOURCE} must spell the server's `{}` as its ANALYSIS_PLATFORM",
+        crate::ANALYSIS_PLATFORM
     );
     // And the declaration it makes is the key the server reads.
     assert!(

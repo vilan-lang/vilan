@@ -468,9 +468,9 @@ fn descend<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
             desugar_list(&mut items.0, source);
             Node::Module(name, items)
         }
-        Node::Impl(subject, traits, mut members) => {
+        Node::Impl(subject, traits, mut members, labels) => {
             desugar_list(&mut members.0, source);
-            Node::Impl(subject, traits, members)
+            Node::Impl(subject, traits, members, labels)
         }
         Node::Trait(name, generics, supertraits, mut members, labels) => {
             desugar_list(&mut members.0, source);

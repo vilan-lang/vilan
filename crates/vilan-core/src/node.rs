@@ -775,6 +775,9 @@ pub enum Node<'src> {
         // The traits being implemented: the `A`, `B` in `impl Subject with A + B`.
         Vec<Spanned<Self>>,
         Spanned<NodeList<'src>>,
+        // F27 R1: `[platform("browser")] impl …` — everything inside requires
+        // that platform, and it is the platform the file is analyzed under.
+        ItemLabels<'src>,
     ),
     // `import <path> only?;` — the path and B318's trailing modifier.
     Import(ImportBranch<'src>, ImportModifier),
@@ -784,6 +787,13 @@ pub enum Node<'src> {
     // `export *;` — every item of this module is exported (B318 §2.1). A
     // module-level item with no inner statement: the marker IS the statement.
     ExportAll,
+    // `[platform("browser")];` — the FILE's platform (F27 R1): a file-leading
+    // statement, `export *;`'s shape (the marker is the statement). Everything
+    // the file declares requires that platform, and it is the platform the file
+    // is analyzed under — outranking every heuristic and the `default-entry`
+    // colour. The patterns are carried as written, with their spans, exactly as
+    // a function's fence is (`Func::platform_fence`).
+    ModulePlatform(Vec<Spanned<&'src str>>),
     // `macro fun name(..) { .. }` — a macro definition (macro-engine.md §3).
     // Its body is HERMETIC: never walked in the program world, compiled in the
     // per-file macro world instead (its imports resolve against `macro_std`
@@ -1082,6 +1092,7 @@ impl<'src> Node<'src> {
             | Node::Bool(_)
             | Node::Error
             | Node::ExportAll
+            | Node::ModulePlatform(_)
             | Node::Import(..)
             | Node::Jump(_)
             | Node::LiftBinder
@@ -1237,7 +1248,7 @@ impl<'src> Node<'src> {
                 visit(subject);
                 visit_pattern(&pattern.0, visit);
             }
-            Node::Impl(subject, traits, body) => {
+            Node::Impl(subject, traits, body, _) => {
                 visit(subject);
                 for trait_ in traits {
                     visit(trait_);
@@ -1358,6 +1369,10 @@ pub struct Labels<'src> {
     /// dangerous on purpose. Read by the editor, and by the opt-in
     /// `[lints] internal_use` warning.
     pub internal: Option<&'src str>,
+    /// `[platform("…")]` on an `impl` block or a nominal (F27 R1), as written
+    /// with spans — empty when absent. On an `impl` everything inside requires
+    /// the platform; on either, the file is analyzed under it.
+    pub platform: Vec<Spanned<&'src str>>,
 }
 
 // An explicit enum backing value, `= ( (-)? NUMBER | STRING )`

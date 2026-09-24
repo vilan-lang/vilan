@@ -283,6 +283,26 @@ impl PlatformPattern {
         }
     }
 
+    /// The tokens a `[platform(..)]` attribute spells `patterns` with — the
+    /// inverse of [`Self::parse`] over a layer's parsed set (F27 R1): the whole
+    /// process family is `@process`, anything else its own token. What a
+    /// diagnostic or a quick fix writes when it offers the attribute.
+    pub fn spell(patterns: &[PlatformPattern]) -> Vec<String> {
+        let family = Self::parse("@process").unwrap_or_default();
+        if patterns.len() == family.len() && family.iter().all(|member| patterns.contains(member)) {
+            return vec!["@process".to_string()];
+        }
+        patterns
+            .iter()
+            .map(|pattern| match pattern {
+                PlatformPattern::Node { version } => runtime_token("node", *version),
+                PlatformPattern::Deno { version } => runtime_token("deno", *version),
+                PlatformPattern::Bun { version } => runtime_token("bun", *version),
+                PlatformPattern::Browser => "browser".to_string(),
+            })
+            .collect()
+    }
+
     /// A concrete platform standing in for this pattern (its supported version when
     /// the pattern is version-agnostic) — so resolution, which works on a concrete
     /// [`Platform`], can answer "does this layer's served set provide module M?".
@@ -302,9 +322,35 @@ impl PlatformPattern {
     }
 }
 
+/// `node` / `node:24` — one runtime pattern's token.
+fn runtime_token(runtime: &str, version: Option<u32>) -> String {
+    match version {
+        Some(version) => format!("{runtime}:{version}"),
+        None => runtime.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pattern_set_spells_back_to_what_parses_to_it() {
+        // F27 R1: the attribute a quick fix writes must parse to the layer.
+        for token in ["@process", "browser", "node", "node:24", "deno:*"] {
+            let parsed = PlatformPattern::parse(token).expect("a token that parses");
+            let spelled = PlatformPattern::spell(&parsed);
+            let reparsed: Vec<PlatformPattern> = spelled
+                .iter()
+                .flat_map(|token| PlatformPattern::parse(token).expect("spelled parses"))
+                .collect();
+            assert_eq!(reparsed, parsed, "{token} -> {spelled:?}");
+        }
+        assert_eq!(
+            PlatformPattern::spell(&PlatformPattern::parse("@process").unwrap()),
+            vec!["@process".to_string()]
+        );
+    }
 
     #[test]
     fn parse_platforms() {

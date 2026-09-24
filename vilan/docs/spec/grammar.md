@@ -7,7 +7,9 @@ The full syntactic grammar, in the notation of §1.3. Token classes
 ## 3.1 Modules and statements
 
 ```text
-module    = { statement } ;
+module    = [ module-platform ] { statement } ;
+module-platform = platform-attr ";" ;       (* F27 R1, §11.3 *)
+platform-attr   = "[" "platform" "(" STRING { "," STRING } [ "," ] ")" "]" ;
 
 statement = derived-item
           | service-item
@@ -32,6 +34,12 @@ statement = derived-item
           | block          (* not before "}" *)
           ;
 ```
+
+A `module-platform` — `[platform("browser")];`, the attribute with a `;`
+after it — declares the platform of the WHOLE FILE (§11.3), and it is
+legal only as the file's first statement; anywhere else it is refused and
+told to move above the first import. The `;` is what tells it from the
+same attribute fencing the file's first function.
 
 A block-like form (`if`/`for`/`match`/`{…}`) in statement position must
 not be the last thing in its enclosing block: in that position it is
@@ -241,14 +249,15 @@ std's and a dependency's stay silent.
 ### Structs and enums
 
 ```text
-struct = [ internal-label ] [ "resource" ] [ "external" ] "struct" (IDENT | "null")
-         [ generic-params ] ( "{" [ field { "," field } [ "," ] ] "}" | ";" ) ;
+struct = [ internal-label ] [ platform-attr ] [ "resource" ] [ "external" ] "struct"
+         (IDENT | "null") [ generic-params ]
+         ( "{" [ field { "," field } [ "," ] ] "}" | ";" ) ;
 field  = [ internal-label ]
          [ "[" "expose" [ "(" "keyed" [ "=" type ] ")" ] "]" ] IDENT [ ":" type ] ;
 internal-label = "[" "internal" "(" STRING ")" "]" ;
 
-enum          = [ internal-label ] [ "resource" ] "enum" IDENT [ generic-params ]
-                "{" [ variant { "," variant } [ "," ] ] "}" ;
+enum          = [ internal-label ] [ platform-attr ] [ "resource" ] "enum" IDENT
+                [ generic-params ] "{" [ variant { "," variant } [ "," ] ] "}" ;
 variant       = [ internal-label ] NAME [ "(" [ type { "," type } [ "," ] ] ")" ]
                 [ "=" backing-value ] ;
 backing-value = [ "-" ] INTEGER | STRING ;
@@ -316,8 +325,9 @@ struct`, and it is accepted only on `struct` and `enum` declarations;
 ### Impls and traits
 
 ```text
-impl  = "impl" type [ "with" type { "+" type } ] "{" { statement } "}" ;
-trait = [ internal-label ] "trait" IDENT [ generic-params ]
+impl  = [ internal-label ] [ platform-attr ] "impl" type [ "with" type { "+" type } ]
+        "{" { statement } "}" ;
+trait = [ internal-label ] [ platform-attr ] "trait" IDENT [ generic-params ]
         [ "with" type { "+" type } ] "{" { function } "}" ;
 ```
 

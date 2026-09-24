@@ -359,6 +359,13 @@ const DOC_HIDDEN_IS_SUPERSEDED: &str = "`[doc(hidden)]` is superseded by visibil
      marker is reached for: it stays exported and callable, and the editor hides it from \
      completion, dims it and leads its hover with the reason";
 
+/// F27 R1's placement rule: a module's `[platform(..)];` is the FILE's platform,
+/// so it leads the file — the one place a reader looks for what the whole file
+/// is. Curated: the rule states itself and names the move that satisfies it.
+pub const MODULE_PLATFORM_LEADS_THE_FILE: &str = "a module's `[platform(..)];` declares the platform of the whole file, so it is the file's \
+     first statement: move it above the first import. To fence one function instead, write the \
+     attribute on it with no `;`";
+
 /// The rule `export <expression>;` breaks (B321). Curated
 /// (diagnostics-standard.md B6 — the prohibition explains itself and names the
 /// sanctioned spellings).
@@ -445,6 +452,7 @@ fn export_takes(node: &Node<'_>) -> bool {
         | Node::Use(_)
         | Node::Export(..)
         | Node::ExportAll
+        | Node::ModulePlatform(_)
         | Node::Let(..)
         | Node::LetDestructure(..)
         | Node::Error => true,
@@ -932,6 +940,13 @@ struct Parser<'a, 'src> {
     /// (variadic-generics.md §S.7), and clears it for the body it then parses:
     /// a `fun` declared inside a member's body is a free function.
     in_member_body: bool,
+    /// Whether the statement about to be read is the FILE's first (F27 R1):
+    /// the one position a module-level `[platform("…")];` may stand in. Set by
+    /// [`Parser::parse_program`] before its first statement and TAKEN by the
+    /// first [`Parser::parse_statement_inner`] that runs — so a statement nested
+    /// inside that first one (a function body's, a `mod`'s) already sees it
+    /// false.
+    file_head: bool,
     /// How many levels of SOURCE NESTING are open, against
     /// [`Parser::NESTING_DEPTH_LIMIT`] (B142) — the parser's own bound, the
     /// companion to the analyzer's `WALK_DEPTH_LIMIT` and `RETURN_DEPTH_LIMIT`.
@@ -1192,6 +1207,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             context_stack: Vec::new(),
             preserve_paren_groups,
             in_member_body: false,
+            file_head: false,
             nesting_depth: 0,
             nesting_refusal: None,
             import_path_failure: None,
@@ -2249,6 +2265,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// (`editing-dx.md` §2.2 mechanism 3 — the file-tail blackout).
     fn parse_program(&mut self) -> Spanned<NodeList<'src>> {
         let mut statements = Vec::new();
+        self.file_head = true;
         loop {
             if self.at_end() {
                 break;
@@ -2325,6 +2342,20 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     /// [`Parser::parse_statement`]'s body, past the depth bound.
     fn parse_statement_inner(&mut self) -> Option<Spanned<Node<'src>>> {
+        // F27 R1: only the file's first statement may be its platform. Taken
+        // here, once, so every statement nested inside this one reads false.
+        let file_head = std::mem::take(&mut self.file_head);
+        if let Some(item) = self.attempt(Self::parse_module_platform) {
+            if !file_head {
+                self.errors.push(ParseError {
+                    span: item.1,
+                    reason: ParseErrorReason::Rule(MODULE_PLATFORM_LEADS_THE_FILE),
+                    context: self.context_stack.clone(),
+                    hint: None,
+                });
+            }
+            return Some(item);
+        }
         // G24's `const let` / `const fun` / `const mut`, ahead of everything:
         // `const` begins no other statement, and the expression fork below
         // would otherwise read `const let` as its prefix over a `let`
@@ -6411,6 +6442,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// the `+`-separated list of implemented traits.
     fn parse_impl(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
+        let labels = self.parse_item_labels();
         self.expect(&Token::Impl)?;
         let subject = self.parse_type()?;
         let traits = if self.eat(&Token::With) {
@@ -6421,7 +6453,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         let body =
             self.within_member_body(|parser| parser.parse_item_body("implementation body"))?;
         Some((
-            Node::Impl(Box::new(subject), traits, body),
+            Node::Impl(Box::new(subject), traits, body, labels),
             self.span_from(start),
         ))
     }
@@ -7471,10 +7503,27 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// enum, a trait or a module `let`. `None` when no label leads, which is
     /// the one-null-pointer case nearly every declaration takes.
     fn parse_item_labels(&mut self) -> ItemLabels<'src> {
-        let internal = self.parse_internal_attribute()?;
-        Some(Box::new(Labels {
-            internal: Some(internal),
-        }))
+        let internal = self.parse_internal_attribute();
+        // F27 R1: `[platform("…")]` follows, the order a function's prefix
+        // gives the two.
+        let platform = self.parse_platform_attribute().unwrap_or_default();
+        if internal.is_none() && platform.is_empty() {
+            return None;
+        }
+        Some(Box::new(Labels { internal, platform }))
+    }
+
+    /// `[platform("…", …)];` — a FILE's platform (F27 R1): the function
+    /// fence's attribute with a `;` after it, which is what tells it from the
+    /// fence on a first item (the `export *;` shape — the marker is the
+    /// statement). Where it may stand is [`Parser::parse_statement_inner`]'s
+    /// rule, not this production's.
+    fn parse_module_platform(&mut self) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        let patterns = self.parse_platform_attribute()?;
+        let span = self.span_from(start);
+        self.expect_ctrl(';')?;
+        Some((Node::ModulePlatform(patterns), span))
     }
 
     /// A LABELLED `let` statement (E221): `[internal("reason")] let name = …;`.
@@ -8614,7 +8663,7 @@ mod tests {
     #[test]
     fn impl_with_clause_and_body() {
         match only_item("impl Point<type T> with Show + Eq { fun show(&self): str { \"p\" } }") {
-            Node::Impl(_subject, traits, body) => {
+            Node::Impl(_subject, traits, body, _) => {
                 assert_eq!(traits.len(), 2, "with Show + Eq");
                 assert_eq!(body.0.len(), 1, "one method");
                 assert!(matches!(body.0[0].0, Node::Func(_)));
@@ -8628,7 +8677,7 @@ mod tests {
         // B294: `_` in type position is the binder production, with or without
         // a bound, and it produces the very node `type _` does.
         let binders = |source: &'static str| match only_item(source) {
-            Node::Impl(subject, _traits, _body) => match subject.0 {
+            Node::Impl(subject, _traits, _body, _) => match subject.0 {
                 Node::AccessorWithGenerics(_, arguments) => arguments
                     .0
                     .into_iter()
@@ -8966,6 +9015,71 @@ mod tests {
     }
 
     #[test]
+    fn a_file_leading_platform_is_the_modules_own() {
+        // F27 R1: the fence's attribute with a `;`, as the file's first
+        // statement.
+        let items = program("[platform(\"browser\")];\n\nimport std::ui::Region;\n");
+        match &items.0[0].0 {
+            Node::ModulePlatform(patterns) => {
+                assert_eq!(
+                    patterns.iter().map(|(text, _)| *text).collect::<Vec<_>>(),
+                    vec!["browser"]
+                );
+            }
+            other => panic!("expected the module's platform, got {other:?}"),
+        }
+        match only_item("[platform(\"@process\", \"browser\")];") {
+            Node::ModulePlatform(patterns) => assert_eq!(patterns.len(), 2),
+            other => panic!("{other:?}"),
+        }
+        // Without the `;` it is the first function's fence, as it always was.
+        match only_item("[platform(\"browser\")] fun f() {}") {
+            Node::Func(function) => assert_eq!(function.platform_fence.len(), 1),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_module_platform_anywhere_but_the_files_head_is_refused() {
+        for source in [
+            "import std::ui::Region;\n[platform(\"browser\")];\n",
+            "fun f() {\n\t[platform(\"browser\")];\n}\n",
+            "mod inner {\n\t[platform(\"browser\")];\n}\n",
+        ] {
+            let (_, errors) = parse(source);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| render(error) == MODULE_PLATFORM_LEADS_THE_FILE),
+                "{source:?}: {errors:?}"
+            );
+        }
+        // The head itself is clean, a leading comment notwithstanding.
+        assert!(!declines(
+            "// the client's slot\n[platform(\"browser\")];\nfun f() {}\n"
+        ));
+    }
+
+    #[test]
+    fn an_impl_and_a_nominal_carry_a_platform_label() {
+        match only_item("[platform(\"browser\")] impl Region { fun f(self) {} }") {
+            Node::Impl(_, _, _, Some(labels)) => assert_eq!(labels.platform.len(), 1),
+            other => panic!("{other:?}"),
+        }
+        match only_item("[internal(\"x\")] [platform(\"browser\")] struct Slot {}") {
+            Node::Struct(.., Some(labels)) => {
+                assert_eq!(labels.internal, Some("x"));
+                assert_eq!(labels.platform[0].0, "browser");
+            }
+            other => panic!("{other:?}"),
+        }
+        match only_item("impl Region { fun f(self) {} }") {
+            Node::Impl(_, _, _, None) => {}
+            other => panic!("an unlabelled impl carries none: {other:?}"),
+        }
+    }
+
+    #[test]
     fn an_internal_label_rides_every_e221_position() {
         // E221: the nominals, a variant, a trait and a module binding.
         fn label_of(source: &str) -> Option<&str> {
@@ -9203,7 +9317,7 @@ mod tests {
             ),
             (
                 "impl Foo { 1 2 3 }\nfun after() {}\n",
-                "Impl((Accessor(\"Foo\"), 5..8), [], ([], 9..18))",
+                "Impl((Accessor(\"Foo\"), 5..8), [], ([], 9..18), None)",
             ),
             (
                 "trait Foo { 1 2 3 }\nfun after() {}\n",

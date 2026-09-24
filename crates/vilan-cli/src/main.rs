@@ -3586,26 +3586,43 @@ fn owning_package(file: &Path) -> Result<Option<(PathBuf, Manifest)>, String> {
 /// a file under a `[project]` or `[library]` root, which has no `[package]` to
 /// belong to.
 fn file_project(entry: PathBuf) -> Result<Project, String> {
-    let bare = |entry: PathBuf| Project::Single {
-        unit: Unit {
-            name: String::new(),
-            pkg_root: pkg_root_of(&entry),
-            entry,
-            package_dir: None,
-            split: false,
-            options: BuildOptions::default(),
-            // No project to colour it: the CLI's `node` default answers, and
-            // there is nothing about the file's own situation to explain.
-            platform_reasons: Vec::new(),
-            // A file with no `[package]` above it IS the program it names, and
-            // there is no manifest to name any other (B250).
-            entry_mode: vilan_core::EntryMode::Declared {
-                declared_entries: Vec::new(),
+    let bare = |entry: PathBuf| {
+        // No project to colour it — but the file may say itself (F27 R1):
+        // `[platform("browser")];`, or fences that admit one platform, is the
+        // platform the editor analyzes it under, and the terminal must not
+        // answer differently. Otherwise the CLI's `node` default answers, and
+        // there is nothing about the file's own situation to explain.
+        let declared = vilan_core::util::read_source(&entry)
+            .ok()
+            .and_then(|text| vilan_core::platform_color::declared_platform(&text));
+        let platform = declared.as_ref().map(|declared| declared.hosts[0]);
+        let platform_reasons = declared
+            .map(|declared| {
+                vec![(
+                    declared.hosts[0],
+                    vilan_core::platform_color::PlatformReason::Declared(declared.written).clause(),
+                )]
+            })
+            .unwrap_or_default();
+        Project::Single {
+            unit: Unit {
+                name: String::new(),
+                pkg_root: pkg_root_of(&entry),
+                entry,
+                package_dir: None,
+                split: false,
+                options: BuildOptions::default(),
+                platform_reasons,
+                // A file with no `[package]` above it IS the program it names,
+                // and there is no manifest to name any other (B250).
+                entry_mode: vilan_core::EntryMode::Declared {
+                    declared_entries: Vec::new(),
+                },
             },
-        },
-        platform: None,
-        shared_platforms: Vec::new(),
-        hooks: BuildHooks::default(),
+            platform,
+            shared_platforms: Vec::new(),
+            hooks: BuildHooks::default(),
+        }
     };
     let Some((directory, manifest)) = owning_package(&entry)? else {
         return Ok(bare(entry));

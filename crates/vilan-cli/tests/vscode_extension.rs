@@ -581,3 +581,25 @@ fn e222_the_override_fires_before_the_configurations_own_set() {
         "extension.ts's AUTO_CLOSE_BEFORE and language-configuration.json's autoCloseBefore disagree"
     );
 }
+
+// --- F27 R1/R6: the platform status line --------------------------------------
+
+/// The status bar says which platform the active vilan file is analyzed under
+/// and which kind of fact chose it — `analyzed as: browser — declared` — with
+/// the whole reason as its tooltip, and it follows the file as it is edited.
+#[test]
+fn f27_the_status_line_names_the_platform_and_the_kind_of_fact() {
+    let source = extension_source();
+    assert!(source.contains("window.createStatusBarItem(StatusBarAlignment.Right, 100)"));
+    assert!(
+        source.contains("`analyzed as: ${answer.platform} — ${answer.kind}`"),
+        "the line's text"
+    );
+    assert!(source.contains("platformStatus.tooltip = answer.reason"));
+    // Shown for a vilan file only, and re-asked after edits settle.
+    assert!(source.contains("editor.document.languageId !== 'vilan'"));
+    assert!(
+        source.contains("window.onDidChangeActiveTextEditor(() => void refreshPlatformStatus())")
+    );
+    assert!(source.contains("schedulePlatformRefresh();"));
+}

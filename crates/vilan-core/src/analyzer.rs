@@ -3456,7 +3456,7 @@ pub struct Analyzer<'src> {
     /// 'anchor'" from a contradiction into an answer ("the `browser` twin of
     /// `std::ui` declares it"). Recorded at load time, where the layer roots
     /// and the module's path are both in hand; read only at a diagnostic.
-    std_layer_twin_files: HashMap<SourceId, Vec<(String, String, PathBuf)>>,
+    std_layer_twin_files: HashMap<SourceId, Vec<(String, String, PathBuf, Vec<String>)>>,
     // E200: the lazy ARGUMENTS `check_lazy_arguments` refused in its own words
     // (ledger row 475, "this argument is the resource `T` …"). Recorded so R9's
     // thunk arm can stand down on exactly those — one diagnostic per root cause
@@ -4241,6 +4241,8 @@ pub struct Analyzer<'src> {
     // (`[internal("reason")]`), keyed by its entity id. A function's own live
     // on `Function`, and a field's and a variant's on their records.
     item_labels: HashMap<Id, Labels<'src>>,
+    // F27 R1: each file's `[platform("…")];`, by the file.
+    module_platforms: HashMap<SourceId, Vec<Spanned<&'src str>>>,
     // Every `lazy let` DECLARATION, in source order, before it is known whether
     // it is module-level (§2) or a local (§3, excluded). `record_lazy_bindings`
     // partitions it: a module-level one becomes a cell, a local is refused.
@@ -5129,7 +5131,7 @@ fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'s
     // gets no row, for the reason stated above: this module offers no such name
     // at all, so it can offer nothing under it.
     for item in items {
-        let Node::Impl(subject, _, body) = unwrap_item(item) else {
+        let Node::Impl(subject, _, body, _) = unwrap_item(item) else {
             continue;
         };
         let Some(head) = type_head(&subject.0) else {
@@ -5217,7 +5219,7 @@ fn declares_member_on(item: &Node, type_name: &str, member: &str) -> bool {
         Node::Struct(name, _, _, _, Some(fields), _) if name.0 == type_name => {
             fields.0.iter().any(|field| field.0.0.0 == member)
         }
-        Node::Impl(subject, _, body) if type_head(&subject.0) == Some(type_name) => {
+        Node::Impl(subject, _, body, _) if type_head(&subject.0) == Some(type_name) => {
             body.0.iter().any(|inner| {
                 matches!(unwrap_item(inner), Node::Func(function) if function.name.0 == member)
             })
@@ -5275,7 +5277,7 @@ fn collect_impl_method_steers<'src>(
     out: &mut Vec<((&'src str, &'src str), &'src str)>,
 ) {
     for item in items {
-        let Node::Impl(subject, traits, body) = unwrap_item(item) else {
+        let Node::Impl(subject, traits, body, _) = unwrap_item(item) else {
             continue;
         };
         let Some(head) = type_head(&subject.0) else {
@@ -6046,6 +6048,7 @@ impl<'src> Analyzer<'src> {
             lazy_eager_parameters: HashSet::default(),
             lazy_binding_declarations: Vec::new(),
             item_labels: HashMap::default(),
+            module_platforms: HashMap::default(),
             lazy_local_bindings: Vec::new(),
             lazy_binding_initializers: IndexMap::default(),
             lazy_thunk_effects: IndexMap::default(),
@@ -26385,12 +26388,21 @@ impl<'src> Analyzer<'src> {
         // Without this the note explains a colour and leaves the member looking
         // like a typo.
         if let Some(member_name) = member_name
-            && let Some((other_layer, module)) =
+            && let Some((other_layer, module, patterns)) =
                 self.twin_declaring_member(source, type_name, member_name)
         {
+            // F27 R1: and the move that puts the file there, which is now a
+            // line the author writes — the editor's quick fix inserts exactly
+            // this attribute, read back off this sentence.
+            let attribute = patterns
+                .iter()
+                .map(|pattern| format!("\"{pattern}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
             msg.push_str(&format!(
-                ". The `{other_layer}` twin of `std::{module}` declares `{member_name}` — an \
-                 entry of that platform (or `--platform`) is what puts this file under it"
+                ". The `{other_layer}` twin of `std::{module}` declares `{member_name}` — \
+                 `[platform({attribute})];` at the top of the file analyzes it under that \
+                 platform, as an entry of that platform (or `--platform`) does"
             ));
         }
         Some(Note {
@@ -26415,8 +26427,8 @@ impl<'src> Analyzer<'src> {
         source: SourceId,
         type_name: &str,
         member_name: &str,
-    ) -> Option<(String, String)> {
-        for (layer, module, path) in self.std_layer_twin_files.get(&source)? {
+    ) -> Option<(String, String, Vec<String>)> {
+        for (layer, module, path, patterns) in self.std_layer_twin_files.get(&source)? {
             let Ok(text) = crate::util::read_source(path) else {
                 continue;
             };
@@ -26428,7 +26440,7 @@ impl<'src> Analyzer<'src> {
                 .iter()
                 .any(|item| declares_member_on(unwrap_item(item), type_name, member_name))
             {
-                return Some((layer.clone(), module.clone()));
+                return Some((layer.clone(), module.clone(), patterns.clone()));
             }
         }
         None
@@ -30348,6 +30360,17 @@ impl<'src> Analyzer<'src> {
             // The marker IS the statement, so there is nothing under it to walk;
             // it takes the same module-level refusal `export` takes, for the same
             // reason.
+            // `[platform("…")];` (F27 R1) — the FILE's platform, recorded
+            // against the file being walked. The parser has already held it to
+            // the file's first statement, so there is no position to refuse
+            // here; `platform_color` reads the record (the requirement it seeds,
+            // the promise it makes) and so does the resolver that chose the
+            // platform this analysis runs under.
+            Node::ModulePlatform(patterns) => {
+                self.module_platforms
+                    .insert(self.current_source_id, patterns.clone());
+                Some(Expr::Void)
+            }
             Node::ExportAll => {
                 self.export_all_modules.insert(scope_id);
                 self.curated_modules.insert(scope_id);
@@ -31781,7 +31804,11 @@ impl<'src> Analyzer<'src> {
                 ));
                 None
             }
-            Node::Impl(subject, traits, body) => {
+            Node::Impl(subject, traits, body, labels) => {
+                // F27 R1: an impl's `[platform(..)]` rides the item labels.
+                if let Some(labels) = labels {
+                    self.item_labels.insert(id, (**labels).clone());
+                }
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
                 // The impl's generic parameters are the `type X` binders in the
@@ -53172,6 +53199,18 @@ pub struct Program<'src> {
     pub item_labels: HashMap<Id, Labels<'src>>,
     /// The entry package's `[lints]` (E221), for `labels::check`.
     pub lints: crate::manifest::Lints,
+    /// F27 R1: each file's `[platform("…")];`, as written, by the file — the
+    /// platform everything the file declares requires (`platform_color`).
+    pub module_platforms: HashMap<SourceId, Vec<Spanned<&'src str>>>,
+    /// F27 R1: those declarations and every `[platform(..)] impl`'s, resolved
+    /// by `platform_color::record_declared_platforms` (a post-pass) into the
+    /// requirement each seeds and the promise each makes.
+    pub declared_requirements: crate::platform_color::DeclaredRequirements,
+    /// WHY this program was analyzed under `platform`, and the kind of fact
+    /// that was — the workspace's `platform_reason`/`platform_kind`, kept for
+    /// the editor's status line (F27 R1/R6).
+    pub platform_reason: Option<String>,
+    pub platform_kind: Option<&'static str>,
     /// The lazy arguments that forward a cell they already hold (§1).
     pub lazy_argument_forwards: HashSet<Id>,
     /// The bindings that hold a memo cell: `lazy` parameters (§1) and `lazy let`
@@ -54965,7 +55004,7 @@ pub(crate) fn service_method_refusals(
         while let Node::Export(_, inner) = node {
             node = &inner.0;
         }
-        let Node::Impl(subject, impl_traits, body) = node else {
+        let Node::Impl(subject, impl_traits, body, _) = node else {
             continue;
         };
         if !impl_traits.is_empty() {
@@ -56325,7 +56364,7 @@ pub fn module_impl_blocks(path: &Path) -> Vec<(String, Vec<String>)> {
     };
     let mut blocks = Vec::new();
     for item in &loaded.ast.0 {
-        let Node::Impl(subject, _, body) = unwrap_item(item) else {
+        let Node::Impl(subject, _, body, _) = unwrap_item(item) else {
             continue;
         };
         let Some(head) = type_head(&subject.0) else {
@@ -56392,6 +56431,12 @@ pub struct Workspace {
     /// keys on — the reason does not change which modules load, resolve, or
     /// expand, only what one diagnostic says about them.
     pub platform_reason: Option<String>,
+    /// The KIND of fact `platform_reason` states, in one word — what the
+    /// editor's status line shows after the platform (F27 R1: "analyzed as:
+    /// browser — declared"); `PlatformReason::kind` for a front end's colour,
+    /// `declared` / `inferred` / `default` where the analysis chose. Out of the
+    /// base cache key for `platform_reason`'s reason.
+    pub platform_kind: Option<&'static str>,
     /// WHICH CONTROL can change this program's ambient scope (E120) — read by
     /// the web-set steer, which has to name a repair the reader can actually
     /// take. A front end fact for the same reason `platform_reason` is one, and
@@ -59749,7 +59794,7 @@ fn analyze_inner<'src>(
                             // so the twin is that same relative path under
                             // another layer's root — and its label is the module
                             // path a user writes (`ui`).
-                            let twins: Vec<(String, String, PathBuf)> = canonical
+                            let twins: Vec<(String, String, PathBuf, Vec<String>)> = canonical
                                 .strip_prefix(crate::util::canonical_path(&layer.root))
                                 .ok()
                                 .map(|relative| {
@@ -59760,7 +59805,14 @@ fn analyze_inner<'src>(
                                         .map(|other| (other, other.root.join(relative)))
                                         .filter(|(_, path)| path.is_file())
                                         .map(|(other, path)| {
-                                            (other.name.clone(), label.clone(), path)
+                                            (
+                                                other.name.clone(),
+                                                label.clone(),
+                                                path,
+                                                crate::target::PlatformPattern::spell(
+                                                    &other.patterns,
+                                                ),
+                                            )
                                         })
                                         .collect()
                                 })
@@ -62450,6 +62502,10 @@ fn analyze_over_world<'src>(
         lazy_eager_parameters: std::mem::take(&mut analyzer.lazy_eager_parameters),
         lazy_binding_initializers: std::mem::take(&mut analyzer.lazy_binding_initializers),
         item_labels: std::mem::take(&mut analyzer.item_labels),
+        module_platforms: std::mem::take(&mut analyzer.module_platforms),
+        declared_requirements: Default::default(),
+        platform_reason: workspace.platform_reason.clone(),
+        platform_kind: workspace.platform_kind,
         lints: workspace.lints,
         lazy_thunk_effects: std::mem::take(&mut analyzer.lazy_thunk_effects),
         suspending_calls: HashSet::default(),

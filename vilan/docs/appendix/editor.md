@@ -82,6 +82,13 @@ produce the same bytes.
 **Linked editing** for markup tag pairs: rename `<div>` and `</div>`
 follows.
 
+**Which platform, and why, before any error.** The platform a file is
+analyzed under decides which `std` twin its types come from, so the status
+bar says it for the vilan file in front of you — `analyzed as: browser —
+declared`, `analyzed as: node — default-entry` — with the whole reason in
+its tooltip. A file can say it itself: `[platform("browser")];` as its first
+line.
+
 **A generic `<` closes itself.** `List<`, `Map<`, `fun pair<` and a
 generic call's own argument list each get their `>` as you type the `<`.
 The editor's static bracket pairs cannot do this — `<` is also the
@@ -222,12 +229,13 @@ sees it.
 
 ## Quick fixes
 
-Fourteen, each attached to the diagnostic that earns it:
+Fifteen, each attached to the diagnostic that earns it:
 
 | Action | Offered on |
 |---|---|
 | ``Import `X` from std::json`` | `cannot find 'X'` where `X` is importable. One action per module when more than one exports the name — never a guess between them |
 | ``Change to `entries` `` | a `did you mean …?` note on a misspelled struct-initializer field |
+| ``Analyze this file under its platform: add `[platform("browser")];` `` | a member the OTHER `std` twin declares (`struct 'Region' has no field 'anchor'` in a file analyzed under node, whose note names the `browser` twin that has it). The edit is the file's first line — the one place a file's platform may be written — and the attribute is the one the note spells |
 | ``Insert `;` `` | ``expected `;` to end this statement``, at the gap the diagnostic points at |
 | ``Remove `;` `` | ``the `;` discards this body's last value`` — it finds the right `;` from the diagnostic's own bookkeeping, and declines rather than guess when a comment sits in the gap |
 | ``Import as `#hidden` `` | a plain import of an item its module does not export. A zero-width insertion of the reach marker at the leaf — the whole edit — which says the reach was deliberate and silences the warning |

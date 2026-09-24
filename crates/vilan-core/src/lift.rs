@@ -334,9 +334,9 @@ fn descend<'src>(node: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
             seal_list(&mut items.0);
             Node::Module(name, items)
         }
-        Node::Impl(subject, traits, mut members) => {
+        Node::Impl(subject, traits, mut members, labels) => {
             seal_list(&mut members.0);
-            Node::Impl(subject, traits, members)
+            Node::Impl(subject, traits, members, labels)
         }
         Node::Trait(name, generics, supertraits, mut members, labels) => {
             seal_list(&mut members.0);

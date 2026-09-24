@@ -55,6 +55,9 @@ struct ProjectContext {
     /// `vilan check <file>` prints, from the same function. Empty when there is
     /// no project to answer from.
     platform_reasons: Vec<(BuildPlatform, String)>,
+    /// F27 R1: per color, the KIND of fact that chose it — the one word the
+    /// status line shows (`PlatformReason::kind`).
+    platform_kinds: Vec<(BuildPlatform, &'static str)>,
     /// Why the project didn't resolve, when it didn't (F5 S5). Everything below
     /// still degrades exactly as it did — the difference is that the reason is
     /// now published instead of swallowed.
@@ -84,6 +87,7 @@ impl ProjectContext {
             pkg_root: None,
             workspace: BuildWorkspace::default(),
             platform_reasons: Vec::new(),
+            platform_kinds: Vec::new(),
             manifest_problem: None,
             manifest_dir: None,
             unloaded_by_entries: None,
@@ -101,6 +105,11 @@ impl ProjectContext {
             .iter()
             .find(|(colored, _)| *colored == platform)
             .map(|(_, reason)| reason.clone());
+        workspace.platform_kind = self
+            .platform_kinds
+            .iter()
+            .find(|(colored, _)| *colored == platform)
+            .map(|(_, kind)| *kind);
         workspace
     }
 }
@@ -128,7 +137,10 @@ struct ManifestProblem {
 /// the file lives in and resolves its dependencies the same way, with no
 /// platform — see the branch itself for the two limits that carries. Anything
 /// unreadable / unrecognized yields [`ProjectContext::none`].
-fn resolve_project_context(entry_path: &Path) -> ProjectContext {
+///
+/// `text` is the file as the editor holds it: its own `[platform(..)]`
+/// declaration outranks the colour (F27 R1), and the buffer's may not be saved.
+fn resolve_project_context(entry_path: &Path, text: &str) -> ProjectContext {
     let mut directory = entry_path.parent();
     let (manifest_path, root) = loop {
         let Some(current) = directory else {
@@ -180,11 +192,16 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
         // Each color with the REASON it was chosen (E119) — the same function
         // `vilan check <file>` calls, so the two surfaces cannot come to two
         // conclusions about why a file is colored either.
-        let choices =
-            vilan_core::platform_color::file_platform_choices(&pkg_root, &manifest, entry_path);
+        let choices = vilan_core::platform_color::file_platform_choices_for(
+            &pkg_root, &manifest, entry_path, text,
+        );
         let platform_reasons: Vec<(BuildPlatform, String)> = choices
             .iter()
             .map(|choice| (choice.platform, choice.reason.clause()))
+            .collect();
+        let platform_kinds: Vec<(BuildPlatform, &'static str)> = choices
+            .iter()
+            .map(|choice| (choice.platform, choice.reason.kind()))
             .collect();
         // E124's module-level slice, taken off the SAME per-entry walk: a
         // choice with reason `ReachedBy` means an entry loads this file, so for
@@ -202,6 +219,12 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
                 .iter()
                 .find(|(colored, _)| *colored == platform)
                 .map(|(_, reason)| reason.clone())
+        });
+        workspace.platform_kind = platform.and_then(|platform| {
+            platform_kinds
+                .iter()
+                .find(|(colored, _)| *colored == platform)
+                .map(|(_, kind)| *kind)
         });
         // B239: the editor analyzes the OPEN file as the entry, because a
         // buffer is all it has — and that file is usually one of the package's
@@ -236,6 +259,7 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
             pkg_root: Some(vilan_core::util::canonical_path(&pkg_root)),
             workspace,
             platform_reasons,
+            platform_kinds,
             manifest_problem,
             manifest_dir: Some(vilan_core::util::canonical_path(root)),
             unloaded_by_entries,
@@ -284,6 +308,7 @@ fn resolve_project_context(entry_path: &Path) -> ProjectContext {
             // A `[library]` declares no target and the editor invents none (see
             // above), so there is no colour to explain.
             platform_reasons: Vec::new(),
+            platform_kinds: Vec::new(),
             manifest_problem,
             // A `[library]` has no entries — validation refuses them outright —
             // so it has no union and gets NO top-level gray, workspace member
@@ -1669,7 +1694,7 @@ impl Document {
         // re-reads the manifest closure beside it. The core line cannot see any
         // of it: it starts inside `analyze`.
         let phase_context_start = vilan_core::PhaseClock::now();
-        let mut context = resolve_project_context(entry_path);
+        let mut context = resolve_project_context(entry_path, text);
         let phase_context = phase_context_start.elapsed();
         let manifest_problem = context.manifest_problem.take();
         let manifest_dir = context.manifest_dir.take();
@@ -2987,6 +3012,21 @@ impl Document {
             return Vec::new();
         }
         vec![(Span::from(offset..offset), ">".to_string())]
+    }
+
+    /// What the editor's status line says about this document (F27 R1/R6):
+    /// the platform the last analysis ran under, the one-word kind of fact
+    /// that chose it, and the full reason clause (its tooltip). `None` before
+    /// any analysis has produced a program.
+    pub fn analysis_platform(
+        &self,
+    ) -> Option<(&'static str, Option<&'static str>, Option<String>)> {
+        let program = self.program.as_ref()?;
+        Some((
+            program.platform.runtime_name(),
+            program.platform_kind,
+            program.platform_reason.clone(),
+        ))
     }
 
     /// Whether the `<` ending at `offset` opens a generic argument or
@@ -6212,6 +6252,21 @@ impl Document {
                         target: None,
                     });
                 }
+            } else if let Some(attribute) = diagnostic
+                .note
+                .as_ref()
+                .and_then(|note| declared_platform_attribute(&note.msg))
+            {
+                // F27 R1: the overlay note names the twin that HAS the member
+                // and the attribute that puts this file under it; the fix
+                // writes that attribute where it is legal — the file's first
+                // line — and nothing else.
+                fixes.push(QuickFix {
+                    title: format!("Analyze this file under its platform: add `{attribute}`"),
+                    span: Span::from(0..0),
+                    replacement: format!("{attribute}\n\n"),
+                    target: None,
+                });
             } else if let Some(suggestion) = diagnostic
                 .note
                 .as_ref()
@@ -7619,7 +7674,7 @@ impl<'a> StyleSurface<'a> {
                 Node::Export(_, inner) => &inner.0,
                 node => node,
             };
-            let Node::Impl(subject, _traits, body) = node else {
+            let Node::Impl(subject, _traits, body, _) = node else {
                 continue;
             };
             let names_style = matches!(subject.0, Node::Accessor("Style"))
@@ -8320,6 +8375,18 @@ fn trailing_semicolon_to_remove(
 fn internal_lead(program: &Program, declaration_id: Id) -> Option<String> {
     // E221: every declaration kind, through the one reader.
     vilan_core::labels::internal_of(program, declaration_id).map(internal_line)
+}
+
+/// F27 R1: the `[platform(..)];` an overlay note recommends — the attribute
+/// the note spells, read back off the one sentence that states it, so the fix
+/// and the diagnostic cannot name two different attributes.
+fn declared_platform_attribute(note: &str) -> Option<&str> {
+    let tail = " at the top of the file analyzes it under that platform";
+    let end = note.find(tail)?;
+    let head = &note[..end];
+    let start = head.rfind("`[platform(")?;
+    let attribute = head[start..].strip_prefix('`')?.strip_suffix('`')?;
+    attribute.ends_with(")];").then_some(attribute)
 }
 
 /// E221: a variant reached through its enum's PATH (`Side::Auto`) is one
@@ -11094,6 +11161,119 @@ pub(crate) mod tests {
             modifier_at("label\n}", 5),
             Some(0),
             "while the field beside it is not: {tokens:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── F27 R1: the file declares the platform it is analyzed under ─────────
+
+    /// The owner's package: a client and a server entry, `default-entry` the
+    /// server, and `slot.vl` (opened) reached by neither.
+    fn f27_workspace(slot: &str) -> (PathBuf, Document) {
+        let entry = "import std::io::print;\n\nfun main() {\n\tprint(\"hi\");\n}\nmain();\n";
+        analyze_workspace(&[
+            ("src/slot.vl", slot),
+            (
+                "vilan.toml",
+                "[package]\nname = \"app\"\ndefault-entry = \"server\"\n\n\
+                 [entry.client]\ntarget = \"browser\"\n\n[entry.server]\n",
+            ),
+            ("src/client.vl", entry),
+            ("src/server.vl", entry),
+        ])
+    }
+
+    const F27_UNDECLARED: &str =
+        "import std::ui::Region;\n\nexport fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+
+    #[test]
+    fn f27_a_declared_module_is_analyzed_as_declared_over_the_default_entry() {
+        let (dir, document) =
+            f27_workspace(&format!("[platform(\"browser\")];\n\n{F27_UNDECLARED}"));
+        assert!(
+            document.diagnostics.is_empty(),
+            "no field error in the wrong twin: {:?}",
+            document.diagnostics
+        );
+        let (platform, kind, reason) = document.analysis_platform().expect("an analysis");
+        assert_eq!(platform, "browser");
+        assert_eq!(kind, Some("declared"), "the status line's word");
+        assert_eq!(
+            reason.as_deref(),
+            Some("it declares `[platform(\"browser\")]`")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f27_an_undeclared_module_says_why_it_is_where_it_is() {
+        // The status line's other half: the colour the file took, and why.
+        let (dir, document) = f27_workspace(F27_UNDECLARED);
+        let (platform, kind, reason) = document.analysis_platform().expect("an analysis");
+        assert_eq!(platform, "node");
+        assert_eq!(kind, Some("default-entry"));
+        assert_eq!(
+            reason.as_deref(),
+            Some("no entry reaches it (default-entry is `server`)")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f27_the_live_buffers_declaration_decides_before_it_is_saved() {
+        // Disk holds the undeclared module; the editor holds the declaration
+        // the author just typed. The buffer is what the file IS.
+        let (dir, _undeclared) = f27_workspace(F27_UNDECLARED);
+        let path = dir.join("src/slot.vl");
+        let live = format!("[platform(\"browser\")];\n\n{F27_UNDECLARED}");
+        let document = Document::analyze(&live, &std_root(), &path);
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
+        );
+        assert_eq!(
+            document.analysis_platform().map(|(platform, ..)| platform),
+            Some("browser")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f27_the_twin_note_offers_the_attribute_as_a_quick_fix() {
+        let (dir, document) = f27_workspace(F27_UNDECLARED);
+        let program = document.program.as_ref().expect("a program");
+        let at = F27_UNDECLARED.find("region.anchor").expect("the read");
+        let fixes = document.quickfixes(program, Span::from(at..at + 13));
+        let fix = fixes
+            .iter()
+            .find(|fix| {
+                fix.title
+                    .starts_with("Analyze this file under its platform")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "the fix: {:?}",
+                    fixes.iter().map(|fix| &fix.title).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            fix.title,
+            "Analyze this file under its platform: add `[platform(\"browser\")];`"
+        );
+        assert_eq!(
+            fix.span.into_range(),
+            0..0,
+            "the file's first line, the one legal place"
+        );
+        assert_eq!(fix.replacement, "[platform(\"browser\")];\n\n");
+        // Applying it is a file that analyzes clean — the fix is the whole move.
+        let fixed = format!("{}{F27_UNDECLARED}", fix.replacement);
+        let document = Document::analyze(&fixed, &std_root(), &dir.join("src/slot.vl"));
+        assert!(
+            document.diagnostics.is_empty(),
+            "{:?}",
+            document.diagnostics
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

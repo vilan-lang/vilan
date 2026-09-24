@@ -48,6 +48,31 @@ the fenced platforms lacks, the error lands **at the fence** with the
 offending chain, not at some distant entry in a dependent build.
 Fences add no runtime behavior; they are checked declarations.
 
+A fence is also the platform its body is **analyzed under**. One
+analysis types a file under one platform — and so under one `std`
+twin, which is what a body over `std::ui`'s `Region` reads its fields
+from — so a file is analyzed under a platform every fence and label in
+it admits, whenever the colour its package gives it (§11.2, the
+`default-entry`'s, inference's) admits none of them. Declarations that
+share no platform make the file a pair of twins; the file's colour
+stands.
+
+**A file's own platform.** `[platform("browser")];` — the attribute
+with a `;`, as the file's first statement — declares the platform of the
+whole file. Everything the file declares requires that platform, exactly
+as a layer module's items require their layer's: a call into it from an
+entry of another platform is the chain error above
+(`` `when_value` requires the `browser` platform its file declares and
+cannot run on `node` ``, with the path from `main`). It is also a fence
+on each of the file's functions, checked the same way. And it is the
+platform the file is analyzed under: it outranks inference and the
+`default-entry` colour outright, and of the entries that reach the file
+only those it admits type-check it — reaching it from another is the
+error. The same attribute on an `impl` block does this for the block's
+members; on a struct, an enum or a trait it takes part in choosing the
+platform the file is analyzed under. A type has no platform of its own
+(§11.2's requirement is on code), so a label on one requires nothing.
+
 ## 11.4 Manifests (`vilan.toml`)
 
 The manifest declares what a directory builds. Sections:

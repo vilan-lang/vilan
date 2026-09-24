@@ -81,6 +81,9 @@ use target::PlatformPattern as Pattern;
 struct InferredPlatform {
     platform: Platform,
     reason: String,
+    /// The one word the editor's status line shows (F27 R1): `declared`,
+    /// `inferred` or `default`.
+    kind: &'static str,
 }
 
 /// Infers a build platform for editor analysis (which has no `--platform`) from
@@ -115,6 +118,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
     let defaulted = |reason: &str| InferredPlatform {
         platform: Platform::default(),
         reason: reason.to_string(),
+        kind: "default",
     };
     let Some(browser_root) = std
         .layers
@@ -188,7 +192,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
                         into.insert(field.0.0.0.to_string());
                     }
                 }
-                Node::Impl(_, _, body) => {
+                Node::Impl(_, _, body, _) => {
                     for item in body.0.iter() {
                         walk(&item.0, true, into);
                     }
@@ -353,6 +357,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
         return InferredPlatform {
             platform: Platform::Browser,
             reason,
+            kind: "inferred",
         };
     }
     // F27 R2: no import settles it, so ask what the file DOES with the twins it
@@ -401,6 +406,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
             }) {
                 return InferredPlatform {
                     platform: Platform::Browser,
+                    kind: "inferred",
                     reason: format!(
                         "it reads `.{member}`, which only the browser twin of `std::{module}` \
                          declares"
@@ -854,7 +860,20 @@ fn analyze_source_unfenced(
     // the colour (a bare file, a `[library]` module, a test harness). The
     // workspace is cloned only on that path — a front end that resolved a
     // platform already stamped its own reason.
-    let inferred = platform.is_none().then(|| infer_platform(&root.0, std));
+    // F27 R1: what the file DECLARES outranks every heuristic below — a
+    // front end that resolved a platform has already applied it
+    // (`platform_color::file_platform_choices`), so this is the no-project path.
+    let inferred =
+        platform
+            .is_none()
+            .then(|| match platform_color::declared_platform_in(&root.0) {
+                Some(declared) => InferredPlatform {
+                    platform: declared.hosts[0],
+                    reason: platform_color::PlatformReason::Declared(declared.written).clause(),
+                    kind: "declared",
+                },
+                None => infer_platform(&root.0, std),
+            });
     let platform = platform.unwrap_or_else(|| {
         inferred
             .as_ref()
@@ -863,6 +882,7 @@ fn analyze_source_unfenced(
     });
     let inferred_workspace = inferred.map(|inferred| Workspace {
         platform_reason: Some(inferred.reason),
+        platform_kind: Some(inferred.kind),
         ..workspace.clone()
     });
     let workspace = inferred_workspace.as_ref().unwrap_or(workspace);
@@ -999,6 +1019,9 @@ pub fn post_analysis_passes(
     // `[lints] internal_use` warns at each use of an `[internal]` item — here,
     // over the finished program, so both pipelines carry it.
     labels::check(program);
+    // F27 R1: the files' and impls' `[platform(..)]` declarations, resolved
+    // once, ahead of every pass that asks what a function requires.
+    platform_color::record_declared_platforms(program);
     // M26's POST-PASS boundary, the outermost of the three the phase line names
     // (`contexts+graph`, `const-pass`, `dispatch-refine`; the last is a slice
     // through the first two, so cancelling either cancels it). The passes are
