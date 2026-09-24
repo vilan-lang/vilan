@@ -26,6 +26,7 @@ pub mod id;
 pub mod impl_select;
 pub mod init_order;
 pub mod interpreter;
+pub mod labels;
 pub mod leak_tally;
 pub mod lexing;
 pub mod lift;
@@ -81,6 +82,9 @@ use target::PlatformPattern as Pattern;
 struct InferredPlatform {
     platform: Platform,
     reason: String,
+    /// The one word the editor's status line shows (F27 R1): `declared`,
+    /// `inferred` or `default`.
+    kind: &'static str,
 }
 
 /// Infers a build platform for editor analysis (which has no `--platform`) from
@@ -115,6 +119,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
     let defaulted = |reason: &str| InferredPlatform {
         platform: Platform::default(),
         reason: reason.to_string(),
+        kind: "default",
     };
     let Some(browser_root) = std
         .layers
@@ -150,7 +155,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
             match node {
                 // N89: `const` is a wrapper like the rest — `const fun f()`
                 // declares `f`.
-                Node::Export(_, inner)
+                Node::Export(_, inner, _)
                 | Node::Derive(_, inner)
                 | Node::Service(_, inner)
                 | Node::Const(inner) => node_declares(&inner.0, name),
@@ -179,21 +184,21 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
     fn declared_members(path: &Path) -> HashSet<String> {
         fn walk(node: &Node, in_member_position: bool, into: &mut HashSet<String>) {
             match node {
-                Node::Export(_, inner)
+                Node::Export(_, inner, _)
                 | Node::Derive(_, inner)
                 | Node::Service(_, inner)
                 | Node::Const(inner) => walk(&inner.0, in_member_position, into),
-                Node::Struct(_, _, _, _, Some(fields)) => {
+                Node::Struct(_, _, _, _, Some(fields), _) => {
                     for field in &fields.0 {
                         into.insert(field.0.0.0.to_string());
                     }
                 }
-                Node::Impl(_, _, body) => {
+                Node::Impl(_, _, body, _) => {
                     for item in body.0.iter() {
                         walk(&item.0, true, into);
                     }
                 }
-                Node::Trait(_, _, _, body) => {
+                Node::Trait(_, _, _, body, _) => {
                     for item in body.0.iter() {
                         walk(&item.0, true, into);
                     }
@@ -340,7 +345,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
     let mut import_reason: Option<String> = None;
     any_node(root, &mut |node| {
         let branch = match node {
-            Node::Import(branch, _) | Node::Use(branch) => branch,
+            Node::Import(branch, ..) | Node::Use(branch) => branch,
             _ => return false,
         };
         let ImportBranch::Path("std", _, ImportTail::Continue(child)) = branch else {
@@ -353,6 +358,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
         return InferredPlatform {
             platform: Platform::Browser,
             reason,
+            kind: "inferred",
         };
     }
     // F27 R2: no import settles it, so ask what the file DOES with the twins it
@@ -360,7 +366,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
     // each twin's two member sets are read once.
     let mut twins: Vec<(String, std::path::PathBuf, Vec<std::path::PathBuf>)> = Vec::new();
     any_node(root, &mut |node| {
-        if let Node::Import(branch, _) | Node::Use(branch) = node
+        if let Node::Import(branch, ..) | Node::Use(branch) = node
             && let ImportBranch::Path("std", _, ImportTail::Continue(child)) = branch
         {
             twin_modules(child, browser_root, &other_roots, &mut twins);
@@ -401,6 +407,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
             }) {
                 return InferredPlatform {
                     platform: Platform::Browser,
+                    kind: "inferred",
                     reason: format!(
                         "it reads `.{member}`, which only the browser twin of `std::{module}` \
                          declares"
@@ -800,7 +807,7 @@ fn analyze_source_unfenced(
             // N89: through the wrappers — `export`, `const`, or both — because
             // what the prelude must not shadow is the NAME, whatever marks it.
             let mut node = node;
-            while let Node::Export(_, inner) | Node::Const(inner) = node {
+            while let Node::Export(_, inner, _) | Node::Const(inner) = node {
                 node = &inner.0;
             }
             let function = match node {
@@ -866,7 +873,20 @@ fn analyze_source_unfenced(
     // the colour (a bare file, a `[library]` module, a test harness). The
     // workspace is cloned only on that path — a front end that resolved a
     // platform already stamped its own reason.
-    let inferred = platform.is_none().then(|| infer_platform(&root.0, std));
+    // F27 R1: what the file DECLARES outranks every heuristic below — a
+    // front end that resolved a platform has already applied it
+    // (`platform_color::file_platform_choices`), so this is the no-project path.
+    let inferred =
+        platform
+            .is_none()
+            .then(|| match platform_color::declared_platform_in(&root.0) {
+                Some(declared) => InferredPlatform {
+                    platform: declared.hosts[0],
+                    reason: platform_color::PlatformReason::Declared(declared.written).clause(),
+                    kind: "declared",
+                },
+                None => infer_platform(&root.0, std),
+            });
     let platform = platform.unwrap_or_else(|| {
         inferred
             .as_ref()
@@ -875,6 +895,7 @@ fn analyze_source_unfenced(
     });
     let inferred_workspace = inferred.map(|inferred| Workspace {
         platform_reason: Some(inferred.reason),
+        platform_kind: Some(inferred.kind),
         ..workspace.clone()
     });
     let workspace = inferred_workspace.as_ref().unwrap_or(workspace);
@@ -1011,6 +1032,13 @@ pub fn post_analysis_passes(
     // the host as `document.activeElement()`. Same table, same question about
     // a declaration, so it runs beside the check above.
     analyzer::check_global_property_externs(program);
+    // E221: a label on a local binding is refused, and the opt-in
+    // `[lints] internal_use` warns at each use of an `[internal]` item — here,
+    // over the finished program, so both pipelines carry it.
+    labels::check(program);
+    // F27 R1: the files' and impls' `[platform(..)]` declarations, resolved
+    // once, ahead of every pass that asks what a function requires.
+    platform_color::record_declared_platforms(program);
     // M26's POST-PASS boundary, the outermost of the three the phase line names
     // (`contexts+graph`, `const-pass`, `dispatch-refine`; the last is a slice
     // through the first two, so cancelling either cancels it). The passes are

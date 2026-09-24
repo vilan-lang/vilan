@@ -380,11 +380,9 @@ fn language_configuration() -> String {
 /// a text edit cannot move the caret past a character it leaves in place
 /// (`List<List<i32>>` needs the caret between the two, not before them). The
 /// only configuration that buys overtype is an `autoClosingPairs` entry for
-/// `<`, which is the hazard this pin exists to keep out. Tracker E202's owed
-/// "typing `>` over the placed one does not double it" is therefore NOT
-/// pinnable by configuration and is reported as an open question, with a
-/// client-side `type` override in `extension.ts` — which can move the caret —
-/// as the candidate follow-up.
+/// `<`, which is the hazard this pin exists to keep out. So the overtype is
+/// the extension's (E222, ruled): a client-side `type` override that asks the
+/// server, places the `>` and swallows the next one — pinned below.
 #[test]
 fn e202_the_angle_pair_surrounds_but_does_not_auto_close() {
     let config = language_configuration();
@@ -477,4 +475,131 @@ fn e203_the_lexer_still_has_no_backtick_token() {
         0,
         "a `Backtick` token appeared: see above"
     );
+}
+
+// --- E222: the extension's `type` override -----------------------------------
+//
+// The TS half is not run by this suite (it needs a VS Code host), so what it
+// promises is pinned TEXTUALLY, one claim per pin: the setting, the override's
+// shape, the two strings it must share with other files, and the declaration
+// the server stands down on (that half is `book_sync`'s, beside the request
+// name; the server's own stand-down is pinned in `vilan-lsp`).
+
+fn extension_source() -> String {
+    std::fs::read_to_string(extension_dir().join("src/extension.ts")).expect("read extension.ts")
+}
+
+/// A `'…'` literal's value, with the two escapes the file uses.
+fn single_quoted_constant(source: &str, name: &str) -> String {
+    let head = format!("const {name} = '");
+    let start = source
+        .find(&head)
+        .unwrap_or_else(|| panic!("extension.ts declares {name}"))
+        + head.len();
+    let end = start + source[start..].find('\'').expect("the closing quote");
+    source[start..end].replace("\\n", "\n").replace("\\t", "\t")
+}
+
+/// The setting exists, is on by default, and says WHY it is a setting — the
+/// one fact a user reaching for it (a Vim user whose `type` it collides with)
+/// needs.
+#[test]
+fn e222_the_generic_pairing_is_a_setting_on_by_default_that_names_vim() {
+    assert_eq!(
+        manifest_field(
+            "contributes.configuration.properties['vilan.autoClosing.generics'].default"
+        ),
+        "true"
+    );
+    let description = manifest_field(
+        "contributes.configuration.properties['vilan.autoClosing.generics'].description",
+    );
+    for needed in ["`type`", "Vim", "type over"] {
+        assert!(
+            description.contains(needed),
+            "the description must say {needed:?} — why this is a setting: {description}"
+        );
+    }
+}
+
+/// The override TYPES THROUGH: every keystroke still reaches VS Code's own
+/// `default:type`, and the override only looks at `<` and `>` — so a
+/// keystroke it has no business with behaves exactly as without it.
+#[test]
+fn e222_the_override_types_every_character_through_default_type() {
+    let source = extension_source();
+    assert!(
+        source.contains("commands.registerCommand('type', typeThrough)"),
+        "the override is registered on `type`"
+    );
+    assert!(
+        source.contains("await commands.executeCommand('default:type', args);"),
+        "and forwards the keystroke to `default:type`"
+    );
+    // Keystrokes queue: a `<` awaiting its answer must not let the next
+    // character land before its `>`.
+    assert!(
+        source.contains("const turn = typing.then(() => typeOne(args));"),
+        "keystrokes are serialised behind the pending `<`"
+    );
+    // Only while the setting asks for it — and a registration refused
+    // (another extension owns `type`) leaves the override absent, not broken.
+    assert!(source.contains("get<boolean>('autoClosing.generics', true)"));
+    assert!(source.contains("another extension already owns the `type` command"));
+}
+
+/// The overtype: a `>` typed onto one the override placed moves the caret and
+/// inserts nothing — the thing an `onTypeFormatting` edit could never do.
+#[test]
+fn e222_a_placed_closer_is_typed_over_not_doubled() {
+    let source = extension_source();
+    assert!(source.contains("if (args.text === '>' && pairsIn(editor) && typeOverClosing(editor)) {\n        return;\n    }"));
+    assert!(source.contains("editor.selection = new Selection(past, past);"));
+    // The placed `>` rides the `<`'s own undo step.
+    assert!(source.contains("undoStopBefore: false"));
+    // And the placed set follows the text (an edit elsewhere shifts it; an edit
+    // over it forgets it), which is what keeps the swallow on THE `>`.
+    assert!(source.contains("workspace.onDidChangeTextDocument(trackClosers)"));
+}
+
+/// The override places a `>` only where VS Code would fire any other pair —
+/// the language configuration's `autoCloseBefore` — so the two lists are ONE
+/// list, held equal here.
+#[test]
+fn e222_the_override_fires_before_the_configurations_own_set() {
+    let source = extension_source();
+    let config = json_field(
+        &extension_dir().join("language-configuration.json"),
+        "JSON.parse(require('fs').readFileSync(process.env.VILAN_JSON, 'utf8')).autoCloseBefore",
+    );
+    // node prints the value itself: the newline and tab come out raw, and a
+    // trailing tab is trimmed by `json_field`'s `trim_end` — compare on the
+    // trimmed form of both.
+    assert_eq!(
+        single_quoted_constant(&source, "AUTO_CLOSE_BEFORE").trim_end(),
+        config.trim_end(),
+        "extension.ts's AUTO_CLOSE_BEFORE and language-configuration.json's autoCloseBefore disagree"
+    );
+}
+
+// --- F27 R1/R6: the platform status line --------------------------------------
+
+/// The status bar says which platform the active vilan file is analyzed under
+/// and which kind of fact chose it — `analyzed as: browser — declared` — with
+/// the whole reason as its tooltip, and it follows the file as it is edited.
+#[test]
+fn f27_the_status_line_names_the_platform_and_the_kind_of_fact() {
+    let source = extension_source();
+    assert!(source.contains("window.createStatusBarItem(StatusBarAlignment.Right, 100)"));
+    assert!(
+        source.contains("`analyzed as: ${answer.platform} — ${answer.kind}`"),
+        "the line's text"
+    );
+    assert!(source.contains("platformStatus.tooltip = answer.reason"));
+    // Shown for a vilan file only, and re-asked after edits settle.
+    assert!(source.contains("editor.document.languageId !== 'vilan'"));
+    assert!(
+        source.contains("window.onDidChangeActiveTextEditor(() => void refreshPlatformStatus())")
+    );
+    assert!(source.contains("schedulePlatformRefresh();"));
 }

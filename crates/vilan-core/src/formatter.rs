@@ -15,7 +15,7 @@ use std::cell::Cell;
 use crate::node::{
     ANONYMOUS_TYPE_BINDER, BinaryOp, Convention, ExportScope, Exposure, ExternBinding, Func,
     GenericArguments, GenericParameters, ImplSelector, ImportBranch, ImportModifier, ImportTail,
-    Node, NodeIfBranch, NodeList, Pattern, StructInitializerField,
+    ItemLabels, Node, NodeIfBranch, NodeList, Pattern, StructInitializerField,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -634,9 +634,9 @@ fn import_kind_and_branch<'node, 'src>(
     node: &'node Node<'src>,
 ) -> Option<(ImportKind, &'node ImportBranch<'src>)> {
     match node {
-        Node::Import(branch, _) => Some((ImportKind::Import, branch)),
+        Node::Import(branch, ..) => Some((ImportKind::Import, branch)),
         Node::Use(branch) => Some((ImportKind::Use, branch)),
-        Node::Export(_, inner) => import_kind_and_branch(&inner.0),
+        Node::Export(_, inner, _) => import_kind_and_branch(&inner.0),
         _ => None,
     }
 }
@@ -2749,7 +2749,7 @@ fn try_extend_import<'src>(
 /// which is not what an add-import quickfix asked for).
 fn plain_import_branch<'node, 'src>(node: &'node Node<'src>) -> Option<&'node ImportBranch<'src>> {
     match node {
-        Node::Import(branch, _) => Some(branch),
+        Node::Import(branch, ..) => Some(branch),
         _ => None,
     }
 }
@@ -3460,6 +3460,15 @@ struct Printer<'src> {
     atomic_elements: bool,
     /// The package's `[fmt]` knobs (E205).
     options: FormatOptions,
+    /// Where the item being printed puts its DECLARATION line, when attribute
+    /// lines went above it (E219): the output offset just past that line's
+    /// indentation. An attribute line is a line of its own with a budget of
+    /// its own — it cannot be broken, so an over-long one is simply long — and
+    /// the width rule measures the declaration from here, so a long
+    /// `[deprecated("…")]` no longer splits the short signature beneath it.
+    /// Set by [`Printer::end_attribute_line`], taken by
+    /// [`Printer::begin_split_reprint`].
+    head_start: Option<usize>,
 }
 
 impl<'src> Printer<'src> {
@@ -3478,6 +3487,7 @@ impl<'src> Printer<'src> {
             probing: false,
             atomic_elements: false,
             options,
+            head_start: None,
         }
     }
 
@@ -3793,6 +3803,10 @@ impl<'src> Printer<'src> {
             let statement_start = self.out.len();
             let comment_cursor = self.cursor;
             let terminated = Self::needs_semicolon(&item.0);
+            // E219: this statement's declaration line is its own; the item
+            // that ENCLOSES it (a function whose body this is) keeps its own
+            // until its own width rule reads it.
+            let enclosing_head = self.head_start.take();
             self.print_item(item);
             if terminated {
                 self.out.push(';');
@@ -3804,6 +3818,7 @@ impl<'src> Printer<'src> {
                     self.out.push(';');
                 }
             }
+            self.head_start = enclosing_head;
             self.flush_trailing_comment(range.end);
             prev_end = range.end;
             index += 1;
@@ -4323,10 +4338,11 @@ impl<'src> Printer<'src> {
                 }
                 self.out.push(';');
             }
-            Node::Export(scope, inner) => {
+            Node::Export(scope, inner, labels) => {
                 self.out.push_str("export");
                 self.print_export_scope(scope.as_deref());
                 self.out.push(' ');
+                self.print_import_labels(labels);
                 self.print_import_like(&inner.0);
             }
             _ => {}
@@ -4366,7 +4382,7 @@ impl<'src> Printer<'src> {
     /// as already-formatted). S6's curation is what made it reachable: five of
     /// std's module-level `let`s carry the marker.
     fn needs_semicolon(node: &Node<'src>) -> bool {
-        if let Node::Export(_, inner) = node {
+        if let Node::Export(_, inner, _) = node {
             return Self::needs_semicolon(&inner.0);
         }
         // `const` asks the DECLARATION under it for the same reason (N89, G24):
@@ -4403,10 +4419,10 @@ impl<'src> Printer<'src> {
                 | Node::Match(_, _)
                 | Node::Block(_)
                 | Node::Func(_)
-                | Node::Struct(_, _, _, _, _)
-                | Node::Enum(_, _, _, _)
-                | Node::Impl(_, _, _)
-                | Node::Trait(_, _, _, _)
+                | Node::Struct(..)
+                | Node::Enum(..)
+                | Node::Impl(..)
+                | Node::Trait(..)
                 | Node::Module(_, _)
                 | Node::Derive(_, _)
                 | Node::Service(_, _)
@@ -4424,7 +4440,8 @@ impl<'src> Printer<'src> {
         match &item.0 {
             // `[resource ][external ]struct Name[<…>][;|{ fields }]` — canonical
             // modifier order is `resource external struct` (destruction.md §3).
-            Node::Struct(name, generics, external, resource, body) => {
+            Node::Struct(name, generics, external, resource, body, labels) => {
+                self.print_item_labels(labels);
                 if *resource {
                     self.out.push_str("resource ");
                 }
@@ -4491,7 +4508,8 @@ impl<'src> Printer<'src> {
                 }
             }
             // `[resource ]enum Name[<…>] { Variant[(payload)][ = backing value], … }`.
-            Node::Enum(name, generics, resource, variants) => {
+            Node::Enum(name, generics, resource, variants, labels) => {
+                self.print_item_labels(labels);
                 if *resource {
                     self.out.push_str("resource ");
                 }
@@ -4504,13 +4522,20 @@ impl<'src> Printer<'src> {
                     self.out.push_str(" {");
                     self.indent += 1;
                     let mut prev_end = variants.1.into_range().start + 1;
-                    for ((variant_name, payload, backing), span) in &variants.0 {
+                    for ((variant_name, payload, backing, internal), span) in &variants.0 {
                         let range = span.into_range();
                         let after_comments = self.flush_comments_before(range.start, prev_end);
                         if self.has_blank_between(after_comments, range.start) {
                             self.blank_line();
                         }
                         self.line();
+                        // E221: a variant's label leads it on its line, as a
+                        // field's does.
+                        if let Some(reason) = internal {
+                            self.out.push_str("[internal(\"");
+                            self.out.push_str(reason);
+                            self.out.push_str("\")] ");
+                        }
                         self.out.push_str(variant_name);
                         if !payload.is_empty() {
                             self.out.push('(');
@@ -4564,8 +4589,9 @@ impl<'src> Printer<'src> {
             // the shape `fun`'s parameter list takes. Before this the header
             // had no split form at all, so a hand-wrapped one reprinted to a
             // different token stream and the file declined.
-            Node::Impl(subject, traits, body) => {
+            Node::Impl(subject, traits, body, labels) => {
                 let split = std::mem::take(&mut self.split);
+                self.print_item_labels(labels);
                 self.out.push_str("impl ");
                 if traits.is_empty() {
                     self.print_type_splitting_the_tail(&subject.0, split);
@@ -4577,7 +4603,8 @@ impl<'src> Printer<'src> {
                 self.print_braced_items(body);
             }
             // `trait Name[ with A + B] { items }`.
-            Node::Trait(name, generics, supertraits, body) => {
+            Node::Trait(name, generics, supertraits, body, labels) => {
+                self.print_item_labels(labels);
                 self.out.push_str("trait ");
                 self.out.push_str(name.0);
                 self.print_generic_parameters(generics.as_deref());
@@ -4591,7 +4618,7 @@ impl<'src> Printer<'src> {
                 let names: Vec<&str> = names.iter().map(|(name, _)| *name).collect();
                 self.out.push_str(&names.join(", "));
                 self.out.push_str(")]");
-                self.line();
+                self.end_attribute_line();
                 self.print_item(derived);
             }
             // `[service]` / `[service(Client, client = H)]` / `[client_service]`
@@ -4620,18 +4647,19 @@ impl<'src> Printer<'src> {
                         self.out.push(')');
                     }
                     self.out.push(']');
-                    self.line();
+                    self.end_attribute_line();
                 }
                 if attribute.client_side {
                     self.out.push_str("[client_service]");
-                    self.line();
+                    self.end_attribute_line();
                 }
                 self.print_item(item);
             }
-            Node::Export(scope, exported) => {
+            Node::Export(scope, exported, labels) => {
                 self.out.push_str("export");
                 self.print_export_scope(scope.as_deref());
                 self.out.push(' ');
+                self.print_import_labels(labels);
                 self.print_item(exported);
             }
             // G24's `const fun` — a DECLARATION under a marker, printed the way
@@ -4651,6 +4679,8 @@ impl<'src> Printer<'src> {
             // `needs_semicolon` leaves it out of its exclusion list and the
             // statement printer supplies the `;`.
             Node::ExportAll => self.out.push_str("export *"),
+            // F27 R1: the file's platform; its `;` is the statement loop's.
+            Node::ModulePlatform(patterns) => self.print_platform_attribute(patterns),
             // `mod name { items }`.
             Node::Module(name, body) => {
                 self.out.push_str("mod ");
@@ -4676,7 +4706,7 @@ impl<'src> Printer<'src> {
                     self.out.push(')');
                 }
                 self.out.push(']');
-                self.line();
+                self.end_attribute_line();
                 self.print_item(annotated);
             }
             // Anything else is an expression appearing as a statement.
@@ -5241,44 +5271,87 @@ impl<'src> Printer<'src> {
     /// `function` production), and `[deprecated("use …")]` leads it — so it is
     /// printed first. The steer is the lexer's raw string text, re-emitted
     /// between quotes exactly as `[extern(..)]`'s symbols are.
+    /// The labels an item carries about itself (E221), each on its own line
+    /// above it — the shape `print_func` gives a function's. PRINTED, never
+    /// skipped: an attribute with no printer arm makes the token net decline
+    /// every file carrying one.
+    fn print_item_labels(&mut self, labels: &ItemLabels<'src>) {
+        let Some(labels) = labels else {
+            return;
+        };
+        // B382: the ordered prefix a function's is — `[deprecated]` leads.
+        if let Some(steer) = labels.deprecated {
+            self.out.push_str("[deprecated(\"");
+            self.out.push_str(steer);
+            self.out.push_str("\")]");
+            self.end_attribute_line();
+        }
+        if let Some(reason) = labels.internal {
+            self.out.push_str("[internal(\"");
+            self.out.push_str(reason);
+            self.out.push_str("\")]");
+            self.end_attribute_line();
+        }
+        if !labels.platform.is_empty() {
+            self.print_platform_attribute(&labels.platform);
+            self.end_attribute_line();
+        }
+    }
+
+    /// B382: a re-export's `[deprecated("…")]` (carried by the `export`), on
+    /// the statement's own line — a re-export is one line, and the attribute is
+    /// about the NAME it publishes.
+    fn print_import_labels(&mut self, labels: &ItemLabels<'src>) {
+        if let Some(steer) = labels.as_ref().and_then(|labels| labels.deprecated) {
+            self.out.push_str("[deprecated(\"");
+            self.out.push_str(steer);
+            self.out.push_str("\")] ");
+        }
+    }
+
+    /// `[platform("a", "b")]`, the patterns as written — a function's fence, an
+    /// item's label and a file's platform (F27 R1) all print through here.
+    fn print_platform_attribute(&mut self, patterns: &[Spanned<&'src str>]) {
+        let patterns = patterns
+            .iter()
+            .map(|(pattern, _)| format!("\"{pattern}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.out.push_str(&format!("[platform({patterns})]"));
+    }
+
     fn print_func(&mut self, func: &Func<'src>) {
         if let Some(steer) = func.deprecated {
             self.out.push_str("[deprecated(\"");
             self.out.push_str(steer);
             self.out.push_str("\")]");
-            self.line();
+            self.end_attribute_line();
         }
         if let Some(reason) = func.internal {
             self.out.push_str("[internal(\"");
             self.out.push_str(reason);
             self.out.push_str("\")]");
-            self.line();
+            self.end_attribute_line();
         }
         if let Some(binding) = &func.extern_binding {
             self.print_extern_attribute(binding, func.extern_retains);
-            self.line();
+            self.end_attribute_line();
         }
         if func.must_use {
             self.out.push_str("[must_use]");
-            self.line();
+            self.end_attribute_line();
         }
         if func.rpc {
             self.out.push_str("[rpc]");
-            self.line();
+            self.end_attribute_line();
         }
         if func.trait_only {
             self.out.push_str("[trait_only]");
-            self.line();
+            self.end_attribute_line();
         }
         if !func.platform_fence.is_empty() {
-            let patterns = func
-                .platform_fence
-                .iter()
-                .map(|(pattern, _)| format!("\"{pattern}\""))
-                .collect::<Vec<_>>()
-                .join(", ");
-            self.out.push_str(&format!("[platform({patterns})]"));
-            self.line();
+            self.print_platform_attribute(&func.platform_fence);
+            self.end_attribute_line();
         }
         if func.is_async {
             self.out.push_str("async ");
@@ -5521,11 +5594,13 @@ impl<'src> Printer<'src> {
             // block's value), so it takes the same width rule.
             let statement_start = self.out.len();
             let comment_cursor = self.cursor;
+            let enclosing_head = self.head_start.take();
             self.print_expr(tail);
             if self.begin_split_reprint(statement_start, comment_cursor) {
                 self.print_expr(tail);
                 self.split = Split::Off;
             }
+            self.head_start = enclosing_head;
             self.flush_trailing_comment(tail_range.end);
             prev_end = tail_range.end;
         }
@@ -5602,7 +5677,7 @@ impl<'src> Printer<'src> {
             | Node::Await(_)
             | Node::Async(_) => 10,
             Node::Assign(_, _, _)
-            | Node::Let(_, _, _, _, _)
+            | Node::Let(..)
             | Node::Closure(_)
             | Node::If(_)
             | Node::For(_, _)
@@ -5735,12 +5810,27 @@ impl<'src> Printer<'src> {
         display_width(first_line) > LINE_BUDGET
     }
 
+    /// Ends an ATTRIBUTE line (`[derive(..)]`, `[deprecated(..)]`, a fence…)
+    /// and marks the line after it as the declaration's (E219).
+    fn end_attribute_line(&mut self) {
+        self.line();
+        self.head_start = Some(self.out.len());
+    }
+
     /// Rolls the output and the comment cursor back to the start of the
     /// statement just printed inline and arms the statement-level split, so the
     /// caller can print the same statement again in split form. Returns `false`
     /// — changing nothing — when the statement fits the budget.
+    ///
+    /// E219: the line measured is the DECLARATION's — the first one after any
+    /// attribute lines the item printed above it — not the statement's first.
+    /// The attribute lines are theirs alone and nothing breaks them.
     fn begin_split_reprint(&mut self, statement_start: usize, comment_cursor: usize) -> bool {
-        if !self.over_line_budget(statement_start) {
+        let measured = match self.head_start.take() {
+            Some(head) if head >= statement_start => head,
+            _ => statement_start,
+        };
+        if !self.over_line_budget(measured) {
             return false;
         }
         self.out.truncate(statement_start);
@@ -7483,7 +7573,10 @@ impl<'src> Printer<'src> {
                 self.out.push_str("const ");
                 self.print_split_operand(inner, 0, split);
             }
-            Node::Let(name, declared_type, value, mutable, lazy) => {
+            Node::Let(name, declared_type, value, mutable, lazy, labels) => {
+                // E221: a module binding's labels, each on its own line above
+                // it, as a function's are.
+                self.print_item_labels(labels);
                 // `lazy` precedes the binder word, as it does on a parameter
                 // (lazy.md §2). It is a keyword with no node of its own beyond
                 // the flag, so dropping it here would silently turn a deferred
@@ -8679,6 +8772,120 @@ mod idempotency {
             "and a function's leads the ordered prefix:\n{formatted}"
         );
         assert_fixed_point("internal", source);
+    }
+
+    /// E219: the ITEM's repro. An attribute line has a width of its own and
+    /// nothing breaks it; the signature under it is measured on its own line,
+    /// so a 110-column steer no longer puts one parameter per line.
+    #[test]
+    fn a_long_attribute_line_leaves_the_short_signature_below_it_alone() {
+        let source = concat!(
+            "[deprecated(\"use two() instead, which takes the same arguments and returns the same sum, and is what every caller wants\")]\n",
+            "fun one(a: i32, b: i32): i32 {\n\tlet c = a;\n\tc + b\n}\n",
+        );
+        assert_eq!(format(source), source, "the repro reprints unchanged");
+        assert_fixed_point("e219_repro", source);
+    }
+
+    /// Every attribute-carrying position takes the rule: a method in an impl,
+    /// a labelled struct, a derive line, a user macro attribute, and a label
+    /// stacked on another.
+    #[test]
+    fn every_attribute_line_has_its_own_budget() {
+        let long = "an internal reason long enough on its own to run past the hundred-column budget of a line";
+        let source = format!(
+            concat!(
+                "[internal(\"{long}\")]\n",
+                "struct Pair<type T> {{\n\tleft: T,\n\tright: T,\n}}\n\n",
+                "impl Pair<type T> {{\n",
+                "\t[deprecated(\"{long}\")]\n",
+                "\t[must_use]\n",
+                "\tfun swap(self, extra: i32): i32 {{\n\t\textra\n\t}}\n",
+                "}}\n\n",
+                "[derive(Clone, PartialEq, Hashable, Json, Wire, Debug, Display, Default, Ord, PartialOrd, Eq)]\n",
+                "struct Key {{\n\tid: i32,\n}}\n",
+            ),
+            long = long
+        );
+        assert_eq!(format(&source), source);
+        assert_fixed_point("e219_positions", &source);
+    }
+
+    /// The control: the rule still applies to the DECLARATION. A signature
+    /// that is itself over the budget splits under a short attribute and under
+    /// a long one alike — the attribute line changes nothing either way.
+    #[test]
+    fn an_over_budget_signature_still_splits_under_any_attribute() {
+        let long_signature = "fun combine(first_argument: i32, second_argument: i32, third_argument: i32, fourth_argument: i32): i32 {\n\t0\n}\n";
+        for attribute in [
+            "[must_use]\n",
+            "[deprecated(\"use two() instead, which takes the same arguments and returns the same sum, and is what every caller wants\")]\n",
+        ] {
+            let formatted = format(&format!("{attribute}{long_signature}"));
+            assert!(
+                formatted.contains("fun combine(\n\tfirst_argument: i32,\n"),
+                "{formatted}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deprecated_steer_survives_the_reprint_on_a_type_and_a_re_export() {
+        // B382: a type's steer on its own line, leading the prefix; a
+        // re-export's on the statement's own line.
+        let source = concat!(
+            "export [deprecated(\"use pkg::inner::DeltaCursor\")] import pkg::inner::DeltaCursor as KeyedCursor;\n\n",
+            "[deprecated(\"use Next\")]\n",
+            "[internal(\"old plumbing\")]\n",
+            "struct Previous {}\n\n",
+            "[deprecated(\"use Shape\")]\n",
+            "trait Shaped {\n\tfun area(self): i32;\n}\n",
+        );
+        assert_eq!(format(source), source);
+        assert_fixed_point("deprecated_b382", source);
+    }
+
+    #[test]
+    fn a_platform_declaration_survives_the_reprint_at_every_f27_position() {
+        // F27 R1: the file's own line, an impl's label and a nominal's.
+        let source = concat!(
+            "[platform(\"browser\")];\n\n",
+            "import std::ui::Region;\n\n",
+            "[platform(\"browser\")]\n",
+            "struct Slot {}\n\n",
+            "[platform(\"browser\", \"@process\")]\n",
+            "impl Slot {\n\tfun f(self) {}\n}\n",
+        );
+        assert_eq!(format(source), source);
+        assert_fixed_point("platform_f27", source);
+    }
+
+    #[test]
+    fn an_internal_label_survives_the_reprint_on_every_e221_position() {
+        // E221: a struct, an enum and its variant, a trait, a module binding —
+        // each printed where it was written, or the token net declines the
+        // file for an attribute the printer dropped.
+        let source = concat!(
+            "[internal(\"a struct\")]\n",
+            "struct Region {\n\tlabel: str,\n}\n\n",
+            "[internal(\"an enum\")]\n",
+            "enum Side {\n\tLeft,\n\t[internal(\"a variant\")] Auto,\n}\n\n",
+            "[internal(\"a trait\")]\n",
+            "trait Seam {\n\tfun seam(self): i32;\n}\n\n",
+            "[internal(\"a binding\")]\n",
+            "let cache = 3;\n\n",
+            "export [internal(\"exported\")]\n",
+            "struct Marker {}\n\n",
+            "[derive(Clone)]\n",
+            "[internal(\"derived\")]\n",
+            "struct Point {\n\tx: i32,\n}\n",
+        );
+        let formatted = format(source);
+        assert_eq!(
+            formatted, source,
+            "the canonical spelling reprints byte-identically"
+        );
+        assert_fixed_point("internal_e221", source);
     }
 }
 

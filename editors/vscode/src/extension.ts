@@ -8,12 +8,18 @@ import {
     CancellationToken,
     CodeAction,
     CodeActionKind,
+    Disposable,
     FileSystemWatcher,
     LogOutputChannel,
     ExtensionContext,
     Range,
+    Selection,
+    StatusBarAlignment,
+    StatusBarItem,
     TextDocument,
+    TextDocumentChangeEvent,
     TextEdit,
+    TextEditor,
 } from 'vscode';
 import {
     DidChangeConfigurationNotification,
@@ -209,7 +215,307 @@ function readFeatureConfig(): object {
         inlayHints: { enabled: config.get<boolean>('inlayHints.enabled', true) },
         semanticTokens: { enabled: config.get<boolean>('semanticTokens.enabled', true) },
         completion: { functionCall: config.get<string>('completion.functionCall', 'full') },
+        // E222: not the setting — whether the override is INSTALLED. The two
+        // differ when another extension owns `type`, and then the server must
+        // keep placing the `>` itself.
+        autoClosing: { generics: typeOverride !== undefined },
     };
+}
+
+// --- E222: a generic `<` pairs, and its `>` types over ------------------------
+//
+// The server has placed a generic `<`'s `>` since E202 (`onTypeFormatting`),
+// and that half cannot be finished from the server: VS Code types OVER a
+// closing character only when it auto-inserted that character itself, and an
+// edit cannot move the caret, so typing the `>` of `List<i32>` by hand gave
+// `List<i32>>`. A static `autoClosingPairs` entry would buy the overtype and
+// grow a `>` in every `a < b` — its `notIn` filter sees only string, comment
+// and regex scopes, and the token left of the caret is `Other` for `List<` and
+// for `a <` alike (editor-39 pinned exactly that).
+//
+// So the extension takes the keystroke. `type` is overridden, and the override
+// is thin: every character is typed by VS Code's own `default:type` exactly as
+// before, and only two are then looked at — a `<` asks the server
+// `vilan/opensAGenericList` and, on a yes, places the `>` itself; a `>` typed
+// onto a `>` this override placed moves the caret past it instead (the map of
+// placed closers below IS the overtype). It declares itself to the server in
+// `initializationOptions` (`autoClosing.generics`, via `readFeatureConfig`), and
+// the server then stops answering `<` through `onTypeFormatting` — a client
+// that never declares it keeps that answer.
+//
+// It is a SETTING (`vilan.autoClosing.generics`, on by default) because only
+// one extension can own `type`: Vim emulation (VSCodeVim) takes it for its own
+// modes. With the setting off — or when another extension already owns the
+// command and registering fails — the override is absent, the server is told
+// so, and the `<` behaves as it did before this.
+
+/// E222: the server's custom request, spelled exactly as `vilan-lsp`'s
+/// `OPENS_A_GENERIC_LIST` declares it; `book_sync` gates the two spellings.
+const OPENS_A_GENERIC_LIST = 'vilan/opensAGenericList';
+
+/// How long a `<` waits for the server before it gives up on its `>`. Every
+/// keystroke after it queues behind the answer (typed text must never reorder),
+/// so the wait is bounded well under a typing interval; an answer that misses
+/// it costs one `>` the author types themselves, which is today's behaviour.
+const GENERIC_ANSWER_TIMEOUT_MS = 150;
+
+/// The characters a `>` may be placed before — the language configuration's own
+/// `autoCloseBefore`, which is where VS Code lets every OTHER pair fire, so a `<`
+/// typed in front of a word (`List|i32`) does not become `List<>i32`.
+/// `vscode_extension.rs` holds the two strings equal.
+const AUTO_CLOSE_BEFORE = ';:.,=}])> \n\t';
+
+/// The installed override, or `undefined` while the setting is off or another
+/// extension owns `type`.
+let typeOverride: Disposable | undefined;
+
+/// Every keystroke's turn, in order: a `<` awaiting the server holds the
+/// characters typed after it, so they land after its `>` rather than before.
+let typing: Promise<void> = Promise.resolve();
+
+/// The `>`s this override placed and may type over, as document offsets per URI.
+/// Kept current through every edit, and forgotten once the caret leaves their
+/// line — VS Code's own overtype forgets an auto-closed character the same way.
+const placedClosers = new Map<string, number[]>();
+
+/// Install or remove the override to match `vilan.autoClosing.generics`.
+/// Returns whether the installed state changed, which is when the server must
+/// be told.
+function syncTypeOverride(): boolean {
+    const wanted = workspace.getConfiguration('vilan').get<boolean>('autoClosing.generics', true);
+    if (wanted && typeOverride === undefined) {
+        try {
+            typeOverride = commands.registerCommand('type', typeThrough);
+            return true;
+        } catch (error) {
+            outputChannel?.warn(
+                'vilan.autoClosing.generics: another extension already owns the `type` command ' +
+                    '(Vim emulation does), so a generic `<` is paired by the server alone and ' +
+                    `its \`>\` is not typed over (${error instanceof Error ? error.message : String(error)})`,
+            );
+            return false;
+        }
+    }
+    if (!wanted && typeOverride !== undefined) {
+        typeOverride.dispose();
+        typeOverride = undefined;
+        placedClosers.clear();
+        return true;
+    }
+    return false;
+}
+
+/// The override itself: queue the keystroke behind the one before it.
+function typeThrough(args: { text: string }): Promise<void> {
+    const turn = typing.then(() => typeOne(args));
+    typing = turn.catch(() => undefined);
+    return turn;
+}
+
+/// Whether a keystroke in `editor` is one this override pairs at all: a vilan
+/// document with one caret and nothing selected. A selection is VS Code's to
+/// surround (`<>` is a surrounding pair), and several carets are left to it too.
+function pairsIn(editor: TextEditor | undefined): editor is TextEditor {
+    return (
+        editor !== undefined &&
+        editor.document.languageId === 'vilan' &&
+        editor.selections.length === 1 &&
+        editor.selection.isEmpty
+    );
+}
+
+async function typeOne(args: { text: string }): Promise<void> {
+    const editor = window.activeTextEditor;
+    if (args.text === '>' && pairsIn(editor) && typeOverClosing(editor)) {
+        return;
+    }
+    await commands.executeCommand('default:type', args);
+    if (args.text === '<' && pairsIn(editor)) {
+        await closeGenericList(editor);
+    }
+}
+
+/// A `>` typed onto one this override placed: move past it, insert nothing.
+function typeOverClosing(editor: TextEditor): boolean {
+    const document = editor.document;
+    const closers = placedClosers.get(document.uri.toString());
+    const caret = editor.selection.active;
+    const offset = document.offsetAt(caret);
+    const index = closers?.indexOf(offset) ?? -1;
+    if (closers === undefined || index < 0) {
+        return false;
+    }
+    closers.splice(index, 1);
+    if (document.getText(new Range(caret, caret.translate(0, 1))) !== '>') {
+        return false;
+    }
+    const past = caret.translate(0, 1);
+    editor.selection = new Selection(past, past);
+    return true;
+}
+
+/// The `<` has been typed; ask the server whether it opens a generic list, and
+/// if so place its `>` without moving the caret.
+async function closeGenericList(editor: TextEditor): Promise<void> {
+    if (!client) {
+        return;
+    }
+    const document = editor.document;
+    const caret = editor.selection.active;
+    const following = document.lineAt(caret.line).text.charAt(caret.character);
+    if (following !== '' && !AUTO_CLOSE_BEFORE.includes(following)) {
+        return;
+    }
+    const version = document.version;
+    let opens = false;
+    try {
+        opens = await Promise.race([
+            client.sendRequest<boolean>(
+                OPENS_A_GENERIC_LIST,
+                client.code2ProtocolConverter.asTextDocumentPositionParams(document, caret),
+            ),
+            new Promise<boolean>((resolve) =>
+                setTimeout(() => resolve(false), GENERIC_ANSWER_TIMEOUT_MS),
+            ),
+        ]);
+    } catch {
+        return;
+    }
+    // The answer is about the text the question was asked of; anything that
+    // moved since (the buffer, the caret, the focus) makes it stale.
+    if (
+        !opens ||
+        document.version !== version ||
+        window.activeTextEditor !== editor ||
+        !editor.selection.active.isEqual(caret)
+    ) {
+        return;
+    }
+    // Merged into the `<`'s own undo step: one undo takes back `<>`.
+    const placed = await editor.edit((builder) => builder.insert(caret, '>'), {
+        undoStopBefore: false,
+        undoStopAfter: false,
+    });
+    if (!placed) {
+        return;
+    }
+    editor.selection = new Selection(caret, caret);
+    const key = document.uri.toString();
+    const closers = placedClosers.get(key) ?? [];
+    closers.push(document.offsetAt(caret));
+    placedClosers.set(key, closers);
+}
+
+// --- F27 R1/R6: the platform a file is analyzed under -------------------------
+//
+// The platform decides which `std` twin a file's types come from, so a file
+// analyzed under the wrong one is full of errors about members that "do not
+// exist". The overlay note on such an error says why the file is where it is;
+// this says it BEFORE any error: `analyzed as: browser — declared` in the
+// status bar, the full reason in its tooltip, for the vilan file in front of
+// the author. The server answers from its last analysis
+// (`vilan/analysisPlatform`), so the line follows the file as it is edited —
+// type `[platform("browser")];` at the top and it turns to `declared`.
+
+/// The server's status request, spelled exactly as `vilan-lsp`'s
+/// `ANALYSIS_PLATFORM` declares it; `book_sync` gates the two spellings.
+const ANALYSIS_PLATFORM = 'vilan/analysisPlatform';
+
+/// How long after an edit the line asks again — past the server's own
+/// analysis debounce, so it asks about the analysis the edit produced.
+const PLATFORM_REFRESH_MS = 600;
+
+let platformStatus: StatusBarItem | undefined;
+let platformRefresh: ReturnType<typeof setTimeout> | undefined;
+
+interface AnalysisPlatform {
+    platform: string;
+    kind: string | null;
+    reason: string | null;
+}
+
+/// Ask the server about the active editor's file and show the answer, or hide
+/// the line for anything that is not a vilan file.
+async function refreshPlatformStatus(): Promise<void> {
+    const editor = window.activeTextEditor;
+    if (!platformStatus) {
+        return;
+    }
+    if (!client || !editor || editor.document.languageId !== 'vilan') {
+        platformStatus.hide();
+        return;
+    }
+    let answer: AnalysisPlatform | null = null;
+    try {
+        answer = await client.sendRequest<AnalysisPlatform | null>(ANALYSIS_PLATFORM, {
+            uri: editor.document.uri.toString(),
+        });
+    } catch {
+        answer = null;
+    }
+    if (!answer || window.activeTextEditor !== editor) {
+        platformStatus.hide();
+        return;
+    }
+    platformStatus.text = answer.kind
+        ? `analyzed as: ${answer.platform} — ${answer.kind}`
+        : `analyzed as: ${answer.platform}`;
+    platformStatus.tooltip = answer.reason
+        ? `This file is analyzed under ${answer.platform}: ${answer.reason}`
+        : `This file is analyzed under ${answer.platform}`;
+    platformStatus.show();
+}
+
+/// Ask again once the edits have settled into an analysis.
+function schedulePlatformRefresh(): void {
+    if (platformRefresh !== undefined) {
+        clearTimeout(platformRefresh);
+    }
+    platformRefresh = setTimeout(() => {
+        platformRefresh = undefined;
+        void refreshPlatformStatus();
+    }, PLATFORM_REFRESH_MS);
+}
+
+/// Keep every placed `>` at its character through edits; one an edit replaces
+/// is gone.
+function trackClosers(changed: TextDocumentChangeEvent): void {
+    const key = changed.document.uri.toString();
+    const closers = placedClosers.get(key);
+    if (closers === undefined) {
+        return;
+    }
+    for (const change of changed.contentChanges) {
+        const start = change.rangeOffset;
+        const end = start + change.rangeLength;
+        const delta = change.text.length - change.rangeLength;
+        for (let index = closers.length - 1; index >= 0; index--) {
+            if (closers[index] >= end) {
+                closers[index] += delta;
+            } else if (closers[index] >= start) {
+                closers.splice(index, 1);
+            }
+        }
+    }
+    if (closers.length === 0) {
+        placedClosers.delete(key);
+    }
+}
+
+/// Forget the placed `>`s once the caret leaves their line.
+function forgetDistantClosers(editor: TextEditor): void {
+    const key = editor.document.uri.toString();
+    const closers = placedClosers.get(key);
+    if (closers === undefined) {
+        return;
+    }
+    const line = editor.selection.active.line;
+    const kept = closers.filter((offset) => editor.document.positionAt(offset).line === line);
+    if (kept.length === 0) {
+        placedClosers.delete(key);
+    } else {
+        placedClosers.set(key, kept);
+    }
 }
 
 /// Resolve the language-server binary. An explicit `vilan.server.path` setting
@@ -397,7 +703,33 @@ export function activate(context: ExtensionContext): void {
     outputChannel = window.createOutputChannel('Vilan Language Server', { log: true });
     context.subscriptions.push(outputChannel);
 
-    void startClient(context);
+    // E222: installed BEFORE the client starts, so its first
+    // `initializationOptions` already say whether the `<` is ours.
+    syncTypeOverride();
+    context.subscriptions.push(
+        { dispose: () => typeOverride?.dispose() },
+        workspace.onDidChangeTextDocument(trackClosers),
+        window.onDidChangeTextEditorSelection((event) => forgetDistantClosers(event.textEditor)),
+        workspace.onDidCloseTextDocument((document) =>
+            placedClosers.delete(document.uri.toString()),
+        ),
+    );
+
+    // F27 R1/R6: the platform status line.
+    platformStatus = window.createStatusBarItem(StatusBarAlignment.Right, 100);
+    platformStatus.name = 'Vilan analysis platform';
+    context.subscriptions.push(
+        platformStatus,
+        { dispose: () => platformRefresh !== undefined && clearTimeout(platformRefresh) },
+        window.onDidChangeActiveTextEditor(() => void refreshPlatformStatus()),
+        workspace.onDidChangeTextDocument((event) => {
+            if (event.document === window.activeTextEditor?.document) {
+                schedulePlatformRefresh();
+            }
+        }),
+    );
+
+    void startClient(context).then(() => schedulePlatformRefresh());
 
     context.subscriptions.push(
         commands.registerCommand('vilan.restartServer', async () => {
@@ -440,9 +772,14 @@ export function activate(context: ExtensionContext): void {
                 await startClient(context);
                 return;
             }
+            // E222: the override follows its setting live, and the server
+            // hears about it only when the installed state actually moved.
+            const overrideMoved =
+                event.affectsConfiguration('vilan.autoClosing') && syncTypeOverride();
             if (
                 client &&
-                (event.affectsConfiguration('vilan.inlayHints') ||
+                (overrideMoved ||
+                    event.affectsConfiguration('vilan.inlayHints') ||
                     event.affectsConfiguration('vilan.semanticTokens') ||
                     event.affectsConfiguration('vilan.completion'))
             ) {

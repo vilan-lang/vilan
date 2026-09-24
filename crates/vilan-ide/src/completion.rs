@@ -2937,10 +2937,11 @@ impl<'a, 'src> Analysis<'a, 'src> {
         let mut items = Vec::new();
         if let Some(enumeration) = program.enums.get(&namespace) {
             for variant in &enumeration.variants {
-                items.push(Completion::bare(
-                    variant.name.to_string(),
-                    CompletionKind::EnumVariant,
-                ));
+                let mut completion =
+                    Completion::bare(variant.name.to_string(), CompletionKind::EnumVariant);
+                // E221: `Side::` offers a labelled variant only to its prefix.
+                completion.internal = variant.internal.map(str::to_string);
+                items.push(completion);
             }
             self.push_methods(namespace, false, &mut items);
         } else if program.structs.contains_key(&namespace) {
@@ -3346,23 +3347,23 @@ impl<'a, 'src> Analysis<'a, 'src> {
                     // a method and a free function answer alike and an
                     // external (std's runtime seams are often externals) is
                     // not a third answer.
-                    completion.internal = program
-                        .functions
-                        .get(&target)
-                        .and_then(|function| function.internal)
-                        .or_else(|| {
-                            program
-                                .external_functions
-                                .get(&target)
-                                .and_then(|external| external.internal)
-                        })
-                        .map(str::to_string);
+                    completion.internal =
+                        vilan_core::labels::internal_of(program, target).map(str::to_string);
                 }
             }
             CompletionKind::Variable => {
                 completion.detail = self.hover_label(id);
+                // E221: a module binding carries the label too.
+                completion.internal =
+                    vilan_core::labels::internal_of(program, id).map(str::to_string);
             }
-            _ => {}
+            // E221: a struct, an enum or a trait — the nominal positions S1
+            // left for this slice. One reader for every kind, so the rule the
+            // candidate is filtered by cannot answer differently per kind.
+            _ => {
+                completion.internal =
+                    vilan_core::labels::internal_of(program, id).map(str::to_string);
+            }
         }
         completion
     }

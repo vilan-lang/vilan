@@ -300,7 +300,15 @@ impl CanvasRenderingContext2D {
 
 	[extern(method, "arc")]
 	[platform("browser")]
-	external fun arc_with_counterclockwise(self, x: f64, y: f64, radius: f64, start_angle: f64, end_angle: f64, counterclockwise: bool): void;
+	external fun arc_with_counterclockwise(
+		self,
+		x: f64,
+		y: f64,
+		radius: f64,
+		start_angle: f64,
+		end_angle: f64,
+		counterclockwise: bool,
+	): void;
 
 	[extern(method, "moveTo")]
 	[platform("browser")]

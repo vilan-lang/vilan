@@ -3344,6 +3344,117 @@ fn calling_an_unannotated_closure_parameter_defers() {
     );
 }
 
+// --- B382: `[deprecated("use …")]` on a type and on a re-export ------------
+
+/// A labelled import that is not EXPORTED publishes no name, so the steer has
+/// nobody to steer — refused, where it is written.
+#[test]
+fn a_deprecated_import_that_is_not_a_re_export_is_refused() {
+    assert_fails_with(
+        concat!(
+            "[deprecated(\"use something else\")] import std::io::print;\n\n",
+            "fun main() {\n\tprint(\"hi\");\n}\n",
+        ),
+        "`[deprecated(..)]` on an `import` deprecates the name a RE-EXPORT publishes",
+    );
+}
+
+/// The shared prefix admits `[platform(..)]` on an `impl` (F27 R1), and so
+/// parses the other two there — where they label nothing a reader names.
+#[test]
+fn a_deprecated_or_internal_impl_block_is_refused() {
+    for label in ["[deprecated(\"use B\")]", "[internal(\"plumbing\")]"] {
+        assert_fails_with(
+            &format!(
+                "struct A {{}}\n\n{label}\nimpl A {{\n\tfun f(self): i32 {{\n\t\t1\n\t}}\n}}\n\nfun main() {{}}\n"
+            ),
+            "nobody names an `impl` block",
+        );
+    }
+}
+
+/// A deprecated type is still a type: it compiles and runs unchanged, and its
+/// own module's uses of it are silent — the steer is for the OTHER modules
+/// (pinned through the binary in `vilan-cli`'s `diagnostics.rs`).
+#[test]
+fn a_deprecated_type_changes_nothing_the_program_means() {
+    let source = concat!(
+        "[deprecated(\"use Next\")]\n",
+        "struct Previous {\n\tat: i32,\n}\n\n",
+        "fun main() {\n\tlet old: Previous = Previous { at = 7 };\n\tprint(i\"{old.at}\");\n}\n",
+    );
+    assert_compiles_and_runs(source, "7\n");
+    assert!(warnings(source).is_empty(), "{:?}", warnings(source));
+}
+
+// --- E221: `[internal("reason")]` on the nominal and binding positions ----
+
+/// Every E221 position compiles and RUNS unchanged: the label is for the
+/// editor (and the opt-in lint), and it changes nothing the program means.
+#[test]
+fn internal_labels_change_nothing_the_program_means() {
+    assert_compiles_and_runs(
+        concat!(
+            "[internal(\"a struct\")]\n",
+            "struct Region {\n\tlabel: str,\n}\n\n",
+            "[internal(\"an enum\")]\n",
+            "enum Side {\n\tLeft,\n\t[internal(\"a variant\")] Auto,\n}\n\n",
+            "[internal(\"a trait\")]\n",
+            "trait Seam {\n\tfun seam(self): i32;\n}\n\n",
+            "impl Region with Seam {\n\tfun seam(self): i32 {\n\t\t7\n\t}\n}\n\n",
+            "[internal(\"a binding\")]\n",
+            "let cache = 3;\n\n",
+            "fun main() {\n",
+            "\tlet region = Region { label = \"r\" };\n",
+            "\tlet side = Side::Auto;\n",
+            "\tlet named = match side {\n\t\tSide::Left => \"left\",\n\t\tSide::Auto => \"auto\",\n\t};\n",
+            "\tprint(i\"{region.label} {named} {region.seam()} {cache}\");\n",
+            "}\n",
+        ),
+        "r auto 7 3\n",
+    );
+}
+
+/// A label on a LOCAL binding is refused: a module and a function body share
+/// the statement production, so the parser reads one anywhere, and only the
+/// finished program knows the binding has no reader outside its body.
+#[test]
+fn an_internal_label_on_a_local_binding_is_refused() {
+    assert_fails_spanning(
+        concat!(
+            "fun main() {\n",
+            "\t[internal(\"nobody can reach it\")]\n",
+            "\tlet hidden = 1;\n",
+            "\tprint(i\"{hidden}\");\n",
+            "}\n",
+        ),
+        "hidden",
+        "`hidden` is a local binding, and `[internal(..)]` labels an item on a module's surface",
+    );
+    // …while the same label on the MODULE binding is the E221 position.
+    assert_compiles_and_runs(
+        concat!(
+            "[internal(\"the shared one\")]\n",
+            "let shown = 1;\n\n",
+            "fun main() {\n\tprint(i\"{shown}\");\n}\n",
+        ),
+        "1\n",
+    );
+}
+
+/// Nothing warns by default: the lint is opt-in (`[lints] internal_use`), and
+/// a file with no manifest has not opted in. (The warning itself is pinned
+/// end to end in `vilan-cli`'s `diagnostics.rs`, where a manifest can say so.)
+#[test]
+fn an_internal_label_warns_nobody_by_default() {
+    let warned = warnings(concat!(
+        "[internal(\"a struct\")]\n",
+        "struct Region {\n\tlabel: str,\n}\n\n",
+        "fun main() {\n\tlet region = Region { label = \"r\" };\n\tprint(region.label);\n}\n",
+    ));
+    assert!(warned.is_empty(), "{warned:?}");
+}
+
 #[test]
 fn doc_hidden_is_refused_and_names_export() {
     // B318 §7.5, RULED 2026-09-13. `[doc(hidden)]` meant "callable, but omitted

@@ -25,7 +25,13 @@ impl HashBuffer {
 }
 
 [extern("node:crypto", "pbkdf2Sync")]
-external fun pbkdf2_sync(password: str, salt: str, iterations: i32, key_length: i32, digest: str): HashBuffer;
+external fun pbkdf2_sync(
+	password: str,
+	salt: str,
+	iterations: i32,
+	key_length: i32,
+	digest: str,
+): HashBuffer;
 
 [extern("node:crypto", "randomBytes")]
 external fun random_bytes_sync(length: i32): HashBuffer;

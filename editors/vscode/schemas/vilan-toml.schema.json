@@ -271,6 +271,19 @@
         }
       }
     },
+    "lints": {
+      "type": "object",
+      "description": "The warnings this package asks for that the compiler does not raise by default.",
+      "additionalProperties": false,
+      "properties": {
+        "internal_use": {
+          "type": "string",
+          "enum": ["allow", "warn"],
+          "description": "`warn`: a warning at every use of an `[internal(\"reason\")]` item outside the module that declares it. Default `allow` — the label on its own only changes what the editor shows.",
+          "default": "allow"
+        }
+      }
+    },
     "macro": {
       "type": "object",
       "description": "The compile-time interpreter's budget.",

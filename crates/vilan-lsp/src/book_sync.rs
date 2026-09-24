@@ -1303,6 +1303,39 @@ fn the_servers_declared_commands_are_the_ones_the_extension_sends() {
     }
 }
 
+/// E222: the server's custom request, asked by the extension's `type`
+/// override. The same two-languages hazard as the commands above — a typo in
+/// either literal is silent, and the symptom is a `<` that quietly stops
+/// pairing — so the extension's spelling is read out of its source and held to
+/// the server's constant.
+#[test]
+fn the_servers_custom_requests_are_the_ones_the_extension_asks() {
+    let extension = read(&repo_root().join(EXTENSION_SOURCE));
+    assert!(
+        extension.contains(&format!(
+            "const OPENS_A_GENERIC_LIST = '{}';",
+            crate::OPENS_A_GENERIC_LIST
+        )),
+        "{EXTENSION_SOURCE} must spell the server's `{}` as its OPENS_A_GENERIC_LIST",
+        crate::OPENS_A_GENERIC_LIST
+    );
+    // F27 R1/R6: the status line's request, the same two-languages hazard.
+    assert!(
+        extension.contains(&format!(
+            "const ANALYSIS_PLATFORM = '{}';",
+            crate::ANALYSIS_PLATFORM
+        )),
+        "{EXTENSION_SOURCE} must spell the server's `{}` as its ANALYSIS_PLATFORM",
+        crate::ANALYSIS_PLATFORM
+    );
+    // And the declaration it makes is the key the server reads.
+    assert!(
+        extension.contains("autoClosing: { generics: typeOverride !== undefined }"),
+        "{EXTENSION_SOURCE} must declare `autoClosing.generics` — whether the \
+         override is INSTALLED — in the feature config the server reads"
+    );
+}
+
 /// The extension's one source file — read as TEXT, like the server's own
 /// sources above, because what is gated is a string literal in it.
 const EXTENSION_SOURCE: &str = "editors/vscode/src/extension.ts";

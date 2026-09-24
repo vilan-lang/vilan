@@ -8,7 +8,7 @@ use crate::id::Id;
 use crate::node::{
     ANONYMOUS_TYPE_BINDER, BackingLiteral, BinaryOp, Convention, EnumVariant, Exposure,
     ExternBinding, Func, GenericParameters, ImplSelector, ImportBranch, ImportModifier, ImportTail,
-    Node, NodeIfBranch, NodeList, Pattern, ServiceAttr,
+    Labels, Node, NodeIfBranch, NodeList, Pattern, ServiceAttr,
 };
 use crate::span::{Span, Spanned};
 use crate::target::{Platform, PlatformPattern};
@@ -1505,6 +1505,9 @@ pub struct EnumVariantDeclaration<'src> {
     /// one (C-style), from 0. There is no successor of `"start"`, so a string
     /// backing must be written on every variant (§3.1(a)).
     pub backing_value: BackingValue,
+    /// Declared `[internal("reason")]` (E221) — `Field::internal`'s twin,
+    /// since a variant is an enum's field-level case.
+    pub internal: Option<&'src str>,
 }
 
 /// One variant as [`read_enum_backing`] resolved it (`backed-enums.md` §10).
@@ -1595,7 +1598,7 @@ pub(crate) fn read_enum_backing<'a>(
     let mut backing_owners: IndexMap<String, (&'a str, Span)> = IndexMap::default();
     let mut read: Vec<VariantBacking<'a>> = Vec::with_capacity(variants.len());
     for variant in variants {
-        let (variant_name, payload, explicit_backing) = &variant.0;
+        let (variant_name, payload, explicit_backing, _internal) = &variant.0;
         let variant_name = *variant_name;
         let has_payload = !payload.is_empty();
         let explicit_backing = explicit_backing.as_ref();
@@ -3463,7 +3466,7 @@ pub struct Analyzer<'src> {
     /// 'anchor'" from a contradiction into an answer ("the `browser` twin of
     /// `std::ui` declares it"). Recorded at load time, where the layer roots
     /// and the module's path are both in hand; read only at a diagnostic.
-    std_layer_twin_files: HashMap<SourceId, Vec<(String, String, PathBuf)>>,
+    std_layer_twin_files: HashMap<SourceId, Vec<(String, String, PathBuf, Vec<String>)>>,
     // E200: the lazy ARGUMENTS `check_lazy_arguments` refused in its own words
     // (ledger row 475, "this argument is the resource `T` …"). Recorded so R9's
     // thunk arm can stand down on exactly those — one diagnostic per root cause
@@ -4266,6 +4269,12 @@ pub struct Analyzer<'src> {
     // are gated on, and "this parameter's type is a resource" is wrong whether
     // or not anybody calls it.
     lazy_eager_parameters: HashSet<Id>,
+    // E221: the labels a nominal, trait or binding declaration carried
+    // (`[internal("reason")]`), keyed by its entity id. A function's own live
+    // on `Function`, and a field's and a variant's on their records.
+    item_labels: HashMap<Id, Labels<'src>>,
+    // F27 R1: each file's `[platform("…")];`, by the file.
+    module_platforms: HashMap<SourceId, Vec<Spanned<&'src str>>>,
     // Every `lazy let` DECLARATION, in source order, before it is known whether
     // it is module-level (§2) or a local (§3, excluded). `record_lazy_bindings`
     // partitions it: a module-level one becomes a cell, a local is refused.
@@ -4849,6 +4858,27 @@ pub struct Analyzer<'src> {
     // entry asks exactly what it asked before, and the one reader that needs the
     // extra bit looks it up by the leaf's own span.
     reach_marked_spans: HashSet<(SourceId, Span)>,
+    // B382: every leaf of an `export [deprecated("…")] import` —
+    // `check_deprecated_reexports` warns at every OTHER file's import of a
+    // name such a re-export publishes.
+    deprecated_import_leaves: Vec<DeprecatedImportLeaf<'src>>,
+}
+
+/// One leaf of an `export [deprecated("…")] import` (B382).
+#[derive(Clone, Debug)]
+struct DeprecatedImportLeaf<'src> {
+    source: SourceId,
+    leaf_span: Span,
+    /// The name the statement binds and a re-export publishes: the alias
+    /// where it renames, the leaf where not.
+    bound: &'src str,
+    /// Whether it renames (`as`): then the bound name is the re-export's own
+    /// spelling and no other import reaches the target by it.
+    renamed: bool,
+    /// The module scope the statement sits in — the module an importer names
+    /// to reach the published name.
+    scope: Id,
+    steer: &'src str,
 }
 
 /// One resolved import leaf, for `check_plain_reaches` (B318 §5).
@@ -5057,7 +5087,7 @@ fn item_visibility<'a, 'src>(item: &'a Spanned<Node<'src>>) -> (Visibility<'src>
     let mut node = &item.0;
     loop {
         match node {
-            Node::Export(scope, inner) => {
+            Node::Export(scope, inner, _) => {
                 visibility = match scope {
                     Some(scope) => {
                         Visibility::Scoped(scope.path.iter().map(|(segment, _)| *segment).collect())
@@ -5091,8 +5121,8 @@ fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'s
             Visibility::Private if export_all => Visibility::Exported,
             marked => marked,
         };
-        if let Node::Export(_, inner) = &item.0
-            && let Node::Import(branch, _) | Node::Use(branch) = &inner.0
+        if let Node::Export(_, inner, _) = &item.0
+            && let Node::Import(branch, ..) | Node::Use(branch) = &inner.0
         {
             let mut entries = Vec::new();
             flatten_namespace_branch(branch, Vec::new(), &mut entries);
@@ -5124,7 +5154,7 @@ fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'s
             Node::Func(function) => (function.name.0, ImportableKind::Function, Vec::new()),
             Node::MacroFun(function) => (function.name.0, ImportableKind::Macro, Vec::new()),
             Node::Struct(name, ..) => (name.0, ImportableKind::Struct, Vec::new()),
-            Node::Enum(name, _, _, variants) => (
+            Node::Enum(name, _, _, variants, _) => (
                 name.0,
                 ImportableKind::Enum,
                 variants.0.iter().map(|variant| variant.0.0).collect(),
@@ -5154,7 +5184,7 @@ fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'s
     // gets no row, for the reason stated above: this module offers no such name
     // at all, so it can offer nothing under it.
     for item in items {
-        let Node::Impl(subject, _, body) = unwrap_item(item) else {
+        let Node::Impl(subject, _, body, _) = unwrap_item(item) else {
             continue;
         };
         let Some(head) = type_head(&subject.0) else {
@@ -5211,7 +5241,7 @@ fn collect_declared_names<'src>(items: &NodeList<'src>, out: &mut Vec<&'src str>
 /// attribute) down to the item itself.
 fn unwrap_item<'a, 'src>(item: &'a Spanned<Node<'src>>) -> &'a Node<'src> {
     let mut node = &item.0;
-    while let Node::Export(_, inner)
+    while let Node::Export(_, inner, _)
     | Node::Derive(_, inner)
     | Node::Service(_, inner)
     | Node::MacroAttribute(_, _, _, inner)
@@ -5239,10 +5269,10 @@ fn type_head<'src>(node: &Node<'src>) -> Option<&'src str> {
 /// no ids, no types, nothing loaded.
 fn declares_member_on(item: &Node, type_name: &str, member: &str) -> bool {
     match item {
-        Node::Struct(name, _, _, _, Some(fields)) if name.0 == type_name => {
+        Node::Struct(name, _, _, _, Some(fields), _) if name.0 == type_name => {
             fields.0.iter().any(|field| field.0.0.0 == member)
         }
-        Node::Impl(subject, _, body) if type_head(&subject.0) == Some(type_name) => {
+        Node::Impl(subject, _, body, _) if type_head(&subject.0) == Some(type_name) => {
             body.0.iter().any(|inner| {
                 matches!(unwrap_item(inner), Node::Func(function) if function.name.0 == member)
             })
@@ -5300,7 +5330,7 @@ fn collect_impl_method_steers<'src>(
     out: &mut Vec<((&'src str, &'src str), &'src str)>,
 ) {
     for item in items {
-        let Node::Impl(subject, traits, body) = unwrap_item(item) else {
+        let Node::Impl(subject, traits, body, _) = unwrap_item(item) else {
             continue;
         };
         let Some(head) = type_head(&subject.0) else {
@@ -6073,6 +6103,8 @@ impl<'src> Analyzer<'src> {
             lazy_cells: HashSet::default(),
             lazy_eager_parameters: HashSet::default(),
             lazy_binding_declarations: Vec::new(),
+            item_labels: HashMap::default(),
+            module_platforms: HashMap::default(),
             lazy_local_bindings: Vec::new(),
             lazy_binding_initializers: IndexMap::default(),
             lazy_thunk_effects: IndexMap::default(),
@@ -6173,6 +6205,7 @@ impl<'src> Analyzer<'src> {
             exposed_private_types: Vec::new(),
             import_reaches: Vec::new(),
             reach_marked_spans: HashSet::default(),
+            deprecated_import_leaves: Vec::new(),
         }
     }
 
@@ -7929,8 +7962,8 @@ impl<'src> Analyzer<'src> {
     /// anything else. Shared by the derive collectors.
     fn derivable_type_name(item: &Node<'src>) -> Option<&'src str> {
         match item {
-            Node::Struct(name, _generics, _external, _resource, Some(_body)) => Some(name.0),
-            Node::Enum(name, _generics, _resource, _variants) => Some(name.0),
+            Node::Struct(name, _generics, _external, _resource, Some(_body), _) => Some(name.0),
+            Node::Enum(name, _generics, _resource, _variants, _) => Some(name.0),
             _ => None,
         }
     }
@@ -7950,7 +7983,7 @@ impl<'src> Analyzer<'src> {
         let unknown = Type::Unknown.get_type_id(self);
         let mut members = Vec::new();
         match item {
-            Node::Struct(_name, _generics, _external, _resource, Some(body)) => {
+            Node::Struct(_name, _generics, _external, _resource, Some(body), _) => {
                 let field_types: HashMap<&str, TypeId> = self
                     .structs
                     .get(&declaration_id)
@@ -7975,7 +8008,7 @@ impl<'src> Analyzer<'src> {
                     }
                 }
             }
-            Node::Enum(_name, _generics, _resource, variants) => {
+            Node::Enum(_name, _generics, _resource, variants, _) => {
                 let payload_types: HashMap<&str, Vec<TypeId>> = self
                     .enums
                     .get(&declaration_id)
@@ -21254,7 +21287,7 @@ impl<'src> Analyzer<'src> {
         match node {
             // N89: `const` joins the wrapper list — a generated `const fun`
             // declares its name exactly as a generated `fun` does.
-            Node::Export(_, inner)
+            Node::Export(_, inner, _)
             | Node::Derive(_, inner)
             | Node::Service(_, inner)
             | Node::MacroAttribute(_, _, _, inner)
@@ -21275,7 +21308,7 @@ impl<'src> Analyzer<'src> {
                 }
             }
             Node::Struct(name, ..) | Node::Trait(name, ..) => move_name(self, name.0),
-            Node::Enum(name, _, _resource, variants) => {
+            Node::Enum(name, _, _resource, variants, _) => {
                 move_name(self, name.0);
                 // Variant constructor names registered by the enum walk (if
                 // any) belong with the enum — a missing name is a no-op.
@@ -26473,12 +26506,21 @@ impl<'src> Analyzer<'src> {
         // Without this the note explains a colour and leaves the member looking
         // like a typo.
         if let Some(member_name) = member_name
-            && let Some((other_layer, module)) =
+            && let Some((other_layer, module, patterns)) =
                 self.twin_declaring_member(source, type_name, member_name)
         {
+            // F27 R1: and the move that puts the file there, which is now a
+            // line the author writes — the editor's quick fix inserts exactly
+            // this attribute, read back off this sentence.
+            let attribute = patterns
+                .iter()
+                .map(|pattern| format!("\"{pattern}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
             msg.push_str(&format!(
-                ". The `{other_layer}` twin of `std::{module}` declares `{member_name}` — an \
-                 entry of that platform (or `--platform`) is what puts this file under it"
+                ". The `{other_layer}` twin of `std::{module}` declares `{member_name}` — \
+                 `[platform({attribute})];` at the top of the file analyzes it under that \
+                 platform, as an entry of that platform (or `--platform`) does"
             ));
         }
         Some(Note {
@@ -26503,8 +26545,8 @@ impl<'src> Analyzer<'src> {
         source: SourceId,
         type_name: &str,
         member_name: &str,
-    ) -> Option<(String, String)> {
-        for (layer, module, path) in self.std_layer_twin_files.get(&source)? {
+    ) -> Option<(String, String, Vec<String>)> {
+        for (layer, module, path, patterns) in self.std_layer_twin_files.get(&source)? {
             let Ok(text) = crate::util::read_source(path) else {
                 continue;
             };
@@ -26516,7 +26558,7 @@ impl<'src> Analyzer<'src> {
                 .iter()
                 .any(|item| declares_member_on(unwrap_item(item), type_name, member_name))
             {
-                return Some((layer.clone(), module.clone()));
+                return Some((layer.clone(), module.clone(), patterns.clone()));
             }
         }
         None
@@ -30437,6 +30479,17 @@ impl<'src> Analyzer<'src> {
             // The marker IS the statement, so there is nothing under it to walk;
             // it takes the same module-level refusal `export` takes, for the same
             // reason.
+            // `[platform("…")];` (F27 R1) — the FILE's platform, recorded
+            // against the file being walked. The parser has already held it to
+            // the file's first statement, so there is no position to refuse
+            // here; `platform_color` reads the record (the requirement it seeds,
+            // the promise it makes) and so does the resolver that chose the
+            // platform this analysis runs under.
+            Node::ModulePlatform(patterns) => {
+                self.module_platforms
+                    .insert(self.current_source_id, patterns.clone());
+                Some(Expr::Void)
+            }
             Node::ExportAll => {
                 self.export_all_modules.insert(scope_id);
                 self.curated_modules.insert(scope_id);
@@ -30451,7 +30504,7 @@ impl<'src> Analyzer<'src> {
                 }
                 Some(Expr::Void)
             }
-            Node::Export(export_scope, inner) => {
+            Node::Export(export_scope, inner, labels) => {
                 // Exports shape a module's public surface, so they only mean
                 // something at a module's top level. A block-scoped `import`
                 // (H2) is deliberately not exportable — and any other `export`
@@ -30464,6 +30517,28 @@ impl<'src> Analyzer<'src> {
                         msg: "`export` is a module-level item and cannot appear inside a body"
                             .to_string(),
                     });
+                }
+                // B382: `export [deprecated("…")] import …;` deprecates each
+                // name the re-export publishes — the alias where it renames,
+                // the leaf where not. Recorded per leaf with the leaf's span,
+                // which is how the statement's own reach (and so the target) is
+                // found again once the world has resolved;
+                // `check_deprecated_reexports` decides it.
+                if let Some(steer) = labels.as_ref().and_then(|labels| labels.deprecated)
+                    && let Node::Import(root_branch, _) = &inner.0
+                {
+                    let mut entries = Vec::new();
+                    flatten_namespace_branch(root_branch, Vec::new(), &mut entries);
+                    for (_, name, leaf_span, alias) in &entries {
+                        self.deprecated_import_leaves.push(DeprecatedImportLeaf {
+                            source: self.current_source_id,
+                            leaf_span: *leaf_span,
+                            bound: alias.map_or(*name, |(alias, _)| alias),
+                            renamed: alias.is_some(),
+                            scope: scope_id,
+                            steer,
+                        });
+                    }
                 }
                 let walked = self.walk_expr_node(inner, scope_id);
                 // A transparent wrapper's own entity is not the declaration's
@@ -31327,9 +31402,14 @@ impl<'src> Analyzer<'src> {
                 }
                 Some(Expr::Binary(*op, lhs_id, rhs_id))
             }
-            Node::Let(name, type_, value, mutable, lazy) => {
+            Node::Let(name, type_, value, mutable, lazy, labels) => {
                 let name_span = name.1;
                 let name = name.0;
+                // E221: a labelled binding's labels, keyed by its entity id
+                // (`labels::check` refuses them on a local).
+                if let Some(labels) = labels {
+                    self.item_labels.insert(id, (**labels).clone());
+                }
                 // lazy.md §2: the binding holds a memo cell whose initializer
                 // runs at its FIRST USE. Which bindings are module-level is not
                 // an answer this walk has (module bodies register as it goes),
@@ -31549,9 +31629,12 @@ impl<'src> Analyzer<'src> {
                 });
                 Some(Expr::Assignment(target_id, stored_value_id))
             }
-            Node::Struct(name, generic_parameters, external, resource, body) => {
+            Node::Struct(name, generic_parameters, external, resource, body, labels) => {
                 let name_span = name.1;
                 let name = name.0;
+                if let Some(labels) = labels {
+                    self.item_labels.insert(id, (**labels).clone());
+                }
                 let external = *external;
                 let resource = *resource;
                 self.declare_scope_item(scope_id, name, id);
@@ -31679,9 +31762,12 @@ impl<'src> Analyzer<'src> {
                 );
                 Some(Expr::Struct(id))
             }
-            Node::Enum(name, generic_parameters, resource, variants) => {
+            Node::Enum(name, generic_parameters, resource, variants, labels) => {
                 let name_span = name.1;
                 let name = name.0;
+                if let Some(labels) = labels {
+                    self.item_labels.insert(id, (**labels).clone());
+                }
                 let resource = *resource;
                 self.declare_scope_item(scope_id, name, id);
                 self.reference_count.entry(id).or_insert(0);
@@ -31733,6 +31819,7 @@ impl<'src> Analyzer<'src> {
                         name: variant_name,
                         data_type_ids,
                         backing_value,
+                        internal: variant.0.3,
                     });
                 }
                 // A bare-lowered enum IS a `str`/number at runtime and carries a
@@ -31858,7 +31945,11 @@ impl<'src> Analyzer<'src> {
                 ));
                 None
             }
-            Node::Impl(subject, traits, body) => {
+            Node::Impl(subject, traits, body, labels) => {
+                // F27 R1: an impl's `[platform(..)]` rides the item labels.
+                if let Some(labels) = labels {
+                    self.item_labels.insert(id, (**labels).clone());
+                }
                 let body_scope = self.create_scope(Some(scope_id));
                 let body_scope_id = self.push_scope(body_scope);
                 // The impl's generic parameters are the `type X` binders in the
@@ -32016,9 +32107,12 @@ impl<'src> Analyzer<'src> {
 
                 Some(Expr::Impl(id))
             }
-            Node::Trait(name, generic_parameters, supertraits, body) => {
+            Node::Trait(name, generic_parameters, supertraits, body, labels) => {
                 let name_span = name.1;
                 let name = name.0;
+                if let Some(labels) = labels {
+                    self.item_labels.insert(id, (**labels).clone());
+                }
                 self.declare_scope_item(scope_id, name, id);
                 self.reference_count.entry(id).or_insert(0);
                 let body_scope = self.create_scope(Some(scope_id));
@@ -44937,6 +45031,7 @@ impl<'src> Analyzer<'src> {
         }
         let declaring = self.module_declaration_scopes();
         let reaches = std::mem::take(&mut self.import_reaches);
+        self.check_deprecated_reexports(&reaches);
         // An import the compiler already REFUSED gets no second word about its
         // visibility (diagnostics-standard B5): `import pkg::client::helper;`
         // where `client` is the program's own entry file is one mistake, and the
@@ -45055,6 +45150,71 @@ impl<'src> Analyzer<'src> {
         // once per entry world and one import statement is one mistake (B5).
         sites.sort_by_key(|(span, source, _)| (source.0, span.start, span.end));
         sites.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1 && left.2 == right.2);
+        for (span, source, msg) in sites {
+            self.warnings.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg,
+            });
+            self.warning_sources.push(source);
+        }
+    }
+
+    /// B382: `export [deprecated("use …")] import a::X as Y;` deprecates the
+    /// name `Y` the re-export publishes. Every OTHER file's import of it warns
+    /// `` `Y` is deprecated; use … `` — the function attribute's own warning —
+    /// at its leaf. (An unexported one never gets here: the parser refuses it,
+    /// `DEPRECATED_IMPORT_IS_A_RE_EXPORT`.)
+    ///
+    /// Decided here, over the resolved reaches, because a re-export's target is
+    /// only known once the world has resolved: the statement's OWN reach (found
+    /// again by its leaf's span) is what names it. An importer matches by the
+    /// target and the name it wrote; a re-export that does not rename also
+    /// matches by the module the importer named, since the original module
+    /// publishes the same name for the same target and must not warn.
+    fn check_deprecated_reexports(&mut self, reaches: &[ImportReach<'src>]) {
+        let leaves = std::mem::take(&mut self.deprecated_import_leaves);
+        if leaves.is_empty() {
+            return;
+        }
+        let mut published: Vec<(Id, &DeprecatedImportLeaf<'src>, Option<&'src str>)> = Vec::new();
+        for leaf in &leaves {
+            let Some(own) = reaches
+                .iter()
+                .find(|reach| reach.source == leaf.source && reach.leaf_span == leaf.leaf_span)
+            else {
+                continue;
+            };
+            let module = self
+                .modules
+                .values()
+                .find(|module| module.body.1 == leaf.scope)
+                .map(|module| module.name);
+            published.push((own.target, leaf, module));
+        }
+        let mut sites: Vec<(Span, SourceId, String)> = Vec::new();
+        for reach in reaches {
+            for (target, leaf, module) in &published {
+                if reach.source == leaf.source
+                    || reach.target != *target
+                    || reach.leaf != leaf.bound
+                {
+                    continue;
+                }
+                let through_it =
+                    leaf.renamed || module.is_some_and(|module| reach.path.last() == Some(&module));
+                if through_it {
+                    sites.push((
+                        reach.leaf_span,
+                        reach.source,
+                        format!("`{}` is deprecated; {}", leaf.bound, leaf.steer),
+                    ));
+                }
+            }
+        }
+        sites.sort_by_key(|(span, source, _)| (source.0, span.start, span.end));
+        sites.dedup();
         for (span, source, msg) in sites {
             self.warnings.push(Error {
                 trace: Vec::new(),
@@ -53854,6 +54014,25 @@ pub struct Program<'src> {
     /// emits as the bare cell, and a read of a binding in `lazy_cells` emits as
     /// `__force(<cell>)`.
     pub lazy_argument_thunks: IndexMap<Id, &'src str>,
+    /// E221: the labels a struct, enum, trait or binding declaration carried
+    /// (`[internal("reason")]`), by its entity id — read by the editor and by
+    /// `labels::check`. Functions, fields and variants keep theirs on their
+    /// own records.
+    pub item_labels: HashMap<Id, Labels<'src>>,
+    /// The entry package's `[lints]` (E221), for `labels::check`.
+    pub lints: crate::manifest::Lints,
+    /// F27 R1: each file's `[platform("…")];`, as written, by the file — the
+    /// platform everything the file declares requires (`platform_color`).
+    pub module_platforms: HashMap<SourceId, Vec<Spanned<&'src str>>>,
+    /// F27 R1: those declarations and every `[platform(..)] impl`'s, resolved
+    /// by `platform_color::record_declared_platforms` (a post-pass) into the
+    /// requirement each seeds and the promise each makes.
+    pub declared_requirements: crate::platform_color::DeclaredRequirements,
+    /// WHY this program was analyzed under `platform`, and the kind of fact
+    /// that was — the workspace's `platform_reason`/`platform_kind`, kept for
+    /// the editor's status line (F27 R1/R6).
+    pub platform_reason: Option<String>,
+    pub platform_kind: Option<&'static str>,
     /// The lazy arguments that forward a cell they already hold (§1).
     pub lazy_argument_forwards: HashSet<Id>,
     /// The bindings that hold a memo cell: `lazy` parameters (§1) and `lazy let`
@@ -55512,7 +55691,8 @@ fn bare_lowered_enum<'a>(
 /// that would lift it, which is why the message says "not supported yet" rather
 /// than describing a rule the language means to keep.
 pub(crate) fn service_generic_refusal(item: &Spanned<Node<'_>>) -> Option<String> {
-    let Node::Struct(name, Some(generic_parameters), _external, _resource, _body) = &item.0 else {
+    let Node::Struct(name, Some(generic_parameters), _external, _resource, _body, _) = &item.0
+    else {
         return None;
     };
     if generic_parameters.0.is_empty() {
@@ -55622,7 +55802,7 @@ pub(crate) fn service_method_refusals(
     item: &Spanned<Node<'_>>,
     nodes: &NodeList<'_>,
 ) -> Vec<(Span, String)> {
-    let Node::Struct(name, _generics, _external, _resource, _body) = &item.0 else {
+    let Node::Struct(name, _generics, _external, _resource, _body, _) = &item.0 else {
         return Vec::new();
     };
     let service_name = name.0;
@@ -55643,10 +55823,10 @@ pub(crate) fn service_method_refusals(
         // that did not would let every refusal below be dodged by writing
         // `export` on the block.
         let mut node = node;
-        while let Node::Export(_, inner) = node {
+        while let Node::Export(_, inner, _) = node {
             node = &inner.0;
         }
-        let Node::Impl(subject, impl_traits, body) = node else {
+        let Node::Impl(subject, impl_traits, body, _) = node else {
             continue;
         };
         if !impl_traits.is_empty() {
@@ -55825,8 +56005,8 @@ pub(crate) fn client_handler_refusal(handler_name: &str, nodes: &NodeList<'_>) -
 
 pub(crate) fn resource_derive_refusal(derive: &str, item: &Spanned<Node<'_>>) -> Option<String> {
     let (kind, name) = match &item.0 {
-        Node::Struct(name, _generics, _external, true, _body) => ("struct", name.0),
-        Node::Enum(name, _generics, true, _variants) => ("enum", name.0),
+        Node::Struct(name, _generics, _external, true, _body, _) => ("struct", name.0),
+        Node::Enum(name, _generics, true, _variants, _) => ("enum", name.0),
         _ => return None,
     };
     let (what_it_would_do, steer) = match derive {
@@ -55867,7 +56047,7 @@ pub(crate) fn resource_derive_refusal(derive: &str, item: &Spanned<Node<'_>>) ->
 /// `is_clean`, so the impl table and the walk's `hashable_names` cannot
 /// disagree; see [`bare_lowered_enum`].
 pub(crate) fn backed_enum_hashable_source(item: &Spanned<Node<'_>>) -> String {
-    let Node::Enum(name, generic_parameters, resource, variants) = &item.0 else {
+    let Node::Enum(name, generic_parameters, resource, variants, _) = &item.0 else {
         return String::new();
     };
     if bare_lowered_enum(
@@ -55923,7 +56103,7 @@ pub(crate) fn backed_enum_hashable_source(item: &Spanned<Node<'_>>) -> String {
 /// lowering emits it, and the conversions now say so. Its literal is rendered
 /// from the resolved value, since there is no written spelling to reprint.
 pub(crate) fn backed_enum_impl_source(item: &Spanned<Node<'_>>) -> String {
-    let Node::Enum(name, generic_parameters, resource, variants) = &item.0 else {
+    let Node::Enum(name, generic_parameters, resource, variants, _) = &item.0 else {
         return String::new();
     };
     // A broken declaration is a hard error the walk reports, and this generator
@@ -56028,7 +56208,7 @@ fn integer_backing_type(variants: &[VariantBacking<'_>]) -> &'static str {
 /// representation cannot disagree: `enum Walked { A = 5, B, C }` used to lower
 /// to the bare numbers while its derived `Json` encoded the variant NAME.
 pub(crate) fn backed_enum_backing_type_of(item: &Spanned<Node<'_>>) -> Option<&'static str> {
-    let Node::Enum(name, generic_parameters, resource, variants) = &item.0 else {
+    let Node::Enum(name, generic_parameters, resource, variants, _) = &item.0 else {
         return None;
     };
     enum_backing_type(
@@ -56235,7 +56415,7 @@ fn contains_service(nodes: &NodeList) -> bool {
 /// or without `export` wrapping) collect in exactly the order they always did.
 fn collect_module_refs<'a>(nodes: &'a NodeList<'a>, root: &str) -> Vec<(&'a str, Span)> {
     fn walk<'a>(node: &'a Spanned<Node<'a>>, root: &str, modules: &mut Vec<(&'a str, Span)>) {
-        if let Node::Import(branch, _) | Node::Use(branch) = &node.0 {
+        if let Node::Import(branch, ..) | Node::Use(branch) = &node.0 {
             let mut entries = Vec::new();
             flatten_namespace_branch(branch, Vec::new(), &mut entries);
             for (path, leaf, leaf_span, _alias) in entries {
@@ -56292,7 +56472,7 @@ fn collect_module_refs<'a>(nodes: &'a NodeList<'a>, root: &str) -> Vec<(&'a str,
 /// the flat program that has always been the common case allocates nothing new.
 fn collect_module_paths<'a>(nodes: &'a NodeList<'a>, root: &str) -> Vec<(&'a str, Span)> {
     fn walk<'a>(node: &'a Spanned<Node<'a>>, root: &str, paths: &mut Vec<(&'a str, Span)>) {
-        if let Node::Import(branch, _) | Node::Use(branch) = &node.0 {
+        if let Node::Import(branch, ..) | Node::Use(branch) = &node.0 {
             let mut entries = Vec::new();
             flatten_namespace_branch(branch, Vec::new(), &mut entries);
             for (path, leaf, leaf_span, _alias) in entries {
@@ -56370,7 +56550,7 @@ fn collect_module_import_paths<'a>(
         root: &str,
         imports: &mut Vec<(&'a str, Span, Vec<&'a str>)>,
     ) {
-        if let Node::Import(branch, _) | Node::Use(branch) = &node.0 {
+        if let Node::Import(branch, ..) | Node::Use(branch) = &node.0 {
             let mut entries = Vec::new();
             flatten_namespace_branch(branch, Vec::new(), &mut entries);
             for (path, leaf, leaf_span, alias) in entries {
@@ -57006,7 +57186,7 @@ pub fn module_impl_blocks(path: &Path) -> Vec<(String, Vec<String>)> {
     };
     let mut blocks = Vec::new();
     for item in &loaded.ast.0 {
-        let Node::Impl(subject, _, body) = unwrap_item(item) else {
+        let Node::Impl(subject, _, body, _) = unwrap_item(item) else {
             continue;
         };
         let Some(head) = type_head(&subject.0) else {
@@ -57052,6 +57232,10 @@ pub struct Workspace {
     /// rather than on a `PackageSpec` because the entry package has no spec in
     /// `packages` — that slice is its dependencies.
     pub entry_prelude: crate::manifest::PreludeSpec,
+    /// The ENTRY package's `[lints]` (E221), every key defaulted. Out of the
+    /// base cache key for `platform_reason`'s reason: it changes which
+    /// warnings one post-pass writes, never what loads or resolves.
+    pub lints: crate::manifest::Lints,
     /// WHY this analysis runs under the platform it does (E119), already
     /// rendered by [`crate::platform_color::PlatformReason::clause`] — "no entry
     /// reaches it (default-entry is `server`)". Where the front end has no
@@ -57069,6 +57253,12 @@ pub struct Workspace {
     /// keys on — the reason does not change which modules load, resolve, or
     /// expand, only what one diagnostic says about them.
     pub platform_reason: Option<String>,
+    /// The KIND of fact `platform_reason` states, in one word — what the
+    /// editor's status line shows after the platform (F27 R1: "analyzed as:
+    /// browser — declared"); `PlatformReason::kind` for a front end's colour,
+    /// `declared` / `inferred` / `default` where the analysis chose. Out of the
+    /// base cache key for `platform_reason`'s reason.
+    pub platform_kind: Option<&'static str>,
     /// WHICH CONTROL can change this program's ambient scope (E120) — read by
     /// the web-set steer, which has to name a repair the reader can actually
     /// take. A front end fact for the same reason `platform_reason` is one, and
@@ -60426,7 +60616,7 @@ fn analyze_inner<'src>(
                             // so the twin is that same relative path under
                             // another layer's root — and its label is the module
                             // path a user writes (`ui`).
-                            let twins: Vec<(String, String, PathBuf)> = canonical
+                            let twins: Vec<(String, String, PathBuf, Vec<String>)> = canonical
                                 .strip_prefix(crate::util::canonical_path(&layer.root))
                                 .ok()
                                 .map(|relative| {
@@ -60437,7 +60627,14 @@ fn analyze_inner<'src>(
                                         .map(|other| (other, other.root.join(relative)))
                                         .filter(|(_, path)| path.is_file())
                                         .map(|(other, path)| {
-                                            (other.name.clone(), label.clone(), path)
+                                            (
+                                                other.name.clone(),
+                                                label.clone(),
+                                                path,
+                                                crate::target::PlatformPattern::spell(
+                                                    &other.patterns,
+                                                ),
+                                            )
                                         })
                                         .collect()
                                 })
@@ -63130,6 +63327,12 @@ fn analyze_over_world<'src>(
         lazy_cells: std::mem::take(&mut analyzer.lazy_cells),
         lazy_eager_parameters: std::mem::take(&mut analyzer.lazy_eager_parameters),
         lazy_binding_initializers: std::mem::take(&mut analyzer.lazy_binding_initializers),
+        item_labels: std::mem::take(&mut analyzer.item_labels),
+        module_platforms: std::mem::take(&mut analyzer.module_platforms),
+        declared_requirements: Default::default(),
+        platform_reason: workspace.platform_reason.clone(),
+        platform_kind: workspace.platform_kind,
+        lints: workspace.lints,
         lazy_thunk_effects: std::mem::take(&mut analyzer.lazy_thunk_effects),
         suspending_calls: HashSet::default(),
         async_values: analyzer.async_values.clone(),

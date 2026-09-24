@@ -525,10 +525,22 @@ export impl File {
 	}
 
 	[extern(method, "read")]
-	async external fun raw_read(self, buffer: Bytes, offset: i32, length: i32, position: i53): RawReadResult;
+	async external fun raw_read(
+		self,
+		buffer: Bytes,
+		offset: i32,
+		length: i32,
+		position: i53,
+	): RawReadResult;
 
 	[extern(method, "write")]
-	async external fun raw_write(self, buffer: Bytes, offset: i32, length: i32, position: i53): RawWriteResult;
+	async external fun raw_write(
+		self,
+		buffer: Bytes,
+		offset: i32,
+		length: i32,
+		position: i53,
+	): RawWriteResult;
 
 	/// Reads into `buffer` from byte `position` of the file; returns the number of
 	/// bytes actually read — `buffer.len()` at most, fewer near the end of the

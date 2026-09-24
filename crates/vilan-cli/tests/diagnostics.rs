@@ -1911,3 +1911,222 @@ fn a_parallel_check_reports_in_member_order() {
         "three per-entry mistakes and the shared one, reported once: {stderr}"
     );
 }
+
+// --- E221: `[lints] internal_use` -------------------------------------------
+//
+// The warning is the one part of `[internal("reason")]` that needs a manifest
+// to exist at all, so it is pinned here, through the binary, where a manifest
+// can say so. Every position the label rides is used from `main.vl`, and the
+// declaring module uses one of them itself.
+
+/// `helper.vl`: one of each labelled position, and a use of its own label.
+const LABELLED_HELPER: &str = concat!(
+    "export [internal(\"a struct\")]\n",
+    "struct Region {\n\t[internal(\"a field\")] anchor: str,\n\tlabel: str,\n}\n\n",
+    "export enum Side {\n\tLeft,\n\t[internal(\"a variant\")] Auto,\n}\n\n",
+    "export [internal(\"a binding\")]\n",
+    "let cache = 3;\n\n",
+    "export [internal(\"a function\")]\n",
+    "fun seam(): i32 {\n\tcache\n}\n",
+);
+
+/// `main.vl`: a use of each, from outside the declaring module.
+const LABELLED_MAIN: &str = concat!(
+    "import pkg::helper::{ Region, Side, cache, seam };\n\n",
+    "fun main() {\n",
+    "\tlet region = Region { anchor = \"a\", label = \"b\" };\n",
+    "\tlet side = Side::Auto;\n",
+    "\tprint(i\"{region.anchor} {cache} {seam()}\");\n",
+    "}\n",
+);
+
+fn labelled_package(tag: &str, manifest: &str) -> PathBuf {
+    let dir = temp_package(tag, LABELLED_MAIN);
+    std::fs::write(dir.join("vilan.toml"), manifest).unwrap();
+    std::fs::write(dir.join("src/helper.vl"), LABELLED_HELPER).unwrap();
+    dir
+}
+
+/// The warning lines `vilan check` wrote, in order.
+fn warning_lines(output: &Output) -> Vec<String> {
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter_map(|line| line.strip_prefix("Warning: ").map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn internal_use_warns_at_every_use_outside_the_declaring_module() {
+    let dir = labelled_package(
+        "internal_use",
+        "[package]\nname = \"app\"\n\n[lints]\ninternal_use = \"warn\"\n",
+    );
+    let output = vilan(&dir, &["check", "."], true);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "a lint warns, it does not fail the check"
+    );
+    let warnings = warning_lines(&output);
+    for expected in [
+        "`Region` is internal: a struct",
+        "`anchor` is internal: a field",
+        "`Auto` is internal: a variant",
+        "`cache` is internal: a binding",
+        "`seam` is internal: a function",
+    ] {
+        assert!(
+            warnings.iter().any(|warning| warning == expected),
+            "missing {expected:?} in {warnings:?}"
+        );
+    }
+    // `cache`: once for the import and once for the read in `main` — never for
+    // `seam`'s own read of it, which is in the module that declares it.
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|warning| warning.starts_with("`cache`"))
+            .count(),
+        2,
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn internal_use_is_silent_unless_the_package_asks() {
+    for (tag, manifest) in [
+        ("internal_use_absent", "[package]\nname = \"app\"\n"),
+        (
+            "internal_use_allow",
+            "[package]\nname = \"app\"\n\n[lints]\ninternal_use = \"allow\"\n",
+        ),
+    ] {
+        let dir = labelled_package(tag, manifest);
+        let output = vilan(&dir, &["check", "."], true);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(output.status.success());
+        let warnings = warning_lines(&output);
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.contains("is internal")),
+            "{tag}: {warnings:?}"
+        );
+    }
+}
+
+// --- B382: `[deprecated("use …")]` on a type and on a re-export ------------
+//
+// The warning is the function attribute's own (`` `{name}` is deprecated;
+// {steer} ``), and it needs a second module to be seen at all: the declaring
+// module's uses are silent. So it is pinned here, through the binary.
+
+/// `inner.vl`: a deprecated struct beside its replacement, used by its own
+/// module; `re.vl`: a deprecated renaming re-export, and a deprecated
+/// NON-renaming one.
+const DEPRECATED_INNER: &str = concat!(
+    "export [deprecated(\"use DeltaCursor\")]\n",
+    "struct KeyedThing {\n\tat: i32,\n}\n\n",
+    "export struct DeltaCursor {\n\tat: i32,\n}\n\n",
+    "export struct Kept {\n\tat: i32,\n}\n\n",
+    "export fun own_use(): KeyedThing {\n\tKeyedThing { at = 1 }\n}\n",
+);
+const DEPRECATED_RE: &str = concat!(
+    "export [deprecated(\"use pkg::inner::DeltaCursor\")] import pkg::inner::DeltaCursor as KeyedCursor;\n",
+    "export [deprecated(\"import it from pkg::inner\")] import pkg::inner::Kept;\n",
+);
+
+fn deprecated_package(tag: &str, main: &str) -> PathBuf {
+    let dir = temp_package(tag, main);
+    std::fs::write(dir.join("src/inner.vl"), DEPRECATED_INNER).unwrap();
+    std::fs::write(dir.join("src/re.vl"), DEPRECATED_RE).unwrap();
+    dir
+}
+
+#[test]
+fn b382_a_deprecated_type_warns_at_each_use_in_another_module() {
+    let dir = deprecated_package(
+        "b382_type",
+        concat!(
+            "import pkg::inner::{ KeyedThing, DeltaCursor };\n\n",
+            "fun main() {\n",
+            "\tlet thing: KeyedThing = KeyedThing { at = 2 };\n",
+            "\tlet cursor: DeltaCursor = DeltaCursor { at = 3 };\n",
+            "\tprint(i\"{thing.at} {cursor.at}\");\n",
+            "}\n",
+        ),
+    );
+    let output = vilan(&dir, &["check", "."], true);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "a deprecation warns, it does not fail"
+    );
+    let warnings = warning_lines(&output);
+    // The import, the annotation and the literal's head — and nothing for the
+    // replacement beside it, or for the declaring module's own `own_use`.
+    assert_eq!(
+        warnings,
+        vec!["`KeyedThing` is deprecated; use DeltaCursor".to_string(); 3],
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn b382_a_deprecated_re_export_warns_at_the_import_that_reaches_through_it() {
+    let dir = deprecated_package(
+        "b382_reexport",
+        concat!(
+            "import pkg::re::{ KeyedCursor, Kept };\n",
+            "import pkg::inner::DeltaCursor;\n\n",
+            "fun takes(cursor: DeltaCursor): i32 {\n\tcursor.at\n}\n\n",
+            "fun main() {\n",
+            "\tlet cursor = KeyedCursor { at = 3 };\n",
+            "\tlet kept = Kept { at = 4 };\n",
+            "\tprint(i\"{takes(cursor)} {kept.at}\");\n",
+            "}\n",
+        ),
+    );
+    let output = vilan(&dir, &["check", "."], true);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(output.status.success());
+    let warnings = warning_lines(&output);
+    // Once each, at the leaf that names the deprecated re-export — and the
+    // renamed name stays TRANSPARENT: a `KeyedCursor` is a `DeltaCursor`.
+    assert_eq!(
+        warnings,
+        vec![
+            "`KeyedCursor` is deprecated; use pkg::inner::DeltaCursor".to_string(),
+            "`Kept` is deprecated; import it from pkg::inner".to_string(),
+        ],
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn b382_importing_the_original_is_not_a_use_of_the_re_export() {
+    // `re` re-exports `Kept` WITHOUT renaming it, deprecated; `inner` still
+    // publishes the same name for the same item, and importing it from there
+    // is exactly what the steer asks for.
+    let dir = deprecated_package(
+        "b382_original",
+        concat!(
+            "import pkg::inner::{ Kept, DeltaCursor };\n",
+            // `re` is LOADED — its re-exports are published in this program —
+            // and only the renamed one is reached through it.
+            "import pkg::re::KeyedCursor;\n\n",
+            "fun main() {\n\tlet kept = Kept { at = 4 };\n",
+            "\tlet cursor: DeltaCursor = KeyedCursor { at = 5 };\n",
+            "\tprint(i\"{kept.at} {cursor.at}\");\n}\n",
+        ),
+    );
+    let output = vilan(&dir, &["check", "."], true);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(output.status.success());
+    let warnings = warning_lines(&output);
+    assert_eq!(
+        warnings,
+        vec!["`KeyedCursor` is deprecated; use pkg::inner::DeltaCursor".to_string()],
+        "`Kept` imported from `inner` is not a use of `re`'s deprecated re-export: {warnings:?}"
+    );
+}

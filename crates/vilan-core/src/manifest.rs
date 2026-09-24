@@ -38,6 +38,9 @@ pub struct Manifest {
     /// rounds, default 16).
     #[serde(rename = "macro", default)]
     pub macro_: Option<MacroSection>,
+    /// `[lints]` — the opt-in warnings (E221): each key a lint, each value
+    /// `"allow"` (the default) or `"warn"`.
+    pub lints: Option<LintsSection>,
     /// `[entry.<name>]` — the package's build entries, each with its own
     /// platform. Empty for the classic single-entry form.
     #[serde(rename = "entry", default)]
@@ -55,8 +58,51 @@ pub struct Manifest {
 /// pinned against. `server` / `client` are here only so [`Manifest::validate`]
 /// can point their users at the replacement; they are not valid content.
 pub const KNOWN_SECTIONS: &[&str] = &[
-    "package", "library", "project", "build", "fmt", "macro", "entry", "server", "client",
+    "package", "library", "project", "build", "fmt", "macro", "lints", "entry", "server", "client",
 ];
+
+/// The `[lints]` section as written (E221): the warnings a package asks for
+/// that the compiler does not raise by default. Every key is optional and
+/// means `"allow"` when absent.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LintsSection {
+    /// `internal_use` — warn at every use of an `[internal("reason")]` item
+    /// outside the module that declares it. The label on its own is only for
+    /// the editor (it hides, dims and explains); a package that wants the
+    /// terminal to say so too asks here.
+    pub internal_use: Option<LintLevel>,
+}
+
+/// What a lint does when it applies.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LintLevel {
+    /// Nothing — the default for every lint.
+    #[default]
+    Allow,
+    /// A non-fatal warning at each site.
+    Warn,
+}
+
+/// The resolved `[lints]` of the ENTRY package (E221), every key defaulted —
+/// what the analysis carries (`Workspace::lints`, then `Program::lints`) so
+/// the pass that reads it needs no manifest.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Lints {
+    pub internal_use: LintLevel,
+}
+
+impl Lints {
+    /// The section as written, every absent key at its default.
+    pub fn from_section(section: Option<&LintsSection>) -> Lints {
+        Lints {
+            internal_use: section
+                .and_then(|section| section.internal_use)
+                .unwrap_or_default(),
+        }
+    }
+}
 
 /// The `[fmt]` section: `vilan fmt`'s per-package knobs (E205, E215).
 ///
@@ -1650,6 +1696,7 @@ pub fn resolve_workspace_with_hook_report(
     git: &GitDeps,
 ) -> Result<(Workspace, Vec<DependencyHooks>), WorkspaceError> {
     let manifest = load_manifest(package_dir)?;
+    let lints = Lints::from_section(manifest.lints.as_ref());
     let defaults = crate::macros::MacroLimits::default();
     let macro_limits = manifest
         .macro_
@@ -1675,6 +1722,7 @@ pub fn resolve_workspace_with_hook_report(
                 Workspace {
                     macro_limits,
                     entry_prelude,
+                    lints,
                     ..Workspace::default()
                 },
                 Vec::new(),
@@ -1715,6 +1763,7 @@ pub fn resolve_workspace_with_hook_report(
             entry_dependencies,
             macro_limits,
             entry_prelude,
+            lints,
             // The front end fills the rest in: resolving the dependency graph
             // says nothing about which entry coloured the file (E119), nor
             // about which control can change the ambient scope (E120) — and
@@ -4677,6 +4726,60 @@ mod tests {
             "a `..` dependency path is the normal spelling, not an error: {:?}",
             manifest.validate()
         );
+    }
+
+    // --- E221: the `[lints]` section ----------------------------------------
+
+    #[test]
+    fn a_lints_section_parses_and_is_a_known_section() {
+        let (manifest, warnings) =
+            Manifest::parse("[package]\nname = \"app\"\n\n[lints]\ninternal_use = \"warn\"\n")
+                .expect("parses");
+        assert!(
+            warnings.is_empty(),
+            "`[lints]` is not an unknown key: {warnings:?}"
+        );
+        assert_eq!(
+            Lints::from_section(manifest.lints.as_ref()).internal_use,
+            LintLevel::Warn
+        );
+        let (manifest, _) =
+            Manifest::parse("[package]\nname = \"app\"\n\n[lints]\ninternal_use = \"allow\"\n")
+                .expect("parses");
+        assert_eq!(
+            Lints::from_section(manifest.lints.as_ref()).internal_use,
+            LintLevel::Allow
+        );
+    }
+
+    #[test]
+    fn an_absent_lint_is_allowed() {
+        // No section, and a section that names nothing, are both the default —
+        // a lint is opt-in.
+        let (manifest, _) = Manifest::parse("[package]\nname = \"app\"\n").expect("parses");
+        assert_eq!(
+            Lints::from_section(manifest.lints.as_ref()),
+            Lints::default()
+        );
+        let (manifest, _) =
+            Manifest::parse("[package]\nname = \"app\"\n\n[lints]\n").expect("parses");
+        assert_eq!(
+            Lints::from_section(manifest.lints.as_ref()),
+            Lints::default()
+        );
+        assert_eq!(Lints::default().internal_use, LintLevel::Allow);
+    }
+
+    #[test]
+    fn a_lint_level_or_a_lint_name_that_does_not_exist_is_refused() {
+        // `deny` is not a level this section has (a warning is the most a label
+        // asks for), and a misspelt lint must not silently do nothing.
+        let deny = Manifest::parse("[lints]\ninternal_use = \"deny\"\n")
+            .expect_err("`deny` is not a level");
+        assert!(deny.contains("allow") && deny.contains("warn"), "{deny}");
+        let typo = Manifest::parse("[lints]\ninternal_uses = \"warn\"\n")
+            .expect_err("an unknown lint is refused");
+        assert!(typo.contains("internal_uses"), "{typo}");
     }
 
     // --- A15's follow-up: a manifest-designated default `run` entry ---------

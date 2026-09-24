@@ -689,6 +689,7 @@ pub enum Node<'src> {
         Option<Box<GenericParameters<'src>>>,
         bool,
         Box<Spanned<Vec<Spanned<EnumVariant<'src>>>>>,
+        ItemLabels<'src>,
     ),
     Error,
     // A loop: `for { .. }` (infinite, condition `None`) or `for cond { .. }`
@@ -774,15 +775,34 @@ pub enum Node<'src> {
         // The traits being implemented: the `A`, `B` in `impl Subject with A + B`.
         Vec<Spanned<Self>>,
         Spanned<NodeList<'src>>,
+        // F27 R1: `[platform("browser")] impl …` — everything inside requires
+        // that platform, and it is the platform the file is analyzed under.
+        ItemLabels<'src>,
     ),
     // `import <path> only?;` — the path and B318's trailing modifier.
     Import(ImportBranch<'src>, ImportModifier),
     // `export <item>` — mark an item as this module's surface, or re-export an
     // import. The first field is the optional `(in PATH)` narrowing (B318 §2.2).
-    Export(Option<Box<ExportScope<'src>>>, Box<Spanned<Self>>),
+    //
+    // The third field is the re-export's `[deprecated("use …")]` (B382):
+    // `export [deprecated(..)] import …;` deprecates the NAME the re-export
+    // publishes, so the steer belongs to the export and not to the import —
+    // which also keeps `Import`'s already-wide payload out of `node_size`'s way.
+    Export(
+        Option<Box<ExportScope<'src>>>,
+        Box<Spanned<Self>>,
+        ItemLabels<'src>,
+    ),
     // `export *;` — every item of this module is exported (B318 §2.1). A
     // module-level item with no inner statement: the marker IS the statement.
     ExportAll,
+    // `[platform("browser")];` — the FILE's platform (F27 R1): a file-leading
+    // statement, `export *;`'s shape (the marker is the statement). Everything
+    // the file declares requires that platform, and it is the platform the file
+    // is analyzed under — outranking every heuristic and the `default-entry`
+    // colour. The patterns are carried as written, with their spans, exactly as
+    // a function's fence is (`Func::platform_fence`).
+    ModulePlatform(Vec<Spanned<&'src str>>),
     // `macro fun name(..) { .. }` — a macro definition (macro-engine.md §3).
     // Its body is HERMETIC: never walked in the program world, compiled in the
     // per-file macro world instead (its imports resolve against `macro_std`
@@ -837,6 +857,11 @@ pub enum Node<'src> {
         Option<Box<Spanned<Self>>>,
         bool,
         bool,
+        // The labels a MODULE binding carries about itself (E221). Always
+        // empty on a local: the parser reads them only ahead of a `let`
+        // statement, and `labels::check` refuses them on a binding that is
+        // not module-level.
+        ItemLabels<'src>,
     ),
     // `let`/`mut` binding with a destructuring pattern: `let (a, b) = pair`. The
     // pattern is irrefutable (a tuple of names/sub-patterns); the rest mirrors
@@ -925,6 +950,7 @@ pub enum Node<'src> {
         bool,
         bool,
         Option<Box<Spanned<Vec<Spanned<StructField<'src>>>>>>,
+        ItemLabels<'src>,
     ),
     // B190: the head is B172's `type-path`, not a bare identifier. The
     // namespace segments are the modules the name was reached through, in
@@ -943,6 +969,7 @@ pub enum Node<'src> {
         // Supertraits: the `A`, `B` in `trait T with A + B`.
         Vec<Spanned<Self>>,
         Box<Spanned<NodeList<'src>>>,
+        ItemLabels<'src>,
     ),
     Tuple(NodeList<'src>),
     // `..e` — a tuple-value SPREAD element (proposal/variadic-generics.md §T):
@@ -1074,6 +1101,7 @@ impl<'src> Node<'src> {
             | Node::Bool(_)
             | Node::Error
             | Node::ExportAll
+            | Node::ModulePlatform(_)
             | Node::Import(..)
             | Node::Jump(_)
             | Node::LiftBinder
@@ -1107,7 +1135,7 @@ impl<'src> Node<'src> {
                     visit(child.node());
                 }
             }
-            Node::Export(_, inner) => visit(inner),
+            Node::Export(_, inner, _) => visit(inner),
             Node::Async(inner)
             | Node::Await(inner)
             | Node::Dereference(inner)
@@ -1185,9 +1213,9 @@ impl<'src> Node<'src> {
                 visit(source);
                 visit(body);
             }
-            Node::Enum(_, generic_parameters, _resource, variants) => {
+            Node::Enum(_, generic_parameters, _resource, variants, _) => {
                 visit_generic_parameters(generic_parameters.as_deref(), visit);
-                for (_, data, _) in variants.0.iter().map(|variant| &variant.0) {
+                for (_, data, _, _) in variants.0.iter().map(|variant| &variant.0) {
                     for type_ in data {
                         visit(type_);
                     }
@@ -1229,7 +1257,7 @@ impl<'src> Node<'src> {
                 visit(subject);
                 visit_pattern(&pattern.0, visit);
             }
-            Node::Impl(subject, traits, body) => {
+            Node::Impl(subject, traits, body, _) => {
                 visit(subject);
                 for trait_ in traits {
                     visit(trait_);
@@ -1238,7 +1266,7 @@ impl<'src> Node<'src> {
                     visit(member);
                 }
             }
-            Node::Let(_, type_, value, _, _) => {
+            Node::Let(_, type_, value, _, _, _) => {
                 if let Some(type_) = type_.as_deref() {
                     visit(type_);
                 }
@@ -1285,7 +1313,7 @@ impl<'src> Node<'src> {
                     visit(statement);
                 }
             }
-            Node::Struct(_, generic_parameters, _, _resource, fields) => {
+            Node::Struct(_, generic_parameters, _, _resource, fields, _) => {
                 visit_generic_parameters(generic_parameters.as_deref(), visit);
                 for (_, type_, _, _) in fields
                     .iter()
@@ -1307,7 +1335,7 @@ impl<'src> Node<'src> {
                     }
                 }
             }
-            Node::Trait(_, generic_parameters, supertraits, body) => {
+            Node::Trait(_, generic_parameters, supertraits, body, _) => {
                 visit_generic_parameters(generic_parameters.as_deref(), visit);
                 for supertrait in supertraits {
                     visit(supertrait);
@@ -1326,7 +1354,40 @@ pub type EnumVariant<'src> = (
     &'src str,
     Vec<Spanned<Node<'src>>>,
     Option<BackingLiteral<'src>>,
+    // `[internal("reason")]` (E221): a variant of a public enum that a reader
+    // should not reach for — `[internal]` on a struct FIELD's shape, since a
+    // variant is the enum's field-level case.
+    Option<&'src str>,
 );
+
+/// The labels an item declaration carries ABOUT itself — attributes that are
+/// not part of its signature and change nothing it means to the type system
+/// (E221). Carried on the nominal and binding declarations (`Node::Struct`,
+/// `Node::Enum`, `Node::Trait`, a module `Node::Let`); a function keeps its own
+/// on `Func`, where E213 put them.
+///
+/// Boxed and optional: nearly every declaration carries none, and a
+/// `Node` variant pays for its widest field on every expression the parser
+/// returns (`node_size.rs`), so the empty case is one null pointer.
+pub type ItemLabels<'src> = Option<Box<Labels<'src>>>;
+
+/// [`ItemLabels`]'s contents, when there are any.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Labels<'src> {
+    /// `[deprecated("use …")]` (B382): on a struct, an enum or a trait — and on
+    /// an `export import`, where it deprecates the NAME that re-export
+    /// publishes. A use warns `` `{name}` is deprecated; {steer} ``, the
+    /// function attribute's own warning.
+    pub deprecated: Option<&'src str>,
+    /// `[internal("reason")]` (E213, E221): reachable on purpose and
+    /// dangerous on purpose. Read by the editor, and by the opt-in
+    /// `[lints] internal_use` warning.
+    pub internal: Option<&'src str>,
+    /// `[platform("…")]` on an `impl` block or a nominal (F27 R1), as written
+    /// with spans — empty when absent. On an `impl` everything inside requires
+    /// the platform; on either, the file is analyzed under it.
+    pub platform: Vec<Spanned<&'src str>>,
+}
 
 // An explicit enum backing value, `= ( (-)? NUMBER | STRING )`
 // (proposal/backed-enums.md §3.1). The production GENERALIZES the integer

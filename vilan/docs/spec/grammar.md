@@ -7,7 +7,9 @@ The full syntactic grammar, in the notation of §1.3. Token classes
 ## 3.1 Modules and statements
 
 ```text
-module    = { statement } ;
+module    = [ module-platform ] { statement } ;
+module-platform = platform-attr ";" ;       (* F27 R1, §11.3 *)
+platform-attr   = "[" "platform" "(" STRING { "," STRING } [ "," ] ")" "]" ;
 
 statement = derived-item
           | service-item
@@ -25,12 +27,19 @@ statement = derived-item
           | enum
           | impl
           | trait
+          | labelled-let   (* §3.4 *)
           | "mod" IDENT "{" { statement } "}"
           | import ";"
           | use ";"
           | block          (* not before "}" *)
           ;
 ```
+
+A `module-platform` — `[platform("browser")];`, the attribute with a `;`
+after it — declares the platform of the WHOLE FILE (§11.3), and it is
+legal only as the file's first statement; anywhere else it is refused and
+told to move above the first import. The `;` is what tells it from the
+same attribute fencing the file's first function.
 
 A block-like form (`if`/`for`/`match`/`{…}`) in statement position must
 not be the last thing in its enclosing block: in that position it is
@@ -50,7 +59,9 @@ impl-selector = "(" "impl" type ")"
                 [ "::" ( NAME | "{" NAME { "," NAME } [ "," ] "}" ) ] ;
 NAME        = IDENT | "true" | "false" ;   (* variant re-exports *)
 
-export      = "export" [ "(" "in" path-branch ")" ] statement   (* §4.8 *)
+export      = "export" [ "(" "in" path-branch ")" ]
+              [ deprecated-label ]   (* only before `import`: B382's re-export *)
+              statement   (* §4.8 *)
             | "export" "*" ";" ;          (* the whole-module marker *)
 ```
 
@@ -202,6 +213,22 @@ when the function is removed, so is the mark. When the item goes away is
 the CHANGELOG's fact, not the source's — the removal comes no earlier
 than the minor release after the warning first shipped.
 
+The same steer labels a **struct**, an **enum**, a **trait** or a module
+binding (leading its prefix, as on a function), and a **re-export**:
+`export [deprecated("use pkg::inner::DeltaCursor")] import
+pkg::inner::DeltaCursor as KeyedCursor;` deprecates the name `KeyedCursor`
+the re-export publishes, while the item stays exactly the item —
+`KeyedCursor` is still a `DeltaCursor`. A use of a deprecated type in
+another module — an import, an annotation, a literal's head — warns with
+the function's own warning; so does every other module's import that
+reaches a deprecated re-export, and importing the item from where it is
+declared does not. The declaring module's own uses are silent, as std's
+are. A `[deprecated]` import that is not exported publishes nothing and is
+refused, and so is a `[deprecated]` or `[internal]` on an `impl` block,
+which nobody names — label its members. The editor strikes a deprecated
+name through at its declaration and every use (the standard `deprecated`
+semantic-token modifier) and leads its hover with the steer.
+
 `[internal("reason")]` follows it, and answers a different question.
 Visibility says whether a module may **name** an item; this says whether
 a reader should **reach for** one that is named — an item exported on
@@ -221,17 +248,38 @@ theme dims; hover leads with the reason. A **field** is the case
 declaration visibility cannot serve at all, since vilan has no per-field
 visibility, and it is the case the attribute was asked for.
 
+The same label rides every other declaration a reader may be steered
+away from: a **struct**, an **enum**, one enum **variant**, a **trait**
+and a **module binding** (`[internal("…")] let cache = …;`, the
+`labelled-let` statement of §3.4). On a struct, an enum or a trait it
+leads the declaration, ahead of `resource`; on a variant it leads the
+variant, as on a field. A label on a *local* `let` is refused — nothing
+outside the body can name a local, so the label would have no reader.
+The editor treats each exactly as it treats a function: hidden from
+completion below an exact three-character prefix, dimmed at the
+declaration and at every use (a type position included), and leading its
+hover. A package that also wants the terminal to say so opts in with
+`[lints] internal_use = "warn"` in its `vilan.toml`: every import and use
+of an internal item outside the module that declares it then warns
+`` `{name}` is internal: {reason} ``; the declaring module's own uses,
+std's and a dependency's stay silent.
+
 ### Structs and enums
 
 ```text
-struct = [ "resource" ] [ "external" ] "struct" (IDENT | "null") [ generic-params ]
+struct = [ deprecated-label ] [ internal-label ] [ platform-attr ] [ "resource" ]
+         [ "external" ] "struct"
+         (IDENT | "null") [ generic-params ]
          ( "{" [ field { "," field } [ "," ] ] "}" | ";" ) ;
-field  = [ "[" "internal" "(" STRING ")" "]" ]
+field  = [ internal-label ]
          [ "[" "expose" [ "(" "keyed" [ "=" type ] ")" ] "]" ] IDENT [ ":" type ] ;
+internal-label = "[" "internal" "(" STRING ")" "]" ;
+deprecated-label = "[" "deprecated" "(" STRING ")" "]" ;
 
-enum          = [ "resource" ] "enum" IDENT [ generic-params ]
-                "{" [ variant { "," variant } [ "," ] ] "}" ;
-variant       = NAME [ "(" [ type { "," type } [ "," ] ] ")" ]
+enum          = [ deprecated-label ] [ internal-label ] [ platform-attr ] [ "resource" ]
+                "enum" IDENT
+                [ generic-params ] "{" [ variant { "," variant } [ "," ] ] "}" ;
+variant       = [ internal-label ] NAME [ "(" [ type { "," type } [ "," ] ] ")" ]
                 [ "=" backing-value ] ;
 backing-value = [ "-" ] INTEGER | STRING ;
 INTEGER       = NUMBER without a fractional part and without a SUFFIX ;
@@ -298,9 +346,11 @@ struct`, and it is accepted only on `struct` and `enum` declarations;
 ### Impls and traits
 
 ```text
-impl  = "impl" type [ "with" type { "+" type } ] "{" { statement } "}" ;
-trait = "trait" IDENT [ generic-params ] [ "with" type { "+" type } ]
-        "{" { function } "}" ;
+impl  = [ internal-label ] [ platform-attr ] "impl" type [ "with" type { "+" type } ]
+        "{" { statement } "}" ;
+trait = [ deprecated-label ] [ internal-label ] [ platform-attr ] "trait" IDENT
+        [ generic-params ]
+        [ "with" type { "+" type } ] "{" { function } "}" ;
 ```
 
 An impl's subject is a **type pattern**: `type X [: bounds]` binders
@@ -363,6 +413,9 @@ marker, never a client name: `[service(http)]` keeps the default
 ```text
 let        = [ "lazy" ] ("let" | "mut") binder [ ":" type ]
              [ "=" expression ] ;
+labelled-let = ( deprecated-label [ internal-label ] | internal-label )
+               [ "lazy" ] ("let" | "mut") IDENT [ ":" type ]
+               [ "=" expression ] ";" ;
 assignment = [ "*" ] place ( "=" | "+=" | "-=" | "*=" | "/=" | "%=" )
              expression ;
 place      = chain ;                 (* an assignable location, §3.6 *)

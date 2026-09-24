@@ -283,8 +283,8 @@ fn descend<'src>(node: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
             return_type,
             return_value: seal_boxed(return_value),
         }),
-        Node::Let(name, annotation, value, mutable, lazy) => {
-            Node::Let(name, annotation, seal_opt(value), mutable, lazy)
+        Node::Let(name, annotation, value, mutable, lazy, labels) => {
+            Node::Let(name, annotation, seal_opt(value), mutable, lazy, labels)
         }
         Node::LetDestructure(pattern, annotation, value, mutable) => {
             Node::LetDestructure(pattern, annotation, seal_opt(value), mutable)
@@ -323,7 +323,7 @@ fn descend<'src>(node: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
         Node::Await(inner) => Node::Await(seal_boxed(inner)),
         Node::Async(inner) => Node::Async(seal_boxed(inner)),
         Node::FuncReturn(value) => Node::FuncReturn(seal_opt(value)),
-        Node::Export(scope, inner) => Node::Export(scope, seal_boxed(inner)),
+        Node::Export(scope, inner, labels) => Node::Export(scope, seal_boxed(inner), labels),
         Node::Const(inner) => Node::Const(seal_boxed(inner)),
         Node::Derive(names, inner) => Node::Derive(names, seal_boxed(inner)),
         Node::Service(attribute, inner) => Node::Service(attribute, seal_boxed(inner)),
@@ -334,13 +334,13 @@ fn descend<'src>(node: Spanned<Node<'src>>) -> Spanned<Node<'src>> {
             seal_list(&mut items.0);
             Node::Module(name, items)
         }
-        Node::Impl(subject, traits, mut members) => {
+        Node::Impl(subject, traits, mut members, labels) => {
             seal_list(&mut members.0);
-            Node::Impl(subject, traits, members)
+            Node::Impl(subject, traits, members, labels)
         }
-        Node::Trait(name, generics, supertraits, mut members) => {
+        Node::Trait(name, generics, supertraits, mut members, labels) => {
             seal_list(&mut members.0);
-            Node::Trait(name, generics, supertraits, members)
+            Node::Trait(name, generics, supertraits, members, labels)
         }
         // A chain-form lift is a sealed atom: its own value never absorbs
         // into a region (§5), but marks in its interior slots (arguments of

@@ -60,8 +60,8 @@ use crate::node::{
     ANONYMOUS_TYPE_BINDER, BackingLiteral, BinaryOp, Closure, Convention, CssBody, CssDeclaration,
     CssItem, CssNested, ElementBody, ElementChild, ElementHeadItem, EnumVariant, ExportScope,
     Exposure, ExternBinding, Func, GenericArguments, GenericParameter, GenericParameters, If,
-    ImplSelector, ImportBranch, ImportModifier, ImportTail, MatchLeg, Node, NodeIfBranch, NodeList,
-    Parameter, Pattern, ServiceAttr, StructField, TupleBound,
+    ImplSelector, ImportBranch, ImportModifier, ImportTail, ItemLabels, Labels, MatchLeg, Node,
+    NodeIfBranch, NodeList, Parameter, Pattern, ServiceAttr, StructField, TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -359,6 +359,19 @@ const DOC_HIDDEN_IS_SUPERSEDED: &str = "`[doc(hidden)]` is superseded by visibil
      marker is reached for: it stays exported and callable, and the editor hides it from \
      completion, dims it and leads its hover with the reason";
 
+/// F27 R1's placement rule: a module's `[platform(..)];` is the FILE's platform,
+/// so it leads the file — the one place a reader looks for what the whole file
+/// is. Curated: the rule states itself and names the move that satisfies it.
+pub const MODULE_PLATFORM_LEADS_THE_FILE: &str = "a module's `[platform(..)];` declares the platform of the whole file, so it is the file's \
+     first statement: move it above the first import. To fence one function instead, write the \
+     attribute on it with no `;`";
+
+/// B382's rule: a `[deprecated]` steer on an import is about the NAME a
+/// re-export publishes, so it needs the `export`. Curated: it names the move.
+pub const DEPRECATED_IMPORT_IS_A_RE_EXPORT: &str = "`[deprecated(..)]` on an `import` deprecates the name a RE-EXPORT publishes, and this \
+     import is not exported, so it publishes nothing — write `export` before the attribute, or \
+     delete it";
+
 /// The rule `export <expression>;` breaks (B321). Curated
 /// (diagnostics-standard.md B6 — the prohibition explains itself and names the
 /// sanctioned spellings).
@@ -445,6 +458,7 @@ fn export_takes(node: &Node<'_>) -> bool {
         | Node::Use(_)
         | Node::Export(..)
         | Node::ExportAll
+        | Node::ModulePlatform(_)
         | Node::Let(..)
         | Node::LetDestructure(..)
         | Node::Error => true,
@@ -932,6 +946,13 @@ struct Parser<'a, 'src> {
     /// (variadic-generics.md §S.7), and clears it for the body it then parses:
     /// a `fun` declared inside a member's body is a free function.
     in_member_body: bool,
+    /// Whether the statement about to be read is the FILE's first (F27 R1):
+    /// the one position a module-level `[platform("…")];` may stand in. Set by
+    /// [`Parser::parse_program`] before its first statement and TAKEN by the
+    /// first [`Parser::parse_statement_inner`] that runs — so a statement nested
+    /// inside that first one (a function body's, a `mod`'s) already sees it
+    /// false.
+    file_head: bool,
     /// How many levels of SOURCE NESTING are open, against
     /// [`Parser::NESTING_DEPTH_LIMIT`] (B142) — the parser's own bound, the
     /// companion to the analyzer's `WALK_DEPTH_LIMIT` and `RETURN_DEPTH_LIMIT`.
@@ -1192,6 +1213,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             context_stack: Vec::new(),
             preserve_paren_groups,
             in_member_body: false,
+            file_head: false,
             nesting_depth: 0,
             nesting_refusal: None,
             import_path_failure: None,
@@ -2249,6 +2271,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// (`editing-dx.md` §2.2 mechanism 3 — the file-tail blackout).
     fn parse_program(&mut self) -> Spanned<NodeList<'src>> {
         let mut statements = Vec::new();
+        self.file_head = true;
         loop {
             if self.at_end() {
                 break;
@@ -2325,6 +2348,20 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     /// [`Parser::parse_statement`]'s body, past the depth bound.
     fn parse_statement_inner(&mut self) -> Option<Spanned<Node<'src>>> {
+        // F27 R1: only the file's first statement may be its platform. Taken
+        // here, once, so every statement nested inside this one reads false.
+        let file_head = std::mem::take(&mut self.file_head);
+        if let Some(item) = self.attempt(Self::parse_module_platform) {
+            if !file_head {
+                self.errors.push(ParseError {
+                    span: item.1,
+                    reason: ParseErrorReason::Rule(MODULE_PLATFORM_LEADS_THE_FILE),
+                    context: self.context_stack.clone(),
+                    hint: None,
+                });
+            }
+            return Some(item);
+        }
         // G24's `const let` / `const fun` / `const mut`, ahead of everything:
         // `const` begins no other statement, and the expression fork below
         // would otherwise read `const let` as its prefix over a `let`
@@ -2351,6 +2388,9 @@ impl<'a, 'src> Parser<'a, 'src> {
             return Some(item);
         }
         if let Some(item) = self.attempt(Self::parse_export) {
+            return Some(item);
+        }
+        if let Some(item) = self.attempt(Self::parse_labelled_let) {
             return Some(item);
         }
         // Items 8-11 & 21: `expression ;`, or a block-bearing form
@@ -4820,7 +4860,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
         let node = match pattern {
             Pattern::Binding(name, _, _) => {
-                Node::Let((name, pattern_span), type_, value, mutable, lazy)
+                Node::Let((name, pattern_span), type_, value, mutable, lazy, None)
             }
             pattern => Node::LetDestructure((pattern, pattern_span), type_, value, mutable),
         };
@@ -6226,6 +6266,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// (checked past the parser).
     fn parse_struct(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
+        let labels = self.parse_item_labels();
         let resource = self.eat(&Token::Resource);
         let external = self.eat(&Token::External);
         self.expect(&Token::Struct)?;
@@ -6271,6 +6312,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 external,
                 resource,
                 body.map(Box::new),
+                labels,
             ),
             self.span_from(start),
         ))
@@ -6299,6 +6341,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// `resource` is the only leading modifier.
     fn parse_enum(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
+        let labels = self.parse_item_labels();
         let resource = self.eat(&Token::Resource);
         self.expect(&Token::Enum)?;
         let name_start = self.position;
@@ -6317,15 +6360,18 @@ impl<'a, 'src> Parser<'a, 'src> {
                 generic_parameters.map(Box::new),
                 resource,
                 Box::new(variants),
+                labels,
             ),
             self.span_from(start),
         ))
     }
 
-    /// One enum variant: `name (payload types)? (= backing value)?`, carrying
-    /// the whole-variant span.
+    /// One enum variant: `[internal(..)]? name (payload types)? (= backing
+    /// value)?`, carrying the whole-variant span.
     fn parse_enum_variant(&mut self) -> Option<Spanned<EnumVariant<'src>>> {
         let start = self.position;
+        // E221: a variant's label leads it, as a field's does (E213).
+        let internal = self.parse_internal_attribute();
         let name = self.eat_name()?;
         let data = self.attempt(|parser| {
             parser.expect_ctrl('(')?;
@@ -6335,7 +6381,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         });
         let backing = self.parse_backing_literal();
         Some((
-            (name, data.unwrap_or_default(), backing),
+            (name, data.unwrap_or_default(), backing, internal),
             self.span_from(start),
         ))
     }
@@ -6402,6 +6448,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// the `+`-separated list of implemented traits.
     fn parse_impl(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
+        let labels = self.parse_item_labels();
         self.expect(&Token::Impl)?;
         let subject = self.parse_type()?;
         let traits = if self.eat(&Token::With) {
@@ -6412,7 +6459,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         let body =
             self.within_member_body(|parser| parser.parse_item_body("implementation body"))?;
         Some((
-            Node::Impl(Box::new(subject), traits, body),
+            Node::Impl(Box::new(subject), traits, body, labels),
             self.span_from(start),
         ))
     }
@@ -6431,6 +6478,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// function declarations only.
     fn parse_trait(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
+        let labels = self.parse_item_labels();
         self.expect(&Token::Trait)?;
         let name_start = self.position;
         let name = self.eat_ident()?;
@@ -6448,6 +6496,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 generic_parameters.map(Box::new),
                 supertraits,
                 Box::new(body),
+                labels,
             ),
             self.span_from(start),
         ))
@@ -6501,6 +6550,21 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     /// `import <namespace_path> only? ;` — an import used as a statement.
     fn parse_import_statement(&mut self) -> Option<Spanned<Node<'src>>> {
+        // B382: a steer on an import that is not re-exported publishes nothing
+        // — refused where it is written, and the import still parses, so the
+        // reader gets the one sentence and not a cascade.
+        if let Some(attribute) = self.attempt(|parser| {
+            let start = parser.position;
+            parser.parse_deprecated_attribute()?;
+            (parser.peek() == Some(&Token::Import)).then(|| parser.span_from(start))
+        }) {
+            self.errors.push(ParseError {
+                span: attribute,
+                reason: ParseErrorReason::Rule(DEPRECATED_IMPORT_IS_A_RE_EXPORT),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
         let import = self.parse_import()?;
         if !self.eat_ctrl(';') {
             self.note_terminator();
@@ -6571,6 +6635,19 @@ impl<'a, 'src> Parser<'a, 'src> {
             return Some((Node::ExportAll, self.span_from(start)));
         }
         let scope = self.parse_export_scope();
+        // B382: `export [deprecated("use …")] import …;` — the steer is the
+        // RE-EXPORT's, so the export carries it. Read only ahead of `import`:
+        // before a declaration the same attribute is the declaration's own
+        // prefix, which its production reads.
+        let labels = self.attempt(|parser| {
+            let steer = parser.parse_deprecated_attribute()?;
+            (parser.peek() == Some(&Token::Import)).then(|| {
+                Box::new(Labels {
+                    deprecated: Some(steer),
+                    ..Labels::default()
+                })
+            })
+        });
         let inner = self.parse_statement()?;
         // B321: `parse_statement` reads an EXPRESSION statement too, so
         // `export (helper);` and `export * helper;` parsed and meant nothing.
@@ -6585,7 +6662,10 @@ impl<'a, 'src> Parser<'a, 'src> {
                 hint: None,
             });
         }
-        Some((Node::Export(scope, Box::new(inner)), self.span_from(start)))
+        Some((
+            Node::Export(scope, Box::new(inner), labels),
+            self.span_from(start),
+        ))
     }
 
     /// `(in PATH)` after `export` — B318 §2.2's narrowing, `None` when the
@@ -7453,6 +7533,67 @@ impl<'a, 'src> Parser<'a, 'src> {
             parser.expect_ctrl(']')?;
             Some(reason)
         })
+    }
+
+    /// The labels an item declaration carries about itself (E221) — the
+    /// ordered prefix `[internal("reason")]?`, read ahead of a struct, an
+    /// enum, a trait or a module `let`. `None` when no label leads, which is
+    /// the one-null-pointer case nearly every declaration takes.
+    fn parse_item_labels(&mut self) -> ItemLabels<'src> {
+        // B382: `[deprecated("use …")]` leads, as it leads a function's prefix;
+        // F27 R1's `[platform("…")]` follows `[internal(..)]`, the order a
+        // function's prefix gives the three.
+        let deprecated = self.parse_deprecated_attribute();
+        let internal = self.parse_internal_attribute();
+        let platform = self.parse_platform_attribute().unwrap_or_default();
+        if deprecated.is_none() && internal.is_none() && platform.is_empty() {
+            return None;
+        }
+        Some(Box::new(Labels {
+            deprecated,
+            internal,
+            platform,
+        }))
+    }
+
+    /// `[platform("…", …)];` — a FILE's platform (F27 R1): the function
+    /// fence's attribute with a `;` after it, which is what tells it from the
+    /// fence on a first item (the `export *;` shape — the marker is the
+    /// statement). Where it may stand is [`Parser::parse_statement_inner`]'s
+    /// rule, not this production's.
+    fn parse_module_platform(&mut self) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        let patterns = self.parse_platform_attribute()?;
+        let span = self.span_from(start);
+        self.expect_ctrl(';')?;
+        Some((Node::ModulePlatform(patterns), span))
+    }
+
+    /// A LABELLED `let` statement (E221): `[internal("reason")] let name = …;`.
+    ///
+    /// Read at statement position ahead of the expression fork, because `[`
+    /// begins a list literal there: without this, `[internal("x")]` parses as
+    /// a one-element list and the `let` after it as a missing `;`. A label is
+    /// required — an unlabelled `let` is the expression fork's, unchanged — and
+    /// only a plain binding takes one (a destructuring `let` names several
+    /// things and none of them is an item). Whether the binding is a MODULE
+    /// binding is not the parser's to know (a module and a function body share
+    /// this production); `labels::check` refuses a labelled local.
+    fn parse_labelled_let(&mut self) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        let labels = self.parse_item_labels()?;
+        let (node, _) = self.parse_let()?;
+        // The statement's span ends where an unlabelled `let`'s does, before
+        // its `;` — it only STARTS earlier, at the label.
+        let span = self.span_from(start);
+        self.expect_ctrl(';')?;
+        let Node::Let(name, type_, value, mutable, lazy, None) = node else {
+            return None;
+        };
+        Some((
+            Node::Let(name, type_, value, mutable, lazy, Some(labels)),
+            span,
+        ))
     }
 
     /// One platform pattern: a quoted string with its span.
@@ -8454,7 +8595,7 @@ mod tests {
     #[test]
     fn struct_fields_generics_and_modifiers() {
         match only_item("struct Point<T> { x: T, y: T }") {
-            Node::Struct(name, generics, external, resource, body) => {
+            Node::Struct(name, generics, external, resource, body, _) => {
                 assert_eq!(name.0, "Point");
                 assert!(generics.is_some());
                 assert!(!external && !resource);
@@ -8465,7 +8606,7 @@ mod tests {
         // `resource external struct null;` — every modifier, the `null` name, the
         // bodyless `;` form.
         match only_item("resource external struct null;") {
-            Node::Struct(name, _, external, resource, body) => {
+            Node::Struct(name, _, external, resource, body, _) => {
                 assert_eq!(name.0, "null");
                 assert!(external && resource);
                 assert!(body.is_none());
@@ -8477,7 +8618,7 @@ mod tests {
     #[test]
     fn exposed_struct_field_is_recorded() {
         match only_item("struct Room { [expose] count: Signal, name: str }") {
-            Node::Struct(_, _, _, _, Some(fields)) => {
+            Node::Struct(_, _, _, _, Some(fields), _) => {
                 let exposed: Vec<Exposure> = fields.0.iter().map(|field| field.0.2).collect();
                 assert_eq!(exposed, vec![Exposure::Whole, Exposure::None]);
             }
@@ -8488,10 +8629,10 @@ mod tests {
     #[test]
     fn enum_variants_payloads_and_discriminants() {
         match only_item("enum Sign { Less = -1, Zero = 0, More(i32, str) }") {
-            Node::Enum(name, _, resource, variants) => {
+            Node::Enum(name, _, resource, variants, _) => {
                 assert_eq!(name.0, "Sign");
                 assert!(!resource);
-                let (_, less_data, less_backing) = &variants.0[0].0;
+                let (_, less_data, less_backing, _) = &variants.0[0].0;
                 assert!(less_data.is_empty());
                 let less_backing = less_backing.as_ref().expect("Less has a backing value");
                 match less_backing {
@@ -8504,7 +8645,7 @@ mod tests {
                     other => panic!("expected an integer backing, got {other:?}"),
                 }
                 assert_eq!(less_backing.to_string(), "-1");
-                let (_, more_data, more_backing) = &variants.0[2].0;
+                let (_, more_data, more_backing, _) = &variants.0[2].0;
                 assert_eq!(more_data.len(), 2, "More carries two payload types");
                 assert_eq!(*more_backing, None);
             }
@@ -8512,7 +8653,7 @@ mod tests {
         }
         // `resource enum` — the only leading modifier on an enum.
         match only_item("resource enum Handle { Open, Closed }") {
-            Node::Enum(_, _, resource, _) => assert!(resource),
+            Node::Enum(_, _, resource, _, _) => assert!(resource),
             other => panic!("expected a resource Enum, got {other:?}"),
         }
     }
@@ -8524,9 +8665,9 @@ mod tests {
         // reprinted by `Display` so the formatter round-trips it and a
         // diagnostic can tell `1` from `"1"`.
         match only_item(r#"enum Align { Start = "flex-start", End = "end" }"#) {
-            Node::Enum(name, _, _, variants) => {
+            Node::Enum(name, _, _, variants, _) => {
                 assert_eq!(name.0, "Align");
-                let (_, _, start_backing) = &variants.0[0].0;
+                let (_, _, start_backing, _) = &variants.0[0].0;
                 match start_backing.as_ref().expect("Start has a backing value") {
                     BackingLiteral::Str { text, .. } => assert_eq!(*text, "flex-start"),
                     other => panic!("expected a string backing, got {other:?}"),
@@ -8565,7 +8706,7 @@ mod tests {
     #[test]
     fn impl_with_clause_and_body() {
         match only_item("impl Point<type T> with Show + Eq { fun show(&self): str { \"p\" } }") {
-            Node::Impl(_subject, traits, body) => {
+            Node::Impl(_subject, traits, body, _) => {
                 assert_eq!(traits.len(), 2, "with Show + Eq");
                 assert_eq!(body.0.len(), 1, "one method");
                 assert!(matches!(body.0[0].0, Node::Func(_)));
@@ -8579,7 +8720,7 @@ mod tests {
         // B294: `_` in type position is the binder production, with or without
         // a bound, and it produces the very node `type _` does.
         let binders = |source: &'static str| match only_item(source) {
-            Node::Impl(subject, _traits, _body) => match subject.0 {
+            Node::Impl(subject, _traits, _body, _) => match subject.0 {
                 Node::AccessorWithGenerics(_, arguments) => arguments
                     .0
                     .into_iter()
@@ -8636,7 +8777,7 @@ mod tests {
         match only_item(
             "trait Ord<T> with Eq { fun cmp(&self, other: &T): i32; fun max(&self): i32 { 0 } }",
         ) {
-            Node::Trait(name, generics, supertraits, body) => {
+            Node::Trait(name, generics, supertraits, body, _) => {
                 assert_eq!(name.0, "Ord");
                 assert!(generics.is_some());
                 assert_eq!(supertraits.len(), 1);
@@ -8674,7 +8815,7 @@ mod tests {
     fn import_recursive_path_and_brace_set() {
         // `std::collections::{ Map, Set }` — a `::` path ending in a set.
         match only_item("import std::collections::{ Map, Set };") {
-            Node::Import(ImportBranch::Path("std", _, ImportTail::Continue(next)), _) => {
+            Node::Import(ImportBranch::Path("std", _, ImportTail::Continue(next)), ..) => {
                 match &*next {
                     ImportBranch::Path("collections", _, ImportTail::Continue(set)) => match &**set
                     {
@@ -8697,7 +8838,7 @@ mod tests {
         // `export import a::b;` — the inner import consumes its own `;`; the Export
         // wraps it (and its span, tested via the differential, includes the `;`).
         match only_item("export import shared::config;") {
-            Node::Export(_, inner) => assert!(matches!(inner.0, Node::Import(..))),
+            Node::Export(_, inner, _) => assert!(matches!(inner.0, Node::Import(..))),
             other => panic!("expected Export, got {other:?}"),
         }
     }
@@ -8895,7 +9036,7 @@ mod tests {
         // A FIELD is the case declaration visibility cannot serve at all.
         match only_item("struct Region { [internal(\"the end marker\")] anchor: str, label: str }")
         {
-            Node::Struct(_, _, _, _, Some(fields)) => {
+            Node::Struct(_, _, _, _, Some(fields), _) => {
                 assert_eq!(fields.0[0].0.3, Some("the end marker"));
                 assert_eq!(fields.0[1].0.3, None);
             }
@@ -8914,6 +9055,177 @@ mod tests {
         assert!(declines(
             "[extern(\"fs\", \"read\")] [internal(\"seam\")] external fun read();"
         ));
+    }
+
+    #[test]
+    fn a_deprecated_steer_rides_a_type_and_a_re_export() {
+        // B382: the function attribute, admitted on the nominals and a trait —
+        // leading the ordered prefix, as it leads a function's.
+        fn steer(source: &str) -> Option<&str> {
+            match only_item(source) {
+                Node::Struct(.., labels) | Node::Enum(.., labels) | Node::Trait(.., labels) => {
+                    labels.and_then(|labels| labels.deprecated)
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(steer("[deprecated(\"use B\")] struct A {}"), Some("use B"));
+        assert_eq!(steer("[deprecated(\"use B\")] enum A { X }"), Some("use B"));
+        assert_eq!(
+            steer("[deprecated(\"use B\")] trait A { fun f(self); }"),
+            Some("use B")
+        );
+        assert_eq!(
+            steer("[deprecated(\"use B\")] [internal(\"x\")] struct A {}"),
+            Some("use B")
+        );
+        // …and on an `export import`, the re-export the ruling names.
+        match only_item("export [deprecated(\"use D\")] import pkg::a::D as K;") {
+            Node::Export(_, inner, Some(labels)) => {
+                assert_eq!(labels.deprecated, Some("use D"));
+                assert!(matches!(&inner.0, Node::Import(..)));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Without the `export` the steer publishes nothing: refused, and the
+        // import itself still parses.
+        let (tree, errors) = parse("[deprecated(\"use D\")] import pkg::a::D;\n");
+        assert!(
+            errors
+                .iter()
+                .any(|error| render(error) == DEPRECATED_IMPORT_IS_A_RE_EXPORT),
+            "{errors:?}"
+        );
+        assert!(matches!(tree.expect("a tree").0[0].0, Node::Import(..)));
+        // The order is the prefix's: `[internal]` before `[deprecated]` declines.
+        assert!(declines(
+            "[internal(\"x\")] [deprecated(\"use B\")] struct A {}"
+        ));
+    }
+
+    #[test]
+    fn a_file_leading_platform_is_the_modules_own() {
+        // F27 R1: the fence's attribute with a `;`, as the file's first
+        // statement.
+        let items = program("[platform(\"browser\")];\n\nimport std::ui::Region;\n");
+        match &items.0[0].0 {
+            Node::ModulePlatform(patterns) => {
+                assert_eq!(
+                    patterns.iter().map(|(text, _)| *text).collect::<Vec<_>>(),
+                    vec!["browser"]
+                );
+            }
+            other => panic!("expected the module's platform, got {other:?}"),
+        }
+        match only_item("[platform(\"@process\", \"browser\")];") {
+            Node::ModulePlatform(patterns) => assert_eq!(patterns.len(), 2),
+            other => panic!("{other:?}"),
+        }
+        // Without the `;` it is the first function's fence, as it always was.
+        match only_item("[platform(\"browser\")] fun f() {}") {
+            Node::Func(function) => assert_eq!(function.platform_fence.len(), 1),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_module_platform_anywhere_but_the_files_head_is_refused() {
+        for source in [
+            "import std::ui::Region;\n[platform(\"browser\")];\n",
+            "fun f() {\n\t[platform(\"browser\")];\n}\n",
+            "mod inner {\n\t[platform(\"browser\")];\n}\n",
+        ] {
+            let (_, errors) = parse(source);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| render(error) == MODULE_PLATFORM_LEADS_THE_FILE),
+                "{source:?}: {errors:?}"
+            );
+        }
+        // The head itself is clean, a leading comment notwithstanding.
+        assert!(!declines(
+            "// the client's slot\n[platform(\"browser\")];\nfun f() {}\n"
+        ));
+    }
+
+    #[test]
+    fn an_impl_and_a_nominal_carry_a_platform_label() {
+        match only_item("[platform(\"browser\")] impl Region { fun f(self) {} }") {
+            Node::Impl(_, _, _, Some(labels)) => assert_eq!(labels.platform.len(), 1),
+            other => panic!("{other:?}"),
+        }
+        match only_item("[internal(\"x\")] [platform(\"browser\")] struct Slot {}") {
+            Node::Struct(.., Some(labels)) => {
+                assert_eq!(labels.internal, Some("x"));
+                assert_eq!(labels.platform[0].0, "browser");
+            }
+            other => panic!("{other:?}"),
+        }
+        match only_item("impl Region { fun f(self) {} }") {
+            Node::Impl(_, _, _, None) => {}
+            other => panic!("an unlabelled impl carries none: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_internal_label_rides_every_e221_position() {
+        // E221: the nominals, a variant, a trait and a module binding.
+        fn label_of(source: &str) -> Option<&str> {
+            match only_item(source) {
+                Node::Struct(.., labels)
+                | Node::Enum(.., labels)
+                | Node::Trait(.., labels)
+                | Node::Let(.., labels) => labels.and_then(|labels| labels.internal),
+                other => panic!("expected a labelled declaration, got {other:?}"),
+            }
+        }
+        assert_eq!(label_of("[internal(\"s\")] struct Region {}"), Some("s"));
+        assert_eq!(
+            label_of("[internal(\"r\")] resource struct Handle { id: i32 }"),
+            Some("r")
+        );
+        assert_eq!(label_of("[internal(\"e\")] enum Side { Left }"), Some("e"));
+        assert_eq!(
+            label_of("[internal(\"t\")] trait Seam { fun seam(self); }"),
+            Some("t")
+        );
+        assert_eq!(label_of("[internal(\"b\")] let cache = 3;"), Some("b"));
+        assert_eq!(label_of("[internal(\"l\")] lazy let db = 3;"), Some("l"));
+        assert_eq!(label_of("[internal(\"m\")] mut counter = 0;"), Some("m"));
+        // Unlabelled, each is the one null pointer it was.
+        assert_eq!(label_of("struct Region {}"), None);
+        assert_eq!(label_of("let cache = 3;"), None);
+        // A variant, on the variant's own record.
+        match only_item("enum Side { Left, [internal(\"v\")] Auto }") {
+            Node::Enum(_, _, _, variants, None) => {
+                assert_eq!(variants.0[0].0.3, None);
+                assert_eq!(variants.0[1].0.3, Some("v"));
+            }
+            other => panic!("expected an Enum, got {other:?}"),
+        }
+        // Behind `export`, and after a `[derive(..)]`, as a function's is.
+        match only_item("export [internal(\"x\")] struct Marker {}") {
+            Node::Export(_, inner, _) => {
+                assert!(
+                    matches!(&inner.0, Node::Struct(.., Some(labels)) if labels.internal == Some("x"))
+                )
+            }
+            other => panic!("expected an Export, got {other:?}"),
+        }
+        match only_item("[derive(Clone)] [internal(\"d\")] struct Point { x: i32 }") {
+            Node::Derive(_, inner) => {
+                assert!(
+                    matches!(&inner.0, Node::Struct(.., Some(labels)) if labels.internal == Some("d"))
+                )
+            }
+            other => panic!("expected a Derive, got {other:?}"),
+        }
+        // A bare `[internal]` is not the label on any of them.
+        assert!(declines("[internal] struct Region {}"));
+        assert!(declines("[internal] let cache = 3;"));
+        // And a `let` destructuring several names takes none.
+        assert!(declines("[internal(\"p\")] let (a, b) = (1, 2);"));
     }
 
     #[test]
@@ -9005,11 +9317,11 @@ mod tests {
         // valid and parse cleanly (the steer never shadows them).
         assert!(matches!(
             only_item("resource struct File { }"),
-            Node::Struct(_, _, false, true, _)
+            Node::Struct(_, _, false, true, _, _)
         ));
         assert!(matches!(
             only_item("resource enum State { A, B }"),
-            Node::Enum(_, _, true, _)
+            Node::Enum(_, _, true, _, _)
         ));
     }
 
@@ -9094,11 +9406,11 @@ mod tests {
             ),
             (
                 "impl Foo { 1 2 3 }\nfun after() {}\n",
-                "Impl((Accessor(\"Foo\"), 5..8), [], ([], 9..18))",
+                "Impl((Accessor(\"Foo\"), 5..8), [], ([], 9..18), None)",
             ),
             (
                 "trait Foo { 1 2 3 }\nfun after() {}\n",
-                "Trait((\"Foo\", 6..9), None, [], ([], 10..19))",
+                "Trait((\"Foo\", 6..9), None, [], ([], 10..19), None)",
             ),
             (
                 "mod foo { 1 2 3 }\nfun after() {}\n",
@@ -9323,7 +9635,7 @@ mod tests {
         // keeps go-to-definition, find-references and rename pointing at the
         // name.
         let marked = only_item("import pkg::a::#hidden;");
-        let Node::Import(ImportBranch::Path("pkg", _, ImportTail::Continue(after_pkg)), _) =
+        let Node::Import(ImportBranch::Path("pkg", _, ImportTail::Continue(after_pkg)), ..) =
             &marked
         else {
             panic!("the path reads as written: {marked:?}");
@@ -9443,7 +9755,7 @@ mod tests {
                 rendered_errors(source)
             );
         }
-        let Node::Export(Some(scope), _) = only_item("export(in pkg::a) struct S { x: i32 }")
+        let Node::Export(Some(scope), _, _) = only_item("export(in pkg::a) struct S { x: i32 }")
         else {
             panic!("the narrowing rides the export node");
         };
