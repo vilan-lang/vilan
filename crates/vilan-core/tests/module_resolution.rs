@@ -6484,6 +6484,177 @@ fn transform_package(
         .map_err(|error| error.msg)
 }
 
+/// N124's package: an exported `Box`, two traits each carrying a DEFAULT
+/// `describe` (`One` answers "one", `Two` answers "two"), one exported
+/// `impl Box with ..` per trait in modules of their own, and an entry whose
+/// import of `p1` is written per case. Every module is one line so `cargo fmt`
+/// cannot leave an indent inside it (AGENTS.md, N123).
+fn inherited_default_files(p1_import: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("b.vl", "export struct Box { n: i32 }\n".to_string()),
+        (
+            "t.vl",
+            "export trait One {\n\tfun describe(self): str { \"one\" }\n}\n\nexport trait Two {\n\tfun describe(self): str { \"two\" }\n}\n".to_string(),
+        ),
+        (
+            "p1.vl",
+            "import pkg::b::Box;\nimport pkg::t::One;\n\nexport impl Box with One {}\n".to_string(),
+        ),
+        (
+            "p2.vl",
+            "import pkg::b::Box;\nimport pkg::t::Two;\n\nexport impl Box with Two {}\n".to_string(),
+        ),
+        (
+            "c.vl",
+            format!("import pkg::b::Box;\n{p1_import}\n\nfun main() {{\n\tlet _ = Box {{ n = 1 }};\n}}\n"),
+        ),
+    ]
+}
+
+/// What N124's pins read off one analyzed package: the entry file, the `Box`
+/// type, and each trait's `describe` default, found by name.
+struct InheritedDefaultProgram {
+    program: vilan_core::analyzer::Program<'static>,
+    entry_file: vilan_core::analyzer::SourceId,
+    box_type: vilan_core::type_::TypeId,
+    one_default: vilan_core::id::Id,
+    two_default: vilan_core::id::Id,
+}
+
+fn analyze_inherited_default_package(p1_import: &str) -> InheritedDefaultProgram {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = scratch::root().join(format!("vilan_modres_n124_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (relative, contents) in inherited_default_files(p1_import) {
+        let path = dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let entry_path = dir.join("c.vl");
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &dir,
+        &entry_path,
+        Some(Platform::default()),
+        &Workspace::default(),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+    let program = program.unwrap_or_else(|| panic!("no program: {messages:#?}"));
+    assert!(messages.is_empty(), "{messages:#?}");
+    let main = program
+        .functions
+        .values()
+        .find(|function| function.name == "main")
+        .expect("the entry's `main`")
+        .id;
+    let entry_file = program.source_of(main).expect("`main` has a file");
+    let box_id = program
+        .structs
+        .values()
+        .find(|declared| declared.name == "Box")
+        .expect("`Box`")
+        .id;
+    let box_type = *program
+        .type_id_to_type_map
+        .iter()
+        .find(|(_, type_)| {
+            matches!(type_, vilan_core::type_::Type::Struct(id, arguments) if *id == box_id && arguments.is_empty())
+        })
+        .expect("`Box` is interned")
+        .0;
+    let default_of = |trait_name: &str| {
+        let trait_id = program
+            .traits
+            .values()
+            .find(|declared| declared.name == trait_name)
+            .unwrap_or_else(|| panic!("trait `{trait_name}`"))
+            .id;
+        vilan_core::mono::trait_default_member(&program, trait_id, "describe")
+            .unwrap_or_else(|| panic!("`{trait_name}::describe` has a default"))
+    };
+    let one_default = default_of("One");
+    let two_default = default_of("Two");
+    InheritedDefaultProgram {
+        program,
+        entry_file,
+        box_type,
+        one_default,
+        two_default,
+    }
+}
+
+/// N124 — F26's impl-ADMISSION parameter on the SHARED inherited-default
+/// lookup (`mono::resolve_inherited_default`, which both emitters call): asked
+/// on behalf of a file whose `only` import DECLINES `p1`'s blocks, `Box`
+/// inherits no `describe` — while the same question asked with no file (the
+/// native emitter's `None`, "every impl in the program") answers `One`'s
+/// default. The control beside it: a plain import of `p1` admits the block and
+/// the file-scoped answer is `One`'s default too.
+///
+/// Red with the parameter planted out of the shared lookup (`resolve_inherited_default`
+/// passing `None` to `applying_trait_ids`): the declined file answers `One`'s
+/// default. NOT red with `None` planted at the JavaScript emitter's call site,
+/// and the pin cannot be made to: the entry that calls `box.describe()` under
+/// the declining import compiles today (the analyzer's default lookup does not
+/// read admission), and when the file-scoped lookup declines, the emitter falls
+/// back to the analyzer's own resolution — the same default — so the emitted
+/// program differs only in the name it gives the function. The two-trait form
+/// the tracker asked for is refused before emission: with `p2` loaded at all,
+/// `box.describe()` is "ambiguous on 'Box'" whatever `c.vl`'s imports admit.
+#[test]
+fn n124_the_shared_inherited_default_lookup_answers_under_the_asking_files_imports() {
+    let declined = analyze_inherited_default_package("import pkg::p1 only;\nimport pkg::p2 only;");
+    assert_eq!(
+        vilan_core::mono::resolve_inherited_default(
+            &declined.program,
+            Some(declined.entry_file),
+            declined.box_type,
+            "describe",
+        ),
+        None,
+        "a file that declines every block inherits no default through them"
+    );
+    let unscoped = vilan_core::mono::resolve_inherited_default(
+        &declined.program,
+        None,
+        declined.box_type,
+        "describe",
+    );
+    assert!(
+        unscoped == Some(declined.one_default) || unscoped == Some(declined.two_default),
+        "with no file, every impl is admitted and a default is inherited: {unscoped:?}"
+    );
+
+    let one_only = analyze_inherited_default_package("import pkg::p1;\nimport pkg::p2 only;");
+    assert_eq!(
+        vilan_core::mono::resolve_inherited_default(
+            &one_only.program,
+            Some(one_only.entry_file),
+            one_only.box_type,
+            "describe",
+        ),
+        Some(one_only.one_default),
+        "the admitted block's trait answers, and the declined one's does not"
+    );
+
+    let two_only = analyze_inherited_default_package("import pkg::p1 only;\nimport pkg::p2;");
+    assert_eq!(
+        vilan_core::mono::resolve_inherited_default(
+            &two_only.program,
+            Some(two_only.entry_file),
+            two_only.box_type,
+            "describe",
+        ),
+        Some(two_only.two_default),
+        "and the other way round: the answer follows the file's imports, not declaration order"
+    );
+}
+
 /// The §3.5 exhibit's modules, with `a.vl`'s and the entry's selector supplied
 /// per case. A generic body in `a.vl` calls `value.tag()` through a bound; the
 /// two blocks that answer it live in `ext.vl`, one per element type.
