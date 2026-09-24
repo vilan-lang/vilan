@@ -85,6 +85,7 @@ guide/persistence.md h2 putting-it-together
 guide/reactive.md h1 reactive-state
 guide/reactive.md h2 signals
 guide/reactive.md h2 derived-state-map-combine-flatten
+guide/reactive.md h3 where-a-derivation-lives-cell-and-dyn-sourcet
 guide/reactive.md h3 selection-over-a-list-selector
 guide/reactive.md h2 reacting-effect-and-sub
 guide/reactive.md h2 ownership-who-cleans-up
