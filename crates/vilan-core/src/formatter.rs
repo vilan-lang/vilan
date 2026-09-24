@@ -3460,6 +3460,15 @@ struct Printer<'src> {
     atomic_elements: bool,
     /// The package's `[fmt]` knobs (E205).
     options: FormatOptions,
+    /// Where the item being printed puts its DECLARATION line, when attribute
+    /// lines went above it (E219): the output offset just past that line's
+    /// indentation. An attribute line is a line of its own with a budget of
+    /// its own — it cannot be broken, so an over-long one is simply long — and
+    /// the width rule measures the declaration from here, so a long
+    /// `[deprecated("…")]` no longer splits the short signature beneath it.
+    /// Set by [`Printer::end_attribute_line`], taken by
+    /// [`Printer::begin_split_reprint`].
+    head_start: Option<usize>,
 }
 
 impl<'src> Printer<'src> {
@@ -3478,6 +3487,7 @@ impl<'src> Printer<'src> {
             probing: false,
             atomic_elements: false,
             options,
+            head_start: None,
         }
     }
 
@@ -3793,6 +3803,10 @@ impl<'src> Printer<'src> {
             let statement_start = self.out.len();
             let comment_cursor = self.cursor;
             let terminated = Self::needs_semicolon(&item.0);
+            // E219: this statement's declaration line is its own; the item
+            // that ENCLOSES it (a function whose body this is) keeps its own
+            // until its own width rule reads it.
+            let enclosing_head = self.head_start.take();
             self.print_item(item);
             if terminated {
                 self.out.push(';');
@@ -3804,6 +3818,7 @@ impl<'src> Printer<'src> {
                     self.out.push(';');
                 }
             }
+            self.head_start = enclosing_head;
             self.flush_trailing_comment(range.end);
             prev_end = range.end;
             index += 1;
@@ -4603,7 +4618,7 @@ impl<'src> Printer<'src> {
                 let names: Vec<&str> = names.iter().map(|(name, _)| *name).collect();
                 self.out.push_str(&names.join(", "));
                 self.out.push_str(")]");
-                self.line();
+                self.end_attribute_line();
                 self.print_item(derived);
             }
             // `[service]` / `[service(Client, client = H)]` / `[client_service]`
@@ -4632,11 +4647,11 @@ impl<'src> Printer<'src> {
                         self.out.push(')');
                     }
                     self.out.push(']');
-                    self.line();
+                    self.end_attribute_line();
                 }
                 if attribute.client_side {
                     self.out.push_str("[client_service]");
-                    self.line();
+                    self.end_attribute_line();
                 }
                 self.print_item(item);
             }
@@ -4691,7 +4706,7 @@ impl<'src> Printer<'src> {
                     self.out.push(')');
                 }
                 self.out.push(']');
-                self.line();
+                self.end_attribute_line();
                 self.print_item(annotated);
             }
             // Anything else is an expression appearing as a statement.
@@ -5269,17 +5284,17 @@ impl<'src> Printer<'src> {
             self.out.push_str("[deprecated(\"");
             self.out.push_str(steer);
             self.out.push_str("\")]");
-            self.line();
+            self.end_attribute_line();
         }
         if let Some(reason) = labels.internal {
             self.out.push_str("[internal(\"");
             self.out.push_str(reason);
             self.out.push_str("\")]");
-            self.line();
+            self.end_attribute_line();
         }
         if !labels.platform.is_empty() {
             self.print_platform_attribute(&labels.platform);
-            self.line();
+            self.end_attribute_line();
         }
     }
 
@@ -5310,33 +5325,33 @@ impl<'src> Printer<'src> {
             self.out.push_str("[deprecated(\"");
             self.out.push_str(steer);
             self.out.push_str("\")]");
-            self.line();
+            self.end_attribute_line();
         }
         if let Some(reason) = func.internal {
             self.out.push_str("[internal(\"");
             self.out.push_str(reason);
             self.out.push_str("\")]");
-            self.line();
+            self.end_attribute_line();
         }
         if let Some(binding) = &func.extern_binding {
             self.print_extern_attribute(binding, func.extern_retains);
-            self.line();
+            self.end_attribute_line();
         }
         if func.must_use {
             self.out.push_str("[must_use]");
-            self.line();
+            self.end_attribute_line();
         }
         if func.rpc {
             self.out.push_str("[rpc]");
-            self.line();
+            self.end_attribute_line();
         }
         if func.trait_only {
             self.out.push_str("[trait_only]");
-            self.line();
+            self.end_attribute_line();
         }
         if !func.platform_fence.is_empty() {
             self.print_platform_attribute(&func.platform_fence);
-            self.line();
+            self.end_attribute_line();
         }
         if func.is_async {
             self.out.push_str("async ");
@@ -5579,11 +5594,13 @@ impl<'src> Printer<'src> {
             // block's value), so it takes the same width rule.
             let statement_start = self.out.len();
             let comment_cursor = self.cursor;
+            let enclosing_head = self.head_start.take();
             self.print_expr(tail);
             if self.begin_split_reprint(statement_start, comment_cursor) {
                 self.print_expr(tail);
                 self.split = Split::Off;
             }
+            self.head_start = enclosing_head;
             self.flush_trailing_comment(tail_range.end);
             prev_end = tail_range.end;
         }
@@ -5793,12 +5810,27 @@ impl<'src> Printer<'src> {
         display_width(first_line) > LINE_BUDGET
     }
 
+    /// Ends an ATTRIBUTE line (`[derive(..)]`, `[deprecated(..)]`, a fence…)
+    /// and marks the line after it as the declaration's (E219).
+    fn end_attribute_line(&mut self) {
+        self.line();
+        self.head_start = Some(self.out.len());
+    }
+
     /// Rolls the output and the comment cursor back to the start of the
     /// statement just printed inline and arms the statement-level split, so the
     /// caller can print the same statement again in split form. Returns `false`
     /// — changing nothing — when the statement fits the budget.
+    ///
+    /// E219: the line measured is the DECLARATION's — the first one after any
+    /// attribute lines the item printed above it — not the statement's first.
+    /// The attribute lines are theirs alone and nothing breaks them.
     fn begin_split_reprint(&mut self, statement_start: usize, comment_cursor: usize) -> bool {
-        if !self.over_line_budget(statement_start) {
+        let measured = match self.head_start.take() {
+            Some(head) if head >= statement_start => head,
+            _ => statement_start,
+        };
+        if !self.over_line_budget(measured) {
             return false;
         }
         self.out.truncate(statement_start);
@@ -8740,6 +8772,61 @@ mod idempotency {
             "and a function's leads the ordered prefix:\n{formatted}"
         );
         assert_fixed_point("internal", source);
+    }
+
+    /// E219: the ITEM's repro. An attribute line has a width of its own and
+    /// nothing breaks it; the signature under it is measured on its own line,
+    /// so a 110-column steer no longer puts one parameter per line.
+    #[test]
+    fn a_long_attribute_line_leaves_the_short_signature_below_it_alone() {
+        let source = concat!(
+            "[deprecated(\"use two() instead, which takes the same arguments and returns the same sum, and is what every caller wants\")]\n",
+            "fun one(a: i32, b: i32): i32 {\n\tlet c = a;\n\tc + b\n}\n",
+        );
+        assert_eq!(format(source), source, "the repro reprints unchanged");
+        assert_fixed_point("e219_repro", source);
+    }
+
+    /// Every attribute-carrying position takes the rule: a method in an impl,
+    /// a labelled struct, a derive line, a user macro attribute, and a label
+    /// stacked on another.
+    #[test]
+    fn every_attribute_line_has_its_own_budget() {
+        let long = "an internal reason long enough on its own to run past the hundred-column budget of a line";
+        let source = format!(
+            concat!(
+                "[internal(\"{long}\")]\n",
+                "struct Pair<type T> {{\n\tleft: T,\n\tright: T,\n}}\n\n",
+                "impl Pair<type T> {{\n",
+                "\t[deprecated(\"{long}\")]\n",
+                "\t[must_use]\n",
+                "\tfun swap(self, extra: i32): i32 {{\n\t\textra\n\t}}\n",
+                "}}\n\n",
+                "[derive(Clone, PartialEq, Hashable, Json, Wire, Debug, Display, Default, Ord, PartialOrd, Eq)]\n",
+                "struct Key {{\n\tid: i32,\n}}\n",
+            ),
+            long = long
+        );
+        assert_eq!(format(&source), source);
+        assert_fixed_point("e219_positions", &source);
+    }
+
+    /// The control: the rule still applies to the DECLARATION. A signature
+    /// that is itself over the budget splits under a short attribute and under
+    /// a long one alike — the attribute line changes nothing either way.
+    #[test]
+    fn an_over_budget_signature_still_splits_under_any_attribute() {
+        let long_signature = "fun combine(first_argument: i32, second_argument: i32, third_argument: i32, fourth_argument: i32): i32 {\n\t0\n}\n";
+        for attribute in [
+            "[must_use]\n",
+            "[deprecated(\"use two() instead, which takes the same arguments and returns the same sum, and is what every caller wants\")]\n",
+        ] {
+            let formatted = format(&format!("{attribute}{long_signature}"));
+            assert!(
+                formatted.contains("fun combine(\n\tfirst_argument: i32,\n"),
+                "{formatted}"
+            );
+        }
     }
 
     #[test]

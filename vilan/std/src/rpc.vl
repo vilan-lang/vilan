@@ -717,7 +717,9 @@ fun deliver_inbound(
 /// `reply_promise`'s resolver carries the reply frame — or the transport failure
 /// that means it will never come.
 [extern(new, "Promise")]
-external fun reply_promise(executor: |(|Result<Frame, str>| void)| void): Promise<Result<Frame, str>>;
+external fun reply_promise(
+	executor: |(|Result<Frame, str>| void)| void,
+): Promise<Result<Frame, str>>;
 
 /// One socket, `impl Transport`: each call rides the multiplex in the request
 /// frame's own kind — text as `r:<id>:<frame>`, binary as the tagged-byte form
