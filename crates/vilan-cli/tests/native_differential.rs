@@ -142,6 +142,11 @@ const DEFAULT_SUITE: &[&str] = &[
     // list| ..)` and a `Delta` pushed with a parameter its payload leaves open
     // — refused at the Order 40 seal, byte-identical now.
     "delta-law.vl",
+    // F34: `map` (a default's own generic bound from its closure argument) and
+    // `flatten` (a `?` lift over an `Option`), both refused at the Order 40
+    // seal.
+    "reactive-on-change.vl",
+    "reactive-flatten.vl",
 ];
 
 /// Corpus programs that are OUTSIDE this differential by construction, named
@@ -1786,6 +1791,67 @@ const KOLT_LOWERING_PROBE: &str = concat!(
     "\tprint(route([]));\n",
     "\tprint(find(\"b\").unwrap_or(0));\n",
     "\tprint(const asset::read(\"native-head.txt\"));\n",
+    "}\n",
+);
+
+/// **F34**: the two reactive COMBINATORS build natively. `map<U>` is a trait
+/// DEFAULT with a generic parameter of its own, reached through a dispatch the
+/// analyzer records no value for — `U` is bound from the closure argument
+/// (`|n| n * 10` against `|T| U`), and the default is one instance per binding
+/// of it as well as per receiver. `flatten` is written with `?` lifts
+/// (`inner_subscription.read()?.dispose()`), which lower to a `match` that
+/// rebuilds the bad half. Both refused at the Order 40 seal (`parameter 1 of
+/// map`; `a ? lift`); `reactive.vl`, `reactive-on-change.vl`,
+/// `reactive-flatten.vl` and `iterator-adapters.vl` flip with them, and two of
+/// those are in [`DEFAULT_SUITE`].
+#[test]
+fn the_reactive_combinators_map_and_flatten_build_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_map.vl"), MAP_PROBE).expect("write the map probe");
+    std::fs::write(staged.join("native_probe_flatten.vl"), FLATTEN_PROBE)
+        .expect("write the flatten probe");
+    for program in ["native_probe_map.vl", "native_probe_flatten.vl"] {
+        assert_eq!(
+            compare(&staged, program),
+            Verdict::Identical,
+            "{program}: a derived signal must print the same on both backends"
+        );
+    }
+}
+
+const MAP_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ Signal, SignalCell, Source };\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet count = SignalCell::new(1);\n",
+    "\tlet scaled = count.map(|n| n * 10);\n",
+    "\tlet labelled = scaled.map(|n| i\"#{n}\");\n",
+    "\tlet halves = count.map(|n| n.as_f64() / 2.0);\n",
+    "\tcount.set(4);\n",
+    "\tlet now: i32 = scaled.get();\n",
+    "\tlet label: str = labelled.get();\n",
+    "\tlet half: f64 = halves.get();\n",
+    "\tprint(i\"{now} {label} {half}\");\n",
+    "\tcount.set(5);\n",
+    "\tlet later: i32 = scaled.get();\n",
+    "\tprint(later);\n",
+    "}\n",
+);
+
+const FLATTEN_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ Signal, SignalCell, Source };\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet first = SignalCell::new(1);\n",
+    "\tlet second = SignalCell::new(2);\n",
+    "\tlet chosen = SignalCell::new(first);\n",
+    "\tlet joined = chosen.flatten();\n",
+    "\tfirst.set(10);\n",
+    "\tchosen.set(second);\n",
+    "\tsecond.set(20);\n",
+    "\tprint(joined.get());\n",
     "}\n",
 );
 

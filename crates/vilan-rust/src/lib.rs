@@ -3288,6 +3288,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.variant_path(enum_id, index, &arguments, span)?
             }
             Expr::TryAssert(receiver) => self.try_assert(id, receiver, depth, span)?,
+            // F34: `a?.b` and an expression-lifting region over `Option` and
+            // `Result` (`proposal/try-and-lift.md` §3, `expression-lifting.md`
+            // §4). A user `Lift` container's trait path stays refused by name.
+            Expr::Lift(subject, binder, continuation) => {
+                self.std_lift(id, subject, binder, continuation, depth, span)?
+            }
+            Expr::LiftRegion(steps, body) => self.std_lift_region(id, &steps, body, depth, span)?,
             Expr::Function(_)
             | Expr::Struct(_)
             | Expr::Enum(_)
@@ -6185,6 +6192,178 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Ok(Some(rendered))
     }
 
+    /// The good/bad split one `?` step makes: a `match` on the step's own
+    /// container that binds the payload as `binder` and runs `good`, and
+    /// rebuilds the bad half — `None`, or `Err` around the same error — which
+    /// is the JS emitter's "the result is the bad container as-is" in a
+    /// language where the two halves are two types (the `!` assertion's
+    /// reason, [`Emitter::try_assert`]).
+    fn lift_split(
+        &mut self,
+        step: Id,
+        binder: Id,
+        good: String,
+        fallback_enum: Option<Id>,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        // The step's own type, else the container the analyzer recorded for
+        // the lift (a step read out of a cell carries no type of its own).
+        let enum_id = match self.type_of(step).and_then(|type_id| self.resolve(type_id)) {
+            Some(Type::Enum(enum_id, _)) => Some(*enum_id),
+            _ => fallback_enum,
+        };
+        let is_result = match enum_id
+            .and_then(|enum_id| self.program.enums.get(&enum_id))
+            .map(|declaration| declaration.name)
+        {
+            Some("Option") => false,
+            Some("Result") => true,
+            Some(_) => return Err(unsupported("a `?` lift over a user `Lift` container", span)),
+            None => {
+                return Err(unsupported(
+                    "a `?` lift over a subject of unknown type",
+                    span,
+                ));
+            }
+        };
+        let mut subject = self.expression(step, depth)?;
+        // A pattern over a PLACE binds by reference under Rust's default
+        // binding modes; the payload is a copy by rule 1, as an `if let`'s is.
+        if matches!(
+            self.program.entity_map.get(&step),
+            Some(Expr::Local(_) | Expr::Parameter(_) | Expr::Field(_, _, _))
+        ) {
+            subject = format!("({subject}).clone()");
+        }
+        let name = self.binding_name(binder);
+        Ok(if is_result {
+            format!("match {subject} {{ Ok({name}) => {good}, Err(error) => Err(error) }}")
+        } else {
+            format!("match {subject} {{ Some({name}) => {good}, None => None }}")
+        })
+    }
+
+    /// The good half's value: the continuation as-is where the lift FLATTENS
+    /// (its value is already the container), else wrapped back into the
+    /// container's good variant.
+    /// The container a lift's dispatch names, where it names one.
+    fn lift_enum(&self, id: Id) -> Option<Id> {
+        match self.program.lift_dispatch.get(&id) {
+            Some(vilan_core::analyzer::LiftDispatch::Std { enum_id, .. }) => Some(*enum_id),
+            _ => None,
+        }
+    }
+
+    fn lift_wrap(&self, id: Id, value: String) -> String {
+        match self.program.lift_dispatch.get(&id) {
+            Some(vilan_core::analyzer::LiftDispatch::Std {
+                flatten: false,
+                enum_id,
+            }) => {
+                let good = match self
+                    .program
+                    .enums
+                    .get(enum_id)
+                    .map(|declaration| declaration.name)
+                {
+                    Some("Result") => "Ok",
+                    _ => "Some",
+                };
+                format!("{good}({value})")
+            }
+            _ => value,
+        }
+    }
+
+    /// `subject?.continuation` over `Option`/`Result` (F34 — `flatten`'s
+    /// `inner_subscription.read()?.dispose()`).
+    fn std_lift(
+        &mut self,
+        id: Id,
+        subject: Id,
+        binder: Id,
+        continuation: Id,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        if !matches!(
+            self.program.lift_dispatch.get(&id),
+            Some(vilan_core::analyzer::LiftDispatch::Std { .. }) | None
+        ) {
+            return Err(unsupported("a `?` lift over a user `Lift` container", span));
+        }
+        // The binder is bound by the split's `match` arm, exactly as an `if
+        // let`'s capture is, so a read of it inside the continuation names it.
+        self.is_captures.insert(binder);
+        let value = self.expecting_nothing(|emitter| emitter.expression(continuation, depth));
+        self.is_captures.remove(&binder);
+        let good = self.lift_wrap(id, value?);
+        let fallback = self.lift_enum(id);
+        self.lift_split(subject, binder, good, fallback, depth, span)
+    }
+
+    /// An expression-lifting region over `Option`/`Result`: its steps as
+    /// nested splits (an EVAL step a plain `let`), the body in the innermost
+    /// good arm, wrapped once.
+    fn std_lift_region(
+        &mut self,
+        id: Id,
+        steps: &[(Id, Id, bool)],
+        body: Id,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        if !matches!(
+            self.program.lift_dispatch.get(&id),
+            Some(vilan_core::analyzer::LiftDispatch::Std { .. }) | None
+        ) {
+            return Err(unsupported("a `?` lift over a user `Lift` container", span));
+        }
+        for (_, binder, _) in steps {
+            self.is_captures.insert(*binder);
+        }
+        let value = self.expecting_nothing(|emitter| emitter.expression(body, depth));
+        let mut rendered = match value {
+            Ok(value) => self.lift_wrap(id, value),
+            Err(error) => {
+                for (_, binder, _) in steps {
+                    self.is_captures.remove(binder);
+                }
+                return Err(error);
+            }
+        };
+        let fallback = self.lift_enum(id);
+        let rendered_steps = self.render_region_steps(steps, &mut rendered, fallback, depth, span);
+        for (_, binder, _) in steps {
+            self.is_captures.remove(binder);
+        }
+        rendered_steps?;
+        Ok(rendered)
+    }
+
+    /// The region's steps around its already-rendered body, innermost last.
+    fn render_region_steps(
+        &mut self,
+        steps: &[(Id, Id, bool)],
+        rendered: &mut String,
+        fallback: Option<Id>,
+        depth: usize,
+        span: Span,
+    ) -> Result<(), Error> {
+        for (step, binder, is_split) in steps.iter().rev() {
+            let inner = std::mem::take(rendered);
+            *rendered = if *is_split {
+                self.lift_split(*step, *binder, inner, fallback, depth, span)?
+            } else {
+                let name = self.binding_name(*binder);
+                let value = self.value_of(*step, depth)?;
+                format!("{{ let {name} = {value}; {inner} }}")
+            };
+        }
+        Ok(())
+    }
+
     /// `expr!` — try-and-lift's assertion (`proposal/try-and-lift.md` §4), which
     /// `std::json`'s derived decoders are written in and which therefore stood
     /// between the JSON surface and a program that decodes anything.
@@ -7062,7 +7241,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
         {
             let concrete = self.concrete(type_id);
             let preferred = self.program.bound_dispatch_traits.get(&call_id).cloned();
-            if let Some(dispatch) = self.resolve_dispatch(concrete, member, &[], preferred, span)? {
+            let own_values = self
+                .program
+                .own_generic_call_bindings
+                .get(&call_id)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(dispatch) =
+                self.resolve_dispatch(concrete, member, &own_values, preferred, span)?
+            {
                 return self.emit_dispatch(dispatch, &function_call.argument_ids, depth, span);
             }
             return Err(unsupported(
@@ -8203,7 +8390,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .map(Some);
             }
             if let Some(default_id) = mono::trait_default_member(self.program, trait_id, member) {
-                let name = self.default_instance(default_id, type_id, span)?;
+                let name = self.default_instance(default_id, type_id, own_generic_values, span)?;
                 return Ok(Some(NativeDispatch::Call(name)));
             }
             // The preference did not materialize (it should not, for a call the
@@ -8221,7 +8408,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         else {
             return Ok(None);
         };
-        let name = self.default_instance(default_id, type_id, span)?;
+        let name = self.default_instance(default_id, type_id, own_generic_values, span)?;
         Ok(Some(NativeDispatch::Call(name)))
     }
 
@@ -8315,19 +8502,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
             type_id,
             &mut substitution,
         );
-        if !own_generic_values.is_empty()
-            && let Some(function) = self.program.functions.get(&member_id)
-        {
-            for (constraint_id, value) in function
-                .generic_parameter_constraint_ids
-                .iter()
-                .zip(own_generic_values.iter())
-            {
-                substitution.insert(*constraint_id, *value);
-            }
-        }
+        substitution.extend(self.own_generic_entries(member_id, own_generic_values));
         let name = self.ensure_function(member_id, &substitution)?.name;
         Ok(NativeDispatch::Call(name))
+    }
+
+    /// A member's OWN generic parameters bound for one call, from the values
+    /// the analyzer recorded for it in order (`own_generic_call_bindings`).
+    /// F34: an inherited DEFAULT reached through `OnType` had been handed none
+    /// at all, so `map<U>`'s `U` went unbound and the call was refused.
+    fn own_generic_entries(&self, member_id: Id, recorded: &[TypeId]) -> Vec<(TypeId, TypeId)> {
+        let Some(function) = self.program.functions.get(&member_id) else {
+            return Vec::new();
+        };
+        function
+            .generic_parameter_constraint_ids
+            .iter()
+            .copied()
+            .zip(recorded.iter().copied())
+            .collect()
     }
 
     /// Emits a resolved dispatch's call, with the receiver as the first
@@ -8455,10 +8648,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
         &mut self,
         default_id: Id,
         type_id: TypeId,
+        own_generic_values: &[TypeId],
         span: Span,
     ) -> Result<String, Error> {
         let type_id = self.concrete(type_id);
-        let key = (default_id, self.type_key(type_id));
+        // F34: a default with generic parameters of its OWN (`map<U>`) is one
+        // instance per binding of them, as well as per receiver type.
+        let own = self.own_generic_entries(default_id, own_generic_values);
+        let mut key_text = self.type_key(type_id);
+        for (_, value) in &own {
+            key_text.push('|');
+            key_text.push_str(&self.type_key(*value));
+        }
+        let key = (default_id, key_text);
         if let Some(reserved) = self.default_instances.get(&key) {
             return Ok(reserved.name.clone());
         }
@@ -8486,7 +8688,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // REPLACED rather than composed, exactly as the JS emitter does it: a
         // default body has no generic parameters of its own, and the trait's
         // arguments for THIS type are the whole binding it runs under.
-        let substitution = self.trait_parameter_substitution(default_id, type_id);
+        let mut substitution = self.trait_parameter_substitution(default_id, type_id);
+        substitution.extend(own);
         let saved_self = self.current_self_type.replace(type_id);
         let self_traits = self.self_traits_of(default_id);
         let saved_traits = std::mem::replace(&mut self.current_self_traits, self_traits);
