@@ -18238,12 +18238,27 @@ impl<'src> Analyzer<'src> {
             return true;
         };
         let bindings: Vec<(TypeId, TypeId)> = bindings.into_iter().collect();
+        // A bound's arguments are written in the impl's own binders
+        // (`impl KeyedSource<type K, type T: Keyed<K>>`), so they are read
+        // through what THIS receiver binds those to — `Keyed<str>` on a
+        // `KeyedSource<str, Row>`. Read raw, `Keyed<K>` met `Row`'s
+        // `Keyed<str>` and the impl answered "does not hold" for its own
+        // receiver (B395, where an inherited default is carried by an impl
+        // whose bounds hold and the false no handed it to a blanket).
+        let context: SubstitutionContext = bindings.iter().copied().collect();
         for (constraint_id, bound_id) in bindings {
             let bound = bound_id.get_type(self);
             if !matches!(bound, Type::Struct(..) | Type::Enum(..)) {
                 continue;
             }
             for (trait_id, arguments) in self.generic_bound_traits(constraint_id) {
+                let arguments: Vec<TypeId> = arguments
+                    .iter()
+                    .map(|argument| {
+                        let argument = argument.get_type(self);
+                        self.substitute_type(&argument, &context).get_type_id(self)
+                    })
+                    .collect();
                 if !self.type_implements_trait_at(&bound, trait_id, &arguments) {
                     return false;
                 }
@@ -20785,7 +20800,7 @@ impl<'src> Analyzer<'src> {
     /// (a default's parameters mention the trait's `T`; without the binding
     /// a closure argument's parameter typed abstractly — B23).
     fn method_member_in_inherited_defaults(
-        &self,
+        &mut self,
         subject_type: &Type,
         member_name: &str,
     ) -> Option<(Id, TypeId, Id, Vec<TypeId>)> {
@@ -20857,12 +20872,27 @@ impl<'src> Analyzer<'src> {
     /// but it is ONE declaration, so it is one candidate — while two unrelated
     /// traits offering same-named defaults are two, and ambiguous (B57 §3,
     /// slice S2's third scan).
+    ///
+    /// **Which impl carries a member reached through several is decided by
+    /// applicability, not by declaration order (B395).** A supertrait's default
+    /// is reachable through every impl whose trait closes over it — the
+    /// type's own `impl Cell with Base<i32>`, and a SUBTRAIT's blanket
+    /// `impl type S: Base<List<type T>> with Feed<T>` whose `S` the receiver
+    /// fills as a hole. They are one member, so one survives, and it used to be
+    /// the first registered: the blanket, whose bound `Cell` meets at the
+    /// trait id and not at `List<T>`, so `cell.twice()` was refused at the
+    /// blanket's bound though `Cell`'s own impl answers it. An impl whose
+    /// binders' bounds do not hold for this receiver AT THEIR ARGUMENTS
+    /// (`impl_bounds_hold`, B268's reading) does not carry the member while
+    /// one whose bounds hold does. The filter narrows and never empties, as
+    /// `applicable_candidates` does for declared members: when no impl
+    /// applies, the unfiltered list stands and the bound diagnostic is kept.
     fn inherited_default_candidates(
-        &self,
+        &mut self,
         subject_type: &Type,
         member_name: &str,
     ) -> Vec<(Id, TypeId, Id, Vec<TypeId>)> {
-        let mut candidates: Vec<(Id, TypeId, Id, Vec<TypeId>)> = Vec::new();
+        let mut reached: Vec<(Id, TypeId, Id, Vec<TypeId>)> = Vec::new();
         for implementation in self.implementations.iter().filter(|implementation| {
             self.impl_subject_admits(
                 subject_type,
@@ -20878,7 +20908,9 @@ impl<'src> Analyzer<'src> {
                 // the concrete surface — only reachable through a bound (§3.2).
                 if !self.member_has_default_body(member_id)
                     || self.declaration_is_trait_only(member_id)
-                    || candidates.iter().any(|(id, ..)| *id == member_id)
+                    || reached.iter().any(|(id, subject, ..)| {
+                        *id == member_id && *subject == implementation.subject
+                    })
                 {
                     continue;
                 }
@@ -20888,12 +20920,27 @@ impl<'src> Analyzer<'src> {
                     .find(|(id, _)| id == trait_id)
                     .map(|(_, arguments)| arguments.clone())
                     .unwrap_or_default();
-                candidates.push((
+                reached.push((
                     member_id,
                     implementation.subject,
                     *trait_id,
                     trait_arguments,
                 ));
+            }
+        }
+        let mut applying = Vec::with_capacity(reached.len());
+        for candidate in &reached {
+            if self.impl_bounds_hold(candidate.1, subject_type) {
+                applying.push(candidate.clone());
+            }
+        }
+        let mut candidates: Vec<(Id, TypeId, Id, Vec<TypeId>)> = Vec::new();
+        for candidate in match applying.is_empty() {
+            true => reached,
+            false => applying,
+        } {
+            if !candidates.iter().any(|(id, ..)| *id == candidate.0) {
+                candidates.push(candidate);
             }
         }
         candidates
