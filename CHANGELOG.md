@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: diagnostics -->
+**The missing-member steer renders a supertrait's member at the arguments the supertrait is reached with: `impl Cell with Feed<i32> {}` under `trait Feed<T> with Base<List<T>>` is told to declare `fun read(self): List<i32>`, where it was told `i32`.** The signature was rendered with the `with` clause's own arguments, so `Base`'s `T` was bound positionally to `Feed`'s `i32` — a declaration that would itself have been refused. It now takes the declaring trait's arguments from the same supertrait walk the signature check already uses (B245). Two pins in `inference::traits`: the constructed argument (red before) and the directly implemented trait (a control). Tracker E220.
+
 <!-- family: fix -->
 **A let-bound closure whose unannotated parameter feeds a generic position resolves: `let f = |m| wrap(m); f(4)` and `let g = |m| Holder { value = m * 2 }; g(4)` run, where both were "type of variable 'f' could not be resolved".** The parameter's type comes from the closure's own call site (B13), the call site waited on the closure's type, the closure's type waited on its body, and the body waited on the parameter. A stationary fixpoint now breaks the cycle: every still-unfilled parameter of a closure a deferred call names (through `let` bindings) takes its first call site's argument type, when that is fully determined, in source order — B13's own rule, applied before the closure's type exists — and the body resolves on the next pass. It runs before B372's door, which would otherwise commit the body's calls with the parameter still open. A second call at another type is refused against the first, naming the call that typed the parameter. Four pins in `inference::generics`: both shapes and the two-types refusal (red before), and the annotated control. Tracker B392.
 

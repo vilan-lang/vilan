@@ -49383,12 +49383,20 @@ impl<'src> Analyzer<'src> {
                 // impl (B206): `Self`, and a `= Self`-defaulted parameter,
                 // resolve to the subject and to the `with`-clause argument
                 // rather than to the trait's own name.
+                // E220: at the arguments the DECLARING trait is reached with —
+                // `impl Cell with Feed<i32>` under `trait Feed<T> with
+                // Base<List<T>>` owes `Base`'s `read` at `List<i32>`, and
+                // rendering it with the clause's own `[i32]` bound `Base`'s `T`
+                // positionally and told the author to declare `: i32`.
+                let declaring_arguments = self
+                    .trait_with_supertraits_at(trait_id, &check.trait_arguments)
+                    .into_iter()
+                    .find(|(reached_id, _)| *reached_id == declaring_trait_id)
+                    .map(|(_, arguments)| arguments)
+                    .unwrap_or_else(|| check.trait_arguments.clone());
                 let signature_subject = SignatureSubject {
                     declaring_trait_id,
-                    rendered_for: SignatureSide::Impl(
-                        check.subject_type_id,
-                        &check.trait_arguments,
-                    ),
+                    rendered_for: SignatureSide::Impl(check.subject_type_id, &declaring_arguments),
                 };
                 // B260: and the HEAD names the trait the same way the suggested
                 // declaration is written — with the `with` clause's arguments.

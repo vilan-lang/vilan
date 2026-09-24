@@ -7054,3 +7054,46 @@ fn b391_a_services_generated_client_call_is_admitted_under_its_own_module() {
     assert_compiles(exported);
     assert_compiles(&exported.replace("export impl Door", "impl Door"));
 }
+
+/// E220: the missing-member steer renders a SUPERTRAIT's member at the
+/// arguments the supertrait is reached with. Red before the fix: "declare `fun
+/// read(self): i32`", the `with` clause's own argument bound onto `Base`'s `T`.
+#[test]
+fn e220_a_supertrait_reached_at_a_constructed_argument_is_rendered_at_it() {
+    let source = concat!(
+        "trait Base<T> {\n",
+        "\tfun read(self): T;\n",
+        "}\n",
+        "\n",
+        "trait Feed<T> with Base<List<T>> {\n",
+        "\tfun feeds(self): bool { true }\n",
+        "}\n",
+        "\n",
+        "struct Cell {}\n",
+        "\n",
+        "impl Cell with Feed<i32> {}\n",
+    );
+    assert_fails_with(
+        source,
+        "'Cell' does not implement trait 'Feed<i32>': missing 'read'; declare `fun read(self): List<i32>`",
+    );
+    assert_fails_without(source, "declare `fun read(self): i32`");
+}
+
+/// The control: the trait implemented DIRECTLY still renders at its own clause
+/// argument (green before and after).
+#[test]
+fn e220_the_directly_implemented_trait_is_rendered_at_its_clause() {
+    assert_fails_with(
+        concat!(
+            "trait Base<T> {\n",
+            "\tfun read(self): T;\n",
+            "}\n",
+            "\n",
+            "struct Cell {}\n",
+            "\n",
+            "impl Cell with Base<i32> {}\n",
+        ),
+        "'Cell' does not implement trait 'Base<i32>': missing 'read'; declare `fun read(self): i32`",
+    );
+}
