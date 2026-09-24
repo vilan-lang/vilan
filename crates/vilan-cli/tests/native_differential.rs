@@ -1614,6 +1614,56 @@ const BIGINT_TRAP_PROBE: &str = concat!(
     "}\n",
 );
 
+/// **F18 slice 3's two seams**: node:crypto's SHA-1 behind `std::rpc_server`'s
+/// `ws_accept_key`, and `std::time`'s host clock — the two host bindings, beside
+/// F33's `Bytes`, that stood between `Server::builder()` and the native backend.
+///
+/// The accept key is RFC 6455 §1.3's own example (the client key
+/// `dGhlIHNhbXBsZSBub25jZQ==` is answered `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`),
+/// asserted verbatim as well as compared, so a native SHA-1 or base64 that
+/// agreed with nothing would still red; the empty key is the second vector
+/// because its digest is the one whose base64 ends in a single `=`. The clock
+/// is compared only in what two processes a moment apart CAN agree on — it is
+/// whole milliseconds since 1970 (the unit and the epoch, the two things a
+/// wrong conversion gets wrong) and `now()` is not before it.
+///
+/// Red at the Order 40 seal (refused by name: `digest`, `now_millis`).
+#[test]
+fn the_websocket_accept_key_and_the_host_clock_agree_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_seams.vl"), SEAMS_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_seams.vl"),
+        Verdict::Identical,
+        "the accept key and the clock must print the same bytes on both backends"
+    );
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "native_probe_seams.vl"])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\nKfh9QIsMVZcl6xEPYxPHzW8SZ8w=\ntrue true\ntrue\n",
+        "RFC 6455's own accept key, and a clock in whole milliseconds since 1970"
+    );
+}
+
+const SEAMS_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::rpc_server::ws_accept_key;\n",
+    "import std::time::{ now, now_millis };\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(ws_accept_key(\"dGhlIHNhbXBsZSBub25jZQ==\"));\n",
+    "\tprint(ws_accept_key(\"\"));\n",
+    "\tlet sampled = now_millis();\n",
+    "\tprint(i\"{sampled > 1790000000000.0} {sampled == sampled.floor()}\");\n",
+    "\tlet later = now();\n",
+    "\tprint(i\"{later.millis >= sampled.as_i53()}\");\n",
+    "}\n",
+);
+
 /// **F18 slice 2**: a closure declared SYNCHRONOUS, answering nothing, whose
 /// body awaits.
 ///

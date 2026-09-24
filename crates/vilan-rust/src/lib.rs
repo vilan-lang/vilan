@@ -1699,6 +1699,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // `remoteAddress`) ANSWER one — the dependency runs this way and
             // not the other.
             "JsonValue" => Ok("vilan_rt::json::JsonValue".to_string()),
+            // F18 slice 3: node:crypto's `Hash`, which `std::rpc_server`'s
+            // WebSocket handshake chains through (`create_hash` → `update` →
+            // `digest`). std names it `NodeHash` so it cannot be read as
+            // `std::hash::Hash`, the `"Hash"` arm above.
+            "NodeHash" => Ok("vilan_rt::crypto::NodeHash".to_string()),
             _ => {
                 let what = format!("the host type `{name}`");
                 self.host_gap(what, span).map(|_| "()".to_string())
@@ -5794,6 +5799,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.place_argument(argument_ids, 0, depth)?,
                 self.value_argument(argument_ids, 1, depth)?
             ),
+            // --- NodeHash (node:crypto, `std::rpc_server`'s handshake) ---
+            ("NodeHash", "update") => format!(
+                "({}).update(&{})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            ("NodeHash", "digest") => format!(
+                "({}).digest(&{})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
             ("NodeSocket", "destroyed") => format!(
                 "({}).destroyed()",
                 self.place_argument(argument_ids, 0, depth)?
@@ -6012,6 +6028,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
         };
         match (*module, *symbol, name) {
             (None, "__sha256", _) => one(self, "crypto::sha256_bytes"),
+            // F18 slice 3: the two seams `std::rpc_server` reaches beyond
+            // `Bytes` — `std::time`'s host clock (the handshake rate limit
+            // stamps each attempt) and node:crypto's `createHash`, whose SHA-1
+            // is the WebSocket accept key. The hash's two methods are
+            // receiver-keyed in [`Emitter::http_host_binding`].
+            (None, "Date.now", "now_millis") => {
+                Ok(Some("vilan_rt::time::now_millis()".to_string()))
+            }
+            (Some("node:crypto"), "createHash", "create_hash") => Ok(Some(format!(
+                "vilan_rt::crypto::create_hash(&{})",
+                self.value_argument(argument_ids, 0, depth)?
+            ))),
             (Some("node:fs/promises"), "readFile", "read_bytes") => one(self, "fs::read_bytes"),
             (Some("node:fs/promises"), "readFile", "read_file_encoded") => {
                 two(self, "fs::read_text")
@@ -8319,6 +8347,7 @@ fn host_handle_name(rendered: &str) -> Option<&'static str> {
         ("vilan_rt::http::Response", "NodeResponse"),
         ("vilan_rt::http::Socket", "NodeSocket"),
         ("vilan_rt::bytes::Bytes", "Bytes"),
+        ("vilan_rt::crypto::NodeHash", "NodeHash"),
     ];
     HANDLES
         .iter()
