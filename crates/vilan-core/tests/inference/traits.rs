@@ -7004,3 +7004,53 @@ fn b390_a_refused_impl_subject_provides_its_trait_to_no_type() {
     assert_fails_with(source, "'i32' does not implement trait 'Named'");
     assert_fails_with(source, "i32 has no method 'name'");
 }
+
+/// B391: a `[service]`'s GENERATED call to its client's `[rpc]` member is
+/// admitted under the module that declared the service — B354's rule for
+/// generated code, which the call-site export gate did not ask. `export impl
+/// Door` curates the module's exports, the plain `impl Peer` is then not
+/// exported, and the generated proxy's `ping` call — filed under the derived
+/// sentinel, which reached nothing — was refused as reaching a hidden block of
+/// its OWN module. Red before the fix: "'ping' is provided by an `impl` in
+/// module ... that ... does not export". The `impl Door` without `export` was
+/// the control that always compiled.
+#[test]
+fn b391_a_services_generated_client_call_is_admitted_under_its_own_module() {
+    let exported = concat!(
+        "import std::io::print;\n",
+        "import std::reactive::{ Signal, SignalCell };\n",
+        "import std::rpc_server::{ Connection, Service };\n",
+        "import std::json::json_codec;\n",
+        "\n",
+        "[client_service]\n",
+        "struct Peer {\n",
+        "\tseen: SignalCell<str>,\n",
+        "}\n",
+        "\n",
+        "impl Peer {\n",
+        "\t[rpc]\n",
+        "\tfun ping(self, note: str) {\n",
+        "\t\tself.seen.set(note);\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "[service(DoorClient, client = Peer)]\n",
+        "struct Door {\n",
+        "\tclient: PeerProxy,\n",
+        "}\n",
+        "\n",
+        "export impl Door {\n",
+        "\t[rpc]\n",
+        "\tfun knock(self): i32 {\n",
+        "\t\tself.client.ping(\"knock\");\n",
+        "\t\t1\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "fun main() {\n",
+        "\tprint(\"ok\");\n",
+        "}\n",
+    );
+    assert_compiles(exported);
+    assert_compiles(&exported.replace("export impl Door", "impl Door"));
+}

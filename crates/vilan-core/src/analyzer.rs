@@ -63824,7 +63824,14 @@ pub fn check_call_site_admission(program: &mut Program) {
     }
     let mut violations: Vec<(Error, SourceId)> = Vec::new();
     for (call_id, function_call) in &program.function_calls {
-        let Some(source) = program.source_of(*call_id) else {
+        // B391: the file a call is ADMITTED under — for generated code, the
+        // module whose attribute generated it (B354's rule, `admitting_file`).
+        // `source_of` answers the `DERIVED_SOURCE` sentinel there, which
+        // declares nothing and reached nothing, so a `[service]`'s generated
+        // call to its own client's `[rpc]` member was refused as reaching a
+        // non-exported block of its OWN module the moment that module
+        // curated its exports (`export impl Door`).
+        let Some(source) = program.note_source_of(*call_id) else {
             continue;
         };
         // A method call's callee is a fresh local bound to the member the
@@ -63896,7 +63903,7 @@ pub fn check_call_site_admission(program: &mut Program) {
                     "narrow one bound so the two are disjoint, or declare it on a trait".to_string()
                 }
             };
-            violations.push((
+            violations.push(program.anchored(
                 Error {
                     trace: Vec::new(),
                     note: None,
@@ -63908,7 +63915,7 @@ pub fn check_call_site_admission(program: &mut Program) {
                          body runs: {fix}"
                     ),
                 },
-                source,
+                *call_id,
             ));
             continue;
         }
@@ -63934,7 +63941,7 @@ pub fn check_call_site_admission(program: &mut Program) {
             && !reached.contains(&(source, implementation.impl_id))
         {
             let subject = subject_head_name(program, implementation.subject);
-            violations.push((
+            violations.push(program.anchored(
                 Error {
                     trace: Vec::new(),
                     note: None,
@@ -63946,7 +63953,7 @@ pub fn check_call_site_admission(program: &mut Program) {
                          on the block"
                     ),
                 },
-                source,
+                *call_id,
             ));
             continue;
         }
@@ -63970,7 +63977,7 @@ pub fn check_call_site_admission(program: &mut Program) {
             ),
             None => "drop the `only`, or name the block in a selector".to_string(),
         };
-        violations.push((
+        violations.push(program.anchored(
             Error {
                 trace: Vec::new(),
                 note: None,
@@ -63979,7 +63986,7 @@ pub fn check_call_site_admission(program: &mut Program) {
                     "'{member}' is provided by an `impl` in module `{module}`, and {claim}: {fix}"
                 ),
             },
-            source,
+            *call_id,
         ));
     }
     // `function_calls` is a map, so the walk order is not the source order the
