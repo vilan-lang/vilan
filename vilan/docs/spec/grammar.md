@@ -25,6 +25,7 @@ statement = derived-item
           | enum
           | impl
           | trait
+          | labelled-let   (* §3.4 *)
           | "mod" IDENT "{" { statement } "}"
           | import ";"
           | use ";"
@@ -221,17 +222,34 @@ theme dims; hover leads with the reason. A **field** is the case
 declaration visibility cannot serve at all, since vilan has no per-field
 visibility, and it is the case the attribute was asked for.
 
+The same label rides every other declaration a reader may be steered
+away from: a **struct**, an **enum**, one enum **variant**, a **trait**
+and a **module binding** (`[internal("…")] let cache = …;`, the
+`labelled-let` statement of §3.4). On a struct, an enum or a trait it
+leads the declaration, ahead of `resource`; on a variant it leads the
+variant, as on a field. A label on a *local* `let` is refused — nothing
+outside the body can name a local, so the label would have no reader.
+The editor treats each exactly as it treats a function: hidden from
+completion below an exact three-character prefix, dimmed at the
+declaration and at every use (a type position included), and leading its
+hover. A package that also wants the terminal to say so opts in with
+`[lints] internal_use = "warn"` in its `vilan.toml`: every import and use
+of an internal item outside the module that declares it then warns
+`` `{name}` is internal: {reason} ``; the declaring module's own uses,
+std's and a dependency's stay silent.
+
 ### Structs and enums
 
 ```text
-struct = [ "resource" ] [ "external" ] "struct" (IDENT | "null") [ generic-params ]
-         ( "{" [ field { "," field } [ "," ] ] "}" | ";" ) ;
-field  = [ "[" "internal" "(" STRING ")" "]" ]
+struct = [ internal-label ] [ "resource" ] [ "external" ] "struct" (IDENT | "null")
+         [ generic-params ] ( "{" [ field { "," field } [ "," ] ] "}" | ";" ) ;
+field  = [ internal-label ]
          [ "[" "expose" [ "(" "keyed" [ "=" type ] ")" ] "]" ] IDENT [ ":" type ] ;
+internal-label = "[" "internal" "(" STRING ")" "]" ;
 
-enum          = [ "resource" ] "enum" IDENT [ generic-params ]
+enum          = [ internal-label ] [ "resource" ] "enum" IDENT [ generic-params ]
                 "{" [ variant { "," variant } [ "," ] ] "}" ;
-variant       = NAME [ "(" [ type { "," type } [ "," ] ] ")" ]
+variant       = [ internal-label ] NAME [ "(" [ type { "," type } [ "," ] ] ")" ]
                 [ "=" backing-value ] ;
 backing-value = [ "-" ] INTEGER | STRING ;
 INTEGER       = NUMBER without a fractional part and without a SUFFIX ;
@@ -299,8 +317,8 @@ struct`, and it is accepted only on `struct` and `enum` declarations;
 
 ```text
 impl  = "impl" type [ "with" type { "+" type } ] "{" { statement } "}" ;
-trait = "trait" IDENT [ generic-params ] [ "with" type { "+" type } ]
-        "{" { function } "}" ;
+trait = [ internal-label ] "trait" IDENT [ generic-params ]
+        [ "with" type { "+" type } ] "{" { function } "}" ;
 ```
 
 An impl's subject is a **type pattern**: `type X [: bounds]` binders
@@ -363,6 +381,8 @@ marker, never a client name: `[service(http)]` keeps the default
 ```text
 let        = [ "lazy" ] ("let" | "mut") binder [ ":" type ]
              [ "=" expression ] ;
+labelled-let = internal-label [ "lazy" ] ("let" | "mut") IDENT [ ":" type ]
+               [ "=" expression ] ";" ;
 assignment = [ "*" ] place ( "=" | "+=" | "-=" | "*=" | "/=" | "%=" )
              expression ;
 place      = chain ;                 (* an assignable location, §3.6 *)

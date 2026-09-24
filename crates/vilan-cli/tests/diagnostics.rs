@@ -1911,3 +1911,106 @@ fn a_parallel_check_reports_in_member_order() {
         "three per-entry mistakes and the shared one, reported once: {stderr}"
     );
 }
+
+// --- E221: `[lints] internal_use` -------------------------------------------
+//
+// The warning is the one part of `[internal("reason")]` that needs a manifest
+// to exist at all, so it is pinned here, through the binary, where a manifest
+// can say so. Every position the label rides is used from `main.vl`, and the
+// declaring module uses one of them itself.
+
+/// `helper.vl`: one of each labelled position, and a use of its own label.
+const LABELLED_HELPER: &str = concat!(
+    "export [internal(\"a struct\")]\n",
+    "struct Region {\n\t[internal(\"a field\")] anchor: str,\n\tlabel: str,\n}\n\n",
+    "export enum Side {\n\tLeft,\n\t[internal(\"a variant\")] Auto,\n}\n\n",
+    "export [internal(\"a binding\")]\n",
+    "let cache = 3;\n\n",
+    "export [internal(\"a function\")]\n",
+    "fun seam(): i32 {\n\tcache\n}\n",
+);
+
+/// `main.vl`: a use of each, from outside the declaring module.
+const LABELLED_MAIN: &str = concat!(
+    "import pkg::helper::{ Region, Side, cache, seam };\n\n",
+    "fun main() {\n",
+    "\tlet region = Region { anchor = \"a\", label = \"b\" };\n",
+    "\tlet side = Side::Auto;\n",
+    "\tprint(i\"{region.anchor} {cache} {seam()}\");\n",
+    "}\n",
+);
+
+fn labelled_package(tag: &str, manifest: &str) -> PathBuf {
+    let dir = temp_package(tag, LABELLED_MAIN);
+    std::fs::write(dir.join("vilan.toml"), manifest).unwrap();
+    std::fs::write(dir.join("src/helper.vl"), LABELLED_HELPER).unwrap();
+    dir
+}
+
+/// The warning lines `vilan check` wrote, in order.
+fn warning_lines(output: &Output) -> Vec<String> {
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter_map(|line| line.strip_prefix("Warning: ").map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn internal_use_warns_at_every_use_outside_the_declaring_module() {
+    let dir = labelled_package(
+        "internal_use",
+        "[package]\nname = \"app\"\n\n[lints]\ninternal_use = \"warn\"\n",
+    );
+    let output = vilan(&dir, &["check", "."], true);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "a lint warns, it does not fail the check"
+    );
+    let warnings = warning_lines(&output);
+    for expected in [
+        "`Region` is internal: a struct",
+        "`anchor` is internal: a field",
+        "`Auto` is internal: a variant",
+        "`cache` is internal: a binding",
+        "`seam` is internal: a function",
+    ] {
+        assert!(
+            warnings.iter().any(|warning| warning == expected),
+            "missing {expected:?} in {warnings:?}"
+        );
+    }
+    // `cache`: once for the import and once for the read in `main` — never for
+    // `seam`'s own read of it, which is in the module that declares it.
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|warning| warning.starts_with("`cache`"))
+            .count(),
+        2,
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn internal_use_is_silent_unless_the_package_asks() {
+    for (tag, manifest) in [
+        ("internal_use_absent", "[package]\nname = \"app\"\n"),
+        (
+            "internal_use_allow",
+            "[package]\nname = \"app\"\n\n[lints]\ninternal_use = \"allow\"\n",
+        ),
+    ] {
+        let dir = labelled_package(tag, manifest);
+        let output = vilan(&dir, &["check", "."], true);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(output.status.success());
+        let warnings = warning_lines(&output);
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.contains("is internal")),
+            "{tag}: {warnings:?}"
+        );
+    }
+}

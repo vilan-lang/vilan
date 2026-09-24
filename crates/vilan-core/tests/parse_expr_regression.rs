@@ -40,7 +40,7 @@ fn expression_subtree(fixture: &str) -> Option<String> {
     let wrapped = format!("let __probe = {fixture};");
     let tree = parse_clean(&wrapped)?;
     let (first, _) = tree.0.first()?;
-    if let Node::Let(_, _, Some(value), _, _) = first {
+    if let Node::Let(_, _, Some(value), _, _, _) = first {
         Some(format!("{value:?}"))
     } else {
         None

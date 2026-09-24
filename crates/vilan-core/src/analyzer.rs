@@ -8,7 +8,7 @@ use crate::id::Id;
 use crate::node::{
     ANONYMOUS_TYPE_BINDER, BackingLiteral, BinaryOp, Convention, EnumVariant, Exposure,
     ExternBinding, Func, GenericParameters, ImplSelector, ImportBranch, ImportModifier, ImportTail,
-    Node, NodeIfBranch, NodeList, Pattern, ServiceAttr,
+    Labels, Node, NodeIfBranch, NodeList, Pattern, ServiceAttr,
 };
 use crate::span::{Span, Spanned};
 use crate::target::{Platform, PlatformPattern};
@@ -1495,6 +1495,9 @@ pub struct EnumVariantDeclaration<'src> {
     /// one (C-style), from 0. There is no successor of `"start"`, so a string
     /// backing must be written on every variant (§3.1(a)).
     pub backing_value: BackingValue,
+    /// Declared `[internal("reason")]` (E221) — `Field::internal`'s twin,
+    /// since a variant is an enum's field-level case.
+    pub internal: Option<&'src str>,
 }
 
 /// One variant as [`read_enum_backing`] resolved it (`backed-enums.md` §10).
@@ -1585,7 +1588,7 @@ pub(crate) fn read_enum_backing<'a>(
     let mut backing_owners: IndexMap<String, (&'a str, Span)> = IndexMap::default();
     let mut read: Vec<VariantBacking<'a>> = Vec::with_capacity(variants.len());
     for variant in variants {
-        let (variant_name, payload, explicit_backing) = &variant.0;
+        let (variant_name, payload, explicit_backing, _internal) = &variant.0;
         let variant_name = *variant_name;
         let has_payload = !payload.is_empty();
         let explicit_backing = explicit_backing.as_ref();
@@ -4234,6 +4237,10 @@ pub struct Analyzer<'src> {
     // are gated on, and "this parameter's type is a resource" is wrong whether
     // or not anybody calls it.
     lazy_eager_parameters: HashSet<Id>,
+    // E221: the labels a nominal, trait or binding declaration carried
+    // (`[internal("reason")]`), keyed by its entity id. A function's own live
+    // on `Function`, and a field's and a variant's on their records.
+    item_labels: HashMap<Id, Labels<'src>>,
     // Every `lazy let` DECLARATION, in source order, before it is known whether
     // it is module-level (§2) or a local (§3, excluded). `record_lazy_bindings`
     // partitions it: a module-level one becomes a cell, a local is refused.
@@ -5092,7 +5099,7 @@ fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'s
             Node::Func(function) => (function.name.0, ImportableKind::Function, Vec::new()),
             Node::MacroFun(function) => (function.name.0, ImportableKind::Macro, Vec::new()),
             Node::Struct(name, ..) => (name.0, ImportableKind::Struct, Vec::new()),
-            Node::Enum(name, _, _, variants) => (
+            Node::Enum(name, _, _, variants, _) => (
                 name.0,
                 ImportableKind::Enum,
                 variants.0.iter().map(|variant| variant.0.0).collect(),
@@ -5207,7 +5214,7 @@ fn type_head<'src>(node: &Node<'src>) -> Option<&'src str> {
 /// no ids, no types, nothing loaded.
 fn declares_member_on(item: &Node, type_name: &str, member: &str) -> bool {
     match item {
-        Node::Struct(name, _, _, _, Some(fields)) if name.0 == type_name => {
+        Node::Struct(name, _, _, _, Some(fields), _) if name.0 == type_name => {
             fields.0.iter().any(|field| field.0.0.0 == member)
         }
         Node::Impl(subject, _, body) if type_head(&subject.0) == Some(type_name) => {
@@ -6038,6 +6045,7 @@ impl<'src> Analyzer<'src> {
             lazy_cells: HashSet::default(),
             lazy_eager_parameters: HashSet::default(),
             lazy_binding_declarations: Vec::new(),
+            item_labels: HashMap::default(),
             lazy_local_bindings: Vec::new(),
             lazy_binding_initializers: IndexMap::default(),
             lazy_thunk_effects: IndexMap::default(),
@@ -7880,8 +7888,8 @@ impl<'src> Analyzer<'src> {
     /// anything else. Shared by the derive collectors.
     fn derivable_type_name(item: &Node<'src>) -> Option<&'src str> {
         match item {
-            Node::Struct(name, _generics, _external, _resource, Some(_body)) => Some(name.0),
-            Node::Enum(name, _generics, _resource, _variants) => Some(name.0),
+            Node::Struct(name, _generics, _external, _resource, Some(_body), _) => Some(name.0),
+            Node::Enum(name, _generics, _resource, _variants, _) => Some(name.0),
             _ => None,
         }
     }
@@ -7901,7 +7909,7 @@ impl<'src> Analyzer<'src> {
         let unknown = Type::Unknown.get_type_id(self);
         let mut members = Vec::new();
         match item {
-            Node::Struct(_name, _generics, _external, _resource, Some(body)) => {
+            Node::Struct(_name, _generics, _external, _resource, Some(body), _) => {
                 let field_types: HashMap<&str, TypeId> = self
                     .structs
                     .get(&declaration_id)
@@ -7926,7 +7934,7 @@ impl<'src> Analyzer<'src> {
                     }
                 }
             }
-            Node::Enum(_name, _generics, _resource, variants) => {
+            Node::Enum(_name, _generics, _resource, variants, _) => {
                 let payload_types: HashMap<&str, Vec<TypeId>> = self
                     .enums
                     .get(&declaration_id)
@@ -21179,7 +21187,7 @@ impl<'src> Analyzer<'src> {
                 }
             }
             Node::Struct(name, ..) | Node::Trait(name, ..) => move_name(self, name.0),
-            Node::Enum(name, _, _resource, variants) => {
+            Node::Enum(name, _, _resource, variants, _) => {
                 move_name(self, name.0);
                 // Variant constructor names registered by the enum walk (if
                 // any) belong with the enum — a missing name is a no-op.
@@ -31230,9 +31238,14 @@ impl<'src> Analyzer<'src> {
                 }
                 Some(Expr::Binary(*op, lhs_id, rhs_id))
             }
-            Node::Let(name, type_, value, mutable, lazy) => {
+            Node::Let(name, type_, value, mutable, lazy, labels) => {
                 let name_span = name.1;
                 let name = name.0;
+                // E221: a labelled binding's labels, keyed by its entity id
+                // (`labels::check` refuses them on a local).
+                if let Some(labels) = labels {
+                    self.item_labels.insert(id, (**labels).clone());
+                }
                 // lazy.md §2: the binding holds a memo cell whose initializer
                 // runs at its FIRST USE. Which bindings are module-level is not
                 // an answer this walk has (module bodies register as it goes),
@@ -31452,9 +31465,12 @@ impl<'src> Analyzer<'src> {
                 });
                 Some(Expr::Assignment(target_id, stored_value_id))
             }
-            Node::Struct(name, generic_parameters, external, resource, body) => {
+            Node::Struct(name, generic_parameters, external, resource, body, labels) => {
                 let name_span = name.1;
                 let name = name.0;
+                if let Some(labels) = labels {
+                    self.item_labels.insert(id, (**labels).clone());
+                }
                 let external = *external;
                 let resource = *resource;
                 self.declare_scope_item(scope_id, name, id);
@@ -31582,9 +31598,12 @@ impl<'src> Analyzer<'src> {
                 );
                 Some(Expr::Struct(id))
             }
-            Node::Enum(name, generic_parameters, resource, variants) => {
+            Node::Enum(name, generic_parameters, resource, variants, labels) => {
                 let name_span = name.1;
                 let name = name.0;
+                if let Some(labels) = labels {
+                    self.item_labels.insert(id, (**labels).clone());
+                }
                 let resource = *resource;
                 self.declare_scope_item(scope_id, name, id);
                 self.reference_count.entry(id).or_insert(0);
@@ -31636,6 +31655,7 @@ impl<'src> Analyzer<'src> {
                         name: variant_name,
                         data_type_ids,
                         backing_value,
+                        internal: variant.0.3,
                     });
                 }
                 // A bare-lowered enum IS a `str`/number at runtime and carries a
@@ -31919,9 +31939,12 @@ impl<'src> Analyzer<'src> {
 
                 Some(Expr::Impl(id))
             }
-            Node::Trait(name, generic_parameters, supertraits, body) => {
+            Node::Trait(name, generic_parameters, supertraits, body, labels) => {
                 let name_span = name.1;
                 let name = name.0;
+                if let Some(labels) = labels {
+                    self.item_labels.insert(id, (**labels).clone());
+                }
                 self.declare_scope_item(scope_id, name, id);
                 self.reference_count.entry(id).or_insert(0);
                 let body_scope = self.create_scope(Some(scope_id));
@@ -53142,6 +53165,13 @@ pub struct Program<'src> {
     /// emits as the bare cell, and a read of a binding in `lazy_cells` emits as
     /// `__force(<cell>)`.
     pub lazy_argument_thunks: IndexMap<Id, &'src str>,
+    /// E221: the labels a struct, enum, trait or binding declaration carried
+    /// (`[internal("reason")]`), by its entity id — read by the editor and by
+    /// `labels::check`. Functions, fields and variants keep theirs on their
+    /// own records.
+    pub item_labels: HashMap<Id, Labels<'src>>,
+    /// The entry package's `[lints]` (E221), for `labels::check`.
+    pub lints: crate::manifest::Lints,
     /// The lazy arguments that forward a cell they already hold (§1).
     pub lazy_argument_forwards: HashSet<Id>,
     /// The bindings that hold a memo cell: `lazy` parameters (§1) and `lazy let`
@@ -54800,7 +54830,8 @@ fn bare_lowered_enum<'a>(
 /// that would lift it, which is why the message says "not supported yet" rather
 /// than describing a rule the language means to keep.
 pub(crate) fn service_generic_refusal(item: &Spanned<Node<'_>>) -> Option<String> {
-    let Node::Struct(name, Some(generic_parameters), _external, _resource, _body) = &item.0 else {
+    let Node::Struct(name, Some(generic_parameters), _external, _resource, _body, _) = &item.0
+    else {
         return None;
     };
     if generic_parameters.0.is_empty() {
@@ -54910,7 +54941,7 @@ pub(crate) fn service_method_refusals(
     item: &Spanned<Node<'_>>,
     nodes: &NodeList<'_>,
 ) -> Vec<(Span, String)> {
-    let Node::Struct(name, _generics, _external, _resource, _body) = &item.0 else {
+    let Node::Struct(name, _generics, _external, _resource, _body, _) = &item.0 else {
         return Vec::new();
     };
     let service_name = name.0;
@@ -55113,8 +55144,8 @@ pub(crate) fn client_handler_refusal(handler_name: &str, nodes: &NodeList<'_>) -
 
 pub(crate) fn resource_derive_refusal(derive: &str, item: &Spanned<Node<'_>>) -> Option<String> {
     let (kind, name) = match &item.0 {
-        Node::Struct(name, _generics, _external, true, _body) => ("struct", name.0),
-        Node::Enum(name, _generics, true, _variants) => ("enum", name.0),
+        Node::Struct(name, _generics, _external, true, _body, _) => ("struct", name.0),
+        Node::Enum(name, _generics, true, _variants, _) => ("enum", name.0),
         _ => return None,
     };
     let (what_it_would_do, steer) = match derive {
@@ -55155,7 +55186,7 @@ pub(crate) fn resource_derive_refusal(derive: &str, item: &Spanned<Node<'_>>) ->
 /// `is_clean`, so the impl table and the walk's `hashable_names` cannot
 /// disagree; see [`bare_lowered_enum`].
 pub(crate) fn backed_enum_hashable_source(item: &Spanned<Node<'_>>) -> String {
-    let Node::Enum(name, generic_parameters, resource, variants) = &item.0 else {
+    let Node::Enum(name, generic_parameters, resource, variants, _) = &item.0 else {
         return String::new();
     };
     if bare_lowered_enum(
@@ -55211,7 +55242,7 @@ pub(crate) fn backed_enum_hashable_source(item: &Spanned<Node<'_>>) -> String {
 /// lowering emits it, and the conversions now say so. Its literal is rendered
 /// from the resolved value, since there is no written spelling to reprint.
 pub(crate) fn backed_enum_impl_source(item: &Spanned<Node<'_>>) -> String {
-    let Node::Enum(name, generic_parameters, resource, variants) = &item.0 else {
+    let Node::Enum(name, generic_parameters, resource, variants, _) = &item.0 else {
         return String::new();
     };
     // A broken declaration is a hard error the walk reports, and this generator
@@ -55316,7 +55347,7 @@ fn integer_backing_type(variants: &[VariantBacking<'_>]) -> &'static str {
 /// representation cannot disagree: `enum Walked { A = 5, B, C }` used to lower
 /// to the bare numbers while its derived `Json` encoded the variant NAME.
 pub(crate) fn backed_enum_backing_type_of(item: &Spanned<Node<'_>>) -> Option<&'static str> {
-    let Node::Enum(name, generic_parameters, resource, variants) = &item.0 else {
+    let Node::Enum(name, generic_parameters, resource, variants, _) = &item.0 else {
         return None;
     };
     enum_backing_type(
@@ -56340,6 +56371,10 @@ pub struct Workspace {
     /// rather than on a `PackageSpec` because the entry package has no spec in
     /// `packages` — that slice is its dependencies.
     pub entry_prelude: crate::manifest::PreludeSpec,
+    /// The ENTRY package's `[lints]` (E221), every key defaulted. Out of the
+    /// base cache key for `platform_reason`'s reason: it changes which
+    /// warnings one post-pass writes, never what loads or resolves.
+    pub lints: crate::manifest::Lints,
     /// WHY this analysis runs under the platform it does (E119), already
     /// rendered by [`crate::platform_color::PlatformReason::clause`] — "no entry
     /// reaches it (default-entry is `server`)". Where the front end has no
@@ -62414,6 +62449,8 @@ fn analyze_over_world<'src>(
         lazy_cells: std::mem::take(&mut analyzer.lazy_cells),
         lazy_eager_parameters: std::mem::take(&mut analyzer.lazy_eager_parameters),
         lazy_binding_initializers: std::mem::take(&mut analyzer.lazy_binding_initializers),
+        item_labels: std::mem::take(&mut analyzer.item_labels),
+        lints: workspace.lints,
         lazy_thunk_effects: std::mem::take(&mut analyzer.lazy_thunk_effects),
         suspending_calls: HashSet::default(),
         async_values: analyzer.async_values.clone(),

@@ -214,6 +214,24 @@ skipped statement — a function body that lost its result, a name whose
 declaration did not parse — are reported too, beside the syntax error
 that explains them.
 
+**Opt-in warnings: `[lints]`.** A few warnings are off unless a package asks
+for them, in its own `vilan.toml`:
+
+```toml
+[lints]
+internal_use = "warn"
+```
+
+`internal_use` warns at every import and use of an `[internal("reason")]`
+item outside the module that declares it — `` `anchor` is internal: place
+against it, never through it ``. The label on its own only changes what the
+editor shows (the name is hidden from completion, dimmed, and its hover leads
+with the reason); a package that wants the terminal to say so too sets the
+key. Each lint is `"allow"` (the default) or `"warn"`, and a lint name or a
+level the section does not have is a manifest error rather than a silent
+no-op. The section is read from the entry package's manifest; std's own uses,
+and a dependency's, are their authors' and never warn.
+
 ## `vilan run [file] [args…]`
 
 Builds and runs. Anything after the file is forwarded to the program.

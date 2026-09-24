@@ -397,9 +397,14 @@ fn descend<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
             return_type,
             return_value: desugar_boxed(return_value, source),
         }),
-        Node::Let(name, annotation, value, mutable, lazy) => {
-            Node::Let(name, annotation, desugar_opt(value, source), mutable, lazy)
-        }
+        Node::Let(name, annotation, value, mutable, lazy, labels) => Node::Let(
+            name,
+            annotation,
+            desugar_opt(value, source),
+            mutable,
+            lazy,
+            labels,
+        ),
         Node::LetDestructure(pattern, annotation, value, mutable) => {
             Node::LetDestructure(pattern, annotation, desugar_opt(value, source), mutable)
         }
@@ -467,9 +472,9 @@ fn descend<'src>(node: Spanned<Node<'src>>, source: &'src str) -> Spanned<Node<'
             desugar_list(&mut members.0, source);
             Node::Impl(subject, traits, members)
         }
-        Node::Trait(name, generics, supertraits, mut members) => {
+        Node::Trait(name, generics, supertraits, mut members, labels) => {
             desugar_list(&mut members.0, source);
-            Node::Trait(name, generics, supertraits, members)
+            Node::Trait(name, generics, supertraits, members, labels)
         }
         Node::Lift(subject, continuation) => Node::Lift(
             desugar_boxed(subject, source),
@@ -572,7 +577,7 @@ mod tests {
         );
         let mut items: Spanned<NodeList<'static>> = tree.expect("a tree");
         super::rewrite_items(&mut items.0, leaked);
-        let Node::Let(_, _, Some(value), _, _) = &items.0[0].0 else {
+        let Node::Let(_, _, Some(value), _, _, _) = &items.0[0].0 else {
             panic!("expected a `let` with a value");
         };
         format!("{value:?}")
@@ -615,7 +620,7 @@ mod tests {
         );
         let mut items: Spanned<NodeList<'static>> = tree.expect("a tree");
         super::rewrite_items(&mut items.0, leaked);
-        let Node::Let(_, _, Some(value), _, _) = &items.0[0].0 else {
+        let Node::Let(_, _, Some(value), _, _, _) = &items.0[0].0 else {
             panic!("expected a `let` with a value");
         };
         let mut node: &Spanned<Node<'static>> = value;

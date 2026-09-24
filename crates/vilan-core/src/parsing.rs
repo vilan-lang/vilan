@@ -60,8 +60,8 @@ use crate::node::{
     ANONYMOUS_TYPE_BINDER, BackingLiteral, BinaryOp, Closure, Convention, CssBody, CssDeclaration,
     CssItem, CssNested, ElementBody, ElementChild, ElementHeadItem, EnumVariant, ExportScope,
     Exposure, ExternBinding, Func, GenericArguments, GenericParameter, GenericParameters, If,
-    ImplSelector, ImportBranch, ImportModifier, ImportTail, MatchLeg, Node, NodeIfBranch, NodeList,
-    Parameter, Pattern, ServiceAttr, StructField, TupleBound,
+    ImplSelector, ImportBranch, ImportModifier, ImportTail, ItemLabels, Labels, MatchLeg, Node,
+    NodeIfBranch, NodeList, Parameter, Pattern, ServiceAttr, StructField, TupleBound,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -2351,6 +2351,9 @@ impl<'a, 'src> Parser<'a, 'src> {
             return Some(item);
         }
         if let Some(item) = self.attempt(Self::parse_export) {
+            return Some(item);
+        }
+        if let Some(item) = self.attempt(Self::parse_labelled_let) {
             return Some(item);
         }
         // Items 8-11 & 21: `expression ;`, or a block-bearing form
@@ -4820,7 +4823,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
         let node = match pattern {
             Pattern::Binding(name, _, _) => {
-                Node::Let((name, pattern_span), type_, value, mutable, lazy)
+                Node::Let((name, pattern_span), type_, value, mutable, lazy, None)
             }
             pattern => Node::LetDestructure((pattern, pattern_span), type_, value, mutable),
         };
@@ -6226,6 +6229,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// (checked past the parser).
     fn parse_struct(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
+        let labels = self.parse_item_labels();
         let resource = self.eat(&Token::Resource);
         let external = self.eat(&Token::External);
         self.expect(&Token::Struct)?;
@@ -6271,6 +6275,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 external,
                 resource,
                 body.map(Box::new),
+                labels,
             ),
             self.span_from(start),
         ))
@@ -6299,6 +6304,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// `resource` is the only leading modifier.
     fn parse_enum(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
+        let labels = self.parse_item_labels();
         let resource = self.eat(&Token::Resource);
         self.expect(&Token::Enum)?;
         let name_start = self.position;
@@ -6317,15 +6323,18 @@ impl<'a, 'src> Parser<'a, 'src> {
                 generic_parameters.map(Box::new),
                 resource,
                 Box::new(variants),
+                labels,
             ),
             self.span_from(start),
         ))
     }
 
-    /// One enum variant: `name (payload types)? (= backing value)?`, carrying
-    /// the whole-variant span.
+    /// One enum variant: `[internal(..)]? name (payload types)? (= backing
+    /// value)?`, carrying the whole-variant span.
     fn parse_enum_variant(&mut self) -> Option<Spanned<EnumVariant<'src>>> {
         let start = self.position;
+        // E221: a variant's label leads it, as a field's does (E213).
+        let internal = self.parse_internal_attribute();
         let name = self.eat_name()?;
         let data = self.attempt(|parser| {
             parser.expect_ctrl('(')?;
@@ -6335,7 +6344,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         });
         let backing = self.parse_backing_literal();
         Some((
-            (name, data.unwrap_or_default(), backing),
+            (name, data.unwrap_or_default(), backing, internal),
             self.span_from(start),
         ))
     }
@@ -6431,6 +6440,7 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// function declarations only.
     fn parse_trait(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
+        let labels = self.parse_item_labels();
         self.expect(&Token::Trait)?;
         let name_start = self.position;
         let name = self.eat_ident()?;
@@ -6448,6 +6458,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 generic_parameters.map(Box::new),
                 supertraits,
                 Box::new(body),
+                labels,
             ),
             self.span_from(start),
         ))
@@ -7455,6 +7466,44 @@ impl<'a, 'src> Parser<'a, 'src> {
         })
     }
 
+    /// The labels an item declaration carries about itself (E221) — the
+    /// ordered prefix `[internal("reason")]?`, read ahead of a struct, an
+    /// enum, a trait or a module `let`. `None` when no label leads, which is
+    /// the one-null-pointer case nearly every declaration takes.
+    fn parse_item_labels(&mut self) -> ItemLabels<'src> {
+        let internal = self.parse_internal_attribute()?;
+        Some(Box::new(Labels {
+            internal: Some(internal),
+        }))
+    }
+
+    /// A LABELLED `let` statement (E221): `[internal("reason")] let name = …;`.
+    ///
+    /// Read at statement position ahead of the expression fork, because `[`
+    /// begins a list literal there: without this, `[internal("x")]` parses as
+    /// a one-element list and the `let` after it as a missing `;`. A label is
+    /// required — an unlabelled `let` is the expression fork's, unchanged — and
+    /// only a plain binding takes one (a destructuring `let` names several
+    /// things and none of them is an item). Whether the binding is a MODULE
+    /// binding is not the parser's to know (a module and a function body share
+    /// this production); `labels::check` refuses a labelled local.
+    fn parse_labelled_let(&mut self) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        let labels = self.parse_item_labels()?;
+        let (node, _) = self.parse_let()?;
+        // The statement's span ends where an unlabelled `let`'s does, before
+        // its `;` — it only STARTS earlier, at the label.
+        let span = self.span_from(start);
+        self.expect_ctrl(';')?;
+        let Node::Let(name, type_, value, mutable, lazy, None) = node else {
+            return None;
+        };
+        Some((
+            Node::Let(name, type_, value, mutable, lazy, Some(labels)),
+            span,
+        ))
+    }
+
     /// One platform pattern: a quoted string with its span.
     fn parse_platform_pattern(&mut self) -> Option<Spanned<&'src str>> {
         let start = self.position;
@@ -8454,7 +8503,7 @@ mod tests {
     #[test]
     fn struct_fields_generics_and_modifiers() {
         match only_item("struct Point<T> { x: T, y: T }") {
-            Node::Struct(name, generics, external, resource, body) => {
+            Node::Struct(name, generics, external, resource, body, _) => {
                 assert_eq!(name.0, "Point");
                 assert!(generics.is_some());
                 assert!(!external && !resource);
@@ -8465,7 +8514,7 @@ mod tests {
         // `resource external struct null;` — every modifier, the `null` name, the
         // bodyless `;` form.
         match only_item("resource external struct null;") {
-            Node::Struct(name, _, external, resource, body) => {
+            Node::Struct(name, _, external, resource, body, _) => {
                 assert_eq!(name.0, "null");
                 assert!(external && resource);
                 assert!(body.is_none());
@@ -8477,7 +8526,7 @@ mod tests {
     #[test]
     fn exposed_struct_field_is_recorded() {
         match only_item("struct Room { [expose] count: Signal, name: str }") {
-            Node::Struct(_, _, _, _, Some(fields)) => {
+            Node::Struct(_, _, _, _, Some(fields), _) => {
                 let exposed: Vec<Exposure> = fields.0.iter().map(|field| field.0.2).collect();
                 assert_eq!(exposed, vec![Exposure::Whole, Exposure::None]);
             }
@@ -8488,10 +8537,10 @@ mod tests {
     #[test]
     fn enum_variants_payloads_and_discriminants() {
         match only_item("enum Sign { Less = -1, Zero = 0, More(i32, str) }") {
-            Node::Enum(name, _, resource, variants) => {
+            Node::Enum(name, _, resource, variants, _) => {
                 assert_eq!(name.0, "Sign");
                 assert!(!resource);
-                let (_, less_data, less_backing) = &variants.0[0].0;
+                let (_, less_data, less_backing, _) = &variants.0[0].0;
                 assert!(less_data.is_empty());
                 let less_backing = less_backing.as_ref().expect("Less has a backing value");
                 match less_backing {
@@ -8504,7 +8553,7 @@ mod tests {
                     other => panic!("expected an integer backing, got {other:?}"),
                 }
                 assert_eq!(less_backing.to_string(), "-1");
-                let (_, more_data, more_backing) = &variants.0[2].0;
+                let (_, more_data, more_backing, _) = &variants.0[2].0;
                 assert_eq!(more_data.len(), 2, "More carries two payload types");
                 assert_eq!(*more_backing, None);
             }
@@ -8512,7 +8561,7 @@ mod tests {
         }
         // `resource enum` — the only leading modifier on an enum.
         match only_item("resource enum Handle { Open, Closed }") {
-            Node::Enum(_, _, resource, _) => assert!(resource),
+            Node::Enum(_, _, resource, _, _) => assert!(resource),
             other => panic!("expected a resource Enum, got {other:?}"),
         }
     }
@@ -8524,9 +8573,9 @@ mod tests {
         // reprinted by `Display` so the formatter round-trips it and a
         // diagnostic can tell `1` from `"1"`.
         match only_item(r#"enum Align { Start = "flex-start", End = "end" }"#) {
-            Node::Enum(name, _, _, variants) => {
+            Node::Enum(name, _, _, variants, _) => {
                 assert_eq!(name.0, "Align");
-                let (_, _, start_backing) = &variants.0[0].0;
+                let (_, _, start_backing, _) = &variants.0[0].0;
                 match start_backing.as_ref().expect("Start has a backing value") {
                     BackingLiteral::Str { text, .. } => assert_eq!(*text, "flex-start"),
                     other => panic!("expected a string backing, got {other:?}"),
@@ -8636,7 +8685,7 @@ mod tests {
         match only_item(
             "trait Ord<T> with Eq { fun cmp(&self, other: &T): i32; fun max(&self): i32 { 0 } }",
         ) {
-            Node::Trait(name, generics, supertraits, body) => {
+            Node::Trait(name, generics, supertraits, body, _) => {
                 assert_eq!(name.0, "Ord");
                 assert!(generics.is_some());
                 assert_eq!(supertraits.len(), 1);
@@ -8895,7 +8944,7 @@ mod tests {
         // A FIELD is the case declaration visibility cannot serve at all.
         match only_item("struct Region { [internal(\"the end marker\")] anchor: str, label: str }")
         {
-            Node::Struct(_, _, _, _, Some(fields)) => {
+            Node::Struct(_, _, _, _, Some(fields), _) => {
                 assert_eq!(fields.0[0].0.3, Some("the end marker"));
                 assert_eq!(fields.0[1].0.3, None);
             }
@@ -8914,6 +8963,66 @@ mod tests {
         assert!(declines(
             "[extern(\"fs\", \"read\")] [internal(\"seam\")] external fun read();"
         ));
+    }
+
+    #[test]
+    fn an_internal_label_rides_every_e221_position() {
+        // E221: the nominals, a variant, a trait and a module binding.
+        fn label_of(source: &str) -> Option<&str> {
+            match only_item(source) {
+                Node::Struct(.., labels)
+                | Node::Enum(.., labels)
+                | Node::Trait(.., labels)
+                | Node::Let(.., labels) => labels.and_then(|labels| labels.internal),
+                other => panic!("expected a labelled declaration, got {other:?}"),
+            }
+        }
+        assert_eq!(label_of("[internal(\"s\")] struct Region {}"), Some("s"));
+        assert_eq!(
+            label_of("[internal(\"r\")] resource struct Handle { id: i32 }"),
+            Some("r")
+        );
+        assert_eq!(label_of("[internal(\"e\")] enum Side { Left }"), Some("e"));
+        assert_eq!(
+            label_of("[internal(\"t\")] trait Seam { fun seam(self); }"),
+            Some("t")
+        );
+        assert_eq!(label_of("[internal(\"b\")] let cache = 3;"), Some("b"));
+        assert_eq!(label_of("[internal(\"l\")] lazy let db = 3;"), Some("l"));
+        assert_eq!(label_of("[internal(\"m\")] mut counter = 0;"), Some("m"));
+        // Unlabelled, each is the one null pointer it was.
+        assert_eq!(label_of("struct Region {}"), None);
+        assert_eq!(label_of("let cache = 3;"), None);
+        // A variant, on the variant's own record.
+        match only_item("enum Side { Left, [internal(\"v\")] Auto }") {
+            Node::Enum(_, _, _, variants, None) => {
+                assert_eq!(variants.0[0].0.3, None);
+                assert_eq!(variants.0[1].0.3, Some("v"));
+            }
+            other => panic!("expected an Enum, got {other:?}"),
+        }
+        // Behind `export`, and after a `[derive(..)]`, as a function's is.
+        match only_item("export [internal(\"x\")] struct Marker {}") {
+            Node::Export(_, inner) => {
+                assert!(
+                    matches!(&inner.0, Node::Struct(.., Some(labels)) if labels.internal == Some("x"))
+                )
+            }
+            other => panic!("expected an Export, got {other:?}"),
+        }
+        match only_item("[derive(Clone)] [internal(\"d\")] struct Point { x: i32 }") {
+            Node::Derive(_, inner) => {
+                assert!(
+                    matches!(&inner.0, Node::Struct(.., Some(labels)) if labels.internal == Some("d"))
+                )
+            }
+            other => panic!("expected a Derive, got {other:?}"),
+        }
+        // A bare `[internal]` is not the label on any of them.
+        assert!(declines("[internal] struct Region {}"));
+        assert!(declines("[internal] let cache = 3;"));
+        // And a `let` destructuring several names takes none.
+        assert!(declines("[internal(\"p\")] let (a, b) = (1, 2);"));
     }
 
     #[test]
@@ -9005,11 +9114,11 @@ mod tests {
         // valid and parse cleanly (the steer never shadows them).
         assert!(matches!(
             only_item("resource struct File { }"),
-            Node::Struct(_, _, false, true, _)
+            Node::Struct(_, _, false, true, _, _)
         ));
         assert!(matches!(
             only_item("resource enum State { A, B }"),
-            Node::Enum(_, _, true, _)
+            Node::Enum(_, _, true, _, _)
         ));
     }
 
@@ -9098,7 +9207,7 @@ mod tests {
             ),
             (
                 "trait Foo { 1 2 3 }\nfun after() {}\n",
-                "Trait((\"Foo\", 6..9), None, [], ([], 10..19))",
+                "Trait((\"Foo\", 6..9), None, [], ([], 10..19), None)",
             ),
             (
                 "mod foo { 1 2 3 }\nfun after() {}\n",

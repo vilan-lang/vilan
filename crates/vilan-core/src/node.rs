@@ -689,6 +689,7 @@ pub enum Node<'src> {
         Option<Box<GenericParameters<'src>>>,
         bool,
         Box<Spanned<Vec<Spanned<EnumVariant<'src>>>>>,
+        ItemLabels<'src>,
     ),
     Error,
     // A loop: `for { .. }` (infinite, condition `None`) or `for cond { .. }`
@@ -837,6 +838,11 @@ pub enum Node<'src> {
         Option<Box<Spanned<Self>>>,
         bool,
         bool,
+        // The labels a MODULE binding carries about itself (E221). Always
+        // empty on a local: the parser reads them only ahead of a `let`
+        // statement, and `labels::check` refuses them on a binding that is
+        // not module-level.
+        ItemLabels<'src>,
     ),
     // `let`/`mut` binding with a destructuring pattern: `let (a, b) = pair`. The
     // pattern is irrefutable (a tuple of names/sub-patterns); the rest mirrors
@@ -925,6 +931,7 @@ pub enum Node<'src> {
         bool,
         bool,
         Option<Box<Spanned<Vec<Spanned<StructField<'src>>>>>>,
+        ItemLabels<'src>,
     ),
     // B190: the head is B172's `type-path`, not a bare identifier. The
     // namespace segments are the modules the name was reached through, in
@@ -943,6 +950,7 @@ pub enum Node<'src> {
         // Supertraits: the `A`, `B` in `trait T with A + B`.
         Vec<Spanned<Self>>,
         Box<Spanned<NodeList<'src>>>,
+        ItemLabels<'src>,
     ),
     Tuple(NodeList<'src>),
     // `..e` — a tuple-value SPREAD element (proposal/variadic-generics.md §T):
@@ -1185,9 +1193,9 @@ impl<'src> Node<'src> {
                 visit(source);
                 visit(body);
             }
-            Node::Enum(_, generic_parameters, _resource, variants) => {
+            Node::Enum(_, generic_parameters, _resource, variants, _) => {
                 visit_generic_parameters(generic_parameters.as_deref(), visit);
-                for (_, data, _) in variants.0.iter().map(|variant| &variant.0) {
+                for (_, data, _, _) in variants.0.iter().map(|variant| &variant.0) {
                     for type_ in data {
                         visit(type_);
                     }
@@ -1238,7 +1246,7 @@ impl<'src> Node<'src> {
                     visit(member);
                 }
             }
-            Node::Let(_, type_, value, _, _) => {
+            Node::Let(_, type_, value, _, _, _) => {
                 if let Some(type_) = type_.as_deref() {
                     visit(type_);
                 }
@@ -1285,7 +1293,7 @@ impl<'src> Node<'src> {
                     visit(statement);
                 }
             }
-            Node::Struct(_, generic_parameters, _, _resource, fields) => {
+            Node::Struct(_, generic_parameters, _, _resource, fields, _) => {
                 visit_generic_parameters(generic_parameters.as_deref(), visit);
                 for (_, type_, _, _) in fields
                     .iter()
@@ -1307,7 +1315,7 @@ impl<'src> Node<'src> {
                     }
                 }
             }
-            Node::Trait(_, generic_parameters, supertraits, body) => {
+            Node::Trait(_, generic_parameters, supertraits, body, _) => {
                 visit_generic_parameters(generic_parameters.as_deref(), visit);
                 for supertrait in supertraits {
                     visit(supertrait);
@@ -1326,7 +1334,31 @@ pub type EnumVariant<'src> = (
     &'src str,
     Vec<Spanned<Node<'src>>>,
     Option<BackingLiteral<'src>>,
+    // `[internal("reason")]` (E221): a variant of a public enum that a reader
+    // should not reach for — `[internal]` on a struct FIELD's shape, since a
+    // variant is the enum's field-level case.
+    Option<&'src str>,
 );
+
+/// The labels an item declaration carries ABOUT itself — attributes that are
+/// not part of its signature and change nothing it means to the type system
+/// (E221). Carried on the nominal and binding declarations (`Node::Struct`,
+/// `Node::Enum`, `Node::Trait`, a module `Node::Let`); a function keeps its own
+/// on `Func`, where E213 put them.
+///
+/// Boxed and optional: nearly every declaration carries none, and a
+/// `Node` variant pays for its widest field on every expression the parser
+/// returns (`node_size.rs`), so the empty case is one null pointer.
+pub type ItemLabels<'src> = Option<Box<Labels<'src>>>;
+
+/// [`ItemLabels`]'s contents, when there are any.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Labels<'src> {
+    /// `[internal("reason")]` (E213, E221): reachable on purpose and
+    /// dangerous on purpose. Read by the editor, and by the opt-in
+    /// `[lints] internal_use` warning.
+    pub internal: Option<&'src str>,
+}
 
 // An explicit enum backing value, `= ( (-)? NUMBER | STRING )`
 // (proposal/backed-enums.md §3.1). The production GENERALIZES the integer

@@ -26,6 +26,7 @@ pub mod id;
 pub mod impl_select;
 pub mod init_order;
 pub mod interpreter;
+pub mod labels;
 pub mod leak_tally;
 pub mod lexing;
 pub mod lift;
@@ -182,7 +183,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
                 | Node::Derive(_, inner)
                 | Node::Service(_, inner)
                 | Node::Const(inner) => walk(&inner.0, in_member_position, into),
-                Node::Struct(_, _, _, _, Some(fields)) => {
+                Node::Struct(_, _, _, _, Some(fields), _) => {
                     for field in &fields.0 {
                         into.insert(field.0.0.0.to_string());
                     }
@@ -192,7 +193,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
                         walk(&item.0, true, into);
                     }
                 }
-                Node::Trait(_, _, _, body) => {
+                Node::Trait(_, _, _, body, _) => {
                     for item in body.0.iter() {
                         walk(&item.0, true, into);
                     }
@@ -994,6 +995,10 @@ pub fn post_analysis_passes(
     // the host as `document.activeElement()`. Same table, same question about
     // a declaration, so it runs beside the check above.
     analyzer::check_global_property_externs(program);
+    // E221: a label on a local binding is refused, and the opt-in
+    // `[lints] internal_use` warns at each use of an `[internal]` item — here,
+    // over the finished program, so both pipelines carry it.
+    labels::check(program);
     // M26's POST-PASS boundary, the outermost of the three the phase line names
     // (`contexts+graph`, `const-pass`, `dispatch-refine`; the last is a slice
     // through the first two, so cancelling either cancels it). The passes are

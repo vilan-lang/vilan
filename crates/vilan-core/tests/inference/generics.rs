@@ -3344,6 +3344,74 @@ fn calling_an_unannotated_closure_parameter_defers() {
     );
 }
 
+// --- E221: `[internal("reason")]` on the nominal and binding positions ----
+
+/// Every E221 position compiles and RUNS unchanged: the label is for the
+/// editor (and the opt-in lint), and it changes nothing the program means.
+#[test]
+fn internal_labels_change_nothing_the_program_means() {
+    assert_compiles_and_runs(
+        concat!(
+            "[internal(\"a struct\")]\n",
+            "struct Region {\n\tlabel: str,\n}\n\n",
+            "[internal(\"an enum\")]\n",
+            "enum Side {\n\tLeft,\n\t[internal(\"a variant\")] Auto,\n}\n\n",
+            "[internal(\"a trait\")]\n",
+            "trait Seam {\n\tfun seam(self): i32;\n}\n\n",
+            "impl Region with Seam {\n\tfun seam(self): i32 {\n\t\t7\n\t}\n}\n\n",
+            "[internal(\"a binding\")]\n",
+            "let cache = 3;\n\n",
+            "fun main() {\n",
+            "\tlet region = Region { label = \"r\" };\n",
+            "\tlet side = Side::Auto;\n",
+            "\tlet named = match side {\n\t\tSide::Left => \"left\",\n\t\tSide::Auto => \"auto\",\n\t};\n",
+            "\tprint(i\"{region.label} {named} {region.seam()} {cache}\");\n",
+            "}\n",
+        ),
+        "r auto 7 3\n",
+    );
+}
+
+/// A label on a LOCAL binding is refused: a module and a function body share
+/// the statement production, so the parser reads one anywhere, and only the
+/// finished program knows the binding has no reader outside its body.
+#[test]
+fn an_internal_label_on_a_local_binding_is_refused() {
+    assert_fails_spanning(
+        concat!(
+            "fun main() {\n",
+            "\t[internal(\"nobody can reach it\")]\n",
+            "\tlet hidden = 1;\n",
+            "\tprint(i\"{hidden}\");\n",
+            "}\n",
+        ),
+        "hidden",
+        "`hidden` is a local binding, and `[internal(..)]` labels an item on a module's surface",
+    );
+    // …while the same label on the MODULE binding is the E221 position.
+    assert_compiles_and_runs(
+        concat!(
+            "[internal(\"the shared one\")]\n",
+            "let shown = 1;\n\n",
+            "fun main() {\n\tprint(i\"{shown}\");\n}\n",
+        ),
+        "1\n",
+    );
+}
+
+/// Nothing warns by default: the lint is opt-in (`[lints] internal_use`), and
+/// a file with no manifest has not opted in. (The warning itself is pinned
+/// end to end in `vilan-cli`'s `diagnostics.rs`, where a manifest can say so.)
+#[test]
+fn an_internal_label_warns_nobody_by_default() {
+    let warned = warnings(concat!(
+        "[internal(\"a struct\")]\n",
+        "struct Region {\n\tlabel: str,\n}\n\n",
+        "fun main() {\n\tlet region = Region { label = \"r\" };\n\tprint(region.label);\n}\n",
+    ));
+    assert!(warned.is_empty(), "{warned:?}");
+}
+
 #[test]
 fn doc_hidden_is_refused_and_names_export() {
     // B318 §7.5, RULED 2026-09-13. `[doc(hidden)]` meant "callable, but omitted

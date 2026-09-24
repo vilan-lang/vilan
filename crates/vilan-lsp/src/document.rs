@@ -2024,17 +2024,8 @@ impl Document {
                     // E213: the resolved index CAN see the label, so the
                     // keystroke list obeys the same rule the analysis's own
                     // completion does.
-                    internal: program
-                        .functions
-                        .get(&id)
-                        .and_then(|function| function.internal)
-                        .or_else(|| {
-                            program
-                                .external_functions
-                                .get(&id)
-                                .and_then(|external| external.internal)
-                        })
-                        .map(str::to_string),
+                    // E221: every declaration kind this index lists.
+                    internal: vilan_core::labels::internal_of(program, id).map(str::to_string),
                     analysis_epoch: epoch,
                 });
             };
@@ -3087,6 +3078,12 @@ impl Document {
             {
                 return Some(self.compose_hover(program, definition, declaration, None));
             }
+            // E221: a labelled nominal hovers with its reason even where no
+            // declaration block answers (a trait in a bound).
+            if let Some(lead) = definition.and_then(|definition| internal_lead(program, definition))
+            {
+                return Some(format!("{lead}\n\n{label}"));
+            }
             return Some(label);
         }
         // Everything below answers by span CONTAINMENT, and an entity's span
@@ -3146,13 +3143,23 @@ impl Document {
             .function_target(id)
             .and_then(|function| self.platform_requirements.get(&function))
             .cloned();
-        match (type_label, requirement) {
+        let answer = match (type_label, requirement) {
             // A blank markdown line, so the requirement renders as its own
             // paragraph under the type.
             (Some(type_label), Some(requirement)) => Some(format!("{type_label}\n\n{requirement}")),
             (Some(type_label), None) => Some(type_label),
             (None, requirement) => requirement,
-        }
+        }?;
+        // E221: a labelled MODULE BINDING leads with its reason too, at its
+        // declaration and at every read of it.
+        let binding = match program.entity_map.get(&id) {
+            Some(Expr::Local(target)) => *target,
+            _ => id,
+        };
+        Some(match internal_lead(program, binding) {
+            Some(lead) => format!("{lead}\n\n{answer}"),
+            None => answer,
+        })
     }
 
     /// The hover for an identifier that spells an `as` alias — its own name
@@ -3843,22 +3850,15 @@ impl Document {
                 }
             }
         };
-        // E213: the label at any use of a declaration that carries one. Read
-        // through the same two maps hover reads, so an external answers like a
-        // function.
+        // E213: the label at any use of a declaration that carries one — and
+        // E221: of any kind (a struct, enum, trait, module binding or variant
+        // as well as a function), read through the one reader hover uses.
         let internal_modifier = |target: Id| {
-            let labelled = program
-                .functions
-                .get(&target)
-                .map(|function| function.internal.is_some())
-                .or_else(|| {
-                    program
-                        .external_functions
-                        .get(&target)
-                        .map(|external| external.internal.is_some())
-                })
-                .unwrap_or(false);
-            if labelled { MODIFIER_INTERNAL } else { 0 }
+            if vilan_core::labels::internal_of(program, target).is_some() {
+                MODIFIER_INTERNAL
+            } else {
+                0
+            }
         };
         // Declaration names.
         for (id, function) in &program.functions {
@@ -3874,17 +3874,29 @@ impl Document {
         }
         for (id, struct_) in &program.structs {
             if entry(*id) {
-                tokens.push((struct_.name_span, TokenKind::Struct, MODIFIER_DECLARATION));
+                tokens.push((
+                    struct_.name_span,
+                    TokenKind::Struct,
+                    MODIFIER_DECLARATION | internal_modifier(*id),
+                ));
             }
         }
         for (id, enum_) in &program.enums {
             if entry(*id) {
-                tokens.push((enum_.name_span, TokenKind::Enum, MODIFIER_DECLARATION));
+                tokens.push((
+                    enum_.name_span,
+                    TokenKind::Enum,
+                    MODIFIER_DECLARATION | internal_modifier(*id),
+                ));
             }
         }
         for (id, trait_) in &program.traits {
             if entry(*id) {
-                tokens.push((trait_.name_span, TokenKind::Interface, MODIFIER_DECLARATION));
+                tokens.push((
+                    trait_.name_span,
+                    TokenKind::Interface,
+                    MODIFIER_DECLARATION | internal_modifier(*id),
+                ));
             }
         }
         for (id, variable) in &program.variables {
@@ -3897,7 +3909,7 @@ impl Document {
                 tokens.push((
                     variable.name_span,
                     TokenKind::Variable,
-                    MODIFIER_DECLARATION | readonly,
+                    MODIFIER_DECLARATION | readonly | internal_modifier(*id),
                 ));
             }
         }
@@ -3930,7 +3942,7 @@ impl Document {
                             _ => 0,
                         };
                         tokens.push((
-                            span,
+                            variant_leaf(program, *target, span),
                             classify_target(*target),
                             readonly | internal_modifier(*target),
                         ));
@@ -3955,15 +3967,7 @@ impl Document {
             // E213 at a MEMBER: the method this call selected, or the field
             // this read resolved to — both already recorded, so the dimming
             // asks the record rather than re-resolving the name.
-            let internal = match program.entity_map.get(call_id) {
-                Some(Expr::Field(_, struct_id, index)) => program
-                    .structs
-                    .get(struct_id)
-                    .and_then(|structure| structure.fields.get(*index))
-                    .is_some_and(|field| field.internal.is_some()),
-                Some(Expr::Local(target)) => internal_modifier(*target) != 0,
-                _ => false,
-            };
+            let internal = vilan_core::labels::member_internal(program, *call_id).is_some();
             tokens.push((*span, kind, if internal { MODIFIER_INTERNAL } else { 0 }));
         }
         // Type-position references (macro names arrive here too).
@@ -3974,10 +3978,15 @@ impl Document {
             // A reference with no resolved definition (an unresolved or
             // synthetic segment) stays untokenized — TextMate's base layer
             // keeps whatever it had.
-            let Some(kind) = definition.map(classify_target) else {
+            let Some(definition) = *definition else {
                 continue;
             };
-            tokens.push((*span, kind, 0));
+            // E221: a labelled nominal is dimmed where a TYPE names it too.
+            tokens.push((
+                *span,
+                classify_target(definition),
+                internal_modifier(definition),
+            ));
         }
         // Markup (element-syntax S5): tags and attribute names come from a
         // RAW parse — the desugar retires `Node::Element` before analysis, so
@@ -8309,17 +8318,32 @@ fn trailing_semicolon_to_remove(
 /// `[internal("reason")]` — a function, a method or an external — or `None`
 /// for the overwhelming majority that carry none.
 fn internal_lead(program: &Program, declaration_id: Id) -> Option<String> {
-    let reason = program
-        .functions
-        .get(&declaration_id)
-        .and_then(|function| function.internal)
-        .or_else(|| {
-            program
-                .external_functions
-                .get(&declaration_id)
-                .and_then(|external| external.internal)
-        })?;
-    Some(internal_line(reason))
+    // E221: every declaration kind, through the one reader.
+    vilan_core::labels::internal_of(program, declaration_id).map(internal_line)
+}
+
+/// E221: a variant reached through its enum's PATH (`Side::Auto`) is one
+/// entity spanning the whole path, and that token overlaps the enum's own
+/// type-reference token (`Side`) — so the overlap filter dropped it, and the
+/// variant was never painted at all, let alone dimmed. Its token is the LEAF:
+/// the variant's name at the end of the span, when the span is longer than it.
+/// Every other reference keeps its span.
+fn variant_leaf(program: &Program, target: Id, span: Span) -> Span {
+    let Some(Expr::EnumVariant(enum_id, index)) = program.entity_map.get(&target) else {
+        return span;
+    };
+    let Some(variant) = program
+        .enums
+        .get(enum_id)
+        .and_then(|enumeration| enumeration.variants.get(*index))
+    else {
+        return span;
+    };
+    let range = span.into_range();
+    if range.end - range.start <= variant.name.len() {
+        return span;
+    }
+    Span::from(range.end - variant.name.len()..range.end)
 }
 
 /// How the label reads in the editor, in ONE place: hover's lead line and the
@@ -11071,6 +11095,192 @@ pub(crate) mod tests {
             Some(0),
             "while the field beside it is not: {tokens:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── E221: the label on the nominal, variant, trait and binding positions ──
+
+    /// `helper.vl` declares one labelled item of each E221 kind beside an
+    /// unlabelled enum; `main.vl` is `main`, opened at the end of `marker`.
+    fn e221_workspace(marker: &str, main: &str) -> (PathBuf, Document, usize) {
+        let (dir, document) = analyze_workspace(&[
+            ("main.vl", main),
+            (
+                "helper.vl",
+                concat!(
+                    "export [internal(\"a struct\")]\n",
+                    "struct Region {\n\tlabel: str,\n}\n\n",
+                    "export enum Side {\n\tLeft,\n\t[internal(\"a variant\")] Auto,\n}\n\n",
+                    "export [internal(\"a trait\")]\n",
+                    "trait Seam {\n\tfun seam(self): i32;\n}\n\n",
+                    "export [internal(\"a binding\")]\n",
+                    "let cache = 3;\n",
+                ),
+            ),
+        ]);
+        let text = document.line_index.text();
+        let offset = text.find(marker).expect("the marker") + marker.len();
+        (dir, document, offset)
+    }
+
+    const E221_IMPORT: &str = "import pkg::helper::{ Region, Side, Seam, cache };\n\n";
+
+    fn labels_at(document: &Document, offset: usize) -> Vec<String> {
+        document
+            .completion(offset)
+            .into_iter()
+            .map(|candidate| candidate.label)
+            .collect()
+    }
+
+    #[test]
+    fn e221_a_labelled_nominal_trait_or_binding_is_absent_from_a_bare_list() {
+        let main = format!("{E221_IMPORT}fun main() {{\n\tlet _ = 1;\n\t\n}}\n");
+        let (dir, document, offset) = e221_workspace("let _ = 1;\n\t", &main);
+        let labels = labels_at(&document, offset);
+        assert!(
+            labels.iter().any(|label| label == "Side"),
+            "the unlabelled enum is offered: {labels:?}"
+        );
+        for hidden in ["Region", "Seam", "cache"] {
+            assert!(
+                !labels.iter().any(|label| label == hidden),
+                "`{hidden}` is labelled, and hidden at a bare position: {labels:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e221_three_characters_of_a_labelled_nominal_bring_it_back_with_its_reason() {
+        for (typed, name, reason) in [
+            ("Reg", "Region", "a struct"),
+            ("cac", "cache", "a binding"),
+            ("Sea", "Seam", "a trait"),
+        ] {
+            let main = format!("{E221_IMPORT}fun main() {{\n\t{typed}\n}}\n");
+            let (dir, document, offset) = e221_workspace(&format!("\t{typed}"), &main);
+            let candidate = document
+                .completion(offset)
+                .into_iter()
+                .find(|candidate| candidate.label == name)
+                .unwrap_or_else(|| panic!("`{typed}` offers `{name}`"));
+            assert_eq!(candidate.internal.as_deref(), Some(reason));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn e221_a_labelled_variant_is_hidden_after_the_path_and_returns_on_its_prefix() {
+        let main = format!("{E221_IMPORT}fun main() {{\n\tlet _ = Side::\n}}\n");
+        let (dir, document, offset) = e221_workspace("Side::", &main);
+        let labels = labels_at(&document, offset);
+        assert!(labels.iter().any(|label| label == "Left"), "{labels:?}");
+        assert!(!labels.iter().any(|label| label == "Auto"), "{labels:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let main = format!("{E221_IMPORT}fun main() {{\n\tlet _ = Side::Aut\n}}\n");
+        let (dir, document, offset) = e221_workspace("Side::Aut", &main);
+        let candidate = document
+            .completion(offset)
+            .into_iter()
+            .find(|candidate| candidate.label == "Auto")
+            .expect("three characters of its own name offer it");
+        assert_eq!(candidate.internal.as_deref(), Some("a variant"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e221_the_internal_modifier_dims_every_kind_at_its_declaration_and_its_uses() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            concat!(
+                "[internal(\"a struct\")]\n",
+                "struct Region {\n\tlabel: str,\n}\n\n",
+                "enum Side {\n\tLeft,\n\t[internal(\"a variant\")] Auto,\n}\n\n",
+                "[internal(\"a binding\")]\n",
+                "let cache = 3;\n\n",
+                "fun read(region: Region): str {\n\tregion.label\n}\n\n",
+                "fun main() {\n\tlet side = Side::Auto;\n\tlet left = Side::Left;\n",
+                "\tprint(i\"{cache}\");\n}\n",
+            ),
+        )]);
+        let text = document.line_index.text();
+        let tokens = document.semantic_tokens();
+        let modifier_at = |needle: &str, skip: usize, length: usize| {
+            let at = text.find(needle).expect("the position") + skip;
+            tokens
+                .iter()
+                .find(|(span, _, _)| {
+                    let range = span.into_range();
+                    range.start == at && range.end == at + length
+                })
+                .map(|(_, _, modifiers)| *modifiers & MODIFIER_INTERNAL)
+        };
+        assert_eq!(
+            modifier_at("Region {", 0, 6),
+            Some(MODIFIER_INTERNAL),
+            "the struct's declaration: {tokens:?}"
+        );
+        assert_eq!(
+            modifier_at("region: Region)", 8, 6),
+            Some(MODIFIER_INTERNAL),
+            "a TYPE naming it: {tokens:?}"
+        );
+        assert_eq!(
+            modifier_at("cache = 3", 0, 5),
+            Some(MODIFIER_INTERNAL),
+            "the binding's declaration: {tokens:?}"
+        );
+        assert_eq!(
+            modifier_at("{cache}", 1, 5),
+            Some(MODIFIER_INTERNAL),
+            "the binding at a use: {tokens:?}"
+        );
+        assert_eq!(
+            modifier_at("Side::Auto;", 6, 4),
+            Some(MODIFIER_INTERNAL),
+            "the variant at a use: {tokens:?}"
+        );
+        assert_eq!(
+            modifier_at("Side::Left;", 6, 4),
+            Some(0),
+            "while its unlabelled sibling is not: {tokens:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn e221_hover_leads_with_the_reason_for_every_kind() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            concat!(
+                "[internal(\"a struct\")]\n",
+                "struct Region {\n\tlabel: str,\n}\n\n",
+                "enum Side {\n\tLeft,\n\t[internal(\"a variant\")] Auto,\n}\n\n",
+                "[internal(\"a trait\")]\n",
+                "trait Seam {\n\tfun seam(self): i32;\n}\n\n",
+                "[internal(\"a binding\")]\n",
+                "let cache = 3;\n\n",
+                "fun read<T: Seam>(region: Region, seam: T): str {\n\tregion.label\n}\n\n",
+                "fun main() {\n\tlet side = Side::Auto;\n\tprint(i\"{cache}\");\n}\n",
+            ),
+        )]);
+        let text = document.line_index.text();
+        for (needle, skip, reason) in [
+            ("region: Region", 9, "a struct"),
+            ("T: Seam", 4, "a trait"),
+            ("{cache}", 2, "a binding"),
+            ("Side::Auto", 7, "a variant"),
+        ] {
+            let at = text.find(needle).expect("the position") + skip;
+            let hover = document
+                .hover(at)
+                .unwrap_or_else(|| panic!("a hover at {needle:?}"));
+            assert!(
+                hover.starts_with(&format!("**internal** — {reason}")),
+                "{needle:?}: the reason LEADS: {hover:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

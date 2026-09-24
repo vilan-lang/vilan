@@ -15,7 +15,7 @@ use std::cell::Cell;
 use crate::node::{
     ANONYMOUS_TYPE_BINDER, BinaryOp, Convention, ExportScope, Exposure, ExternBinding, Func,
     GenericArguments, GenericParameters, ImplSelector, ImportBranch, ImportModifier, ImportTail,
-    Node, NodeIfBranch, NodeList, Pattern, StructInitializerField,
+    ItemLabels, Node, NodeIfBranch, NodeList, Pattern, StructInitializerField,
 };
 use crate::span::{Span, Spanned};
 use crate::token::Token;
@@ -4403,10 +4403,10 @@ impl<'src> Printer<'src> {
                 | Node::Match(_, _)
                 | Node::Block(_)
                 | Node::Func(_)
-                | Node::Struct(_, _, _, _, _)
-                | Node::Enum(_, _, _, _)
+                | Node::Struct(..)
+                | Node::Enum(..)
                 | Node::Impl(_, _, _)
-                | Node::Trait(_, _, _, _)
+                | Node::Trait(..)
                 | Node::Module(_, _)
                 | Node::Derive(_, _)
                 | Node::Service(_, _)
@@ -4424,7 +4424,8 @@ impl<'src> Printer<'src> {
         match &item.0 {
             // `[resource ][external ]struct Name[<…>][;|{ fields }]` — canonical
             // modifier order is `resource external struct` (destruction.md §3).
-            Node::Struct(name, generics, external, resource, body) => {
+            Node::Struct(name, generics, external, resource, body, labels) => {
+                self.print_item_labels(labels);
                 if *resource {
                     self.out.push_str("resource ");
                 }
@@ -4491,7 +4492,8 @@ impl<'src> Printer<'src> {
                 }
             }
             // `[resource ]enum Name[<…>] { Variant[(payload)][ = backing value], … }`.
-            Node::Enum(name, generics, resource, variants) => {
+            Node::Enum(name, generics, resource, variants, labels) => {
+                self.print_item_labels(labels);
                 if *resource {
                     self.out.push_str("resource ");
                 }
@@ -4504,13 +4506,20 @@ impl<'src> Printer<'src> {
                     self.out.push_str(" {");
                     self.indent += 1;
                     let mut prev_end = variants.1.into_range().start + 1;
-                    for ((variant_name, payload, backing), span) in &variants.0 {
+                    for ((variant_name, payload, backing, internal), span) in &variants.0 {
                         let range = span.into_range();
                         let after_comments = self.flush_comments_before(range.start, prev_end);
                         if self.has_blank_between(after_comments, range.start) {
                             self.blank_line();
                         }
                         self.line();
+                        // E221: a variant's label leads it on its line, as a
+                        // field's does.
+                        if let Some(reason) = internal {
+                            self.out.push_str("[internal(\"");
+                            self.out.push_str(reason);
+                            self.out.push_str("\")] ");
+                        }
                         self.out.push_str(variant_name);
                         if !payload.is_empty() {
                             self.out.push('(');
@@ -4577,7 +4586,8 @@ impl<'src> Printer<'src> {
                 self.print_braced_items(body);
             }
             // `trait Name[ with A + B] { items }`.
-            Node::Trait(name, generics, supertraits, body) => {
+            Node::Trait(name, generics, supertraits, body, labels) => {
+                self.print_item_labels(labels);
                 self.out.push_str("trait ");
                 self.out.push_str(name.0);
                 self.print_generic_parameters(generics.as_deref());
@@ -5241,6 +5251,22 @@ impl<'src> Printer<'src> {
     /// `function` production), and `[deprecated("use …")]` leads it — so it is
     /// printed first. The steer is the lexer's raw string text, re-emitted
     /// between quotes exactly as `[extern(..)]`'s symbols are.
+    /// The labels an item carries about itself (E221), each on its own line
+    /// above it — the shape `print_func` gives a function's. PRINTED, never
+    /// skipped: an attribute with no printer arm makes the token net decline
+    /// every file carrying one.
+    fn print_item_labels(&mut self, labels: &ItemLabels<'src>) {
+        let Some(labels) = labels else {
+            return;
+        };
+        if let Some(reason) = labels.internal {
+            self.out.push_str("[internal(\"");
+            self.out.push_str(reason);
+            self.out.push_str("\")]");
+            self.line();
+        }
+    }
+
     fn print_func(&mut self, func: &Func<'src>) {
         if let Some(steer) = func.deprecated {
             self.out.push_str("[deprecated(\"");
@@ -5602,7 +5628,7 @@ impl<'src> Printer<'src> {
             | Node::Await(_)
             | Node::Async(_) => 10,
             Node::Assign(_, _, _)
-            | Node::Let(_, _, _, _, _)
+            | Node::Let(..)
             | Node::Closure(_)
             | Node::If(_)
             | Node::For(_, _)
@@ -7483,7 +7509,10 @@ impl<'src> Printer<'src> {
                 self.out.push_str("const ");
                 self.print_split_operand(inner, 0, split);
             }
-            Node::Let(name, declared_type, value, mutable, lazy) => {
+            Node::Let(name, declared_type, value, mutable, lazy, labels) => {
+                // E221: a module binding's labels, each on its own line above
+                // it, as a function's are.
+                self.print_item_labels(labels);
                 // `lazy` precedes the binder word, as it does on a parameter
                 // (lazy.md §2). It is a keyword with no node of its own beyond
                 // the flag, so dropping it here would silently turn a deferred
@@ -8679,6 +8708,34 @@ mod idempotency {
             "and a function's leads the ordered prefix:\n{formatted}"
         );
         assert_fixed_point("internal", source);
+    }
+
+    #[test]
+    fn an_internal_label_survives_the_reprint_on_every_e221_position() {
+        // E221: a struct, an enum and its variant, a trait, a module binding —
+        // each printed where it was written, or the token net declines the
+        // file for an attribute the printer dropped.
+        let source = concat!(
+            "[internal(\"a struct\")]\n",
+            "struct Region {\n\tlabel: str,\n}\n\n",
+            "[internal(\"an enum\")]\n",
+            "enum Side {\n\tLeft,\n\t[internal(\"a variant\")] Auto,\n}\n\n",
+            "[internal(\"a trait\")]\n",
+            "trait Seam {\n\tfun seam(self): i32;\n}\n\n",
+            "[internal(\"a binding\")]\n",
+            "let cache = 3;\n\n",
+            "export [internal(\"exported\")]\n",
+            "struct Marker {}\n\n",
+            "[derive(Clone)]\n",
+            "[internal(\"derived\")]\n",
+            "struct Point {\n\tx: i32,\n}\n",
+        );
+        let formatted = format(source);
+        assert_eq!(
+            formatted, source,
+            "the canonical spelling reprints byte-identically"
+        );
+        assert_fixed_point("internal_e221", source);
     }
 }
 

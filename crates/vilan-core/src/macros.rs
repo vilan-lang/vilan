@@ -2943,7 +2943,7 @@ fn construct_generic_parameters(
 /// or `[2, FunctionItem]` — the variant order declared in `meta.vl`.
 fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
     match &item.0 {
-        Node::Struct(name, generics, _external, _resource, fields) => {
+        Node::Struct(name, generics, _external, _resource, fields, _labels) => {
             let fields = fields
                 .iter()
                 .flat_map(|fields| &fields.0)
@@ -2970,12 +2970,12 @@ fn construct_item(item: &Spanned<Node>, text: &str) -> js::Node<'static> {
                 ]),
             ])
         }
-        Node::Enum(name, generics, _resource, variants) => {
+        Node::Enum(name, generics, _resource, variants, _labels) => {
             let variants = variants
                 .0
                 .iter()
                 .map(|(variant, _)| {
-                    let (variant_name, payload, backing) = variant;
+                    let (variant_name, payload, backing, _internal) = variant;
                     array(vec![
                         string_literal(variant_name),
                         array(
@@ -3092,7 +3092,7 @@ pub(crate) fn construct_service(
     nodes: &NodeList,
     text: &str,
 ) -> Option<(js::Node<'static>, String, ServiceSurface)> {
-    let Node::Struct(name, _generics, _external, _resource, Some(fields)) = &item.0 else {
+    let Node::Struct(name, _generics, _external, _resource, Some(fields), _labels) = &item.0 else {
         return None;
     };
     let service_name = name.0;
@@ -3197,7 +3197,7 @@ fn service_http_refusals(
     if !attribute.http {
         return Vec::new();
     }
-    let Node::Struct(name, _generics, _external, _resource, fields) = &item.0 else {
+    let Node::Struct(name, _generics, _external, _resource, fields, _labels) = &item.0 else {
         return Vec::new();
     };
     let service_name = name.0;
