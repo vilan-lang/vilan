@@ -397,7 +397,7 @@ const ROWS_WITHOUT_A_KEY: &[(&str, &str)] = &[
 /// `&'static str` rather than a literal (the lexer's rule constants come through
 /// one of them), which is why the enumeration in check (3) cannot reach the row
 /// and why it is keyless in the first place.
-const RULE_STATEMENT_SITES: usize = 49;
+const RULE_STATEMENT_SITES: usize = 50;
 
 /// The one literal run of the resource-derive refusal that is neither a slot
 /// nor assembled: what its ledger row is keyed on, and what
@@ -522,6 +522,11 @@ const CURATED_RULE_STATEMENTS: &[(&str, &str, &str)] = &[
         "crates/vilan-core/src/parsing.rs",
         "MODULE_PLATFORM_LEADS_THE_FILE",
         "a module's `[platform(..)];` declares the platform of the whole file,",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "DEPRECATED_IMPORT_IS_A_RE_EXPORT",
+        "`[deprecated(..)]` on an `import` deprecates the name a RE-EXPORT publishes,",
     ),
     (
         "crates/vilan-core/src/parsing.rs",

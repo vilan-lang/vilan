@@ -2014,3 +2014,119 @@ fn internal_use_is_silent_unless_the_package_asks() {
         );
     }
 }
+
+// --- B382: `[deprecated("use …")]` on a type and on a re-export ------------
+//
+// The warning is the function attribute's own (`` `{name}` is deprecated;
+// {steer} ``), and it needs a second module to be seen at all: the declaring
+// module's uses are silent. So it is pinned here, through the binary.
+
+/// `inner.vl`: a deprecated struct beside its replacement, used by its own
+/// module; `re.vl`: a deprecated renaming re-export, and a deprecated
+/// NON-renaming one.
+const DEPRECATED_INNER: &str = concat!(
+    "export [deprecated(\"use DeltaCursor\")]\n",
+    "struct KeyedThing {\n\tat: i32,\n}\n\n",
+    "export struct DeltaCursor {\n\tat: i32,\n}\n\n",
+    "export struct Kept {\n\tat: i32,\n}\n\n",
+    "export fun own_use(): KeyedThing {\n\tKeyedThing { at = 1 }\n}\n",
+);
+const DEPRECATED_RE: &str = concat!(
+    "export [deprecated(\"use pkg::inner::DeltaCursor\")] import pkg::inner::DeltaCursor as KeyedCursor;\n",
+    "export [deprecated(\"import it from pkg::inner\")] import pkg::inner::Kept;\n",
+);
+
+fn deprecated_package(tag: &str, main: &str) -> PathBuf {
+    let dir = temp_package(tag, main);
+    std::fs::write(dir.join("src/inner.vl"), DEPRECATED_INNER).unwrap();
+    std::fs::write(dir.join("src/re.vl"), DEPRECATED_RE).unwrap();
+    dir
+}
+
+#[test]
+fn b382_a_deprecated_type_warns_at_each_use_in_another_module() {
+    let dir = deprecated_package(
+        "b382_type",
+        concat!(
+            "import pkg::inner::{ KeyedThing, DeltaCursor };\n\n",
+            "fun main() {\n",
+            "\tlet thing: KeyedThing = KeyedThing { at = 2 };\n",
+            "\tlet cursor: DeltaCursor = DeltaCursor { at = 3 };\n",
+            "\tprint(i\"{thing.at} {cursor.at}\");\n",
+            "}\n",
+        ),
+    );
+    let output = vilan(&dir, &["check", "."], true);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "a deprecation warns, it does not fail"
+    );
+    let warnings = warning_lines(&output);
+    // The import, the annotation and the literal's head — and nothing for the
+    // replacement beside it, or for the declaring module's own `own_use`.
+    assert_eq!(
+        warnings,
+        vec!["`KeyedThing` is deprecated; use DeltaCursor".to_string(); 3],
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn b382_a_deprecated_re_export_warns_at_the_import_that_reaches_through_it() {
+    let dir = deprecated_package(
+        "b382_reexport",
+        concat!(
+            "import pkg::re::{ KeyedCursor, Kept };\n",
+            "import pkg::inner::DeltaCursor;\n\n",
+            "fun takes(cursor: DeltaCursor): i32 {\n\tcursor.at\n}\n\n",
+            "fun main() {\n",
+            "\tlet cursor = KeyedCursor { at = 3 };\n",
+            "\tlet kept = Kept { at = 4 };\n",
+            "\tprint(i\"{takes(cursor)} {kept.at}\");\n",
+            "}\n",
+        ),
+    );
+    let output = vilan(&dir, &["check", "."], true);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(output.status.success());
+    let warnings = warning_lines(&output);
+    // Once each, at the leaf that names the deprecated re-export — and the
+    // renamed name stays TRANSPARENT: a `KeyedCursor` is a `DeltaCursor`.
+    assert_eq!(
+        warnings,
+        vec![
+            "`KeyedCursor` is deprecated; use pkg::inner::DeltaCursor".to_string(),
+            "`Kept` is deprecated; import it from pkg::inner".to_string(),
+        ],
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn b382_importing_the_original_is_not_a_use_of_the_re_export() {
+    // `re` re-exports `Kept` WITHOUT renaming it, deprecated; `inner` still
+    // publishes the same name for the same item, and importing it from there
+    // is exactly what the steer asks for.
+    let dir = deprecated_package(
+        "b382_original",
+        concat!(
+            "import pkg::inner::{ Kept, DeltaCursor };\n",
+            // `re` is LOADED — its re-exports are published in this program —
+            // and only the renamed one is reached through it.
+            "import pkg::re::KeyedCursor;\n\n",
+            "fun main() {\n\tlet kept = Kept { at = 4 };\n",
+            "\tlet cursor: DeltaCursor = KeyedCursor { at = 5 };\n",
+            "\tprint(i\"{kept.at} {cursor.at}\");\n}\n",
+        ),
+    );
+    let output = vilan(&dir, &["check", "."], true);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(output.status.success());
+    let warnings = warning_lines(&output);
+    assert_eq!(
+        warnings,
+        vec!["`KeyedCursor` is deprecated; use pkg::inner::DeltaCursor".to_string()],
+        "`Kept` imported from `inner` is not a use of `re`'s deprecated re-export: {warnings:?}"
+    );
+}

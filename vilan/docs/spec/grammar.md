@@ -59,7 +59,9 @@ impl-selector = "(" "impl" type ")"
                 [ "::" ( NAME | "{" NAME { "," NAME } [ "," ] "}" ) ] ;
 NAME        = IDENT | "true" | "false" ;   (* variant re-exports *)
 
-export      = "export" [ "(" "in" path-branch ")" ] statement   (* §4.8 *)
+export      = "export" [ "(" "in" path-branch ")" ]
+              [ deprecated-label ]   (* only before `import`: B382's re-export *)
+              statement   (* §4.8 *)
             | "export" "*" ";" ;          (* the whole-module marker *)
 ```
 
@@ -211,6 +213,22 @@ when the function is removed, so is the mark. When the item goes away is
 the CHANGELOG's fact, not the source's — the removal comes no earlier
 than the minor release after the warning first shipped.
 
+The same steer labels a **struct**, an **enum**, a **trait** or a module
+binding (leading its prefix, as on a function), and a **re-export**:
+`export [deprecated("use pkg::inner::DeltaCursor")] import
+pkg::inner::DeltaCursor as KeyedCursor;` deprecates the name `KeyedCursor`
+the re-export publishes, while the item stays exactly the item —
+`KeyedCursor` is still a `DeltaCursor`. A use of a deprecated type in
+another module — an import, an annotation, a literal's head — warns with
+the function's own warning; so does every other module's import that
+reaches a deprecated re-export, and importing the item from where it is
+declared does not. The declaring module's own uses are silent, as std's
+are. A `[deprecated]` import that is not exported publishes nothing and is
+refused, and so is a `[deprecated]` or `[internal]` on an `impl` block,
+which nobody names — label its members. The editor strikes a deprecated
+name through at its declaration and every use (the standard `deprecated`
+semantic-token modifier) and leads its hover with the steer.
+
 `[internal("reason")]` follows it, and answers a different question.
 Visibility says whether a module may **name** an item; this says whether
 a reader should **reach for** one that is named — an item exported on
@@ -249,14 +267,17 @@ std's and a dependency's stay silent.
 ### Structs and enums
 
 ```text
-struct = [ internal-label ] [ platform-attr ] [ "resource" ] [ "external" ] "struct"
+struct = [ deprecated-label ] [ internal-label ] [ platform-attr ] [ "resource" ]
+         [ "external" ] "struct"
          (IDENT | "null") [ generic-params ]
          ( "{" [ field { "," field } [ "," ] ] "}" | ";" ) ;
 field  = [ internal-label ]
          [ "[" "expose" [ "(" "keyed" [ "=" type ] ")" ] "]" ] IDENT [ ":" type ] ;
 internal-label = "[" "internal" "(" STRING ")" "]" ;
+deprecated-label = "[" "deprecated" "(" STRING ")" "]" ;
 
-enum          = [ internal-label ] [ platform-attr ] [ "resource" ] "enum" IDENT
+enum          = [ deprecated-label ] [ internal-label ] [ platform-attr ] [ "resource" ]
+                "enum" IDENT
                 [ generic-params ] "{" [ variant { "," variant } [ "," ] ] "}" ;
 variant       = [ internal-label ] NAME [ "(" [ type { "," type } [ "," ] ] ")" ]
                 [ "=" backing-value ] ;
@@ -327,7 +348,8 @@ struct`, and it is accepted only on `struct` and `enum` declarations;
 ```text
 impl  = [ internal-label ] [ platform-attr ] "impl" type [ "with" type { "+" type } ]
         "{" { statement } "}" ;
-trait = [ internal-label ] [ platform-attr ] "trait" IDENT [ generic-params ]
+trait = [ deprecated-label ] [ internal-label ] [ platform-attr ] "trait" IDENT
+        [ generic-params ]
         [ "with" type { "+" type } ] "{" { function } "}" ;
 ```
 
@@ -391,7 +413,8 @@ marker, never a client name: `[service(http)]` keeps the default
 ```text
 let        = [ "lazy" ] ("let" | "mut") binder [ ":" type ]
              [ "=" expression ] ;
-labelled-let = internal-label [ "lazy" ] ("let" | "mut") IDENT [ ":" type ]
+labelled-let = ( deprecated-label [ internal-label ] | internal-label )
+               [ "lazy" ] ("let" | "mut") IDENT [ ":" type ]
                [ "=" expression ] ";" ;
 assignment = [ "*" ] place ( "=" | "+=" | "-=" | "*=" | "/=" | "%=" )
              expression ;

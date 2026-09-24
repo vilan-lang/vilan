@@ -4826,6 +4826,27 @@ pub struct Analyzer<'src> {
     // entry asks exactly what it asked before, and the one reader that needs the
     // extra bit looks it up by the leaf's own span.
     reach_marked_spans: HashSet<(SourceId, Span)>,
+    // B382: every leaf of an `export [deprecated("…")] import` —
+    // `check_deprecated_reexports` warns at every OTHER file's import of a
+    // name such a re-export publishes.
+    deprecated_import_leaves: Vec<DeprecatedImportLeaf<'src>>,
+}
+
+/// One leaf of an `export [deprecated("…")] import` (B382).
+#[derive(Clone, Debug)]
+struct DeprecatedImportLeaf<'src> {
+    source: SourceId,
+    leaf_span: Span,
+    /// The name the statement binds and a re-export publishes: the alias
+    /// where it renames, the leaf where not.
+    bound: &'src str,
+    /// Whether it renames (`as`): then the bound name is the re-export's own
+    /// spelling and no other import reaches the target by it.
+    renamed: bool,
+    /// The module scope the statement sits in — the module an importer names
+    /// to reach the published name.
+    scope: Id,
+    steer: &'src str,
 }
 
 /// One resolved import leaf, for `check_plain_reaches` (B318 §5).
@@ -5034,7 +5055,7 @@ fn item_visibility<'a, 'src>(item: &'a Spanned<Node<'src>>) -> (Visibility<'src>
     let mut node = &item.0;
     loop {
         match node {
-            Node::Export(scope, inner) => {
+            Node::Export(scope, inner, _) => {
                 visibility = match scope {
                     Some(scope) => {
                         Visibility::Scoped(scope.path.iter().map(|(segment, _)| *segment).collect())
@@ -5068,8 +5089,8 @@ fn collect_importables<'src>(items: &NodeList<'src>, out: &mut Vec<Importable<'s
             Visibility::Private if export_all => Visibility::Exported,
             marked => marked,
         };
-        if let Node::Export(_, inner) = &item.0
-            && let Node::Import(branch, _) | Node::Use(branch) = &inner.0
+        if let Node::Export(_, inner, _) = &item.0
+            && let Node::Import(branch, ..) | Node::Use(branch) = &inner.0
         {
             let mut entries = Vec::new();
             flatten_namespace_branch(branch, Vec::new(), &mut entries);
@@ -5188,7 +5209,7 @@ fn collect_declared_names<'src>(items: &NodeList<'src>, out: &mut Vec<&'src str>
 /// attribute) down to the item itself.
 fn unwrap_item<'a, 'src>(item: &'a Spanned<Node<'src>>) -> &'a Node<'src> {
     let mut node = &item.0;
-    while let Node::Export(_, inner)
+    while let Node::Export(_, inner, _)
     | Node::Derive(_, inner)
     | Node::Service(_, inner)
     | Node::MacroAttribute(_, _, _, inner)
@@ -6149,6 +6170,7 @@ impl<'src> Analyzer<'src> {
             exposed_private_types: Vec::new(),
             import_reaches: Vec::new(),
             reach_marked_spans: HashSet::default(),
+            deprecated_import_leaves: Vec::new(),
         }
     }
 
@@ -21169,7 +21191,7 @@ impl<'src> Analyzer<'src> {
         match node {
             // N89: `const` joins the wrapper list — a generated `const fun`
             // declares its name exactly as a generated `fun` does.
-            Node::Export(_, inner)
+            Node::Export(_, inner, _)
             | Node::Derive(_, inner)
             | Node::Service(_, inner)
             | Node::MacroAttribute(_, _, _, inner)
@@ -30385,7 +30407,7 @@ impl<'src> Analyzer<'src> {
                 }
                 Some(Expr::Void)
             }
-            Node::Export(export_scope, inner) => {
+            Node::Export(export_scope, inner, labels) => {
                 // Exports shape a module's public surface, so they only mean
                 // something at a module's top level. A block-scoped `import`
                 // (H2) is deliberately not exportable — and any other `export`
@@ -30398,6 +30420,28 @@ impl<'src> Analyzer<'src> {
                         msg: "`export` is a module-level item and cannot appear inside a body"
                             .to_string(),
                     });
+                }
+                // B382: `export [deprecated("…")] import …;` deprecates each
+                // name the re-export publishes — the alias where it renames,
+                // the leaf where not. Recorded per leaf with the leaf's span,
+                // which is how the statement's own reach (and so the target) is
+                // found again once the world has resolved;
+                // `check_deprecated_reexports` decides it.
+                if let Some(steer) = labels.as_ref().and_then(|labels| labels.deprecated)
+                    && let Node::Import(root_branch, _) = &inner.0
+                {
+                    let mut entries = Vec::new();
+                    flatten_namespace_branch(root_branch, Vec::new(), &mut entries);
+                    for (_, name, leaf_span, alias) in &entries {
+                        self.deprecated_import_leaves.push(DeprecatedImportLeaf {
+                            source: self.current_source_id,
+                            leaf_span: *leaf_span,
+                            bound: alias.map_or(*name, |(alias, _)| alias),
+                            renamed: alias.is_some(),
+                            scope: scope_id,
+                            steer,
+                        });
+                    }
                 }
                 let walked = self.walk_expr_node(inner, scope_id);
                 // A transparent wrapper's own entity is not the declaration's
@@ -44356,6 +44400,7 @@ impl<'src> Analyzer<'src> {
         }
         let declaring = self.module_declaration_scopes();
         let reaches = std::mem::take(&mut self.import_reaches);
+        self.check_deprecated_reexports(&reaches);
         // An import the compiler already REFUSED gets no second word about its
         // visibility (diagnostics-standard B5): `import pkg::client::helper;`
         // where `client` is the program's own entry file is one mistake, and the
@@ -44474,6 +44519,71 @@ impl<'src> Analyzer<'src> {
         // once per entry world and one import statement is one mistake (B5).
         sites.sort_by_key(|(span, source, _)| (source.0, span.start, span.end));
         sites.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1 && left.2 == right.2);
+        for (span, source, msg) in sites {
+            self.warnings.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg,
+            });
+            self.warning_sources.push(source);
+        }
+    }
+
+    /// B382: `export [deprecated("use …")] import a::X as Y;` deprecates the
+    /// name `Y` the re-export publishes. Every OTHER file's import of it warns
+    /// `` `Y` is deprecated; use … `` — the function attribute's own warning —
+    /// at its leaf. (An unexported one never gets here: the parser refuses it,
+    /// `DEPRECATED_IMPORT_IS_A_RE_EXPORT`.)
+    ///
+    /// Decided here, over the resolved reaches, because a re-export's target is
+    /// only known once the world has resolved: the statement's OWN reach (found
+    /// again by its leaf's span) is what names it. An importer matches by the
+    /// target and the name it wrote; a re-export that does not rename also
+    /// matches by the module the importer named, since the original module
+    /// publishes the same name for the same target and must not warn.
+    fn check_deprecated_reexports(&mut self, reaches: &[ImportReach<'src>]) {
+        let leaves = std::mem::take(&mut self.deprecated_import_leaves);
+        if leaves.is_empty() {
+            return;
+        }
+        let mut published: Vec<(Id, &DeprecatedImportLeaf<'src>, Option<&'src str>)> = Vec::new();
+        for leaf in &leaves {
+            let Some(own) = reaches
+                .iter()
+                .find(|reach| reach.source == leaf.source && reach.leaf_span == leaf.leaf_span)
+            else {
+                continue;
+            };
+            let module = self
+                .modules
+                .values()
+                .find(|module| module.body.1 == leaf.scope)
+                .map(|module| module.name);
+            published.push((own.target, leaf, module));
+        }
+        let mut sites: Vec<(Span, SourceId, String)> = Vec::new();
+        for reach in reaches {
+            for (target, leaf, module) in &published {
+                if reach.source == leaf.source
+                    || reach.target != *target
+                    || reach.leaf != leaf.bound
+                {
+                    continue;
+                }
+                let through_it =
+                    leaf.renamed || module.is_some_and(|module| reach.path.last() == Some(&module));
+                if through_it {
+                    sites.push((
+                        reach.leaf_span,
+                        reach.source,
+                        format!("`{}` is deprecated; {}", leaf.bound, leaf.steer),
+                    ));
+                }
+            }
+        }
+        sites.sort_by_key(|(span, source, _)| (source.0, span.start, span.end));
+        sites.dedup();
         for (span, source, msg) in sites {
             self.warnings.push(Error {
                 trace: Vec::new(),
@@ -55001,7 +55111,7 @@ pub(crate) fn service_method_refusals(
         // that did not would let every refusal below be dodged by writing
         // `export` on the block.
         let mut node = node;
-        while let Node::Export(_, inner) = node {
+        while let Node::Export(_, inner, _) = node {
             node = &inner.0;
         }
         let Node::Impl(subject, impl_traits, body, _) = node else {
@@ -55593,7 +55703,7 @@ fn contains_service(nodes: &NodeList) -> bool {
 /// or without `export` wrapping) collect in exactly the order they always did.
 fn collect_module_refs<'a>(nodes: &'a NodeList<'a>, root: &str) -> Vec<(&'a str, Span)> {
     fn walk<'a>(node: &'a Spanned<Node<'a>>, root: &str, modules: &mut Vec<(&'a str, Span)>) {
-        if let Node::Import(branch, _) | Node::Use(branch) = &node.0 {
+        if let Node::Import(branch, ..) | Node::Use(branch) = &node.0 {
             let mut entries = Vec::new();
             flatten_namespace_branch(branch, Vec::new(), &mut entries);
             for (path, leaf, leaf_span, _alias) in entries {
@@ -55650,7 +55760,7 @@ fn collect_module_refs<'a>(nodes: &'a NodeList<'a>, root: &str) -> Vec<(&'a str,
 /// the flat program that has always been the common case allocates nothing new.
 fn collect_module_paths<'a>(nodes: &'a NodeList<'a>, root: &str) -> Vec<(&'a str, Span)> {
     fn walk<'a>(node: &'a Spanned<Node<'a>>, root: &str, paths: &mut Vec<(&'a str, Span)>) {
-        if let Node::Import(branch, _) | Node::Use(branch) = &node.0 {
+        if let Node::Import(branch, ..) | Node::Use(branch) = &node.0 {
             let mut entries = Vec::new();
             flatten_namespace_branch(branch, Vec::new(), &mut entries);
             for (path, leaf, leaf_span, _alias) in entries {
@@ -55728,7 +55838,7 @@ fn collect_module_import_paths<'a>(
         root: &str,
         imports: &mut Vec<(&'a str, Span, Vec<&'a str>)>,
     ) {
-        if let Node::Import(branch, _) | Node::Use(branch) = &node.0 {
+        if let Node::Import(branch, ..) | Node::Use(branch) = &node.0 {
             let mut entries = Vec::new();
             flatten_namespace_branch(branch, Vec::new(), &mut entries);
             for (path, leaf, leaf_span, alias) in entries {

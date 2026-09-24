@@ -1477,7 +1477,7 @@ pub fn declared_platform_in(root: &crate::node::NodeList) -> Option<DeclaredPlat
             patterns.iter().map(|(text, _)| *text).collect::<Vec<_>>()
         };
         match node {
-            Node::Export(_, inner)
+            Node::Export(_, inner, _)
             | Node::Derive(_, inner)
             | Node::Service(_, inner)
             | Node::Const(inner)

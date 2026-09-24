@@ -154,7 +154,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
             match node {
                 // N89: `const` is a wrapper like the rest — `const fun f()`
                 // declares `f`.
-                Node::Export(_, inner)
+                Node::Export(_, inner, _)
                 | Node::Derive(_, inner)
                 | Node::Service(_, inner)
                 | Node::Const(inner) => node_declares(&inner.0, name),
@@ -183,7 +183,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
     fn declared_members(path: &Path) -> HashSet<String> {
         fn walk(node: &Node, in_member_position: bool, into: &mut HashSet<String>) {
             match node {
-                Node::Export(_, inner)
+                Node::Export(_, inner, _)
                 | Node::Derive(_, inner)
                 | Node::Service(_, inner)
                 | Node::Const(inner) => walk(&inner.0, in_member_position, into),
@@ -344,7 +344,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
     let mut import_reason: Option<String> = None;
     any_node(root, &mut |node| {
         let branch = match node {
-            Node::Import(branch, _) | Node::Use(branch) => branch,
+            Node::Import(branch, ..) | Node::Use(branch) => branch,
             _ => return false,
         };
         let ImportBranch::Path("std", _, ImportTail::Continue(child)) = branch else {
@@ -365,7 +365,7 @@ fn infer_platform(root: &NodeList, std: &PackageSpec) -> InferredPlatform {
     // each twin's two member sets are read once.
     let mut twins: Vec<(String, std::path::PathBuf, Vec<std::path::PathBuf>)> = Vec::new();
     any_node(root, &mut |node| {
-        if let Node::Import(branch, _) | Node::Use(branch) = node
+        if let Node::Import(branch, ..) | Node::Use(branch) = node
             && let ImportBranch::Path("std", _, ImportTail::Continue(child)) = branch
         {
             twin_modules(child, browser_root, &other_roots, &mut twins);
@@ -794,7 +794,7 @@ fn analyze_source_unfenced(
             // N89: through the wrappers — `export`, `const`, or both — because
             // what the prelude must not shadow is the NAME, whatever marks it.
             let mut node = node;
-            while let Node::Export(_, inner) | Node::Const(inner) = node {
+            while let Node::Export(_, inner, _) | Node::Const(inner) = node {
                 node = &inner.0;
             }
             let function = match node {

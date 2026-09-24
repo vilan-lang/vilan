@@ -36,6 +36,19 @@ pub fn internal_of<'src>(program: &Program<'src>, target: Id) -> Option<&'src st
     program.item_labels.get(&target)?.internal
 }
 
+/// The `[deprecated("use …")]` steer on the declaration `target` names — a
+/// function or external (their own records), or a struct, enum, trait or
+/// module binding (B382, [`Program::item_labels`]) — or `None`.
+pub fn deprecated_of<'src>(program: &Program<'src>, target: Id) -> Option<&'src str> {
+    if let Some(function) = program.functions.get(&target) {
+        return function.deprecated;
+    }
+    if let Some(external) = program.external_functions.get(&target) {
+        return external.deprecated;
+    }
+    program.item_labels.get(&target)?.deprecated
+}
+
 /// The label at a MEMBER position (`.name`), keyed by the access: the field a
 /// read resolved to, or the method a call selected — both already recorded, so
 /// this asks the record rather than re-resolving the name.
@@ -111,6 +124,8 @@ fn member_name_of<'src>(program: &Program<'src>, access: Id) -> Option<&'src str
 ///    judge. Off unless the entry package's manifest asks.
 pub fn check(program: &mut Program) {
     refuse_local_labels(program);
+    refuse_impl_labels(program);
+    warn_deprecated_uses(program);
     if program.lints.internal_use == LintLevel::Warn {
         warn_internal_uses(program);
     }
@@ -144,6 +159,117 @@ fn refuse_local_labels(program: &mut Program) {
                 note: None,
                 span,
                 msg,
+            },
+            source,
+        );
+    }
+}
+
+/// B382: a use of a `[deprecated("use …")]` struct, enum, trait or module
+/// binding warns `` `{name}` is deprecated; {steer} `` — the function
+/// attribute's warning, word for word. A function's own uses are warned where
+/// they always were (the analyzer's `check_deprecated`); these are the
+/// declarations B382 admitted the attribute on. Silent in std and a dependency
+/// (their authors migrate their own callers, as a function's deprecation is
+/// silent in std) and in the module that declares the item, whose own `impl`
+/// blocks and constructors are not the uses the steer is for.
+fn warn_deprecated_uses(program: &mut Program) {
+    let lookup = program.source_lookup();
+    let is_user = |source: SourceId| {
+        program
+            .source_layers
+            .get(source.0 as usize)
+            .is_some_and(|layer| layer.containing.is_none())
+    };
+    let steer_of = |target: Id| -> Option<(&str, &str)> {
+        if program.functions.contains_key(&target)
+            || program.external_functions.contains_key(&target)
+        {
+            return None;
+        }
+        Some((
+            name_of(program, target)?,
+            program.item_labels.get(&target)?.deprecated?,
+        ))
+    };
+    let mut sites: Vec<(Span, SourceId, String)> = Vec::new();
+    let mut seen: HashSet<(u32, usize, usize)> = HashSet::default();
+    let mut record = |span: Span, source: SourceId, target: Id| {
+        if !is_user(source) || lookup.of(target) == Some(source) {
+            return;
+        }
+        let Some((name, steer)) = steer_of(target) else {
+            return;
+        };
+        if seen.insert((source.0, span.start, span.end)) {
+            sites.push((span, source, format!("`{name}` is deprecated; {steer}")));
+        }
+    };
+    // Type position: an annotation, a bound, an impl subject, an import leaf.
+    for (source, span, definition, _) in &program.type_references {
+        if let Some(definition) = definition {
+            record(*span, *source, *definition);
+        }
+    }
+    // Value position: a struct literal's head, a binding read.
+    for (id, expr) in &program.entity_map {
+        let Expr::Local(target) = expr else {
+            continue;
+        };
+        let Some(span) = program.span_map.get(id).map(|span| **span) else {
+            continue;
+        };
+        let Some(source) = lookup.of(*id) else {
+            continue;
+        };
+        if span.start < span.end {
+            record(span, source, *target);
+        }
+    }
+    sites.sort_by_key(|(span, source, _)| (source.0, span.start, span.end));
+    for (span, source, msg) in sites {
+        program.warnings.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span,
+            msg,
+        });
+        program.warning_sources.push(source);
+    }
+}
+
+/// An `impl` block takes `[platform(..)]` (F27 R1) through the same prefix a
+/// type does, and so the prefix admits the other two there as well — where
+/// they would label nothing: nobody NAMES an impl block, so there is no use to
+/// steer or to hide. Refused, pointing at the members, which are what a
+/// reader reaches for.
+fn refuse_impl_labels(program: &mut Program) {
+    let mut refused: Vec<(Span, SourceId)> = program
+        .implementations
+        .iter()
+        .filter(|implementation| {
+            program
+                .item_labels
+                .get(&implementation.impl_id)
+                .is_some_and(|labels| labels.deprecated.is_some() || labels.internal.is_some())
+        })
+        .filter_map(|implementation| {
+            let span = **program.span_map.get(&implementation.impl_id)?;
+            Some((span, implementation.source))
+        })
+        .collect();
+    refused.sort_by_key(|(span, source)| (source.0, span.start));
+    refused.dedup();
+    for (span, source) in refused {
+        program.push_diagnostic(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg: "`[deprecated(..)]` and `[internal(..)]` label a declaration a reader names, \
+                      and nobody names an `impl` block — write the label on the members it \
+                      is about"
+                    .to_string(),
             },
             source,
         );

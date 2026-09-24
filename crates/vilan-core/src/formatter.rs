@@ -634,9 +634,9 @@ fn import_kind_and_branch<'node, 'src>(
     node: &'node Node<'src>,
 ) -> Option<(ImportKind, &'node ImportBranch<'src>)> {
     match node {
-        Node::Import(branch, _) => Some((ImportKind::Import, branch)),
+        Node::Import(branch, ..) => Some((ImportKind::Import, branch)),
         Node::Use(branch) => Some((ImportKind::Use, branch)),
-        Node::Export(_, inner) => import_kind_and_branch(&inner.0),
+        Node::Export(_, inner, _) => import_kind_and_branch(&inner.0),
         _ => None,
     }
 }
@@ -2749,7 +2749,7 @@ fn try_extend_import<'src>(
 /// which is not what an add-import quickfix asked for).
 fn plain_import_branch<'node, 'src>(node: &'node Node<'src>) -> Option<&'node ImportBranch<'src>> {
     match node {
-        Node::Import(branch, _) => Some(branch),
+        Node::Import(branch, ..) => Some(branch),
         _ => None,
     }
 }
@@ -4323,10 +4323,11 @@ impl<'src> Printer<'src> {
                 }
                 self.out.push(';');
             }
-            Node::Export(scope, inner) => {
+            Node::Export(scope, inner, labels) => {
                 self.out.push_str("export");
                 self.print_export_scope(scope.as_deref());
                 self.out.push(' ');
+                self.print_import_labels(labels);
                 self.print_import_like(&inner.0);
             }
             _ => {}
@@ -4366,7 +4367,7 @@ impl<'src> Printer<'src> {
     /// as already-formatted). S6's curation is what made it reachable: five of
     /// std's module-level `let`s carry the marker.
     fn needs_semicolon(node: &Node<'src>) -> bool {
-        if let Node::Export(_, inner) = node {
+        if let Node::Export(_, inner, _) = node {
             return Self::needs_semicolon(&inner.0);
         }
         // `const` asks the DECLARATION under it for the same reason (N89, G24):
@@ -4639,10 +4640,11 @@ impl<'src> Printer<'src> {
                 }
                 self.print_item(item);
             }
-            Node::Export(scope, exported) => {
+            Node::Export(scope, exported, labels) => {
                 self.out.push_str("export");
                 self.print_export_scope(scope.as_deref());
                 self.out.push(' ');
+                self.print_import_labels(labels);
                 self.print_item(exported);
             }
             // G24's `const fun` — a DECLARATION under a marker, printed the way
@@ -5262,6 +5264,13 @@ impl<'src> Printer<'src> {
         let Some(labels) = labels else {
             return;
         };
+        // B382: the ordered prefix a function's is — `[deprecated]` leads.
+        if let Some(steer) = labels.deprecated {
+            self.out.push_str("[deprecated(\"");
+            self.out.push_str(steer);
+            self.out.push_str("\")]");
+            self.line();
+        }
         if let Some(reason) = labels.internal {
             self.out.push_str("[internal(\"");
             self.out.push_str(reason);
@@ -5271,6 +5280,17 @@ impl<'src> Printer<'src> {
         if !labels.platform.is_empty() {
             self.print_platform_attribute(&labels.platform);
             self.line();
+        }
+    }
+
+    /// B382: a re-export's `[deprecated("…")]` (carried by the `export`), on
+    /// the statement's own line — a re-export is one line, and the attribute is
+    /// about the NAME it publishes.
+    fn print_import_labels(&mut self, labels: &ItemLabels<'src>) {
+        if let Some(steer) = labels.as_ref().and_then(|labels| labels.deprecated) {
+            self.out.push_str("[deprecated(\"");
+            self.out.push_str(steer);
+            self.out.push_str("\")] ");
         }
     }
 
@@ -8720,6 +8740,22 @@ mod idempotency {
             "and a function's leads the ordered prefix:\n{formatted}"
         );
         assert_fixed_point("internal", source);
+    }
+
+    #[test]
+    fn a_deprecated_steer_survives_the_reprint_on_a_type_and_a_re_export() {
+        // B382: a type's steer on its own line, leading the prefix; a
+        // re-export's on the statement's own line.
+        let source = concat!(
+            "export [deprecated(\"use pkg::inner::DeltaCursor\")] import pkg::inner::DeltaCursor as KeyedCursor;\n\n",
+            "[deprecated(\"use Next\")]\n",
+            "[internal(\"old plumbing\")]\n",
+            "struct Previous {}\n\n",
+            "[deprecated(\"use Shape\")]\n",
+            "trait Shaped {\n\tfun area(self): i32;\n}\n",
+        );
+        assert_eq!(format(source), source);
+        assert_fixed_point("deprecated_b382", source);
     }
 
     #[test]

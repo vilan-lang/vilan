@@ -1096,9 +1096,13 @@ pub const MODIFIER_READONLY: u32 = 1 << 1;
 /// declaration is not going away and is not wrong to use; it is one to know
 /// what you are doing with.
 pub const MODIFIER_INTERNAL: u32 = 1 << 2;
+/// B382: `[deprecated("use …")]`, the LSP's own standard modifier — a theme
+/// strikes it through — on the declaration and every use, by E213's same
+/// mechanism: read off the one label reader, `labels::deprecated_of`.
+pub const MODIFIER_DEPRECATED: u32 = 1 << 3;
 
 /// The modifier legend.
-pub const TOKEN_MODIFIERS: [&str; 3] = ["declaration", "readonly", "internal"];
+pub const TOKEN_MODIFIERS: [&str; 4] = ["declaration", "readonly", "internal", "deprecated"];
 
 /// The LSP legend, index-aligned with `TokenKind`.
 pub const TOKEN_TYPES: [&str; 13] = [
@@ -1446,7 +1450,7 @@ fn names_bound_in(source: &str) -> HashSet<String> {
             // macro attribute or G24's `const` still declares its own name
             // (N89).
             let mut node = &item.0;
-            while let Node::Export(_, inner)
+            while let Node::Export(_, inner, _)
             | Node::Derive(_, inner)
             | Node::Service(_, inner)
             | Node::MacroAttribute(_, _, _, inner)
@@ -3893,12 +3897,22 @@ impl Document {
         // E213: the label at any use of a declaration that carries one — and
         // E221: of any kind (a struct, enum, trait, module binding or variant
         // as well as a function), read through the one reader hover uses.
+        //
+        // B382: a `[deprecated]` declaration carries its own modifier by the
+        // same read, so every site that dims an internal name strikes a
+        // deprecated one.
         let internal_modifier = |target: Id| {
-            if vilan_core::labels::internal_of(program, target).is_some() {
+            let internal = if vilan_core::labels::internal_of(program, target).is_some() {
                 MODIFIER_INTERNAL
             } else {
                 0
-            }
+            };
+            let deprecated = if vilan_core::labels::deprecated_of(program, target).is_some() {
+                MODIFIER_DEPRECATED
+            } else {
+                0
+            };
+            internal | deprecated
         };
         // Declaration names.
         for (id, function) in &program.functions {
@@ -4007,8 +4021,17 @@ impl Document {
             // E213 at a MEMBER: the method this call selected, or the field
             // this read resolved to — both already recorded, so the dimming
             // asks the record rather than re-resolving the name.
-            let internal = vilan_core::labels::member_internal(program, *call_id).is_some();
-            tokens.push((*span, kind, if internal { MODIFIER_INTERNAL } else { 0 }));
+            let internal = if vilan_core::labels::member_internal(program, *call_id).is_some() {
+                MODIFIER_INTERNAL
+            } else {
+                0
+            };
+            // B382: a deprecated METHOD is struck at its call too.
+            let deprecated = match program.entity_map.get(call_id) {
+                Some(Expr::Local(target)) => internal_modifier(*target) & MODIFIER_DEPRECATED,
+                _ => 0,
+            };
+            tokens.push((*span, kind, internal | deprecated));
         }
         // Type-position references (macro names arrive here too).
         for (source, span, definition, _) in &program.type_references {
@@ -7671,7 +7694,7 @@ impl<'a> StyleSurface<'a> {
             // filtered: an unexported block is still a body this file can
             // inline, and visibility is not what decides that.
             let node = match &item.0 {
-                Node::Export(_, inner) => &inner.0,
+                Node::Export(_, inner, _) => &inner.0,
                 node => node,
             };
             let Node::Impl(subject, _traits, body, _) = node else {
@@ -8373,8 +8396,15 @@ fn trailing_semicolon_to_remove(
 /// `[internal("reason")]` — a function, a method or an external — or `None`
 /// for the overwhelming majority that carry none.
 fn internal_lead(program: &Program, declaration_id: Id) -> Option<String> {
-    // E221: every declaration kind, through the one reader.
-    vilan_core::labels::internal_of(program, declaration_id).map(internal_line)
+    // E221: every declaration kind, through the one reader — and B382's
+    // steer, which leads first: it is the line that says what to use instead.
+    let deprecated = vilan_core::labels::deprecated_of(program, declaration_id)
+        .map(|steer| format!("**deprecated** — {steer}"));
+    let internal = vilan_core::labels::internal_of(program, declaration_id).map(internal_line);
+    match (deprecated, internal) {
+        (Some(deprecated), Some(internal)) => Some(format!("{deprecated}\n\n{internal}")),
+        (deprecated, internal) => deprecated.or(internal),
+    }
 }
 
 /// F27 R1: the `[platform(..)];` an overlay note recommends — the attribute
@@ -11163,6 +11193,63 @@ pub(crate) mod tests {
             "while the field beside it is not: {tokens:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── B382: `[deprecated("use …")]` on a type ─────────────────────────────
+
+    #[test]
+    fn b382_a_deprecated_type_is_struck_at_its_declaration_and_its_uses_and_hovers_its_steer() {
+        let (dir, document) = analyze_workspace(&[(
+            "main.vl",
+            concat!(
+                "[deprecated(\"use Next\")]\n",
+                "struct Previous {\n\tat: i32,\n}\n\n",
+                "struct Next {\n\tat: i32,\n}\n\n",
+                "fun read(old: Previous, new: Next): i32 {\n\told.at + new.at\n}\n",
+            ),
+        )]);
+        let text = document.line_index.text();
+        let tokens = document.semantic_tokens();
+        let modifier_at = |needle: &str, skip: usize, length: usize| {
+            let at = text.find(needle).expect("the position") + skip;
+            tokens
+                .iter()
+                .find(|(span, _, _)| {
+                    let range = span.into_range();
+                    range.start == at && range.end == at + length
+                })
+                .map(|(_, _, modifiers)| *modifiers & MODIFIER_DEPRECATED)
+        };
+        assert_eq!(
+            modifier_at("Previous {", 0, 8),
+            Some(MODIFIER_DEPRECATED),
+            "the declaration: {tokens:?}"
+        );
+        assert_eq!(
+            modifier_at("old: Previous", 5, 8),
+            Some(MODIFIER_DEPRECATED),
+            "a type naming it: {tokens:?}"
+        );
+        assert_eq!(
+            modifier_at("new: Next", 5, 4),
+            Some(0),
+            "its replacement is not: {tokens:?}"
+        );
+        let at = text.find("old: Previous").expect("the use") + 6;
+        let hover = document.hover(at).expect("a hover");
+        assert!(
+            hover.starts_with("**deprecated** — use Next"),
+            "the steer LEADS: {hover:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn b382_the_legend_names_the_standard_deprecated_modifier() {
+        // A client maps the LSP's own `deprecated` modifier to a strikethrough;
+        // the bit is index-aligned with the legend.
+        assert_eq!(TOKEN_MODIFIERS[3], "deprecated");
+        assert_eq!(MODIFIER_DEPRECATED, 1 << 3);
     }
 
     // ── F27 R1: the file declares the platform it is analyzed under ─────────

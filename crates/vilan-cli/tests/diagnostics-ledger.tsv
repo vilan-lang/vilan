@@ -589,3 +589,4 @@ row	flagship	key
 565	-	{subject_name} `{member}` is async, but `{trait_name}::{member}` is declared sync, so this value cannot become a `dyn {trait_name}`: a call through an object is compiled once, against the declaration, and would hand back an unawaited promise. Declare `{trait_name}::{member}` `async` (an implementation may then be either), or keep the value behind a generic bound, where each implementation is awaited as it is written
 NEW	-	`{name}` is internal: {reason}
 NEW	-	`{name}` is a local binding, and `[internal(..)]` labels an item on a module's surface: nothing outside this body can name it, so the label has no reader — delete it
+NEW	-	`[deprecated(..)]` and `[internal(..)]` label a declaration a reader names, and nobody names an `impl` block — write the label on the members it is about

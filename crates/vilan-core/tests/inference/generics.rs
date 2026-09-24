@@ -3344,6 +3344,49 @@ fn calling_an_unannotated_closure_parameter_defers() {
     );
 }
 
+// --- B382: `[deprecated("use …")]` on a type and on a re-export ------------
+
+/// A labelled import that is not EXPORTED publishes no name, so the steer has
+/// nobody to steer — refused, where it is written.
+#[test]
+fn a_deprecated_import_that_is_not_a_re_export_is_refused() {
+    assert_fails_with(
+        concat!(
+            "[deprecated(\"use something else\")] import std::io::print;\n\n",
+            "fun main() {\n\tprint(\"hi\");\n}\n",
+        ),
+        "`[deprecated(..)]` on an `import` deprecates the name a RE-EXPORT publishes",
+    );
+}
+
+/// The shared prefix admits `[platform(..)]` on an `impl` (F27 R1), and so
+/// parses the other two there — where they label nothing a reader names.
+#[test]
+fn a_deprecated_or_internal_impl_block_is_refused() {
+    for label in ["[deprecated(\"use B\")]", "[internal(\"plumbing\")]"] {
+        assert_fails_with(
+            &format!(
+                "struct A {{}}\n\n{label}\nimpl A {{\n\tfun f(self): i32 {{\n\t\t1\n\t}}\n}}\n\nfun main() {{}}\n"
+            ),
+            "nobody names an `impl` block",
+        );
+    }
+}
+
+/// A deprecated type is still a type: it compiles and runs unchanged, and its
+/// own module's uses of it are silent — the steer is for the OTHER modules
+/// (pinned through the binary in `vilan-cli`'s `diagnostics.rs`).
+#[test]
+fn a_deprecated_type_changes_nothing_the_program_means() {
+    let source = concat!(
+        "[deprecated(\"use Next\")]\n",
+        "struct Previous {\n\tat: i32,\n}\n\n",
+        "fun main() {\n\tlet old: Previous = Previous { at = 7 };\n\tprint(i\"{old.at}\");\n}\n",
+    );
+    assert_compiles_and_runs(source, "7\n");
+    assert!(warnings(source).is_empty(), "{:?}", warnings(source));
+}
+
 // --- E221: `[internal("reason")]` on the nominal and binding positions ----
 
 /// Every E221 position compiles and RUNS unchanged: the label is for the

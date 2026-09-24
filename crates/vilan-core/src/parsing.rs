@@ -366,6 +366,12 @@ pub const MODULE_PLATFORM_LEADS_THE_FILE: &str = "a module's `[platform(..)];` d
      first statement: move it above the first import. To fence one function instead, write the \
      attribute on it with no `;`";
 
+/// B382's rule: a `[deprecated]` steer on an import is about the NAME a
+/// re-export publishes, so it needs the `export`. Curated: it names the move.
+pub const DEPRECATED_IMPORT_IS_A_RE_EXPORT: &str = "`[deprecated(..)]` on an `import` deprecates the name a RE-EXPORT publishes, and this \
+     import is not exported, so it publishes nothing — write `export` before the attribute, or \
+     delete it";
+
 /// The rule `export <expression>;` breaks (B321). Curated
 /// (diagnostics-standard.md B6 — the prohibition explains itself and names the
 /// sanctioned spellings).
@@ -6544,6 +6550,21 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     /// `import <namespace_path> only? ;` — an import used as a statement.
     fn parse_import_statement(&mut self) -> Option<Spanned<Node<'src>>> {
+        // B382: a steer on an import that is not re-exported publishes nothing
+        // — refused where it is written, and the import still parses, so the
+        // reader gets the one sentence and not a cascade.
+        if let Some(attribute) = self.attempt(|parser| {
+            let start = parser.position;
+            parser.parse_deprecated_attribute()?;
+            (parser.peek() == Some(&Token::Import)).then(|| parser.span_from(start))
+        }) {
+            self.errors.push(ParseError {
+                span: attribute,
+                reason: ParseErrorReason::Rule(DEPRECATED_IMPORT_IS_A_RE_EXPORT),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
         let import = self.parse_import()?;
         if !self.eat_ctrl(';') {
             self.note_terminator();
@@ -6614,6 +6635,19 @@ impl<'a, 'src> Parser<'a, 'src> {
             return Some((Node::ExportAll, self.span_from(start)));
         }
         let scope = self.parse_export_scope();
+        // B382: `export [deprecated("use …")] import …;` — the steer is the
+        // RE-EXPORT's, so the export carries it. Read only ahead of `import`:
+        // before a declaration the same attribute is the declaration's own
+        // prefix, which its production reads.
+        let labels = self.attempt(|parser| {
+            let steer = parser.parse_deprecated_attribute()?;
+            (parser.peek() == Some(&Token::Import)).then(|| {
+                Box::new(Labels {
+                    deprecated: Some(steer),
+                    ..Labels::default()
+                })
+            })
+        });
         let inner = self.parse_statement()?;
         // B321: `parse_statement` reads an EXPRESSION statement too, so
         // `export (helper);` and `export * helper;` parsed and meant nothing.
@@ -6628,7 +6662,10 @@ impl<'a, 'src> Parser<'a, 'src> {
                 hint: None,
             });
         }
-        Some((Node::Export(scope, Box::new(inner)), self.span_from(start)))
+        Some((
+            Node::Export(scope, Box::new(inner), labels),
+            self.span_from(start),
+        ))
     }
 
     /// `(in PATH)` after `export` — B318 §2.2's narrowing, `None` when the
@@ -7503,14 +7540,20 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// enum, a trait or a module `let`. `None` when no label leads, which is
     /// the one-null-pointer case nearly every declaration takes.
     fn parse_item_labels(&mut self) -> ItemLabels<'src> {
+        // B382: `[deprecated("use …")]` leads, as it leads a function's prefix;
+        // F27 R1's `[platform("…")]` follows `[internal(..)]`, the order a
+        // function's prefix gives the three.
+        let deprecated = self.parse_deprecated_attribute();
         let internal = self.parse_internal_attribute();
-        // F27 R1: `[platform("…")]` follows, the order a function's prefix
-        // gives the two.
         let platform = self.parse_platform_attribute().unwrap_or_default();
-        if internal.is_none() && platform.is_empty() {
+        if deprecated.is_none() && internal.is_none() && platform.is_empty() {
             return None;
         }
-        Some(Box::new(Labels { internal, platform }))
+        Some(Box::new(Labels {
+            deprecated,
+            internal,
+            platform,
+        }))
     }
 
     /// `[platform("…", …)];` — a FILE's platform (F27 R1): the function
@@ -8772,7 +8815,7 @@ mod tests {
     fn import_recursive_path_and_brace_set() {
         // `std::collections::{ Map, Set }` — a `::` path ending in a set.
         match only_item("import std::collections::{ Map, Set };") {
-            Node::Import(ImportBranch::Path("std", _, ImportTail::Continue(next)), _) => {
+            Node::Import(ImportBranch::Path("std", _, ImportTail::Continue(next)), ..) => {
                 match &*next {
                     ImportBranch::Path("collections", _, ImportTail::Continue(set)) => match &**set
                     {
@@ -8795,7 +8838,7 @@ mod tests {
         // `export import a::b;` — the inner import consumes its own `;`; the Export
         // wraps it (and its span, tested via the differential, includes the `;`).
         match only_item("export import shared::config;") {
-            Node::Export(_, inner) => assert!(matches!(inner.0, Node::Import(..))),
+            Node::Export(_, inner, _) => assert!(matches!(inner.0, Node::Import(..))),
             other => panic!("expected Export, got {other:?}"),
         }
     }
@@ -9015,6 +9058,52 @@ mod tests {
     }
 
     #[test]
+    fn a_deprecated_steer_rides_a_type_and_a_re_export() {
+        // B382: the function attribute, admitted on the nominals and a trait —
+        // leading the ordered prefix, as it leads a function's.
+        fn steer(source: &str) -> Option<&str> {
+            match only_item(source) {
+                Node::Struct(.., labels) | Node::Enum(.., labels) | Node::Trait(.., labels) => {
+                    labels.and_then(|labels| labels.deprecated)
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(steer("[deprecated(\"use B\")] struct A {}"), Some("use B"));
+        assert_eq!(steer("[deprecated(\"use B\")] enum A { X }"), Some("use B"));
+        assert_eq!(
+            steer("[deprecated(\"use B\")] trait A { fun f(self); }"),
+            Some("use B")
+        );
+        assert_eq!(
+            steer("[deprecated(\"use B\")] [internal(\"x\")] struct A {}"),
+            Some("use B")
+        );
+        // …and on an `export import`, the re-export the ruling names.
+        match only_item("export [deprecated(\"use D\")] import pkg::a::D as K;") {
+            Node::Export(_, inner, Some(labels)) => {
+                assert_eq!(labels.deprecated, Some("use D"));
+                assert!(matches!(&inner.0, Node::Import(..)));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Without the `export` the steer publishes nothing: refused, and the
+        // import itself still parses.
+        let (tree, errors) = parse("[deprecated(\"use D\")] import pkg::a::D;\n");
+        assert!(
+            errors
+                .iter()
+                .any(|error| render(error) == DEPRECATED_IMPORT_IS_A_RE_EXPORT),
+            "{errors:?}"
+        );
+        assert!(matches!(tree.expect("a tree").0[0].0, Node::Import(..)));
+        // The order is the prefix's: `[internal]` before `[deprecated]` declines.
+        assert!(declines(
+            "[internal(\"x\")] [deprecated(\"use B\")] struct A {}"
+        ));
+    }
+
+    #[test]
     fn a_file_leading_platform_is_the_modules_own() {
         // F27 R1: the fence's attribute with a `;`, as the file's first
         // statement.
@@ -9117,7 +9206,7 @@ mod tests {
         }
         // Behind `export`, and after a `[derive(..)]`, as a function's is.
         match only_item("export [internal(\"x\")] struct Marker {}") {
-            Node::Export(_, inner) => {
+            Node::Export(_, inner, _) => {
                 assert!(
                     matches!(&inner.0, Node::Struct(.., Some(labels)) if labels.internal == Some("x"))
                 )
@@ -9546,7 +9635,7 @@ mod tests {
         // keeps go-to-definition, find-references and rename pointing at the
         // name.
         let marked = only_item("import pkg::a::#hidden;");
-        let Node::Import(ImportBranch::Path("pkg", _, ImportTail::Continue(after_pkg)), _) =
+        let Node::Import(ImportBranch::Path("pkg", _, ImportTail::Continue(after_pkg)), ..) =
             &marked
         else {
             panic!("the path reads as written: {marked:?}");
@@ -9666,7 +9755,7 @@ mod tests {
                 rendered_errors(source)
             );
         }
-        let Node::Export(Some(scope), _) = only_item("export(in pkg::a) struct S { x: i32 }")
+        let Node::Export(Some(scope), _, _) = only_item("export(in pkg::a) struct S { x: i32 }")
         else {
             panic!("the narrowing rides the export node");
         };

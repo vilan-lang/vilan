@@ -783,7 +783,16 @@ pub enum Node<'src> {
     Import(ImportBranch<'src>, ImportModifier),
     // `export <item>` — mark an item as this module's surface, or re-export an
     // import. The first field is the optional `(in PATH)` narrowing (B318 §2.2).
-    Export(Option<Box<ExportScope<'src>>>, Box<Spanned<Self>>),
+    //
+    // The third field is the re-export's `[deprecated("use …")]` (B382):
+    // `export [deprecated(..)] import …;` deprecates the NAME the re-export
+    // publishes, so the steer belongs to the export and not to the import —
+    // which also keeps `Import`'s already-wide payload out of `node_size`'s way.
+    Export(
+        Option<Box<ExportScope<'src>>>,
+        Box<Spanned<Self>>,
+        ItemLabels<'src>,
+    ),
     // `export *;` — every item of this module is exported (B318 §2.1). A
     // module-level item with no inner statement: the marker IS the statement.
     ExportAll,
@@ -1126,7 +1135,7 @@ impl<'src> Node<'src> {
                     visit(child.node());
                 }
             }
-            Node::Export(_, inner) => visit(inner),
+            Node::Export(_, inner, _) => visit(inner),
             Node::Async(inner)
             | Node::Await(inner)
             | Node::Dereference(inner)
@@ -1365,6 +1374,11 @@ pub type ItemLabels<'src> = Option<Box<Labels<'src>>>;
 /// [`ItemLabels`]'s contents, when there are any.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Labels<'src> {
+    /// `[deprecated("use …")]` (B382): on a struct, an enum or a trait — and on
+    /// an `export import`, where it deprecates the NAME that re-export
+    /// publishes. A use warns `` `{name}` is deprecated; {steer} ``, the
+    /// function attribute's own warning.
+    pub deprecated: Option<&'src str>,
     /// `[internal("reason")]` (E213, E221): reachable on purpose and
     /// dangerous on purpose. Read by the editor, and by the opt-in
     /// `[lints] internal_use` warning.
