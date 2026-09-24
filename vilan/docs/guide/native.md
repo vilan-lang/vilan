@@ -77,6 +77,14 @@ backends agree exactly, printing included — node writes a `BigInt` with its
 suffix, so `7n / 2n` is `3n` on both. If you need arbitrary precision as the
 SUBJECT of a program — RSA, a big factorial — that is the JS backend today.
 
+**Integer overflow is the program's, on both backends.** A conforming program
+does not overflow (spec §7.2a), and the two backends answer one that does
+differently: the JS backend runs on with an out-of-range value, and a native
+debug build panics. An overflow rustc can see at compile time — `a + 1` right
+after `let a: i32 = 2147483647;` — does not build at all, and `vilan` says so as
+the program's overflow, naming the expression rustc underlined in the emitted
+Rust, rather than as a backend defect.
+
 ## Where the emitted Rust goes
 
 `dist/native/<entry>/`, with `src/main.rs` the emitted program and `Cargo.toml`

@@ -1535,24 +1535,36 @@ impl Document {
         let entry_path = entry_path.to_path_buf();
         let outer_entry_path = entry_path.clone();
         let cancel = cancel.clone();
+        const ANALYSIS_STACK_SIZE: usize = 128 * 1024 * 1024;
         std::thread::Builder::new()
-            .stack_size(128 * 1024 * 1024)
+            .stack_size(ANALYSIS_STACK_SIZE)
             .spawn(move || {
-                // Installed for the life of the analysis and torn down before
-                // the thread ends, so the token is exactly the analysis's.
-                let _scope = cancel.install();
-                let document = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    #[cfg(test)]
-                    analysis_fence_tests::maybe_inject(&entry_path);
-                    Self::analyze_on_this_thread(&text, &std_dir, &entry_path)
-                }))
-                .unwrap_or_else(|_| Self::internal_error(&text, &entry_path));
-                // Read AFTER the analysis, on the thread that ran it: a
-                // cancelled analysis's document is dropped here — which is what
-                // gives its entry text, tree and owned modules back
-                // (`AnalyzedProgram`'s `Drop`, `leak-soak.md` §7) — rather than
-                // travelling back to a caller who would only drop it anyway.
-                (!cancel.is_cancelled()).then_some(document)
+                // N121: the thread DECLARES its stack, first thing, so the
+                // analyzer's stack probe (`vilan_core::stack_guard`) knows
+                // where it ends. A runaway recursion then PANICS short of the
+                // guard page — which the fences below turn into a diagnostic —
+                // where it used to overflow, and an overflow is an `abort()`
+                // no fence and no `join` can observe: it took this whole
+                // server down with the buffer that triggered it (B385).
+                vilan_core::stack_guard::with_declared_stack(ANALYSIS_STACK_SIZE, || {
+                    // Installed for the life of the analysis and torn down
+                    // before the thread ends, so the token is exactly the
+                    // analysis's.
+                    let _scope = cancel.install();
+                    let document = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        #[cfg(test)]
+                        analysis_fence_tests::maybe_inject(&entry_path);
+                        Self::analyze_on_this_thread(&text, &std_dir, &entry_path)
+                    }))
+                    .unwrap_or_else(|_| Self::internal_error(&text, &entry_path));
+                    // Read AFTER the analysis, on the thread that ran it: a
+                    // cancelled analysis's document is dropped here — which is
+                    // what gives its entry text, tree and owned modules back
+                    // (`AnalyzedProgram`'s `Drop`, `leak-soak.md` §7) — rather
+                    // than travelling back to a caller who would only drop it
+                    // anyway.
+                    (!cancel.is_cancelled()).then_some(document)
+                })
             })
             .expect("spawn analysis thread")
             .join()
@@ -27358,11 +27370,10 @@ mod dead_item_paint_tests {
 /// so `join()` never returns and there is no `Err` to observe. Measured on
 /// this host: a 1 MiB-stack thread recursing without bound exits the process
 /// 134 (SIGABRT), and the line after the `join` never runs. That is what took
-/// the server down in B385, and it is why the guard that ends an unbounded
-/// walk has to live in the WALK — B385's own fix — rather than at this seam.
-/// A stack-remaining probe inside the analyzer's recursive descents (turning
-/// an overflow into a panic this fence already catches) is the general answer
-/// and is not this lane's file to write.
+/// the server down in B385. N121's answer is a stack-remaining probe in the
+/// analyzer's recursive funnels (`vilan_core::stack_guard`) that PANICS short
+/// of the guard page, on a thread that declared its stack — which the analysis
+/// thread now does — so the overflow becomes a panic this fence catches.
 #[cfg(test)]
 mod analysis_fence_tests {
     use super::*;
@@ -27374,11 +27385,66 @@ mod analysis_fence_tests {
     /// global flag would fire inside a stranger's analysis.
     const PLANTED: &str = "n119-planted-panic.vl";
 
+    /// N121's plant: an analysis on this path recurses WITHOUT BOUND, probing
+    /// the stack once per level the way the analyzer's funnels do — a
+    /// runaway walk, minus the walk. Keyed on the file for the same reason.
+    const PLANTED_RUNAWAY: &str = "n121-planted-runaway.vl";
+
     /// Called on the analysis thread, inside the fence.
     pub(crate) fn maybe_inject(entry_path: &Path) {
         if entry_path.file_name().is_some_and(|name| name == PLANTED) {
             unreachable!("N119: planted analyzer abort");
         }
+        if entry_path
+            .file_name()
+            .is_some_and(|name| name == PLANTED_RUNAWAY)
+        {
+            runaway(0);
+        }
+    }
+
+    /// One level of the planted runaway: a probe, then a frame the optimizer
+    /// cannot fold into a loop.
+    #[allow(
+        unconditional_recursion,
+        reason = "the plant IS an unbounded recursion; the stack probe inside it is the only way out"
+    )]
+    fn runaway(level: usize) -> usize {
+        vilan_core::stack_guard::ensure_sufficient_stack("the planted runaway");
+        let frame = std::hint::black_box([level as u8; 4096]);
+        runaway(level + 1) + frame[0] as usize
+    }
+
+    /// N121: a recursion that runs away on the analysis thread is refused by
+    /// the stack probe and lands the internal-error document — the SERVER
+    /// lives, and the next analysis runs the normal path.
+    ///
+    /// Non-vacuous against the thread's DECLARATION, which is what the probe
+    /// reads its floor from: remove `with_declared_stack` from
+    /// `analyze_cancellable` and the probe is inert, the plant runs past
+    /// 128 MiB into the guard page, and this test ABORTS the test process
+    /// (`thread '<unknown>' has overflowed its stack`, SIGABRT) — a red with
+    /// no assertion message, which is the very failure this pins away.
+    #[test]
+    fn a_runaway_recursion_answers_a_diagnostic_and_the_server_lives() {
+        let planted = Document::analyze(GOOD, &std_root(), Path::new(PLANTED_RUNAWAY));
+        assert!(
+            !planted.program.is_some(),
+            "a refused analysis lands no program"
+        );
+        let published = planted.published_diagnostics();
+        let messages: Vec<&str> = published.iter().map(|one| one.message.as_str()).collect();
+        assert_eq!(published.len(), 1, "{messages:?}");
+        assert!(
+            published[0].message.contains("internal error")
+                && published[0].message.contains(PLANTED_RUNAWAY),
+            "the internal-error diagnostic names the file: {messages:?}"
+        );
+        let next = Document::analyze(GOOD, &std_root(), Path::new("n121-next.vl"));
+        assert!(
+            next.program.is_some(),
+            "the next analysis produces a program"
+        );
     }
 
     const GOOD: &str = "fun main() {\n\tlet value = 1;\n\tlet _ = value;\n}\n";

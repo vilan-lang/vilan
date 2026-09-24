@@ -29598,6 +29598,7 @@ impl<'src> Analyzer<'src> {
     const WALK_DEPTH_LIMIT: usize = 500;
 
     fn walk_expr_node(&mut self, node: &'src Spanned<Node<'src>>, scope_id: Id) -> Id {
+        crate::stack_guard::ensure_sufficient_stack("the expression walk");
         let _depth = crate::depth_stats::DepthFrame::enter(crate::depth_stats::EXPR_WALK);
         self.walk_depth += 1;
         if self.walk_depth > Self::WALK_DEPTH_LIMIT {
@@ -32631,6 +32632,7 @@ impl<'src> Analyzer<'src> {
         expected_type_id: TypeId,
         lookup_scope_id: Id,
     ) -> Option<ExprPattern> {
+        crate::stack_guard::ensure_sufficient_stack("the pattern walk");
         let _depth = crate::depth_stats::DepthFrame::enter(crate::depth_stats::PATTERN);
         match pattern {
             WalkPattern::Wildcard => Some(ExprPattern::Wildcard),
@@ -34916,6 +34918,7 @@ impl<'src> Analyzer<'src> {
         exprs_seen: &mut HashSet<Id>,
     ) -> Type {
         INFERENCE_ENTRIES.with(|count| count.set(count.get().saturating_add(1)));
+        crate::stack_guard::ensure_sufficient_stack("type inference");
         let _depth = crate::depth_stats::DepthFrame::enter(crate::depth_stats::INFER);
         // `exprs_seen` guards against infinite recursion through a genuine cycle
         // (an expression whose type depends on itself). It tracks the current

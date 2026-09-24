@@ -265,19 +265,191 @@ fn cargo_build(directory: &Path, name: &str) -> Result<PathBuf, ExitCode> {
         }
     };
     if !output.status.success() {
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-        eprintln!(
-            "{} `cargo build` refused the emitted Rust. That is a BACKEND defect, not a defect \
-             in the vilan program — please report it with the program and \
-             `dist/native/*/src/main.rs`.",
-            paint::error_prefix()
-        );
+        let rustc_output = String::from_utf8_lossy(&output.stderr);
+        eprint!("{rustc_output}");
+        let refusal = RustcRefusal::read(&rustc_output);
+        for overflow in &refusal.overflows {
+            eprintln!(
+                "{} the PROGRAM overflows: rustc evaluated {} at compile time and refused it \
+                 ({}). A conforming program does not overflow (spec §7.2a): the JavaScript \
+                 backend would have run on past it with an out-of-range value, and a native \
+                 build refuses an overflow rustc can see at compile time — so this is the \
+                 program's own arithmetic, not a backend defect.",
+                paint::error_prefix(),
+                overflow.named(),
+                overflow.reason,
+            );
+        }
+        if refusal.other_errors > 0 || refusal.overflows.is_empty() {
+            eprintln!(
+                "{} `cargo build` refused the emitted Rust. That is a BACKEND defect, not a \
+                 defect in the vilan program — please report it with the program and \
+                 `dist/native/*/src/main.rs`.",
+                paint::error_prefix()
+            );
+        }
         return Err(ExitCode::FAILURE);
     }
     let target = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| directory.join("target"));
     Ok(target.join("debug").join(name))
+}
+
+/// What rustc's refusal of the emitted Rust was made of, read off its
+/// human-readable output (N120).
+///
+/// One class of refusal is NOT a backend defect: rustc's deny-by-default
+/// `arithmetic_overflow` lint evaluates constant integer arithmetic and refuses
+/// the build when it overflows — `let a: i32 = 2147483647; print(a + 1);`.
+/// A conforming program does not overflow (spec §7.2a, and I5's ruling 2 for
+/// `usize`: backend-defined, never memory-unsafe), the JavaScript backend runs
+/// on past one, and this program did overflow — so blaming the backend for it
+/// is a false accusation.
+/// Everything else rustc refuses still is a backend defect: the emitter wrote
+/// Rust that does not compile.
+///
+/// Read from the TEXT because the CLI carries no JSON reader, and the lint's
+/// head (`this arithmetic operation will overflow`) and rustc's snippet layout
+/// have been stable across every toolchain this backend has pinned. A refusal
+/// whose text does not match is simply not recognised, and falls back to the
+/// backend-defect sentence — the conservative reading.
+#[derive(Debug, Default, PartialEq)]
+struct RustcRefusal {
+    overflows: Vec<ConstantOverflow>,
+    /// rustc errors that are not `arithmetic_overflow` — cargo's own trailer
+    /// (`could not compile`) and rustc's (`aborting due to`) are not counted.
+    other_errors: usize,
+}
+
+/// One `arithmetic_overflow` refusal: where in the emitted Rust, the
+/// expression rustc underlined there, and rustc's own reason.
+#[derive(Debug, PartialEq)]
+struct ConstantOverflow {
+    /// `src/main.rs:LINE:COLUMN`, as rustc's `-->` line gives it.
+    location: String,
+    /// The underlined expression, when the span is on one line.
+    expression: Option<String>,
+    /// rustc's label: `attempt to compute `i32::MAX + 1_i32`, which would
+    /// overflow`.
+    reason: String,
+}
+
+impl ConstantOverflow {
+    /// The expression and where it is, for the sentence.
+    fn named(&self) -> String {
+        match &self.expression {
+            Some(expression) => format!("`{expression}` (the emitted Rust, {})", self.location),
+            None => format!("the expression at {} in the emitted Rust", self.location),
+        }
+    }
+}
+
+/// The lint's message head, which names the refusal whatever else changes.
+const OVERFLOW_HEAD: &str = "error: this arithmetic operation will overflow";
+
+impl RustcRefusal {
+    fn read(rustc_output: &str) -> RustcRefusal {
+        let lines: Vec<String> = rustc_output.lines().map(strip_ansi).collect();
+        let mut refusal = RustcRefusal::default();
+        for (index, line) in lines.iter().enumerate() {
+            if line == OVERFLOW_HEAD {
+                refusal
+                    .overflows
+                    .push(ConstantOverflow::read(&lines[index + 1..]));
+            } else if (line.starts_with("error:") || line.starts_with("error["))
+                && !line.starts_with("error: could not compile")
+                && !line.starts_with("error: aborting due to")
+            {
+                refusal.other_errors += 1;
+            }
+        }
+        refusal
+    }
+}
+
+impl ConstantOverflow {
+    /// Reads the snippet after the lint's head: the `-->` location, then the
+    /// first line whose gutter holds carets — the underline — and the source
+    /// line above it, which the carets index by column once both gutters are
+    /// cut at their `| `.
+    fn read(following: &[String]) -> ConstantOverflow {
+        let block: Vec<&String> = following
+            .iter()
+            .take_while(|line| !line.starts_with("error") && !line.starts_with("warning"))
+            .collect();
+        let location = block
+            .iter()
+            .find_map(|line| line.trim_start().strip_prefix("--> "))
+            .unwrap_or("src/main.rs")
+            .to_string();
+        let underline = block.iter().position(|line| {
+            after_gutter(line).is_some_and(|text| text.trim_start().starts_with('^'))
+        });
+        let (expression, reason) = match underline {
+            Some(position) => {
+                // Columns, counted in characters on both lines: the gutters
+                // are cut, so the underline's leading spaces are the
+                // expression's column in the source line above it.
+                let marks = after_gutter(block[position]).unwrap_or_default();
+                let start = marks.chars().take_while(|mark| *mark == ' ').count();
+                let width = marks
+                    .chars()
+                    .skip(start)
+                    .take_while(|mark| *mark == '^')
+                    .count();
+                let reason: String = marks.chars().skip(start + width).collect();
+                let expression = position
+                    .checked_sub(1)
+                    .and_then(|above| after_gutter(block[above]))
+                    .filter(|source| source.chars().count() >= start + width)
+                    .map(|source| source.chars().skip(start).take(width).collect());
+                (expression, reason.trim().to_string())
+            }
+            None => (None, String::new()),
+        };
+        ConstantOverflow {
+            location,
+            expression,
+            reason: if reason.is_empty() {
+                "the arithmetic would overflow".to_string()
+            } else {
+                reason
+            },
+        }
+    }
+}
+
+/// The text after a snippet line's `| ` gutter, if the line has one.
+fn after_gutter(line: &str) -> Option<&str> {
+    let (gutter, text) = line.split_once('|')?;
+    if !gutter
+        .trim()
+        .chars()
+        .all(|character| character.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(text.strip_prefix(' ').unwrap_or(text))
+}
+
+/// `line` without ANSI escape sequences — `CARGO_TERM_COLOR=always` colours
+/// the output even into a pipe.
+fn strip_ansi(line: &str) -> String {
+    let mut plain = String::with_capacity(line.len());
+    let mut characters = line.chars();
+    while let Some(character) = characters.next() {
+        if character == '\u{1b}' {
+            for terminator in characters.by_ref() {
+                if terminator.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(character);
+        }
+    }
+    plain
 }
 
 /// `vilan build --backend rust` — write the project, build it, say where the
@@ -346,4 +518,99 @@ pub fn run(unit: &Unit, platform: Platform, args: &[String]) -> ExitCode {
         Err(code) => return code,
     };
     crate::exit_code_of(Command::new(&binary).args(args).status())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// rustc's refusal of `let a: i32 = 2147483647; print(a + 1);` as `cargo
+    /// build` printed it into a pipe (1.90 and 1.98.1 print it alike).
+    /// A RAW string, so the diagnostics ledger's continuation gate reads it
+    /// as the drawing it is rather than as a lost `\`.
+    const OVERFLOW: &str = r#"   Compiling over v0.0.0 (/tmp/over/dist/native/over)
+error: this arithmetic operation will overflow
+  --> src/main.rs:10:22
+   |
+10 |     vilan_rt::print(&((a_8852 + (1i32))));
+   |                      ^^^^^^^^^^^^^^^^^^^ attempt to compute `i32::MAX + 1_i32`, which would overflow
+   |
+   = note: `#[deny(arithmetic_overflow)]` on by default
+
+error: could not compile `over` (bin "over") due to 1 previous error
+"#;
+
+    /// A refusal that IS the emitter's: a type mismatch.
+    const MISMATCH: &str = r#"error[E0308]: mismatched types
+ --> src/main.rs:4:18
+  |
+4 |     let a: u64 = 1i32;
+  |            ---   ^^^^ expected `u64`, found `i32`
+  |            |
+  |            expected due to this
+
+"#;
+
+    #[test]
+    fn an_arithmetic_overflow_refusal_is_read_as_the_programs_own() {
+        let refusal = RustcRefusal::read(OVERFLOW);
+        assert_eq!(
+            refusal,
+            RustcRefusal {
+                overflows: vec![ConstantOverflow {
+                    location: "src/main.rs:10:22".to_string(),
+                    expression: Some("((a_8852 + (1i32)))".to_string()),
+                    reason: "attempt to compute `i32::MAX + 1_i32`, which would overflow"
+                        .to_string(),
+                }],
+                other_errors: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn any_other_rustc_error_is_still_counted_as_the_backends() {
+        assert_eq!(
+            RustcRefusal::read(MISMATCH),
+            RustcRefusal {
+                overflows: Vec::new(),
+                other_errors: 1,
+            }
+        );
+        // Mixed: the overflow is read, AND the mismatch keeps the
+        // backend-defect sentence owed.
+        let mixed = RustcRefusal::read(&format!("{MISMATCH}{OVERFLOW}"));
+        assert_eq!(mixed.overflows.len(), 1);
+        assert_eq!(mixed.other_errors, 1);
+    }
+
+    #[test]
+    fn a_coloured_refusal_reads_the_same() {
+        let coloured = OVERFLOW
+            .replace(
+                "error: this arithmetic",
+                "\u{1b}[1m\u{1b}[91merror\u{1b}[0m\u{1b}[1m: this arithmetic",
+            )
+            .replace("   |      ", "\u{1b}[1m\u{1b}[94m   |\u{1b}[0m      ");
+        assert_eq!(RustcRefusal::read(&coloured), RustcRefusal::read(OVERFLOW));
+    }
+
+    #[test]
+    fn a_multi_line_span_names_its_location_without_an_expression() {
+        let multi_line = r#"error: this arithmetic operation will overflow
+  --> src/main.rs:10:5
+   |
+10 | /     vilan_rt::print(&((a_8852
+11 | |         + (1i32))));
+   | |___________________^ attempt to compute `i32::MAX + 1_i32`, which would overflow
+"#;
+        let refusal = RustcRefusal::read(multi_line);
+        assert_eq!(refusal.overflows.len(), 1);
+        assert_eq!(refusal.overflows[0].location, "src/main.rs:10:5");
+        assert_eq!(refusal.overflows[0].expression, None);
+        assert_eq!(
+            refusal.overflows[0].named(),
+            "the expression at src/main.rs:10:5 in the emitted Rust"
+        );
+    }
 }

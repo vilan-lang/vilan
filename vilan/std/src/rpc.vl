@@ -19,7 +19,14 @@
 
 import pkg::bytes::{ ByteBuffer, Bytes, bytes_of_buffer, new_text_decoder };
 import pkg::compare::PartialEq;
-import pkg::fetch::{ Response as HostResponse, get, post, post_bytes, post_bytes_typed };
+import pkg::fetch::{
+	Header,
+	Response as HostResponse,
+	get,
+	post,
+	post_bytes,
+	post_bytes_with_headers,
+};
 import pkg::hash::{ Hash, Hashable };
 import pkg::io::panic;
 import pkg::json::JsonValue;
@@ -112,35 +119,34 @@ async external fun guarded_async<T>(body: async || T): Result<T, str>;
 
 export impl HttpTransport with Transport {
 	/// The reply is read in the request's format — both sides run one codec
-	/// (deployment-wide, Q6), so the kinds always match.
-	///
-	/// An unreachable host, a DNS failure, a connection dropped mid-body: each is a
-	/// rejection of the host `fetch`, and each answers `Err(reason)` —
-	/// `Transport`'s own contract, which this used to break by letting the
-	/// rejection leave as an UNHANDLED one and take the process down with it
-	/// (tracker B374). The caller's `match` runs; `call` maps the `Err` to
-	/// `RpcError::Transport`. The retrying transport is still `SocketTransport` —
-	/// nothing here dials twice.
+	/// (deployment-wide, Q6), so the kinds always match. See `post_frame` for what
+	/// a failed POST answers.
 	fun call(self, request: Frame): Task<Result<Frame, str>> {
-		async {
-			// The guard wraps the READ as well as the POST: a response whose body
-			// is still arriving when the connection drops rejects at
-			// `text()`/`bytes()`, not at `send()`.
-			match request {
-				Frame::Text(let body) => {
-					match guarded_async(|| read_text_reply(self.url, body)) {
-						Ok(let reply) => reply,
-						Err(let reason) => Err(reason),
-					}
-				},
-				Frame::Binary(let body) => {
-					match guarded_async(|| read_binary_reply(self.url, body)) {
-						Ok(let reply) => reply,
-						Err(let reason) => Err(reason),
-					}
-				},
-			}
-		}
+		post_frame(self.url, [], request)
+	}
+}
+
+/// `HttpTransport` with request HEADERS, sent on every POST (A127) — the transport
+/// a generated client's `over_http_with(mount, codec, headers)` builds, and the way
+/// a page that holds its credential in storage rather than in a cookie reaches a
+/// service gated by `authorize_request`: `[("Authorization", i"Bearer {token}")]`.
+/// A cookie rides a same-origin POST on its own; a header token has to be written,
+/// and `HttpTransport` has nowhere to write one.
+///
+/// A second transport rather than a field on `HttpTransport`: a field would break
+/// every `HttpTransport { url }` literal written today, and vilan has no field
+/// defaults. Each header is sent after the rpc media type, in order. The media type
+/// itself is the transport's to set, so a `Content-Type` does not belong among
+/// them.
+export struct HeaderedHttpTransport {
+	url: str,
+	headers: List<(str, str)>,
+}
+
+export impl HeaderedHttpTransport with Transport {
+	/// `HttpTransport::call`, with this transport's headers on the POST.
+	fun call(self, request: Frame): Task<Result<Frame, str>> {
+		post_frame(self.url, self.headers, request)
 	}
 }
 
@@ -179,8 +185,12 @@ fun not_an_envelope(response: HostResponse): str {
 	i"the server answered {response.status()} with something that is not an rpc reply"
 }
 
-fun read_text_reply(url: str, body: str): Result<Frame, str> {
-	let response = post(url, body).header("Content-Type", RPC_TEXT_MEDIA_TYPE).send();
+fun read_text_reply(url: str, body: str, headers: List<(str, str)>): Result<Frame, str> {
+	mut request = post(url, body).header("Content-Type", RPC_TEXT_MEDIA_TYPE);
+	for (name, value) in headers {
+		request = request.header(name, value);
+	}
+	let response = request.send();
 	if reply_is_an_envelope(response) {
 		Ok(Frame::Text(response.text()))
 	} else {
@@ -188,12 +198,48 @@ fun read_text_reply(url: str, body: str): Result<Frame, str> {
 	}
 }
 
-fun read_binary_reply(url: str, body: Bytes): Result<Frame, str> {
-	let response = post_bytes_typed(url, body, RPC_BINARY_MEDIA_TYPE);
+fun read_binary_reply(url: str, body: Bytes, headers: List<(str, str)>): Result<Frame, str> {
+	mut sent = [Header { name = "Content-Type", value = RPC_BINARY_MEDIA_TYPE }];
+	for (name, value) in headers {
+		sent.push(Header { name, value });
+	}
+	let response = post_bytes_with_headers(url, body, sent);
 	if reply_is_an_envelope(response) {
 		Ok(Frame::Binary(response.bytes()))
 	} else {
 		Err(not_an_envelope(response))
+	}
+}
+
+/// One frame POSTed to `url` carrying `headers` beside the media type, and the
+/// reply frame read back — the whole of an HTTP transport's `call`, shared by the
+/// two that exist.
+///
+/// An unreachable host, a DNS failure, a connection dropped mid-body: each is a
+/// rejection of the host `fetch`, and each answers `Err(reason)` — `Transport`'s
+/// own contract, which this used to break by letting the rejection leave as an
+/// UNHANDLED one and take the process down with it (tracker B374). The caller's
+/// `match` runs; `call` maps the `Err` to `RpcError::Transport`. The retrying
+/// transport is still `SocketTransport` — nothing here dials twice.
+fun post_frame(url: str, headers: List<(str, str)>, request: Frame): Task<Result<Frame, str>> {
+	async {
+		// The guard wraps the READ as well as the POST: a response whose body is
+		// still arriving when the connection drops rejects at `text()`/`bytes()`,
+		// not at `send()`.
+		match request {
+			Frame::Text(let body) => {
+				match guarded_async(|| read_text_reply(url, body, headers)) {
+					Ok(let reply) => reply,
+					Err(let reason) => Err(reason),
+				}
+			},
+			Frame::Binary(let body) => {
+				match guarded_async(|| read_binary_reply(url, body, headers)) {
+					Ok(let reply) => reply,
+					Err(let reason) => Err(reason),
+				}
+			},
+		}
 	}
 }
 
@@ -6095,6 +6141,13 @@ export macro fun service(item: Item): Source {
 	let http_client_is_holdable = !any_handle
 		&& exposed_names.len() == 0
 		&& target.handler_name == "";
+	//
+	// `over_http_with` (A127) is its twin for a client that has to send a
+	// CREDENTIAL in a header — a token a page keeps in storage, which no cookie
+	// carries — and the headers ride every POST that client makes. It builds a
+	// `HeaderedHttpTransport` rather than widening `HttpTransport`, whose `{ url }`
+	// literal is written across the estate and would break with a second field.
+	// Same rule, same mount, so it is emitted exactly when `over_http` is.
 	let over_http_impl = if target.client_name != "" && http_client_is_holdable {
 		impl_of(target.client_name)
 			.generics("<HttpTransport>")
@@ -6105,6 +6158,16 @@ export macro fun service(item: Item): Source {
 				.expr(i"{target.client_name} \{ transport = HttpTransport \{ url = mount + "
 					+ quote("rpc")
 					+ " }, codec }"))
+			.render() + impl_of(target.client_name)
+			.generics("<HeaderedHttpTransport>")
+			.method(fun_of("over_http_with")
+				.parameter("mount: str")
+				.parameter("codec: Codec")
+				.parameter("headers: List<(str, str)>")
+				.returns(i"{target.client_name}<HeaderedHttpTransport>")
+				.expr(i"{target.client_name} \{ transport = HeaderedHttpTransport \{ url = mount + "
+						+ quote("rpc")
+						+ ", headers }, codec }"))
 			.render()
 	} else {
 		""
@@ -6169,7 +6232,7 @@ export macro fun service(item: Item): Source {
 	// so the service's vocabulary is the author's again.
 	let imports = "import std::rpc;\n"
 		+ "import std::reactive;\n"
-		+ "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, KeyedSource, RpcService, Origin, ClientProxy, SocketDuplex, SocketTransport, HttpTransport, ReactiveClient };\n"
+		+ "import std::rpc::{ Transport, Dispatcher, RpcError, RpcOutcome, RemoteSource, KeyedSource, RpcService, Origin, ClientProxy, SocketDuplex, SocketTransport, HttpTransport, HeaderedHttpTransport, ReactiveClient };\n"
 		+ "import std::wire::{ Codec, Serializer, Frame, Keyed };\n"
 		+ "import std::result::Result;\n"
 		+ "import std::option::Option;\n"

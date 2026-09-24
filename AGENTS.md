@@ -225,7 +225,13 @@ Rust workspace, nine crates, plus the language's own tree:
   server, a watcher, an editor surface) fences at its own boundary —
   catch, degrade to an honest internal-error answer, details left to
   stderr; a new one-shot entry takes the CLI's stance. Either way,
-  write which and why at the site.
+  write which and why at the site. A fence catches PANICS, and a stack
+  overflow is not one — it aborts the process from any thread (N121) — so a
+  long-lived thread that runs the analysis also DECLARES its stack
+  (`vilan_core::stack_guard::with_declared_stack`, first thing in the thread,
+  with the size it was spawned with): the analyzer's recursion funnels probe
+  that declaration and panic short of the guard page, which the fence then
+  catches. An undeclared thread's probe is inert.
 - **Every lock RECOVERS from poisoning — no exceptions, and a test
   holds the line** (E97, ruled 2026-08-28: "do the safe thing, prevent
   a poisoned cache"). `.lock()`, `.read()` and `.write()` are followed
@@ -256,6 +262,23 @@ Rust workspace, nine crates, plus the language's own tree:
   unless the work order says so. Run git from the worktree root, or via
   `git -C <worktree>`; never share a compound command with `cd` that could
   land in another checkout.
+- **Four traps Order 40's lanes met, each now a rule** (N123). `cargo fmt` JOINS a
+  `\`-continued string literal and leaves the next line's indentation inside the
+  string, which `diagnostics_ledger.rs`'s
+  `no_prose_literal_swallows_a_line_continuation` then reds on, so a multi-line `.vl`
+  fixture in a Rust test is a `concat!` of one-line literals or a one-line program
+  (a rowed diagnostic MESSAGE is still ONE `\`-continued literal, because the ledger
+  reads it that way — re-read it after `cargo fmt`). `Document::semantic_tokens`
+  (vilan-lsp) answers `(Span, TokenKind, u32)` — a BYTE span and a modifier bitset,
+  not a line/character pair — so a modifier pin converts through the document's line
+  index (`analyzed_index().range(span)`, as
+  `a_window_answers_byte_for_byte_what_filtering_the_full_stream_answers` does)
+  rather than trusting a helper that assumes positions. Any change to
+  `vilan/docs/spec/grammar.md` gates `cargo test -p vilan-cli --test grammar_ebnf`
+  and `--test grammar_sync` beside the docs pair (`markdown_golden`, `book_sync`).
+  And every change to `vilan/std` gates `cargo test -p vilan-cli --test
+  shared_census` — a committed per-file count of std's `Shared::new` sites, so two
+  lanes that each add one merge textually clean and red together.
 
 ## How to work
 

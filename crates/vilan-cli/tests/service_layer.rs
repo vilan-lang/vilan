@@ -6873,6 +6873,108 @@ async fun run_client(base: str) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A127: `over_http_with(mount, codec, headers)` — the S4 table's `/req/` row
+/// (`authorize_request` alone) answers 401 to a client with no credential and
+/// 200 to one with a good bearer, and the generated client can now BE the
+/// second one. Over both codecs, because the text and binary frames take
+/// different POST paths, and with a wrong bearer beside the good one so the
+/// header is shown to be READ rather than merely present. `over_http` beside it
+/// is the unchanged control: no header, refused.
+#[test]
+fn over_http_with_sends_its_headers_on_every_post_and_opens_the_request_gate() {
+    let dir = temp_project("over_http_with");
+    write(
+        &dir,
+        "vilan.toml",
+        "[package]\nname = \"app\"\ntarget = \"node\"\n",
+    );
+    write(
+        &dir,
+        "src/main.vl",
+        r#"import std::io::print;
+import std::process::exit;
+import std::option::Option::{ self, Some, None };
+import std::result::Result::{ self, Ok, Err };
+import std::json::json_codec;
+import std::binary::binary_codec;
+import std::http::{ Request, Response, Server };
+import std::rpc_server::{ Reject, Service, Session };
+import std::rpc::RpcError;
+
+[service(Client)]
+struct Door {
+	seed: i32,
+}
+
+impl Door {
+	[rpc]
+	fun echo(self, value: i32): i32 {
+		value + self.seed
+	}
+}
+
+fun by_bearer(request: Request): Result<Session, Reject> {
+	match request.header("authorization") {
+		Some(let value) => if value == "Bearer good" { Ok(Session::of("ada")) } else { Err(Reject::Forbidden) },
+		None => Err(Reject::Unauthorized),
+	}
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.with_service(Service::new(Door { seed = 1 }.dispatcher().into_protocol(json_codec()))
+			.at("/req/")
+			.authorize_request(|request| by_bearer(request)))
+		.with_service(Service::new(Door { seed = 1 }.dispatcher().into_protocol(binary_codec()))
+			.at("/bin/")
+			.authorize_request(|request| by_bearer(request)))
+		.on_request(|request| Response::builder().code(404).body("nope").build())
+		.on_start(|server| run_client(server.url()))
+		.build()
+		.start();
+}
+
+fun say(label: str, outcome: Result<i32, RpcError>) {
+	match outcome {
+		Ok(let value) => print(i"{label} ok {value}"),
+		Err(let error) => match error {
+			RpcError::Transport(let reason) => print(i"{label} transport {reason}"),
+			_ => print(i"{label} {error.to_json()}"),
+		},
+	}
+}
+
+async fun run_client(base: str) {
+	say("bare", Client::over_http(base + "req/", json_codec()).echo(41));
+	let good = Client::over_http_with(base + "req/", json_codec(), [("Authorization", "Bearer good")]);
+	say("good", good.echo(41));
+	say("again", good.echo(1));
+	say("wrong", Client::over_http_with(base + "req/", json_codec(), [("Authorization", "Bearer nope")]).echo(41));
+	say("binary bare", Client::over_http(base + "bin/", binary_codec()).echo(41));
+	say("binary good", Client::over_http_with(base + "bin/", binary_codec(), [("X-Trace", "7"), ("Authorization", "Bearer good")]).echo(41));
+	exit(0);
+}
+"#,
+    );
+    let stdout = vilan_run_with_liveness_bound(&dir);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "bare \"Unauthorized\"",
+            "good ok 42",
+            "again ok 2",
+            "wrong \"Unauthorized\"",
+            "binary bare \"Unauthorized\"",
+            "binary good ok 42",
+        ],
+        "the 401 row turns 200 with the header, on every POST of the client, over both \
+         codecs; a wrong bearer is still refused (403 reads the Unauthorized arm):\n{stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A120 S5 (`transport-rpc.md` §9.7.5, Q1 RULED: an opt-in MARKER): what
 /// `[service(.., http)]` refuses, each at the member that declared it.
 ///

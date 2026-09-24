@@ -183,20 +183,27 @@ export fun post(url: str, body: str): Request {
 /// none at all. `post_bytes_typed` is the same call with one, which is what a
 /// server that requires a media type needs (`transport-rpc.md` §9.7.9).
 export fun post_bytes(url: str, body: Bytes): Response {
-	post_bytes_with(url, body, "")
+	post_bytes_with_headers(url, body, [])
 }
 
 /// `post_bytes` with a declared `Content-Type`.
 export fun post_bytes_typed(url: str, body: Bytes, media_type: str): Response {
-	post_bytes_with(url, body, media_type)
+	if media_type == "" {
+		post_bytes_with_headers(url, body, [])
+	} else {
+		post_bytes_with_headers(url, body, [Header { name = "Content-Type", value = media_type }])
+	}
 }
 
-fun post_bytes_with(url: str, body: Bytes, media_type: str): Response {
+/// `post_bytes` with the request's headers written out — a `Content-Type`, a
+/// credential, anything the server reads. The one-shot binary POST that
+/// `std::rpc`'s `HeaderedHttpTransport` sends every binary frame through.
+export fun post_bytes_with_headers(url: str, body: Bytes, headers: List<Header>): Response {
 	let options = new_request_init();
 	options.set_method("POST");
 	options.set_body_bytes(body);
-	if media_type != "" {
-		options.set_headers([Header { name = "Content-Type", value = media_type }]);
+	if headers.len() > 0 {
+		options.set_headers(headers);
 	}
 	attach_ambient_signal(options);
 	fetch_with(url, options)

@@ -395,29 +395,18 @@ fn autofocus_focuses_the_modal_input_once_it_is_in_the_document() {
 //
 // `autofocus` is bounded and frame-aware now — attempt in the microtask, then
 // on the next animation frame, then once more on the frame after, then stop —
-// and this is the pin. The stub is extended by exactly what makes the claim
-// measurable: a `visibility` a hidden element refuses `focus()` with,
-// `document.activeElement` tracking what actually took it, `matches(":focus")`
-// reading it back, and a `requestAnimationFrame` that fires nothing until the
-// test says `flushFrame()`. A frame that never comes on its own is the point:
-// "on the next frame" is a claim about ORDER, and a real rAF would let a pass
-// mean "eventually".
+// and this is the pin. What makes the claim measurable is the SHARED stub's
+// own focus model (`support/dom/stub.js`, ui-40): `focus()` refuses a target
+// whose resolved `visibility` is `hidden` (inherited, as the platform
+// resolves it) and logs `!hidden`, `document.activeElement` tracks what
+// actually took focus, and `matches(":focus")` reads it back. This suite
+// carried a PRIVATE `focus()` override reading a `data-visibility` marker
+// until N122 retired it onto that model; what it still adds is its own frame
+// clock — a `requestAnimationFrame` that fires nothing until the test says
+// `flushFrame()`. A frame that never comes on its own is the point: "on the
+// next frame" is a claim about ORDER, and a real rAF would let a pass mean
+// "eventually".
 const DOM_STUB_FRAMES: &str = r##"
-// A hidden element refuses focus. The platform reads a computed style; the
-// stub reads a marker attribute the fixture sets, which is the same fact with
-// no layout engine behind it.
-const setAttributeBase = StubElement.prototype.setAttribute;
-StubElement.prototype.setAttribute = function (name, value) {
-    setAttributeBase.call(this, name, value);
-    if (name === "data-visibility") this.visibility = value;
-};
-StubElement.prototype.focus = function () {
-    const refused = this.visibility === "hidden";
-    global.focusLog.push(describe(this) + (refused ? "!refused" : "!taken"));
-    if (refused) return;
-    this.focused = true;
-    global.activeElement = this;
-};
 let frameQueue = [];
 global.requestAnimationFrame = (callback) => frameQueue.push(callback);
 global.flushFrame = () => {
@@ -439,18 +428,19 @@ global.findByName = (name) => {
 };
 "##;
 
-/// The overlay's shape: a panel mounted hidden, `autofocus` chained onto its
-/// input. Nothing here mentions a frame — that is the whole point of the
-/// one-word form.
+/// The overlay's shape: a panel mounted `visibility: hidden`, `autofocus`
+/// chained onto its input. Nothing here mentions a frame — that is the whole
+/// point of the one-word form.
 const HIDDEN_AUTOFOCUS: &str = r#"import std::io::print;
 import std::reactive::{ Signal, SignalCell };
 import std::ui::{ View, mount_root, view, when };
 
 fun main() {
 	let open: SignalCell<bool> = Signal::new(false);
+	let placed: SignalCell<str> = Signal::new("hidden");
 	let _root = mount_root("app", || {
 		view("div").child(when(open, || {
-			view("input").attr("name", "modal").attr("data-visibility", "hidden").autofocus()
+			view("input").attr("name", "modal").style_var("visibility", placed).autofocus()
 		}))
 	});
 	open.set(true);
@@ -473,7 +463,7 @@ fn b271_autofocus_is_refused_in_the_microtask_and_taken_on_the_first_frame() {
          console.log(\"activeBefore=\" + (activeElement ? activeElement.attributes.name : \"none\"));\n  \
          // The ResizeObserver callback: the panel is placed and flipped visible\n  \
          // in the rendering step a frame callback runs after.\n  \
-         panel.visibility = \"visible\";\n  \
+         panel.style.setProperty(\"visibility\", \"visible\");\n  \
          console.log(\"ranFrame=\" + flushFrame());\n  \
          console.log(\"afterFrame=\" + focusLog.join(\"|\"));\n  \
          console.log(\"activeAfter=\" + (activeElement ? activeElement.attributes.name : \"none\"));\n  \
@@ -489,7 +479,7 @@ fn b271_autofocus_is_refused_in_the_microtask_and_taken_on_the_first_frame() {
             .to_string()
     };
     assert!(
-        line("microtask=").ends_with("!refused"),
+        line("microtask=").ends_with("!hidden"),
         "a hidden element refuses focus, and the microtask is where it is \
          still hidden; got:\n{stdout}"
     );
@@ -517,8 +507,9 @@ fn b271_autofocus_is_refused_in_the_microtask_and_taken_on_the_first_frame() {
         "two attempts: the microtask's and the first frame's; got:\n{stdout}"
     );
     assert!(
-        attempts[1].ends_with("!taken"),
-        "the first frame after the flip takes focus; got:\n{stdout}"
+        attempts[1].ends_with("@doc"),
+        "the first frame after the flip takes focus (the shared stub logs a \
+         taken focus bare, a refused one with its reason); got:\n{stdout}"
     );
     assert_eq!(
         line("activeAfter="),
@@ -531,6 +522,93 @@ fn b271_autofocus_is_refused_in_the_microtask_and_taken_on_the_first_frame() {
         "tail=0",
         "the retry is BOUNDED: a taken focus queues no further frame; \
          got:\n{stdout}"
+    );
+}
+
+/// N122: the shared stub REFUSES the `focus()` the platform would, and says
+/// why. `support/dom/stub.js` is read by eight suites, and ui-40 gave its
+/// `focus()` two fidelity rules every focus pin now stands on — a target must
+/// be a FOCUSABLE AREA (a bare `<div>` is not; any written `tabindex` makes one
+/// programmatically focusable), and it must not resolve `visibility: hidden`
+/// (inherited) — so they are pinned through a program: a refused focus leaves
+/// `document.activeElement` where it was, reads `false` from
+/// `matches(":focus")`, dispatches no `focusin`, and logs its reason.
+const FOCUS_REFUSALS: &str = r#"import std::dom::{ active_element, create_element, get_element_by_id, is_null, window };
+import std::io::print;
+
+fun main() {
+	mut heard = 0;
+	let _heard = window().listen_capture("focusin", |_event| {
+		heard = heard + 1;
+	});
+	let root = get_element_by_id("app");
+	let bare = create_element("div");
+	root.append(bare);
+	bare.focus();
+	print(i"bare took={bare.matches(":focus")} active_null={is_null(active_element())} heard={heard}");
+	let programmatic = create_element("div");
+	programmatic.set_attribute("tabindex", "-1");
+	root.append(programmatic);
+	programmatic.focus();
+	print(i"negative_tabindex took={programmatic.matches(":focus")} heard={heard}");
+	let shade = create_element("section");
+	root.append(shade);
+	let inside = create_element("input");
+	shade.append(inside);
+	shade.set_style_property("visibility", "hidden");
+	inside.focus();
+	print(i"hidden_ancestor took={inside.matches(":focus")} kept={programmatic.matches(":focus")} heard={heard}");
+}
+
+main();
+"#;
+
+#[test]
+fn n122_the_shared_stub_refuses_a_focus_the_platform_would() {
+    let harness = format!(
+        "{DOM_STUB}\nrequire(\"./app.js\");\nconsole.log(\"log=\" + focusLog.join(\"|\"));\n"
+    );
+    let stdout = build_and_run("n122_refusals", FOCUS_REFUSALS, &harness);
+    let line = |key: &str| -> String {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(key))
+            .unwrap_or_else(|| panic!("no {key:?} line in:\n{stdout}"))
+            .to_string()
+    };
+    assert_eq!(
+        line("bare "),
+        "bare took=false active_null=true heard=0",
+        "a bare `<div>` is not a focusable area: the request does nothing, \
+         silently, as the platform's does; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("negative_tabindex "),
+        "negative_tabindex took=true heard=1",
+        "a written `tabindex`, even a negative one, makes an element \
+         programmatically focusable — and a focus that takes dispatches \
+         `focusin`; got:\n{stdout}"
+    );
+    assert_eq!(
+        line("hidden_ancestor "),
+        "hidden_ancestor took=false kept=true heard=1",
+        "an input under a `visibility: hidden` ancestor is refused, focus stays \
+         where it was, and no `focusin` fires; got:\n{stdout}"
+    );
+    let log = line("log=");
+    let entries: Vec<&str> = log.trim_start_matches("log=").split('|').collect();
+    assert_eq!(entries.len(), 3, "one entry per request; got:\n{stdout}");
+    assert!(
+        entries[0].starts_with("div#") && entries[0].ends_with("!unfocusable"),
+        "the refusal names its reason; got:\n{stdout}"
+    );
+    assert!(
+        entries[1].starts_with("div#") && entries[1].ends_with("@doc"),
+        "a taken focus is logged bare; got:\n{stdout}"
+    );
+    assert!(
+        entries[2].starts_with("input#") && entries[2].ends_with("!hidden"),
+        "the refusal names its reason; got:\n{stdout}"
     );
 }
 

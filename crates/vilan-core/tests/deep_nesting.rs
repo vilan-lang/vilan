@@ -786,3 +786,100 @@ fn the_formatters_parse_mode_is_bounded_too() {
         "group-preserving mode must carry the same bound, got: {messages:#?}"
     );
 }
+
+/// Analyzes `source` on a thread spawned with `thread_size` whose stack is
+/// DECLARED to the probe (N121, `vilan_core::stack_guard`) as `declared_size`
+/// — the way the language server's analysis thread declares its 128 MiB.
+/// `analyze_source` is the playground's call, so what comes back is what the
+/// playground's fence answers.
+fn analyze_on_a_declared_stack(
+    thread_size: usize,
+    declared_size: usize,
+    source: String,
+) -> Analysis {
+    std::thread::Builder::new()
+        .stack_size(thread_size)
+        .spawn(move || {
+            vilan_core::stack_guard::with_declared_stack(declared_size, || {
+                let leaked: &'static str = Box::leak(source.into_boxed_str());
+                let (program, errors) = analyze_source(
+                    leaked,
+                    &std_spec(),
+                    Path::new("."),
+                    Path::new("declared.vl"),
+                    Some(Platform::default()),
+                    &Workspace::default(),
+                );
+                Analysis {
+                    produced: program.is_some(),
+                    messages: errors.into_iter().map(|error| error.msg).collect(),
+                    inference_entries: 0,
+                }
+            })
+        })
+        .expect("spawn the declared worker")
+        .join()
+        .expect("the declared worker panicked — the fence must hold the probe's refusal")
+}
+
+/// N121: a recursion that reaches the end of a DECLARED stack is refused by
+/// the probe and answered by the fence as a diagnostic — the process lives.
+///
+/// The plant is a 490-link method chain: under the walk's 500-level bound, so
+/// nothing refuses it by DEPTH, and flat to the parser. The stack is declared
+/// at 2 MiB, so the probe refuses past 1 MiB (the red zone's minimum). Measured
+/// with `VILAN_DEPTH_STATS` at this sha, the chain's walk needs ~1.2 MiB
+/// optimized (~2.4 KiB a level; the 11.3 KiB the CLI's comment records is an
+/// older frame) and ~20 MiB unoptimized (42,464 bytes a level), so the probe
+/// refuses it under both profiles.
+///
+/// The THREAD is 16 MiB, larger than the declaration, for one reason: the
+/// syntactic visitors that run before the walk (`collect_module_paths`, over
+/// `Node::for_each_child`) recurse once per link too and are NOT probed — they
+/// need over 2 MiB for this chain unoptimized, and on a 2 MiB thread they
+/// overflow before any probe is reached. 16 MiB is still smaller than the
+/// unoptimized walk, so without the probe this pin reds as a real SIGABRT in
+/// the debug suite (read the sentence, not the assertion, as
+/// `a_thirty_level_chain_still_fits_libtests_own_two_mib_thread` says) and on
+/// "no program" optimized. Planted red by removing the `walk_expr_node` probe:
+/// `thread '<unknown>' has overflowed its stack`.
+#[test]
+fn a_walk_that_would_overflow_a_declared_stack_is_refused_with_the_fences_diagnostic() {
+    let source = format!(
+        "fun main() {{\n\tlet x = \"seed\"{};\n}}\n",
+        ".trim()".repeat(490)
+    );
+    let Analysis {
+        produced, messages, ..
+    } = analyze_on_a_declared_stack(16 * 1024 * 1024, 2 * 1024 * 1024, source);
+    assert!(!produced, "a refused analysis lands no program");
+    assert_eq!(
+        messages,
+        vec![
+            "internal error: the compiler panicked analyzing this file (this is a bug; the \
+             details are on stderr)"
+                .to_string()
+        ],
+        "the fence answers the refusal with its one internal-error diagnostic"
+    );
+}
+
+/// The control: the probe on a 4 MiB thread declared at its real size does not
+/// refuse a program that fits it. Thirty links is the walk canary's plant,
+/// which fits a 2 MiB thread with room over, so a probe that fired here would
+/// be refusing code the thread can hold.
+#[test]
+fn a_program_that_fits_a_declared_stack_is_not_refused() {
+    let source = format!(
+        "fun main() {{\n\tlet x = \"seed\"{};\n}}\n",
+        ".trim()".repeat(30)
+    );
+    let Analysis {
+        produced, messages, ..
+    } = analyze_on_a_declared_stack(4 * 1024 * 1024, 4 * 1024 * 1024, source);
+    assert!(
+        produced,
+        "a thirty-link chain analyzes on a declared 4 MiB thread"
+    );
+    assert!(messages.is_empty(), "{messages:#?}");
+}

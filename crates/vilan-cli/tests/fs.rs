@@ -1576,6 +1576,54 @@ main();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// N126's instrument for a LOADED runner: a `--require` preload that makes
+/// every `FileHandle`'s close land `VILAN_LATE_CLOSE_MS` late, so the race CI
+/// lost once (run 35790429797 read `1` for `0`) is reproduced on demand rather
+/// than waited for. `close` is an OWN property of each handle node hands out,
+/// so it is wrapped per handle, at `open`; the ESM facade the emitted program
+/// imports `open` through is re-synced from the patched CommonJS export. Each
+/// delayed close writes one marker line to stderr, which is what lets the pin
+/// prove the preload took effect — a node that changed either detail would
+/// otherwise leave this leg silently testing nothing.
+#[cfg(target_os = "linux")]
+const LATE_CLOSE_PRELOAD: &str = r#"const promises = require("fs/promises");
+const realOpen = promises.open;
+promises.open = async function (...args) {
+	const handle = await realOpen.apply(this, args);
+	const realClose = handle.close;
+	handle.close = function () {
+		process.stderr.write("n126: late close\n");
+		return new Promise((resolve) => setTimeout(resolve, Number(process.env.VILAN_LATE_CLOSE_MS)))
+			.then(() => realClose.call(handle));
+	};
+	return handle;
+};
+require("module").syncBuiltinESMExports();
+"#;
+
+/// `vilan run probe.vl` in `dir`, optionally with every file close made late
+/// by [`LATE_CLOSE_PRELOAD`]; returns stdout and stderr, asserting success.
+#[cfg(target_os = "linux")]
+fn run_temporary_handle_probe(dir: &Path, late_close_ms: Option<u32>) -> (String, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_vilan"));
+    command.args(["run", "probe.vl"]).current_dir(dir);
+    if let Some(milliseconds) = late_close_ms {
+        let preload = dir.join("late_close.cjs");
+        std::fs::write(&preload, LATE_CLOSE_PRELOAD).expect("write the preload");
+        command
+            .env("NODE_OPTIONS", format!("--require {}", preload.display()))
+            .env("VILAN_LATE_CLOSE_MS", milliseconds.to_string());
+    }
+    let output = command.output().expect("run vilan");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "vilan run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    (stdout, stderr)
+}
+
 #[test]
 // The INSTRUMENT is `/proc/self/fd`, which only Linux has — the emission
 // property this observes (a temporary's drop at its statement's end) is
@@ -1590,16 +1638,35 @@ fn a_temporary_handle_releases_its_descriptor_at_its_statements_end() {
     // its descriptor on every path until process exit: ten of them climbed the
     // count by ten and it never came back down (P6's "after 10 temporaries:
     // 31"). Under statement-end ownership the count is back at its baseline
-    // before the next statement is observed, so a straight line of temporaries
-    // holds ONE descriptor at a time and a loop of them holds one per
-    // iteration.
+    // by the next statement, so a straight line of temporaries holds ONE
+    // descriptor at a time and a loop of them holds one per iteration.
     //
-    // The counts are read IMMEDIATELY, with no settling poll, and that is the
-    // whole instrument: P10 measured that Q1's fire-and-forget close is back
-    // before the next statement runs, and a poll would let node's own
-    // FileHandle finalizer close a LEAKED descriptor and report zero.
-    // Plant-proven that way — with the temporary rule disabled the three
-    // readings are 1, 2 and 7 rather than 0, 0 and 0.
+    // The close is Q1's fire-and-forget: the statement's end INITIATES it and
+    // does not wait. P10 measured it back before the next statement runs, and
+    // this pin read the count IMMEDIATELY on that strength — until a loaded CI
+    // runner read `1` for `0` once (N126, run 35790429797). So each reading is
+    // `above`: the count, re-read every 10 ms for at most 50 ms WHILE it is
+    // above the baseline, and returned at once when it is not. A leaked
+    // descriptor stays leaked across that window, so the plant still reds —
+    // with the temporary rule disabled the three readings are 1, 2 and 7, as
+    // they were unpolled.
+    //
+    // The worry the immediate read was guarding against is node's FileHandle
+    // FINALIZER closing a leaked descriptor during a poll and hiding the leak.
+    // Measured on the plant (the three temporary closes deleted from the
+    // emitted program, node 24.2, loadavg ~20): the finalizer is driven by
+    // GC, GC by allocation, and polling every 10 ms the first leaked
+    // descriptor was collected 154-216 ms after the loop over eight runs — and
+    // then only four of the seven. `above` polls at most five times per
+    // reading and the plant read 1, 2, 7 in every run. And the pin does not
+    // rest on that margin alone: a finalized FileHandle prints `Closing file
+    // descriptor N on garbage collection` on stderr, which this asserts
+    // absent, so a leak the finalizer masked from the count still reds.
+    //
+    // The second run is the flake itself, reproduced: every close lands 20 ms
+    // late (`LATE_CLOSE_PRELOAD`). Unpolled, that run read 1, 2 and 7 — the
+    // staircase of a leak, from descriptors that were all closing — and with
+    // `above` it reads 0, 0, 0.
     //
     // The warm-up ahead of the baseline is load-bearing for the same reasons
     // `a_dropped_file_closes_the_underlying_descriptor` documents: the first
@@ -1623,6 +1690,19 @@ fun fd_count(): i32 {
 	read_dir("/proc/self/fd").len()
 }
 
+// How far above `baseline` the count is, re-read every 10 ms for at most
+// 50 ms while it is above: a close that is merely late settles, a leak does
+// not.
+fun above(baseline: i32): i32 {
+	for _attempt in Range::new(0, 5) {
+		if fd_count() == baseline {
+			ret 0;
+		}
+		sleep(10);
+	}
+	fd_count() - baseline
+}
+
 fun main() {
 	let warm = File::open("data/ten.txt");
 	drop(warm);
@@ -1635,25 +1715,48 @@ fun main() {
 	// The straight-line staircase: two statements, each opening a temporary.
 	// Under the leak this climbed to baseline + 1, then + 2, and stayed.
 	print(File::open("data/ten.txt").read_at(buffer, 0));
-	print(fd_count() - baseline);
+	print(above(baseline));
 	print(File::open("data/ten.txt").stat().size);
-	print(fd_count() - baseline);
+	print(above(baseline));
 
 	// The loop: one per iteration, never N.
 	for _round in Range::new(0, 5) {
 		print(File::open("data/ten.txt").stat().size);
 	}
-	print(fd_count() - baseline);
+	print(above(baseline));
 }
 main();
 "#,
     );
-    let stdout = run_ok(&dir, "probe.vl");
+    const EXPECTED: &str = "warm\n4\n0\n10\n0\n10\n10\n10\n10\n10\n0\n";
+    let (stdout, stderr) = run_temporary_handle_probe(&dir, None);
     assert_eq!(
-        stdout, "warm\n4\n0\n10\n0\n10\n10\n10\n10\n10\n0\n",
+        stdout, EXPECTED,
         "every temporary handle is released at its own statement's end, so the \
-         descriptor count is back at its baseline before the next statement — \
+         descriptor count is back at its baseline by the next statement — \
          straight-line and in a loop alike"
+    );
+    assert!(
+        !stderr.contains("on garbage collection"),
+        "a FileHandle was closed by node's finalizer, which only happens to a \
+         LEAKED one: {stderr}"
+    );
+
+    let (stdout, stderr) = run_temporary_handle_probe(&dir, Some(20));
+    assert_eq!(
+        stderr.matches("n126: late close").count(),
+        8,
+        "the late-close preload must have delayed every close (the warm-up's and \
+         the seven temporaries'), or this leg tests nothing: {stderr}"
+    );
+    assert_eq!(
+        stdout, EXPECTED,
+        "a close that lands 20 ms late is a LOADED runner, not a leak: each \
+         reading settles within its 50 ms"
+    );
+    assert!(
+        !stderr.contains("on garbage collection"),
+        "no FileHandle may reach node's finalizer: {stderr}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
