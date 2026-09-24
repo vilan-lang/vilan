@@ -386,9 +386,9 @@ fn download_verify_swap(
     // (L21), so this is the second of two chances rather than the only one —
     // which matters for a toolchain built from source, which never runs this
     // command at all.
-    let pruned = vilan_embedded_std::prune_stale(
-        &vilan_embedded_std::default_cache_root(),
-        vilan_embedded_std::STALE_AFTER,
+    let pruned = vilan_embedded::prune_stale(
+        &vilan_embedded::default_cache_root(),
+        vilan_embedded::STALE_AFTER,
     );
     if pruned > 0 {
         println!(

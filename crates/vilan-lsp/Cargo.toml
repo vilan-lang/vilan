@@ -14,7 +14,7 @@ vilan-core = { path = "../vilan-core" }
 # and definition read — shared with the playground (K9,
 # proposal/playground-completion.md §3).
 vilan-ide = { path = "../vilan-ide" }
-vilan-embedded-std = { path = "../vilan-embedded-std" }
+vilan-embedded = { path = "../vilan-embedded" }
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["rt-multi-thread", "io-std", "macros", "time"] }
 dashmap = "6"

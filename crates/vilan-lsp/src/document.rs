@@ -350,7 +350,7 @@ fn resolve_dependencies(
     root: &Path,
     manifest_path: &Path,
 ) -> (BuildWorkspace, Option<ManifestProblem>) {
-    let git = vilan_core::git_dep::GitDeps::cache_only(vilan_embedded_std::default_git_dep_root());
+    let git = vilan_core::git_dep::GitDeps::cache_only(vilan_embedded::default_git_dep_root());
     match vilan_core::manifest::resolve_workspace(root, &git) {
         Ok(workspace) => (workspace, None),
         Err(error) => (
@@ -12421,7 +12421,7 @@ pub(crate) mod tests {
             reference: vilan_core::git_dep::GitRef::Tag("v1.0.0".to_string()),
         };
         let entry =
-            vilan_core::git_dep::entry_path(&vilan_embedded_std::default_git_dep_root(), &source);
+            vilan_core::git_dep::entry_path(&vilan_embedded::default_git_dep_root(), &source);
         assert!(
             !entry.exists(),
             "the editor must not populate the git cache: {}",

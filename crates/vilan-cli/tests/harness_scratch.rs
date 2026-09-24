@@ -199,7 +199,7 @@ fn no_test_file_writes_to_the_shared_tmpfs() {
         "{} test file(s) write their scratch to `std::env::temp_dir()`. That is \
          a tmpfs every worktree shares, and filling it produces reds that are \
          green on a re-run (N82). Use `scratch::root()` — `mod scratch;` in a \
-         `vilan-core` or `vilan-embedded-std` suite, `support::scratch_root()` \
+         `vilan-core` or `vilan-embedded` suite, `support::scratch_root()` \
          in a `vilan-cli` one:\n{}",
         unlisted.len(),
         unlisted.join("\n")

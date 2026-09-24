@@ -29,7 +29,7 @@ fn repo_root() -> PathBuf {
 const WORKSPACE_CRATES: &[&str] = &[
     "vilan-cli",
     "vilan-core",
-    "vilan-embedded-std",
+    "vilan-embedded",
     "vilan-lsp",
     "vilan-ide",
     // The emit-Rust backend (F1 S1a). `vilan-rt` is the one to look at twice:

@@ -1152,7 +1152,7 @@ dependencies = [
  "libc",
  "sha2",
  "vilan-core",
- "vilan-embedded-std",
+ "vilan-embedded",
  "vilan-rust",
  "windows-sys",
 ]
@@ -1168,7 +1168,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "vilan-embedded-std"
+name = "vilan-embedded"
 version = "0.40.0"
 
 [[package]]
@@ -1188,7 +1188,7 @@ dependencies = [
  "tokio",
  "tower-lsp",
  "vilan-core",
- "vilan-embedded-std",
+ "vilan-embedded",
  "vilan-ide",
  "windows-sys",
 ]
@@ -1217,7 +1217,7 @@ name = "vilan-wasm"
 version = "0.40.0"
 dependencies = [
  "vilan-core",
- "vilan-embedded-std",
+ "vilan-embedded",
  "vilan-ide",
  "wasm-bindgen",
 ]

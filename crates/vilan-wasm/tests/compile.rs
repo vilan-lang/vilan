@@ -430,7 +430,7 @@ fn a_second_compile_replaces_the_first_program() {
 /// their platform tokens must still be what `embedded_std_spec` hard-codes.
 #[test]
 fn the_hand_built_std_spec_matches_the_manifest() {
-    let manifest = vilan_embedded_std::FILES
+    let manifest = vilan_embedded::FILES
         .iter()
         .find(|(key, _)| *key == "std/vilan.toml")
         .map(|(_, contents)| *contents)
@@ -686,7 +686,7 @@ fn a_browser_program_is_rejected_for_node() {
 /// promises "a toolchain path for a diagnostic inside std", and nothing else
 /// here produces one.
 ///
-/// The injected key is not one of `vilan_embedded_std::FILES`, so `boot()` —
+/// The injected key is not one of `vilan_embedded::FILES`, so `boot()` —
 /// which re-registers every embedded file on every compile — neither clobbers
 /// it nor is clobbered by it, and no other test imports the module.
 #[test]

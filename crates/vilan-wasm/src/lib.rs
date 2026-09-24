@@ -2,7 +2,7 @@
 //! (backlog D11, `proposal/web-playground.md`).
 //!
 //! There is no filesystem behind this. The toolchain's own sources are compiled
-//! into the binary by `vilan-embedded-std` and registered in core's
+//! into the binary by `vilan-embedded` and registered in core's
 //! document overlay under a synthetic `/toolchain` root at boot; the visitor's
 //! program is registered under `/project`. Module resolution then works exactly
 //! as it does in an editor with unsaved buffers, which is the seam D11 S1 built
@@ -348,7 +348,7 @@ fn embedded_std_spec() -> PackageSpec {
 /// instance no matter how many times this runs.
 pub fn boot() {
     let root = Path::new(TOOLCHAIN_ROOT);
-    for (key, contents) in vilan_embedded_std::FILES {
+    for (key, contents) in vilan_embedded::FILES {
         // Keys are always forward-slashed, on every host that generated them.
         vilan_core::analyzer::set_document_overlay(&root.join(key), Some((*contents).to_string()));
     }
