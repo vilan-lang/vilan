@@ -2105,6 +2105,43 @@ fn the_five_literal_positions_take_their_contexts_width_natively() {
     );
 }
 
+/// B397: `combine` over a source whose value is itself a TUPLE. The JS
+/// backend read it wrong (`x=1,2 y=c l=undefined`) until the comprehension was
+/// emitted unrolled for that instance; the native one refuses a mapped tuple by
+/// name today. The claim held here is the differential's own: whatever the
+/// native backend does with this program, it is never a DIFFERENT answer — a
+/// refusal now, the same bytes once it lowers comprehensions.
+const COMBINE_TUPLE_ELEMENT_PROBE: &str = concat!(
+    "import std::reactive::{ SignalCell, combine };\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet point = SignalCell::new((1, 2));\n",
+    "\tlet label = SignalCell::new(\"c\");\n",
+    "\tlet both = combine((point, label));\n",
+    "\tlet ((x, y), l) = both.get();\n",
+    "\tprint(i\"{x} {y} {l}\");\n",
+    "\tpoint.set((3, 4));\n",
+    "\tlet ((x2, y2), l2) = both.get();\n",
+    "\tprint(i\"{x2} {y2} {l2}\");\n",
+    "}\n",
+);
+
+#[test]
+fn combine_over_a_tuple_valued_source_is_never_a_different_answer_natively() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_combine_tuple.vl"),
+        COMBINE_TUPLE_ELEMENT_PROBE,
+    )
+    .expect("write the probe program");
+    let verdict = compare(&staged, "native_probe_combine_tuple.vl");
+    assert!(
+        !matches!(verdict, Verdict::Broken(_)),
+        "the native backend must refuse this program by name or print what node prints: \
+         {verdict:?}"
+    );
+}
+
 /// F31's trap, in one program: the read whose binding was declared OUTSIDE the
 /// loop keeps its copy, and the read whose binding the loop body itself
 /// declares moves.

@@ -49755,6 +49755,28 @@ impl<'src> Analyzer<'src> {
         // walk filled, both of which are complete before either pass.
         self.refuse_shadowed_submodules();
 
+        // B397: a tuple comprehension's own type — the mapped tuple `(U in T:
+        // B)` its body makes — is the emitter's to read per instance (whether
+        // an element's result is a tuple it must splice), and it is computed
+        // on demand and stored nowhere. Recorded once the fixpoint has typed
+        // every body.
+        let comprehensions: Vec<Id> = self
+            .expr_id_to_expr_map
+            .iter()
+            .filter(|(_, expr)| matches!(expr, Expr::TupleComprehension(..)))
+            .map(|(id, _)| *id)
+            .collect();
+        for comprehension_id in comprehensions {
+            let comprehension_type =
+                self.infer_type(comprehension_id, &Type::Unknown, &HashMap::default());
+            if matches!(comprehension_type, Type::Mapped(..)) {
+                let type_id = comprehension_type.get_type_id(self);
+                self.resolved_types
+                    .entry(comprehension_id)
+                    .or_insert(type_id);
+            }
+        }
+
         // Hand any still-unresolved constraints back to `self.constraints` so the
         // post-fixpoint passes (the `for…in` commit, the end-of-fixpoint
         // diagnostics) see them where they always have.
