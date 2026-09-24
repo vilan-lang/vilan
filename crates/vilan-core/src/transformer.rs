@@ -4753,7 +4753,19 @@ impl<'src> Transformer<'src> {
                 // A flat tuple is a JS array, so the comprehension lowers to a
                 // runtime `source.map((x) => body)` — arity-independent, no
                 // monomorphization needed. The binder is the closure parameter.
+                //
+                // B397: ...unless an element is itself a TUPLE, which storage
+                // FLATTENS (types.md §5.9): a source element then spans several
+                // slots of the array `.map` walks one slot at a time, and a
+                // tuple-valued body result must SPLICE into the result rather
+                // than nest in it. That instance is emitted unrolled — see
+                // `unrolled_comprehension`.
                 let (binder_id, source_id, body_id) = (*binder_id, *source_id, *body_id);
+                if let Some(unrolled) =
+                    self.unrolled_comprehension(id, binder_id, source_id, body_id, block)
+                {
+                    return Some(unrolled);
+                }
                 let source = self.walk_entity(source_id, block).unwrap_or(js::Node::Void);
                 let parameter_name = self.ng.name_for(binder_id);
                 let mut body = Vec::new();
@@ -7786,6 +7798,166 @@ impl<'src> Transformer<'src> {
             }
             offset += width;
         }
+    }
+
+    /// B397 — a tuple comprehension `(x in source => body)` emitted UNROLLED,
+    /// for the instance whose flat layout a runtime `.map` would get wrong.
+    ///
+    /// The source is a mapped tuple `(U in T: F<U>)`; in this instance `T` is a
+    /// concrete tuple `(X0, .., Xn)`, so element `i` is `F[U := Xi]`, which is
+    /// `width(F[U := Xi])` slots of the flat source array, and the body's value
+    /// for it is `B[U := Xi]` — spliced into the result when it is a tuple. With
+    /// every source element one non-tuple slot and every result a non-tuple,
+    /// `.map` is exactly right and this answers `None`, which is what keeps every
+    /// comprehension that was correct byte-identical (`combine` over scalar
+    /// cells). Otherwise: the source is evaluated ONCE into a temporary, each
+    /// element is read at its flat offset (a slot, or a `.slice` for a
+    /// multi-slot element), and the body runs once per element as `((x) =>
+    /// body)(element)` with `U` bound to that element's type while it is
+    /// emitted — so a call inside the body specializes per element too.
+    ///
+    /// `combine((SignalCell::new((1, 2)), SignalCell::new("c")))` is the
+    /// exhibit: the `.map` answered `[[1, 2], "c"]`, which the flat reader
+    /// `((x, y), l)` read as `x = 1,2`, `y = c`, `l = undefined`.
+    fn unrolled_comprehension(
+        &mut self,
+        comprehension_id: Id,
+        binder_id: Id,
+        source_id: Id,
+        body_id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> Option<js::Node<'src>> {
+        let source_type_id = self.expr_type_id(source_id)?;
+        let Some(Type::Mapped(binder, source_tuple, template)) = self
+            .program
+            .type_id_to_type_map
+            .get(&source_type_id)
+            .cloned()
+        else {
+            return None;
+        };
+        let comprehension_type_id = self.expr_type_id(comprehension_id)?;
+        let Some(Type::Mapped(_, _, body_template)) = self
+            .program
+            .type_id_to_type_map
+            .get(&comprehension_type_id)
+            .cloned()
+        else {
+            return None;
+        };
+        let Some(Type::Tuple(elements)) = self
+            .program
+            .type_id_to_type_map
+            .get(&self.resolve_type_id(source_tuple))
+            .cloned()
+        else {
+            return None;
+        };
+        // Each element's (source width, whether the body's value is a tuple).
+        let mut layout: Vec<(TypeId, usize, bool)> = Vec::with_capacity(elements.len());
+        for element in &elements {
+            let element = self.resolve_type_id(*element);
+            let outer = self.enter_comprehension_element(binder, element);
+            let source_width = self.flat_width(template);
+            let source_is_tuple = matches!(
+                self.program
+                    .type_id_to_type_map
+                    .get(&self.resolve_type_id(template)),
+                Some(Type::Tuple(_))
+            );
+            let result_is_tuple = matches!(
+                self.program
+                    .type_id_to_type_map
+                    .get(&self.resolve_type_id(body_template)),
+                Some(Type::Tuple(_))
+            );
+            self.current_substitution = outer;
+            if source_is_tuple && source_width == 1 {
+                // A one-slot tuple element still reads as an ARRAY; `.slice`
+                // below is what gives it one.
+                layout.push((element, usize::MAX, result_is_tuple));
+            } else {
+                layout.push((element, source_width, result_is_tuple));
+            }
+        }
+        if layout
+            .iter()
+            .all(|(_, width, result_is_tuple)| *width == 1 && !*result_is_tuple)
+        {
+            return None;
+        }
+        let source = self.walk_entity(source_id, block).unwrap_or(js::Node::Void);
+        let source = match source {
+            js::Node::Local(name) => js::Node::Local(name),
+            other => {
+                let name = self.ng.next_name();
+                block.push(js::Node::ConstVariable(js::Variable {
+                    name: name.clone(),
+                    value: Box::new(other),
+                }));
+                js::Node::Local(name)
+            }
+        };
+        let parameter_name = self.ng.name_for(binder_id);
+        let mut offset = 0usize;
+        let mut items = Vec::with_capacity(layout.len());
+        for (element, width, result_is_tuple) in layout {
+            let slots = match width {
+                usize::MAX => 1,
+                width => width,
+            };
+            let slot = match width {
+                1 => js::Node::PropertyIndex(
+                    Box::new(source.clone()),
+                    Box::new(js::Node::Number(offset.to_string(), None)),
+                ),
+                _ => js::Node::Call(
+                    Box::new(js::Node::Property(
+                        Box::new(source.clone()),
+                        "slice".to_string(),
+                    )),
+                    vec![
+                        js::Node::Number(offset.to_string(), None),
+                        js::Node::Number((offset + slots).to_string(), None),
+                    ],
+                ),
+            };
+            offset += slots;
+            let outer = self.enter_comprehension_element(binder, element);
+            let mut body = Vec::new();
+            if let Some(value) = self.walk_entity(body_id, &mut body) {
+                body.push(js::Node::Return(Box::new(value)));
+            }
+            self.current_substitution = outer;
+            let call = js::Node::Call(
+                Box::new(js::Node::Closure(js::Closure {
+                    parameters: vec![js::Parameter {
+                        name: parameter_name.clone(),
+                    }],
+                    body,
+                    is_async: false,
+                    origin: None,
+                })),
+                vec![slot],
+            );
+            items.push(match result_is_tuple {
+                true => js::Node::Spread(Box::new(call)),
+                false => call,
+            });
+        }
+        Some(js::Node::Array(items))
+    }
+
+    /// Binds a comprehension's element binder to one element's type on top of
+    /// the substitution in force, answering the substitution to restore.
+    fn enter_comprehension_element(
+        &mut self,
+        binder: TypeId,
+        element: TypeId,
+    ) -> HashMap<TypeId, TypeId> {
+        let mut inner = self.current_substitution.clone();
+        inner.insert(binder, element);
+        std::mem::replace(&mut self.current_substitution, inner)
     }
 
     /// The number of flat slots a value of `type_id` occupies once tuples are

@@ -87,9 +87,11 @@ Two rules that differ from JS:
   `i53` and an `i32` in one expression is a compile error. Convert
   explicitly with the `as_*` methods, or suffix the literal.
 
-That second rule has one trap. If `stamp` is an `i53`,
-write `stamp + 1000i53`, not `stamp + 1000`. The bare `1000` is an `i32`,
-and the mix won't compile.
+A bare literal is not a mix: it takes the type of what it meets. If
+`stamp` is an `i53`, `stamp + 1000` and `1000 + stamp` are both `i53`
+arithmetic, and so is `let delay = 1000; stamp + delay` — an unannotated
+binding of a literal takes its type from its first typed use, and is an
+`i32` only when no use says otherwise.
 
 > **Going deeper.** The `as_*` conversions use Rust's `as` semantics:
 > floats truncate toward zero, and integers fold two's-complement into

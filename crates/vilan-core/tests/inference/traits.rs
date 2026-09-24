@@ -6925,3 +6925,175 @@ fn b359_ords_clamp_default_still_answers_over_the_integers() {
         "3\n5\n4\n5\n",
     );
 }
+
+// --- B390: an impl whose SUBJECT is refused provides nothing. The subject
+// --- resolved to `Unknown`, which compares equal to every type, so the block
+// --- entered every candidate set: a call on an innocent type was reported
+// --- ambiguous "between `Root` and `unknown`", and every type satisfied the
+// --- block's trait.
+
+const B390_REFUSED_SUBJECT: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "trait Named {\n",
+    "\tfun name(self): str;\n",
+    "}\n",
+    "\n",
+    "struct Root {}\n",
+    "\n",
+    "struct Leaf<T> { value: T }\n",
+    "\n",
+    "impl Root with Named {\n",
+    "\tfun name(self): str { \"root\" }\n",
+    "}\n",
+    "\n",
+    "impl Leaf<i32, str> with Named {\n",
+    "\tfun name(self): str { \"leaf\" }\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet root = Root {};\n",
+    "\tprint(root.name());\n",
+    "}\n",
+);
+
+/// The item's repro: ONE error, the arity refusal at the impl. Red before the
+/// fix with a second, "'name' is ambiguous on 'Root': both 'Root' and
+/// 'unknown' provide it", at the innocent call.
+#[test]
+fn b390_a_refused_impl_subject_reports_once_at_the_impl() {
+    let diagnostics = failure_diagnostics(B390_REFUSED_SUBJECT);
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "one refused subject is one diagnostic: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics[0]
+            .0
+            .contains("`Leaf` takes 1 type argument, 2 given"),
+        "{diagnostics:#?}"
+    );
+}
+
+/// The block's trait is provided to NOTHING — not by method call, not at a
+/// bound. Red before the fix, which reported only the arity refusal: the
+/// refused block made `i32` a `Named`, so both uses checked clean.
+#[test]
+fn b390_a_refused_impl_subject_provides_its_trait_to_no_type() {
+    let source = concat!(
+        "import std::io::print;\n",
+        "\n",
+        "trait Named {\n",
+        "\tfun name(self): str;\n",
+        "}\n",
+        "\n",
+        "struct Leaf<T> { value: T }\n",
+        "\n",
+        "impl Leaf<i32, str> with Named {\n",
+        "\tfun name(self): str { \"leaf\" }\n",
+        "}\n",
+        "\n",
+        "fun shout<T: Named>(value: T): str { value.name() }\n",
+        "\n",
+        "fun main() {\n",
+        "\tprint(shout(5));\n",
+        "\tprint(5.name());\n",
+        "}\n",
+    );
+    assert_fails_with(source, "'i32' does not implement trait 'Named'");
+    assert_fails_with(source, "i32 has no method 'name'");
+}
+
+/// B391: a `[service]`'s GENERATED call to its client's `[rpc]` member is
+/// admitted under the module that declared the service — B354's rule for
+/// generated code, which the call-site export gate did not ask. `export impl
+/// Door` curates the module's exports, the plain `impl Peer` is then not
+/// exported, and the generated proxy's `ping` call — filed under the derived
+/// sentinel, which reached nothing — was refused as reaching a hidden block of
+/// its OWN module. Red before the fix: "'ping' is provided by an `impl` in
+/// module ... that ... does not export". The `impl Door` without `export` was
+/// the control that always compiled.
+#[test]
+fn b391_a_services_generated_client_call_is_admitted_under_its_own_module() {
+    let exported = concat!(
+        "import std::io::print;\n",
+        "import std::reactive::{ Signal, SignalCell };\n",
+        "import std::rpc_server::{ Connection, Service };\n",
+        "import std::json::json_codec;\n",
+        "\n",
+        "[client_service]\n",
+        "struct Peer {\n",
+        "\tseen: SignalCell<str>,\n",
+        "}\n",
+        "\n",
+        "impl Peer {\n",
+        "\t[rpc]\n",
+        "\tfun ping(self, note: str) {\n",
+        "\t\tself.seen.set(note);\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "[service(DoorClient, client = Peer)]\n",
+        "struct Door {\n",
+        "\tclient: PeerProxy,\n",
+        "}\n",
+        "\n",
+        "export impl Door {\n",
+        "\t[rpc]\n",
+        "\tfun knock(self): i32 {\n",
+        "\t\tself.client.ping(\"knock\");\n",
+        "\t\t1\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "fun main() {\n",
+        "\tprint(\"ok\");\n",
+        "}\n",
+    );
+    assert_compiles(exported);
+    assert_compiles(&exported.replace("export impl Door", "impl Door"));
+}
+
+/// E220: the missing-member steer renders a SUPERTRAIT's member at the
+/// arguments the supertrait is reached with. Red before the fix: "declare `fun
+/// read(self): i32`", the `with` clause's own argument bound onto `Base`'s `T`.
+#[test]
+fn e220_a_supertrait_reached_at_a_constructed_argument_is_rendered_at_it() {
+    let source = concat!(
+        "trait Base<T> {\n",
+        "\tfun read(self): T;\n",
+        "}\n",
+        "\n",
+        "trait Feed<T> with Base<List<T>> {\n",
+        "\tfun feeds(self): bool { true }\n",
+        "}\n",
+        "\n",
+        "struct Cell {}\n",
+        "\n",
+        "impl Cell with Feed<i32> {}\n",
+    );
+    assert_fails_with(
+        source,
+        "'Cell' does not implement trait 'Feed<i32>': missing 'read'; declare `fun read(self): List<i32>`",
+    );
+    assert_fails_without(source, "declare `fun read(self): i32`");
+}
+
+/// The control: the trait implemented DIRECTLY still renders at its own clause
+/// argument (green before and after).
+#[test]
+fn e220_the_directly_implemented_trait_is_rendered_at_its_clause() {
+    assert_fails_with(
+        concat!(
+            "trait Base<T> {\n",
+            "\tfun read(self): T;\n",
+            "}\n",
+            "\n",
+            "struct Cell {}\n",
+            "\n",
+            "impl Cell with Base<i32> {}\n",
+        ),
+        "'Cell' does not implement trait 'Base<i32>': missing 'read'; declare `fun read(self): i32`",
+    );
+}

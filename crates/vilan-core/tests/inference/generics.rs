@@ -6477,14 +6477,15 @@ fn b227_the_enclosing_call_still_types_a_printed_parameter() {
 
 #[test]
 fn b227_an_any_call_as_a_closures_sole_use_leaves_the_slot_open() {
-    // The deliberate edge. Skipping without deferring means a closure whose
-    // ONLY use is an `any` call gets no type from anywhere — and that is the
-    // right answer, reported by the message that already covers it. Deferring
-    // instead would deadlock: the body waits for the parameter, and nothing
-    // else is ever going to fill it. Note this is the same verdict a GENERIC
-    // sink (`fun sink<T>(m: T)`) has always produced for the same program.
-    assert_fails_with(
-        r#"
+    // The deliberate edge. Skipping without deferring means the `any` sink
+    // does not type the parameter — it tells the hole nothing, so `v` is never
+    // `any`. Until B392 nothing else typed it either and the program ended in
+    // "could not be resolved"; since B392 a let-bound closure's parameter
+    // takes its FIRST CALL SITE's type when the fixpoint stalls (`f(1)` makes
+    // `v` an `i32`), so the error is now the true one about the body. What
+    // this pins is B227's half: the sink is still not where the type came
+    // from.
+    let source = r#"
         fun sink(m: any): void {}
 
         fun main() {
@@ -6492,9 +6493,9 @@ fn b227_an_any_call_as_a_closures_sole_use_leaves_the_slot_open() {
             f(1);
         }
         main();
-        "#,
-        "could not be resolved",
-    );
+        "#;
+    assert_fails_with(source, "i32 has no method 'no_such_method'");
+    assert_fails_without(source, "on any");
 }
 
 #[test]
@@ -8711,5 +8712,67 @@ fn b372_a_let_bound_closure_still_compiles_when_its_wait_cannot_be_answered() {
         }
         "#,
         "8\n",
+    );
+}
+
+// --- B392: a LET-BOUND closure whose unannotated parameter feeds a generic
+// --- position waited on its own call site, which waited on the closure's
+// --- type, which waited on the body — which waited on the parameter. A
+// --- stationary fixpoint now fills the parameter from its first call site.
+
+const B392_PRELUDE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Holder<T> { value: T }\n",
+    "\n",
+    "fun wrap<T>(value: T): Holder<T> { Holder { value } }\n",
+    "\n",
+);
+
+/// The bare-parameter call. Red before the fix: "type of variable 'f' could not
+/// be resolved".
+#[test]
+fn b392_a_let_bound_closure_passing_its_parameter_to_a_generic_call() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B392_PRELUDE}fun main() {{\n\tlet f = |m| wrap(m);\n\tprint(f(4).value);\n\tprint(f(9).value + 1);\n}}\n"
+        ),
+        "4\n10\n",
+    );
+}
+
+/// B288's struct literal over the parameter. Red before the fix: "type of
+/// variable 'g' could not be resolved".
+#[test]
+fn b392_a_let_bound_closure_building_a_generic_struct_from_its_parameter() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B392_PRELUDE}fun main() {{\n\tlet g = |m| Holder {{ value = m * 2 }};\n\tprint(g(4).value);\n}}\n"
+        ),
+        "8\n",
+    );
+}
+
+/// The first call site decides; a second at another type is ITS mismatch,
+/// naming the call that typed the parameter. Red before the fix (the variable
+/// was unresolved instead).
+#[test]
+fn b392_a_second_call_at_another_type_is_refused_against_the_first() {
+    assert_fails_with(
+        &format!(
+            "{B392_PRELUDE}fun main() {{\n\tlet f = |m| wrap(m);\n\tprint(f(4).value);\n\tprint(f(\"x\").value);\n}}\n"
+        ),
+        "Expected i32, but got str instead.",
+    );
+}
+
+/// The control: the annotated parameter, which always resolved.
+#[test]
+fn b392_the_annotated_parameter_control() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B392_PRELUDE}fun main() {{\n\tlet h = |m: i32| wrap(m);\n\tprint(h(5).value);\n}}\n"
+        ),
+        "5\n",
     );
 }

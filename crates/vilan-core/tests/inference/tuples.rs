@@ -7148,3 +7148,86 @@ fn b377_an_unused_binding_over_a_nested_let_still_runs_it() {
         "5\n",
     );
 }
+
+// --- B397 (MISCOMPILE): a tuple comprehension lowered to a runtime `.map`
+// --- over the FLAT tuple array, so an element that is itself a tuple nested
+// --- in the result (and a multi-slot source element was walked one slot at a
+// --- time). The instance whose layout `.map` gets wrong is emitted unrolled.
+
+/// The item's repro, through shipped `combine`. Red before the fix: `x=1,2
+/// y=c l=undefined`, twice.
+#[test]
+fn b397_combine_over_a_tuple_valued_source_reads_flat() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ SignalCell, combine };\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet point = SignalCell::new((1, 2));\n",
+            "\tlet label = SignalCell::new(\"c\");\n",
+            "\tlet both = combine((point, label));\n",
+            "\tlet ((x, y), l) = both.get();\n",
+            "\tprint(i\"{x} {y} {l}\");\n",
+            "\tpoint.set((3, 4));\n",
+            "\tlet ((x2, y2), l2) = both.get();\n",
+            "\tprint(i\"{x2} {y2} {l2}\");\n",
+            "}\n",
+        ),
+        "1 2 c\n3 4 c\n",
+    );
+}
+
+/// A user comprehension whose RESULT elements are tuples (`(7, c.get())`)
+/// splices each one, and one whose element is a tuple reads it whole. Red
+/// before the fix: `a=1,2 b=c c=undefined`, `whole.1=undefined`,
+/// `p.0.1=7,x p.1.0=undefined p.1.1=undefined`.
+#[test]
+fn b397_a_comprehensions_tuple_results_splice_into_the_flat_result() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::SignalCell;\n",
+            "\n",
+            "fun reads<T: (2..)>(cells: (U in T: SignalCell<U>)): T {\n",
+            "\t(c in cells => c.get())\n",
+            "}\n",
+            "\n",
+            "fun pairs<T: (2..)>(cells: (U in T: SignalCell<U>)): (U in T: (i32, U)) {\n",
+            "\t(c in cells => (7, c.get()))\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet ((a, b), c) = reads((SignalCell::new((1, 2)), SignalCell::new(\"c\")));\n",
+            "\tprint(i\"a={a} b={b} c={c}\");\n",
+            "\tlet whole = reads((SignalCell::new((1, 2)), SignalCell::new(\"c\")));\n",
+            "\tprint(i\"whole.1={whole.1}\");\n",
+            "\tlet p = pairs((SignalCell::new(1), SignalCell::new(\"x\")));\n",
+            "\tprint(i\"p.0.1={p.0.1} p.1.0={p.1.0} p.1.1={p.1.1}\");\n",
+            "}\n",
+        ),
+        "a=1 b=2 c=c\nwhole.1=c\np.0.1=1 p.1.0=7 p.1.1=x\n",
+    );
+}
+
+/// The control: over scalar cells the `.map` lowering was right, and it is
+/// still what is emitted — `combine` of two scalar cells prints as before and
+/// its emitted comprehension is the runtime map (green before and after).
+#[test]
+fn b397_a_comprehension_over_scalar_elements_keeps_the_runtime_map() {
+    let source = concat!(
+        "import std::io::print;\n",
+        "import std::reactive::SignalCell;\n",
+        "\n",
+        "fun reads<T: (2..)>(cells: (U in T: SignalCell<U>)): T {\n",
+        "\t(c in cells => c.get())\n",
+        "}\n",
+        "\n",
+        "fun main() {\n",
+        "\tlet (a, b) = reads((SignalCell::new(1), SignalCell::new(\"c\")));\n",
+        "\tprint(i\"a={a} b={b}\");\n",
+        "}\n",
+    );
+    assert_compiles_and_runs(source, "a=1 b=c\n");
+    assert_emits_containing(source, ".map((c) =>");
+}

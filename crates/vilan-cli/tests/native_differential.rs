@@ -2098,6 +2098,104 @@ fn a_literal_assigned_to_a_narrow_binding_takes_the_bindings_width() {
     );
 }
 
+/// B389's five literal positions, natively: an unsuffixed literal takes its
+/// context's width where the POSITION states none the emitter can read — the
+/// left operand of a comparison and of an arithmetic operator, a `match` arm,
+/// a generic call's argument, a list literal's elements, and a bare `let`
+/// typed by a later use (through a comparison peer and a binding built from
+/// it). The JS backend has one number and never asks; the Rust one wrote
+/// `0i32 < n_u64` and `identity((5i32))` for a `u64` instance until the
+/// solver recorded each literal's settled width.
+const LITERAL_POSITIONS_PROBE: &str = concat!(
+    "fun take(count: u53): u53 { count }\n",
+    "fun half(value: f64): f64 { value / 2 }\n",
+    "fun identity<T>(value: T): T { value }\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet n: u53 = 4;\n",
+    "\tprint(take(1 + n));\n",
+    "\tif 0 < n { print(\"positive\"); }\n",
+    "\tlet m = 10 - n;\n",
+    "\tprint(take(m));\n",
+    "\tlet xs: List<u32> = [0, 1, 2];\n",
+    "\tprint(xs[2]);\n",
+    "\tmatch n {\n",
+    "\t\t4 => print(\"four\"),\n",
+    "\t\t_ => print(\"other\"),\n",
+    "\t}\n",
+    "\tlet k: i53 = identity(5);\n",
+    "\tprint(k);\n",
+    "\tlet bare = 7;\n",
+    "\tprint(take(bare));\n",
+    "\tmut i = 0;\n",
+    "\tlet limit: u53 = 3;\n",
+    "\tfor i < limit { i += 1; }\n",
+    "\tprint(take(i));\n",
+    "\tlet one = 1;\n",
+    "\tlet halved = one / 2;\n",
+    "\tprint(half(one));\n",
+    "\tprint(halved);\n",
+    "\tlet x: f64 = 3;\n",
+    "\tprint(1 / x);\n",
+    "\tprint(3 / 2.0);\n",
+    "\tlet quarter = 1 / 4.0;\n",
+    "\tprint(quarter);\n",
+    "}\n",
+);
+
+#[test]
+fn the_five_literal_positions_take_their_contexts_width_natively() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_literal_positions.vl"),
+        LITERAL_POSITIONS_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_literal_positions.vl"),
+        Verdict::Identical,
+        "a literal must take its context's width in every position B389 names — a mismatch is \
+         a rustc refusal of the emitted Rust, which is a backend defect"
+    );
+}
+
+/// B397: `combine` over a source whose value is itself a TUPLE. The JS
+/// backend read it wrong (`x=1,2 y=c l=undefined`) until the comprehension was
+/// emitted unrolled for that instance; the native one refuses a mapped tuple by
+/// name today. The claim held here is the differential's own: whatever the
+/// native backend does with this program, it is never a DIFFERENT answer — a
+/// refusal now, the same bytes once it lowers comprehensions.
+const COMBINE_TUPLE_ELEMENT_PROBE: &str = concat!(
+    "import std::reactive::{ SignalCell, combine };\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet point = SignalCell::new((1, 2));\n",
+    "\tlet label = SignalCell::new(\"c\");\n",
+    "\tlet both = combine((point, label));\n",
+    "\tlet ((x, y), l) = both.get();\n",
+    "\tprint(i\"{x} {y} {l}\");\n",
+    "\tpoint.set((3, 4));\n",
+    "\tlet ((x2, y2), l2) = both.get();\n",
+    "\tprint(i\"{x2} {y2} {l2}\");\n",
+    "}\n",
+);
+
+#[test]
+fn combine_over_a_tuple_valued_source_is_never_a_different_answer_natively() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_combine_tuple.vl"),
+        COMBINE_TUPLE_ELEMENT_PROBE,
+    )
+    .expect("write the probe program");
+    let verdict = compare(&staged, "native_probe_combine_tuple.vl");
+    assert!(
+        !matches!(verdict, Verdict::Broken(_)),
+        "the native backend must refuse this program by name or print what node prints: \
+         {verdict:?}"
+    );
+}
+
 /// F31's trap, in one program: the read whose binding was declared OUTSIDE the
 /// loop keeps its copy, and the read whose binding the loop body itself
 /// declares moves.

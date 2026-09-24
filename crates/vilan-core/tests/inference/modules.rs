@@ -2621,19 +2621,22 @@ fn a_closure_parameter_of_an_unimplemented_type_fails_the_bound() {
 
 #[test]
 fn a_let_bound_closure_with_an_untypable_parameter_reports_honestly() {
-    // The one shape the deferral cannot finish: a let-bound closure whose
-    // parameter no owning call ever types. Before the fix this misrendered
-    // silently; now it is an honest unresolved-type diagnostic (annotating
-    // the parameter resolves it).
-    assert_fails_with(
+    // The shape the deferral could not finish: a let-bound closure whose
+    // parameter no OWNING call types. Before that fix this misrendered
+    // silently; then it was an honest unresolved-type diagnostic; since B392
+    // the parameter takes its first call site's type when the fixpoint stalls
+    // (`wrap("later")` makes `x` a `str`), and the page renders.
+    assert_compiles_and_runs(
         r#"
+        import std::io::print;
         import std::ui::{ View, render, view };
         fun main() {
             let wrap = |x| view("p").child(x);
-            let _page = render(wrap("later"));
+            print(render(wrap("later")));
         }
+        main();
         "#,
-        "could not be resolved",
+        "<p>later</p>\n",
     );
 }
 

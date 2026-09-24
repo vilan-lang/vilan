@@ -12253,3 +12253,706 @@ fn the_delta_feed_shape_admits_a_real_source_and_refuses_a_plain_struct() {
         "false\n2\n",
     );
 }
+
+// --- B395: a supertrait DEFAULT on a type that implements the supertrait at
+// --- OTHER arguments than a subtrait's blanket bounds it at. The default is
+// --- reached through both the type's own impl and the blanket (its subject is
+// --- a hole); the blanket used to carry it because it registered first, and the
+// --- call was then refused at the blanket's bound. The blanket's bound is now
+// --- read at its arguments (B268) and a blanket it does not hold for does not
+// --- carry the member.
+
+/// The item's repro: `Cell` is a `Base<i32>`, the blanket is over
+/// `Base<List<T>>`, and `twice` is `Base`'s default. Red before the fix:
+/// "'Cell' does not implement trait 'Base<List<T>>'".
+#[test]
+fn b395_a_supertrait_default_on_other_arguments_reaches_the_types_own_impl() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base<T> {
+            fun read(self): T;
+            fun twice(self): i32 { 2 }
+        }
+
+        trait Feed<T> with Base<List<T>> { fun feeds(self): bool; }
+
+        impl type S: Base<List<type T>> with Feed<T> {
+            fun feeds(self): bool { false }
+        }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Base<i32> {
+            fun read(self): i32 { self.n }
+        }
+
+        fun main() {
+            let cell = Cell { n = 1 };
+            print(cell.twice());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+/// The same pair with the type's own impl declared FIRST — ordering-sensitive
+/// by construction, since the old answer was the first registered impl. Green
+/// before the fix too; it holds that the fix is not an order flip.
+#[test]
+fn b395_the_same_default_with_the_types_impl_declared_first() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base<T> {
+            fun read(self): T;
+            fun twice(self): i32 { 2 }
+        }
+
+        trait Feed<T> with Base<List<T>> { fun feeds(self): bool; }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Base<i32> {
+            fun read(self): i32 { self.n }
+        }
+
+        impl type S: Base<List<type T>> with Feed<T> {
+            fun feeds(self): bool { false }
+        }
+
+        fun main() {
+            let cell = Cell { n = 1 };
+            print(cell.twice());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+/// The item's control: the supertrait at the SAME arguments as the blanket's
+/// bound (`Base<T>`) — the blanket's bound holds, so it may carry the default
+/// and the answer is the same. Green before the fix.
+#[test]
+fn b395_the_control_at_matching_arguments() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        trait Base<T> {
+            fun read(self): T;
+            fun twice(self): i32 { 2 }
+        }
+
+        trait Feed<T> with Base<T> { fun feeds(self): bool; }
+
+        impl type S: Base<type T> with Feed<T> {
+            fun feeds(self): bool { false }
+        }
+
+        struct Cell { n: i32 }
+
+        impl Cell with Base<i32> {
+            fun read(self): i32 { self.n }
+        }
+
+        fun main() {
+            let cell = Cell { n = 1 };
+            print(cell.twice());
+            print(cell.feeds());
+        }
+        "#,
+        "2\nfalse\n",
+    );
+}
+
+/// A112 S3's ruled shape, as std will declare it: a feed trait `with
+/// Source<List<T>>` and BOTH its blankets — the "no log" one over every list
+/// source and the forwarding one over every `DeltaSource`. `Source`'s defaults
+/// (`sub`, `map`) must reach a custom `Source<i32>` (`reactive-on-change.vl`'s
+/// `Stored`) and a `SignalCell<i32>`, a list-valued custom source must still
+/// map, and the feed must still answer per source kind through the
+/// supertrait. Red before the fix at `stored.sub` ("'Stored<i32>' does not
+/// implement trait 'Source<List<T>>'").
+#[test]
+fn b395_the_ruled_delta_feed_shape_leaves_source_defaults_on_other_arguments() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ DeltaCursor, DeltaSource, ListCell, SeqOp, Signal, SignalCell, Source, Subscription };
+
+        trait Feed<T> with Source<List<T>> {
+            fun cursor_of(self): Option<DeltaCursor>;
+        }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun cursor_of(self): Option<DeltaCursor> { None }
+        }
+
+        impl type S: DeltaSource<List<type T>, SeqOp<T>> with Feed<T> {
+            fun cursor_of(self): Option<DeltaCursor> { Some(self.cursor()) }
+        }
+
+        struct Stored<T> { inner: SignalCell<T> }
+
+        impl Stored<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+
+            [must_use]
+            fun on_change(self, observer: |T| void): Subscription {
+                self.inner.on_change(observer)
+            }
+        }
+
+        fun fed<T, S: Feed<T>>(source: S): str {
+            match source.cursor_of() {
+                Some(let _cursor) => i"log over {source.get().len()}",
+                None => i"none over {source.get().len()}",
+            }
+        }
+
+        fun main() {
+            let stored = Stored { inner = Signal::new(10) };
+            let eagerly = stored.sub(|value| print(i"eager {value}"));
+            eagerly.dispose();
+            let labelled = stored.map(|value| i"n={value}");
+            print(labelled.get());
+            let number: SignalCell<i32> = Signal::new(3);
+            print(number.map(|value| value * 2).get());
+            let listed = Stored { inner = Signal::new([1, 2]) };
+            print(listed.map(|items| items.len() * 10).get());
+            let cell: ListCell<str> = ListCell<str>::of(["a"]);
+            let plain: SignalCell<List<str>> = Signal::new(["a", "b"]);
+            print(i"{fed(cell)} / {fed(plain)} / {fed(listed)}");
+            print(plain.map(|items| items.len()).get());
+        }
+        "#,
+        "eager 10\nn=10\n6\n20\nlog over 1 / none over 2 / none over 2\n2\n",
+    );
+}
+
+/// The soundness half of the same shape: carrying the default through the
+/// type's own impl must not make a `Source<i32>` a feed. Green before the fix
+/// (B394's guard); held here beside the fix that reads the blanket's bound.
+#[test]
+fn b395_the_ruled_shape_still_refuses_a_scalar_source_as_a_feed() {
+    let source = r#"
+        import std::io::print;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ DeltaCursor, Signal, SignalCell, Source, Subscription };
+
+        trait Feed<T> with Source<List<T>> {
+            fun cursor_of(self): Option<DeltaCursor>;
+        }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun cursor_of(self): Option<DeltaCursor> { None }
+        }
+
+        struct Stored<T> { inner: SignalCell<T> }
+
+        impl Stored<type T> with Source<T> {
+            fun get(self): T { self.inner.get() }
+
+            [must_use]
+            fun on_change(self, observer: |T| void): Subscription {
+                self.inner.on_change(observer)
+            }
+        }
+
+        fun fed<T, S: Feed<T>>(source: S): bool { source.cursor_of().is_none() }
+
+        fun main() {
+            let stored = Stored { inner = Signal::new(10) };
+            print(stored.map(|value| value + 1).get());
+            print(fed(stored));
+        }
+        "#;
+    let errors = compile(source).expect_err("a `Source<i32>` must not be a feed");
+    assert_eq!(
+        errors.len(),
+        1,
+        "the ONE refusal is the feed bound; `stored.map` must check clean: {errors:#?}"
+    );
+    assert!(
+        errors[0].contains("'Stored<i32>' does not implement trait 'Feed<T>'"),
+        "{errors:#?}"
+    );
+}
+
+/// `reactive_channels`' keyed mirror in miniature: a source over
+/// `Option<List<T>>` whose impl binds `T: Keyed<K>` — a bound whose ARGUMENT
+/// is another of the impl's binders, itself bounded (`K: PartialEq`; an
+/// unbounded `K` compares as a hole and hides the defect). The receiver's own
+/// impl must be read as holding for it (`Keyed<K>` at `K := str`, which `Row`
+/// provides), or the
+/// only impl left to carry `Source`'s default is the feed blanket, refused at
+/// `Source<List<T>>`. Red with the raw argument read: "'Mirror<str, Row>' does
+/// not implement trait 'Source<List<T>>'".
+#[test]
+fn b395_an_impl_whose_bound_names_another_binder_carries_the_default() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::compare::PartialEq;
+        import std::option::Option::{ self, None, Some };
+        import std::reactive::{ Signal, SignalCell, Source, Subscription };
+
+        trait Feed<T> with Source<List<T>> { fun feeds(self): bool; }
+
+        impl type S: Source<List<type T>> with Feed<T> {
+            fun feeds(self): bool { false }
+        }
+
+        trait Keyed<K> { fun key(self): K; }
+
+        struct Row { id: str }
+
+        impl Row with Keyed<str> {
+            fun key(self): str { self.id }
+        }
+
+        struct Mirror<K, T> { inner: SignalCell<Option<List<T>>>, last: SignalCell<Option<K>> }
+
+        impl Mirror<type K: PartialEq, type T: Keyed<K>> with Source<Option<List<T>>> {
+            fun get(self): Option<List<T>> { self.inner.get() }
+
+            [must_use]
+            fun on_change(self, observer: |Option<List<T>>| void): Subscription {
+                self.inner.on_change(observer)
+            }
+        }
+
+        fun main() {
+            let seeded: Option<List<Row>> = Some([Row { id = "a" }]);
+            let nothing: Option<str> = None;
+            let mirror = Mirror { inner = Signal::new(seeded), last = Signal::new(nothing) };
+            let shown = mirror.sub(|value| match value {
+                Some(let rows) => print(i"rows:{rows.len()}"),
+                None => print("rows:none"),
+            });
+            shown.dispose();
+        }
+        "#,
+        "rows:1\n",
+    );
+}
+
+// --- B389: the five literal positions B370's ruling covers and its fix did not
+// --- deliver. An unsuffixed literal takes its type from its context in each,
+// --- for every numeric width; each position is pinned at `i53`, `u32` and
+// --- `f64` (all red before the fix, all green at `i32`, which was the default
+// --- they fell back to), and the census's thirteen passing positions are the
+// --- controls. `take` is the typed use each program ends in.
+
+/// One program over the width `ty`: `take` (a function of that width) and
+/// `body` inside `main`, run and compared.
+fn b389_program(ty: &str, prelude: &str, body: &str) -> String {
+    format!(
+        "import std::io::print;\n\nfun take(count: {ty}): {ty} {{ count }}\n{prelude}\nfun main() {{\n{body}\n}}\n"
+    )
+    .replace("WIDTH", ty)
+}
+
+fn b389_runs(ty: &str, prelude: &str, body: &str, expected: &str) {
+    let program = b389_program(ty, prelude, body);
+    match compile_and_run(&program) {
+        Ok(stdout) => assert_eq!(stdout, expected, "at `{ty}`:\n{program}"),
+        Err(errors) => panic!("at `{ty}` the program was refused: {errors:#?}\n{program}"),
+    }
+}
+
+/// Position 1: a literal LEFT of a binary operator — arithmetic, a
+/// comparison, and an unannotated binding over the arithmetic (whose type is
+/// the right operand's, not the literal's default).
+fn b389_left_operand(ty: &str) {
+    b389_runs(
+        ty,
+        "",
+        "\tlet n: WIDTH = 4;\n\tprint(take(1 + n));\n\tif 0 < n { print(\"positive\"); }\n\tlet m = 10 - n;\n\tprint(take(m));",
+        "5\npositive\n6\n",
+    );
+}
+
+#[test]
+fn b389_a_left_literal_operand_takes_the_right_operands_type_i53() {
+    b389_left_operand("i53");
+}
+
+#[test]
+fn b389_a_left_literal_operand_takes_the_right_operands_type_u32() {
+    b389_left_operand("u32");
+}
+
+#[test]
+fn b389_a_left_literal_operand_takes_the_right_operands_type_f64() {
+    b389_left_operand("f64");
+}
+
+/// Position 2: the elements of an ANNOTATED list literal, and (the same law
+/// with no annotation) literal elements beside a typed sibling.
+fn b389_list_elements(ty: &str) {
+    b389_runs(
+        ty,
+        "",
+        "\tlet xs: List<WIDTH> = [0, 1, 2];\n\tprint(take(xs[2]));\n\tlet n: WIDTH = 7;\n\tlet ys = [0, n];\n\tprint(take(ys[1]));",
+        "2\n7\n",
+    );
+}
+
+#[test]
+fn b389_an_annotated_list_literals_elements_take_its_element_type_i53() {
+    b389_list_elements("i53");
+}
+
+#[test]
+fn b389_an_annotated_list_literals_elements_take_its_element_type_u32() {
+    b389_list_elements("u32");
+}
+
+#[test]
+fn b389_an_annotated_list_literals_elements_take_its_element_type_f64() {
+    b389_list_elements("f64");
+}
+
+/// Position 3: a literal MATCH pattern takes the subject's type.
+fn b389_match_pattern(ty: &str) {
+    b389_runs(
+        ty,
+        "",
+        "\tlet n: WIDTH = 4;\n\tmatch n {\n\t\t0 => print(\"zero\"),\n\t\t4 => print(\"four\"),\n\t\t_ => print(\"other\"),\n\t}",
+        "four\n",
+    );
+}
+
+#[test]
+fn b389_a_literal_match_pattern_takes_the_subjects_type_i53() {
+    b389_match_pattern("i53");
+}
+
+#[test]
+fn b389_a_literal_match_pattern_takes_the_subjects_type_u32() {
+    b389_match_pattern("u32");
+}
+
+#[test]
+fn b389_a_literal_match_pattern_takes_the_subjects_type_f64() {
+    b389_match_pattern("f64");
+}
+
+/// Position 4: a GENERIC call's return — the literal argument is typed by
+/// what the call's expectation binds the generic to, free function and
+/// method alike.
+fn b389_generic_call(ty: &str) {
+    b389_runs(
+        ty,
+        "fun identity<T>(value: T): T { value }\n\nstruct Box {}\n\nimpl Box {\n\tfun same<T>(self, value: T): T { value }\n}\n",
+        "\tlet n: WIDTH = identity(5);\n\tprint(take(n));\n\tlet m: WIDTH = Box {}.same(6);\n\tprint(take(m));",
+        "5\n6\n",
+    );
+}
+
+#[test]
+fn b389_a_generic_calls_literal_argument_takes_the_expected_return_i53() {
+    b389_generic_call("i53");
+}
+
+#[test]
+fn b389_a_generic_calls_literal_argument_takes_the_expected_return_u32() {
+    b389_generic_call("u32");
+}
+
+#[test]
+fn b389_a_generic_calls_literal_argument_takes_the_expected_return_f64() {
+    b389_generic_call("f64");
+}
+
+/// Position 5: a bare `let n = 0` takes its type from a LATER use — a typed
+/// argument, a comparison peer (`i < limit`, the loop an index walks), and a
+/// binding built from it (`let doubled = chained * 2`).
+fn b389_bare_let(ty: &str) {
+    b389_runs(
+        ty,
+        "",
+        "\tlet n = 7;\n\tprint(take(n));\n\tmut i = 0;\n\tlet limit: WIDTH = 3;\n\tfor i < limit { i += 1; }\n\tprint(take(i));\n\tlet chained = 2;\n\tlet doubled = chained * 2;\n\tprint(take(doubled));",
+        "7\n3\n4\n",
+    );
+}
+
+#[test]
+fn b389_a_bare_literal_binding_takes_the_type_of_its_use_i53() {
+    b389_bare_let("i53");
+}
+
+#[test]
+fn b389_a_bare_literal_binding_takes_the_type_of_its_use_u32() {
+    b389_bare_let("u32");
+}
+
+#[test]
+fn b389_a_bare_literal_binding_takes_the_type_of_its_use_f64() {
+    b389_bare_let("f64");
+}
+
+/// The binding's type is its USE's, so the operators over it are too: `one`
+/// is an `f64` because `take` makes it one, and `one / 2` divides as floats
+/// (`0.5`). Typing the binding late without its arithmetic following would
+/// be B370's truncation again.
+#[test]
+fn b389_a_literal_binding_typed_by_a_later_use_divides_at_that_type() {
+    b389_runs(
+        "f64",
+        "",
+        "\tlet one = 1;\n\tlet half = one / 2;\n\tprint(take(one));\n\tprint(half);",
+        "1\n0.5\n",
+    );
+}
+
+/// A literal binding no use types keeps its default, `i32` — an integer
+/// division still truncates, and the literal still reaches an `i32` use.
+#[test]
+fn b389_an_untyped_literal_binding_keeps_its_default() {
+    b389_runs(
+        "i32",
+        "",
+        "\tlet three = 3;\n\tprint(three / 2);\n\tmut count = 0;\n\tfor count < 2 { count += 1; }\n\tprint(take(count));",
+        "1\n2\n",
+    );
+}
+
+/// A literal binding's first typed use decides; a SECOND use at another width
+/// is that use's mismatch — the binding does not quietly serve both.
+#[test]
+fn b389_a_literal_binding_used_at_two_widths_is_refused_at_the_second() {
+    assert_fails_with(
+        "import std::io::print;\n\nfun take(count: u53): u53 { count }\nfun other(count: u32): u32 { count }\n\nfun main() {\n\tlet n = 7;\n\tprint(take(n));\n\tprint(other(n));\n}\n",
+        "Expected u32, but got u53",
+    );
+}
+
+/// The controls: the census's thirteen positions that already took their
+/// context's type, at each of the three widths — none may move.
+fn b389_controls(ty: &str) {
+    let cases: [(&str, &str); 13] = [
+        ("argument", "\tlet _ = take(3);"),
+        ("annotated_let", "\tlet n: WIDTH = 0;\n\tlet _ = take(n);"),
+        (
+            "binary_right",
+            "\tlet n: WIDTH = 4;\n\tlet _ = take(n + 1);",
+        ),
+        (
+            "struct_field",
+            "\tlet h = Holder { at = 0 };\n\tlet _ = take(h.at);",
+        ),
+        ("return_position", "\tlet _ = take(zero());"),
+        (
+            "comparison",
+            "\tlet n: WIDTH = 4;\n\tif n > 0 { print(\"yes\"); }",
+        ),
+        (
+            "compound_assign",
+            "\tmut n: WIDTH = 4;\n\tn -= 1;\n\tlet _ = take(n);",
+        ),
+        (
+            "tuple_element",
+            "\tlet pair: (WIDTH, str) = (0, \"a\");\n\tlet _ = take(pair.0);",
+        ),
+        (
+            "closure_parameter",
+            "\tlet f = |n: WIDTH| take(n);\n\tlet _ = f(7);",
+        ),
+        (
+            "option_some",
+            "\tlet found: Option<WIDTH> = Some(0);\n\tmatch found {\n\t\tSome(let n) => {\n\t\t\tlet _ = take(n);\n\t\t},\n\t\tNone => {},\n\t}",
+        ),
+        (
+            "list_index_literal",
+            "\tlet xs: List<str> = [\"a\", \"b\"];\n\tprint(xs[0]);",
+        ),
+        (
+            "downward_loop",
+            "\tlet xs: List<str> = [\"a\", \"b\"];\n\tmut i: WIDTH = xs.len().as_WIDTH();\n\tfor i > 0 {\n\t\ti -= 1;\n\t\tprint(xs[i.as_i32()]);\n\t}",
+        ),
+        (
+            "underflow_runs",
+            "\tmut i: WIDTH = 0;\n\ti -= 1;\n\tprint(i\"{i}\");",
+        ),
+    ];
+    for (name, body) in cases {
+        let program = b389_program(
+            ty,
+            "struct Holder { at: WIDTH }\n\nfun zero(): WIDTH { 0 }\n",
+            body,
+        );
+        if let Err(errors) = compile(&program) {
+            panic!("control `{name}` at `{ty}` was refused: {errors:#?}\n{program}");
+        }
+    }
+}
+
+#[test]
+fn b389_the_thirteen_passing_positions_stay_passing_i53() {
+    b389_controls("i53");
+}
+
+#[test]
+fn b389_the_thirteen_passing_positions_stay_passing_u32() {
+    b389_controls("u32");
+}
+
+#[test]
+fn b389_the_thirteen_passing_positions_stay_passing_f64() {
+    b389_controls("f64");
+}
+
+// --- B396: a SECOND bound over `T` on a generic function's `S` stopped the
+// --- argument that determines `T` from binding it. `trait_args_for` answers a
+// --- blanket's still-abstract arguments as its fallback, and
+// --- `derive_generics_from_bounds` bound the caller's `T` to that foreign
+// --- binder first; the key closure could no longer bind it and every bound
+// --- was reported against an abstract `T`.
+
+/// The source that is NOT a list source (an rpc mirror's shape), and a feed
+/// trait declared the way std's `DeltaFeed` is — a blanket over every
+/// `Source<List<T>>`. `BOUNDS` is the two-bound clause under test.
+const B396_PROGRAM: &str = concat!(
+    "import std::compare::PartialEq;\n",
+    "import std::io::print;\n",
+    "import std::option::Option::{ self, None, Some };\n",
+    "import std::reactive::{ Signal, SignalCell, Source, Subscription };\n",
+    "\n",
+    "trait Feed<T> { fun feeds(self): bool; }\n",
+    "\n",
+    "impl type S: Source<List<type T>> with Feed<T> {\n",
+    "\tfun feeds(self): bool { false }\n",
+    "}\n",
+    "\n",
+    "[derive(PartialEq)]\n",
+    "struct Todo { id: i32, label: str }\n",
+    "\n",
+    "struct Mirror<T> { inner: SignalCell<Option<List<T>>> }\n",
+    "\n",
+    "impl Mirror<type T> with Source<Option<List<T>>> {\n",
+    "\tfun get(self): Option<List<T>> { self.inner.get() }\n",
+    "\n",
+    "\t[must_use]\n",
+    "\tfun on_change(self, observer: |Option<List<T>>| void): Subscription {\n",
+    "\t\tself.inner.on_change(observer)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun run<T: PartialEq, K: PartialEq, BOUNDS>(source: S, key: |T| K): i32 {\n",
+    "\tmut total = 0;\n",
+    "\tfor item in source.get() {\n",
+    "\t\tif key(item) == key(item) { total += 1; }\n",
+    "\t}\n",
+    "\ttotal\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tBODY\n",
+    "}\n",
+);
+
+fn b396_refusal(bounds: &str) {
+    let program = B396_PROGRAM.replace("BOUNDS", bounds).replace(
+        "BODY",
+        "let seeded: Option<List<Todo>> = None;\n\tlet remote = Mirror { inner = Signal::new(seeded) };\n\tprint(run(remote, |todo: Todo| todo.id));",
+    );
+    let errors = compile(&program).expect_err("a mirror is not a list source");
+    assert_eq!(
+        errors.len(),
+        2,
+        "one refusal per bound, each at `Todo`, with `{bounds}`: {errors:#?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error
+                .contains("'Mirror<Todo>' does not implement trait 'Source<List<Todo>>'")),
+        "{errors:#?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("'Mirror<Todo>' does not implement trait 'Feed<Todo>'")),
+        "{errors:#?}"
+    );
+}
+
+/// Red before the fix: three errors, `Feed<T>`, `Source<List<T>>` and "generic
+/// parameter 'T' is missing the bound ': PartialEq'".
+#[test]
+fn b396_a_second_bound_does_not_unbind_the_key_closures_parameter() {
+    b396_refusal("S: Source<List<T>> + Feed<T>");
+}
+
+/// The same in the other order (red before the fix, the same three errors).
+#[test]
+fn b396_a_second_bound_written_first_does_not_unbind_it_either() {
+    b396_refusal("S: Feed<T> + Source<List<T>>");
+}
+
+/// The control: a real list source satisfies both bounds, with the key
+/// closure's parameter unannotated, in either order — green before and after.
+#[test]
+fn b396_a_list_source_under_both_bounds_runs_in_either_order() {
+    for bounds in [
+        "S: Source<List<T>> + Feed<T>",
+        "S: Feed<T> + Source<List<T>>",
+    ] {
+        let program = B396_PROGRAM.replace("BOUNDS", bounds).replace(
+            "BODY",
+            "let todos: SignalCell<List<Todo>> = Signal::new([Todo { id = 1, label = \"a\" }]);\n\tprint(run(todos, |todo| todo.id));",
+        );
+        match compile_and_run(&program) {
+            Ok(stdout) => assert_eq!(stdout, "1\n", "with `{bounds}`"),
+            Err(errors) => panic!("with `{bounds}`: {errors:#?}"),
+        }
+    }
+}
+
+// --- Found under B389: an expression of unsuffixed literals with a FRACTIONAL
+// --- one in it divided as integers when nothing stated a type — the left
+// --- literal took `i32`, so `1 / 4.0` was `i32 / f64`, recorded truncating
+// --- division, and printed `0`.
+
+/// Red before: `0`, `1`, `0` (the binding over the literal typed by its peer
+/// likewise truncated).
+#[test]
+fn a_literal_expression_with_a_fractional_literal_divides_as_floats() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet quarter = 1 / 4.0;\n",
+            "\tprint(quarter);\n",
+            "\tprint(3 / 2.0);\n",
+            "\tlet one = 1;\n",
+            "\tprint(one / 4.0);\n",
+            "}\n",
+        ),
+        "0.25\n1.5\n0.25\n",
+    );
+}
+
+/// The control: the fractional literal on the LEFT, which already typed the
+/// expression as `f64` (green before and after).
+#[test]
+fn a_fractional_left_literal_already_divided_as_floats() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "\n",
+            "fun main() {\n",
+            "\tprint(1.0 / 4);\n",
+            "\tprint(7 / 2);\n",
+            "}\n",
+        ),
+        "0.25\n3\n",
+    );
+}
