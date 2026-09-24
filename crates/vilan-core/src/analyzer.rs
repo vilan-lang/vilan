@@ -36449,6 +36449,14 @@ impl<'src> Analyzer<'src> {
                     }
                     false => None,
                 };
+                // An expression of literals alone, one of them fractional, is
+                // an `f64` expression with no context to say otherwise: its
+                // integer literals take `f64` too. Read left-first, `1 / 4.0`
+                // was `i32 / f64` and divided truncating — `0`, silently.
+                let peer = match (peer, self.numeric_primitive_name(&constraint)) {
+                    (None, None) => self.fractional_literal_default(expr_id),
+                    (peer, _) => peer,
+                };
                 if let Some(peer) = &peer {
                     self.note_binary_context(expr_id, peer);
                 }
@@ -43391,6 +43399,18 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// B389 — the default an expression of unsuffixed literals takes as a
+    /// WHOLE where no context states a type: `f64` as soon as one of its
+    /// literals has a fraction (`1 / 4.0` is float division, `0.25`), and
+    /// nothing otherwise (each integer literal's own default, `i32`, stands).
+    fn fractional_literal_default(&self, expr_id: Id) -> Option<Type> {
+        let mut shape = LiteralShape::default();
+        (self.literal_numeric_shape(expr_id, false, &mut shape)
+            && shape.saw_literal
+            && shape.fractional)
+            .then(|| self.primitive_struct_type("f64"))
+    }
+
     /// B389 — whether `variable_id` is a LITERAL binding: unannotated, not
     /// `lazy`, initialized by unsuffixed literals (through other literal
     /// bindings). See `literal_lets_wait`.
@@ -43508,7 +43528,11 @@ impl<'src> Analyzer<'src> {
                         .lets
                         .iter()
                         .find_map(|variable_id| self.literal_let_expectations.get(variable_id))
-                        .map(|type_id| type_id.get_type(self)),
+                        .map(|type_id| type_id.get_type(self))
+                        .or_else(|| {
+                            (other.lets.is_empty() && other.fractional)
+                                .then(|| self.primitive_struct_type("f64"))
+                        }),
                     false => Some(self.infer_type(other_side, &Type::Unknown, &HashMap::default())),
                 };
                 let Some(peer_type) = peer_type else {
@@ -50354,7 +50378,11 @@ impl<'src> Analyzer<'src> {
             // as inference typed it (`1 + n`, `0 < n` over `n: u53`) — read at
             // `Unknown` it answers its default and every check below would
             // compare that default with the right operand's real type.
-            if !matches!(
+            if !self.binary_context_types.contains_key(&binary_id)
+                && let Some(float) = self.fractional_literal_default(binary_id)
+            {
+                lhs_type = self.infer_type(lhs_id, &float, &HashMap::default());
+            } else if !matches!(
                 op,
                 BinaryOp::And | BinaryOp::Or | BinaryOp::Shl | BinaryOp::Shr | BinaryOp::UShr
             ) && self.is_unsuffixed_numeric(lhs_id)

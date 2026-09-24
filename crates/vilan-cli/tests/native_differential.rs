@@ -2083,6 +2083,9 @@ const LITERAL_POSITIONS_PROBE: &str = concat!(
     "\tprint(halved);\n",
     "\tlet x: f64 = 3;\n",
     "\tprint(1 / x);\n",
+    "\tprint(3 / 2.0);\n",
+    "\tlet quarter = 1 / 4.0;\n",
+    "\tprint(quarter);\n",
     "}\n",
 );
 

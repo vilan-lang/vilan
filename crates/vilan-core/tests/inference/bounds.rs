@@ -12914,3 +12914,45 @@ fn b396_a_list_source_under_both_bounds_runs_in_either_order() {
         }
     }
 }
+
+// --- Found under B389: an expression of unsuffixed literals with a FRACTIONAL
+// --- one in it divided as integers when nothing stated a type — the left
+// --- literal took `i32`, so `1 / 4.0` was `i32 / f64`, recorded truncating
+// --- division, and printed `0`.
+
+/// Red before: `0`, `1`, `0` (the binding over the literal typed by its peer
+/// likewise truncated).
+#[test]
+fn a_literal_expression_with_a_fractional_literal_divides_as_floats() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet quarter = 1 / 4.0;\n",
+            "\tprint(quarter);\n",
+            "\tprint(3 / 2.0);\n",
+            "\tlet one = 1;\n",
+            "\tprint(one / 4.0);\n",
+            "}\n",
+        ),
+        "0.25\n1.5\n0.25\n",
+    );
+}
+
+/// The control: the fractional literal on the LEFT, which already typed the
+/// expression as `f64` (green before and after).
+#[test]
+fn a_fractional_left_literal_already_divided_as_floats() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "\n",
+            "fun main() {\n",
+            "\tprint(1.0 / 4);\n",
+            "\tprint(7 / 2);\n",
+            "}\n",
+        ),
+        "0.25\n3\n",
+    );
+}
