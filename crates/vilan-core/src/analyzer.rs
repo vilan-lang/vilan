@@ -3963,6 +3963,13 @@ pub struct Analyzer<'src> {
     // element rather than a copy. Maps the binding id to whether the view is
     // writable (`&mut`). Drives the indexed-loop lowering + view classification.
     for_each_views: HashMap<Id, bool>,
+    // A written closure TYPE whose parameters are views (`|&mut T| void`): the
+    // closure type's id → per parameter, `Some(mutable)` for a `&`/`&mut` and
+    // `None` for a value. `walk_type_node` erases the `&` (a view is tracked
+    // beside the type, never in it), and the JS backend needs nothing more —
+    // an object is a reference there. The native backend's closure SIGNATURE
+    // does (F18 slice 3: `SignalCell::update(mutate: sync |&mut T| void)`).
+    closure_type_parameter_views: HashMap<TypeId, Vec<Option<bool>>>,
     // `match opt { Some(let v) => .. }` where `opt` is a call returning a view
     // wrapped in an enum payload (`fun get(..): Option<&mut i32> { Some(&mut
     // self.x) }`, or `Option<&mut Node>` for an aggregate). The capture `v` binds
@@ -6064,6 +6071,7 @@ impl<'src> Analyzer<'src> {
             for_each_next: HashMap::default(),
             for_each_iterable_types: HashMap::default(),
             for_each_views: HashMap::default(),
+            closure_type_parameter_views: HashMap::default(),
             wrapped_view_captures: HashMap::default(),
             prepped_binary_ops: Vec::new(),
             binary_context_types: HashMap::default(),
@@ -33340,6 +33348,17 @@ impl<'src> Analyzer<'src> {
                     .collect(),
             )),
             Node::ClosureType(parameters, return_type) => {
+                let views: Vec<Option<bool>> = parameters
+                    .0
+                    .iter()
+                    .map(|parameter| match &parameter.1.0 {
+                        Node::Reference(mutable, _) => Some(*mutable),
+                        _ => None,
+                    })
+                    .collect();
+                if views.iter().any(Option::is_some) {
+                    self.closure_type_parameter_views.insert(type_id, views);
+                }
                 let t_parameter_type_ids = parameters
                     .0
                     .iter()
@@ -53506,6 +53525,13 @@ pub struct Program<'src> {
     pub for_each_iterable_types: HashMap<Id, TypeId>,
     // `for e in &mut list` loop bindings → whether the element view is `&mut`.
     pub for_each_views: HashMap<Id, bool>,
+    /// A written closure TYPE's view parameters (`|&mut T| void`), keyed by the
+    /// closure type's id: per parameter, `Some(mutable)` for a `&`/`&mut` view
+    /// and `None` for a value. Only closure types with at least one view are
+    /// recorded. The type itself carries the POINTEE (views are tracked beside
+    /// types), so this is where the native backend reads the `&mut` its
+    /// closure signature has to spell.
+    pub closure_type_parameter_views: HashMap<TypeId, Vec<Option<bool>>>,
     pub binary_op_dispatch: HashMap<Id, Id>,
     /// B176: `str + value` binaries whose right operand is a generic parameter
     /// whose bound provides the string form — `(the parameter's constraint, the
@@ -63300,6 +63326,7 @@ fn analyze_over_world<'src>(
         for_each_next: analyzer.for_each_next,
         for_each_iterable_types: analyzer.for_each_iterable_types,
         for_each_views: analyzer.for_each_views,
+        closure_type_parameter_views: analyzer.closure_type_parameter_views,
         binary_op_dispatch: analyzer.binary_op_dispatch,
         concat_render_dispatch: analyzer.concat_render_dispatch,
         own_generic_call_bindings: analyzer.own_generic_call_bindings,

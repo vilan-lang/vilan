@@ -216,6 +216,13 @@ struct Emitter<'a, 'src> {
     /// type is not grounded, and only when it names the same declaration, so it
     /// can narrow an answer and never change one.
     expected_type: Option<TypeId>,
+    /// The CALLEE's substitution while a direct call's arguments are rendered,
+    /// so an argument's position is its parameter's type under the binding
+    /// the call makes (`Signal::new(Map::new())`: the argument's position is
+    /// `T`, which the CALL binds to `Map<str, i32>`). Consulted only to compute
+    /// that expectation — never while the argument itself is walked, where the
+    /// caller's substitution is the one in force.
+    argument_substitution: Option<HashMap<TypeId, TypeId>>,
     /// R3: the bindings boxed into a counted cell, and why they had to be.
     /// Computed over EVERY closure the program loaded, std's unreached ones
     /// included — it is a lookup the walk consults, not a measurement.
@@ -438,6 +445,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             current_self_traits: HashSet::new(),
             current_returns_view: false,
             expected_type: None,
+            argument_substitution: None,
             boxed: HashSet::new(),
             boxed_emitted: HashSet::new(),
             module_bindings: HashSet::new(),
@@ -1192,6 +1200,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             Type::Closure(parameters, return_type_id, _) => {
                 out.push_str("Fn");
+                // A view parameter is a different Rust signature, so it keys
+                // apart from the same closure type over values.
+                if let Some(views) = self.program.closure_type_parameter_views.get(&type_id) {
+                    for view in views {
+                        out.push_str(match view {
+                            Some(true) => "M",
+                            Some(false) => "R",
+                            None => "V",
+                        });
+                    }
+                }
                 self.write_key_arguments(parameters, out);
                 out.push_str("->");
                 self.write_type_key(*return_type_id, out);
@@ -1300,6 +1319,63 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
         }
         substitution
+    }
+
+    /// Closes a call's OPEN bindings from the position the call fills (B370's
+    /// law, on the generic-call path — the rule [`Emitter::variant_arguments`]
+    /// and [`Emitter::struct_arguments_at`] already apply to a constructor).
+    ///
+    /// `let cell: SignalCell<List<i32>> = SignalCell::new([])` records `T` as
+    /// `List<?>` at the call — the empty literal says nothing, and the
+    /// annotation is what closes it — and `Signal::new(Map::new())` leaves both
+    /// of `Map`'s arguments open the same way. JavaScript has one array and
+    /// never had to ask; natively an open binding is a refusal (or, minted, a
+    /// second Rust type). So a binding that is not GROUNDED, or a generic
+    /// parameter the call left unbound, is bound by matching the callee's
+    /// declared return type against the position's type — only when the
+    /// position is itself grounded, and never over a binding that already is.
+    fn close_open_bindings_from_position(
+        &self,
+        substitution: &mut HashMap<TypeId, TypeId>,
+        target: Id,
+    ) {
+        let Some(expected) = self
+            .expected_type
+            .filter(|type_id| self.is_grounded(*type_id))
+        else {
+            return;
+        };
+        let Some(function) = self.program.functions.get(&target) else {
+            return;
+        };
+        let Some(returns) = function.return_type_id else {
+            return;
+        };
+        let mut open: Vec<TypeId> = substitution
+            .iter()
+            .filter(|(_, bound)| !self.is_grounded(**bound))
+            .map(|(constraint_id, _)| *constraint_id)
+            .collect();
+        // The callee's own parameters AND the ones its signature mentions from
+        // an enclosing declaration — `Map::new`'s `K` and `V` are the impl's,
+        // not the function's.
+        let mut unbound = function.generic_parameter_constraint_ids.clone();
+        unbound.extend(mono::signature_generics(self.program, target));
+        for constraint_id in unbound {
+            if !substitution.contains_key(&constraint_id) && !open.contains(&constraint_id) {
+                open.push(constraint_id);
+            }
+        }
+        if open.is_empty() {
+            return;
+        }
+        let mut bound: HashMap<TypeId, TypeId> = HashMap::default();
+        self.bind_parameters(&open, returns, self.concrete(expected), &mut bound);
+        for (constraint_id, type_id) in bound {
+            if self.is_grounded(type_id) {
+                substitution.insert(constraint_id, type_id);
+            }
+        }
     }
 
     /// The substitution a trait DEFAULT body is specialized under: the trait's
@@ -1415,9 +1491,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // Read and CLEAR: the flag belongs to this position's outermost
                 // closure, not to a closure nested inside its own signature.
                 let is_async = std::mem::take(&mut self.expects_async);
+                // A parameter WRITTEN as a view (`|&mut T| void`) is a reference
+                // in the signature, as the closure literal that lands here binds
+                // it (`move |list: &mut Vec<i32>|`) — the analyzer records the
+                // `&`/`&mut` the type itself erases.
+                let views = self
+                    .program
+                    .closure_type_parameter_views
+                    .get(&type_id)
+                    .cloned()
+                    .unwrap_or_default();
                 let mut parts = Vec::new();
-                for parameter in &parameters {
-                    parts.push(self.rust_type(*parameter, span)?);
+                for (index, parameter) in parameters.iter().enumerate() {
+                    let rendered = self.rust_type(*parameter, span)?;
+                    parts.push(match views.get(index).copied().flatten() {
+                        Some(true) => format!("&mut {rendered}"),
+                        Some(false) => format!("&{rendered}"),
+                        None => rendered,
+                    });
                 }
                 // B309: the `context` clause is part of the TYPE, and
                 // `context::thread_contexts` appends one hidden parameter per
@@ -2858,6 +2949,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// and `mut-parameters.vl` is the pin — `original.with_x(9)` leaves
     /// `original.x` at 0, so the receiver was copied. Reading it as a loan
     /// emitted `&Point` where the body assigns a field, which rustc refuses.
+    /// Whether a parameter is a VALUE in vilan that this backend receives by
+    /// reference — a bare, non-`mut` `self`, which nothing can write through,
+    /// so a `&T` is a copy nobody can tell apart from one.
+    fn is_a_value_received_by_reference(
+        &self,
+        parameter: &vilan_core::analyzer::Parameter<'_>,
+    ) -> bool {
+        parameter.convention == Convention::Bare && self.receiving_form(parameter) == Receiving::Ref
+    }
+
     fn receiving_form(&self, parameter: &vilan_core::analyzer::Parameter<'_>) -> Receiving {
         match parameter.convention {
             Convention::Ref => Receiving::Ref,
@@ -5336,7 +5437,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     return true;
                 }
                 match self.program.parameters.get(binding) {
-                    Some(parameter) => self.receiving_form(parameter) == Receiving::ByValue,
+                    Some(parameter) => {
+                        self.receiving_form(parameter) == Receiving::ByValue
+                            || self.is_a_value_received_by_reference(parameter)
+                    }
                     None => self.program.variables.contains_key(binding),
                 }
             })
@@ -5350,6 +5454,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .iter()
             .map(|binding| {
                 let name = self.binding_name(*binding);
+                // A plain `self` arrives as a `&T` natively, and a closure the
+                // counted `Rc<dyn Fn>` stores cannot hold a borrow of the
+                // caller's frame — `ListCell::set` hands `SignalCell::update` a
+                // closure that records into `self.log`, and rustc refused the
+                // `'static` it needs. The receiver is a VALUE in vilan (a bare
+                // `self` is a copy), so the capture takes a copy of it, which is
+                // what capturing a by-value parameter already does.
+                if self
+                    .program
+                    .parameters
+                    .get(binding)
+                    .is_some_and(|parameter| self.is_a_value_received_by_reference(parameter))
+                {
+                    return format!("let {name} = (*{name}).clone(); ");
+                }
                 format!("let {name} = {name}.clone(); ")
             })
             .collect();
@@ -6715,7 +6834,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
         else {
             // A value call — `(h.f)()`. The subject is a counted closure.
             let subject = self.expression(function_call.subject_id, depth)?;
-            let arguments = self.value_arguments(&function_call.argument_ids, depth)?;
+            let callee_type = self.type_of(function_call.subject_id);
+            let arguments =
+                self.closure_call_arguments(callee_type, &function_call.argument_ids, depth)?;
             return Ok(format!("({subject})({})", arguments.join(", ")));
         };
         let target = *target;
@@ -6855,13 +6976,28 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // [`Emitter::emit_intrinsic`] states: the borrow outlives the call
             // and a read of the same binding inside the item would meet it.
             // The item is STORED, so it is a consuming position (see
-            // [`Emitter::consumed_value_of_expecting`]).
+            // [`Emitter::consumed_value_of_expecting`]), and its position is
+            // the receiver's ELEMENT type: `ops.push(Delta::Reset(current))`
+            // on a `List<Delta<K, T>>` is where `Reset`'s `K` — which its
+            // payload does not mention — is closed, exactly as a `let`'s
+            // annotation closes it ([`Emitter::variant_arguments`]).
+            let element_type = function_call
+                .argument_ids
+                .first()
+                .and_then(|receiver| self.type_of(*receiver))
+                .and_then(|type_id| self.resolve(type_id))
+                .and_then(|resolved| match resolved {
+                    Type::Struct(_, arguments) => arguments.first().copied(),
+                    _ => None,
+                });
             let item = match function_call.argument_ids.get(1) {
-                Some(argument) => self.consumed_value_of_expecting(*argument, None, depth)?,
+                Some(argument) => {
+                    self.consumed_value_of_expecting(*argument, element_type, depth)?
+                }
                 None => "()".to_string(),
             };
             let receiver = match function_call.argument_ids.first() {
-                Some(argument) => self.mutable_place(*argument, depth)?,
+                Some(argument) => self.mutable_receiver(*argument, depth)?,
                 None => "()".to_string(),
             };
             if function_call
@@ -6961,14 +7097,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if self.program.parameters.contains_key(&target)
             || self.program.variables.contains_key(&target)
         {
-            let arguments = self.value_arguments(&function_call.argument_ids, depth)?;
+            let callee_type = self.type_of(function_call.subject_id);
+            let arguments =
+                self.closure_call_arguments(callee_type, &function_call.argument_ids, depth)?;
             let callee = self.read_module_binding_or_local(target, span)?;
             return Ok(format!("({callee})({})", arguments.join(", ")));
         }
 
         // An ordinary call, monomorphized against whatever binds it.
-        let substitution =
+        let mut substitution =
             self.call_substitution(call_id, target, &function_call.generic_argument_ids);
+        self.close_open_bindings_from_position(&mut substitution, target);
         // F21: an `Option` whose payload is a VIEW is a `&`/`&mut` natively,
         // and the only position that carries it today is a `match` subject,
         // where the leg binds the reference and reads through it. Anywhere else
@@ -6998,13 +7137,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .ensure_function_with_bits(target, &substitution, &bits)?
             .name;
         let mut prelude = String::new();
+        self.argument_substitution = Some(substitution.clone());
         let arguments = self.call_arguments_adapting(
             target,
             &function_call.argument_ids,
             depth,
             &mut prelude,
             &bits,
-        )?;
+        );
+        self.argument_substitution = None;
+        let arguments = arguments?;
         Ok(Self::with_argument_prelude(
             prelude,
             format!("{name}({})", arguments.join(", ")),
@@ -7068,14 +7210,43 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .iter()
             .map(|parameter| self.receiving_form(parameter))
             .collect();
+        // Taken, not read: the arguments below are walked under the CALLER's
+        // substitution, and a call nested inside one sets its own.
+        let callee_substitution = self.argument_substitution.take();
         // Whether any argument will take a borrow of a cell that the arguments
         // after it must not be evaluated under.
         let borrows_a_cell = argument_ids.iter().enumerate().any(|(index, argument)| {
             matches!(conventions.get(index), Some(Receiving::RefMut))
                 && self.place_lives_in_a_cell(*argument)
         });
+        // The callee's WHOLE parameter list, hidden context parameters
+        // included (they have no `parameters` record, so `declared` omits
+        // them). A call can carry MORE arguments than that: the context pass
+        // threads a hidden argument at a trait call when SOME impl of the
+        // member needs the context, and the impl this instance dispatched to
+        // (`SignalCell::sub`, from `keyed_forward`'s `source.sub(..)`) declares
+        // none. JavaScript drops a surplus argument; a Rust call cannot take
+        // one, and a surplus argument can only be the pass's (the analyzer
+        // refuses a written one), so it is dropped here too.
+        let arity = self
+            .program
+            .functions
+            .get(&target)
+            .map(|function| function.parameters.len());
+        if let Some(span) = self.reentrant_view_read(&declared, argument_ids) {
+            return Err(unsupported(
+                "a closure handed a `&mut` view of a value that reads the same place again \
+                 inside it (`cell.update(|&mut list| cell.get())`: a read that aliases a live \
+                 write, which the JS backend answers with the in-progress value and safe Rust \
+                 cannot express)",
+                span,
+            ));
+        }
         let mut rendered = Vec::new();
         for (index, argument) in argument_ids.iter().enumerate() {
+            if arity.is_some_and(|arity| index >= arity) {
+                break;
+            }
             // F20: an argument standing in a `lazy` parameter is a cell, not a
             // value — see [`Emitter::lazy_argument`].
             if let Some(cell) = self.lazy_argument(*argument, depth) {
@@ -7090,9 +7261,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // read is indistinguishable from the place and costs no borrow that
             // could collide with another read in the same statement.
             let wants_a_mutable_place = matches!(conventions.get(index), Some(Receiving::RefMut));
-            let expecting = declared
-                .get(index)
-                .map(|parameter| self.concrete(parameter.type_id));
+            let expecting =
+                declared
+                    .get(index)
+                    .map(|parameter| match callee_substitution.clone() {
+                        Some(callee) => {
+                            let saved = self.enter_substitution(callee.into_iter().collect());
+                            let concrete = self.concrete(parameter.type_id);
+                            self.current_substitution = saved;
+                            concrete
+                        }
+                        None => self.concrete(parameter.type_id),
+                    });
             // A parameter declared `async |T| U` takes a future-answering
             // closure, so a sync literal at the call site is wrapped.
             // F22: an argument standing in a parameter this INSTANCE adapts is
@@ -7199,6 +7379,116 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let mut rendered = Vec::new();
         for argument in argument_ids {
             rendered.push(self.consumed_value_of(*argument, depth)?);
+        }
+        Ok(rendered)
+    }
+
+    /// A call that hands a closure LITERAL a `&mut` view (a parameter whose
+    /// closure type writes `|&mut T| ..`) while that closure reads the call's
+    /// RECEIVER place again — `SignalCell::update(|&mut list| { ..
+    /// todos.get() .. })` over `todos`. On the JS backend the read sees the
+    /// in-progress value, because the view and the cell are one object;
+    /// natively the view is a live `RefMut` of the cell and the read a second
+    /// borrow of it, which safe Rust answers with a panic. So the shape is
+    /// refused by name at compile time — the span is the offending read.
+    ///
+    /// The test is the receiver's exact place (its binding and field path): a
+    /// read of a DIFFERENT field of the same `self` is not the cell and is left
+    /// alone, which is what kolt's store writes. A read through an ALIAS of the
+    /// cell is not seen here and still panics at run time with Rust's message.
+    fn reentrant_view_read(
+        &self,
+        declared: &[vilan_core::analyzer::Parameter<'src>],
+        argument_ids: &[Id],
+    ) -> Option<Span> {
+        let receiver = self.place_spine(*argument_ids.first()?)?;
+        for (index, parameter) in declared.iter().enumerate() {
+            let writes_a_view = self
+                .program
+                .closure_type_parameter_views
+                .get(&parameter.type_id)
+                .is_some_and(|views| views.contains(&Some(true)));
+            if !writes_a_view {
+                continue;
+            }
+            let Some(&argument) = argument_ids.get(index) else {
+                continue;
+            };
+            let Some(Expr::Closure(closure_id)) = self.program.entity_map.get(&argument) else {
+                continue;
+            };
+            let Some(closure) = self.program.closures.get(closure_id) else {
+                continue;
+            };
+            let mut pending = vec![closure.return_];
+            let mut visited = HashSet::new();
+            while let Some(expr_id) = pending.pop() {
+                if !visited.insert(expr_id) {
+                    continue;
+                }
+                if self.place_spine(expr_id).as_ref() == Some(&receiver) {
+                    return Some(self.span_of(expr_id));
+                }
+                pending.extend(self.children_of(expr_id));
+            }
+        }
+        None
+    }
+
+    /// A place as its binding and the field indices from it — `self.a.b` is
+    /// `(self, [a, b])` — or `None` for anything that is not a place.
+    fn place_spine(&self, id: Id) -> Option<(Id, Vec<usize>)> {
+        let _guard = vilan_core::util::RecursionGuard::enter()?;
+        match self.program.entity_map.get(&id)? {
+            Expr::Local(binding) | Expr::Parameter(binding) => Some((*binding, Vec::new())),
+            &Expr::Field(subject, _, index) => {
+                let (binding, mut path) = self.place_spine(subject)?;
+                path.push(index);
+                Some((binding, path))
+            }
+            _ => None,
+        }
+    }
+
+    /// The arguments of a call through a closure VALUE, against the closure
+    /// type's own parameters: a value parameter consumes its argument
+    /// ([`Self::value_arguments`]'s rule), and a parameter the type WROTE as a
+    /// view (`sync |&mut T| void`, recorded by the analyzer beside the type)
+    /// takes a PLACE — `SignalCell::update`'s `mutate(self.value.write())`
+    /// hands the cell's own storage to the closure, which is the whole of what
+    /// `update` is for. A place that is already a `&mut` loan is reborrowed;
+    /// anything else is borrowed and reaches the parameter through Rust's deref
+    /// coercion (a cell's `RefMut` guard included).
+    fn closure_call_arguments(
+        &mut self,
+        callee_type: Option<TypeId>,
+        argument_ids: &[Id],
+        depth: usize,
+    ) -> Result<Vec<String>, Error> {
+        let views = callee_type
+            .map(|type_id| self.concrete(type_id))
+            .and_then(|type_id| self.program.closure_type_parameter_views.get(&type_id))
+            .cloned()
+            .unwrap_or_default();
+        let mut rendered = Vec::new();
+        for (index, argument) in argument_ids.iter().enumerate() {
+            let already_a_reference = matches!(
+                self.program.entity_map.get(argument),
+                Some(Expr::Reference(_, _))
+            );
+            rendered.push(match views.get(index).copied().flatten() {
+                Some(_) if already_a_reference => self.expression(*argument, depth)?,
+                Some(true) => {
+                    let place = self.mutable_place(*argument, depth)?;
+                    if self.names_a_mutable_loan(*argument) {
+                        format!("&mut *{place}")
+                    } else {
+                        format!("&mut {place}")
+                    }
+                }
+                Some(false) => format!("&{}", self.expression(*argument, depth)?),
+                None => self.consumed_value_of(*argument, depth)?,
+            });
         }
         Ok(rendered)
     }
@@ -8139,7 +8429,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         for (index, argument) in argument_ids.iter().enumerate() {
             arguments.push(if index == 0 {
                 if mutating {
-                    self.mutable_place(*argument, depth)?
+                    self.mutable_receiver(*argument, depth)?
                 } else {
                     self.expression(*argument, depth)?
                 }
@@ -8197,6 +8487,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// is only a place if every node between the root and the write is one.
     /// `RefMut` derefs both ways, so a field, an index and a `&mut` all reach
     /// through it the way they reach through the value itself.
+    /// [`Self::mutable_place`] as the RECEIVER of a mutating intrinsic, which
+    /// the intrinsic borrows `&mut` itself: a binding that is already a `&mut`
+    /// loan (`update(|&mut list| list.push(x))`'s `list`) is dereferenced, so
+    /// the borrow is a reborrow of its target rather than a `&mut &mut` rustc
+    /// only takes from a `mut` binding.
+    fn mutable_receiver(&mut self, id: Id, depth: usize) -> Result<String, Error> {
+        let place = self.mutable_place(id, depth)?;
+        if self.names_a_mutable_loan(id) {
+            return Ok(format!("(*{place})"));
+        }
+        Ok(place)
+    }
+
     fn mutable_place(&mut self, id: Id, depth: usize) -> Result<String, Error> {
         // `boxed_emitted` is deliberately NOT written here: C15's count measures
         // what the walk EMITTED as a `Captured` cell, which is the DECLARATION's

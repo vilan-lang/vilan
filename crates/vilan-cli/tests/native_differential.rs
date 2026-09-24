@@ -138,6 +138,10 @@ const DEFAULT_SUITE: &[&str] = &[
     // capture all write into the same bytes, as a `Uint8Array` does; `slice`
     // and `concat` are the two that make a new one.
     "bytes-aliasing.vl",
+    // F18 slice 3: `ListCell`'s writes through `SignalCell::update(|&mut
+    // list| ..)` and a `Delta` pushed with a parameter its payload leaves open
+    // — refused at the Order 40 seal, byte-identical now.
+    "delta-law.vl",
 ];
 
 /// Corpus programs that are OUTSIDE this differential by construction, named
@@ -1561,6 +1565,337 @@ const PARTNER_WIDTH_PROBE: &str = concat!(
     "\tprint(i\"{wide * 2 > 17} {(wide + 1) == 10}\");\n",
     "}\n",
 );
+
+/// A closure TYPE written over a VIEW (`|&mut T| void`, `|&T| U`) takes its
+/// argument by reference natively, as the literal landing in it binds it —
+/// the analyzer records the `&`/`&mut` the type itself erases
+/// (`Program::closure_type_parameter_views`). `SignalCell::update(|&mut list|
+/// ..)` is the shape everything reactive writes through (kolt's store, the
+/// keyed rpc mirrors, `ListCell`), and it was refused ("an unresolved type")
+/// at the Order 40 seal; a user function taking one is here too.
+#[test]
+fn a_closure_type_over_a_view_takes_its_argument_by_reference() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_views.vl"), VIEW_CLOSURE_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_views.vl"),
+        Verdict::Identical,
+        "a view-parameter closure writes the caller's value on both backends"
+    );
+}
+
+const VIEW_CLOSURE_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::map::Map;\n",
+    "import std::reactive::{ Signal, SignalCell };\n",
+    "\n",
+    "struct Counter {\n",
+    "\tn: i32,\n",
+    "}\n",
+    "\n",
+    "fun apply(counter: &mut Counter, step: |&mut Counter| void) {\n",
+    "\tstep(counter);\n",
+    "\tstep(counter);\n",
+    "}\n",
+    "\n",
+    "fun peek(counter: &Counter, read: |&Counter| i32): i32 {\n",
+    "\tread(counter)\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut counter = Counter { n = 1 };\n",
+    "\tapply(&mut counter, |&mut held| {\n",
+    "\t\theld.n = held.n * 3;\n",
+    "\t});\n",
+    "\tprint(peek(&counter, |&held| held.n + 1));\n",
+    "\tlet list: SignalCell<List<i32>> = SignalCell::new([]);\n",
+    "\tlist.update(|&mut items| {\n",
+    "\t\titems.push(4);\n",
+    "\t\titems.push(5);\n",
+    "\t});\n",
+    "\tlet names: SignalCell<Map<str, i32>> = Signal::new(Map::new());\n",
+    "\tnames.update(|&mut entries| {\n",
+    "\t\tentries.insert(\"a\", 1);\n",
+    "\t});\n",
+    "\tprint(i\"{counter.n} {list.get().len()} {names.get().len()}\");\n",
+    "}\n",
+);
+
+/// The one shape a closure-over-a-view cannot take natively, refused BY NAME
+/// at compile time: a closure handed `update`'s `&mut` view that reads the
+/// SAME cell again inside it. The JS backend answers the in-progress value (the
+/// view and the cell are one object); natively the view is a live `RefMut` and
+/// the read a second borrow, which safe Rust answers with a panic — so it is
+/// named rather than run. `signal-update.vl`'s last section is this shape, and
+/// the whole-set differential counts it refused. The control beside it reads a
+/// DIFFERENT cell inside the closure and builds, identical on both backends.
+#[test]
+fn a_reentrant_read_of_an_updated_cell_is_refused_by_name() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_reentrant.vl"),
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ Signal, SignalCell };\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet todos: SignalCell<List<i32>> = Signal::new([1]);\n",
+            "\ttodos.update(|&mut list| {\n",
+            "\t\tlist.push(2);\n",
+            "\t\tprint(todos.get().len());\n",
+            "\t});\n",
+            "}\n",
+        ),
+    )
+    .expect("write the refused probe");
+    std::fs::write(
+        staged.join("native_probe_other_cell.vl"),
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ Signal, SignalCell };\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet todos: SignalCell<List<i32>> = Signal::new([1]);\n",
+            "\tlet other: SignalCell<List<i32>> = Signal::new([7, 8]);\n",
+            "\ttodos.update(|&mut list| {\n",
+            "\t\tlist.push(other.get().len());\n",
+            "\t});\n",
+            "\tprint(todos.get());\n",
+            "}\n",
+        ),
+    )
+    .expect("write the control");
+    match compare(&staged, "native_probe_reentrant.vl") {
+        Verdict::Refused(reason) => assert!(
+            reason.contains("reads the same place again"),
+            "refused, and for this reason: {reason}"
+        ),
+        other => panic!("a reentrant read of an updated cell must be refused by name: {other:?}"),
+    }
+    assert_eq!(
+        compare(&staged, "native_probe_other_cell.vl"),
+        Verdict::Identical,
+        "reading a different cell inside the closure is not the refused shape"
+    );
+}
+
+/// A generic call whose binding the call itself leaves OPEN is closed by the
+/// position it fills (B370's law on the generic-call path): `SignalCell::new([])`
+/// under a `SignalCell<List<i32>>` annotation, `Signal::new(Map::new())` whose
+/// argument's own binding is closed by the parameter the outer call binds, and a
+/// variant whose payload leaves a parameter open (`Delta::Remove("k")`,
+/// `Delta::Reset([1, 2])`) pushed into a `List<Delta<str, i32>>`. Refused at
+/// the Order 40 seal ("an unresolved type").
+#[test]
+fn a_generic_call_left_open_is_closed_by_its_position() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_open.vl"), OPEN_BINDING_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_open.vl"),
+        Verdict::Identical,
+        "an open binding closed by its position builds the same value on both backends"
+    );
+}
+
+const OPEN_BINDING_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::map::Map;\n",
+    "import std::reactive::{ Signal, SignalCell };\n",
+    "\n",
+    "enum Delta<K, T> {\n",
+    "\tReset(List<T>),\n",
+    "\tRemove(K),\n",
+    "}\n",
+    "\n",
+    "fun count_resets(ops: List<Delta<str, i32>>): i32 {\n",
+    "\tmut resets = 0;\n",
+    "\tfor op in ops {\n",
+    "\t\tmatch op {\n",
+    "\t\t\tDelta::Reset(let items) => resets += items.len(),\n",
+    "\t\t\tDelta::Remove(let _key) => {},\n",
+    "\t\t}\n",
+    "\t}\n",
+    "\tresets\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet cell: SignalCell<List<i32>> = SignalCell::new([]);\n",
+    "\tlet named: SignalCell<Map<str, i32>> = Signal::new(Map::new());\n",
+    "\tmut ops: List<Delta<str, i32>> = [];\n",
+    "\tops.push(Delta::Reset([1, 2]));\n",
+    "\tops.push(Delta::Remove(\"k\"));\n",
+    "\tprint(i\"{cell.get().len()} {named.get().len()} {ops.len()} {count_resets(ops)}\");\n",
+    "}\n",
+);
+
+/// Builds `program` (already staged) natively and for node, and answers the
+/// two commands that START each leg's server: the native binary and `node
+/// <program>.mjs`, both run from the staging directory so a relative `dist/`
+/// and a `const asset::read` beside the program resolve the same way.
+fn both_servers(staged: &Path, program: &str) -> (Command, Command) {
+    let built = vilan(staged)
+        .args(["build", "--backend", "rust", program])
+        .output()
+        .expect("build the server natively");
+    assert!(
+        built.status.success(),
+        "the native leg did not build:\n{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let binary = String::from_utf8_lossy(&built.stdout)
+        .lines()
+        .find_map(|line| line.split(" -> ").nth(1).map(str::to_string))
+        .expect("`vilan build` says where the binary is");
+    let bundled = vilan(staged)
+        .args(["build", program])
+        .output()
+        .expect("build the server for node");
+    assert!(
+        bundled.status.success(),
+        "the JS leg did not build:\n{}",
+        String::from_utf8_lossy(&bundled.stderr)
+    );
+    let mut native = Command::new(staged.join(&binary));
+    native.current_dir(staged);
+    let mut node = Command::new("node");
+    node.current_dir(staged).arg(program.replace(".vl", ".mjs"));
+    (native, node)
+}
+
+/// Builds a client program for node (clients are always the JS leg: the
+/// generated rpc client is a browser-shaped program).
+fn build_client(staged: &Path, program: &str) {
+    let bundled = vilan(staged)
+        .args(["build", program])
+        .output()
+        .expect("build the client for node");
+    assert!(
+        bundled.status.success(),
+        "the client did not build:\n{}",
+        String::from_utf8_lossy(&bundled.stderr)
+    );
+}
+
+/// Runs a node client to completion under a LIVENESS bound (the clients exit
+/// by themselves; the bound only turns a hang into a failure), and answers its
+/// stdout.
+fn run_client(staged: &Path, program: &str, environment: &[(&str, String)]) -> String {
+    let mut command = Command::new("node");
+    command
+        .current_dir(staged)
+        .arg(program.replace(".vl", ".mjs"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().expect("spawn the client");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        if child.try_wait().expect("poll the client").is_some() {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the client never finished");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .expect("the client's stdout")
+        .read_to_string(&mut out)
+        .expect("read the client's stdout");
+    out
+}
+
+/// **F18 slice 3 — the rpc server natively.** `service_layer.rs`'s keyed pin
+/// (A39) with its two halves pulled apart: the SERVER — a `[service]` with an
+/// `[expose]` and an `[expose(keyed)]` field, mounted with `Service::new` on
+/// `Server::builder()` — is built by each backend in turn, and the CLIENT,
+/// always node, connects over the upgrade handover (a real RFC 6455 accept key,
+/// computed by `vilan_rt::crypto`), holds a PER-KEY subscription on the keyed
+/// mirror, posts, edits, and prints what its mirrors hold and the contract hash
+/// it computed.
+///
+/// The client's whole stdout is compared between the two servers, and the
+/// server's own announced contract hash is compared with the client's — the
+/// wire is byte-identical to node's exactly when a vilan client cannot tell
+/// the two servers apart, and the hash is unmoved exactly when the native
+/// server hashes its contract as node does (a moved hash is a client refused
+/// as `Contract`, which the verbatim lines below would red on).
+///
+/// Red at the Order 40 seal: `Server::builder()` refused by name; past it, the
+/// rpc path reached `SignalCell::update(|&mut store| ..)` (a closure TYPE's view
+/// parameter, which the type erased), `Signal::new(Map::new())` (a binding the
+/// position closes), `keyed_diff`'s `ops.push(Delta::Reset(..))` (an open
+/// variant parameter), a `self` captured into a stored closure, and a context
+/// argument the dispatched `SignalCell::sub` does not take.
+#[test]
+fn the_keyed_rpc_service_answers_a_node_client_the_same_from_a_native_server() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_keyed_server.vl"),
+        include_str!("native/keyed_chat_server.vl"),
+    )
+    .expect("write the server");
+    std::fs::write(
+        staged.join("native_keyed_client.vl"),
+        include_str!("native/keyed_chat_client.vl"),
+    )
+    .expect("write the client");
+    build_client(&staged, "native_keyed_client.vl");
+    let (mut native_command, mut node_command) = both_servers(&staged, "native_keyed_server.vl");
+    let serve = |command: &mut Command| {
+        let server = ServerUnderTest::spawn(command);
+        let answered = run_client(
+            &staged,
+            "native_keyed_client.vl",
+            &[("CHAT_PORT", server.port().to_string())],
+        );
+        let contract = server
+            .announcement
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("contract="))
+            .unwrap_or_default()
+            .to_string();
+        (answered, contract)
+    };
+    let (native, native_contract) = serve(&mut native_command);
+    let (javascript, node_contract) = serve(&mut node_command);
+    assert_eq!(
+        native, javascript,
+        "a node client must see the same wire from both servers"
+    );
+    assert_eq!(
+        native_contract, node_contract,
+        "the contract hash is unmoved"
+    );
+    for line in [
+        "post:2",
+        "edit:true",
+        "m2:world again",
+        "held:m2=world again ",
+        "topic-held:general",
+        "fault:false",
+    ] {
+        assert!(
+            native.lines().any(|answered| answered == line),
+            "the client's `{line}` over the native server:\n{native}"
+        );
+    }
+    assert!(
+        native
+            .lines()
+            .any(|line| line == format!("hash:{native_contract}")),
+        "the client's contract hash is the server's own ({native_contract}):\n{native}"
+    );
+}
 
 /// The three exchanges the exit drives, over one spawned server.
 struct ServedLogin {
