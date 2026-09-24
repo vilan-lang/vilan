@@ -4526,15 +4526,16 @@ fn a112_s3_a_list_cell_under_each_builds_only_the_rows_its_ops_name() {
 
 /// The S2 random walk (`vilan/test/list-cell.vl`, claim 10), extended THROUGH
 /// `each`: 300 turns of 1–4 ops each, drawn from the whole vocabulary and made
-/// inside one `batch` (so one drain applies several ops in order), with three
+/// inside one `batch` (so one drain applies several ops in order), with four
 /// runs mounted on it — `each` over the cell, `each` over a `map_each` chained
-/// on it, and `each_values` over the cell. After every turn the program reads
-/// the three runs back out of the document and panics on the first one that
-/// differs from what the cell holds.
+/// on it, `each_values` over the cell, and (S3b) `each_by` over the cell, whose
+/// rows show their text through their own cell. After every turn the program
+/// reads the four runs back out of the document and panics on the first one
+/// that differs from what the cell holds.
 const A112_S3_WALK: &str = r#"import std::io::{ panic, print };
-import std::reactive::{ ListCell, SequenceCell, Signal, Source, batch, map_each };
+import std::reactive::{ ListCell, SequenceCell, Signal, SignalCell, Source, batch, map_each };
 import std::shared::Shared;
-import std::ui::{ View, each, each_values, mount_root, view };
+import std::ui::{ View, each, each_by, each_values, mount_root, view };
 
 [derive(PartialEq, Hashable)]
 struct Row {
@@ -4568,6 +4569,15 @@ fun rendered(item: Row): View {
 	view("li").text(item.text)
 }
 
+/// `each_by`'s rows are counted apart, so the three runs S3 pinned keep their
+/// number and this one states its own.
+let by_renders: Shared<i32> = Shared::new(0);
+
+fun rendered_by(cell: SignalCell<Row>): View {
+	by_renders.write() = by_renders.read() + 1;
+	view("li").bind_text(cell.map(|item: Row| item.text))
+}
+
 fun joined(values: List<Row>, suffix: str): str {
 	mut out = "";
 	mut first = true;
@@ -4589,8 +4599,10 @@ fun main() {
 			.child(view("ol").child(each(walk, |item: Row| item.id, |item: Row| rendered(item))))
 			.child(view("ol").child(each(starred, |item: Row| item.id, |item: Row| rendered(item))))
 			.child(view("ol").child(each_values(walk, |item: Row| rendered(item))))
+			.child(view("ol").child(each_by(walk, |item: Row| item.id, |cell: SignalCell<Row>| rendered_by(cell))))
 	});
 	renders.write() = 0;
+	by_renders.write() = 0;
 	mut naive = 0;
 	mut turn = 1;
 	for turn <= 300 {
@@ -4655,14 +4667,14 @@ fun main() {
 		});
 		let held = walk.get();
 		naive += held.len() * 3;
-		let wanted = i"{joined(held, "")}|{joined(held, "*")}|{joined(held, "")}";
+		let wanted = i"{joined(held, "")}|{joined(held, "*")}|{joined(held, "")}|{joined(held, "")}";
 		let shown = lists();
 		if shown != wanted {
 			panic(i"turn {turn}: the document shows\n  {shown}\nwhere the cell holds\n  {wanted}");
 		}
 		turn += 1;
 	}
-	print(i"walk: turns=300 length={walk.get().len()} ids={ids.read()} renders={renders.read()} rerun={naive}");
+	print(i"walk: turns=300 length={walk.get().len()} ids={ids.read()} renders={renders.read()} by={by_renders.read()} rerun={naive}");
 }
 
 [extern("__lists")]
@@ -4698,14 +4710,409 @@ require("./app.js");
 /// patch held at Order 39 wrote — instead of the list after the move (turn 4);
 /// `splice_rows` placing arrivals at the anchor instead of before the next
 /// row's marker (turn 1); and the `SetAt` arm skipping the rebuild when only
-/// the key matches (turn 13).
+/// the key matches (turn 13). The same three planted into `place_each_by`
+/// alone red the fourth run, and only it, at the same turns — 4, 1 and
+/// 13 — the last as `each_by`'s own form of it, a same-key `SetAt`
+/// that skips the write into the row's cell.
 #[test]
 fn a112_s3_the_random_walk_holds_through_each() {
     let harness = format!("{DOM_STUB}{A112_S3_WALK_HARNESS_TAIL}");
     let stdout = build_and_run("a112_s3_walk", A112_S3_WALK, &harness);
     assert_eq!(
-        stdout, "walk: turns=300 length=0 ids=587 renders=3306 rerun=12258\n",
+        stdout, "walk: turns=300 length=0 ids=587 renders=3306 by=1078 rerun=12258\n",
         "A112 S3's walk tail moved: the renders count is rows BUILT across \
-         three runs, the rerun the rows a pass would have looked at; got:\n{stdout}"
+         the three S3 runs, `by` the rows `each_by` built (S3b), the rerun \
+         the rows a pass would have looked at over the three; got:\n{stdout}"
+    );
+}
+
+// --- A112 S3b: `each_by` on the op path ---------------------------------------
+
+/// `A112_S3_OPS` over `each_by`: the same edits, each printed as
+/// `pass|tree|cost`, where the cost adds `maps` — the calls of the row's own
+/// `map`, which is one per row BUILT plus one per write into a row's CELL. That
+/// column is what separates `each_by` from `each`: a changed item under a
+/// surviving key is written into the row's cell (`maps=1`, nothing built), and
+/// a pass writes into EVERY surviving row's cell whether it changed or not.
+const A112_S3B_OPS: &str = r#"import std::io::print;
+import std::reactive::{ ListCell, SequenceCell, Signal, SignalCell, Source };
+import std::shared::Shared;
+import std::ui::{ View, each_by, mount_root, view };
+
+struct Row {
+	id: i32,
+	text: str,
+}
+
+fun row(id: i32, text: str): Row {
+	Row { id = id, text = text }
+}
+
+let keys: Shared<i32> = Shared::new(0);
+let maps: Shared<i32> = Shared::new(0);
+
+fun keyed(item: Row): i32 {
+	keys.write() = keys.read() + 1;
+	item.id
+}
+
+fun label(cell: SignalCell<Row>): View {
+	view("li").bind_text(cell.map(|item: Row| {
+		maps.write() = maps.read() + 1;
+		item.text
+	}))
+}
+
+fun spent(): str {
+	let line = i"{cost()} keys={keys.read()} maps={maps.read()}";
+	keys.write() = 0;
+	maps.write() = 0;
+	line
+}
+
+fun main() {
+	let rows: ListCell<Row> = ListCell<Row>::of([row(1, "a"), row(2, "b"), row(3, "c"), row(4, "d")]);
+	let _root = mount_root("app", || {
+		view("ul")
+			.child(view("li").text("H"))
+			.child(each_by(rows, keyed, |cell: SignalCell<Row>| label(cell)))
+			.child(view("li").text("F"))
+	});
+	print(i"mount|{tree()}|{spent()}");
+	rows.push(row(5, "e"));
+	print(i"push|{tree()}|{spent()}");
+	rows.prepend(row(0, "z"));
+	print(i"prepend|{tree()}|{spent()}");
+	rows.remove_at(2);
+	print(i"remove|{tree()}|{spent()}");
+	rows.set_at(1, row(1, "A"));
+	print(i"set_at|{tree()}|{spent()}");
+	rows.set_at(1, row(1, "A"));
+	print(i"set_at-same|{tree()}|{spent()}");
+	rows.set_at(2, row(33, "k"));
+	print(i"set_at-key|{tree()}|{spent()}");
+	rows.insert_all(2, [row(7, "g"), row(8, "h")]);
+	print(i"insert_all|{tree()}|{spent()}");
+	rows.edit(|&mut list| {
+		list.push(row(9, "i"));
+		list.remove_at(0);
+		list.insert_at(1, row(6, "f"));
+	});
+	print(i"edit|{tree()}|{spent()}");
+	rows.move_range(0, 1, 3);
+	print(i"move|{tree()}|{spent()}");
+	rows.set([row(1, "a"), row(2, "b")]);
+	print(i"set|{tree()}|{spent()}");
+	rows.clear();
+	print(i"clear|{tree()}|{spent()}");
+
+	// The control: a plain cell keeps the pass.
+	let plain: SignalCell<List<Row>> = Signal::new([row(1, "a"), row(2, "b"), row(3, "c")]);
+	let _second = mount_root("app", || {
+		view("ol").child(each_by(plain, keyed, |cell: SignalCell<Row>| label(cell)))
+	});
+	let _reset = spent();
+	plain.update(|&mut list| { list.push(row(4, "d")); });
+	print(i"plain-push||{spent()}");
+
+	// At scale: one push into 1,000 rows, one in-place change, one removal.
+	mut many: List<Row> = [];
+	mut index = 0;
+	for index < 1000 {
+		many.push(row(index, "r"));
+		index += 1;
+	}
+	let big: ListCell<Row> = ListCell<Row>::of(many);
+	let _third = mount_root("app", || {
+		view("ol").child(each_by(big, keyed, |cell: SignalCell<Row>| label(cell)))
+	});
+	let _mounted = spent();
+	big.push(row(1000, "new"));
+	print(i"big-push||{spent()}");
+	big.set_at(250, row(250, "changed"));
+	print(i"big-set_at||{spent()}");
+	big.remove_at(500);
+	print(i"big-remove||{spent()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+[extern("__cost")]
+external fun cost(): str;
+
+main();
+"#;
+
+/// A112 S3b: a `ListCell` under `each_by` is followed by its OPS, as `each`'s
+/// run has been since S3.
+///
+/// The claim is the cost column at 1,000 rows — one push builds ONE row, calls
+/// the key function once and runs one row `map`; an in-place change under the
+/// same key builds NOTHING and runs exactly one row `map` (the write into that
+/// row's cell, which is what `each_by` is for); a removal cuts one row and
+/// touches no other. The tree column is what says the cheaper path still
+/// shows the right run after every edit in the vocabulary, including a `SetAt`
+/// that changes the KEY (the row is rebuilt, as the pass would) and the
+/// `Move`/`Reset` fallbacks to the pass. The plain `SignalCell` beside it is
+/// the control: the same push costs a whole pass there, and writes into every
+/// surviving row's cell (`maps=4` over three rows and one arrival).
+///
+/// Non-vacuity: on the tree before S3b (`place_each_by` answering every source
+/// with the pass) the tree column is unchanged and the cost column reds —
+/// `big-push` reads `keys=2002 maps=1001`.
+#[test]
+fn a112_s3b_a_list_cell_under_each_by_builds_only_the_rows_its_ops_name() {
+    let harness = format!("{DOM_STUB}{A98_COST_HARNESS_TAIL}");
+    let stdout = build_and_run("a112_s3b_ops", A112_S3B_OPS, &harness);
+    let seen: Vec<(String, Vec<String>, String)> = stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('|');
+            let name = parts.next()?.to_string();
+            let tree = nodes(parts.next()?);
+            let cost = parts.next()?.to_string();
+            Some((name, tree, cost))
+        })
+        .collect();
+    let tree = |labels: &[&str]| {
+        let mut expected = vec!["root".to_string(), "ul".to_string(), "li'H'".to_string()];
+        for label in labels {
+            expected.push(format!("li'{label}'"));
+        }
+        expected.push("li'F'".to_string());
+        expected
+    };
+    let none: Vec<String> = Vec::new();
+    let expected: Vec<(String, Vec<String>, String)> = vec![
+        // The first build is the pass: seven elements, four keys read twice
+        // (the plan and the key list it keeps), one row `map` per row.
+        (
+            "mount",
+            tree(&["a", "b", "c", "d"]),
+            "cut=0 built=7 keys=8 maps=4",
+        ),
+        (
+            "push",
+            tree(&["a", "b", "c", "d", "e"]),
+            "cut=0 built=1 keys=1 maps=1",
+        ),
+        (
+            "prepend",
+            tree(&["z", "a", "b", "c", "d", "e"]),
+            "cut=0 built=1 keys=1 maps=1",
+        ),
+        (
+            "remove",
+            tree(&["z", "a", "c", "d", "e"]),
+            "cut=1 built=0 keys=0 maps=0",
+        ),
+        // Same key, different item: the row is KEPT and its cell written —
+        // where `each` rebuilds it (`cut=1 built=1`).
+        (
+            "set_at",
+            tree(&["z", "A", "c", "d", "e"]),
+            "cut=0 built=0 keys=1 maps=1",
+        ),
+        // Same key, equal item: still a write into the cell, as the pass's
+        // `Keep` makes one — `each_by` asks nothing of `T`, so it cannot tell.
+        (
+            "set_at-same",
+            tree(&["z", "A", "c", "d", "e"]),
+            "cut=0 built=0 keys=1 maps=1",
+        ),
+        // A different KEY at that position: the row that was there is gone and a
+        // new one is built, as the pass would plan it.
+        (
+            "set_at-key",
+            tree(&["z", "A", "k", "d", "e"]),
+            "cut=1 built=1 keys=2 maps=1",
+        ),
+        (
+            "insert_all",
+            tree(&["z", "A", "g", "h", "k", "d", "e"]),
+            "cut=0 built=2 keys=2 maps=2",
+        ),
+        // Three ops, one notification: the push and the insert build a row
+        // each, the removal cuts one.
+        (
+            "edit",
+            tree(&["A", "f", "g", "h", "k", "d", "e", "i"]),
+            "cut=1 built=2 keys=2 maps=2",
+        ),
+        // A `Move` is the pass at the moved list: the one row that moved is cut
+        // and put back (A98), nothing is built, and — the pass's price under
+        // `each_by` — every kept row's cell is written.
+        (
+            "move",
+            tree(&["f", "g", "h", "A", "k", "d", "e", "i"]),
+            "cut=1 built=0 keys=16 maps=8",
+        ),
+        // A `Reset` is the pass: every row whose key left is cut, and the one
+        // key that survives (`1`, now "A" -> "a") keeps its row and has its
+        // cell written, which is where this differs from `each`'s `cut=8`.
+        ("set", tree(&["a", "b"]), "cut=7 built=1 keys=4 maps=2"),
+        ("clear", tree(&[]), "cut=2 built=0 keys=0 maps=0"),
+        ("plain-push", none.clone(), "cut=0 built=1 keys=8 maps=4"),
+        ("big-push", none.clone(), "cut=0 built=1 keys=1 maps=1"),
+        ("big-set_at", none.clone(), "cut=0 built=0 keys=1 maps=1"),
+        ("big-remove", none, "cut=1 built=0 keys=0 maps=0"),
+    ]
+    .into_iter()
+    .map(|(name, tree, cost)| (name.to_string(), tree, cost.to_string()))
+    .collect();
+    assert_eq!(
+        seen, expected,
+        "A112 S3b: a `ListCell` under `each_by` must build only the rows its \
+         ops name, write only the cells they name, and still show the right \
+         run; a plain `SignalCell` keeps the pass; got:\n{stdout}"
+    );
+}
+
+// --- M86: a `ListCell` write copies no whole list -----------------------------
+
+/// A 1,000-row `ListCell` with a `map_each`, an `each` and an `each_by` on it,
+/// driven through the vocabulary; after each write the program prints how many
+/// WHOLE-LIST copies the write made. A deep copy of a list is the emitted
+/// `__clone`, which is `value.map(__clone)`, so the harness counts
+/// `Array.prototype.map` calls on arrays of 1,000 elements or more — a row's
+/// own copy (a two-element array) is not counted, a copy of the run is.
+const M86_COPIES: &str = r#"import std::io::print;
+import std::option::Option::{ self, None, Some };
+import std::reactive::{ ListCell, SequenceCell, Signal, SignalCell, Source, map_each };
+import std::ui::{ View, each, each_by, mount_root, view };
+
+[derive(PartialEq, Hashable)]
+struct Row {
+	id: i32,
+	text: str,
+}
+
+fun row(id: i32, text: str): Row {
+	Row { id = id, text = text }
+}
+
+fun main() {
+	mut many: List<Row> = [];
+	mut index = 0;
+	for index < 1000 {
+		many.push(row(index, "r"));
+		index += 1;
+	}
+	let cell: ListCell<Row> = ListCell<Row>::of(many);
+	let ids = map_each(cell, |item: Row| item.id);
+	let _root = mount_root("app", || {
+		view("div")
+			.child(view("ol").child(each(cell, |item: Row| item.id, |item: Row| view("li").text(item.text))))
+			.child(view("ol").child(each_by(cell, |item: Row| item.id, |held: SignalCell<Row>| {
+				view("li").bind_text(held.map(|item: Row| item.text))
+			})))
+	});
+	let _mounted = wholes();
+	cell.push(row(1000, "pushed"));
+	print(i"push wholes={wholes()}");
+	cell.insert_at(10, row(1001, "inserted"));
+	print(i"insert_at wholes={wholes()}");
+	cell.remove_at(20);
+	print(i"remove_at wholes={wholes()}");
+	cell.set_at(30, row(30, "changed"));
+	print(i"set_at wholes={wholes()}");
+	cell.move_range(0, 2, 5);
+	print(i"move_range wholes={wholes()}");
+	let size = cell.size();
+	print(i"size={size} wholes={wholes()}");
+	let total: i32 = cell.peek(|list| list.len());
+	let third: Option<Row> = cell.peek(|list| list.get(2));
+	let text = match third {
+		Some(let found) => found.text,
+		None => "none",
+	};
+	print(i"peek={total} third={text} wholes={wholes()}");
+	cell.edit(|&mut list| {
+		list.push(row(1002, "edited"));
+		list.remove_at(0);
+	});
+	print(i"edit wholes={wholes()}");
+	mut edited = cell.get();
+	print(i"get wholes={wholes()}");
+	edited[40] = row(edited[40].id, "reconciled");
+	cell.reconcile_to(edited);
+	print(i"reconcile_to wholes={wholes()}");
+	print(i"size={cell.size()} ids={ids.size()} rows={rows()}");
+}
+
+[extern("__wholes")]
+external fun wholes(): i32;
+
+[extern("__rows")]
+external fun rows(): str;
+
+main();
+"#;
+
+/// Counts whole-list copies (see `M86_COPIES`) and reads the two runs' lengths.
+const M86_HARNESS_TAIL: &str = r#"
+global.__wholes = (() => {
+    let wholes = 0;
+    const map = Array.prototype.map;
+    Array.prototype.map = function (...args) {
+        if (this.length >= 1000) wholes += 1;
+        return map.apply(this, args);
+    };
+    return () => { const seen = wholes; wholes = 0; return seen; };
+})();
+global.__rows = () => {
+    const out = [];
+    const visit = (node) => {
+        if (node.tagName === "ol") out.push(node.children.filter((child) => child.tagName === "li").length);
+        node.children.forEach(visit);
+    };
+    visit(documentRoot);
+    return out.join("/");
+};
+require("./app.js");
+"#;
+
+/// M86: a write to a 1,000-row `ListCell` copies no whole list — not the cell's
+/// own, not a derived `map_each` cell's, and not on its way to `each` or
+/// `each_by` — and `peek`, the read that borrows (R-e), answers a length and one
+/// element without copying the run.
+///
+/// Before M86 every `splice` read the cell's length through `get()`, which is a
+/// deep copy of the run, and the everyday defaults (`push`, `insert_at`) read it
+/// twice — once to find the end, once inside `splice` — so a push into 1,000
+/// rows copied the run twice and a `map_each` over it copied ITS run once more
+/// (6.27 M of the 6.30 M Ir a push cost under `each`). `set_at` copied the run
+/// to read one element, and `reconcile_to` copied it to diff it. What still
+/// copies is what must, and the pin states it rather than hiding it: `get()`
+/// hands out a value (one); `edit` hands its body a recorder over a list of its
+/// own and takes the result back (two, per batch, however many mutations it
+/// holds); and a `Move` is still the whole-list PASS in both `each` and
+/// `each_by` (A112 S3's fallback), whose own copies of the run are the eleven —
+/// the `ListCell` and the `map_each` make none of them.
+///
+/// Non-vacuity: on the tree before M86 this reads `push wholes=3`,
+/// `insert_at wholes=2`, `remove_at wholes=2`, `set_at wholes=2`,
+/// `size=1001 wholes=1`, `edit wholes=6` and `reconcile_to wholes=3`.
+#[test]
+fn m86_a_list_cell_write_copies_no_whole_list() {
+    let harness = format!("{DOM_STUB}{M86_HARNESS_TAIL}");
+    let stdout = build_and_run("m86_copies", M86_COPIES, &harness);
+    assert_eq!(
+        stdout,
+        concat!(
+            "push wholes=0\n",
+            "insert_at wholes=0\n",
+            "remove_at wholes=0\n",
+            "set_at wholes=0\n",
+            "move_range wholes=11\n",
+            "size=1001 wholes=0\n",
+            "peek=1001 third=r wholes=0\n",
+            "edit wholes=2\n",
+            "get wholes=1\n",
+            "reconcile_to wholes=0\n",
+            "size=1001 ids=1001 rows=1001/1001\n",
+        ),
+        "M86: a `ListCell` write must copy no whole list; got:\n{stdout}"
     );
 }

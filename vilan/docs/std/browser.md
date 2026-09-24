@@ -364,12 +364,15 @@ child has no property to bind.
 every `Source<List<T>>` has it, so nothing that placed before is refused now.
 Over a plain `SignalCell<List<T>>` a change is a
 whole-list pass: every key read, a diff, the plan applied. Over a `ListCell<T>`
-or a `KeyedCell` — any `DeltaSource<List<T>, SeqOp<T>>` — `each` and
-`each_values` apply the recorded ops to the rows instead: one push into 1,000
-rows builds ONE row and reads one key, a removal cuts one row, and an element
-changed to an equal value costs nothing. A wholesale `set` and a `move_range`
-fall back to the pass. `each_by` and the server twin keep the pass (a server
-render reads the list once).
+or a `KeyedCell` — any `DeltaSource<List<T>, SeqOp<T>>` — `each`,
+`each_values` and `each_by` apply the recorded ops to the rows instead: one
+push into 1,000 rows builds ONE row and reads one key, a removal cuts one row,
+and under `each` an element changed to an equal value costs nothing. Under
+`each_by` an element changed in place under the same key is written into that
+row's cell and nothing is built — and only that row's cell, where the pass
+writes into every surviving row's. A wholesale `set` and a `move_range` fall
+back to the pass. The server twin keeps its one read (a server render reads
+the list once, so it has no change to follow).
 
 **A row, a body or a branch can be any `Slot`.** A render closure returns
 `C: Slot`, not `View` — so a row may be a fragment, a text node, or another

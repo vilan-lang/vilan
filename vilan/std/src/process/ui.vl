@@ -631,6 +631,9 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slo
 /// built against a fresh `SignalCell<T>` holding that element. No reconciliation
 /// and no later change to follow, so the cell is written once and never again — but
 /// it must exist, because `render` is the same closure the client runs.
+///
+/// No op path (A112 S3b), for `place_each`'s reason: a server render is only a
+/// first build.
 fun place_each_by<T, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
 	parent: View,
 	source: S,

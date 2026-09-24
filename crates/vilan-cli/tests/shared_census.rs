@@ -38,7 +38,7 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ("browser/router.vl", 1, "R: the module-level `wired` latch"),
     (
         "browser/ui.vl",
-        26,
+        25,
         "O + R: per-boundary row/owner bookkeeping (+3 at Order 39: `when_some`'s \
          row, owner and payload cell — A119), plus A121's focus scopes at Order \
          40 — the scope STACK and its id source are R (module bindings, program \
@@ -46,17 +46,21 @@ const CENSUS: &[(&str, usize, &str)] = &[
          the nesting cannot be read off the DOM), and a `FocusScope`'s `focused` \
          latch is O (it dies with the boundary that installed the scope). −1 at \
          A112 S3: `each`'s row list IS its region's (`region.rows`), not a \
-         second cell kept in step with it",
+         second cell kept in step with it; −1 at A112 S3b: `each_by`'s, the \
+         same way",
     ),
     (
         "delta.vl",
-        9,
+        10,
         "E: the delta log's ops/version/base/cursors (twice — `new` and \
          `with_limit`) plus a cursor's own sequence. Every one of them is \
          minted by the CELL that holds the log and read by the CONSUMERS that \
          hold cursors into it, which is the E class exactly; they are A54's \
          five cells, lifted out of `rpc.vl` and spelled once per constructor \
-         (A112 S1).",
+         (A112 S1). +1 at M86: a `ListCell`'s own list, held in a cell of its \
+         own rather than inside a `SignalCell` so a write can read its length \
+         in place — E for the same reason (minted by the cell, read and \
+         written through every copy of the handle).",
     ),
     (
         "memo.vl",

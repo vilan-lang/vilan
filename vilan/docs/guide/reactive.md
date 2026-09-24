@@ -669,9 +669,10 @@ fun main() {
 ```
 
 It is an ordinary `Source<List<T>>` besides — `each`, `map`, `effect` all
-take it — and nothing that ignores the changes pays for them. `each` uses
-them: a push into a 1,000-row `ListCell` builds one row, where the same push
-into a `SignalCell<List<T>>` re-reads every key to find it.
+take it — and nothing that ignores the changes pays for them. `each`,
+`each_values` and `each_by` use them: a push into a 1,000-row `ListCell`
+builds one row, where the same push into a `SignalCell<List<T>>` re-reads
+every key to find it.
 
 Its mutators are `push`, `prepend`, `insert_at`, `insert_all`,
 `remove_at`, `remove_range`, `pop`, `extend`, `clear`, `set_all`,
