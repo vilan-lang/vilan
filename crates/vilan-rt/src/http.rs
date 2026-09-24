@@ -673,13 +673,16 @@ impl Response {
 
     /// `response.write(chunk)` — a chunk without ending the response, which is
     /// SSE's shape. The head goes out on the first chunk, with no
-    /// `Content-Length`, because a stream has no length to declare.
+    /// `Content-Length`, because a stream has no length to declare. A status
+    /// that carries no body sends its head and drops the chunk, as node does.
     pub fn write(&self, chunk: &str) {
         if self.0.ended.get() {
             return;
         }
         self.send_head(None);
-        self.0.connection.enqueue(chunk.as_bytes());
+        if status_carries_a_body(self.0.status.get()) {
+            self.0.connection.enqueue(chunk.as_bytes());
+        }
     }
 
     /// `response.end(body)`.
@@ -690,6 +693,16 @@ impl Response {
     /// `response.end(bytes)`.
     pub fn end_bytes(&self, body: &Bytes) {
         if self.0.ended.replace(true) {
+            return;
+        }
+        // A `204`, a `304` and every `1xx` carry NO body (RFC 9110 §6.4.1), and
+        // node treats them so: no `Content-Length` of its own and any data
+        // handed to `end` ignored. A `304` answering `If-None-Match` is the
+        // case that reaches here — `std::http`'s `etag_response` — and
+        // `Content-Length: 0` on it would claim the representation is empty.
+        if !status_carries_a_body(self.0.status.get()) {
+            self.send_head(None);
+            self.0.connection.stage.set(Stage::Closing);
             return;
         }
         // A response that already streamed declared no length, so its body
@@ -712,6 +725,12 @@ impl Response {
             self.0.connection.on_close.borrow_mut().push(callback);
         }
     }
+}
+
+/// Whether a response with this status may carry a body — every status but
+/// the `1xx` family, `204 No Content` and `304 Not Modified` (RFC 9110 §6.4.1).
+fn status_carries_a_body(status: u16) -> bool {
+    !((100..200).contains(&status) || status == 204 || status == 304)
 }
 
 impl PartialEq for Response {
@@ -1314,6 +1333,43 @@ mod tests {
         );
         assert_eq!(body, "hello\n");
         assert_eq!(served.borrow().clone(), vec!["GET /x".to_string()]);
+    }
+
+    /// A `304` carries no body and no length of its own — node's treatment of
+    /// every status RFC 9110 §6.4.1 says has no content, and what `std::http`'s
+    /// `etag_response` answers a matching `If-None-Match` with. A
+    /// `Content-Length: 0` there would claim the representation is empty.
+    #[test]
+    fn a_not_modified_answer_sends_no_length_and_no_body() {
+        let answered = block_on(async move {
+            let handler: Handler = Rc::new(move |_request: Request, response: Response| {
+                crate::executor::pin_future(async move {
+                    response.set_status_code(304);
+                    response.set_header("ETag", "\"v1\"");
+                    response.end("ignored");
+                })
+            });
+            let server = create_server(handler);
+            server.listen(0, Rc::new(|| {}));
+            let port = server.port() as u16;
+            let client = fetch(port, "GET /x HTTP/1.1\r\nHost: a\r\n\r\n");
+            crate::executor::sleep(200, None).await;
+            server.close(Rc::new(|| {}));
+            client.join().expect("the client thread")
+        });
+        let (status, headers, body) = split(&answered);
+        assert_eq!(status, "HTTP/1.1 304 Not Modified");
+        assert!(
+            headers.iter().any(|line| line == "ETag: \"v1\""),
+            "{headers:?}"
+        );
+        assert!(
+            !headers
+                .iter()
+                .any(|line| line.starts_with("Content-Length")),
+            "a 304 declares no length: {headers:?}"
+        );
+        assert_eq!(body, "", "and carries no body");
     }
 
     #[test]

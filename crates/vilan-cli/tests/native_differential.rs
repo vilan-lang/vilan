@@ -1261,6 +1261,307 @@ const KOLT_SHAPE_PROBE: &str = concat!(
     "}\n",
 );
 
+/// **F18 slice 3**: `Server::builder()` — the shipped spelling, which every
+/// server before this pin had to avoid for the `Server` struct literal — builds
+/// natively and serves a build over a real socket, byte-for-byte with node,
+/// INCLUDING `serve_build`'s conditional-GET arm.
+///
+/// The chain is the one kolt's server writes: `serve_build(require_build(..))`
+/// (which reads the leg's manifest through `std::fs::stat` and `readFile` at
+/// boot), `cache_build` with a validating policy, `on_request` for every path
+/// the build does not claim, `on_start`. Three exchanges, each compared whole
+/// between the legs (status, the headers the program and std set, the body):
+/// the artifact with its `ETag` and `Cache-Control`; a REVALIDATION with that
+/// `ETag` in `If-None-Match`, which is the `304` with no body and no length
+/// (node sends none, and neither may this runtime — `Content-Length: 0` was
+/// what it sent before this slice); and the fallback.
+///
+/// Red at the Order 40 seal: `Server::builder()` was refused by name (the
+/// mutating `Bytes` bindings, `now_millis`, SHA-1), then — past those — rustc
+/// refused fourteen emitted errors across five lowering classes (a `&mut` loan
+/// handed on, a literal beside a `u32`, a consumed place read at a `let`, a
+/// tuple, a field; an `async` hook in an `Option` field).
+#[test]
+fn the_builder_serves_its_build_and_revalidates_it_over_a_real_socket() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_builder.vl"), BUILDER_PROBE)
+        .expect("write the probe program");
+    let dist = staged.join("dist");
+    std::fs::create_dir_all(&dist).expect("create the build directory");
+    std::fs::write(dist.join("client.js"), "console.log(\"client\");\n")
+        .expect("write the artifact");
+    std::fs::write(
+        dist.join("client.chunks.json"),
+        "{\"leg\":\"client\",\"entry\":\"client.js\",\"styles\":null,\
+         \"classic_script\":false,\"chunks\":[],\"assets\":[]}",
+    )
+    .expect("write the build manifest");
+
+    let built = vilan(&staged)
+        .args(["build", "--backend", "rust", "native_probe_builder.vl"])
+        .output()
+        .expect("build the server natively");
+    assert!(
+        built.status.success(),
+        "the native leg did not build:\n{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let binary = String::from_utf8_lossy(&built.stdout)
+        .lines()
+        .find_map(|line| line.split(" -> ").nth(1).map(str::to_string))
+        .expect("`vilan build` says where the binary is");
+    let mut native_command = Command::new(staged.join(&binary));
+    native_command.current_dir(&staged);
+    let native = revalidated_exchanges(native_command);
+
+    let bundled = vilan(&staged)
+        .args(["build", "native_probe_builder.vl"])
+        .output()
+        .expect("build the server for node");
+    assert!(
+        bundled.status.success(),
+        "the JS leg did not build:\n{}",
+        String::from_utf8_lossy(&bundled.stderr)
+    );
+    let mut node = Command::new("node");
+    node.current_dir(&staged).arg("native_probe_builder.mjs");
+    let javascript = revalidated_exchanges(node);
+
+    assert_eq!(
+        native, javascript,
+        "the two backends must answer the same three exchanges"
+    );
+    let [artifact, revalidated, fallback] = &native[..] else {
+        panic!("three exchanges, got {native:?}");
+    };
+    assert_eq!(artifact.status, "HTTP/1.1 200 OK");
+    assert_eq!(artifact.body, "console.log(\"client\");\n");
+    assert!(
+        artifact
+            .headers
+            .iter()
+            .any(|line| line.starts_with("ETag: \""))
+            && artifact
+                .headers
+                .iter()
+                .any(|line| line == "Cache-Control: no-cache"),
+        "the validating policy's headers: {:?}",
+        artifact.headers
+    );
+    assert_eq!(revalidated.status, "HTTP/1.1 304 Not Modified");
+    assert_eq!(revalidated.body, "");
+    assert!(
+        !revalidated
+            .headers
+            .iter()
+            .any(|line| line.starts_with("Content-Length")),
+        "a 304 declares no length: {:?}",
+        revalidated.headers
+    );
+    assert_eq!(fallback.status, "HTTP/1.1 200 OK");
+    assert_eq!(fallback.body, "fallback /other");
+}
+
+/// The artifact, its revalidation with the `ETag` the first answer carried,
+/// and a path the build does not claim — over one spawned server.
+fn revalidated_exchanges(mut command: Command) -> Vec<ServedRequest> {
+    let server = ServerUnderTest::spawn(&mut command);
+    let port = server.port();
+    let artifact = ServedRequest::exchange(port, "GET", "/client.js", "");
+    let etag = artifact
+        .headers
+        .iter()
+        .find_map(|line| line.strip_prefix("ETag: "))
+        .unwrap_or("\"none\"")
+        .to_string();
+    let revalidated = ServedRequest::exchange_with(
+        port,
+        "GET",
+        "/client.js",
+        &format!("If-None-Match: {etag}\r\n"),
+        "",
+    );
+    let fallback = ServedRequest::exchange(port, "GET", "/other", "");
+    vec![artifact, revalidated, fallback]
+}
+
+const BUILDER_PROBE: &str = concat!(
+    "import std::build::require_build;\n",
+    "import std::http::{ CachePolicy, Response, Server };\n",
+    "import std::io::print;\n",
+    "\n",
+    "async fun main() {\n",
+    "\tlet build = require_build(\"client\");\n",
+    "\tServer::builder()\n",
+    "\t\t.port(0)\n",
+    "\t\t.serve_build(build)\n",
+    "\t\t.cache_build(|url| CachePolicy::validated().cache_control(\"no-cache\"))\n",
+    "\t\t.on_request(|request| Response::builder()\n",
+    "\t\t\t.set_header(\"Content-Type\", \"text/plain\")\n",
+    "\t\t\t.body(i\"fallback {request.path()}\")\n",
+    "\t\t\t.build())\n",
+    "\t\t.on_start(|server| print(i\"vilan-test-port={server.port()}\"))\n",
+    "\t\t.build()\n",
+    "\t\t.start();\n",
+    "}\n",
+);
+
+/// Rule 1's copy at EVERY position that consumes a place read, for the types
+/// the JS backend never copies (`str`, `Option`, enums, handles): a `let`, a
+/// struct literal's field, a list and a tuple element, an assignment, a `push`,
+/// a subscript read out of a `Vec` at a `let` and at a tail, and a FIELD handed
+/// to a call while its struct is read again. Each was a use-after-move (or a
+/// move out of a `Vec`) natively — eleven rustc errors at the Order 40 seal —
+/// and all of them are on `Server::builder()`'s std path.
+#[test]
+fn a_consumed_place_read_is_copied_at_every_consuming_position() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_consumed.vl"), CONSUMED_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_consumed.vl"),
+        Verdict::Identical,
+        "a place read into a consuming position is a copy on both backends"
+    );
+}
+
+const CONSUMED_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::option::Option::{ self, None, Some };\n",
+    "\n",
+    "struct Asset {\n",
+    "\tname: str,\n",
+    "\tkind: Option<str>,\n",
+    "}\n",
+    "\n",
+    "fun describe(name: str, kind: Option<str>): str {\n",
+    "\tlet shown: str = kind.unwrap_or(\"-\");\n",
+    "\tname + \":\" + shown\n",
+    "}\n",
+    "\n",
+    "fun last(path: str): str {\n",
+    "\tlet parts = path.split(\"/\");\n",
+    "\tparts[parts.len() - 1]\n",
+    "}\n",
+    "\n",
+    "fun kind_of(asset: Asset): Option<str> {\n",
+    "\tasset.kind\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet parts = \"a/b/c\".split(\"/\");\n",
+    "\tlet first = parts[0];\n",
+    "\tlet copy = first;\n",
+    "\tprint(i\"{first} {copy} {last(\"x/y\")} {parts[1]}\");\n",
+    "\tlet asset = Asset { name = \"logo\", kind = Some(\"svg\") };\n",
+    "\tprint(describe(asset.name, asset.kind));\n",
+    "\tlet again = asset;\n",
+    "\tlet kind: str = kind_of(asset).unwrap_or(\"?\");\n",
+    "\tprint(i\"{asset.name} {again.name} {kind}\");\n",
+    "\tmut kept: List<(str, i32)> = [];\n",
+    "\tfor entry in [(\"x\", 1), (\"y\", 2)] {\n",
+    "\t\tlet (address, at) = entry;\n",
+    "\t\tkept.push((address, at));\n",
+    "\t\tif address == \"y\" {\n",
+    "\t\t\tprint(i\"kept {address} at {at}\");\n",
+    "\t\t}\n",
+    "\t}\n",
+    "\tprint(kept.len());\n",
+    "\tlet maybe: Option<str> = Some(\"m\");\n",
+    "\tlet other = maybe;\n",
+    "\tlet built = Asset { name = first, kind = maybe };\n",
+    "\tlet listed = [first, copy];\n",
+    "\tmut target = \"t\";\n",
+    "\ttarget = first;\n",
+    "\tlet shown: str = maybe.unwrap_or(\"\");\n",
+    "\tlet also: str = other.unwrap_or(\"\");\n",
+    "\tprint(i\"{shown} {also} {built.name} {listed.len()} {target} {first}\");\n",
+    "}\n",
+);
+
+/// A binding that IS a `&mut` loan — a `&mut` parameter, a `&mut self` — is
+/// REBORROWED when handed to another `&mut` position (`&mut *loan`), not
+/// borrowed again: `&mut loan` is a `&mut &mut T` that rustc takes only from a
+/// `mut` binding. `[derive(Wire)]`'s `describe` hands its serializer on this
+/// way, which is how `Server::builder()`'s rpc error encoding reached it.
+#[test]
+fn a_mutable_loan_is_reborrowed_when_it_is_handed_on() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_reborrow.vl"), REBORROW_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_reborrow.vl"),
+        Verdict::Identical,
+        "a forwarded `&mut` loan writes the caller's value on both backends"
+    );
+}
+
+const REBORROW_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Counter {\n",
+    "\tn: i32,\n",
+    "}\n",
+    "\n",
+    "impl Counter {\n",
+    "\tfun bump(&mut self) {\n",
+    "\t\tself.n = self.n + 1;\n",
+    "\t}\n",
+    "\tfun twice(&mut self) {\n",
+    "\t\tself.bump();\n",
+    "\t\tself.bump();\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun step(counter: &mut Counter) {\n",
+    "\tcounter.bump();\n",
+    "}\n",
+    "\n",
+    "fun forward(counter: &mut Counter) {\n",
+    "\tstep(counter);\n",
+    "\tcounter.twice();\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut counter = Counter { n = 0 };\n",
+    "\tforward(&mut counter);\n",
+    "\tprint(counter.n);\n",
+    "}\n",
+);
+
+/// An unsuffixed literal takes its PARTNER'S width across a binary operator
+/// (`unit >= 65` over a `u32` is a `u32` comparison), and a host binding's
+/// argument takes its own parameter's type rather than the enclosing
+/// position's (`let unit: u32 = "A".code_at(0)` — the index is an `i32`).
+/// `std::string`'s `to_lowercase_ascii`, on `Request::header`'s path, is the
+/// first shape; seven rustc errors at the Order 40 seal.
+#[test]
+fn a_literal_operand_takes_its_partners_width() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_partner.vl"), PARTNER_WIDTH_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_partner.vl"),
+        Verdict::Identical,
+        "a literal beside a `u32` is a `u32` on both backends"
+    );
+}
+
+const PARTNER_WIDTH_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet unit: u32 = \"A\".code_at(0);\n",
+    "\tlet other: u32 = 70;\n",
+    "\tlet wide: u53 = 9;\n",
+    "\tprint(i\"{unit >= 65 && unit <= 90} {other > 65} {unit == 65} {unit - 65}\");\n",
+    // A literal on the LEFT is B389's (solver-41): the analyzer refuses it
+    // before either backend sees it, so only right-hand literals are here.
+    "\tprint(i\"{wide * 2 > 17} {(wide + 1) == 10}\");\n",
+    "}\n",
+);
+
 /// The three exchanges the exit drives, over one spawned server.
 struct ServedLogin {
     exchanges: Vec<ServedRequest>,
@@ -1301,13 +1602,25 @@ impl ServedRequest {
     /// `announced_line` is empty here: it belongs to the server, and a caller
     /// driving several exchanges has it from the spawn.
     fn exchange(port: u16, method: &str, path: &str, body: &str) -> ServedRequest {
+        ServedRequest::exchange_with(port, method, path, "", body)
+    }
+
+    /// [`ServedRequest::exchange`] with extra request header lines (each ending
+    /// `\r\n`) — how a revalidation sends its `If-None-Match`.
+    fn exchange_with(
+        port: u16,
+        method: &str,
+        path: &str,
+        extra_headers: &str,
+        body: &str,
+    ) -> ServedRequest {
         let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
             .expect("connect to the port the server announced");
         stream
             .write_all(
                 format!(
                     "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\
-                     Connection: close\r\n\r\n{body}",
+                     {extra_headers}Connection: close\r\n\r\n{body}",
                     body.len()
                 )
                 .as_bytes(),

@@ -377,6 +377,16 @@ fun selected_protocol(offered: List<str>): str {
 	""
 }
 
+/// An app-installed `async` hook — `Service::authorize`'s and
+/// `Service::authorize_request`'s — held where J2 v1 lets an `async` closure
+/// type live. `Option<async |T| U>` is not one of those places, and a hook
+/// stored as a plain `|T| U` and re-marked `async` at a `let` only works where
+/// a closure is a closure whatever it answers: natively an `async` closure
+/// answers a future, and the plain type has nowhere to keep that fact.
+struct AsyncGate<T> {
+	check: async |T| Result<Session, Reject>,
+}
+
 /// One rpc service mounted on a `Server`: the protocol, where its routes live, and
 /// what happens to a connection's per-connection state. The routes
 /// (`{mount}events`, `{mount}send`, `{mount}rpc`) and the upgrade handshake are
@@ -406,17 +416,19 @@ export struct Service {
 	/// the factory; `Err(reject)` answers the raw socket and destroys it, before
 	/// any of this service's state exists for that client.
 	///
-	/// Stored plain and re-marked `async` at a `let` where it is called (J2 v1: an
-	/// `async` closure TYPE lives only at parameter/`let`/field/return seams, and
-	/// never nested inside a `Option<…>`) — which is what makes the call await, so
-	/// a hook that verifies a signature settles before the handshake is answered.
-	authorize: Option<|Handshake| Result<Session, Reject>>,
+	/// Held in an `AsyncGate` rather than as a bare closure because J2 v1 lets an
+	/// `async` closure TYPE live only at parameter/`let`/field/return seams —
+	/// never nested inside an `Option<…>` — and a struct FIELD is one of those
+	/// seams: the hook stays `async` in its type from `authorize` to the call,
+	/// so the call awaits and a hook that verifies a signature settles before
+	/// the handshake is answered.
+	authorize: Option<AsyncGate<Handshake>>,
 	/// The per-request gate on the connectionless `{mount}rpc` POST leg (A120 S4,
 	/// `transport-rpc.md` §9.7.6), when the app installed one. `authorize`'s twin
 	/// for the leg that has no handshake: `Ok(session)` is stamped on that one
-	/// request's `RpcRequest`, `Err(reject)` answers the POST. Stored plain for
-	/// `authorize`'s reason.
-	authorize_request: Option<|Request| Result<Session, Reject>>,
+	/// request's `RpcRequest`, `Err(reject)` answers the POST. Held in an
+	/// `AsyncGate` for `authorize`'s reason.
+	authorize_request: Option<AsyncGate<Request>>,
 	/// Live upgraded connections on this mount, and the ceiling `0` means none. A
 	/// cell, so every copy of this `Service` value counts into one total.
 	live: Shared<i32>,
@@ -584,7 +596,7 @@ export impl Service {
 	/// the other two with a plain 401) — unless the service ALSO installs
 	/// `authorize_request`, which gates the POST leg in its own vocabulary.
 	fun authorize(own self, check: async |Handshake| Result<Session, Reject>): Service {
-		self.authorize = Some(check);
+		self.authorize = Some(AsyncGate { check });
 		self
 	}
 
@@ -633,7 +645,7 @@ export impl Service {
 	/// a credential a script puts in a header is CSRF-immune by construction. std
 	/// reads no cookie for you.
 	fun authorize_request(own self, check: async |Request| Result<Session, Reject>): Service {
-		self.authorize_request = Some(check);
+		self.authorize_request = Some(AsyncGate { check });
 		self
 	}
 
@@ -806,11 +818,10 @@ fun gate_upgrade(
 	}
 	match service.authorize {
 		None => Ok(Session::anonymous()),
-		Some(let check) => {
-			// Re-marked at the `let` so the call awaits (J2's typed channel): the
-			// hook may verify a signature, and nothing may be written to the socket
-			// until it has.
-			let gate: async |Handshake| Result<Session, Reject> = check;
+		Some(let installed) => {
+			// Awaited, because the gate's field is `async`: the hook may verify a
+			// signature, and nothing may be written to the socket until it has.
+			let gate = installed.check;
 			// The verification bound (A48): armed before the hook is called and
 			// disarmed the moment it answers. `settled` is what makes the listener
 			// one-way — node's `"timeout"` handler stays attached for the life of
@@ -984,10 +995,9 @@ fun rpc_frame_response(service: Service, request: Request): Response {
 			// and before the frame is read.
 			let session = match service.authorize_request {
 				None => Session::anonymous(),
-				Some(let check) => {
-					// Re-marked at the `let` so the call awaits, as `gate_upgrade`
-					// does for `authorize`.
-					let gate: async |Request| Result<Session, Reject> = check;
+				Some(let installed) => {
+					// Awaited, as `gate_upgrade`'s call of `authorize` is.
+					let gate = installed.check;
 					match gate(request) {
 						Ok(let proved) => proved,
 						Err(let reject) => ret request_refusal(service, reject),

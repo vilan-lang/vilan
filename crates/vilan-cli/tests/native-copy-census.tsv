@@ -4,7 +4,7 @@
 bool	1	0
 recursion	0	0
 loops	0	0
-copy-elision	0	0
+copy-elision	0	1
 field-assignment	0	0
 for-in	0	0
 list-splice	0	0
@@ -14,7 +14,7 @@ borrows	0	0
 generic-inference	0	4
 default-generic-param	0	1
 default	0	0
-mut-parameters	2	0
+mut-parameters	2	1
 compound-index	0	0
 interpolated-multiline-string	0	0
 derive-json	2	1
