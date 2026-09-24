@@ -25,12 +25,9 @@ fun main() {
 	let quotient = count / step;
 	let remainder = count.rem(step);
 	print(i"{total} {left} {scaled} {quotient} {remainder}");
-	let halved = halve(count, 4usize);
+	let halved = halve(count, 4);
 	print(i"{halved}");
-	// The suffix on `42usize` is a finding, not the style: natively a
-	// comparison's unsuffixed literal is emitted at `i32` whatever the left
-	// operand's width (every sized width, not only `usize`), which rustc refuses.
-	print(i"{count > step} {count == 42usize} {count != step}");
+	print(i"{count > step} {count == 42} {count != step}");
 
 	// The bounds are the JS guarantee on every backend (§11 Q3).
 	let top = usize::max_value();
@@ -41,7 +38,7 @@ fun main() {
 	let floor = step.saturating_sub(count);
 	print(i"{floor}");
 	print(step.checked_sub(count).is_none());
-	let back: usize = count.checked_sub(step).unwrap_or(0usize);
+	let back: usize = count.checked_sub(step).unwrap_or(0);
 	print(i"{back}");
 
 	// Conversions in, and back out.
@@ -66,11 +63,11 @@ fun main() {
 		Err(let reason) => print(reason),
 	}
 	mut rows: Map<usize, str> = Map::new();
-	rows.insert(3usize, "three");
-	print(rows.get(3usize).unwrap_or("none"));
+	rows.insert(3, "three");
+	print(rows.get(3).unwrap_or("none"));
 
 	// A list of them serializes and parses through each element's own impl.
-	let positions: List<usize> = [0usize, 3usize, 2147483647usize];
+	let positions: List<usize> = [0, 3, 2147483647];
 	let encoded = positions.to_json();
 	print(encoded);
 	let decoded: Result<List<usize>, str> = List::from_json(encoded);

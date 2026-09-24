@@ -199,6 +199,7 @@ const FOLDS: &[&str] = &[
     "tuple-access.vl",
     "tuple-spread.vl",
     "unary-minus.vl",
+    "usize-literals.vl",
     "usize-underflow.vl",
     "usize.vl",
     "vec2.vl",

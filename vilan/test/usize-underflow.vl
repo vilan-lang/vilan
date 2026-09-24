@@ -19,7 +19,7 @@ fun main() {
 	print(i"{under}");
 	print(under < first);
 	// What a program that wants a defined answer writes instead.
-	print(first.checked_sub(1usize).is_none());
-	let floor = first.saturating_sub(1usize);
+	print(first.checked_sub(1).is_none());
+	let floor = first.saturating_sub(1);
 	print(i"{floor}");
 }

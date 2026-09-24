@@ -127,6 +127,9 @@ const DEFAULT_SUITE: &[&str] = &[
     // I5 S1: `usize`, the index type — the platform word natively, `u53` on JS,
     // printing the same family surface on both.
     "usize.vl",
+    // I5 S1 + B389: the literal law at `usize`, all 21 measured positions in one
+    // program — the literals' native widths are the record B389 writes.
+    "usize-literals.vl",
 ];
 
 /// Corpus programs that are OUTSIDE this differential by construction, named

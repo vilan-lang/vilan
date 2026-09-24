@@ -189,6 +189,7 @@ macro_rules! corpus_manifest {
             tuple_access => "tuple-access.vl",
             tuple_spread => "tuple-spread.vl",
             unary_minus => "unary-minus.vl",
+            usize_literals => "usize-literals.vl",
             usize_underflow => "usize-underflow.vl",
             usize => "usize.vl",
             value_semantics => "value-semantics.vl",
