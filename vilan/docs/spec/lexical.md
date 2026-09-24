@@ -74,9 +74,18 @@ two's-complement width), `i53`/`u53` (the wide integers; see below),
 `f` (`f64`), `f32`, `f64`, `n` (`BigInt`). An **unknown suffix is a
 compile error** (the retired `i64`/`u64` suffixes get a rename hint). An
 unsuffixed literal takes its type from its CONTEXT — the annotation, the
-parameter, the field, the return type it lands at — and `i32` for an
-integer literal, `f64` for a fractional one, is the DEFAULT where the
-context states nothing. That holds for an expression of unsuffixed
+parameter, the field, the return type it lands at, the other operand of a
+binary operator (on either side: `1 + n` and `n + 1` are both `n`'s
+type), the element type of an annotated list literal (or a typed sibling
+element), the value a `match` pattern is tested against, and the type a
+generic call's expected result binds its parameter to (`let n: u53 =
+identity(5)`) — and `i32` for an integer literal, `f64` for a fractional
+one, is the DEFAULT where the context states nothing. A binding with no
+annotation whose initializer is such a literal (`let n = 0;`, or
+arithmetic over literals and other such bindings) has no type of its own
+either: it takes the numeric type its first typed USE states — an
+argument, an operand beside a typed value (`i < xs.len()`), an
+assignment — and the default only when no use states one. That holds for an expression of unsuffixed
 literals as well as for a lone one, including the operator it is
 computed with: `let ratio: f64 = 7 / 2;` is float division and `3.5`,
 where the same expression with no annotation truncates to `3`. Every

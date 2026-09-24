@@ -1341,6 +1341,16 @@ struct R11Instance {
     call_id: Id,
 }
 
+/// B389 — what [`Analyzer::literal_numeric_shape`] saw: whether any literal
+/// at all (a pure alias cycle has none), whether one has a fraction, and the
+/// literal bindings it went through.
+#[derive(Default)]
+struct LiteralShape {
+    saw_literal: bool,
+    fractional: bool,
+    lets: Vec<Id>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Variable<'src> {
     pub id: Id,
@@ -3491,6 +3501,28 @@ pub struct Analyzer<'src> {
     // refusal the program never had. On a stalled fixpoint the door commits
     // with what it has, which is exactly what it did before it deferred.
     fixpoint_stalled: bool,
+    // B389: an UNANNOTATED binding whose initializer is built from unsuffixed
+    // numeric literals alone (`let n = 0`, `mut i = 1 + 2`, or another such
+    // binding) has no type of its own — it takes the numeric type its first
+    // typed USE states, the way the literal itself does in an argument
+    // (`take(n)` for `fun take(count: u53)` makes `n` a `u53`). While this is
+    // set (inside the constraint fixpoint, until it stalls), such a binding
+    // DEFERS instead of defaulting, and every read of it that carries a
+    // numeric expectation records that expectation in
+    // `literal_let_expectations`; a stall first looks for a numeric PEER
+    // (`i < xs.len()`, `n = width`) and then opens this door, so a binding no
+    // use types defaults exactly as before (`i32`, or `f64` with a fraction).
+    literal_lets_wait: bool,
+    // B389: the numeric type a literal binding's first typed use asked of it.
+    literal_let_expectations: HashMap<Id, TypeId>,
+    // B389: the numeric type an UNSUFFIXED literal was settled at by a
+    // concrete numeric context — the first one, as `binary_context_types`
+    // keeps (a nearer landing wins). Never written from an `Unknown`
+    // expectation, so a literal no context typed has no record and keeps its
+    // default. Exported into `Program::expr_type_ids` for literals nothing
+    // else typed: the native emitter's width for a literal whose position
+    // states none (`0 < n`, a `match` arm, a generic argument).
+    literal_types: HashMap<Id, TypeId>,
     // The `(value, trait, arguments)` bound questions `satisfies_trait_bound`
     // is answering right now, innermost last. A question that reaches itself
     // is a cycle, and a cycle proves nothing: a supertrait blanket (`impl type
@@ -5902,6 +5934,9 @@ impl<'src> Analyzer<'src> {
             dependency_sources: HashSet::default(),
             type_map_writes: 0,
             fixpoint_stalled: false,
+            literal_lets_wait: false,
+            literal_let_expectations: HashMap::default(),
+            literal_types: HashMap::default(),
             bound_proofs_in_progress: Vec::new(),
             frozen_ranges: Vec::new(),
             world_ranges: Vec::new(),
@@ -32949,8 +32984,16 @@ impl<'src> Analyzer<'src> {
             WalkPattern::Literal(literal_id) => {
                 // The literal's type must be compatible with the matched value's.
                 let literal_id = *literal_id;
-                let literal_type = self.infer_type(literal_id, &Type::Unknown, &HashMap::default());
                 let subject_type = expected_type_id.get_type(self);
+                // B389: an unsuffixed literal pattern is typed by the value it
+                // is matched against (`match n { 0 => .. }` over `n: u53`), as a
+                // literal is typed by every other position it lands in.
+                let literal_constraint = match self.numeric_primitive_name(&subject_type) {
+                    Some(_) => subject_type.clone(),
+                    None => Type::Unknown,
+                };
+                let literal_type =
+                    self.infer_type(literal_id, &literal_constraint, &HashMap::default());
                 // B82: a literal pattern against a type PARAMETER is sound at
                 // runtime — the emitted test is a `===`, which a value of any
                 // other type simply fails — so `match value { 1 => .. }` inside
@@ -35337,14 +35380,20 @@ impl<'src> Analyzer<'src> {
                                 .copied(),
                             _ => None,
                         };
-                        if fraction.is_some() {
+                        let name = if fraction.is_some() {
                             match expected {
                                 Some("f32") => "f32",
                                 _ => "f64",
                             }
                         } else {
                             expected.unwrap_or("i32")
+                        };
+                        // B389: the context's width, recorded (`literal_types`).
+                        if expected == Some(name) {
+                            let type_id = self.primitive_struct_type(name).get_type_id(self);
+                            self.literal_types.entry(expr_id).or_insert(type_id);
                         }
+                        name
                     }
                 };
                 self.primitive_struct_type(name)
@@ -35499,14 +35548,60 @@ impl<'src> Analyzer<'src> {
                         }),
                     false => expected_element.clone(),
                 };
+                // B389: an unsuffixed literal ELEMENT takes the numeric element
+                // type the literal is expected at (`let xs: List<u53> = [0, 1]`),
+                // or, with no such expectation, the type of its first sibling
+                // that has one of its own (`[0, n]`). Literal elements only —
+                // the note above stands for everything else.
+                let literal_element: Option<Type> = match seeded_element
+                    .as_ref()
+                    .filter(|expected| self.numeric_primitive_name(expected).is_some())
+                {
+                    Some(expected) => Some(expected.clone()),
+                    None if item_ids
+                        .iter()
+                        .any(|item_id| self.is_unsuffixed_numeric(*item_id)) =>
+                    {
+                        match item_ids
+                            .iter()
+                            .copied()
+                            .find(|item_id| !self.is_unsuffixed_numeric(*item_id))
+                        {
+                            Some(sibling_id) => {
+                                let sibling = self.infer_type_inner(
+                                    sibling_id,
+                                    &Type::Unknown,
+                                    substitution_context,
+                                    exprs_seen,
+                                );
+                                if matches!(sibling, Type::Unresolved) {
+                                    return Type::Unresolved;
+                                }
+                                self.numeric_primitive_name(&sibling)
+                                    .is_some()
+                                    .then_some(sibling)
+                            }
+                            None => None,
+                        }
+                    }
+                    None => None,
+                };
                 let mut element_type = match seeded_element {
                     Some(expected @ Type::Dyn(..)) => expected,
                     _ => Type::Unknown,
                 };
                 for item_id in &item_ids {
+                    let item_constraint = match (&literal_element, &element_type) {
+                        (Some(literal_element), Type::Unknown)
+                            if self.is_unsuffixed_numeric(*item_id) =>
+                        {
+                            literal_element.clone()
+                        }
+                        _ => element_type.clone(),
+                    };
                     let item_type = self.infer_type_inner(
                         *item_id,
-                        &element_type,
+                        &item_constraint,
                         substitution_context,
                         exprs_seen,
                     );
@@ -36162,6 +36257,14 @@ impl<'src> Analyzer<'src> {
                     _ => Type::Unknown,
                 }
             }
+            // B389: a literal binding still waiting for its type answers "not
+            // yet" rather than its default, and a read that carries a numeric
+            // expectation is what types it (see `literal_lets_wait`).
+            Expr::Variable(variable_id) if self.literal_let_is_pending(*variable_id) => {
+                let variable_id = *variable_id;
+                self.note_literal_let_expectation(variable_id, &constraint);
+                Type::Unresolved
+            }
             Expr::Variable(variable_id) => {
                 let variable = self.variables.get(variable_id).unwrap();
                 let variable_type = variable.type_id.get_type(self);
@@ -36241,15 +36344,45 @@ impl<'src> Analyzer<'src> {
                 _,
                 _,
             ) => self.bool_type(),
-            Expr::Binary(_, lhs_id, _rhs_id) => {
-                let lhs_id = *lhs_id;
+            Expr::Binary(op, lhs_id, rhs_id) => {
+                let (op, lhs_id, rhs_id) = (*op, *lhs_id, *rhs_id);
                 // B370: this is the ONE place a context's type flows into an
                 // arithmetic expression, so it is where the expression's
                 // settled type is recorded for the emission verdicts
                 // `finalize_build` computes. See `binary_context_types`.
                 self.note_binary_context(expr_id, &constraint);
-                let lhs =
-                    self.infer_type_inner(lhs_id, &constraint, substitution_context, exprs_seen);
+                // B389: a literal LEFT operand with no numeric context takes
+                // the right operand's type (`1 + n` over `n: u53` is a `u53`),
+                // as a literal right operand already took the left's. A shift
+                // is left out: its amount is not its value's peer.
+                let peer = match self.numeric_primitive_name(&constraint).is_none()
+                    && !matches!(op, BinaryOp::Shl | BinaryOp::Shr | BinaryOp::UShr)
+                    && self.is_unsuffixed_numeric(lhs_id)
+                    && !self.is_unsuffixed_numeric(rhs_id)
+                {
+                    true => {
+                        let rhs = self.infer_type_inner(
+                            rhs_id,
+                            &Type::Unknown,
+                            substitution_context,
+                            exprs_seen,
+                        );
+                        if matches!(rhs, Type::Unresolved) {
+                            return Type::Unresolved;
+                        }
+                        self.numeric_primitive_name(&rhs).is_some().then_some(rhs)
+                    }
+                    false => None,
+                };
+                if let Some(peer) = &peer {
+                    self.note_binary_context(expr_id, peer);
+                }
+                let lhs = self.infer_type_inner(
+                    lhs_id,
+                    peer.as_ref().unwrap_or(&constraint),
+                    substitution_context,
+                    exprs_seen,
+                );
                 match lhs {
                     Type::Unresolved => Type::Unresolved,
                     _ => lhs,
@@ -41154,6 +41287,13 @@ impl<'src> Analyzer<'src> {
                     // two-phase one on every call: all 112 corpus goldens are
                     // byte-identical with this hoist unconditional.
                     if matches!(&target, Expr::Function(_) | Expr::ExternalFunction(_)) {
+                        self.bind_literal_generics_from_expectation(
+                            call_id,
+                            target_id,
+                            argument_ids,
+                            0,
+                            &mut substitution_context,
+                        );
                         self.bind_callee_own_generics(
                             target_id,
                             argument_ids,
@@ -42181,6 +42321,15 @@ impl<'src> Analyzer<'src> {
                     .get(&id)
                     .cloned()
                     .unwrap_or_default();
+                // B389: a generic only a literal argument fixes takes the call's
+                // numeric expectation first.
+                self.bind_literal_generics_from_expectation(
+                    id,
+                    member_id,
+                    argument_ids,
+                    1,
+                    &mut substitution,
+                );
                 // Bind the method's own generics from the non-closure arguments
                 // first, so a closure parameter `|T| ..` is typed with `T` known.
                 self.bind_callee_own_generics(member_id, argument_ids, 1, true, &mut substitution);
@@ -42795,6 +42944,31 @@ impl<'src> Analyzer<'src> {
         let initial_type_id = constraint.initial_type_id;
         let value_ids = &constraint.value_ids;
 
+        // B389: a LITERAL binding takes its type from its first typed use (see
+        // `literal_lets_wait`). With none recorded yet it waits; with one, the
+        // initializer is inferred AT that type first — which is also how a
+        // literal binding it is built from (`let m = n + 1`) is told.
+        let literal_expectation = match matches!(initial_type_id.get_type(self), Type::Unknown)
+            && self.is_literal_let(variable_id)
+        {
+            true => match self.literal_let_expectations.get(&variable_id).copied() {
+                Some(expected) => Some(expected),
+                None if self.literal_lets_wait => return Resolution::Deferred,
+                None => None,
+            },
+            false => None,
+        };
+        if let (Some(expected), Some(&first_value_id)) = (literal_expectation, value_ids.first()) {
+            let expected = expected.get_type(self);
+            self.seed_expectation(first_value_id, &expected);
+            if matches!(
+                self.infer_type(first_value_id, &expected, &HashMap::default()),
+                Type::Unresolved
+            ) {
+                return Resolution::Deferred;
+            }
+        }
+
         // The first value (with the annotation) grounds the variable's type and
         // must be ready. Later values — reassignments — may refer to the variable
         // itself (e.g. `i += 1`), so they are checked only after grounding.
@@ -42850,6 +43024,17 @@ impl<'src> Analyzer<'src> {
         // value is the inference origin a later mismatch names (B3).
         let mut inferred_origin = constraint.inferred_origin;
         let unannotated = matches!(variable_type, Type::Unknown);
+        // B389: the use's type stands where an annotation would, and the
+        // initializer is still the origin a later mismatch names.
+        if let Some(expected) = literal_expectation {
+            variable_type = expected.get_type(self);
+            if inferred_origin.is_none() {
+                inferred_origin = value_ids
+                    .first()
+                    .and_then(|value_id| self.span_map.get(value_id))
+                    .map(|span| **span);
+            }
+        }
 
         if let Some(&first_value_id) = value_ids.first() {
             let value_type = self.infer_type(first_value_id, &variable_type, &substitution_context);
@@ -43021,6 +43206,277 @@ impl<'src> Analyzer<'src> {
         }
         let type_id = constraint.clone().get_type_id(self);
         self.binary_context_types.entry(expr).or_insert(type_id);
+    }
+
+    /// B389 — the numeric primitive `type_` names, if it names one.
+    fn numeric_primitive_name(&self, type_: &Type) -> Option<&'static str> {
+        let Type::Struct(struct_id, arguments) = type_ else {
+            return None;
+        };
+        if !arguments.is_empty() {
+            return None;
+        }
+        crate::type_::NUMERIC_PRIMITIVE_NAMES
+            .iter()
+            .find(|name| self.primitive_struct_ids.get(**name) == Some(struct_id))
+            .copied()
+    }
+
+    /// B389 — whether `expr_id` is built from UNSUFFIXED numeric literals
+    /// alone: a literal, a negation of one, and arithmetic over them. Such an
+    /// expression has no type of its own; its context supplies one.
+    fn is_unsuffixed_numeric(&self, expr_id: Id) -> bool {
+        let mut shape = LiteralShape::default();
+        self.literal_numeric_shape(expr_id, false, &mut shape) && shape.saw_literal
+    }
+
+    /// B389 — the walk behind [`Self::is_unsuffixed_numeric`] and
+    /// [`Self::is_literal_let`]. With `through_lets`, a reference to another
+    /// literal binding counts as part of the shape (`let m = n + 1` over `let n
+    /// = 0`), and its id is collected; the collected list doubles as the visit
+    /// set, so a module-level cycle ends. Fails CLOSED: anything else — a
+    /// suffixed literal, a call, a field, a shift — is not a literal shape.
+    fn literal_numeric_shape(
+        &self,
+        expr_id: Id,
+        through_lets: bool,
+        shape: &mut LiteralShape,
+    ) -> bool {
+        let Some(_guard) = crate::util::RecursionGuard::enter() else {
+            return false;
+        };
+        match self.expr_id_to_expr_map.get(&expr_id) {
+            Some(Expr::Number(_, fraction, None)) => {
+                shape.saw_literal = true;
+                shape.fractional |= fraction.is_some();
+                true
+            }
+            Some(Expr::Unary('-', operand)) => {
+                let operand = *operand;
+                self.literal_numeric_shape(operand, through_lets, shape)
+            }
+            Some(Expr::Binary(
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem,
+                lhs_id,
+                rhs_id,
+            )) => {
+                let (lhs_id, rhs_id) = (*lhs_id, *rhs_id);
+                self.literal_numeric_shape(lhs_id, through_lets, shape)
+                    && self.literal_numeric_shape(rhs_id, through_lets, shape)
+            }
+            Some(Expr::Local(variable_id)) if through_lets => {
+                let variable_id = *variable_id;
+                if shape.lets.contains(&variable_id) {
+                    return true;
+                }
+                let Some(variable) = self.variables.get(&variable_id) else {
+                    return false;
+                };
+                // A binding that already HAS its type is not waiting on
+                // anything: it is a typed operand, not part of the shape.
+                if variable.annotated
+                    || self.lazy_binding_declarations.contains(&variable_id)
+                    || !matches!(variable.type_id.borrow_type(self), Type::Unknown)
+                {
+                    return false;
+                }
+                let Some(initial) = variable.initial else {
+                    return false;
+                };
+                shape.lets.push(variable_id);
+                self.literal_numeric_shape(initial, through_lets, shape)
+            }
+            _ => false,
+        }
+    }
+
+    /// B389 — whether `variable_id` is a LITERAL binding: unannotated, not
+    /// `lazy`, initialized by unsuffixed literals (through other literal
+    /// bindings). See `literal_lets_wait`.
+    fn is_literal_let(&self, variable_id: Id) -> bool {
+        let Some(variable) = self.variables.get(&variable_id) else {
+            return false;
+        };
+        if variable.annotated || self.lazy_binding_declarations.contains(&variable_id) {
+            return false;
+        }
+        let Some(initial) = variable.initial else {
+            return false;
+        };
+        let mut shape = LiteralShape {
+            lets: vec![variable_id],
+            ..LiteralShape::default()
+        };
+        self.literal_numeric_shape(initial, true, &mut shape) && shape.saw_literal
+    }
+
+    /// B389 — a literal binding still WAITING for its type: one with no type
+    /// yet, while `literal_lets_wait` holds.
+    fn literal_let_is_pending(&self, variable_id: Id) -> bool {
+        self.literal_lets_wait
+            && self
+                .variables
+                .get(&variable_id)
+                .is_some_and(|variable| matches!(variable.type_id.borrow_type(self), Type::Unknown))
+            && self.is_literal_let(variable_id)
+    }
+
+    /// B389 — record `constraint` as the type a literal binding's use asked of
+    /// it, if it is a numeric primitive the binding's literals can take (a
+    /// fractional one takes only `f32`/`f64`, as the literal itself does). The
+    /// first recorded wins; a later use that disagrees is that use's mismatch.
+    fn note_literal_let_expectation(&mut self, variable_id: Id, constraint: &Type) {
+        let Some(name) = self.numeric_primitive_name(constraint) else {
+            return;
+        };
+        // An unsuffixed literal typed `BigInt` still EMITS as a JS number
+        // (`tb(3)` for `fun tb(v: BigInt)` throws "Cannot mix BigInt and other
+        // types" today), so a binding is not steered into that.
+        if name == "BigInt" || self.literal_let_expectations.contains_key(&variable_id) {
+            return;
+        }
+        let mut shape = LiteralShape {
+            lets: vec![variable_id],
+            ..LiteralShape::default()
+        };
+        let Some(initial) = self
+            .variables
+            .get(&variable_id)
+            .and_then(|variable| variable.initial)
+        else {
+            return;
+        };
+        if !self.literal_numeric_shape(initial, true, &mut shape) {
+            return;
+        }
+        if shape.fractional && !matches!(name, "f32" | "f64") {
+            return;
+        }
+        let type_id = constraint.clone().get_type_id(self);
+        self.literal_let_expectations.insert(variable_id, type_id);
+    }
+
+    /// B389 — the stall's PEER pass: a literal binding no directed read typed
+    /// takes the numeric type of what it meets in a binary operator or an
+    /// assignment (`i < xs.len()`, `i = width`, `total += price`). Each side
+    /// made only of literals and still-waiting literal bindings is typed by
+    /// the OTHER side when that is a concrete numeric primitive — or, when the
+    /// other side is itself such a shape, by an expectation one of its
+    /// bindings already has. Answers whether anything was recorded (the
+    /// fixpoint then runs on before the door opens, so a chain of peers
+    /// settles). Shifts are left out: a shift's amount is not its value's
+    /// peer.
+    fn discover_literal_let_expectations(&mut self) -> bool {
+        let mut pairs: Vec<(Id, Id)> = Vec::new();
+        for (binary_id, op, _) in &self.prepped_binary_ops {
+            if matches!(
+                op,
+                BinaryOp::And | BinaryOp::Or | BinaryOp::Shl | BinaryOp::Shr | BinaryOp::UShr
+            ) {
+                continue;
+            }
+            if let Some(Expr::Binary(_, lhs_id, rhs_id)) = self.expr_id_to_expr_map.get(binary_id) {
+                pairs.push((*lhs_id, *rhs_id));
+            }
+        }
+        for (target_id, value_id) in &self.prepped_assignments {
+            pairs.push((*target_id, *value_id));
+        }
+        let mut recorded = false;
+        for (left, right) in pairs {
+            for (waiting_side, other_side) in [(left, right), (right, left)] {
+                let mut waiting = LiteralShape::default();
+                if !self.literal_numeric_shape(waiting_side, true, &mut waiting) {
+                    continue;
+                }
+                let pending: Vec<Id> = waiting
+                    .lets
+                    .iter()
+                    .copied()
+                    .filter(|variable_id| {
+                        self.literal_let_is_pending(*variable_id)
+                            && !self.literal_let_expectations.contains_key(variable_id)
+                    })
+                    .collect();
+                if pending.is_empty() {
+                    continue;
+                }
+                let mut other = LiteralShape::default();
+                let peer_type = match self.literal_numeric_shape(other_side, true, &mut other) {
+                    true => other
+                        .lets
+                        .iter()
+                        .find_map(|variable_id| self.literal_let_expectations.get(variable_id))
+                        .map(|type_id| type_id.get_type(self)),
+                    false => Some(self.infer_type(other_side, &Type::Unknown, &HashMap::default())),
+                };
+                let Some(peer_type) = peer_type else {
+                    continue;
+                };
+                if self.numeric_primitive_name(&peer_type).is_none() {
+                    continue;
+                }
+                for variable_id in pending {
+                    self.note_literal_let_expectation(variable_id, &peer_type);
+                    recorded |= self.literal_let_expectations.contains_key(&variable_id);
+                }
+            }
+        }
+        recorded
+    }
+
+    /// B389 — a call's own generic that is fixed ONLY by a literal argument
+    /// (`identity<T>(value: T)` called as `identity(5)`) takes the numeric
+    /// type the call's expectation binds it to (`let n: u53 = identity(5)`),
+    /// before the literal would bind it to its default. Only a bare generic
+    /// parameter qualifies, and only a numeric binding is taken: the literal
+    /// is typed by the context the call lands in, which is the law everywhere
+    /// else, and nothing that is not a number is decided here.
+    fn bind_literal_generics_from_expectation(
+        &mut self,
+        call_id: Id,
+        callee_id: Id,
+        argument_ids: &[Id],
+        self_parameter_offset: usize,
+        substitution: &mut SubstitutionContext,
+    ) {
+        if !self.expected_types.contains_key(&call_id) {
+            return;
+        }
+        let Some((parameter_ids, _)) = self.method_signature(callee_id) else {
+            return;
+        };
+        let mut literal_generics: Vec<TypeId> = Vec::new();
+        for (index, argument_id) in argument_ids.iter().enumerate() {
+            if !self.is_unsuffixed_numeric(*argument_id) {
+                continue;
+            }
+            let Some(parameter_id) = parameter_ids.get(index + self_parameter_offset) else {
+                continue;
+            };
+            let Some(Type::Generic(constraint_id)) = self
+                .parameters
+                .get(parameter_id)
+                .map(|parameter| parameter.type_id.get_type(self))
+            else {
+                continue;
+            };
+            if !substitution.contains_key(&constraint_id) {
+                literal_generics.push(constraint_id);
+            }
+        }
+        if literal_generics.is_empty() {
+            return;
+        }
+        let mut trial = substitution.clone();
+        self.bind_callee_own_generics_from_expectation(call_id, callee_id, &mut trial);
+        for generic in literal_generics {
+            if let Some(bound) = trial.get(&generic).copied()
+                && self.numeric_primitive_name(&bound.get_type(self)).is_some()
+            {
+                self.record_generic_binding(substitution, generic, bound);
+            }
+        }
     }
 
     fn seed_expectation(&mut self, expr: Id, constraint: &Type) {
@@ -49029,6 +49485,7 @@ impl<'src> Analyzer<'src> {
         // the loop for why the second one in a row ends the fixpoint.
         let mut fruitless_backstops = 0u32;
         self.fixpoint_stalled = false;
+        self.literal_lets_wait = true;
 
         for _ in 0..max_iterations {
             let mut progress = self.resolve_constraints();
@@ -49096,6 +49553,19 @@ impl<'src> Analyzer<'src> {
                 continue;
             }
             fruitless_backstops += 1;
+            if fruitless_backstops >= 2 && self.literal_lets_wait {
+                // B389: a stationary fixpoint is where a literal binding no
+                // read has typed looks for a PEER, and — once none is left to
+                // find — takes its default. Before B372's door, so a binding
+                // is typed by the time anything that door commits reads it.
+                if !self.discover_literal_let_expectations() {
+                    self.literal_lets_wait = false;
+                }
+                fruitless_backstops = 0;
+                self.constraints
+                    .extend(self.deferred.drain(..).map(|(constraint, _)| constraint));
+                continue;
+            }
             if fruitless_backstops >= 2 {
                 // B372: a stationary fixpoint is the moment a PREFERENCE
                 // deferral gives way — see `fixpoint_stalled`. One more round
@@ -49112,6 +49582,7 @@ impl<'src> Analyzer<'src> {
             }
         }
         self.fixpoint_stalled = false;
+        self.literal_lets_wait = false;
         if split_on {
             split.push(("fixpoint", split_mark.elapsed()));
             let stages: Vec<String> = split
@@ -49755,7 +50226,25 @@ impl<'src> Analyzer<'src> {
         }
 
         for (binary_id, op, lhs_id) in std::mem::take(&mut self.prepped_binary_ops) {
-            let lhs_type = self.infer_type(lhs_id, &Type::Unknown, &HashMap::default());
+            let mut lhs_type = self.infer_type(lhs_id, &Type::Unknown, &HashMap::default());
+            // B389: a literal LEFT operand is typed by its right one, exactly
+            // as inference typed it (`1 + n`, `0 < n` over `n: u53`) — read at
+            // `Unknown` it answers its default and every check below would
+            // compare that default with the right operand's real type.
+            if !matches!(
+                op,
+                BinaryOp::And | BinaryOp::Or | BinaryOp::Shl | BinaryOp::Shr | BinaryOp::UShr
+            ) && self.is_unsuffixed_numeric(lhs_id)
+                && let Some(Expr::Binary(_, _, rhs_id)) = self.expr_id_to_expr_map.get(&binary_id)
+            {
+                let rhs_id = *rhs_id;
+                if !self.is_unsuffixed_numeric(rhs_id) {
+                    let rhs_type = self.infer_type(rhs_id, &Type::Unknown, &HashMap::default());
+                    if self.numeric_primitive_name(&rhs_type).is_some() {
+                        lhs_type = self.infer_type(lhs_id, &rhs_type, &HashMap::default());
+                    }
+                }
+            }
             // B370: the emission verdicts below are a property of the
             // expression's SETTLED type, and the left operand re-read at
             // `Unknown` answers the DEFAULT — which for an unsuffixed literal
@@ -61894,6 +62383,10 @@ fn analyze_over_world<'src>(
             analyzer.pretty_print_type(type_, &empty_substitution),
         );
         expr_type_ids.insert(*expr_id, *type_id);
+    }
+    // B389: a literal's settled width, where nothing above typed it.
+    for (literal_id, type_id) in &analyzer.literal_types {
+        expr_type_ids.entry(*literal_id).or_insert(*type_id);
     }
     // Also label variable and parameter bindings by their own id: a *use* of one
     // (an `Expr::Local`/`Expr::Parameter`) carries no type on its own expr id, so

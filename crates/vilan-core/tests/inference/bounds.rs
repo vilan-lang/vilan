@@ -12540,3 +12540,270 @@ fn b395_an_impl_whose_bound_names_another_binder_carries_the_default() {
         "rows:1\n",
     );
 }
+
+// --- B389: the five literal positions B370's ruling covers and its fix did not
+// --- deliver. An unsuffixed literal takes its type from its context in each,
+// --- for every numeric width; each position is pinned at `i53`, `u32` and
+// --- `f64` (all red before the fix, all green at `i32`, which was the default
+// --- they fell back to), and the census's thirteen passing positions are the
+// --- controls. `take` is the typed use each program ends in.
+
+/// One program over the width `ty`: `take` (a function of that width) and
+/// `body` inside `main`, run and compared.
+fn b389_program(ty: &str, prelude: &str, body: &str) -> String {
+    format!(
+        "import std::io::print;\n\nfun take(count: {ty}): {ty} {{ count }}\n{prelude}\nfun main() {{\n{body}\n}}\n"
+    )
+    .replace("WIDTH", ty)
+}
+
+fn b389_runs(ty: &str, prelude: &str, body: &str, expected: &str) {
+    let program = b389_program(ty, prelude, body);
+    match compile_and_run(&program) {
+        Ok(stdout) => assert_eq!(stdout, expected, "at `{ty}`:\n{program}"),
+        Err(errors) => panic!("at `{ty}` the program was refused: {errors:#?}\n{program}"),
+    }
+}
+
+/// Position 1: a literal LEFT of a binary operator — arithmetic, a
+/// comparison, and an unannotated binding over the arithmetic (whose type is
+/// the right operand's, not the literal's default).
+fn b389_left_operand(ty: &str) {
+    b389_runs(
+        ty,
+        "",
+        "\tlet n: WIDTH = 4;\n\tprint(take(1 + n));\n\tif 0 < n { print(\"positive\"); }\n\tlet m = 10 - n;\n\tprint(take(m));",
+        "5\npositive\n6\n",
+    );
+}
+
+#[test]
+fn b389_a_left_literal_operand_takes_the_right_operands_type_i53() {
+    b389_left_operand("i53");
+}
+
+#[test]
+fn b389_a_left_literal_operand_takes_the_right_operands_type_u32() {
+    b389_left_operand("u32");
+}
+
+#[test]
+fn b389_a_left_literal_operand_takes_the_right_operands_type_f64() {
+    b389_left_operand("f64");
+}
+
+/// Position 2: the elements of an ANNOTATED list literal, and (the same law
+/// with no annotation) literal elements beside a typed sibling.
+fn b389_list_elements(ty: &str) {
+    b389_runs(
+        ty,
+        "",
+        "\tlet xs: List<WIDTH> = [0, 1, 2];\n\tprint(take(xs[2]));\n\tlet n: WIDTH = 7;\n\tlet ys = [0, n];\n\tprint(take(ys[1]));",
+        "2\n7\n",
+    );
+}
+
+#[test]
+fn b389_an_annotated_list_literals_elements_take_its_element_type_i53() {
+    b389_list_elements("i53");
+}
+
+#[test]
+fn b389_an_annotated_list_literals_elements_take_its_element_type_u32() {
+    b389_list_elements("u32");
+}
+
+#[test]
+fn b389_an_annotated_list_literals_elements_take_its_element_type_f64() {
+    b389_list_elements("f64");
+}
+
+/// Position 3: a literal MATCH pattern takes the subject's type.
+fn b389_match_pattern(ty: &str) {
+    b389_runs(
+        ty,
+        "",
+        "\tlet n: WIDTH = 4;\n\tmatch n {\n\t\t0 => print(\"zero\"),\n\t\t4 => print(\"four\"),\n\t\t_ => print(\"other\"),\n\t}",
+        "four\n",
+    );
+}
+
+#[test]
+fn b389_a_literal_match_pattern_takes_the_subjects_type_i53() {
+    b389_match_pattern("i53");
+}
+
+#[test]
+fn b389_a_literal_match_pattern_takes_the_subjects_type_u32() {
+    b389_match_pattern("u32");
+}
+
+#[test]
+fn b389_a_literal_match_pattern_takes_the_subjects_type_f64() {
+    b389_match_pattern("f64");
+}
+
+/// Position 4: a GENERIC call's return — the literal argument is typed by
+/// what the call's expectation binds the generic to, free function and
+/// method alike.
+fn b389_generic_call(ty: &str) {
+    b389_runs(
+        ty,
+        "fun identity<T>(value: T): T { value }\n\nstruct Box {}\n\nimpl Box {\n\tfun same<T>(self, value: T): T { value }\n}\n",
+        "\tlet n: WIDTH = identity(5);\n\tprint(take(n));\n\tlet m: WIDTH = Box {}.same(6);\n\tprint(take(m));",
+        "5\n6\n",
+    );
+}
+
+#[test]
+fn b389_a_generic_calls_literal_argument_takes_the_expected_return_i53() {
+    b389_generic_call("i53");
+}
+
+#[test]
+fn b389_a_generic_calls_literal_argument_takes_the_expected_return_u32() {
+    b389_generic_call("u32");
+}
+
+#[test]
+fn b389_a_generic_calls_literal_argument_takes_the_expected_return_f64() {
+    b389_generic_call("f64");
+}
+
+/// Position 5: a bare `let n = 0` takes its type from a LATER use — a typed
+/// argument, a comparison peer (`i < limit`, the loop an index walks), and a
+/// binding built from it (`let doubled = chained * 2`).
+fn b389_bare_let(ty: &str) {
+    b389_runs(
+        ty,
+        "",
+        "\tlet n = 7;\n\tprint(take(n));\n\tmut i = 0;\n\tlet limit: WIDTH = 3;\n\tfor i < limit { i += 1; }\n\tprint(take(i));\n\tlet chained = 2;\n\tlet doubled = chained * 2;\n\tprint(take(doubled));",
+        "7\n3\n4\n",
+    );
+}
+
+#[test]
+fn b389_a_bare_literal_binding_takes_the_type_of_its_use_i53() {
+    b389_bare_let("i53");
+}
+
+#[test]
+fn b389_a_bare_literal_binding_takes_the_type_of_its_use_u32() {
+    b389_bare_let("u32");
+}
+
+#[test]
+fn b389_a_bare_literal_binding_takes_the_type_of_its_use_f64() {
+    b389_bare_let("f64");
+}
+
+/// The binding's type is its USE's, so the operators over it are too: `one`
+/// is an `f64` because `take` makes it one, and `one / 2` divides as floats
+/// (`0.5`). Typing the binding late without its arithmetic following would
+/// be B370's truncation again.
+#[test]
+fn b389_a_literal_binding_typed_by_a_later_use_divides_at_that_type() {
+    b389_runs(
+        "f64",
+        "",
+        "\tlet one = 1;\n\tlet half = one / 2;\n\tprint(take(one));\n\tprint(half);",
+        "1\n0.5\n",
+    );
+}
+
+/// A literal binding no use types keeps its default, `i32` — an integer
+/// division still truncates, and the literal still reaches an `i32` use.
+#[test]
+fn b389_an_untyped_literal_binding_keeps_its_default() {
+    b389_runs(
+        "i32",
+        "",
+        "\tlet three = 3;\n\tprint(three / 2);\n\tmut count = 0;\n\tfor count < 2 { count += 1; }\n\tprint(take(count));",
+        "1\n2\n",
+    );
+}
+
+/// A literal binding's first typed use decides; a SECOND use at another width
+/// is that use's mismatch — the binding does not quietly serve both.
+#[test]
+fn b389_a_literal_binding_used_at_two_widths_is_refused_at_the_second() {
+    assert_fails_with(
+        "import std::io::print;\n\nfun take(count: u53): u53 { count }\nfun other(count: u32): u32 { count }\n\nfun main() {\n\tlet n = 7;\n\tprint(take(n));\n\tprint(other(n));\n}\n",
+        "Expected u32, but got u53",
+    );
+}
+
+/// The controls: the census's thirteen positions that already took their
+/// context's type, at each of the three widths — none may move.
+fn b389_controls(ty: &str) {
+    let cases: [(&str, &str); 13] = [
+        ("argument", "\tlet _ = take(3);"),
+        ("annotated_let", "\tlet n: WIDTH = 0;\n\tlet _ = take(n);"),
+        (
+            "binary_right",
+            "\tlet n: WIDTH = 4;\n\tlet _ = take(n + 1);",
+        ),
+        (
+            "struct_field",
+            "\tlet h = Holder { at = 0 };\n\tlet _ = take(h.at);",
+        ),
+        ("return_position", "\tlet _ = take(zero());"),
+        (
+            "comparison",
+            "\tlet n: WIDTH = 4;\n\tif n > 0 { print(\"yes\"); }",
+        ),
+        (
+            "compound_assign",
+            "\tmut n: WIDTH = 4;\n\tn -= 1;\n\tlet _ = take(n);",
+        ),
+        (
+            "tuple_element",
+            "\tlet pair: (WIDTH, str) = (0, \"a\");\n\tlet _ = take(pair.0);",
+        ),
+        (
+            "closure_parameter",
+            "\tlet f = |n: WIDTH| take(n);\n\tlet _ = f(7);",
+        ),
+        (
+            "option_some",
+            "\tlet found: Option<WIDTH> = Some(0);\n\tmatch found {\n\t\tSome(let n) => {\n\t\t\tlet _ = take(n);\n\t\t},\n\t\tNone => {},\n\t}",
+        ),
+        (
+            "list_index_literal",
+            "\tlet xs: List<str> = [\"a\", \"b\"];\n\tprint(xs[0]);",
+        ),
+        (
+            "downward_loop",
+            "\tlet xs: List<str> = [\"a\", \"b\"];\n\tmut i: WIDTH = xs.len().as_WIDTH();\n\tfor i > 0 {\n\t\ti -= 1;\n\t\tprint(xs[i.as_i32()]);\n\t}",
+        ),
+        (
+            "underflow_runs",
+            "\tmut i: WIDTH = 0;\n\ti -= 1;\n\tprint(i\"{i}\");",
+        ),
+    ];
+    for (name, body) in cases {
+        let program = b389_program(
+            ty,
+            "struct Holder { at: WIDTH }\n\nfun zero(): WIDTH { 0 }\n",
+            body,
+        );
+        if let Err(errors) = compile(&program) {
+            panic!("control `{name}` at `{ty}` was refused: {errors:#?}\n{program}");
+        }
+    }
+}
+
+#[test]
+fn b389_the_thirteen_passing_positions_stay_passing_i53() {
+    b389_controls("i53");
+}
+
+#[test]
+fn b389_the_thirteen_passing_positions_stay_passing_u32() {
+    b389_controls("u32");
+}
+
+#[test]
+fn b389_the_thirteen_passing_positions_stay_passing_f64() {
+    b389_controls("f64");
+}

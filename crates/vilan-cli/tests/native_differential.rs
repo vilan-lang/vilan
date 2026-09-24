@@ -2044,6 +2044,64 @@ fn a_literal_assigned_to_a_narrow_binding_takes_the_bindings_width() {
     );
 }
 
+/// B389's five literal positions, natively: an unsuffixed literal takes its
+/// context's width where the POSITION states none the emitter can read — the
+/// left operand of a comparison and of an arithmetic operator, a `match` arm,
+/// a generic call's argument, a list literal's elements, and a bare `let`
+/// typed by a later use (through a comparison peer and a binding built from
+/// it). The JS backend has one number and never asks; the Rust one wrote
+/// `0i32 < n_u64` and `identity((5i32))` for a `u64` instance until the
+/// solver recorded each literal's settled width.
+const LITERAL_POSITIONS_PROBE: &str = concat!(
+    "fun take(count: u53): u53 { count }\n",
+    "fun half(value: f64): f64 { value / 2 }\n",
+    "fun identity<T>(value: T): T { value }\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet n: u53 = 4;\n",
+    "\tprint(take(1 + n));\n",
+    "\tif 0 < n { print(\"positive\"); }\n",
+    "\tlet m = 10 - n;\n",
+    "\tprint(take(m));\n",
+    "\tlet xs: List<u32> = [0, 1, 2];\n",
+    "\tprint(xs[2]);\n",
+    "\tmatch n {\n",
+    "\t\t4 => print(\"four\"),\n",
+    "\t\t_ => print(\"other\"),\n",
+    "\t}\n",
+    "\tlet k: i53 = identity(5);\n",
+    "\tprint(k);\n",
+    "\tlet bare = 7;\n",
+    "\tprint(take(bare));\n",
+    "\tmut i = 0;\n",
+    "\tlet limit: u53 = 3;\n",
+    "\tfor i < limit { i += 1; }\n",
+    "\tprint(take(i));\n",
+    "\tlet one = 1;\n",
+    "\tlet halved = one / 2;\n",
+    "\tprint(half(one));\n",
+    "\tprint(halved);\n",
+    "\tlet x: f64 = 3;\n",
+    "\tprint(1 / x);\n",
+    "}\n",
+);
+
+#[test]
+fn the_five_literal_positions_take_their_contexts_width_natively() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_literal_positions.vl"),
+        LITERAL_POSITIONS_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_literal_positions.vl"),
+        Verdict::Identical,
+        "a literal must take its context's width in every position B389 names — a mismatch is \
+         a rustc refusal of the emitted Rust, which is a backend defect"
+    );
+}
+
 /// F31's trap, in one program: the read whose binding was declared OUTSIDE the
 /// loop keeps its copy, and the read whose binding the loop body itself
 /// declares moves.
