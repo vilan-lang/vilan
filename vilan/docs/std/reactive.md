@@ -886,10 +886,11 @@ log does not know what a `Reset` is for its op type and the cell does, which is
 the only place the two layers need to know about each other.
 
 A consumer that can USE ops but must not REQUIRE them — `each` takes any
-`Source<List<T>>` — bounds on `DeltaFeed<T>` beside it:
+`Source<List<T>>` — bounds on `DeltaFeed<T>`, which brings `Source<List<T>>`
+with it:
 
 ```vilan,fragment
-trait DeltaFeed<T> {
+trait DeltaFeed<T> with Source<List<T>> {
 	fun delta_cursor(self): Option<DeltaCursor>              // `None`: no log, take the whole value
 	fun delta_since(self, cursor: DeltaCursor): List<SeqOp<T>>
 	fun drop_delta_cursor(self, cursor: DeltaCursor)

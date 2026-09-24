@@ -454,9 +454,10 @@ fn refused(tag: &str, contents: &str) -> String {
 
 /// A112 S3's `DeltaFeed` must answer the question it exists for (a `ListCell`
 /// has a feed, a plain `SignalCell<List<T>>` has none) and must NOT make
-/// anything else a source. It ships as the two-bound fallback (no supertrait;
-/// a consumer writes `S: Source<List<T>> + DeltaFeed<T>`), and this pin is
-/// what the switch to the ruled `with Source<List<T>>` form must keep green.
+/// anything else a source. The control bounds on `DeltaFeed<T>` ALONE and
+/// reads the list through the supertrait — the ruled `trait DeltaFeed<T> with
+/// Source<List<T>>` (A112 §13), switched to after B395; on the two-bound
+/// fallback it shipped as, that control is refused (`S` has no `get`).
 ///
 /// Non-vacuous by the compiler it was found on: on 3e4e6c51 (before
 /// solver-40b's guard in `satisfies_trait_bound`) with the ruled supertrait
@@ -474,7 +475,7 @@ fn std_delta_feed_admits_list_sources_and_refuses_everything_else() {
 import std::option::Option::{ self, None, Some };
 import std::reactive::{ DeltaFeed, ListCell, Signal, SignalCell, Source };
 
-fun logged<T, S: Source<List<T>> + DeltaFeed<T>>(source: S): str {
+fun logged<T, S: DeltaFeed<T>>(source: S): str {
 	match source.delta_cursor() {
 		Some(let _cursor) => i"log over {source.get().len()}",
 		None => i"none over {source.get().len()}",

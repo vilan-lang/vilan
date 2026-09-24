@@ -344,19 +344,17 @@ export trait DeltaSource<C, O> with Source<C> {
 /// bounding on `DeltaSource` directly is that a consumer may be written ONCE for
 /// both kinds of source.
 ///
-/// **No supertrait, yet — the declared fallback.** The ruled spelling is `trait
-/// DeltaFeed<T> with Source<List<T>>`, so a consumer could bound on `DeltaFeed<T>`
-/// alone. It waits on B395: with it, a `Source` DEFAULT member (`sub`, `map`,
-/// `effect_on_change`) called on a type that is a `Source` at OTHER arguments — a
-/// custom `Source<i32>`, an rpc mirror's `Source<Option<List<T>>>` — resolves
-/// through this trait's blanket and is refused at its bound. Until then a consumer
-/// writes both bounds, `S: Source<List<T>> + DeltaFeed<T>`.
+/// It is declared `with Source<List<T>>` because a feed is only ever asked of a
+/// collection source, so a consumer bounds on `DeltaFeed<T>` alone and reads the
+/// list through it. The first blanket's own bound IS that supertrait: the subject's
+/// bound supplies the supertrait's members (spec/types.md §5.5), and a type with no
+/// `Source<List<T>>` of its own does not reach the blanket.
 ///
 /// It is a separate trait rather than three defaults on `Source<T>` because
 /// `Source`'s argument is the whole value and these are about a COLLECTION's
 /// element type — a `Source<i32>` has no `SeqOp<i32>` feed to offer, and giving it
 /// one would put a collection's vocabulary on every signal in the language.
-export trait DeltaFeed<T> {
+export trait DeltaFeed<T> with Source<List<T>> {
 	/// A cursor into this source's op log, or `None` when it keeps none.
 	fun delta_cursor(self): Option<DeltaCursor>;
 

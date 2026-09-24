@@ -1140,9 +1140,8 @@ export fun swap_split<T: PartialEq, S: Source<T>, C: Slot>(
 /// the method and left the value form alone.
 ///
 /// Over a `ListCell` or any other `DeltaSource` the run follows the source's ops
-/// rather than re-diffing the list (A112 S3; `place_each` says how); the ruled
-/// spelling of the bound that placement asks for is `S: DeltaFeed<T>` alone, which
-/// waits on B395, so it is written `S: Source<List<T>> + DeltaFeed<T>` for now.
+/// rather than re-diffing the list (A112 S3; `place_each` says how). Placement asks
+/// for `S: DeltaFeed<T>`, which every `Source<List<T>>` answers.
 export fun each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>>, C: Slot>(
 	source: S,
 	key: sync |T| K,
@@ -1237,24 +1236,26 @@ export impl Swap<type T: PartialEq, type S: Source<T>, type C: Slot> with Slot {
 }
 
 /// Placing a run asks its source for a delta feed (A112 S3), which every
-/// `Source<List<T>>` has. The bound sits HERE and not on `each`/`Each`: at the call
-/// it would be a second bound over `T`, and a source that is not a list source (an
-/// rpc mirror, B304's pin) would then be refused with `T` unbound — four errors
-/// naming an abstract `List<T>` instead of the one that names `List<Todo>`.
-export impl Each<type T: PartialEq, type K: PartialEq + Hashable, type S: Source<List<T>> + DeltaFeed<T>, type C: Slot> with Slot {
+/// `Source<List<T>>` has. The bound sits HERE and not on `each`/`Each`: at the
+/// call, a source that is not a list source (an rpc mirror, `a52`'s pin) is
+/// refused with the one error that names `Source<List<Todo>>`. Written there,
+/// alone it would name `DeltaFeed<T>` with `T` unbound, and beside
+/// `Source<List<T>>` it leaves `T` unbound too — three or four errors naming an
+/// abstract `T` either way (B396).
+export impl Each<type T: PartialEq, type K: PartialEq + Hashable, type S: DeltaFeed<T>, type C: Slot> with Slot {
 	fun place(self, parent: View) {
 		place_each(parent, self.source, self.key, self.render);
 	}
 }
 
-export impl EachValues<type T: PartialEq + Hashable, type S: Source<List<T>> + DeltaFeed<T>, type C: Slot> with Slot {
+export impl EachValues<type T: PartialEq + Hashable, type S: DeltaFeed<T>, type C: Slot> with Slot {
 	fun place(self, parent: View) {
 		place_each(parent, self.source, |item| item, self.render);
 	}
 }
 
 /// `each_by` asks the same of its source, for the same reason (A112 S3b).
-export impl EachBy<type T, type K: PartialEq + Hashable, type S: Source<List<T>> + DeltaFeed<T>, type C: Slot> with Slot {
+export impl EachBy<type T, type K: PartialEq + Hashable, type S: DeltaFeed<T>, type C: Slot> with Slot {
 	fun place(self, parent: View) {
 		place_each_by(parent, self.source, self.key, self.render);
 	}
@@ -1418,7 +1419,7 @@ fun row_references(
 /// is read. Any other `Source<List<T>>` — every plain `SignalCell` — keeps the
 /// whole-list PASS, exactly as before; the pass is also what a `Reset` and a `Move`
 /// fall back to on the op path.
-fun place_each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>> + DeltaFeed<T>, C: Slot>(
+fun place_each<T: PartialEq, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 	parent: View,
 	source: S,
 	key: sync |T| K,
@@ -1673,7 +1674,7 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: Source<List<T>> + Delta
 /// element changed in place under the same key is WRITTEN INTO that row's cell and
 /// nothing is built, exactly as the pass's `Keep` does it — but only for the row
 /// the op names, where the pass writes into every surviving row's cell.
-fun place_each_by<T, K: PartialEq + Hashable, S: Source<List<T>> + DeltaFeed<T>, C: Slot>(
+fun place_each_by<T, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 	parent: View,
 	source: S,
 	key: sync |T| K,
