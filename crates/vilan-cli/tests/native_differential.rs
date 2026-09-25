@@ -147,6 +147,12 @@ const DEFAULT_SUITE: &[&str] = &[
     // seal.
     "reactive-on-change.vl",
     "reactive-flatten.vl",
+    // F35: `ListCell`, the two sequence traits and `map_each` — with a named
+    // function handed where a closure stands, a trait default writing through
+    // `&mut self` while reading it, a `&mut` view forwarded, and the 300-turn
+    // walk whose `edited[next_random(size)] = next_random(100)` is the
+    // assignment-order pin's corpus witness.
+    "list-cell.vl",
 ];
 
 /// Corpus programs that are OUTSIDE this differential by construction, named
@@ -2808,6 +2814,156 @@ const CRYPTO_PROBE: &str = concat!(
     "\tlet other = Shared::new(2);\n",
     "\tlet same = cell;\n",
     "\tprint(i\"{cell.identity()} {other.identity()} {same.identity()}\");\n",
+    "}\n",
+);
+
+/// **F35's find — a native MISCOMPILE**: an assignment evaluates its place's
+/// SUBSCRIPTS before its value, in source order, as JavaScript does.
+///
+/// Rust evaluates an assignment's right-hand side BEFORE its place, so
+/// `list[next()] = next() * 10` gave the first draw to the value and the second
+/// to the index, and wrote `10` into slot 2 where node writes `20` into slot 1 —
+/// no error anywhere, a different answer. `list-cell.vl`'s random walk met it
+/// (`edited[next_random(size)] = next_random(100)` edited a different element,
+/// and `map_each` then ran `g` 1,105 times against node's 1,081). One line per
+/// place shape: a subscript, two nested subscripts, a subscript under a field
+/// write, and the compound form (B105's hoist, unchanged, as the control).
+#[test]
+fn an_assignment_evaluates_its_subscripts_before_its_value_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_order.vl"), ORDER_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_order.vl"),
+        Verdict::Identical,
+        "an assignment's order of evaluation must be the same on both backends"
+    );
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "native_probe_order.vl"])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "0 20 0 0\n0 5 0 0 0\n7 0\n9 20\n",
+        "node's answers: every subscript drawn before the value"
+    );
+}
+
+const ORDER_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::shared::Shared;\n",
+    "\n",
+    "let counter: Shared<i32> = Shared::new(0);\n",
+    "\n",
+    "fun next(): i32 {\n",
+    "\tcounter.write() = counter.read() + 1;\n",
+    "\tcounter.read()\n",
+    "}\n",
+    "\n",
+    "struct Point {\n",
+    "\tx: i32,\n",
+    "\ty: i32,\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut list = [0, 0, 0, 0];\n",
+    "\tlist[next()] = next() * 10;\n",
+    "\tprint(i\"{list[0]} {list[1]} {list[2]} {list[3]}\");\n",
+    "\tmut grid = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];\n",
+    "\tgrid[next() - 3][next() - 3] = next();\n",
+    "\tprint(i\"{grid[0][0]} {grid[0][1]} {grid[1][0]} {grid[1][2]} {grid[2][1]}\");\n",
+    "\tmut points = [Point { x = 0, y = 0 }, Point { x = 0, y = 0 }];\n",
+    "\tpoints[next() - 6].x = next();\n",
+    "\tprint(i\"{points[0].x} {points[1].x}\");\n",
+    "\tlist[next() - 8] += next();\n",
+    "\tprint(i\"{list[0]} {list[1]}\");\n",
+    "}\n",
+);
+
+/// **F35**: the three lowering classes `ListCell` and `map_each` met past the
+/// `any` wall the item was filed on (which an earlier order had already
+/// lifted — the premise, re-measured, had moved):
+///
+/// 1. a NAMED FUNCTION in a value position (`apply(values, twice)`, `let named =
+///    twice`) — the emitted instance behind the same counted handle a closure
+///    literal is;
+/// 2. a `&mut self` method whose later argument READS the receiver
+///    (`self.place(self.size(), value)`, a trait default's `push` over
+///    `splice`) — the value is evaluated ahead of the `&mut` borrow, since
+///    Rust's two-phase borrow covers only an autoref method receiver (E0502);
+/// 3. a `&mut` the source WROTE over a binding that is already a `&mut` loan
+///    (`fill(&mut target)` with `target: &mut Stack`) — a reborrow, not a
+///    `&mut &mut` (E0596).
+///
+/// Each line is node's answer; each class was a refusal or a rustc error
+/// before F35.
+#[test]
+fn a_named_function_value_and_a_forwarded_loan_build_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_loans.vl"), LOANS_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_loans.vl"),
+        Verdict::Identical,
+        "the three classes must print the same bytes on both backends"
+    );
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "native_probe_loans.vl"])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "1 102 203 304\n2 4 6 42\n"
+    );
+}
+
+const LOANS_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Stack {\n",
+    "\titems: List<i32>,\n",
+    "}\n",
+    "\n",
+    "impl Stack {\n",
+    "\tfun size(self): i32 {\n",
+    "\t\tself.items.len()\n",
+    "\t}\n",
+    "\n",
+    "\tfun place(&mut self, at: i32, value: i32) {\n",
+    "\t\tself.items.push(at * 100 + value);\n",
+    "\t}\n",
+    "\n",
+    "\tfun push(&mut self, value: i32) {\n",
+    "\t\tself.place(self.size(), value);\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun fill(target: &mut Stack) {\n",
+    "\ttarget.push(1);\n",
+    "\ttarget.push(2);\n",
+    "}\n",
+    "\n",
+    "fun refill(target: &mut Stack) {\n",
+    "\tfill(&mut target);\n",
+    "\ttarget.push(3);\n",
+    "}\n",
+    "\n",
+    "fun twice(value: i32): i32 {\n",
+    "\tvalue * 2\n",
+    "}\n",
+    "\n",
+    "fun apply(values: List<i32>, f: |i32| i32): List<i32> {\n",
+    "\tvalues.map(f)\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut stack = Stack { items = [] };\n",
+    "\trefill(&mut stack);\n",
+    "\tstack.push(4);\n",
+    "\tprint(i\"{stack.items[0]} {stack.items[1]} {stack.items[2]} {stack.items[3]}\");\n",
+    "\tlet doubled = apply([1, 2, 3], twice);\n",
+    "\tlet named = twice;\n",
+    "\tprint(i\"{doubled[0]} {doubled[1]} {doubled[2]} {named(21)}\");\n",
     "}\n",
 );
 

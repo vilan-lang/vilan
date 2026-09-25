@@ -3164,6 +3164,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 };
                 self.variant_path(enum_id, index, &[], span)?
             }
+            // F35: a named FUNCTION in a value position — `map_each(source,
+            // counted)` hands `counted` itself where a closure could stand.
+            Expr::Local(binding) if self.program.functions.contains_key(&binding) => {
+                self.function_value(binding, span)?
+            }
             Expr::Local(binding) => self.read_module_binding_or_local(binding, span)?,
             Expr::Parameter(binding) => self.binding_name(binding),
             Expr::Variable(binding) => self.declaration(binding, depth)?,
@@ -3291,7 +3296,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.struct_literal(struct_id, &arguments, &pairs, depth, span)?
             }
             Expr::Reference(operand, mutable) => {
-                if mutable {
+                if mutable && self.names_a_mutable_loan(operand) {
+                    // F35: a `&mut` the source wrote over a binding that is
+                    // ALREADY a `&mut` loan — `fill(&mut list)` inside
+                    // `edit(|&mut list| ..)` — reborrows it, as an argument the
+                    // source did not spell does (`&mut &mut T` is a type rustc
+                    // takes only from a `mut` binding, and it is not the
+                    // parameter's type either way).
+                    format!("&mut *{}", self.mutable_place(operand, depth)?)
+                } else if mutable {
                     // A `&mut` the source wrote names a place the holder will
                     // WRITE, so a cell-resident binding reaches its cell — see
                     // [`Emitter::mutable_place`].
@@ -3713,9 +3726,57 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 return Ok(format!("*{} = {value_text}", self.binding_name(binding)));
             }
         }
-        let target_text = self.mutable_place(target, depth)?;
-        let value_text = self.consumed_value_of_expecting(value, expecting, depth)?;
-        Ok(format!("{target_text} = {value_text}"))
+        // The place's SUBSCRIPTS are evaluated first, in source order, and
+        // only then the value — the order JavaScript has. Rust evaluates an
+        // assignment's right-hand side BEFORE its place expression, so
+        // `list[next()] = next() * 10` handed the first draw to the value and
+        // the second to the index: a wrong answer with no error anywhere
+        // (`list-cell.vl`'s random walk, `edited[next_random(size)] =
+        // next_random(100)`, edited a different element natively). A
+        // subscript is hoisted into a `let` ahead of the write, as the
+        // compound form's already are (B105).
+        let mut prelude = String::new();
+        let saved = std::mem::take(&mut self.hoisted);
+        let rendered = self
+            .hoist_subscripts(target, &mut prelude, depth)
+            .and_then(|_| {
+                let target_text = self.mutable_place(target, depth)?;
+                let value_text = self.consumed_value_of_expecting(value, expecting, depth)?;
+                Ok((target_text, value_text))
+            });
+        self.hoisted = saved;
+        let (target_text, value_text) = rendered?;
+        if prelude.is_empty() {
+            return Ok(format!("{target_text} = {value_text}"));
+        }
+        Ok(format!("{{ {prelude}{target_text} = {value_text}; }}"))
+    }
+
+    /// Every subscript along one place's spine into a `let`, root first — the
+    /// single-place half of [`Self::pair_places`], for a plain assignment.
+    fn hoist_subscripts(
+        &mut self,
+        place: Id,
+        prelude: &mut String,
+        depth: usize,
+    ) -> Result<(), Error> {
+        match self.program.entity_map.get(&place).cloned() {
+            Some(Expr::Index(subject, index)) => {
+                self.hoist_subscripts(subject, prelude, depth)?;
+                let name = format!("__hoist{}", self.hoisted.len());
+                let rendered =
+                    self.expecting_nothing(|emitter| emitter.expression(index, depth))?;
+                let _ = write!(prelude, "let {name} = {rendered}; ");
+                self.hoisted.insert(index, name);
+                Ok(())
+            }
+            Some(Expr::Field(subject, _, _))
+            | Some(Expr::Dereference(subject))
+            | Some(Expr::TupleIndex(subject, _, _)) => {
+                self.hoist_subscripts(subject, prelude, depth)
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Renders with NO expected type — the positions a surrounding
@@ -3994,6 +4055,74 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         let cell = self.ensure_module_binding(binding, span)?;
         Ok(format!("{cell}.with(|cell| cell.get())"))
+    }
+
+    /// A named function used as a VALUE (F35) — the JS backend's bare function
+    /// name, and natively the emitted instance behind the same counted handle a
+    /// closure literal is (`Rc::new(..)`, F16), so the two are interchangeable
+    /// at every position a closure type is written.
+    ///
+    /// The Rust function item is passed as it is, not wrapped in a forwarding
+    /// closure: a fn item implements `Fn` for exactly its own signature —
+    /// higher-ranked over a `&T` parameter, which a forwarding closure's
+    /// inferred signature would not be — and it unsizes to the position's
+    /// `Rc<dyn Fn(..) -> ..>` wherever the closure literal would.
+    ///
+    /// Three shapes are named instead, each because the function's native
+    /// signature is NOT the closure type's: a GENERIC function (its instance is
+    /// chosen by the position's closure type, which nothing here unifies
+    /// against the declaration yet — and which the analyzer refuses today,
+    /// `Expected |i32| U, but got fn same<T>(T): T`, so the arm is the
+    /// backend's answer for the day it admits one), an `async` one (it answers a future where
+    /// the position's closure answers a value — F22's adapted instance), and
+    /// one with a `lazy` parameter or a context-threaded hidden one (the
+    /// signature carries a cell or an extra argument the closure type does
+    /// not).
+    fn function_value(&mut self, function_id: Id, span: Span) -> Result<String, Error> {
+        let Some(function) = self.program.functions.get(&function_id).cloned() else {
+            return Err(unsupported("an unresolved function", span));
+        };
+        if !function.generic_parameter_constraint_ids.is_empty() {
+            return self.host_gap(
+                format!(
+                    "the GENERIC function `{}` named as a value (its instance is chosen by the \
+                     closure type it lands in)",
+                    function.name
+                ),
+                span,
+            );
+        }
+        if function.is_async || self.program.async_functions.contains(&function_id) {
+            return self.host_gap(
+                format!(
+                    "the `async` function `{}` named as a value (an adapted instance)",
+                    function.name
+                ),
+                span,
+            );
+        }
+        let reshaped = function.parameters.iter().any(|parameter| {
+            self.program
+                .context_hidden_parameters
+                .contains_key(parameter)
+                || self
+                    .program
+                    .parameters
+                    .get(parameter)
+                    .is_some_and(|declared| declared.lazy || declared.spread)
+        });
+        if reshaped {
+            return self.host_gap(
+                format!(
+                    "the function `{}` named as a value (a `lazy`, spread or context-threaded \
+                     parameter reshapes its signature)",
+                    function.name
+                ),
+                span,
+            );
+        }
+        let instance = self.ensure_function(function_id, &HashMap::default())?;
+        Ok(format!("std::rc::Rc::new({})", instance.name))
     }
 
     /// Emits the `thread_local!` for one module-level binding, once, and
@@ -7707,6 +7836,28 @@ impl<'a, 'src> Emitter<'a, 'src> {
             matches!(conventions.get(index), Some(Receiving::RefMut))
                 && self.place_lives_in_a_cell(*argument)
         });
+        // F35: the same hoist for a `&mut` argument whose PLACE a later
+        // by-value argument reads — a trait default's `self.splice(self.size(),
+        // 0, [value])` over `&mut self`. JS evaluates the reads first for free;
+        // Rust's two-phase borrow covers only an autoref METHOD receiver, and
+        // the emitted call is a free function handed `&mut *this`, so the read
+        // met a live mutable borrow and rustc refused it (E0502). Taking the
+        // place has no effect of its own, so evaluating the values ahead of it
+        // is the order the program already had.
+        let borrows_a_read_place = argument_ids.iter().enumerate().any(|(index, argument)| {
+            matches!(conventions.get(index), Some(Receiving::RefMut))
+                && self.place_spine(*argument).is_some_and(|(root, _)| {
+                    argument_ids
+                        .iter()
+                        .enumerate()
+                        .skip(index + 1)
+                        .any(|(later, read)| {
+                            matches!(conventions.get(later), None | Some(Receiving::ByValue))
+                                && self.reads_binding(*read, root)
+                        })
+                })
+        });
+        let borrows_a_cell = borrows_a_cell || borrows_a_read_place;
         // The callee's WHOLE parameter list, hidden context parameters
         // included (they have no `parameters` record, so `declared` omits
         // them). A call can carry MORE arguments than that: the context pass
@@ -7936,6 +8087,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             _ => None,
         }
+    }
+
+    /// Whether the expression `id` reads `binding` anywhere inside it.
+    fn reads_binding(&self, id: Id, binding: Id) -> bool {
+        let mut pending = vec![id];
+        let mut visited = HashSet::new();
+        while let Some(expr_id) = pending.pop() {
+            if !visited.insert(expr_id) {
+                continue;
+            }
+            if matches!(
+                self.program.entity_map.get(&expr_id),
+                Some(Expr::Local(read) | Expr::Parameter(read)) if *read == binding
+            ) {
+                return true;
+            }
+            pending.extend(self.children_of(expr_id));
+        }
+        false
     }
 
     /// The arguments of a call through a closure VALUE, against the closure
@@ -9007,10 +9177,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let subject_text = self.mutable_place(subject, depth)?;
                 Ok(format!("{subject_text}.{offset}"))
             }
-            Some(Expr::Reference(operand, true)) => {
-                let operand_text = self.mutable_place(operand, depth)?;
-                Ok(format!("&mut {operand_text}"))
-            }
+            // Everything else — the source's own `&mut` among it — is the
+            // expression arm's, which reborrows a binding that is already a
+            // `&mut` loan (F35) rather than taking a `&mut &mut`.
             _ => self.expression(id, depth),
         }
     }
