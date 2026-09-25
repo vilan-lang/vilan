@@ -57,7 +57,14 @@ Run it when it is the right instrument, not as a way of finding out what you
 just did. Two instrument notes: nextest does not run doc-tests (all empty
 today; CI's `cargo test --workspace --doc` leg guards the gap), and plain
 `cargo test --workspace --no-fail-fast` remains a correct, slower
-equivalent.
+equivalent — ON ONE CONDITION the runners do not share: nextest gives every
+test its own PROCESS, and `cargo test` runs a binary's tests as THREADS of one.
+Process-wide state — a staging directory keyed by the process id, a global
+flag a test flips — is therefore private under nextest and shared under
+`cargo test`, and a test written against the first races under the second
+(`native_differential` failed 38 of 46 that way until its staging went per
+test, N129). Anything a test keys by `std::process::id()` or flips globally
+must be per TEST instead, or serialized by the test itself.
 
 - **Never pipe it through `grep`, `head`, or `tail` and read the exit code.**
   The pipeline reports the *filter's* status, so a red suite looks green — this

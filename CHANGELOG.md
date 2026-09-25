@@ -26,6 +26,9 @@ written down.
 ## Unreleased
 
 <!-- family: tooling -->
+**`native_differential` passes under plain `cargo test`: each test stages the corpus into its own directory, where all of them shared one per process (N129).** The staging directory was keyed by the process id, which nextest makes one per test and `cargo test` makes one per binary, so under `cargo test` every test's `remove_dir_all` deleted its siblings' working copies mid-build (38 of 46 failed with `stage a corpus program: No such file or directory`). The name now carries a per-call counter after the process id. CLAUDE.md's sentence that plain `cargo test --workspace` is an equivalent of nextest now names the condition it rests on: process-wide state is private per test under nextest and shared under `cargo test`.
+
+<!-- family: tooling -->
 **The Windows cross-check is `clippy -D warnings` over the tests, and it is green: `split.rs`'s `Instant` import moved into the one `cfg(unix)` test that reads it (N130).** `cargo clippy --target x86_64-pc-windows-msvc -p vilan-cli --tests -- -D warnings` refused an import that is unused on Windows, and nothing gated it: the `clippy` CI leg is ubuntu-only and the Windows cross-checks were `cargo check`, where the import is a warning in a log. `scripts/ci-local.sh windows` now runs `cargo clippy --workspace --exclude vilan-rt-sqlite --all-targets --target x86_64-pc-windows-msvc -- -D warnings`. It excludes `vilan-rt-sqlite` because that crate's bundled SQLite build needs a C compiler for msvc, which a Linux box does not have, so the old `cargo check --workspace` leg was red on every Linux box from the moment that crate landed. CLAUDE.md's cross-check sentence names the new command.
 
 <!-- family: feature -->

@@ -259,15 +259,24 @@ pub fn platform_free_programs() -> Vec<String> {
 }
 
 /// A staged copy of the corpus, so a build writes its artifacts beside a copy
-/// rather than into the tree. Per PROCESS: nextest runs each test of this binary
-/// in its own process, concurrently, and a staging directory the four shared —
-/// each one beginning by removing it — was a race the Order 37 seal lost
-/// (`cannot create ./dist/native/bool/src`: a sibling test had just deleted the
-/// working directory out from under the build). The shared cargo target
-/// directory stays shared on purpose; cargo locks it itself.
+/// rather than into the tree. Per CALL — one per test, since every test stages
+/// once. nextest runs each test of this binary in its own process, concurrently,
+/// and a staging directory the four shared — each one beginning by removing it —
+/// was a race the Order 37 seal lost (`cannot create ./dist/native/bool/src`: a
+/// sibling test had just deleted the working directory out from under the
+/// build). Keying it by the process id closed that for nextest and left it open
+/// for plain `cargo test`, which runs the tests as THREADS of one process: 38 of
+/// 46 failed there, each deleting the others' staging (N129). The process id
+/// still leads the name, so two concurrent runs of this binary cannot meet
+/// either. The shared cargo target directory stays shared on purpose; cargo
+/// locks it itself.
 fn stage() -> PathBuf {
-    let staged = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("native-differential-src-{}", std::process::id()));
+    static STAGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let call = STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let staged = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "native-differential-src-{}-{call}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&staged);
     copy_tree(&corpus_dir(), &staged);
     staged
