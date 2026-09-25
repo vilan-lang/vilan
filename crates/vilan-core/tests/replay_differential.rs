@@ -319,6 +319,17 @@ fn an_entry_shaped_world_agrees_between_replayed_and_rederived_module_checks() {
         })
     };
 
+    // The budget is lifted for both legs, because the reuse assertion below
+    // is EXACT and an LRU is a scheduler, not a claim: sixteen workers store a
+    // world each on their first analysis, the default budget held ~29 of
+    // them at Order 41, and a pair whose first analysis runs long past its
+    // store (a large program's checks) can find its world evicted by the
+    // others before its second analysis reads it — a cold miss that reuses
+    // nothing and says nothing about the seam. The budget is
+    // `base_cache.rs`'s subject; this leg's subject is replay against
+    // re-derivation, so every world stays until its pair has read it.
+    let budget_before = vilan_core::analyzer::base_cache_budget();
+    vilan_core::analyzer::set_base_cache_budget(usize::MAX);
     vilan_core::analyzer::set_world_reuse(false);
     vilan_core::analyzer::base_cache_clear();
     let derived = observe_all();
@@ -326,6 +337,7 @@ fn an_entry_shaped_world_agrees_between_replayed_and_rederived_module_checks() {
     vilan_core::analyzer::base_cache_clear();
     let replayed = observe_all();
     vilan_core::analyzer::base_cache_clear();
+    vilan_core::analyzer::set_base_cache_budget(budget_before);
 
     for (directory, _) in &packages {
         let _ = std::fs::remove_dir_all(directory);
