@@ -57,9 +57,9 @@ it admits, whenever the colour its package gives it (§11.2, the
 share no platform make the file a pair of twins; the file's colour
 stands.
 
-**A file's own platform.** `[platform("browser")];` — the attribute
-with a `;`, as the file's first statement — declares the platform of the
-whole file. Everything the file declares requires that platform, exactly
+**A file's own platform.** `[platform("browser")] mod self;` — the
+attribute on `mod self;`, the file's own module (§4.1), as the file's
+first statement — declares the platform of the whole file. Everything the file declares requires that platform, exactly
 as a layer module's items require their layer's: a call into it from an
 entry of another platform is the chain error above
 (`` `when_value` requires the `browser` platform its file declares and

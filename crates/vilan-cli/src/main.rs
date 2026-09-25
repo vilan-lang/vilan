@@ -3621,7 +3621,7 @@ fn owning_package(file: &Path) -> Result<Option<(PathBuf, Manifest)>, String> {
 fn file_project(entry: PathBuf) -> Result<Project, String> {
     let bare = |entry: PathBuf| {
         // No project to colour it — but the file may say itself (F27 R1):
-        // `[platform("browser")];`, or fences that admit one platform, is the
+        // `[platform("browser")] mod self;`, or fences that admit one platform, is the
         // platform the editor analyzes it under, and the terminal must not
         // answer differently. Otherwise the CLI's `node` default answers, and
         // there is nothing about the file's own situation to explain.

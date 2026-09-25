@@ -111,6 +111,11 @@ const NON_KEYWORD_TERMINALS: &[(&str, &str)] = &[
     ),
     ("_", "the wildcard pattern"),
     (
+        "self",
+        "the file's own module in `mod self;` (§3.1, B415) — an identifier the parser \
+         matches by text and reserves as a module name, never a keyword",
+    ),
+    (
         "void",
         "the unit VALUE, the sixth literal (§2.2 lists it contextual; N113 — \
          the atom production read every `void` as the unit from the day it \

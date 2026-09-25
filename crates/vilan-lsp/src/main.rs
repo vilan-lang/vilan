@@ -6493,7 +6493,10 @@ mod generic_pairing_tests {
     async fn the_status_lines_request_names_the_platform_and_why() {
         let (service, _socket) = backend();
         let backend = service.inner();
-        let uri = open(backend, "[platform(\"browser\")];\n\nfun main() {}\n");
+        let uri = open(
+            backend,
+            "[platform(\"browser\")] mod self;\n\nfun main() {}\n",
+        );
         let answer = backend
             .analysis_platform(TextDocumentIdentifier { uri })
             .await

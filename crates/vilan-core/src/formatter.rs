@@ -4679,8 +4679,16 @@ impl<'src> Printer<'src> {
             // `needs_semicolon` leaves it out of its exclusion list and the
             // statement printer supplies the `;`.
             Node::ExportAll => self.out.push_str("export *"),
-            // F27 R1: the file's platform; its `;` is the statement loop's.
-            Node::ModulePlatform(patterns) => self.print_platform_attribute(patterns),
+            // B415: `[platform(..)] mod self` — the host of the file's own
+            // attributes (F27 R1's platform), on one line; its `;` is the
+            // statement loop's.
+            Node::ModulePlatform(patterns) => {
+                if !patterns.is_empty() {
+                    self.print_platform_attribute(patterns);
+                    self.out.push(' ');
+                }
+                self.out.push_str("mod self");
+            }
             // `mod name { items }`.
             Node::Module(name, body) => {
                 self.out.push_str("mod ");
@@ -8849,7 +8857,7 @@ mod idempotency {
     fn a_platform_declaration_survives_the_reprint_at_every_f27_position() {
         // F27 R1: the file's own line, an impl's label and a nominal's.
         let source = concat!(
-            "[platform(\"browser\")];\n\n",
+            "[platform(\"browser\")] mod self;\n\n",
             "import std::ui::Region;\n\n",
             "[platform(\"browser\")]\n",
             "struct Slot {}\n\n",
@@ -8858,6 +8866,9 @@ mod idempotency {
         );
         assert_eq!(format(source), source);
         assert_fixed_point("platform_f27", source);
+        // B415: a host with no attribute on it reprints as itself.
+        let bare = "mod self;\n\nfun f() {}\n";
+        assert_eq!(format(bare), bare);
     }
 
     #[test]

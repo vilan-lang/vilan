@@ -7,8 +7,8 @@ The full syntactic grammar, in the notation of §1.3. Token classes
 ## 3.1 Modules and statements
 
 ```text
-module    = [ module-platform ] { statement } ;
-module-platform = platform-attr ";" ;       (* F27 R1, §11.3 *)
+module    = [ module-self ] { statement } ;
+module-self   = [ platform-attr ] "mod" "self" ";" ;  (* B415, §4.1, §11.3 *)
 platform-attr   = "[" "platform" "(" STRING { "," STRING } [ "," ] ")" "]" ;
 
 statement = derived-item
@@ -35,11 +35,13 @@ statement = derived-item
           ;
 ```
 
-A `module-platform` — `[platform("browser")];`, the attribute with a `;`
-after it — declares the platform of the WHOLE FILE (§11.3), and it is
-legal only as the file's first statement; anywhere else it is refused and
-told to move above the first import. The `;` is what tells it from the
-same attribute fencing the file's first function.
+A `module-self` — `mod self;`, the file's OWN module, with no body — is
+the host for attributes about the whole file (§4.1): `[platform("browser")]
+mod self;` declares the platform of the WHOLE FILE (§11.3). It is legal
+only as the file's first statement; anywhere else it is refused and told to
+move above the first import. `self` is reserved for it: a nested
+`"mod" IDENT` block may not be named `self`. The same attribute with no
+`mod self` after it fences the file's first function.
 
 A block-like form (`if`/`for`/`match`/`{…}`) in statement position must
 not be the last thing in its enclosing block: in that position it is

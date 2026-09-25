@@ -4281,7 +4281,7 @@ pub struct Analyzer<'src> {
     // (`[internal("reason")]`), keyed by its entity id. A function's own live
     // on `Function`, and a field's and a variant's on their records.
     item_labels: HashMap<Id, Labels<'src>>,
-    // F27 R1: each file's `[platform("…")];`, by the file.
+    // F27 R1: each file's `[platform("…")] mod self;` (B415), by the file.
     module_platforms: HashMap<SourceId, Vec<Spanned<&'src str>>>,
     // Every `lazy let` DECLARATION, in source order, before it is known whether
     // it is module-level (§2) or a local (§3, excluded). `record_lazy_bindings`
@@ -26545,7 +26545,7 @@ impl<'src> Analyzer<'src> {
                 .join(", ");
             msg.push_str(&format!(
                 ". The `{other_layer}` twin of `std::{module}` declares `{member_name}` — \
-                 `[platform({attribute})];` at the top of the file analyzes it under that \
+                 `[platform({attribute})] mod self;` at the top of the file analyzes it under that \
                  platform, as an entry of that platform (or `--platform`) does"
             ));
         }
@@ -30505,15 +30505,19 @@ impl<'src> Analyzer<'src> {
             // The marker IS the statement, so there is nothing under it to walk;
             // it takes the same module-level refusal `export` takes, for the same
             // reason.
-            // `[platform("…")];` (F27 R1) — the FILE's platform, recorded
+            // `[platform("…")] mod self;` (F27 R1, B415) — the FILE's platform, recorded
             // against the file being walked. The parser has already held it to
             // the file's first statement, so there is no position to refuse
             // here; `platform_color` reads the record (the requirement it seeds,
             // the promise it makes) and so does the resolver that chose the
             // platform this analysis runs under.
             Node::ModulePlatform(patterns) => {
-                self.module_platforms
-                    .insert(self.current_source_id, patterns.clone());
+                // B415: a bare `mod self;` hosts no attribute and declares
+                // nothing.
+                if !patterns.is_empty() {
+                    self.module_platforms
+                        .insert(self.current_source_id, patterns.clone());
+                }
                 Some(Expr::Void)
             }
             Node::ExportAll => {
@@ -54145,7 +54149,7 @@ pub struct Program<'src> {
     pub item_labels: HashMap<Id, Labels<'src>>,
     /// The entry package's `[lints]` (E221), for `labels::check`.
     pub lints: crate::manifest::Lints,
-    /// F27 R1: each file's `[platform("…")];`, as written, by the file — the
+    /// F27 R1: each file's `[platform("…")] mod self;` (B415), as written, by the file — the
     /// platform everything the file declares requires (`platform_color`).
     pub module_platforms: HashMap<SourceId, Vec<Spanned<&'src str>>>,
     /// F27 R1: those declarations and every `[platform(..)] impl`'s, resolved

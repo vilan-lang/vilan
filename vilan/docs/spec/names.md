@@ -8,6 +8,13 @@ declarations (`fun`, `struct`, `enum`, `trait`, `impl`, module-level
 declaration: a file `routes.vl` in a package's source root is the module
 `routes` of that package.
 
+The one statement that speaks about the file's module itself is
+**`mod self;`** — `self` is the file's own module, the statement has no
+body, and it must be the file's first statement. It is the host for
+attributes about the whole file: today `[platform("browser")] mod self;`
+(§11.3). `self` is reserved for it, so a nested module cannot be named
+`self` (`mod self { … }` is refused).
+
 Modules form a **tree**, and a directory under the source root is a
 module path. `a.vl` **or** `a/lib.vl` is the body of module `a` (both
 present is an ambiguity error, §4.2), and `a/b.vl` is the module `a::b`

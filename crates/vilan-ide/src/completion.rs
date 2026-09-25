@@ -428,6 +428,17 @@ pub const CONSTRUCT_SNIPPETS: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
+/// B415: the host of the file's own attributes, offered only where it is legal
+/// — the file's first statement — as `(label, detail, body, keyword)` in
+/// [`CONSTRUCT_SNIPPETS`]' shape. Not a row of that table: those are offered
+/// at every scope position, and this one is refused everywhere but the head.
+const FILE_HEAD_SNIPPET: (&str, &str, &str, &str) = (
+    "mod",
+    "[platform(…)] mod self;",
+    "declare the platform this file is analyzed under",
+    "[platform(\"${1:browser}\")] mod self;\n\n$0",
+);
+
 /// The keyword lexeme a token spells, or `None` for non-keyword tokens
 /// (identifiers, literals, operators, punctuation). Exhaustive over `Token`
 /// deliberately: a new keyword variant must be classified here, which forces
@@ -1734,6 +1745,15 @@ impl<'a, 'src> Analysis<'a, 'src> {
                     .map(|candidate| candidate.label.as_str())
                     .collect();
                 scope_candidates.extend(self.auto_import_completions(&in_scope));
+                // B415: at the file's head — no token before the word being
+                // typed — the host of the file's own attributes.
+                if !tokens
+                    .iter()
+                    .any(|(_, span)| span.into_range().start < start)
+                {
+                    let (keyword, label, detail, body) = FILE_HEAD_SNIPPET;
+                    scope_candidates.push(Completion::snippet(label, detail, body, keyword));
+                }
                 scope_candidates
             }
         };

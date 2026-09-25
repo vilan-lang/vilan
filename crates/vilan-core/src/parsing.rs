@@ -359,12 +359,19 @@ const DOC_HIDDEN_IS_SUPERSEDED: &str = "`[doc(hidden)]` is superseded by visibil
      marker is reached for: it stays exported and callable, and the editor hides it from \
      completion, dims it and leads its hover with the reason";
 
-/// F27 R1's placement rule: a module's `[platform(..)];` is the FILE's platform,
-/// so it leads the file — the one place a reader looks for what the whole file
-/// is. Curated: the rule states itself and names the move that satisfies it.
-pub const MODULE_PLATFORM_LEADS_THE_FILE: &str = "a module's `[platform(..)];` declares the platform of the whole file, so it is the file's \
-     first statement: move it above the first import. To fence one function instead, write the \
-     attribute on it with no `;`";
+/// B415's placement rule: `mod self;` hosts the FILE's own attributes (F27
+/// R1's `[platform(..)]` today), so it leads the file — the one place a reader
+/// looks for what the whole file is. Curated: the rule states itself and names
+/// the move that satisfies it.
+pub const MODULE_SELF_LEADS_THE_FILE: &str = "`mod self;` carries the attributes of the whole file, so it is the file's first statement: \
+     move it above the first import. To fence one function instead, write `[platform(..)]` on \
+     the function";
+
+/// B415's reserved name: `self` is the file's OWN module, the one `mod self;`
+/// declares, so no nested module may take it. Curated: it names the one
+/// legal `self` module and the move.
+pub const MODULE_SELF_IS_RESERVED: &str = "`self` is reserved for the file's own module — `mod self;`, with no body, as the file's \
+     first statement — so a nested module cannot take the name: give it another";
 
 /// B382's rule: a `[deprecated]` steer on an import is about the NAME a
 /// re-export publishes, so it needs the `export`. Curated: it names the move.
@@ -946,8 +953,9 @@ struct Parser<'a, 'src> {
     /// (variadic-generics.md §S.7), and clears it for the body it then parses:
     /// a `fun` declared inside a member's body is a free function.
     in_member_body: bool,
-    /// Whether the statement about to be read is the FILE's first (F27 R1):
-    /// the one position a module-level `[platform("…")];` may stand in. Set by
+    /// Whether the statement about to be read is the FILE's first (B415): the
+    /// one position `mod self;` — the host of the file's platform — may stand
+    /// in. Set by
     /// [`Parser::parse_program`] before its first statement and TAKEN by the
     /// first [`Parser::parse_statement_inner`] that runs — so a statement nested
     /// inside that first one (a function body's, a `mod`'s) already sees it
@@ -2348,14 +2356,15 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     /// [`Parser::parse_statement`]'s body, past the depth bound.
     fn parse_statement_inner(&mut self) -> Option<Spanned<Node<'src>>> {
-        // F27 R1: only the file's first statement may be its platform. Taken
-        // here, once, so every statement nested inside this one reads false.
+        // B415: only the file's first statement may be its `mod self;` (the
+        // host of F27 R1's platform). Taken here, once, so every statement
+        // nested inside this one reads false.
         let file_head = std::mem::take(&mut self.file_head);
-        if let Some(item) = self.attempt(Self::parse_module_platform) {
+        if let Some(item) = self.attempt(Self::parse_module_self) {
             if !file_head {
                 self.errors.push(ParseError {
                     span: item.1,
-                    reason: ParseErrorReason::Rule(MODULE_PLATFORM_LEADS_THE_FILE),
+                    reason: ParseErrorReason::Rule(MODULE_SELF_LEADS_THE_FILE),
                     context: self.context_stack.clone(),
                     hint: None,
                 });
@@ -6502,11 +6511,23 @@ impl<'a, 'src> Parser<'a, 'src> {
         ))
     }
 
-    /// `mod name { statements }` — a nested module.
+    /// `mod name { statements }` — a nested module. `self` is the file's own
+    /// module (B415's `mod self;`), so a nested module by that name is refused
+    /// where it is written — and still parsed, so the reader gets the one
+    /// sentence and not a cascade.
     fn parse_module(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         self.expect(&Token::Mod)?;
+        let name_span = self.here_span();
         let name = self.eat_ident()?;
+        if name == "self" {
+            self.errors.push(ParseError {
+                span: name_span,
+                reason: ParseErrorReason::Rule(MODULE_SELF_IS_RESERVED),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
         let body = self.parse_item_body("module body")?;
         Some((Node::Module(name, body), self.span_from(start)))
     }
@@ -7556,14 +7577,21 @@ impl<'a, 'src> Parser<'a, 'src> {
         }))
     }
 
-    /// `[platform("…", …)];` — a FILE's platform (F27 R1): the function
-    /// fence's attribute with a `;` after it, which is what tells it from the
-    /// fence on a first item (the `export *;` shape — the marker is the
-    /// statement). Where it may stand is [`Parser::parse_statement_inner`]'s
-    /// rule, not this production's.
-    fn parse_module_platform(&mut self) -> Option<Spanned<Node<'src>>> {
+    /// `[platform("…", …)]? mod self;` — the host of the FILE's own
+    /// attributes (B415): today the file's platform (F27 R1), which R1 first
+    /// shipped as the bare `[platform(..)];`. `self` is the file's own module,
+    /// and a `mod` with no body is only ever this one. A host with no attribute
+    /// declares nothing (empty patterns). Where it may stand is
+    /// [`Parser::parse_statement_inner`]'s rule, not this production's; a
+    /// `mod self` WITH a body is [`Parser::parse_module`]'s refusal.
+    fn parse_module_self(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
-        let patterns = self.parse_platform_attribute()?;
+        let patterns = self.parse_platform_attribute().unwrap_or_default();
+        self.expect(&Token::Mod)?;
+        if self.peek() != Some(&Token::Ident("self")) {
+            return None;
+        }
+        self.bump();
         let span = self.span_from(start);
         self.expect_ctrl(';')?;
         Some((Node::ModulePlatform(patterns), span))
@@ -9104,10 +9132,10 @@ mod tests {
     }
 
     #[test]
-    fn a_file_leading_platform_is_the_modules_own() {
-        // F27 R1: the fence's attribute with a `;`, as the file's first
-        // statement.
-        let items = program("[platform(\"browser\")];\n\nimport std::ui::Region;\n");
+    fn a_file_leading_mod_self_hosts_the_files_platform() {
+        // B415: `[platform("…")] mod self;` as the file's first statement is
+        // the host for the file's own attributes (F27 R1's platform).
+        let items = program("[platform(\"browser\")] mod self;\n\nimport std::ui::Region;\n");
         match &items.0[0].0 {
             Node::ModulePlatform(patterns) => {
                 assert_eq!(
@@ -9117,11 +9145,17 @@ mod tests {
             }
             other => panic!("expected the module's platform, got {other:?}"),
         }
-        match only_item("[platform(\"@process\", \"browser\")];") {
+        match only_item("[platform(\"@process\", \"browser\")] mod self;") {
             Node::ModulePlatform(patterns) => assert_eq!(patterns.len(), 2),
             other => panic!("{other:?}"),
         }
-        // Without the `;` it is the first function's fence, as it always was.
+        // A host with no attribute on it declares nothing, and parses.
+        match only_item("mod self;") {
+            Node::ModulePlatform(patterns) => assert!(patterns.is_empty()),
+            other => panic!("{other:?}"),
+        }
+        // The attribute on a first function is that function's fence, as it
+        // always was.
         match only_item("[platform(\"browser\")] fun f() {}") {
             Node::Func(function) => assert_eq!(function.platform_fence.len(), 1),
             other => panic!("{other:?}"),
@@ -9129,24 +9163,62 @@ mod tests {
     }
 
     #[test]
-    fn a_module_platform_anywhere_but_the_files_head_is_refused() {
+    fn the_bare_file_platform_statement_is_gone() {
+        // B415 removes F27 R1's `[platform("…")];`: `mod self;` is its host,
+        // and the attribute with only a `;` after it is no statement at all.
+        assert!(
+            !matches!(
+                program("[platform(\"browser\")];\n")
+                    .0
+                    .first()
+                    .map(|item| &item.0),
+                Some(Node::ModulePlatform(_))
+            ),
+            "the bare form must not parse as the file's platform"
+        );
+    }
+
+    #[test]
+    fn mod_self_anywhere_but_the_files_head_is_refused() {
         for source in [
-            "import std::ui::Region;\n[platform(\"browser\")];\n",
-            "fun f() {\n\t[platform(\"browser\")];\n}\n",
-            "mod inner {\n\t[platform(\"browser\")];\n}\n",
+            "import std::ui::Region;\n[platform(\"browser\")] mod self;\n",
+            "import std::ui::Region;\nmod self;\n",
+            "fun f() {\n\t[platform(\"browser\")] mod self;\n}\n",
+            "mod inner {\n\t[platform(\"browser\")] mod self;\n}\n",
         ] {
             let (_, errors) = parse(source);
             assert!(
                 errors
                     .iter()
-                    .any(|error| render(error) == MODULE_PLATFORM_LEADS_THE_FILE),
+                    .any(|error| render(error) == MODULE_SELF_LEADS_THE_FILE),
                 "{source:?}: {errors:?}"
             );
         }
         // The head itself is clean, a leading comment notwithstanding.
         assert!(!declines(
-            "// the client's slot\n[platform(\"browser\")];\nfun f() {}\n"
+            "// the client's slot\n[platform(\"browser\")] mod self;\nfun f() {}\n"
         ));
+    }
+
+    #[test]
+    fn self_is_a_reserved_module_name() {
+        // B415: `self` names the file's own module, so no module may be
+        // declared by that name — at the head or anywhere else.
+        for source in [
+            "mod self {\n\tfun f() {}\n}\n",
+            "fun g() {}\nmod self {}\n",
+            "mod outer {\n\tmod self {}\n}\n",
+        ] {
+            let (_, errors) = parse(source);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| render(error) == MODULE_SELF_IS_RESERVED),
+                "{source:?}: {errors:?}"
+            );
+        }
+        // Any other name is a module, as it always was.
+        assert!(!declines("mod selfish {\n\tfun f() {}\n}\n"));
     }
 
     #[test]

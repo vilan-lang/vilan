@@ -2222,7 +2222,7 @@ fn file_mode_does_not_ask_a_module_for_a_main() {
 // reach it. A declaration outranks both.
 
 /// The owner's shape, declared.
-const DECLARED_REGION_MODULE: &str = "[platform(\"browser\")];\n\nimport std::ui::Region;\n\nexport fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
+const DECLARED_REGION_MODULE: &str = "[platform(\"browser\")] mod self;\n\nimport std::ui::Region;\n\nexport fun anchor_of(region: Region) {\n\tregion.anchor;\n}\n";
 
 /// The same body under a function FENCE — which, before R1, changed nothing
 /// about how its body resolved.
@@ -2273,7 +2273,8 @@ fn f27_a_function_fence_resolves_its_body_under_its_platform() {
 fn f27_reaching_a_declared_module_from_a_server_entry_reports_the_chain() {
     // A module that types under both twins, so the only thing wrong with the
     // server reaching it is the reach.
-    let declared = "[platform(\"browser\")];\n\nexport fun when_value(): str {\n\t\"x\"\n}\n";
+    let declared =
+        "[platform(\"browser\")] mod self;\n\nexport fun when_value(): str {\n\t\"x\"\n}\n";
     let server = "import std::io::print;\nimport pkg::slot::when_value;\n\nfun render(): str {\n\twhen_value()\n}\n\nfun main() {\n\tprint(render());\n}\nmain();\n";
     let dir = f27_package("f27_chain", declared, server);
     let output = vilan_plain(&["check", dir.join("src/server.vl").to_str().unwrap()]);
@@ -2295,7 +2296,7 @@ fn f27_a_bare_files_declaration_is_its_platform_on_the_terminal_too() {
     write(
         &dir,
         "slot.vl",
-        "[platform(\"browser\")];\n\nimport std::ui::Region;\n\nfun anchor_of(region: Region) {\n\tregion.anchor;\n}\n\nfun main() {}\n",
+        "[platform(\"browser\")] mod self;\n\nimport std::ui::Region;\n\nfun anchor_of(region: Region) {\n\tregion.anchor;\n}\n\nfun main() {}\n",
     );
     let output = vilan_plain(&["check", dir.join("slot.vl").to_str().unwrap()]);
     let text = combined(&output);
@@ -2313,7 +2314,7 @@ fn f27_the_twin_note_names_the_attribute_that_moves_the_file() {
     let text = combined(&output);
     assert!(
         text.contains(
-            "`[platform(\"browser\")];` at the top of the file analyzes it under that platform"
+            "`[platform(\"browser\")] mod self;` at the top of the file analyzes it under that platform"
         ),
         "R6's note now names the line R1 added:\n{text}"
     );

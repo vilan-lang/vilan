@@ -796,8 +796,10 @@ pub enum Node<'src> {
     // `export *;` — every item of this module is exported (B318 §2.1). A
     // module-level item with no inner statement: the marker IS the statement.
     ExportAll,
-    // `[platform("browser")];` — the FILE's platform (F27 R1): a file-leading
-    // statement, `export *;`'s shape (the marker is the statement). Everything
+    // `[platform("browser")] mod self;` — the FILE's platform (F27 R1), on the
+    // host B415 gave file-level attributes: `self` is the file's own module,
+    // and the statement must lead the file (a bare `mod self;` carries no
+    // patterns and declares nothing). Everything
     // the file declares requires that platform, and it is the platform the file
     // is analyzed under — outranking every heuristic and the `default-entry`
     // colour. The patterns are carried as written, with their spans, exactly as
