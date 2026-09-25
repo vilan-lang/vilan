@@ -2083,6 +2083,19 @@ fn the_keyed_rpc_service_answers_a_node_client_the_same_from_a_native_server() {
 ///
 /// Non-vacuous by content: the bodies and the client's lines are asserted
 /// verbatim, and the two logins differ only in the password.
+///
+/// **F40: the REAL password path.** The shape hashes as kolt's `store.vl` does —
+/// PBKDF2-HMAC-SHA-512 at 100,000 rounds through a node:crypto `pbkdf2Sync` the
+/// program binds itself, read back through the `Buffer`'s `toString("hex")`, a
+/// salt and a session token from `std::crypto::random_bytes` — so both legs run
+/// `vilan-rt-crypto`'s arithmetic against node's. The tokens are random by
+/// design and are compared MASKED ([`mask_session_tokens`]); the authorized
+/// client carries the real one, so a token the store did not keep is a refused
+/// client. PBKDF2's bytes themselves are held to node's in
+/// [`the_crypto_surface_answers_nodes_bytes_on_both_backends`]; kolt's own
+/// `server.vl`, built natively on a scratch copy, is measured beside the
+/// order's census (`sweeps/order42/native-42/`), where one backend's hash is
+/// verified by the other over one database file.
 #[test]
 fn the_kolt_server_shape_serves_a_login_and_a_keyed_subscription_from_a_native_build() {
     let staged = stage();
@@ -2151,11 +2164,27 @@ fn the_kolt_server_shape_serves_a_login_and_a_keyed_subscription_from_a_native_b
         );
         (exchanges, authorized, refused)
     };
-    let native = serve(&mut native_command);
-    let javascript = serve(&mut node_command);
+    let mut native = serve(&mut native_command);
+    let mut javascript = serve(&mut node_command);
+    // F40: the salt and the session token are `random_bytes(32).to_hex()`
+    // on both legs, as in kolt, so each body is compared with its tokens
+    // MASKED — and the tokens themselves are held to what random ones must
+    // be: 64 lowercase hex digits, fresh per session, never the other leg's.
+    let native_tokens = mask_session_tokens(&mut native.0);
+    let node_tokens = mask_session_tokens(&mut javascript.0);
     assert_eq!(
         native.0, javascript.0,
         "the six HTTP exchanges must be the same from both servers"
+    );
+    for tokens in [&native_tokens, &node_tokens] {
+        assert_eq!(tokens.len(), 2, "register and login each open a session");
+        assert_ne!(tokens[0], tokens[1], "a session token is fresh per session");
+    }
+    assert!(
+        native_tokens
+            .iter()
+            .all(|token| !node_tokens.contains(token)),
+        "two processes never draw the same token: {native_tokens:?} {node_tokens:?}"
     );
     assert_eq!(
         native.1, javascript.1,
@@ -2174,8 +2203,8 @@ fn the_kolt_server_shape_serves_a_login_and_a_keyed_subscription_from_a_native_b
     assert_eq!(
         bodies[..4],
         [
-            "{\"ok\":true,\"token\":\"81ff4294f07c6f3c\",\"message\":\"welcome ada\"}",
-            "{\"ok\":true,\"token\":\"81ff4294f07c6f3c\",\"message\":\"welcome ada\"}",
+            "{\"ok\":true,\"token\":\"<session token>\",\"message\":\"welcome ada\"}",
+            "{\"ok\":true,\"token\":\"<session token>\",\"message\":\"welcome ada\"}",
             "{\"ok\":false,\"token\":\"\",\"message\":\"wrong password\"}",
             "malformed call",
         ]
@@ -2215,6 +2244,38 @@ fn the_kolt_server_shape_serves_a_login_and_a_keyed_subscription_from_a_native_b
         native.1
     );
     assert_eq!(native.2.trim(), "err:Unauthorized");
+}
+
+/// Replaces every session token in `exchanges`' bodies — a run of exactly 64
+/// lowercase hex digits, which is `random_bytes(32).to_hex()` — with a
+/// placeholder, and answers the tokens in order. Anything that LOOKS like a
+/// token but is not 64 lowercase hex stays in the body and fails the compare.
+fn mask_session_tokens(exchanges: &mut [ServedRequest]) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for exchange in exchanges {
+        let mut masked = String::new();
+        let mut rest = exchange.body.as_str();
+        while let Some(start) = rest.find("\"token\":\"") {
+            let (before, after) = rest.split_at(start + "\"token\":\"".len());
+            masked.push_str(before);
+            let end = after.find('"').unwrap_or(after.len());
+            let token = &after[..end];
+            if token.len() == 64
+                && token
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            {
+                tokens.push(token.to_string());
+                masked.push_str("<session token>");
+            } else {
+                masked.push_str(token);
+            }
+            rest = &after[end..];
+        }
+        masked.push_str(rest);
+        exchange.body = masked;
+    }
+    tokens
 }
 
 /// The three exchanges the exit drives, over one spawned server.
@@ -2631,6 +2692,122 @@ const SEAMS_PROBE: &str = concat!(
     "\tprint(i\"{sampled > 1790000000000.0} {sampled == sampled.floor()}\");\n",
     "\tlet later = now();\n",
     "\tprint(i\"{later.millis >= sampled.as_i53()}\");\n",
+    "}\n",
+);
+
+/// **F40 (RULED (a))**: `std::crypto`'s OS randomness, SHA-384/512, HMAC and
+/// PBKDF2 natively, through the separate `vilan-rt-crypto` crate — and
+/// node:crypto's `pbkdf2Sync` bound by the PROGRAM, with the `Buffer` it answers
+/// declared as an `external struct` of the program's own naming and read back
+/// through `toString(encoding)`, which is how kolt's `store.vl` hashes a
+/// password.
+///
+/// Every deterministic line is compared byte for byte against node AND held
+/// verbatim (each value is node's own answer), so a digest, an HMAC or a PBKDF2
+/// that is wrong in any bit reds here; the random lines print only what two
+/// processes can agree on — the lengths, that two draws differ, the UUID's
+/// version nibble. The last line is `Shared::identity`'s stamp, which counts
+/// from 1 in first-ask order on both backends (the native `i64` address it had
+/// been did not even compile against std's `i32` declaration, which is the wall
+/// kolt's server met past its host gaps).
+///
+/// And the reach is RECORDED: this program's manifest names `vilan-rt-crypto`,
+/// and a program that reaches no crypto names neither optional crate.
+///
+/// Red before F40: refused by name (`random_bytes`, `sha384`, `sha512`,
+/// `hmac_sha512`, `pbkdf2_sha512`, `pbkdf2_sync`, `to_string_encoded`).
+#[test]
+fn the_crypto_surface_answers_nodes_bytes_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_crypto.vl"), CRYPTO_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_crypto.vl"),
+        Verdict::Identical,
+        "the crypto surface must print the same bytes on both backends"
+    );
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "native_probe_crypto.vl"])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        concat!(
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f\n",
+            "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7\n",
+            "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737\n",
+            "e1d9c16aa681708a45f5c7c4e215ceb66e011a2e9f0040713f18aefdb866d53cf76cab2868a39b9f7840edce4fef5a82be67335c77a6068e04112754f27ccf4e\n",
+            "9c549ce63c45f8df93229c0fac3d6457dc31b241409e21ef1b4e45c97c11001333ddb86821b04cb42fdfa9e3cb9996f4cee97ff6a7e62be799a5b23a83fc5a7f\n",
+            "6mwBTcctb4zNHtkqzh1B8NjeiVc=\n",
+            "rk0Mla9rRtMtCt_5KPBt0CowP47zwlHf1uLYWpVHTEM\n",
+            "32 64 false\n",
+            "36 4\n",
+            "1 2 1\n",
+        ),
+        "node's own answers, and what two processes can agree on about randomness"
+    );
+    let manifest_of = |program: &str| {
+        std::fs::read_to_string(
+            staged
+                .join("dist")
+                .join("native")
+                .join(program)
+                .join("Cargo.toml"),
+        )
+        .expect("read the generated manifest")
+    };
+    let manifest = manifest_of("native_probe_crypto");
+    assert!(
+        manifest.contains("vilan-rt-crypto") && !manifest.contains("vilan-rt-sqlite"),
+        "a program reaching `std::crypto`'s randomness names the crypto crate, and only it:\n\
+         {manifest}"
+    );
+    let plain = vilan(&staged)
+        .args(["build", "--backend", "rust", "bool.vl"])
+        .output()
+        .expect("build a program that reaches no optional crate");
+    assert!(plain.status.success());
+    let manifest = manifest_of("bool");
+    assert!(
+        !manifest.contains("vilan-rt-crypto") && !manifest.contains("vilan-rt-sqlite"),
+        "a program that reaches neither names neither:\n{manifest}"
+    );
+}
+
+const CRYPTO_PROBE: &str = concat!(
+    "import std::bytes::encode_utf8;\n",
+    "import std::crypto::{ hmac_sha512, pbkdf2_sha512, random_bytes, random_uuid, sha384, sha512 };\n",
+    "import std::io::print;\n",
+    "import std::shared::Shared;\n",
+    "\n",
+    "external struct HashBuffer;\n",
+    "\n",
+    "impl HashBuffer {\n",
+    "\t[extern(method, \"toString\")]\n",
+    "\texternal fun to_string_encoded(self, encoding: str): str;\n",
+    "}\n",
+    "\n",
+    "[extern(\"node:crypto\", \"pbkdf2Sync\")]\n",
+    "external fun pbkdf2_sync(password: str, salt: str, iterations: i32, key_length: i32, digest: str): HashBuffer;\n",
+    "\n",
+    "async fun main() {\n",
+    "\tprint(sha512(encode_utf8(\"abc\")).to_hex());\n",
+    "\tprint(sha384(encode_utf8(\"abc\")).to_hex());\n",
+    "\tprint(hmac_sha512(encode_utf8(\"Jefe\"), encode_utf8(\"what do ya want for nothing?\")).to_hex());\n",
+    "\tprint(pbkdf2_sha512(encode_utf8(\"password\"), encode_utf8(\"salt\"), 2, 512).to_hex());\n",
+    "\tlet derived = pbkdf2_sync(\"lovelace1\", \"0123456789abcdef\", 100000, 64, \"sha512\");\n",
+    "\tprint(derived.to_string_encoded(\"hex\"));\n",
+    "\tprint(pbkdf2_sync(\"password\", \"salt\", 2, 20, \"sha1\").to_string_encoded(\"base64\"));\n",
+    "\tprint(pbkdf2_sync(\"password\", \"salt\", 2, 32, \"SHA256\").to_string_encoded(\"base64url\"));\n",
+    "\tlet first = random_bytes(32);\n",
+    "\tlet second = random_bytes(32);\n",
+    "\tprint(i\"{first.len()} {first.to_hex().len()} {first.to_hex() == second.to_hex()}\");\n",
+    "\tlet uuid = random_uuid();\n",
+    "\tprint(i\"{uuid.len()} {uuid.substring(14, 15)}\");\n",
+    "\tlet cell = Shared::new(1);\n",
+    "\tlet other = Shared::new(2);\n",
+    "\tlet same = cell;\n",
+    "\tprint(i\"{cell.identity()} {other.identity()} {same.identity()}\");\n",
     "}\n",
 );
 
@@ -3440,22 +3617,30 @@ fn the_native_copy_census_matches_its_table() {
 /// F29: a program whose host bindings sit ONLY inside a refused call — in its
 /// arguments, and in the body of a closure among them.
 ///
-/// `random_uuid` is reached nowhere but inside the argument of the refused
-/// `random_bytes` call; `range_i32` nowhere but inside the body of the closure
+/// `host_name` is reached nowhere but inside the argument of the refused
+/// `set_priority` call; `range_i32` nowhere but inside the body of the closure
 /// the refused `hmr_register_teardown` takes. Neither was in the census before
 /// the walk continued past a refusal, which is how `createServer`'s handler hid
 /// nine bindings from the census that sized F18.
+///
+/// The argument pair is the PROGRAM's own `node:os` bindings, which no backend
+/// table will ever answer: the pair had been `random_bytes(random_uuid()..)`,
+/// and F40 lowered both, which turned the pin's shape into a program with
+/// nothing hidden in it. A pair the runtime cannot grow into keeps it measuring
+/// the walk rather than the runtime's coverage.
 const CENSUS_PROBE: &str = concat!(
-    "import std::crypto::{ random_bytes, random_uuid };\n",
     "import std::random::range_i32;\n",
     "import std::rpc::hmr_register_teardown;\n",
-    "import std::bytes::Bytes;\n",
     "import std::io::print;\n",
     "\n",
-    "fun consume(value: Bytes) {}\n",
+    "[extern(\"node:os\", \"hostname\")]\n",
+    "external fun host_name(): str;\n",
+    "\n",
+    "[extern(\"node:os\", \"setPriority\")]\n",
+    "external fun set_priority(name: str): i32;\n",
     "\n",
     "fun main() {\n",
-    "\tconsume(random_bytes(random_uuid().len()));\n",
+    "\tprint(set_priority(host_name()));\n",
     "\thmr_register_teardown(|| { print(range_i32(1, 4)); });\n",
     "}\n",
 );
@@ -3491,7 +3676,7 @@ fn the_host_census_walks_past_a_refusal_into_its_arguments_and_closure_bodies() 
     let census = String::from_utf8_lossy(&output.stdout);
     for hidden in [
         // Reached only inside the ARGUMENT of a refused host binding's call.
-        "the host binding `random_uuid`",
+        "the host binding `host_name`",
         // Reached only inside the BODY of a closure handed to a refused one.
         "the intrinsic `RandomInt`",
     ] {
@@ -3503,7 +3688,7 @@ fn the_host_census_walks_past_a_refusal_into_its_arguments_and_closure_bodies() 
     // And the refusals themselves are still reported, which is what the walk is
     // a continuation OF.
     for refused in [
-        "the host binding `random_bytes`",
+        "the host binding `set_priority`",
         "the host binding `hmr_register_teardown`",
     ] {
         assert!(

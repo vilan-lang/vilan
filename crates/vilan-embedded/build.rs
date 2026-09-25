@@ -63,25 +63,22 @@ fn main() {
         "embedded-std build: {} holds no src/lib.rs — is this a complete checkout?",
         runtime_root.display()
     );
-    // F18 slice 2: `vilan-rt-sqlite` materializes BESIDE the runtime, under the
-    // same hash and the same root, because the generated cargo manifest reaches
-    // it as a sibling of the runtime path (Order 39's R1 keeps it a separate
-    // CRATE; it is not a separate cache). A program that does not reach
-    // `std::db` never names it, so the extra files cost a materialization and
-    // nothing else.
-    let sqlite_root = manifest_dir.join("../vilan-rt-sqlite");
-    collect_rust(
-        &sqlite_root,
-        Path::new("vilan-rt-sqlite"),
-        &mut runtime_files,
-    );
-    assert!(
-        runtime_files
-            .iter()
-            .any(|(key, _)| key == "vilan-rt-sqlite/src/lib.rs"),
-        "embedded-std build: {} holds no src/lib.rs — is this a complete checkout?",
-        sqlite_root.display()
-    );
+    // F18 slice 2 and F40: the OPTIONAL runtime crates (`vilan-rt-sqlite`,
+    // `vilan-rt-crypto`) materialize BESIDE the runtime, under the same hash and
+    // the same root, because the generated cargo manifest reaches each as a
+    // sibling of the runtime path (the rulings keep them separate CRATES; they
+    // are not separate caches). A program that reaches neither never names
+    // them, so the extra files cost a materialization and nothing else.
+    for optional in OPTIONAL_CRATES {
+        let root = manifest_dir.join("..").join(optional.directory);
+        collect_rust(&root, Path::new(optional.directory), &mut runtime_files);
+        let library = format!("{}/src/lib.rs", optional.directory);
+        assert!(
+            runtime_files.iter().any(|(key, _)| *key == library),
+            "embedded-std build: {} holds no src/lib.rs — is this a complete checkout?",
+            root.display()
+        );
+    }
     runtime_files.sort();
     write_table(
         &mut generated,
@@ -91,7 +88,12 @@ fn main() {
         &runtime_files,
     );
     generated.push_str(&runtime_manifest(&runtime_root));
-    generated.push_str(&sqlite_manifest(&sqlite_root));
+    for optional in OPTIONAL_CRATES {
+        generated.push_str(&optional_manifest(
+            &manifest_dir.join("..").join(optional.directory),
+            optional,
+        ));
+    }
 
     let mut out = fs::File::create(&out_path).unwrap();
     out.write_all(generated.as_bytes()).unwrap();
@@ -131,24 +133,48 @@ fn write_table(
     generated.push_str("];\n\n");
 }
 
-/// The `Cargo.toml` the materialized `vilan-rt-sqlite` carries —
-/// [`runtime_manifest`]'s twin, and the one place the two differ is the point:
-/// this crate HAS dependencies (that is why it is a crate of its own), so its
+/// An optional runtime crate: its directory beside `vilan-rt`, and the name of
+/// the generated static its materialized manifest is written into.
+struct OptionalCrate {
+    directory: &'static str,
+    manifest_static: &'static str,
+    item: &'static str,
+}
+
+/// The crates `vilan-rust`'s `OptionalCrates` names — each a runtime surface
+/// that takes a crates.io dependency `vilan-rt` must not.
+const OPTIONAL_CRATES: &[OptionalCrate] = &[
+    OptionalCrate {
+        directory: "vilan-rt-sqlite",
+        manifest_static: "RT_SQLITE_MANIFEST",
+        item: "F18 slice 2",
+    },
+    OptionalCrate {
+        directory: "vilan-rt-crypto",
+        manifest_static: "RT_CRYPTO_MANIFEST",
+        item: "F40",
+    },
+];
+
+/// The `Cargo.toml` a materialized optional crate carries — [`runtime_manifest`]'s
+/// twin, and the one place the two differ is the point: these crates HAVE
+/// dependencies (that is why each is a crate of its own), so the
 /// `[dependencies]` block is copied through from the real manifest rather than
-/// emptied.
-fn sqlite_manifest(sqlite_root: &Path) -> String {
-    let path = sqlite_root.join("Cargo.toml");
+/// emptied. The workspace-only `[lints]` block is what is dropped.
+fn optional_manifest(root: &Path, optional: &OptionalCrate) -> String {
+    let path = root.join("Cargo.toml");
     println!("cargo:rerun-if-changed={}", path.display());
     let manifest = fs::read_to_string(&path).unwrap();
     let package = block_of(&manifest, "[package]");
     let dependencies = block_of(&manifest, "[dependencies]");
     let generated = format!("{package}\n\n{dependencies}\n\n[workspace]\n");
     format!(
-        "/// The `Cargo.toml` `vilan-rt-sqlite` is materialized with (F18 slice 2):\n\
+        "/// The `Cargo.toml` `{}` is materialized with ({}):\n\
          /// the real crate's `[package]` and `[dependencies]` blocks plus a\n\
          /// `[workspace]` of its own. Unlike [`RT_MANIFEST`] the dependencies are\n\
          /// KEPT — having them is why this crate exists apart from the runtime.\n\
-         pub static RT_SQLITE_MANIFEST: &str = {generated:?};\n"
+         pub static {}: &str = {generated:?};\n",
+        optional.directory, optional.item, optional.manifest_static
     )
 }
 

@@ -404,7 +404,23 @@ fn describe_panic(payload: &Box<dyn std::any::Any + Send>) -> Str {
 /// later slice. Cloning is another handle to the SAME cell, which is what makes
 /// it the box a `SignalCell` is built out of.
 pub struct Shared<T> {
-    inner: Rc<RefCell<T>>,
+    inner: Rc<Slot<T>>,
+}
+
+/// What a [`Shared`] handle points at: the value, and the identity stamp
+/// [`Shared::identity`] takes on the first ask (`0` until then).
+///
+/// The stamp lives on the CELL, beside its value, exactly where the JS
+/// backend's `__shared_identity` puts its `__id` — so every handle reads the
+/// one number, and a cell nothing asks about never takes one.
+struct Slot<T> {
+    value: RefCell<T>,
+    identity: std::cell::Cell<i32>,
+}
+
+thread_local! {
+    /// The next identity to stamp — `__shared_identity_next`, which starts at 1.
+    static NEXT_IDENTITY: std::cell::Cell<i32> = const { std::cell::Cell::new(1) };
 }
 
 impl<T> Clone for Shared<T> {
@@ -418,7 +434,10 @@ impl<T> Clone for Shared<T> {
 impl<T> Shared<T> {
     pub fn new(value: T) -> Self {
         Shared {
-            inner: Rc::new(RefCell::new(value)),
+            inner: Rc::new(Slot {
+                value: RefCell::new(value),
+                identity: std::cell::Cell::new(0),
+            }),
         }
     }
 
@@ -431,11 +450,11 @@ impl<T> Shared<T> {
     where
         T: Clone,
     {
-        self.inner.borrow().clone()
+        self.inner.value.borrow().clone()
     }
 
     pub fn set(&self, value: T) {
-        *self.inner.borrow_mut() = value;
+        *self.inner.value.borrow_mut() = value;
     }
 
     /// `Shared::write()` USED AS A PLACE — `cell.write().push(x)`,
@@ -452,7 +471,7 @@ impl<T> Shared<T> {
     /// and rustc cannot see — panics at the read instead of reading through it.
     /// That is R3's ruled residue and the same stance [`Shared::get`] takes.
     pub fn borrow_mut(&self) -> std::cell::RefMut<'_, T> {
-        self.inner.borrow_mut()
+        self.inner.value.borrow_mut()
     }
 
     /// The count, for the measurement C14 S4 will want and for tests here.
@@ -462,11 +481,28 @@ impl<T> Shared<T> {
 
     /// This CELL's identity — the same number for every handle to one cell,
     /// different for every other cell, stable for a run (`shared.vl`'s
-    /// `identity`). The JS backend mints a counter per cell; here the cell's
-    /// own address IS its identity, and it is narrowed to the `i53` range the
-    /// language promises.
-    pub fn identity(&self) -> i64 {
-        (Rc::as_ptr(&self.inner) as usize as u64 & 0x1f_ffff_ffff_ffff) as i64
+    /// `identity(self): i32`).
+    ///
+    /// STAMPED on the first ask from a counter that starts at 1, as the JS
+    /// backend's `__shared_identity` stamps `cell.__id` — so a program that
+    /// asks in the same order gets the same numbers on both backends. It had
+    /// been the cell's address, narrowed to `i53` as an `i64`: rustc refused
+    /// every `fun .. : i32` that returned it (kolt's server reaches
+    /// `std::reactive::cell_identity` through its `[rpc]` methods, F40's exit),
+    /// and an address narrowed to the declared `i32` could collide between two
+    /// live cells, which a counter cannot.
+    pub fn identity(&self) -> i32 {
+        let stamped = self.inner.identity.get();
+        if stamped != 0 {
+            return stamped;
+        }
+        let minted = NEXT_IDENTITY.with(|next| {
+            let minted = next.get();
+            next.set(minted.wrapping_add(1));
+            minted
+        });
+        self.inner.identity.set(minted);
+        minted
     }
 
     /// The back-edge handle (`shared.vl`'s `downgrade`): it names the cell and
@@ -492,7 +528,7 @@ impl<T> PartialEq for Shared<T> {
 /// with node's spacing.
 impl<T: Js> Js for Shared<T> {
     fn js(&self) -> String {
-        format!("{{ v: {} }}", self.inner.borrow().js_nested())
+        format!("{{ v: {} }}", self.inner.value.borrow().js_nested())
     }
 }
 
@@ -504,7 +540,7 @@ impl<T: Js> Js for Shared<T> {
 /// says that is the shape landing ahead of the guarantee, and a program written
 /// against the `Option` keeps working either way.
 pub struct Weak<T> {
-    inner: rc::Weak<RefCell<T>>,
+    inner: rc::Weak<Slot<T>>,
 }
 
 impl<T> Clone for Weak<T> {
@@ -1549,7 +1585,7 @@ impl<T> Json for Set<T> {
 /// [`Js for Shared`]), so that is its JSON too.
 impl<T: Json> Json for Shared<T> {
     fn json(&self) -> String {
-        format!("{{\"v\":{}}}", self.inner.borrow().json())
+        format!("{{\"v\":{}}}", self.inner.value.borrow().json())
     }
 }
 

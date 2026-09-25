@@ -93,10 +93,11 @@ pub struct Emitted {
     /// nothing compiles it, and the mode exists because "what does this program
     /// still need" is a question one run should answer.
     pub host_gaps: Vec<String>,
-    /// Whether the program reached `std::db`, so the cargo project written for
-    /// it depends on `vilan-rt-sqlite` (F18 slice 2; Order 39's R1). A program
-    /// that does not names the crate nowhere and never builds it.
-    pub reaches_sqlite: bool,
+    /// The OPTIONAL runtime crates the program reached, so the cargo project
+    /// written for it depends on exactly those (F18 slice 2's
+    /// `vilan-rt-sqlite`, F40's `vilan-rt-crypto`). A program that reaches
+    /// neither names neither and never builds them.
+    pub optional_crates: OptionalCrates,
     /// R3's measurement: how many bindings this program had to box into
     /// `vilan_rt::Captured<_>` (an `Rc<RefCell<_>>`) because a closure captures
     /// them and something writes them. C15's by-value capture optimisation is
@@ -113,6 +114,35 @@ pub struct Emitted {
     /// handle is one of those and is not a copy).
     pub consumed_copies: usize,
     pub consumed_copies_elided: usize,
+}
+
+/// The runtime crates a program links only when it REACHES them — each one a
+/// crates.io dependency `vilan-rt` must not take (Order 37's R8), kept out of it
+/// in a crate of its own and named by the generated manifest on demand.
+///
+/// Both sit BESIDE `vilan-rt` — as siblings in the repository and in the
+/// materialized cache alike — which is how [`cargo_manifest`] finds them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OptionalCrates {
+    /// `std::db` — `vilan-rt-sqlite` (`rusqlite`, `bundled`; Order 39's R1).
+    pub sqlite: bool,
+    /// OS randomness, SHA-384/512, HMAC and PBKDF2 — `vilan-rt-crypto`
+    /// (`getrandom`; F40, RULED (a)).
+    pub crypto: bool,
+}
+
+impl OptionalCrates {
+    /// The crate directories reached, in a fixed order.
+    pub fn names(self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if self.sqlite {
+            names.push("vilan-rt-sqlite");
+        }
+        if self.crypto {
+            names.push("vilan-rt-crypto");
+        }
+        names
+    }
 }
 
 /// Emits `program` as a single Rust source file.
@@ -316,6 +346,11 @@ struct Emitter<'a, 'src> {
     /// one of the three host TYPES is rendered, which is the narrowest point
     /// every reach passes through: a binding takes or answers one.
     reaches_sqlite: bool,
+    /// Whether this program reached `vilan-rt-crypto` (F40, RULED (a)): OS
+    /// randomness, SHA-384/512, HMAC or PBKDF2. Set by
+    /// [`Emitter::crypto_host_binding`] and by rendering a node `Buffer`'s type
+    /// — the two places a program's text can name that crate.
+    reaches_crypto: bool,
     /// Whether the function being emitted DECLARES an `async |T| U` return
     /// type (J2's `async_returning`) — so the closure literal it hands back is
     /// a future-answering one.
@@ -472,6 +507,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             expects_async_value: false,
             current_return_type: None,
             reaches_sqlite: false,
+            reaches_crypto: false,
             returns_an_async_closure: false,
             closure_captures: Vec::new(),
             expects_payload_view: None,
@@ -535,7 +571,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Ok(Emitted {
             source,
             host_gaps: self.host_gaps.iter().cloned().collect(),
-            reaches_sqlite: self.reaches_sqlite,
+            optional_crates: OptionalCrates {
+                sqlite: self.reaches_sqlite,
+                crypto: self.reaches_crypto,
+            },
             boxed_bindings: self.boxed_emitted.len(),
             consumed_copies: self.copies_taken,
             consumed_copies_elided: self.copies_elided,
@@ -1812,6 +1851,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             "NodeHash" => Ok("vilan_rt::crypto::NodeHash".to_string()),
             // `std::fs`'s `fs.Stats`, which `stat` copies three fields out of.
             "RawStat" => Ok("vilan_rt::fs::RawStat".to_string()),
+            // F40: node's `Buffer`, under whatever name the program gave it —
+            // recognized by the binding that answers it, not by the name.
+            _ if self.node_buffer_struct(id) => {
+                self.reaches_crypto = true;
+                Ok("vilan_rt_crypto::NodeBuffer".to_string())
+            }
             _ => {
                 let what = format!("the host type `{name}`");
                 self.host_gap(what, span).map(|_| "()".to_string())
@@ -6537,6 +6582,198 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Ok(Some(rendered))
     }
 
+    /// Every host table this backend has, in ONE order — the single answer to
+    /// "does the runtime have a body for this binding".
+    ///
+    /// An external call reaches it two ways, directly and through a blanket
+    /// impl's selected member ([`NativeDispatch::Host`]), and the two used to
+    /// carry the table list twice, which is how a table added to one site and
+    /// not the other would emit a binding one way and refuse it the other.
+    /// `Ok(None)` means no table answered and the caller refuses by name.
+    fn lowered_host_binding(
+        &mut self,
+        target: Id,
+        name: &str,
+        binding: Option<&ExternBinding<'src>>,
+        argument_ids: &[Id],
+        depth: usize,
+        span: Span,
+    ) -> Result<Option<String>, Error> {
+        // J6: the concurrency helpers have native bodies in
+        // `vilan_rt::executor`.
+        if let Some(rendered) =
+            self.runtime_host_binding(name, binding, argument_ids, depth, span)?
+        {
+            return Ok(Some(rendered));
+        }
+        // F18: the HTTP surface has native bodies in `vilan_rt::http`.
+        if let Some(rendered) = self.http_host_binding(target, binding, argument_ids, depth)? {
+            return Ok(Some(rendered));
+        }
+        // F18 slice 2: `std::json`'s host seams in `vilan_rt::json`, and
+        // `std::number`/`std::string`'s in the runtime's scalar half.
+        if let Some(rendered) = self.json_host_binding(name, binding, argument_ids, depth)? {
+            return Ok(Some(rendered));
+        }
+        if let Some(rendered) =
+            self.scalar_host_binding(target, name, binding, argument_ids, depth, span)?
+        {
+            return Ok(Some(rendered));
+        }
+        if let Some(rendered) =
+            self.math_host_binding(target, binding, argument_ids, depth, span)?
+        {
+            return Ok(Some(rendered));
+        }
+        if let Some(rendered) = self.host_module_binding(name, binding, argument_ids, depth)? {
+            return Ok(Some(rendered));
+        }
+        if let Some(rendered) = self.db_host_binding(name, binding, argument_ids, depth)? {
+            return Ok(Some(rendered));
+        }
+        self.crypto_host_binding(target, name, binding, argument_ids, depth)
+    }
+
+    /// F40 (RULED (a)): the bindings `vilan-rt-crypto` answers — OS
+    /// randomness, the SHA-512 family, HMAC and PBKDF2 — each of which RECORDS
+    /// the reach, so the generated manifest names the crate.
+    ///
+    /// Two surfaces. std's helpers are keyed on the host symbol alone, since
+    /// each is a `__`-prefixed name only `std::crypto` declares (as
+    /// [`Emitter::host_module_binding`]'s `__sha256` is). node:crypto's
+    /// `pbkdf2Sync` is keyed on the MODULE and symbol and NOT on the vilan
+    /// name, because a program binds it ITSELF — kolt's `store.vl` declares
+    /// `pbkdf2_sync` beside an `external struct HashBuffer` of its own naming —
+    /// and a program's name for it is its own business. The `Buffer` that
+    /// answers is recognized the same way: by the binding that PRODUCES the
+    /// struct, never by what the program called it
+    /// ([`Emitter::node_buffer_struct`]).
+    ///
+    /// Numeric arguments are widened to `i64` at the call, so the runtime's
+    /// signatures do not depend on the width a declaration happened to choose
+    /// (std says `i32` today; a program may say `u53`).
+    fn crypto_host_binding(
+        &mut self,
+        target: Id,
+        name: &str,
+        binding: Option<&ExternBinding<'src>>,
+        argument_ids: &[Id],
+        depth: usize,
+    ) -> Result<Option<String>, Error> {
+        let Some(binding) = binding else {
+            return Ok(None);
+        };
+        let rendered = match binding {
+            ExternBinding::Function {
+                module: None,
+                symbol,
+            } => match *symbol {
+                "__random_bytes" => format!(
+                    "vilan_rt_crypto::random_bytes(({}) as i64)",
+                    self.value_argument(argument_ids, 0, depth)?
+                ),
+                "crypto.randomUUID" => "vilan_rt_crypto::random_uuid()".to_string(),
+                "__sha384" => format!(
+                    "vilan_rt_crypto::sha384_bytes({})",
+                    self.value_argument(argument_ids, 0, depth)?
+                ),
+                "__sha512" => format!(
+                    "vilan_rt_crypto::sha512_bytes({})",
+                    self.value_argument(argument_ids, 0, depth)?
+                ),
+                "__hmac_sha512" => format!(
+                    "vilan_rt_crypto::hmac_sha512_bytes({}, {})",
+                    self.value_argument(argument_ids, 0, depth)?,
+                    self.value_argument(argument_ids, 1, depth)?
+                ),
+                "__pbkdf2_sha512" => format!(
+                    "vilan_rt_crypto::pbkdf2_sha512_bytes({}, {}, ({}) as i64, ({}) as i64)",
+                    self.value_argument(argument_ids, 0, depth)?,
+                    self.value_argument(argument_ids, 1, depth)?,
+                    self.value_argument(argument_ids, 2, depth)?,
+                    self.value_argument(argument_ids, 3, depth)?
+                ),
+                _ => return Ok(None),
+            },
+            ExternBinding::Function {
+                module: Some("node:crypto"),
+                symbol: "pbkdf2Sync",
+            } => format!(
+                "vilan_rt_crypto::pbkdf2_sync(&{}, &{}, ({}) as i64, ({}) as i64, &{})",
+                self.value_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?,
+                self.value_argument(argument_ids, 3, depth)?,
+                self.value_argument(argument_ids, 4, depth)?
+            ),
+            // `buffer.toString(encoding)` on the `Buffer` `pbkdf2Sync`
+            // answered. A plain `Uint8Array`'s `toString` is a different
+            // function (it joins the elements with commas and ignores its
+            // argument), which is why the receiver has to be a Buffer and not
+            // any bytes.
+            ExternBinding::Method { symbol }
+                if symbol.unwrap_or(name) == "toString"
+                    && argument_ids.len() == 2
+                    && self
+                        .host_receiver_struct(target)
+                        .is_some_and(|receiver| self.node_buffer_struct(receiver)) =>
+            {
+                format!(
+                    "({}).to_string_encoded(&{})",
+                    self.place_argument(argument_ids, 0, depth)?,
+                    self.value_argument(argument_ids, 1, depth)?
+                )
+            }
+            _ => return Ok(None),
+        };
+        self.reaches_crypto = true;
+        Ok(Some(rendered))
+    }
+
+    /// The struct an external member's `self` parameter is declared at — the
+    /// id, where [`Emitter::host_receiver_type`] answers std's name for it.
+    fn host_receiver_struct(&self, target: Id) -> Option<Id> {
+        let external = self.program.external_functions.get(&target)?;
+        let first = external.parameters.first()?;
+        let parameter = self.program.parameters.get(first)?;
+        match self.resolve(parameter.type_id)? {
+            Type::Struct(id, _) => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// Whether an `external struct` is node's `Buffer` — decided by the
+    /// binding that PRODUCES it: the declared return type of a
+    /// `[extern("node:crypto", "pbkdf2Sync")]`.
+    ///
+    /// A program names the host class whatever it likes (kolt says
+    /// `HashBuffer`), so the name is no evidence and is never read; what the
+    /// program cannot choose is what node hands back from that call. Only
+    /// `external` declarations qualify — a vilan struct is never a host class,
+    /// which is the rule [`Emitter::nominal_struct`]'s name table keeps too.
+    fn node_buffer_struct(&self, struct_id: Id) -> bool {
+        if !self
+            .program
+            .structs
+            .get(&struct_id)
+            .is_some_and(|declaration| declaration.external)
+        {
+            return false;
+        }
+        self.program.external_functions.values().any(|external| {
+            matches!(
+                external.extern_binding,
+                Some(ExternBinding::Function {
+                    module: Some("node:crypto"),
+                    symbol: "pbkdf2Sync",
+                })
+            ) && matches!(
+                self.resolve(external.return_type_id),
+                Some(Type::Struct(id, _)) if *id == struct_id
+            )
+        })
+    }
+
     /// The plain `node:fs/promises` set and `std::crypto`'s digest (F18
     /// slice 2).
     ///
@@ -7318,35 +7555,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let Some(external) = self.program.external_functions.get(&target) {
             let name = external.name;
             let binding = external.extern_binding.clone();
-            // J6: the concurrency helpers have native bodies in
-            // `vilan_rt::executor`. Everything else is still a host binding
-            // this backend has nothing to put behind it.
-            if let Some(rendered) = self.runtime_host_binding(
-                name,
-                binding.as_ref(),
-                &function_call.argument_ids,
-                depth,
-                span,
-            )? {
-                return Ok(rendered);
-            }
-            // F18: and the HTTP surface has native bodies in `vilan_rt::http`.
-            if let Some(rendered) = self.http_host_binding(
-                target,
-                binding.as_ref(),
-                &function_call.argument_ids,
-                depth,
-            )? {
-                return Ok(rendered);
-            }
-            // F18 slice 2: and `std::json`'s host seams in `vilan_rt::json`,
-            // and `std::number`/`std::string`'s in the runtime's scalar half.
-            if let Some(rendered) =
-                self.json_host_binding(name, binding.as_ref(), &function_call.argument_ids, depth)?
-            {
-                return Ok(rendered);
-            }
-            if let Some(rendered) = self.scalar_host_binding(
+            if let Some(rendered) = self.lowered_host_binding(
                 target,
                 name,
                 binding.as_ref(),
@@ -7354,28 +7563,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 depth,
                 span,
             )? {
-                return Ok(rendered);
-            }
-            if let Some(rendered) = self.math_host_binding(
-                target,
-                binding.as_ref(),
-                &function_call.argument_ids,
-                depth,
-                span,
-            )? {
-                return Ok(rendered);
-            }
-            if let Some(rendered) = self.host_module_binding(
-                name,
-                binding.as_ref(),
-                &function_call.argument_ids,
-                depth,
-            )? {
-                return Ok(rendered);
-            }
-            if let Some(rendered) =
-                self.db_host_binding(name, binding.as_ref(), &function_call.argument_ids, depth)?
-            {
                 return Ok(rendered);
             }
             let what = format!(
@@ -8568,22 +8755,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 };
                 let name = external.name;
                 let binding = external.extern_binding.clone();
-                if let Some(rendered) =
-                    self.runtime_host_binding(name, binding.as_ref(), argument_ids, depth, span)?
-                {
-                    return Ok(rendered);
-                }
-                if let Some(rendered) =
-                    self.http_host_binding(member_id, binding.as_ref(), argument_ids, depth)?
-                {
-                    return Ok(rendered);
-                }
-                if let Some(rendered) =
-                    self.json_host_binding(name, binding.as_ref(), argument_ids, depth)?
-                {
-                    return Ok(rendered);
-                }
-                if let Some(rendered) = self.scalar_host_binding(
+                if let Some(rendered) = self.lowered_host_binding(
                     member_id,
                     name,
                     binding.as_ref(),
@@ -8591,21 +8763,6 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     depth,
                     span,
                 )? {
-                    return Ok(rendered);
-                }
-                if let Some(rendered) =
-                    self.math_host_binding(member_id, binding.as_ref(), argument_ids, depth, span)?
-                {
-                    return Ok(rendered);
-                }
-                if let Some(rendered) =
-                    self.host_module_binding(name, binding.as_ref(), argument_ids, depth)?
-                {
-                    return Ok(rendered);
-                }
-                if let Some(rendered) =
-                    self.db_host_binding(name, binding.as_ref(), argument_ids, depth)?
-                {
                     return Ok(rendered);
                 }
                 let what = format!(
@@ -9206,6 +9363,7 @@ fn host_handle_name(rendered: &str) -> Option<&'static str> {
         ("vilan_rt::bytes::Bytes", "Bytes"),
         ("vilan_rt::crypto::NodeHash", "NodeHash"),
         ("vilan_rt::fs::RawStat", "RawStat"),
+        ("vilan_rt_crypto::NodeBuffer", "Buffer"),
     ];
     HANDLES
         .iter()
@@ -9360,24 +9518,34 @@ fn form_name(expr: &Expr<'_>) -> &'static str {
 
 /// The `Cargo.toml` of the project the backend writes, pointing at the runtime
 /// crate by path. `edition 2024` matches the workspace's own.
-pub fn cargo_manifest(name: &str, runtime_path: &str, reaches_sqlite: bool) -> String {
-    // F18 slice 2, Order 39's R1: `vilan-rt-sqlite` is named only when the
-    // program reached `std::db`. A program that did not pays neither the
-    // lockfile entry nor the C compile of SQLite's amalgamation, which is the
-    // whole reason the surface is a crate apart from the dependency-free
-    // runtime. The path is a SIBLING of the runtime's, because that is how the
-    // two sit in the repository and in the materialized cache alike.
-    let sqlite = if reaches_sqlite {
+pub fn cargo_manifest(name: &str, runtime_path: &str, optional: OptionalCrates) -> String {
+    // F18 slice 2 (Order 39's R1) and F40: an optional runtime crate is named
+    // only when the program reached it. A program that did not pays neither
+    // the lockfile entry nor the build — for SQLite that is the C compile of
+    // its amalgamation, for crypto the `getrandom` crate. Each path is a
+    // SIBLING of the runtime's, because that is how they sit in the repository
+    // and in the materialized cache alike.
+    let mut dependencies = String::new();
+    for crate_name in optional.names() {
         let beside = std::path::Path::new(runtime_path)
             .parent()
-            .map(|parent| parent.join("vilan-rt-sqlite"))
-            .unwrap_or_else(|| std::path::PathBuf::from("vilan-rt-sqlite"));
-        format!(
-            "vilan-rt-sqlite = {{ path = {:?} }}\n",
+            .map(|parent| parent.join(crate_name))
+            .unwrap_or_else(|| std::path::PathBuf::from(crate_name));
+        dependencies.push_str(&format!(
+            "{crate_name} = {{ path = {:?} }}\n",
             beside.to_string_lossy()
-        )
+        ));
+    }
+    // F40: a native build is DEBUG by default (Order 37's R8), and PBKDF2's
+    // cost is its iteration count by design — kolt's 100,000 rounds of
+    // HMAC-SHA-512 is 200,000 block compressions per password, which
+    // unoptimized arithmetic turns from milliseconds into most of a second.
+    // The crypto crate alone is optimized in the dev profile; the program's own
+    // code keeps the fast-to-build profile the developer asked for.
+    let crypto_profile = if optional.crypto {
+        "\n[profile.dev.package.vilan-rt-crypto]\nopt-level = 3\n"
     } else {
-        String::new()
+        ""
     };
     format!(
         "[package]\n\
@@ -9391,10 +9559,11 @@ pub fn cargo_manifest(name: &str, runtime_path: &str, reaches_sqlite: bool) -> S
          \n\
          [dependencies]\n\
          vilan-rt = {{ path = {runtime_path:?} }}\n\
-         {sqlite}\
+         {dependencies}\
          \n\
          [profile.release]\n\
          panic = \"unwind\"\n\
+         {crypto_profile}\
          \n\
          [workspace]\n"
     )

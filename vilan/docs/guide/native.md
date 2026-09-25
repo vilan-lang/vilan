@@ -26,8 +26,15 @@ What the backend reaches today:
 - `async`, `await`, `Task` and `Nursery`, on a single-threaded executor of the
   runtime's own
 - `std::json`, `std::db` (SQLite, through a separate runtime crate that a
-  program links only when it reaches `std::db`), `std::bytes`, `std::crypto`'s
-  SHA-256, `std::time`'s clock, and the plain `std::fs` reads and writes
+  program links only when it reaches `std::db`), `std::bytes`, `std::time`'s
+  clock, and the plain `std::fs` reads and writes
+- `std::crypto`: SHA-256, SHA-384 and SHA-512, HMAC-SHA-512, PBKDF2,
+  `random_bytes` and `random_uuid` from the operating system's random source —
+  and node:crypto's `pbkdf2Sync` when a program binds it itself, with the
+  `Buffer` it answers read back through `toString("hex")`. Everything past
+  SHA-256 lives in a second runtime crate a program links only when it reaches
+  one of them, since OS randomness is the one thing here that needs a
+  dependency
 - **servers**: `std::http` — `Server::builder()` with `serve_build`,
   `cache_build` and its conditional GET, `on_request`, `on_start` — and
   `std::rpc_server`: a `[service]` mounted with `Service::new` or
@@ -38,8 +45,8 @@ What the backend reaches today:
 What it does **not** reach yet — each refused by name, with the construct in the
 message, rather than silently mis-compiled: the browser platform (`std::dom`,
 `std::ui`, `std::web`, `std::router`), `resource` types (deterministic
-teardown natively is its own slice), a handful of host bindings (SHA-512 and
-PBKDF2, `random_bytes`, the `fs` calls that take an options object), and
+teardown natively is its own slice), a handful of host bindings (the `fs`
+calls that take an options object), and
 `--watch` (a native round is a full `cargo build`; the dev loop's hot-swap
 belongs to the JS backend).
 
@@ -67,6 +74,11 @@ generated project yourself:
 ```sh
 cargo build --release --manifest-path dist/native/hello/Cargo.toml
 ```
+
+One exception is made for you: a program that reaches PBKDF2 gets the crypto
+runtime crate optimised even in debug, because a password hash's cost is its
+iteration count by design — 100,000 rounds of HMAC-SHA-512 takes seconds
+unoptimised and a tenth of one optimised. Your own code keeps the debug build.
 
 ## Numbers
 

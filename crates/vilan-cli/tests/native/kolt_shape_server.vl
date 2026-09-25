@@ -4,10 +4,14 @@
 // handshake gate, the build served from its own description, and the
 // generated shell for every other path. Kolt's own files are never copied
 // into this tree.
+//
+// F40: the password path is kolt's REAL one now — PBKDF2-HMAC-SHA-512 through
+// a node:crypto `pbkdf2Sync` the program binds itself, read back through the
+// `Buffer`'s `toString("hex")` under a host-struct name of the program's own,
+// with the salt and the session token drawn from `std::crypto::random_bytes`.
 import std::asset;
 import std::build::require_build;
-import std::bytes::encode_utf8;
-import std::crypto::sha256;
+import std::crypto::random_bytes;
 import std::db::Database;
 import std::document::Document;
 import std::http::{ CachePolicy, Request, Response, Server };
@@ -47,36 +51,58 @@ let messages: SignalCell<Map<str, Message>> = Signal::new(Map::new());
 
 fun open_store(): Database {
 	let database = Database::open(":memory:");
-	database.exec("CREATE TABLE account (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password_hash TEXT)");
+	database.exec("CREATE TABLE account (id INTEGER PRIMARY KEY, username TEXT UNIQUE, salt TEXT, password_hash TEXT)");
 	database.exec("CREATE TABLE session (token TEXT PRIMARY KEY, username TEXT)");
 	database
 }
 
-async fun digest(text: str): str {
-	sha256(encode_utf8(text)).to_hex()
+external struct HashBuffer;
+
+impl HashBuffer {
+	[extern(method, "toString")]
+	external fun to_string_encoded(self, encoding: str): str;
+}
+
+[extern("node:crypto", "pbkdf2Sync")]
+external fun pbkdf2_sync(
+	password: str,
+	salt: str,
+	iterations: i32,
+	key_length: i32,
+	digest: str,
+): HashBuffer;
+
+fun hash_password(password: str, salt: str): str {
+	pbkdf2_sync(password, salt, 100000, 64, "sha512").to_string_encoded("hex")
+}
+
+fun fresh_token(): str {
+	random_bytes(32).to_hex()
 }
 
 mod KoltAuth {
-	export async fun register(username: str, password: str): AuthOutcome {
+	export fun register(username: str, password: str): AuthOutcome {
 		if username.len() < 2 || password.len() < 8 {
 			ret AuthOutcome { ok = false, token = "", message = "username or password too short" };
 		}
 		match db.prepare("SELECT id FROM account WHERE username = ?").first([username]) {
 			Some(let _row) => AuthOutcome { ok = false, token = "", message = "username taken" },
 			None => {
-				let hashed = digest(username + ":" + password);
+				let salt = fresh_token();
 				db
-					.prepare("INSERT INTO account (username, password_hash) VALUES (?, ?)")
-					.run([username, hashed]);
+					.prepare("INSERT INTO account (username, salt, password_hash) VALUES (?, ?, ?)")
+					.run([username, salt, hash_password(password, salt)]);
 				open_session(username)
 			},
 		}
 	}
 
-	export async fun login(username: str, password: str): AuthOutcome {
-		match db.prepare("SELECT password_hash FROM account WHERE username = ?").first([username]) {
+	export fun login(username: str, password: str): AuthOutcome {
+		match db
+			.prepare("SELECT salt, password_hash FROM account WHERE username = ?")
+			.first([username]) {
 			Some(let row) => {
-				if row.text("password_hash") == digest(username + ":" + password) {
+				if row.text("password_hash") == hash_password(password, row.text("salt")) {
 					open_session(username)
 				} else {
 					AuthOutcome { ok = false, token = "", message = "wrong password" }
@@ -87,8 +113,8 @@ mod KoltAuth {
 	}
 }
 
-async fun open_session(username: str): AuthOutcome {
-	let token = digest(username + ":session").substring(0, 16);
+fun open_session(username: str): AuthOutcome {
+	let token = fresh_token();
 	db
 		.prepare("INSERT OR REPLACE INTO session (token, username) VALUES (?, ?)")
 		.run([token, username]);
