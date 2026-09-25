@@ -153,6 +153,9 @@ const DEFAULT_SUITE: &[&str] = &[
     // walk whose `edited[next_random(size)] = next_random(100)` is the
     // assignment-order pin's corpus witness.
     "list-cell.vl",
+    // F36: `i"{one.get()}"` — a generic call's result, interpolated, judged at
+    // the type the call binds its parameter to.
+    "reactive-selector.vl",
 ];
 
 /// Corpus programs that are OUTSIDE this differential by construction, named
@@ -2966,6 +2969,153 @@ const LOANS_PROBE: &str = concat!(
     "\tprint(i\"{doubled[0]} {doubled[1]} {doubled[2]} {named(21)}\");\n",
     "}\n",
 );
+
+/// **F36 (a)**: interpolating a GENERIC call's result. The call's recorded type
+/// is the callee's own parameter (`Source<T>::get`'s `T`), which is neither a
+/// scalar nor a `str` until the call's substitution binds it — so every
+/// `i"{source.get()}"` was refused as "a value with its own `render`". The
+/// operand is now judged at the type THIS call binds (`i32`, `str`, `bool`),
+/// through the substitution the call itself is emitted under.
+///
+/// Written over `Source` BOUNDS, not `SignalCell` return types, so reactive-42's
+/// combinator flip (`map` answering a node) keeps it green: `show` and `shout`
+/// take any `S: Source<..>`, and the derived value is only ever handed to one.
+#[test]
+fn a_generic_calls_result_interpolates_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_interpolate.vl"),
+        INTERPOLATE_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_interpolate.vl"),
+        Verdict::Identical,
+        "an interpolated generic call must print the same bytes on both backends"
+    );
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "native_probe_interpolate.vl"])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "count 1\ndoubled 10\nname ada <ada> true 6\n"
+    );
+}
+
+const INTERPOLATE_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ SignalCell, Source };\n",
+    "\n",
+    "fun show<S: Source<i32>>(label: str, source: S) {\n",
+    "\tprint(i\"{label} {source.get()}\");\n",
+    "}\n",
+    "\n",
+    "fun shout<S: Source<str>>(source: S): str {\n",
+    "\ti\"<{source.get()}>\"\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet count = SignalCell::new(1);\n",
+    "\tshow(\"count\", count);\n",
+    "\tlet doubled = count.map(|n| n * 2);\n",
+    "\tcount.set(5);\n",
+    "\tshow(\"doubled\", doubled);\n",
+    "\tlet name = SignalCell::new(\"ada\");\n",
+    "\tlet flag = SignalCell::new(true);\n",
+    "\tprint(i\"name {name.get()} {shout(name)} {flag.get()} {count.get() + 1}\");\n",
+    "}\n",
+);
+
+/// **F36 (b), premise CORRECTED**: `encode_json` over a `List<i32>` — the item
+/// recorded rustc's E0596 (a `&mut` through an immutable binding), and on this
+/// base every shape re-measured builds and prints node's bytes: a local, a
+/// `mut` local, a parameter, a field through `self`, a call's result, a
+/// closure's parameter, a literal, a `List<usize>`, a cell's value, a nested
+/// list, and a `[derive(Wire)]` struct holding one. The lowering that closed it
+/// is the loan REBORROW native-41 landed for `[derive(Wire)]`'s `describe`
+/// handing its serializer on; this is its regression pin, green from the
+/// first run — there was nothing left to turn red.
+#[test]
+fn encode_json_over_a_list_prints_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_encode.vl"), ENCODE_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_encode.vl"),
+        Verdict::Identical,
+        "`encode_json` over a list must print the same bytes on both backends"
+    );
+}
+
+const ENCODE_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::json::encode_json;\n",
+    "import std::reactive::{ SignalCell, Source };\n",
+    "import std::wire::Wire;\n",
+    "\n",
+    "[derive(Wire)]\n",
+    "struct Bag {\n",
+    "\tvalues: List<i32>,\n",
+    "\tname: str,\n",
+    "}\n",
+    "\n",
+    "impl Bag {\n",
+    "\tfun text(self): str {\n",
+    "\t\tencode_json(self.values)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun make(): List<i32> {\n",
+    "\t[4, 5]\n",
+    "}\n",
+    "\n",
+    "fun show(values: List<i32>): str {\n",
+    "\tencode_json(values)\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet values: List<i32> = [1, 2, 3];\n",
+    "\tprint(encode_json(values));\n",
+    "\tmut grown: List<i32> = [1];\n",
+    "\tgrown.push(2);\n",
+    "\tprint(encode_json(grown));\n",
+    "\tprint(show(values));\n",
+    "\tlet bag = Bag { values, name = \"h\" };\n",
+    "\tprint(bag.text());\n",
+    "\tprint(encode_json(bag));\n",
+    "\tprint(encode_json(make()));\n",
+    "\tlet render = |list: List<i32>| encode_json(list);\n",
+    "\tprint(render([9]));\n",
+    "\tprint(encode_json([1, 2, 3]));\n",
+    "\tlet sizes: List<usize> = [1, 2];\n",
+    "\tprint(encode_json(sizes));\n",
+    "\tlet cell = SignalCell::new([6, 7]);\n",
+    "\tprint(encode_json(cell.get()));\n",
+    "\tlet nested: List<List<i32>> = [[1], [2, 3]];\n",
+    "\tprint(encode_json(nested));\n",
+    "}\n",
+);
+
+/// F36's boundary, named: `blanket-impl.vl` got past the interpolation and met
+/// a call that threads FEWER context arguments than its callee's instance
+/// declares (`badge("static")` from `main`, whose instance takes the ambient
+/// `Owner` because one impl of the trait member it dispatches through reaches
+/// it; JavaScript passes `undefined`). rustc refused that as E0061 — a BROKEN
+/// verdict — so it is refused by name instead, which is what the whole-set
+/// sweep's zero-broken gate needs. The context pass is the analyzer's, and the
+/// fix that makes the call emittable is there.
+#[test]
+fn a_call_missing_a_context_argument_is_refused_by_name() {
+    let staged = stage();
+    match compare(&staged, "blanket-impl.vl") {
+        Verdict::Refused(reason) => assert!(
+            reason.contains("a call to `badge` that threads fewer context arguments"),
+            "{reason}"
+        ),
+        other => panic!("expected a refusal by name, got {other:?}"),
+    }
+}
 
 /// **F18 slice 2**: a closure declared SYNCHRONOUS, answering nothing, whose
 /// body awaits.

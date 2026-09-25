@@ -4680,7 +4680,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return self.emit_dispatch(dispatch, &[id], depth, span);
         }
         let text = self.expression(id, depth)?;
-        if self.is_str_expr(id) {
+        // F36: a generic call's result is judged at the type THIS call binds
+        // its parameter to — `i"{cell.get()}"` over a `SignalCell<i32>` is an
+        // `i32` here, where the record says `T` and the operand was refused.
+        let settled = self.settled_value_type(id);
+        if self.is_str_expr(id) || settled.is_some_and(|type_id| self.is_str_type(type_id)) {
             return Ok(text);
         }
         // A scalar renders as its `console.log` form, which is the same string
@@ -4689,7 +4693,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // trait default whose callee the specialization picks, and whose real
         // type is the `str` the analyzer already checked. `js_of` of a `str` is
         // that `str`, so the two cases share an answer.
-        if self.is_scalar_expr(id) || self.type_of(id).is_none() {
+        if self.is_scalar_expr(id)
+            || settled.is_some_and(|type_id| self.is_scalar_type(type_id))
+            || self.type_of(id).is_none()
+        {
             return Ok(format!("vilan_rt::js_of(&({text}))"));
         }
         Err(unsupported(
@@ -4772,31 +4779,65 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// `render` and whose `console.log` rendering are the same string.
     fn is_scalar_expr(&self, id: Id) -> bool {
         self.type_of(id)
-            .and_then(|type_id| self.resolve(type_id))
-            .and_then(|resolved| match resolved {
-                Type::Struct(struct_id, _) => self.program.structs.get(struct_id),
-                _ => None,
-            })
-            .is_some_and(|declaration| {
-                scalar_type(declaration.name).is_some() && declaration.name != "str"
-            })
-            || self
-                .type_of(id)
-                .and_then(|type_id| self.resolve(type_id))
-                .is_some_and(|resolved| {
-                    matches!(resolved, Type::Enum(enum_id, _)
-                    if self.program.bool_enum_id == Some(*enum_id))
-                })
+            .is_some_and(|type_id| self.is_scalar_type(type_id))
+    }
+
+    /// [`Self::is_scalar_expr`] for a type in hand.
+    fn is_scalar_type(&self, type_id: TypeId) -> bool {
+        match self.resolve(type_id) {
+            Some(Type::Struct(struct_id, _)) => {
+                self.program
+                    .structs
+                    .get(struct_id)
+                    .is_some_and(|declaration| {
+                        scalar_type(declaration.name).is_some() && declaration.name != "str"
+                    })
+            }
+            Some(Type::Enum(enum_id, _)) => self.program.bool_enum_id == Some(*enum_id),
+            _ => false,
+        }
     }
 
     fn is_str(&self, id: Id) -> bool {
         self.type_of(id)
-            .and_then(|type_id| self.resolve(type_id))
-            .and_then(|resolved| match resolved {
-                Type::Struct(struct_id, _) => self.program.structs.get(struct_id),
-                _ => None,
-            })
-            .is_some_and(|declaration| declaration.name == "str")
+            .is_some_and(|type_id| self.is_str_type(type_id))
+    }
+
+    /// [`Self::is_str`] for a type in hand.
+    fn is_str_type(&self, type_id: TypeId) -> bool {
+        matches!(
+            self.resolve(type_id),
+            Some(Type::Struct(struct_id, _))
+                if self.program.structs.get(struct_id).is_some_and(|declaration| declaration.name == "str")
+        )
+    }
+
+    /// The type an operand's VALUE has at this site (F36): its recorded type,
+    /// except where that record is still the CALLEE's own generic parameter —
+    /// `cell.get()` records `SignalCell<T>::get`'s `T` — in which case it is
+    /// that parameter as this call binds it, through the same substitution the
+    /// call itself is emitted under ([`Self::call_substitution`]).
+    fn settled_value_type(&mut self, id: Id) -> Option<TypeId> {
+        let recorded = self.type_of(id)?;
+        if !matches!(self.resolve(recorded), Some(Type::Generic(_))) {
+            return Some(recorded);
+        }
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&id).cloned() else {
+            return Some(recorded);
+        };
+        let Some(call) = self.program.function_calls.get(&call_id) else {
+            return Some(recorded);
+        };
+        let generic_arguments = call.generic_argument_ids.clone();
+        let Some(Expr::Local(target)) = self.program.entity_map.get(&call.subject_id).cloned()
+        else {
+            return Some(recorded);
+        };
+        let substitution = self.call_substitution(call_id, target, &generic_arguments);
+        let saved = self.enter_substitution(substitution.into_iter().collect());
+        let settled = self.concrete(recorded);
+        self.current_substitution = saved;
+        Some(settled)
     }
 
     fn if_branch(&mut self, branch: &ExprIfBranch, depth: usize) -> Result<String, Error> {
@@ -7753,6 +7794,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let name = self
             .ensure_function_with_bits(target, &substitution, &bits)?
             .name;
+        self.refuse_unthreaded_context(target, &function_call.argument_ids, span)?;
         let mut prelude = String::new();
         self.argument_substitution = Some(substitution.clone());
         let arguments = self.call_arguments_adapting(
@@ -7994,6 +8036,49 @@ impl<'a, 'src> Emitter<'a, 'src> {
             rendered.push(text);
         }
         Ok(rendered)
+    }
+
+    /// The other direction of [`Self::call_arguments_adapting`]'s surplus rule:
+    /// a call that threads FEWER context arguments than the callee's instance
+    /// declares.
+    ///
+    /// The context pass can mint a hidden parameter on an instance whose
+    /// caller it threads nothing from — `blanket-impl.vl`'s `main` calls
+    /// `badge("static")`, whose instance declares the ambient `Owner` because
+    /// ONE impl of the trait member it dispatches through reaches it — and
+    /// JavaScript fills the gap with `undefined`, which that path never reads.
+    /// A Rust call cannot omit an argument, and there is no `Owner` to invent,
+    /// so the shape is refused by name rather than answered with a value the
+    /// program never had. (The context pass is the analyzer's; the fix that
+    /// makes this call emittable belongs there — F36's report.)
+    fn refuse_unthreaded_context(
+        &self,
+        target: Id,
+        argument_ids: &[Id],
+        span: Span,
+    ) -> Result<(), Error> {
+        let Some(function) = self.program.functions.get(&target) else {
+            return Ok(());
+        };
+        let unthreaded = argument_ids.len() < function.parameters.len()
+            && function.parameters[argument_ids.len()..]
+                .iter()
+                .any(|parameter| {
+                    self.program
+                        .context_hidden_parameters
+                        .contains_key(parameter)
+                });
+        if unthreaded {
+            return Err(unsupported(
+                &format!(
+                    "a call to `{}` that threads fewer context arguments than its instance \
+                     declares (the JS backend passes `undefined` for the missing one)",
+                    function.name
+                ),
+                span,
+            ));
+        }
+        Ok(())
     }
 
     /// A rendered call, wrapped in the block its argument prelude needs (F30).
@@ -8905,6 +8990,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let mut prelude = String::new();
                 let arguments = match target {
                     Some(target) => {
+                        self.refuse_unthreaded_context(target, argument_ids, span)?;
                         self.call_arguments(target, argument_ids, depth, &mut prelude)?
                     }
                     None => self.value_arguments(argument_ids, depth)?,
