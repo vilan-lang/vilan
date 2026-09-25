@@ -2182,10 +2182,7 @@ export impl type S: Source<type T> {
 	}
 
 	[internal("A124 S2b: the cold `switch`, std-internal until the flip (S2c) makes `switch` return it")]
-	fun switch_node<U, I: Source<U>>(
-		self,
-		select: sync |T| I,
-	): Switch<S, T, I, U> {
+	fun switch_node<U, I: Source<U>>(self, select: sync |T| I): Switch<S, T, I, U> {
 		Switch<S, T, I, U> { up = self, select }
 	}
 
@@ -2221,9 +2218,7 @@ export impl type S: Source<type T: PartialEq> {
 /// The n-ary cold `combine`, over inputs already erased to `dyn Source` (see
 /// `Combine` for why they must arrive erased). `[internal]` until the flip.
 export [internal("A124 S2b: the cold `combine`, std-internal until the flip (S2c) makes `combine` return it")]
-fun combine_node<T: (2..)>(
-	sources: (U in T: dyn Source<U>),
-): Combine<T> {
+fun combine_node<T: (2..)>(sources: (U in T: dyn Source<U>)): Combine<T> {
 	Combine<T> { sources }
 }
 
