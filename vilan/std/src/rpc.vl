@@ -4157,11 +4157,18 @@ export impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
 	}
 
 	/// The element held under `key` and where it sits, if the cell holds one — a
-	/// lookup, not a scan. What a per-key forward seeds from.
+	/// lookup, not a scan. What a per-key forward seeds from, and what it answers a
+	/// `Reset` with.
+	///
+	/// The element is read IN PLACE (M87): `elements.get()` hands back the whole
+	/// run as a VALUE — a deep copy of N elements to read one, 2.9 M Ir per locate
+	/// into 1,000 keys — where `.get(at)` on the cell's own storage copies the one
+	/// element it names. `SignalCell::get` IS that storage's read (`value.read()`),
+	/// so nothing about what is read, or when, changes.
 	fun locate(self, key: K): Option<(i32, T)> {
 		match self.positions.read().get(key.hash()) {
 			None => None,
-			Some(let at) => match self.elements.get().get(at) {
+			Some(let at) => match self.elements.value.read().get(at) {
 				None => None,
 				Some(let element) => Some((at, element)),
 			},

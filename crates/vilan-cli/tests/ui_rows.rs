@@ -5366,3 +5366,94 @@ fn m86_a_list_cell_write_copies_no_whole_list() {
         "M86: a `ListCell` write must copy no whole list; got:\n{stdout}"
     );
 }
+
+// --- M87: `KeyedCell::locate` copies no whole list -----------------------------
+
+/// A 1,000-key `KeyedCell`, located into: a key at the front, one in the middle,
+/// one past the end, and again after a removal and an insert have moved the index.
+/// After each, how many WHOLE-LIST copies the read made (M86's counter).
+const M87_LOCATE: &str = r#"import std::io::print;
+import std::rpc::KeyedCell;
+import std::wire::Keyed;
+
+struct Row {
+	id: i32,
+	text: str,
+}
+
+impl Row with Keyed<i32> {
+	fun key(self): i32 {
+		self.id
+	}
+}
+
+fun located(cell: KeyedCell<i32, Row>, key: i32): str {
+	match cell.locate(key) {
+		Some(let hit) => {
+			let (at, row) = hit;
+			i"at={at} text={row.text}"
+		},
+		None => "none",
+	}
+}
+
+fun main() {
+	mut many: List<Row> = [];
+	mut index = 0;
+	for index < 1000 {
+		many.push(Row { id = index, text = i"r{index}" });
+		index += 1;
+	}
+	let cell: KeyedCell<i32, Row> = KeyedCell<i32, Row>::new(many);
+	let _built = wholes();
+	print(i"front {located(cell, 0)} wholes={wholes()}");
+	print(i"middle {located(cell, 500)} wholes={wholes()}");
+	print(i"absent {located(cell, 5000)} wholes={wholes()}");
+	cell.remove(0);
+	cell.insert(Row { id = 1000, text = "new" });
+	cell.update(500, |&mut row| {
+		row.text = "edited";
+	});
+	let _written = wholes();
+	print(i"moved {located(cell, 500)} wholes={wholes()}");
+	print(i"inserted {located(cell, 1000)} wholes={wholes()}");
+	print(i"removed {located(cell, 0)} wholes={wholes()}");
+}
+
+[extern("__wholes")]
+external fun wholes(): i32;
+
+main();
+"#;
+
+/// M87: `KeyedCell::locate` — what a per-key forward seeds from, and what it
+/// answers a `Reset` with — reads the one element it names and copies nothing
+/// else. It read `self.elements.get()`, and `SignalCell::get` hands back a VALUE,
+/// so every locate deep-copied the whole run to read one element: M86's shape on
+/// `ListCell`, in `std::rpc`. Callgrind, per `locate` into 1,000 keys under
+/// `node --jitless`: 2,881,649 Ir before (collections-42's probe,
+/// `sweeps/order42/collections-42/m87/`).
+///
+/// The answers are held with the copies: the index a removal shifted (`500` is
+/// at 499 after key 0 leaves), an element an `update` wrote, an insert at the
+/// end, and a key that is gone.
+///
+/// Non-vacuity: on the tree before M87 every line that FINDS its key reads
+/// `wholes=1` (a miss answers from the index and never reached the copy).
+#[test]
+fn m87_keyed_cell_locate_copies_no_whole_list() {
+    let harness = format!("{DOM_STUB}{M86_HARNESS_TAIL}");
+    let stdout = build_and_run("m87_locate", M87_LOCATE, &harness);
+    assert_eq!(
+        stdout,
+        concat!(
+            "front at=0 text=r0 wholes=0\n",
+            "middle at=500 text=r500 wholes=0\n",
+            "absent none wholes=0\n",
+            "moved at=499 text=edited wholes=0\n",
+            "inserted at=999 text=new wholes=0\n",
+            "removed none wholes=0\n",
+        ),
+        "M87: `KeyedCell::locate` must read one element without copying the run; got:\n{stdout}"
+    );
+}
