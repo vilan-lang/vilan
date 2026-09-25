@@ -1143,6 +1143,10 @@ Three doors write a whole list, and they cost differently on purpose:
 | `set(values)` (the `Signal` impl) | `SeqOp::Reset` | every element, rebuilt |
 | `reconcile_to(values)` | one `Splice` over what changed | the elements that changed |
 
+`set_all` and `set` cost a list view the same: `each` and `each_by` match a
+`Splice`'s span by key exactly as they match a `Reset`, so a row whose key
+survives either one is kept, never rebuilt.
+
 `reconcile_to` is the compat door: it diffs the common prefix and the common
 suffix and records ONE `Splice` over what is between them, so an append, a
 prepend, an insertion, a removal or an edited span each cost only the elements

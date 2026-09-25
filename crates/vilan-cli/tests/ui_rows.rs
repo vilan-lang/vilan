@@ -4529,9 +4529,11 @@ fn a112_s3_a_list_cell_under_each_builds_only_the_rows_its_ops_name() {
 /// inside one `batch` (so one drain applies several ops in order), with four
 /// runs mounted on it — `each` over the cell, `each` over a `map_each` chained
 /// on it, `each_values` over the cell, and (S3b) `each_by` over the cell, whose
-/// rows show their text through their own cell. After every turn the program
-/// reads the four runs back out of the document and panics on the first one
-/// that differs from what the cell holds.
+/// rows show their text through their own cell — and (A129) two more as the
+/// CONTROL: `each` and `each_by` over a plain derivation of the cell, which
+/// keeps no log and so takes the whole-list pass every turn. After every turn the
+/// program reads the six runs back out of the document and panics on the first
+/// one that differs from what the cell holds.
 const A112_S3_WALK: &str = r#"import std::io::{ panic, print };
 import std::reactive::{ ListCell, SequenceCell, Signal, SignalCell, Source, batch, map_each };
 import std::shared::Shared;
@@ -4578,6 +4580,23 @@ fun rendered_by(cell: SignalCell<Row>): View {
 	view("li").bind_text(cell.map(|item: Row| item.text))
 }
 
+/// The CONTROL (A129): `each` and `each_by` over a plain derivation of the cell,
+/// which keeps no log, so both take the whole-list pass on every turn. Their rows
+/// are counted apart again: what the op path builds is read against them.
+let pass_renders: Shared<i32> = Shared::new(0);
+
+fun rendered_pass(item: Row): View {
+	pass_renders.write() = pass_renders.read() + 1;
+	view("li").text(item.text)
+}
+
+let pass_by_renders: Shared<i32> = Shared::new(0);
+
+fun rendered_pass_by(cell: SignalCell<Row>): View {
+	pass_by_renders.write() = pass_by_renders.read() + 1;
+	view("li").bind_text(cell.map(|item: Row| item.text))
+}
+
 fun joined(values: List<Row>, suffix: str): str {
 	mut out = "";
 	mut first = true;
@@ -4594,15 +4613,20 @@ fun joined(values: List<Row>, suffix: str): str {
 fun main() {
 	let walk: ListCell<Row> = ListCell<Row>::of([fresh(), fresh(), fresh()]);
 	let starred = map_each(walk, |item: Row| Row { id = item.id, text = item.text + "*" });
+	let passed = walk.map(|list: List<Row>| list);
 	let _root = mount_root("app", || {
 		view("div")
 			.child(view("ol").child(each(walk, |item: Row| item.id, |item: Row| rendered(item))))
 			.child(view("ol").child(each(starred, |item: Row| item.id, |item: Row| rendered(item))))
 			.child(view("ol").child(each_values(walk, |item: Row| rendered(item))))
 			.child(view("ol").child(each_by(walk, |item: Row| item.id, |cell: SignalCell<Row>| rendered_by(cell))))
+			.child(view("ol").child(each(passed, |item: Row| item.id, |item: Row| rendered_pass(item))))
+			.child(view("ol").child(each_by(passed, |item: Row| item.id, |cell: SignalCell<Row>| rendered_pass_by(cell))))
 	});
 	renders.write() = 0;
 	by_renders.write() = 0;
+	pass_renders.write() = 0;
+	pass_by_renders.write() = 0;
 	mut naive = 0;
 	mut turn = 1;
 	for turn <= 300 {
@@ -4667,14 +4691,14 @@ fun main() {
 		});
 		let held = walk.get();
 		naive += held.len() * 3;
-		let wanted = i"{joined(held, "")}|{joined(held, "*")}|{joined(held, "")}|{joined(held, "")}";
+		let wanted = i"{joined(held, "")}|{joined(held, "*")}|{joined(held, "")}|{joined(held, "")}|{joined(held, "")}|{joined(held, "")}";
 		let shown = lists();
 		if shown != wanted {
 			panic(i"turn {turn}: the document shows\n  {shown}\nwhere the cell holds\n  {wanted}");
 		}
 		turn += 1;
 	}
-	print(i"walk: turns=300 length={walk.get().len()} ids={ids.read()} renders={renders.read()} by={by_renders.read()} rerun={naive}");
+	print(i"walk: turns=300 length={walk.get().len()} ids={ids.read()} renders={renders.read()} by={by_renders.read()} rerun={naive} pass={pass_renders.read()} pass_by={pass_by_renders.read()}");
 }
 
 [extern("__lists")]
@@ -4714,15 +4738,29 @@ require("./app.js");
 /// alone red the fourth run, and only it, at the same turns — 4, 1 and
 /// 13 — the last as `each_by`'s own form of it, a same-key `SetAt`
 /// that skips the write into the row's cell.
+///
+/// A129 moved the tail: `renders` 3,306 → 2,061 and `by` 1,078 → 575, against
+/// the control's `pass_by=557` — before it, a `Splice` that removed and
+/// re-inserted the same keys (`reconcile_to`'s edit + append above all) was
+/// applied by position and rebuilt its whole span. The 18 rows `by` still
+/// builds beyond the pass are rows BUILT AND CUT INSIDE ONE DRAIN (an
+/// `insert_at(0, ..)` then `remove_at(0)` in one `edit`; a push then a `pop`):
+/// the op path applies each op as it comes, and the pass, reading only the list
+/// the drain settles on, never sees them. A `Reset` in a drain supersedes the
+/// ops before it (A129's `live_ops`), which took 9 of the 27 the span match
+/// left; the rest are no span's to recover.
 #[test]
 fn a112_s3_the_random_walk_holds_through_each() {
     let harness = format!("{DOM_STUB}{A112_S3_WALK_HARNESS_TAIL}");
     let stdout = build_and_run("a112_s3_walk", A112_S3_WALK, &harness);
     assert_eq!(
-        stdout, "walk: turns=300 length=0 ids=587 renders=3306 by=1078 rerun=12258\n",
+        stdout,
+        "walk: turns=300 length=0 ids=587 renders=2061 by=575 rerun=12258 pass=653 pass_by=557\n",
         "A112 S3's walk tail moved: the renders count is rows BUILT across \
          the three S3 runs, `by` the rows `each_by` built (S3b), the rerun \
-         the rows a pass would have looked at over the three; got:\n{stdout}"
+         the rows a pass would have looked at over the three, and `pass` / \
+         `pass_by` the rows the two control runs built on the pass (A129); \
+         got:\n{stdout}"
     );
 }
 
@@ -4967,6 +5005,218 @@ fn a112_s3b_a_list_cell_under_each_by_builds_only_the_rows_its_ops_name() {
          ops name, write only the cells they name, and still show the right \
          run; a plain `SignalCell` keeps the pass; got:\n{stdout}"
     );
+}
+
+// --- A129: a splice's span is matched by KEY -----------------------------------
+
+/// Two runs over two `ListCell`s — `each_by` in the `ul`, `each` in the `ol` —
+/// driven through the splices that REMOVE rows and put rows back in one op, each
+/// printed as `name|tree|cost`. The tree is flattened WITH identities
+/// (`li#12'a'`), so the pin reads not only what the run shows but which
+/// elements show it: a row whose key survives the splice is the SAME element
+/// afterwards.
+const A129_SPAN: &str = r#"import std::io::print;
+import std::reactive::{ ListCell, SequenceCell, Signal, SignalCell, Source, batch };
+import std::ui::{ View, each, each_by, mount_root, view };
+
+[derive(PartialEq, Hashable)]
+struct Row {
+	id: i32,
+	text: str,
+}
+
+fun row(id: i32, text: str): Row {
+	Row { id = id, text = text }
+}
+
+fun main() {
+	let by: ListCell<Row> = ListCell<Row>::of([row(1, "a"), row(2, "b"), row(3, "c")]);
+	let plain: ListCell<Row> = ListCell<Row>::of([row(1, "a"), row(2, "b"), row(3, "c")]);
+	let _root = mount_root("app", || {
+		view("div")
+			.child(view("ul").child(each_by(by, |item: Row| item.id, |cell: SignalCell<Row>| {
+				view("li").bind_text(cell.map(|item: Row| item.text))
+			})))
+			.child(view("ol").child(each(plain, |item: Row| item.id, |item: Row| view("li").text(item.text))))
+	});
+	print(i"mount|{tree()}|{cost()}");
+	by.set_all([row(1, "A"), row(2, "B"), row(3, "C")]);
+	print(i"by-set_all|{tree()}|{cost()}");
+	by.set([row(1, "a"), row(2, "b"), row(3, "c")]);
+	print(i"by-set|{tree()}|{cost()}");
+	by.reconcile_to([row(1, "a"), row(2, "b2"), row(3, "c"), row(4, "d")]);
+	print(i"by-reconcile_to|{tree()}|{cost()}");
+	by.set_all([row(3, "c"), row(1, "a"), row(2, "b2"), row(4, "d")]);
+	print(i"by-reorder|{tree()}|{cost()}");
+	by.splice(1, 2, [row(4, "x"), row(1, "a")]);
+	print(i"by-bounded|{tree()}|{cost()}");
+	batch(|| {
+		by.push(row(9, "z"));
+		by.set([row(1, "a"), row(2, "b")]);
+	});
+	print(i"by-superseded|{tree()}|{cost()}");
+	plain.set_all([row(1, "a"), row(2, "b"), row(3, "c")]);
+	print(i"set_all-equal|{tree()}|{cost()}");
+	plain.set_all([row(1, "A"), row(2, "b"), row(3, "c")]);
+	print(i"set_all-one|{tree()}|{cost()}");
+	plain.reconcile_to([row(1, "A"), row(2, "b2"), row(3, "c"), row(4, "d")]);
+	print(i"reconcile_to|{tree()}|{cost()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+[extern("__cost")]
+external fun cost(): str;
+
+main();
+"#;
+
+/// The `li`s of the first `ul` and of the first `ol` in a flattened tree, each
+/// as `(identity, text)`.
+fn a129_rows(line: &str) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    let mut by = Vec::new();
+    let mut plain = Vec::new();
+    let mut in_plain = false;
+    for token in line.split(' ') {
+        if token.starts_with("ol#") {
+            in_plain = true;
+        }
+        let Some(rest) = token.strip_prefix("li#") else {
+            continue;
+        };
+        let (identity, text) = rest.split_once('\'').unwrap_or((rest, ""));
+        let row = (
+            identity.to_string(),
+            text.trim_end_matches('\'').to_string(),
+        );
+        if in_plain {
+            plain.push(row);
+        } else {
+            by.push(row);
+        }
+    }
+    (by, plain)
+}
+
+/// A129 (RULED 2026-09-25): a `Splice` that both removes and inserts gets the
+/// pass's identity rule INSIDE its span. Before it the op path applied such a
+/// splice by POSITION — every row in the span cut and every arrival built — so
+/// `set_all` over the same three keys cost `cut=3 built=3` under `each_by`
+/// where `set` (a `Reset`, the pass) cost nothing, and `reconcile_to`'s edit +
+/// append rebuilt the tail (`cut=2 built=3`).
+///
+/// What each line holds: under `each_by` a surviving key keeps its row and its
+/// ELEMENT (the identities are compared, not only the labels) and takes the new
+/// item through its cell; a reorder inside one splice moves the one row A98's
+/// scans move; and the match is BOUNDED to the span — `by-bounded` splices
+/// `[4'x', 1'a']` over rows 1 and 2 while the row keyed 4 sits outside the span,
+/// and that row is not claimed: `x` is built fresh, `a` keeps its row, `d`
+/// stays where it was. Under `each` an equal item is a `Keep` (nothing built)
+/// and a changed one a `Refresh` of that row alone, as the pass plans it.
+///
+/// `by-superseded` is the drain rule beside it: a `Reset` says what the list
+/// BECAME, so the ops ahead of it in the same drain are dropped unapplied and a
+/// row the reset would cut is never built.
+///
+/// Non-vacuity, four plants, each red here: the op path's `Splice` arm always
+/// positional (the tree before A129 — `by-set_all` reads `cut=3 built=3`, and the
+/// walk's tail `by=1057`); the span's right boundary taken as the region's
+/// anchor instead of the marker of the first row after the span (`by-bounded`:
+/// the last span row's cut runs on through `d`, which leaves the document); the
+/// span's rows read from position 0 instead of `at` (`by-reconcile_to` reads
+/// `cut=1 built=2`, and the walk panics at turn 5); and every op of a drain
+/// applied, the `Reset` superseding nothing (`by-superseded` reads
+/// `cut=4 built=2`, the walk `by=584`).
+#[test]
+fn a129_a_splice_keeps_the_rows_whose_keys_survive_it() {
+    let harness = format!("{DOM_STUB}{A98_COST_HARNESS_TAIL}");
+    let stdout = build_and_run("a129_span", A129_SPAN, &harness);
+    let lines: Vec<(&str, &str, &str)> = stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('|');
+            Some((parts.next()?, parts.next()?, parts.next()?))
+        })
+        .collect();
+    let costs: Vec<(&str, &str)> = lines.iter().map(|(name, _, cost)| (*name, *cost)).collect();
+    assert_eq!(
+        costs,
+        vec![
+            ("mount", "cut=0 built=9"),
+            // The same three keys: every row kept, every cell written.
+            ("by-set_all", "cut=0 built=0"),
+            // The control: a `Reset` is the pass, and costs what the splice now does.
+            ("by-set", "cut=0 built=0"),
+            // One edit + an append: the edited row's cell written, one row built.
+            ("by-reconcile_to", "cut=0 built=1"),
+            // `3` to the front inside one splice: that row moves, nothing is built.
+            ("by-reorder", "cut=1 built=0"),
+            // Bounded: row 2 leaves, `x` is new, `a` is kept.
+            ("by-bounded", "cut=1 built=1"),
+            // A push and a `set` in one drain: the `Reset` supersedes the push,
+            // so `z` is never built — the pass alone builds `b` and cuts three.
+            ("by-superseded", "cut=3 built=1"),
+            ("set_all-equal", "cut=0 built=0"),
+            ("set_all-one", "cut=1 built=1"),
+            // The edited row refreshed, `c` kept, `d` built.
+            ("reconcile_to", "cut=1 built=2"),
+        ],
+        "A129: a splice over surviving keys must cost what the pass costs; got:\n{stdout}"
+    );
+    let rows: Vec<(Vec<(String, String)>, Vec<(String, String)>)> =
+        lines.iter().map(|(_, tree, _)| a129_rows(tree)).collect();
+    let texts = |run: &[(String, String)]| -> Vec<String> {
+        run.iter().map(|(_, text)| text.clone()).collect()
+    };
+    let identities = |run: &[(String, String)]| -> Vec<String> {
+        run.iter().map(|(identity, _)| identity.clone()).collect()
+    };
+    let (mount_by, mount_plain) = &rows[0];
+    assert_eq!(texts(mount_by), ["a", "b", "c"]);
+    assert_eq!(texts(mount_plain), ["a", "b", "c"]);
+    let [one, two, three] = identities(mount_by).try_into().expect("three rows");
+    let expect_by = |at: usize, wanted: &[(&String, &str)]| {
+        let seen: Vec<(String, String)> = rows[at].0.clone();
+        let wanted: Vec<(String, String)> = wanted
+            .iter()
+            .map(|(identity, text)| ((*identity).clone(), (*text).to_string()))
+            .collect();
+        assert_eq!(
+            seen, wanted,
+            "A129: `{}`'s `each_by` rows; got:\n{stdout}",
+            lines[at].0
+        );
+    };
+    expect_by(1, &[(&one, "A"), (&two, "B"), (&three, "C")]);
+    expect_by(2, &[(&one, "a"), (&two, "b"), (&three, "c")]);
+    let four = rows[3].0[3].0.clone();
+    expect_by(3, &[(&one, "a"), (&two, "b2"), (&three, "c"), (&four, "d")]);
+    expect_by(4, &[(&three, "c"), (&one, "a"), (&two, "b2"), (&four, "d")]);
+    let fresh = rows[5].0[1].0.clone();
+    assert!(
+        ![&one, &two, &three, &four].contains(&&fresh),
+        "A129: `x` must be a fresh row — the row keyed 4 lies outside the span; got:\n{stdout}"
+    );
+    expect_by(
+        5,
+        &[(&three, "c"), (&fresh, "x"), (&one, "a"), (&four, "d")],
+    );
+    // The superseded drain: the key that survives the `set` keeps its row.
+    assert_eq!(rows[6].0[0].0, one);
+    assert_eq!(texts(&rows[6].0), ["a", "b"]);
+    // `each`: an equal item keeps its element, a changed one is rebuilt.
+    let plain_before = identities(mount_plain);
+    assert_eq!(
+        rows[7].1, rows[0].1,
+        "A129: `set_all` of equal items; got:\n{stdout}"
+    );
+    assert_eq!(texts(&rows[8].1), ["A", "b", "c"]);
+    assert_ne!(rows[8].1[0].0, plain_before[0]);
+    assert_eq!(identities(&rows[8].1)[1..], plain_before[1..]);
+    assert_eq!(texts(&rows[9].1), ["A", "b2", "c", "d"]);
+    assert_eq!(rows[9].1[0], rows[8].1[0]);
+    assert_eq!(rows[9].1[2], rows[8].1[2]);
 }
 
 // --- M86: a `ListCell` write copies no whole list -----------------------------
