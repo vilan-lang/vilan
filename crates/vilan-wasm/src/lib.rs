@@ -59,6 +59,16 @@ const PROJECT_ROOT: &str = "/project";
 /// future work in the proposal's §9.
 const ENTRY_NAME: &str = "main.vl";
 
+/// The wasm build's stack — the linker's `-zstack-size`, 16 MiB, which is what
+/// `release.yml` ships the playground with (its comment has the measurement)
+/// and what `scripts/ci-local.sh wasm` builds with. Every entry the page calls
+/// DECLARES it to the analyzer's stack probe (N128), because on wasm32 a stack
+/// overflow is not even an abort: the shadow stack grows down into linear
+/// memory and a runaway walk overwrites the page's data. Declared, the probe
+/// panics first, and the page recycles the instance. The two build flags are
+/// held to this number by `the_declared_wasm_stack_is_the_one_the_builds_link`.
+pub const WASM_STACK_SIZE: usize = 16 * 1024 * 1024;
+
 /// Where one diagnostic points, in the shape the page renders.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
@@ -846,6 +856,13 @@ pub fn version() -> &'static str {
 mod bindings {
     use wasm_bindgen::prelude::*;
 
+    /// Runs one entry's work with the stack DECLARED ([`crate::WASM_STACK_SIZE`]).
+    /// Each export is called by the page from the top of the stack, so the
+    /// declaration made here is made at the thread's top, as the probe needs.
+    fn declared<T>(body: impl FnOnce() -> T) -> T {
+        vilan_core::stack_guard::with_declared_stack(crate::WASM_STACK_SIZE, body)
+    }
+
     /// One diagnostic, as the page consumes it.
     #[wasm_bindgen(getter_with_clone)]
     pub struct Diagnostic {
@@ -951,7 +968,7 @@ mod bindings {
     /// Compiles Vilan source to JavaScript for the browser.
     #[wasm_bindgen]
     pub fn compile(source: String) -> CompileResult {
-        convert(crate::compile_program(&source))
+        declared(|| convert(crate::compile_program(&source)))
     }
 
     /// Compiles for a named platform: "node" checks the process leg (the
@@ -960,7 +977,7 @@ mod bindings {
     /// toggle.
     #[wasm_bindgen]
     pub fn compile_for(source: String, platform: String) -> CompileResult {
-        convert(crate::compile_program_for(&source, platform_of(&platform)))
+        declared(|| convert(crate::compile_program_for(&source, platform_of(&platform))))
     }
 
     /// [`compile_for`] plus the ambient scope (K14): `prelude` is `undefined`
@@ -975,11 +992,13 @@ mod bindings {
         platform: String,
         prelude: Option<String>,
     ) -> CompileResult {
-        convert(crate::compile_program_with(
-            &source,
-            platform_of(&platform),
-            crate::PlaygroundPrelude::from_option(prelude.as_deref()),
-        ))
+        declared(|| {
+            convert(crate::compile_program_with(
+                &source,
+                platform_of(&platform),
+                crate::PlaygroundPrelude::from_option(prelude.as_deref()),
+            ))
+        })
     }
 
     /// The page's platform word. "node" is the server check mode; anything
@@ -1003,7 +1022,7 @@ mod bindings {
     /// [`format_checked`] instead.
     #[wasm_bindgen]
     pub fn format(source: String) -> String {
-        crate::format_program(&source).text
+        declared(|| crate::format_program(&source).text)
     }
 
     /// One formatting verdict, as the page consumes it (E197).
@@ -1021,7 +1040,7 @@ mod bindings {
     /// `null` on success and a sentence naming the construct otherwise.
     #[wasm_bindgen]
     pub fn format_checked(source: String) -> FormatResult {
-        let outcome = crate::format_program(&source);
+        let outcome = declared(|| crate::format_program(&source));
         FormatResult {
             text: outcome.text,
             declined: outcome.declined,
@@ -1035,15 +1054,17 @@ mod bindings {
     /// before this build must keep working against the next wasm module.
     #[wasm_bindgen]
     pub fn format_checked_with(source: String, wrap_comments: bool) -> FormatResult {
-        let outcome = crate::format_program_with(
-            &source,
-            vilan_core::formatter::FormatOptions {
-                wrap_comments,
-                // The playground has no manifest to climb: the formatter's own
-                // width (E215's default = the code width).
-                comment_width: vilan_core::formatter::DEFAULT_COMMENT_WIDTH,
-            },
-        );
+        let outcome = declared(|| {
+            crate::format_program_with(
+                &source,
+                vilan_core::formatter::FormatOptions {
+                    wrap_comments,
+                    // The playground has no manifest to climb: the formatter's own
+                    // width (E215's default = the code width).
+                    comment_width: vilan_core::formatter::DEFAULT_COMMENT_WIDTH,
+                },
+            )
+        });
         FormatResult {
             text: outcome.text,
             declined: outcome.declined,
@@ -1090,7 +1111,7 @@ mod bindings {
     /// glue built before it existed simply registers no completion source.
     #[wasm_bindgen]
     pub fn complete(source: String, line: u32, character: u32) -> Vec<CompletionItem> {
-        crate::complete_program(&source, line, character)
+        declared(|| crate::complete_program(&source, line, character))
             .into_iter()
             .map(|item| {
                 let edit = item.import_edit;

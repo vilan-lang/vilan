@@ -1406,3 +1406,38 @@ fn css_dotted_head_completion_reaches_the_playground() {
         "a dotted item is never a property: {offered:?}"
     );
 }
+
+/// N128: the stack the wasm entries DECLARE to the probe is the stack the
+/// builds LINK. A declaration larger than the real stack puts the probe's floor
+/// below the stack's end, where it never fires and the runaway walk writes past
+/// the shadow stack into the page's data; one smaller refuses programs the page
+/// could hold. Every `-zstack-size` in the shipping build (`release.yml`) and in
+/// CI's wasm leg (`scripts/ci-local.sh`) must be `WASM_STACK_SIZE` — planted red
+/// by the 64 MiB the local leg linked before N128.
+#[test]
+fn the_declared_wasm_stack_is_the_one_the_builds_link() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for file in [".github/workflows/release.yml", "scripts/ci-local.sh"] {
+        let text = std::fs::read_to_string(root.join(file)).expect("read the build file");
+        let sizes: Vec<usize> = text
+            .split("-zstack-size=")
+            .skip(1)
+            .map(|rest| {
+                rest.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse()
+                    .expect("a numeric -zstack-size")
+            })
+            .collect();
+        assert!(!sizes.is_empty(), "{file} links no -zstack-size");
+        for size in sizes {
+            assert_eq!(
+                size,
+                vilan_wasm::WASM_STACK_SIZE,
+                "{file} links a {size}-byte wasm stack, but the entries declare \
+                 `WASM_STACK_SIZE` to the stack probe"
+            );
+        }
+    }
+}

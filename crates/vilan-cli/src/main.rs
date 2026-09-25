@@ -241,6 +241,35 @@ enum CacheCommand {
 /// a process.
 const COMPILER_STACK_SIZE: usize = 128 * 1024 * 1024;
 
+/// Spawns a compiler thread: [`COMPILER_STACK_SIZE`] of stack, DECLARED to the
+/// analyzer's stack probe (`vilan_core::stack_guard`, N121) as the first thing
+/// the thread does. An undeclared thread's probes are inert, so a runaway walk
+/// on it runs into the guard page and aborts the process with no word about
+/// which walk; declared, the probe panics naming it, and the CLI's stance on a
+/// compiler panic (outside the fence, AGENTS.md: exit loudly) takes it from
+/// there. Every compiler thread goes through here or
+/// [`spawn_scoped_compiler_thread`] (N128), and a pin holds the sites to that.
+fn spawn_compiler_thread<T: Send + 'static>(
+    body: impl FnOnce() -> T + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<T>> {
+    std::thread::Builder::new()
+        .stack_size(COMPILER_STACK_SIZE)
+        .spawn(|| vilan_core::stack_guard::with_declared_stack(COMPILER_STACK_SIZE, body))
+}
+
+/// [`spawn_compiler_thread`] inside a `std::thread::scope` — the parallel
+/// build legs and check members (M35).
+fn spawn_scoped_compiler_thread<'scope, 'env, T: Send + 'scope>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    body: impl FnOnce() -> T + Send + 'scope,
+) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, T>> {
+    std::thread::Builder::new()
+        .stack_size(COMPILER_STACK_SIZE)
+        .spawn_scoped(scope, || {
+            vilan_core::stack_guard::with_declared_stack(COMPILER_STACK_SIZE, body)
+        })
+}
+
 fn main() -> ExitCode {
     // Compilation recurses over deeply-nested ASTs and type graphs, which can
     // run past the default main-thread stack on otherwise-valid programs. Do the
@@ -256,33 +285,37 @@ fn main() -> ExitCode {
     //     Measured through this binary on the worst plant (5000 nested
     //     parentheses): peak depth 501, 34,181 bytes (33.4 KiB) per level of
     //     source nesting, 16.24 MiB unoptimized, 3.93 MiB optimized.
-    //   * the phase-1 expression walk, 42,464 bytes (41.5 KiB) per level
-    //     (500 levels, ~20.3 MiB) — the deepest consumer by bytes per level.
+    //   * the phase-1 expression walk, ~47,400 bytes (46.3 KiB) per level
+    //     (500 levels, ~22.6 MiB) — the deepest consumer by bytes per level.
+    //     OPTIMIZED it is ~2.1 KiB a level (~1 MiB at the bound).
     //   * the return-inference chain, ~12.8 KiB per call link (500, ~6.4 MiB).
     //
-    // The parse and walk figures are N101's re-measurement: the record had the
-    // parse frame at ~71.8 KiB a level and 35.2 MiB at the bound, and the walk
-    // at ~36 KiB, and neither reproduces (N97 re-keyed the walk; the parse
-    // numbers are 2.2x what `VILAN_DEPTH_STATS` reads). `deep_nesting.rs` holds
-    // both with the method that produced them, and a canary each.
+    // The parse figures are N101's re-measurement: the record had the parse
+    // frame at ~71.8 KiB a level and 35.2 MiB at the bound, which did not
+    // reproduce (2.2x what `VILAN_DEPTH_STATS` reads). The walk figures are
+    // N128's (2026-09-25, `VILAN_DEPTH_STATS`, the slope between a 100- and a
+    // 450-link chain, debug and release binaries): the frame had grown from
+    // N97's 42,464 bytes, and AGENTS.md's "11.3 KiB optimized" was an older
+    // frame still. `deep_nesting.rs` holds both with the method that produced
+    // them, and a canary each.
     //
     // Each refuses with a diagnostic rather than overflowing, and the phases
     // run in SEQUENCE — the parse has unwound before analysis starts — so the
-    // worst case is the largest of them, not their sum: ~20 MiB unoptimized,
+    // worst case is the largest of them, not their sum: ~23 MiB unoptimized,
     // and it is the WALK now rather than the parse. Real code is nowhere near
     // it: all 211 corpus entries peak at 23 parser levels against a bound of
     // 500, and a realistic analysis peaks under 1 MiB.
     //
-    // 128 MiB is ~6.3x that measured worst case, and the headroom is not idle.
+    // 128 MiB is ~5.7x that measured worst case, and the headroom is not idle.
     // A macro-world compile NESTS a full pipeline inside the running analysis
     // (see `Document::analyze` in vilan-lsp), so a deep walk carrying a deep
-    // nested parse inside it composes to roughly 37 MiB; this covers that with
-    // room over. Bounding the parser is what made the number finite at all —
+    // nested parse inside it composes to roughly 39 MiB; this covers that with
+    // room over. The thread DECLARES this size to the stack probe
+    // (`spawn_compiler_thread`, N128), so a walk that runs away past every
+    // bound is refused by name rather than aborting in the guard page. Bounding the parser is what made the number finite at all —
     // before B142 there was no worst case to size anything against, and the
     // margin was standing in for a bound that did not exist.
-    std::thread::Builder::new()
-        .stack_size(COMPILER_STACK_SIZE)
-        .spawn(run_cli)
+    spawn_compiler_thread(run_cli)
         .expect("spawn compiler thread")
         .join()
         .expect("compiler thread panicked")
@@ -5175,12 +5208,10 @@ fn compile_tier(
                     .iter()
                     .copied()
                     .map(|index| {
-                        std::thread::Builder::new()
-                            .stack_size(COMPILER_STACK_SIZE)
-                            .spawn_scoped(scope, move || {
-                                (index, compile_leg(members, index, debug, emission))
-                            })
-                            .expect("spawn a build worker")
+                        spawn_scoped_compiler_thread(scope, move || {
+                            (index, compile_leg(members, index, debug, emission))
+                        })
+                        .expect("spawn a build worker")
                     })
                     .collect();
                 workers
@@ -5277,14 +5308,12 @@ fn check_workspace(members: &[(Unit, Platform)], debug: bool) -> RoundOutcome {
         let workers: Vec<_> = rest
             .iter()
             .map(|(unit, platform)| {
-                std::thread::Builder::new()
-                    .stack_size(COMPILER_STACK_SIZE)
-                    .spawn_scoped(scope, || {
-                        capture_arm();
-                        let ok = check(unit, *platform);
-                        (ok, capture_take())
-                    })
-                    .expect("spawn a check worker")
+                spawn_scoped_compiler_thread(scope, || {
+                    capture_arm();
+                    let ok = check(unit, *platform);
+                    (ok, capture_take())
+                })
+                .expect("spawn a check worker")
             })
             .collect();
         workers
@@ -7811,6 +7840,49 @@ fn report_warning(filename: &str, src: &str, span: std::ops::Range<usize>, messa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- N128: every compiler thread DECLARES its stack ----------------------
+
+    /// The main compiler thread's body runs with its stack declared to the
+    /// probe, at the size it was spawned with. Planted red by spawning without
+    /// `with_declared_stack`: the body reads `None`, which is what all three
+    /// compiler threads read before N128 — and a probe on an undeclared thread
+    /// never fires.
+    #[test]
+    fn a_compiler_thread_declares_its_stack_to_the_probe() {
+        let declared = spawn_compiler_thread(vilan_core::stack_guard::declared_stack_size)
+            .expect("spawn")
+            .join()
+            .expect("join");
+        assert_eq!(declared, Some(COMPILER_STACK_SIZE));
+    }
+
+    /// The same for the parallel build legs' and check members' threads.
+    #[test]
+    fn a_scoped_compiler_thread_declares_its_stack_to_the_probe() {
+        let declared = std::thread::scope(|scope| {
+            spawn_scoped_compiler_thread(scope, vilan_core::stack_guard::declared_stack_size)
+                .expect("spawn")
+                .join()
+                .expect("join")
+        });
+        assert_eq!(declared, Some(COMPILER_STACK_SIZE));
+    }
+
+    /// And no compiler thread is spawned any other way: the stack size is
+    /// written in this file exactly twice, inside the two helpers above. A
+    /// third spawn written the old way — a `Builder` with the size and no
+    /// declaration — reds here rather than shipping an inert probe.
+    #[test]
+    fn every_compiler_thread_is_spawned_through_the_declaring_helpers() {
+        let needle = concat!(".stack_size(", "COMPILER_STACK_SIZE)");
+        assert_eq!(
+            include_str!("main.rs").matches(needle).count(),
+            2,
+            "a compiler thread spawned outside `spawn_compiler_thread` / \
+             `spawn_scoped_compiler_thread` declares no stack to the probe"
+        );
+    }
 
     // --- Renamed CLI spellings (proposal/deprecation.md §4) -----------------
 

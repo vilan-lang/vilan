@@ -127,11 +127,13 @@ leg_audit() {
 }
 
 # The playground's compiler reaches wasm32 at all (ci.yml's `wasm` job), with
-# the same 64 MiB stack the playground ships with. The bindings are generated
+# the same 16 MiB stack the playground ships with (release.yml; this said 64 MiB
+# and linked 64 MiB for a release after the parser's bound let release.yml drop
+# to 16 — `vilan-wasm`'s `WASM_STACK_SIZE` pin holds both now, N128). The bindings are generated
 # because a signature wasm-bindgen cannot express must fail here rather than on
 # the page. `wasm-bindgen` must be the version `vilan-wasm/Cargo.toml` pins.
 leg_wasm() {
-    RUSTFLAGS="-C link-arg=-zstack-size=67108864" \
+    RUSTFLAGS="-C link-arg=-zstack-size=16777216" \
         cargo build -p vilan-wasm --profile wasm-release \
         --target wasm32-unknown-unknown
     wasm-bindgen --target web --out-dir target/wasm-pkg \

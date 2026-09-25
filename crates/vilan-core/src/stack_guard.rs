@@ -17,6 +17,9 @@
 //! and `util::RecursionGuard::enter`, the guard `substitute_type`,
 //! `reconcile_type` and impl selection's `subject_shape_matches` all enter —
 //! which is the one both B385's and B387's cycles went through on every lap.
+//! And a fifth for the SYNTACTIC visitors that run before any of those (N128):
+//! `Node::for_each_child`, which `collect_module_paths` and every other
+//! whole-tree scan recurse through once per level of nesting.
 //! The probe sits on the funnels rather than in each walk because a runaway
 //! recursion is, by definition, one nobody predicted: a probe that has to be
 //! placed in the walk that runs away is a probe placed after the fact.
@@ -119,6 +122,16 @@ pub fn with_declared_stack<R>(stack_size: usize, body: impl FnOnce() -> R) -> R 
     }
     let _restore = Restore(DECLARED.with(|cell| cell.replace(Some(declared))));
     body()
+}
+
+/// The size this thread DECLARED ([`with_declared_stack`]), or `None` on a
+/// thread that declared nothing — where every probe is inert. For the pins
+/// that hold a thread-spawning site to its declaration (N128): a spawn that
+/// forgets to declare has probes that never fire, and nothing else can see
+/// that from outside the thread.
+#[doc(hidden)]
+pub fn declared_stack_size() -> Option<usize> {
+    DECLARED.with(Cell::get).map(|declared| declared.size)
 }
 
 /// The probe: panics when this thread declared its stack
