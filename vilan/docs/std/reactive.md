@@ -23,7 +23,7 @@ import std::reactive::{
 |---|---|---|
 | `Source<T>` | trait | anything readable + subscribable (requires `get`/`on_change`; `on_settle`/`sub`/`effect`/`effect_on_change`/`scoped_effect`/`scoped_effect_on_change`/`map` are defaults) |
 | `Subscriber` | struct | one observer's record — its id (a turn's dedup key), `notify`, liveness and class; what `on_settle` carries |
-| `.cell()`, `.distinct()` | blanket methods | on any `Source`: materialise into a cached cell (no comparison); pass a change on only when the value differs (`T: PartialEq`) |
+| `.cell()`, `.cell_global()`, `.distinct()` | blanket methods | on any `Source`: materialise into a cached cell (no comparison), owner-tied — or, `.cell_global()`, for the life of the program; pass a change on only when the value differs (`T: PartialEq`) |
 | `Map`, `Switch`, `Combine`, `Distinct` | structs | the cold pipeline nodes (A124): hold their upstream, compute when read; built by `map`/`switch`/`combine` from v0.41.0 |
 | `Resource<T>`, `ResourceState<T>` | struct/enum | a value that may still be loading — pending, settled, failed — and its fallbacks; std-internal until v0.41.0 |
 | `Signal<T>` | trait | the writable half (`set`/`notify`/`set_with`); `Source` is its supertrait |
@@ -430,6 +430,7 @@ upstream and computes its value when read. Two of those nodes are public on ever
 ```vilan,fragment
 impl type S: Source<type T> {
 	fun cell(self): SignalCell<T>          // materialise: one cached value
+	fun cell_global(self): SignalCell<T>   // the same, for the life of the program
 }
 impl type S: Source<type T: PartialEq> {
 	fun distinct(self): Distinct<S, T>     // pass a change on only when it differs
@@ -443,6 +444,32 @@ chain above it runs once; a `get()` in a hot loop pulls a whole chain every time
 and a `.cell()` makes it one read. It is a derivation like `map` — made inside an
 owner it dies with the owner, and a turn settles it before any effect reads it —
 and it is a source again, so a chain continues through it.
+
+**A module-level cell is `.cell_global()`.** A `.cell()` is owner-tied, and a
+module binding's initializer has no owner, so there its registration would stay
+on the upstream for the life of the program — a loop nothing releases, behind a
+spelling that promises a scope. The compiler refuses `.cell()` written directly
+in a module binding's initializer and steers to the two doors: build the cell
+under the owner that reads it (inside the view, or an `owner_scope.run`), or
+write `.cell_global()`, which is the same cached node with that lifetime in its
+name — it registers with no owner even inside one, and nothing releases it:
+
+```vilan
+import std::reactive::{ Signal, SignalCell, Source };
+
+let path: SignalCell<str> = Signal::new("/");
+let depth: SignalCell<i32> = path.map(|value| value.len()).cell_global();
+
+fun main() {
+	path.set("/docs");
+	print(depth.get());     // 5
+}
+```
+
+The refusal reads the initializer's own calls: a `.cell()` in a closure the
+initializer creates, or inside a function it calls, is not caught — and leaks
+the same way, because a module-level closure keeps the (owner-less) context it
+was created in. Spell those `.cell_global()` too.
 
 `.cell()` **does not compare**: every change above it is a `set`, and a `set`
 always notifies. **`.distinct()`** is the node that compares — it asks

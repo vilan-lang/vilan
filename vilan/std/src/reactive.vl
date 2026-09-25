@@ -2196,13 +2196,35 @@ export impl type S: Source<type T> {
 	/// like every derivation (A28): made inside a boundary its registration dies
 	/// with the boundary. It is marked a DERIVATION (A110 door 2), so a turn
 	/// settles it before any effect reads it. And it is composable anywhere: the
-	/// result is a source again, so a chain continues through it.
+	/// result is a source again, so a chain continues through it — anywhere but a
+	/// module binding's initializer, which has no owner to tie it to and refuses it
+	/// with a steer to `.cell_global()` (A130).
 	fun cell(self): SignalCell<T> {
 		let cached = SignalCell::new(self.get());
 		as_derivation();
 		let _owned = register_with_owner(self.on_settle(mint_subscriber(|| {
 			cached.set(self.get());
 		})));
+		cached
+	}
+
+	/// `.cell()` for a cell that lives as long as the PROGRAM — the spelling for a
+	/// module-level derivation (A130). A `.cell()` is owner-tied, and a module
+	/// binding's initializer has no owner to tie it to: its registration would stay
+	/// on the upstream for the life of the program while the name promised a scope.
+	/// So `.cell()` there is refused, and this is the spelling that says the
+	/// lifetime out loud: it registers with NO owner, even inside a boundary, and
+	/// nothing releases it. What it holds — the upstream's list → its record → this
+	/// cell's refresh → the chain above → the upstream — is a loop for the life of
+	/// the program BY DESIGN (`proposal/reactive-pipeline.md` §2.4); the standing
+	/// no-cycle gate excludes it by this name. Otherwise it is `.cell()`: no
+	/// comparison, a derivation (A110 door 2), a source again.
+	fun cell_global(self): SignalCell<T> {
+		let cached = SignalCell::new(self.get());
+		as_derivation();
+		let _for_the_program = self.on_settle(mint_subscriber(|| {
+			cached.set(self.get());
+		}));
 		cached
 	}
 }

@@ -1179,6 +1179,314 @@ fn a124_s2b_a_resource_state_machine_and_its_four_fallbacks() {
     );
 }
 
+// --- A130: a module binding's `.cell()` is refused; `.cell_global()` says it --
+//
+// A `.cell()` is owner-tied, and a module binding's initializer has no owner, so
+// its registration stays on the upstream for the life of the program. The
+// direct spelling is refused with a steer; `.cell_global()` is the spelling that
+// names the lifetime. STATIC-ONLY (R-e): the initializer's own calls, not a
+// closure it creates and not a call it makes into a function that builds one.
+
+const A130_REFUSAL: &str = "`.cell()` in the initializer of the module binding";
+
+#[test]
+fn a130_a_cell_in_a_module_bindings_initializer_is_refused_at_the_method() {
+    // Red before A130: the program compiled, and `route`'s registration stayed
+    // on `path` for the life of the program.
+    let source = r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        let path: SignalCell<str> = Signal::new("/");
+        let route: SignalCell<str> = path.cell();
+
+        fun main() {
+            print(route.get());
+        }
+        "#;
+    assert_fails_spanning(source, "cell", A130_REFUSAL);
+    assert_fails_with(source, "the module binding `route`");
+    assert_fails_with(
+        source,
+        "or write `.cell_global()`, which says that lifetime",
+    );
+}
+
+#[test]
+fn a130_the_refusal_reaches_a_cell_through_a_dyn_receiver() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        let path: SignalCell<str> = Signal::new("/");
+        let erased: dyn Source<str> = path;
+        let cached: SignalCell<str> = erased.cell();
+
+        fun main() {
+            print(cached.get());
+        }
+        "#,
+        "the module binding `cached`",
+    );
+}
+
+#[test]
+fn a130_the_refusal_reaches_a_cell_inside_a_struct_literal_field() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        struct Holder {
+            value: SignalCell<str>,
+        }
+
+        let path: SignalCell<str> = Signal::new("/");
+        let held: Holder = Holder { value = path.cell() };
+
+        fun main() {
+            print(held.value.get());
+        }
+        "#,
+        "the module binding `held`",
+    );
+}
+
+#[test]
+fn a130_the_refusal_reaches_a_cell_passed_as_an_argument() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        fun keep(value: SignalCell<str>): SignalCell<str> {
+            value
+        }
+
+        let path: SignalCell<str> = Signal::new("/");
+        let kept: SignalCell<str> = keep(path.cell());
+
+        fun main() {
+            print(kept.get());
+        }
+        "#,
+        "the module binding `kept`",
+    );
+}
+
+#[test]
+fn a130_the_refusal_reaches_a_cell_in_a_value_if_branch() {
+    assert_fails_with(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        let path: SignalCell<str> = Signal::new("/");
+        let chosen: SignalCell<str> = if true { path.cell() } else { path };
+
+        fun main() {
+            print(chosen.get());
+        }
+        "#,
+        "the module binding `chosen`",
+    );
+}
+
+#[test]
+fn a130_one_diagnostic_per_refused_binding_and_none_for_the_others() {
+    // Two refused bindings, two diagnostics; the global, the closure and the
+    // root beside them add none.
+    let source = r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        let path: SignalCell<str> = Signal::new("/");
+        let first: SignalCell<str> = path.cell();
+        let global: SignalCell<str> = path.cell_global();
+        let second: SignalCell<str> = path.cell();
+
+        fun main() {
+            print(i"{first.get()}{global.get()}{second.get()}");
+        }
+        "#;
+    let refusals: Vec<String> = failure_diagnostics(source)
+        .into_iter()
+        .map(|(message, _span)| message)
+        .filter(|message| message.contains(A130_REFUSAL))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        2,
+        "one refusal per binding; got {refusals:?}"
+    );
+    assert!(
+        refusals[0].contains("`first`") && refusals[1].contains("`second`"),
+        "{refusals:?}"
+    );
+}
+
+#[test]
+fn a130_a_closure_the_initializer_creates_is_not_refused() {
+    // Creating a closure is inert, so the check does not enter it (the load-time
+    // rule `init_order` keeps). It is ALSO the second half of the documented
+    // remainder: a closure captures its context at CREATION (spec §8.4), and a
+    // module-level closure was created with no owner ambient, so calling it
+    // under one does not tie the cell to that owner — the registration outlives
+    // the dispose (`1`), exactly as a `.cell()` reached through a call does.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
+
+        let path: SignalCell<str> = Signal::new("/");
+        let cached_path = || path.cell();
+
+        fun main() {
+            let owner = Owner::new();
+            let cached = run_with_owner(owner, || cached_path());
+            print(i"{cached.get()} {path.subscribers.read().len()}");
+            owner.dispose();
+            print(path.subscribers.read().len());
+        }
+
+        main();
+        "#,
+        "/ 1\n1\n",
+    );
+}
+
+#[test]
+fn a130_a_cell_reached_through_a_call_from_module_init_is_the_documented_remainder() {
+    // STATIC-ONLY by ruling (R-e): a `.cell()` one call down from the
+    // initializer is not caught, and leaks exactly as the refused spelling
+    // would. Pinned so that a widening of the check is a decision, not a drift.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        let path: SignalCell<str> = Signal::new("/");
+
+        fun cached(): SignalCell<str> {
+            path.cell()
+        }
+
+        let through: SignalCell<str> = cached();
+
+        fun main() {
+            path.set("/a");
+            print(i"{through.get()} {path.subscribers.read().len()}");
+        }
+
+        main();
+        "#,
+        "/a 1\n",
+    );
+}
+
+#[test]
+fn a130_a_cell_in_a_function_body_is_not_refused() {
+    // Only a MODULE binding's initializer: the same spelling in `main` has an
+    // owner to meet when one is ambient, and is not this check's.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        fun main() {
+            let path: SignalCell<str> = Signal::new("/");
+            let cached = path.cell();
+            path.set("/b");
+            print(cached.get());
+        }
+
+        main();
+        "#,
+        "/b\n",
+    );
+}
+
+#[test]
+fn a130_a_users_own_cell_method_is_not_refused() {
+    // The check names std's `.cell()`, not a spelling: a user's inherent `cell`
+    // at module level is an ordinary call.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+
+        struct Box {
+            n: i32,
+        }
+
+        impl Box {
+            fun cell(self): i32 {
+                self.n + 1
+            }
+        }
+
+        let answer: i32 = Box { n = 41 }.cell();
+
+        fun main() {
+            print(answer);
+        }
+
+        main();
+        "#,
+        "42\n",
+    );
+}
+
+#[test]
+fn a130_cell_global_at_module_level_compiles_and_follows_its_source() {
+    // Red before A130 on the name alone (`SignalCell<str> has no method
+    // 'cell_global'`).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source };
+
+        let path: SignalCell<str> = Signal::new("/");
+        let route: SignalCell<str> = path.map(|value| "route" + value).cell_global();
+
+        fun main() {
+            print(route.get());
+            path.set("/docs");
+            print(route.get());
+        }
+
+        main();
+        "#,
+        "route/\nroute/docs\n",
+    );
+}
+
+#[test]
+fn a130_cell_global_ignores_an_ambient_owner_where_cell_is_released_with_it() {
+    // The lifetime is in the name: made under an owner, `.cell_global()` still
+    // follows its source after the owner is disposed, and `.cell()` beside it
+    // does not. One subscriber is left on the root — the global's.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Owner, Signal, SignalCell, Source, run_with_owner };
+
+        fun main() {
+            let root: SignalCell<i32> = Signal::new(1);
+            let owner = Owner::new();
+            let global = run_with_owner(owner, || root.cell_global());
+            let owned = run_with_owner(owner, || root.cell());
+            owner.dispose();
+            root.set(2);
+            print(i"global={global.get()} owned={owned.get()} left={root.subscribers.read().len()}");
+        }
+
+        main();
+        "#,
+        "global=2 owned=1 left=1\n",
+    );
+}
+
 // --- A29: a disposed session lets its transport forget it --------------------
 
 // `ReactiveClient::new`/`ReactiveServer::new` install an inbound handler that
