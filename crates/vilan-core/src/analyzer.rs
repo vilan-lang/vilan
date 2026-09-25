@@ -40771,6 +40771,13 @@ impl<'src> Analyzer<'src> {
     /// — an argument, a `let` annotation, a reassignment, a return, a field —
     /// said only the plain sentence, which every index conversion meets (I5).
     /// `BigInt` is left out as a target: nothing converts into it by method.
+    ///
+    /// When one side is `usize` the sentence NAMES it (I5 §8.2): an index is a
+    /// position, a length or a count, and after S2 moved std's signatures that
+    /// is what a reader meeting this message has to learn — `len()` answers
+    /// one, `get` takes one — not only that two widths differ. The tail is the
+    /// same steer either way, which the quick fix and `vilan check --fix` read
+    /// the conversion off.
     fn type_mismatch_message(
         &self,
         expected_type: &Type,
@@ -40780,12 +40787,26 @@ impl<'src> Analyzer<'src> {
         let expected = self.pretty_print_type(expected_type, substitution_context);
         let got = self.pretty_print_type(got_type, substitution_context);
         match self.numeric_conversion_target(expected_type, got_type) {
+            Some("usize") => format!(
+                "Expected usize (an index: a position, a length or a count), but got {got} \
+                 instead. There are no implicit numeric conversions; convert with `.as_usize()`"
+            ),
+            Some(target) if self.is_usize(got_type) => format!(
+                "Expected {expected}, but got usize (an index: a position, a length or a count) \
+                 instead. There are no implicit numeric conversions; convert with `.as_{target}()`"
+            ),
             Some(target) => format!(
                 "Expected {expected}, but got {got} instead. There are no implicit numeric \
                  conversions; convert with `.as_{target}()`"
             ),
             None => format!("Expected {expected}, but got {got} instead."),
         }
+    }
+
+    /// Whether `type_` is the index type, `usize`.
+    fn is_usize(&self, type_: &Type) -> bool {
+        matches!(type_, Type::Struct(id, _)
+            if self.primitive_struct_ids.get("usize") == Some(id))
     }
 
     /// The width a value of `got_type` converts to with `.as_<width>()` to fit
@@ -40838,6 +40859,25 @@ impl<'src> Analyzer<'src> {
     ) -> (String, Option<crate::error::Note>) {
         let got = self.pretty_print_type(argument_type, substitution_context);
         let plain = self.type_mismatch_message(parameter_type, argument_type, substitution_context);
+        // I5 §8.2: an index mismatch at an argument notes the parameter's
+        // declaration — which may be in std, where S2 moved it — the way B72's
+        // steer below does for a bare trait.
+        if self
+            .numeric_conversion_target(parameter_type, argument_type)
+            .is_some()
+            && (self.is_usize(parameter_type) || self.is_usize(argument_type))
+        {
+            let declared = self.pretty_print_type(parameter_type, substitution_context);
+            let note = self
+                .span_map
+                .get(&parameter_id)
+                .map(|span| crate::error::Note {
+                    span: **span,
+                    msg: format!("'{parameter_name}' is declared `{declared}` here"),
+                    source: self.source_of_id(parameter_id),
+                });
+            return (plain, note);
+        }
         let Type::Trait(trait_id, _) = parameter_type else {
             return (plain, None);
         };

@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 vilan-core = { path = "../vilan-core" }
+vilan-ide = { path = "../vilan-ide" }
 vilan-rust = { path = "../vilan-rust" }
 vilan-embedded = { path = "../vilan-embedded" }
 ariadne = "0.6.0"

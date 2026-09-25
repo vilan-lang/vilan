@@ -592,3 +592,5 @@ row	flagship	key
 568	-	`[deprecated(..)]` and `[internal(..)]` label a declaration a reader names, and nobody names an `impl` block — write the label on the members it is about
 569	-	Expected {expected}, but got {got} instead. There are no implicit numeric conversions; convert with `.as_{target}()`
 570	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out of range: a value of `{name}` cannot be below zero, and a sentinel for 'nothing here' is `None` in an `Option<{name}>`
+NEW	-	Expected usize (an index: a position, a length or a count), but got {got} instead. There are no implicit numeric conversions; convert with `.as_usize()`
+NEW	-	Expected {expected}, but got usize (an index: a position, a length or a count) instead. There are no implicit numeric conversions; convert with `.as_{target}()`

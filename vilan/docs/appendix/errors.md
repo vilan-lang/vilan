@@ -164,7 +164,11 @@ mixed with a bare integer literal: the literal is `i32`, and there are
 no implicit conversions. Suffix it (`stamp + 1000i53`). When both sides
 are numeric widths the message goes on to name the conversion —
 ``There are no implicit numeric conversions; convert with `.as_u53()` `` —
-and the editor offers it as a quick fix.
+and the editor offers it as a quick fix. When one side is `usize` the
+message says what that is, ``Expected usize (an index: a position, a
+length or a count), but got i32 instead``, so a program migrating its
+indexes to `usize` learns which of its values are indexes — and
+`vilan check --fix` converts every one of them in a package.
 → [Values and types](../tour/values-and-types.md)
 
 **"generic parameter '…' is missing the bound ': …' required by this call"**

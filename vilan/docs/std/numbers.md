@@ -166,9 +166,12 @@ false.
 
 **Converting** goes through the family's `as_*` methods in both directions:
 every numeric type has `as_usize()`, and `usize` has `as_i8()` … `as_f64()`.
-A mismatch names the conversion it wants (``Expected usize, but got i32
+A mismatch names the conversion it wants, and names an index as one
+(``Expected usize (an index: a position, a length or a count), but got i32
 instead. There are no implicit numeric conversions; convert with
-`.as_usize()` ``), and the editor offers to write it.
+`.as_usize()` ``); the editor offers to write it, or to declare a
+literal-bound counter `usize` instead, and `vilan check --fix` writes
+every one of them in a package (see the [CLI](../appendix/cli.md)).
 
 **On the wire** a `usize` travels at `i32`'s width, not `u53`'s — a length
 or a position that crosses rpc keeps the width it has always had, so frames

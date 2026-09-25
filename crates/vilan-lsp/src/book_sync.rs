@@ -1091,8 +1091,26 @@ fn editor_page_code_action_titles_are_the_servers() {
             panic!("{EDITOR_PAGE}'s Quick fixes section no longer opens with a count — update this pin with the page")
         });
     let number_words = [
-        "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven",
-        "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen",
+        "One",
+        "Two",
+        "Three",
+        "Four",
+        "Five",
+        "Six",
+        "Seven",
+        "Eight",
+        "Nine",
+        "Ten",
+        "Eleven",
+        "Twelve",
+        "Thirteen",
+        "Fourteen",
+        "Fifteen",
+        "Sixteen",
+        "Seventeen",
+        "Eighteen",
+        "Nineteen",
+        "Twenty",
     ];
     assert_eq!(
         number_words

@@ -25,8 +25,8 @@ fn usize_is_a_distinct_type_not_an_alias_of_u53() {
             "\tprint(i\"{id}\");\n",
             "}\n",
         ),
-        "Expected u53, but got usize instead. There are no implicit numeric conversions; \
-         convert with `.as_u53()`",
+        "Expected u53, but got usize (an index: a position, a length or a count) instead. \
+         There are no implicit numeric conversions; convert with `.as_u53()`",
     );
 }
 
@@ -40,8 +40,8 @@ fn an_i32_does_not_flow_into_a_usize() {
             "\tprint(i\"{n}\");\n",
             "}\n",
         ),
-        "Expected usize, but got i32 instead. There are no implicit numeric conversions; \
-         convert with `.as_usize()`",
+        "Expected usize (an index: a position, a length or a count), but got i32 instead. \
+         There are no implicit numeric conversions; convert with `.as_usize()`",
     );
 }
 
@@ -707,5 +707,125 @@ fn a_non_negative_value_converts_unchanged_at_u53_and_usize() {
             "}\n",
         ),
         "0 0 7 7\n9007199254740000 9007199254740000\n",
+    );
+}
+
+// --- the naming diagnostic (§8.2) -------------------------------------------------
+//
+// A mismatch with `usize` on either side NAMES it as an index, so a reader
+// migrating to S2's signatures learns what changed, not only that two widths
+// differ; the tail is still E218's steer, which the quick fix and
+// `vilan check --fix` read the conversion off. A mismatch between two
+// non-index widths keeps E218's plain sentence (`inference::bounds` pins it).
+
+#[test]
+fn a_value_meeting_a_usize_is_told_it_is_an_index() {
+    assert_fails_with(
+        concat!(
+            "fun main() {\n",
+            "\tlet width: i32 = 3;\n",
+            "\tlet at: usize = width;\n",
+            "\tprint(i\"{at}\");\n",
+            "}\n",
+        ),
+        "Expected usize (an index: a position, a length or a count), but got i32 instead. \
+         There are no implicit numeric conversions; convert with `.as_usize()`",
+    );
+}
+
+#[test]
+fn a_usize_meeting_a_value_is_told_it_is_an_index() {
+    assert_fails_with(
+        concat!(
+            "fun main() {\n",
+            "\tlet at: usize = 3;\n",
+            "\tlet width: i32 = at;\n",
+            "\tprint(i\"{width}\");\n",
+            "}\n",
+        ),
+        "Expected i32, but got usize (an index: a position, a length or a count) instead. \
+         There are no implicit numeric conversions; convert with `.as_i32()`",
+    );
+}
+
+#[test]
+fn a_usize_meeting_a_float_is_told_it_is_an_index() {
+    assert_fails_with(
+        concat!(
+            "fun main() {\n",
+            "\tlet at: usize = 3;\n",
+            "\tlet scale: f64 = at;\n",
+            "\tprint(i\"{scale}\");\n",
+            "}\n",
+        ),
+        "Expected f64, but got usize (an index: a position, a length or a count) instead. \
+         There are no implicit numeric conversions; convert with `.as_f64()`",
+    );
+}
+
+#[test]
+fn an_index_argument_notes_the_parameter_declaration() {
+    // §8.2: the note anchors on the parameter's declaration, as B72's does.
+    assert_fails_noting(
+        concat!(
+            "fun pick(xs: List<str>, at: usize): str {\n",
+            "\txs[at]\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet which: i32 = 1;\n",
+            "\tprint(pick([\"a\", \"b\"], which));\n",
+            "}\n",
+        ),
+        "Expected usize (an index: a position, a length or a count), but got i32 instead.",
+        "at",
+        "'at' is declared `usize` here",
+    );
+}
+
+#[test]
+fn a_usize_argument_to_a_value_parameter_notes_the_declaration() {
+    assert_fails_noting(
+        concat!(
+            "fun double(value: i32): i32 {\n",
+            "\tvalue * 2\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet at: usize = 2;\n",
+            "\tprint(i\"{double(at)}\");\n",
+            "}\n",
+        ),
+        "Expected i32, but got usize (an index: a position, a length or a count) instead.",
+        "value",
+        "'value' is declared `i32` here",
+    );
+}
+
+#[test]
+fn a_non_index_numeric_argument_keeps_the_plain_steer_and_no_note() {
+    // The control: two widths neither of which is an index.
+    assert_fails_with(
+        concat!(
+            "fun widen(value: u53): u53 {\n",
+            "\tvalue\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet small: i32 = 2;\n",
+            "\tprint(i\"{widen(small)}\");\n",
+            "}\n",
+        ),
+        "Expected u53, but got i32 instead. There are no implicit numeric conversions; \
+         convert with `.as_u53()`",
+    );
+    assert_fails_without(
+        concat!(
+            "fun widen(value: u53): u53 {\n",
+            "\tvalue\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet small: i32 = 2;\n",
+            "\tprint(i\"{widen(small)}\");\n",
+            "}\n",
+        ),
+        "an index",
     );
 }

@@ -229,7 +229,7 @@ sees it.
 
 ## Quick fixes
 
-Sixteen, each attached to the diagnostic that earns it:
+Eighteen, each attached to the diagnostic that earns it:
 
 | Action | Offered on |
 |---|---|
@@ -248,7 +248,9 @@ Sixteen, each attached to the diagnostic that earns it:
 | ``Remove `!important` `` | ``!important`` in a `css` block — a `Style` merges by record update, so a later declaration on the same property already wins. Takes the space before the marker with it |
 | ``Parenthesize the closure type`` | a `fun` whose RETURN type is an un-parenthesized closure type carrying a `context` clause (B343) — the type grammar's own `context` suffix is greedy, so the clause lands on the closure's own return type, which cannot carry one. The edit covers the written return type and adds the parentheses that give the clause to the FUNCTION; the refusal also names the other reading (the clause on the closure that is RETURNED), which is a second pair of parentheses and yours to choose |
 | ``Rewrite as `child(each(…))` `` | one of the six `View` methods A99 retired — `when`, `swap`, `swap_split`, `bind_each`, `bind_each_values`, `bind_each_by`. The edit covers the call alone, so the receiver, the chain around it and the arguments are untouched text; the `{each(…)}` hole the diagnostic also names is left to you, since whether a hole is right is a question about the markup around the call |
-| ``Convert with `.as_u53()` `` | ``Expected u53, but got i32 instead. There are no implicit numeric conversions; convert with `.as_u53()` `` — a value of one numeric width where another is declared (an argument, a `let` annotation, a reassignment, a return, a field). The edit writes the conversion the message names after the value, parenthesizing it first unless it is already a name, a field path or a call chain, so `xs.len() + 1` becomes `(xs.len() + 1).as_u53()` — the whole value, not its last operand |
+| ``Convert with `.as_u53()` `` | ``Expected u53, but got i32 instead. There are no implicit numeric conversions; convert with `.as_u53()` `` — a value of one numeric width where another is declared (an argument, a `let` annotation, a reassignment, a return, a field, a subscript's index). The edit writes the conversion the message names after the value, parenthesizing it first unless it is already a name, a field path or a call chain, so `xs.len() + 1` becomes `(xs.len() + 1).as_u53()` — the whole value, not its last operand. Where the message names an index (``Expected usize (an index: a position, a length or a count), but got i32 instead. …``) it is the same edit, and it is also offered on an operator between a `usize` and another integer width (`` `<` compares two values of the same type, but the operands are `i32` and `usize` ``), where nothing is declared: the non-index operand converts to `usize` |
+| ``Declare `at` a `usize` `` | the same index mismatch, when the value is a counter bound by a bare literal earlier in the same function (`mut at = 0;`). The edit writes `: usize` after the counter's name, because the counter IS an index — converting at each of its uses would leave `.as_usize()` on a value that should never have been anything else. Offered ahead of the conversion |
+| ``Convert all 2 indexes in this file`` | any index mismatch, when the file carries more than one — a file migrating to `usize` meets one per index, and this action takes each one's first fix (the declaration where there is one, else the conversion) in ONE edit. It is the edit `vilan check --fix` makes, file by file, until nothing is left to fix |
 
 and two source actions:
 
