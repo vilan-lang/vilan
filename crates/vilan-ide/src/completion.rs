@@ -307,18 +307,13 @@ pub const KEYWORD_DOCS: &[(&str, &str, &str)] = &[
     ),
     (
         "own",
-        "Passes a parameter by value as an owned copy; for a `resource` this moves ownership into the callee.",
+        "Passes a parameter by value as an owned copy; for a `[resource]` type this moves ownership into the callee.",
         "spec/memory.html#63-rule-3--references-are-second-class-views",
     ),
     (
         "borrows",
         "Names which parameter a function returns a view into: the one sanctioned way a view escapes a function (often inferred).",
         "spec/memory.html#65-projections-borrows",
-    ),
-    (
-        "resource",
-        "An owned value with exactly one owner, moved rather than copied, and torn down at scope end.",
-        "spec/memory.html#68-resources-and-destruction",
     ),
     (
         "dyn",
@@ -428,6 +423,18 @@ pub const CONSTRUCT_SNIPPETS: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
+/// The ATTRIBUTES that change what a declaration IS, each with a one-line
+/// meaning and a deep link into the book — [`KEYWORD_DOCS`]' shape, for a word
+/// written inside `[…]` rather than lexed as a keyword. B413 dissolved the
+/// `resource` keyword into `[resource]`; its hover moved here with it. Every
+/// `page#anchor` is held to the book's headings by `book_sync.rs`, as the
+/// keywords' are.
+pub const ATTRIBUTE_DOCS: &[(&str, &str, &str)] = &[(
+    "resource",
+    "Marks a struct or an enum as a resource: an owned value with exactly one owner, moved rather than copied, and torn down at scope end.",
+    "spec/memory.html#68-resources-and-destruction",
+)];
+
 /// B415: the host of the file's own attributes, offered only where it is legal
 /// — the file's first statement — as `(label, detail, body, keyword)` in
 /// [`CONSTRUCT_SNIPPETS`]' shape. Not a row of that table: those are offered
@@ -473,7 +480,6 @@ pub fn keyword_lexeme(token: &Token) -> Option<&'static str> {
         Token::Own => "own",
         Token::Borrows => "borrows",
         Token::Ret => "ret",
-        Token::Resource => "resource",
         Token::Dyn => "dyn",
         Token::Struct => "struct",
         Token::Trait => "trait",

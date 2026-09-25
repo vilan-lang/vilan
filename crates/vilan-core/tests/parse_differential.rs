@@ -208,8 +208,8 @@ fn corpus_absent_constructs() -> Vec<(String, String)> {
         ),
         // The `null`-named bodyless external struct and the full resource modifier.
         ("external_null", "external struct null;"),
-        ("resource_external", "resource external struct Handle;"),
-        ("resource_enum", "resource enum State { Open, Closed }"),
+        ("resource_external", "[resource] external struct Handle;"),
+        ("resource_enum", "[resource] enum State { Open, Closed }"),
         // An enum with negative + explicit discriminants alongside a payload.
         (
             "enum_discriminants",

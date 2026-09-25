@@ -329,15 +329,15 @@ fun write_file(path: str, contents: str)    // async
 fun read_dir(path: str): List<str>          // async — entry names, flat
 fun stat(path: str): Option<Stat>           // async — None if the path isn't there
 
-resource external struct File               // an open file — the handle tier
+[resource] external struct File               // an open file — the handle tier
 fun with_file<T>(path: str, body: |File| T): T   // open, run, close (awaited)
 fun with_file_create<T>(path: str, body: |File| T): T   // …and one per constructor
 
-resource struct Reader                      // a cursor over an open file
+[resource] struct Reader                      // a cursor over an open file
 fun Reader::of(own file: File): Reader      // takes the handle; starts at byte 0
 fun Reader::next(self, size: i32): Bytes    // the next chunk; empty at end of file
 
-resource external struct Watcher            // a live watch — the watch tier
+[resource] external struct Watcher            // a live watch — the watch tier
 fun Watcher::watch(path: str): Watcher      // the path, and a directory's own entries
 fun Watcher::watch_all(path: str): Watcher  // the whole tree beneath it
 fun Watcher::next(self): Change             // async — the next change

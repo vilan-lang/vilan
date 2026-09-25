@@ -17,7 +17,7 @@ import std::drop::Drop;
 import std::io::print;
 
 // A leaf resource that announces its teardown.
-resource struct Res {
+[resource] struct Res {
 	tag: str,
 }
 impl Res with Drop {
@@ -29,7 +29,7 @@ impl Res with Drop {
 // A resource that OWNS resources and has its own `Drop`: the body runs first,
 // then the fields drop in reverse declaration order.
 // witness: drop2($d); $a($d[1]); $a($d[0]);
-resource struct Pair {
+[resource] struct Pair {
 	first: Res,
 	second: Res,
 }
@@ -40,7 +40,7 @@ impl Pair with Drop {
 }
 
 // A resource by containment only (no `Drop` impl) still drops its field.
-resource struct Bag {
+[resource] struct Bag {
 	item: Res,
 }
 
@@ -97,7 +97,7 @@ fun containment() {
 // another body owns, so it drops what it replaces exactly as `overwrite` above
 // does — and the drop is emitted BEFORE the `__replace` that truncates the
 // payload out from under it.
-resource struct Slot {
+[resource] struct Slot {
 	held: Res,
 }
 

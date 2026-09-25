@@ -612,8 +612,8 @@ const PATTERN_BINDER_IS_ONE_WORD: &str = "a pattern binds mutably with `mut x`: 
 const BRACE_IN_AN_ISTRING: &str = "a `{` inside an `i\"…\"` string opens an interpolation hole, so this is being read as \
      an expression — write `\\{` (and `\\}`) for a literal brace";
 
-/// A keyword that declares an ITEM — `fun`/`struct`/…, plus the `external` and
-/// `resource` modifiers that lead one. An item is never part of an expression, so
+/// A keyword that declares an ITEM — `fun`/`struct`/…, plus the `external`
+/// modifier that leads one. An item is never part of an expression, so
 /// [`Parser::scan_to_sync_point`] may stop at one even inside a delimited region it
 /// is skipping (a `{` above it excepted: a block or closure body holds ordinary
 /// statements, and a nested `fun` is one of them).
@@ -694,7 +694,6 @@ fn starts_item(token: &Token<'_>) -> bool {
             | Token::Export
             | Token::Macro
             | Token::External
-            | Token::Resource
     )
 }
 
@@ -1119,6 +1118,7 @@ pub const KNOWN_ATTRIBUTE_MARKERS: &[&str] = &[
     "platform",
     "deprecated",
     "internal",
+    "resource",
 ];
 
 /// Whether `name` is one of [`KNOWN_ATTRIBUTE_MARKERS`]. Mirrors the chumsky
@@ -6268,15 +6268,16 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     // --- Structs / enums -----------------------------------------------------
 
-    /// `resource? external? struct (name | null) generics? ({ fields } | ;)`. The
-    /// `resource` modifier sits in `external`'s position (canonical order `resource
-    /// external struct`); the name may be the `null` keyword (the built-in `external
-    /// struct null`); a bodyless `;` form is valid only for an `external` struct
-    /// (checked past the parser).
+    /// `labels [resource]? external? struct (name | null) generics? ({ fields } |
+    /// ;)`. The `[resource]` attribute (B413; the keyword it replaced sat in the
+    /// same place) closes the label prefix, ahead of `external` (canonical order
+    /// `[resource] external struct`); the name may be the `null` keyword (the
+    /// built-in `external struct null`); a bodyless `;` form is valid only for an
+    /// `external` struct (checked past the parser).
     fn parse_struct(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         let labels = self.parse_item_labels();
-        let resource = self.eat(&Token::Resource);
+        let resource = self.parse_resource_kind();
         let external = self.eat(&Token::External);
         self.expect(&Token::Struct)?;
         let name_start = self.position;
@@ -6334,6 +6335,8 @@ impl<'a, 'src> Parser<'a, 'src> {
         // E213's label leads, as it does on a function: it is about the field
         // rather than about what crosses the wire.
         let internal = self.parse_internal_attribute();
+        // B413: a FIELD is no type declaration; refused, and parsed past.
+        self.refuse_misplaced_resource_attribute();
         let exposed = self.eat_expose_attribute();
         let name_start = self.position;
         let name = self.eat_ident()?;
@@ -6346,12 +6349,12 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some(((name, type_, exposed, internal), self.span_from(start)))
     }
 
-    /// `resource? enum name generics? { variants }`. There is no `external enum`, so
-    /// `resource` is the only leading modifier.
+    /// `labels [resource]? enum name generics? { variants }`. There is no
+    /// `external enum`, so `[resource]` (B413) is the only kind attribute.
     fn parse_enum(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         let labels = self.parse_item_labels();
-        let resource = self.eat(&Token::Resource);
+        let resource = self.parse_resource_kind();
         self.expect(&Token::Enum)?;
         let name_start = self.position;
         let name = self.eat_ident()?;
@@ -6381,6 +6384,8 @@ impl<'a, 'src> Parser<'a, 'src> {
         let start = self.position;
         // E221: a variant's label leads it, as a field's does (E213).
         let internal = self.parse_internal_attribute();
+        // B413: nor is a VARIANT; refused, and parsed past.
+        self.refuse_misplaced_resource_attribute();
         let name = self.eat_name()?;
         let data = self.attempt(|parser| {
             parser.expect_ctrl('(')?;
@@ -7729,15 +7734,19 @@ impl<'a, 'src> Parser<'a, 'src> {
         })
     }
 
-    /// `resource` NOT followed by `external` / `struct` / `enum` — the misplaced-
-    /// modifier steer (item 15 in the statement choice, after `struct`/`enum`, so a
-    /// valid `resource struct` / `resource external struct` / `resource enum` is
-    /// never shadowed). Emits a parse error and recovers to a `Node::Error` spanning
-    /// the `resource` keyword, leaving the offending token unconsumed (so
-    /// `fun`/`impl`/`let`/`trait` still parse on the next statement).
+    /// `[resource]` NOT followed by `external` / `struct` / `enum` — the
+    /// misplaced-attribute steer (item 15 in the statement choice, after
+    /// `struct`/`enum`, so a valid `[resource] struct` / `[resource] external
+    /// struct` / `[resource] enum` is never shadowed). Emits a parse error and
+    /// recovers to a `Node::Error` spanning the attribute, leaving the item after
+    /// it unconsumed (so `fun`/`impl`/`let`/`trait` still parse on the next
+    /// statement). B413 moved the kind from a keyword to this attribute; the
+    /// steer moved with it.
     fn parse_misplaced_resource(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
-        self.expect(&Token::Resource)?;
+        if !self.eat_marker_attribute("resource") {
+            return None;
+        }
         if matches!(
             self.peek(),
             Some(Token::External | Token::Struct | Token::Enum)
@@ -7745,16 +7754,66 @@ impl<'a, 'src> Parser<'a, 'src> {
             return None;
         }
         let span = self.span_from(start);
+        self.push_misplaced_resource(span);
+        Some((Node::Error, span))
+    }
+
+    /// The `[resource]` kind of a struct or an enum (B413), or `false`. The
+    /// RETIRED keyword spelling — `resource` as a word right before `struct`,
+    /// `external` or `enum`, which only a declaration can be — is taken too, as
+    /// the kind it meant, with ONE refusal steering to the attribute: the
+    /// declaration still parses, so the reader gets the sentence and not a
+    /// cascade.
+    fn parse_resource_kind(&mut self) -> bool {
+        if self.eat_marker_attribute("resource") {
+            return true;
+        }
+        if self.peek() == Some(&Token::Ident("resource"))
+            && matches!(
+                self.peek_at(1),
+                Some(Token::External | Token::Struct | Token::Enum)
+            )
+        {
+            let span = self.here_span();
+            self.bump();
+            self.errors.push(ParseError {
+                span,
+                reason: ParseErrorReason::Rule(
+                    "`resource` is an attribute, not a keyword: write `[resource]` before the \
+                     declaration (`[resource] struct`, `[resource] external struct`, \
+                     `[resource] enum`)",
+                ),
+                context: Vec::new(),
+                hint: None,
+            });
+            return true;
+        }
+        false
+    }
+
+    /// B413: `[resource]` where no type is declared — a field, a variant — is
+    /// the misplaced-attribute steer, and the position then parses as if it
+    /// were not there.
+    fn refuse_misplaced_resource_attribute(&mut self) {
+        let start = self.position;
+        if self.eat_marker_attribute("resource") {
+            let span = self.span_from(start);
+            self.push_misplaced_resource(span);
+        }
+    }
+
+    /// The one statement of the misplaced-`[resource]` rule, for every position
+    /// that refuses it.
+    fn push_misplaced_resource(&mut self, span: Span) {
         self.errors.push(ParseError {
             span,
             reason: ParseErrorReason::Rule(
-                "`resource` is a type-declaration modifier: it may appear only \
-                 before a `struct` or `enum` declaration",
+                "`[resource]` marks a type as a resource: it may label only a `struct` \
+                 or an `enum` declaration",
             ),
             context: Vec::new(),
             hint: None,
         });
-        Some((Node::Error, span))
     }
 
     /// The whole part of a `Number` token, consumed — the chumsky `integer`
@@ -8631,9 +8690,9 @@ mod tests {
             }
             other => panic!("expected Struct, got {other:?}"),
         }
-        // `resource external struct null;` — every modifier, the `null` name, the
+        // `[resource] external struct null;` — every modifier, the `null` name, the
         // bodyless `;` form.
-        match only_item("resource external struct null;") {
+        match only_item("[resource] external struct null;") {
             Node::Struct(name, _, external, resource, body, _) => {
                 assert_eq!(name.0, "null");
                 assert!(external && resource);
@@ -8679,8 +8738,8 @@ mod tests {
             }
             other => panic!("expected Enum, got {other:?}"),
         }
-        // `resource enum` — the only leading modifier on an enum.
-        match only_item("resource enum Handle { Open, Closed }") {
+        // `[resource] enum` — an enum takes the attribute too (B413).
+        match only_item("[resource] enum Handle { Open, Closed }") {
             Node::Enum(_, _, resource, _, _) => assert!(resource),
             other => panic!("expected a resource Enum, got {other:?}"),
         }
@@ -9254,7 +9313,7 @@ mod tests {
         }
         assert_eq!(label_of("[internal(\"s\")] struct Region {}"), Some("s"));
         assert_eq!(
-            label_of("[internal(\"r\")] resource struct Handle { id: i32 }"),
+            label_of("[internal(\"r\")] [resource] struct Handle { id: i32 }"),
             Some("r")
         );
         assert_eq!(label_of("[internal(\"e\")] enum Side { Left }"), Some("e"));
@@ -9382,19 +9441,86 @@ mod tests {
 
     #[test]
     fn misplaced_resource_declines_but_a_valid_resource_declaration_parses() {
-        // `resource` before a non-declaration is the steer (an error) — declines.
-        assert!(declines("resource fun f() { }"));
-        assert!(declines("resource impl Foo { }"));
-        // But `resource struct` / `resource external struct` / `resource enum` are
-        // valid and parse cleanly (the steer never shadows them).
+        // `[resource]` before a non-declaration is the steer (an error) —
+        // declines (B413: the attribute, as the keyword was before it).
+        assert!(declines("[resource] fun f() { }"));
+        assert!(declines("[resource] impl Foo { }"));
+        // But `[resource] struct` / `[resource] external struct` /
+        // `[resource] enum` are valid and parse cleanly (the steer never
+        // shadows them).
         assert!(matches!(
-            only_item("resource struct File { }"),
+            only_item("[resource] struct File { }"),
             Node::Struct(_, _, false, true, _, _)
         ));
         assert!(matches!(
-            only_item("resource enum State { A, B }"),
+            only_item("[resource] enum State { A, B }"),
             Node::Enum(_, _, true, _, _)
         ));
+        // After the labels, in the prefix's order, and before `external`.
+        assert!(matches!(
+            only_item("[internal(\"r\")] [resource] external struct Db;"),
+            Node::Struct(_, _, true, true, _, Some(_))
+        ));
+    }
+
+    #[test]
+    fn the_resource_attribute_is_refused_on_everything_but_a_struct_or_an_enum() {
+        // B413: one rule, at every other position — an item, a local, a field
+        // and a variant.
+        for source in [
+            "[resource] fun f() {}\n",
+            "[resource] impl Foo {}\n",
+            "[resource] trait Foo {}\n",
+            "fun main() {\n\t[resource] let x = 1;\n}\n",
+            "struct S {\n\t[resource] handle: i32,\n}\n",
+            "enum E {\n\t[resource] Open,\n}\n",
+        ] {
+            let (_, errors) = parse(source);
+            let rendered: Vec<String> = errors.iter().map(render).collect();
+            assert!(
+                rendered.contains(
+                    &"`[resource]` marks a type as a resource: it may label only a `struct` \
+                      or an `enum` declaration"
+                        .to_string()
+                ),
+                "{source:?}: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_retired_resource_keyword_is_refused_with_the_attribute_steer() {
+        // B413: `resource struct` / `resource external struct` / `resource
+        // enum` — the spelling before the keyword dissolved — is ONE refusal
+        // naming the attribute, and the declaration still parses under it.
+        for source in [
+            "resource struct File { fd: i32 }\n",
+            "resource external struct Database;\n",
+            "resource enum State { A, B }\n",
+            "export resource struct File {}\n",
+        ] {
+            let (_, errors) = parse(source);
+            assert_eq!(
+                errors.iter().map(render).collect::<Vec<_>>(),
+                vec![
+                    "`resource` is an attribute, not a keyword: write `[resource]` before the \
+                     declaration (`[resource] struct`, `[resource] external struct`, \
+                     `[resource] enum`)"
+                        .to_string()
+                ],
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_is_an_ordinary_name_now() {
+        // B413: the word is no longer reserved — a binding, a field, a
+        // function and a member read may all be called `resource`.
+        assert!(!declines("fun main() {\n\tlet resource = 1;\n}\n"));
+        assert!(!declines("struct Lease {\n\tresource: i32,\n}\n"));
+        assert!(!declines("fun resource(): i32 {\n\t1\n}\n"));
+        assert!(!declines("fun f(x: Lease) {\n\tlet _ = x.resource;\n}\n"));
     }
 
     #[test]
@@ -9513,10 +9639,10 @@ mod tests {
     fn render_states_the_resource_language_rule() {
         // diagnostics-standard.md B6 — the prohibition explains itself.
         assert_eq!(
-            rendered_errors("resource fun foo() {}\n"),
+            rendered_errors("[resource] fun foo() {}\n"),
             vec![
-                "`resource` is a type-declaration modifier: it may appear only \
-                 before a `struct` or `enum` declaration"
+                "`[resource]` marks a type as a resource: it may label only a `struct` \
+                 or an `enum` declaration"
                     .to_string()
             ]
         );

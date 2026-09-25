@@ -789,7 +789,7 @@ fn a_post_build_violation_in_a_module_renders_in_that_module() {
         dir.as_path(),
         "src/store.vl",
         "export *;\n\nimport std::io::print;\nimport std::drop::Drop;\n\
-         resource struct Guard { label: str }\n\
+         [resource] struct Guard { label: str }\n\
          impl Guard with Drop { fun drop(&mut self) { print(self.label); } }\n\n\
          fun keep() {\n\tmut arr: List<Guard> = [];\n}\n",
     );

@@ -251,7 +251,7 @@ fn a_lazy_parameter_of_resource_type_is_refused() {
         import std::io::print;
         import std::drop::Drop;
 
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
 
         impl Res with Drop {
             fun drop(&mut self) {
@@ -280,7 +280,7 @@ fn a_lazy_argument_that_names_a_resource_local_is_an_r9_capture() {
         import std::io::print;
         import std::drop::Drop;
 
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
 
         impl Res with Drop {
             fun drop(&mut self) {
@@ -1493,7 +1493,7 @@ fn an_inert_argument_does_not_excuse_a_resource_typed_lazy_parameter() {
         import std::io::print;
         import std::drop::Drop;
 
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
 
         impl Res with Drop {
             fun drop(&mut self) {
@@ -1586,7 +1586,7 @@ fn a_generic_lazy_parameter_instantiated_at_a_produced_resource_is_refused() {
         import std::drop::{ Drop, drop };
         import std::io::print;
 
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop {
             fun drop(&mut self) {
                 print(i"drop {self.tag}");
@@ -1622,7 +1622,7 @@ fn a_generic_forwarding_its_own_type_into_a_lazy_parameter_is_refused() {
         import std::drop::{ Drop, drop };
         import std::io::print;
 
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop {
             fun drop(&mut self) {
                 print(i"drop {self.tag}");
@@ -1662,7 +1662,7 @@ fn a_module_level_resource_in_a_lazy_position_is_refused_at_the_argument() {
         import std::drop::{ Drop, drop };
         import std::io::print;
 
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop {
             fun drop(&mut self) {
                 print(i"drop {self.tag}");
@@ -1692,7 +1692,7 @@ fn a_resource_local_in_a_lazy_position_is_still_only_the_r9_capture() {
         import std::drop::{ Drop, drop };
         import std::io::print;
 
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop {
             fun drop(&mut self) {
                 print(i"drop {self.tag}");
@@ -1730,14 +1730,14 @@ fn a_lazy_argument_through_a_resource_field_is_one_diagnostic() {
         import std::drop::{ Drop, drop };
         import std::io::print;
 
-        resource struct Conn { tag: str }
+        [resource] struct Conn { tag: str }
         impl Conn with Drop {
             fun drop(&mut self) {
                 print(i"drop {self.tag}");
             }
         }
 
-        resource struct Holder { conn: Conn }
+        [resource] struct Holder { conn: Conn }
 
         fun hold<T>(flag: bool, lazy fallback: T): bool {
             flag
@@ -1764,14 +1764,14 @@ fn a_lazy_argument_through_a_loaned_resource_field_is_one_diagnostic() {
         import std::drop::{ Drop, drop };
         import std::io::print;
 
-        resource struct Conn { tag: str }
+        [resource] struct Conn { tag: str }
         impl Conn with Drop {
             fun drop(&mut self) {
                 print(i"drop {self.tag}");
             }
         }
 
-        resource struct Holder { conn: Conn }
+        [resource] struct Holder { conn: Conn }
 
         fun hold<T>(flag: bool, lazy fallback: T): bool {
             flag

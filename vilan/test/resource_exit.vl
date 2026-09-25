@@ -21,7 +21,7 @@
 import std::drop::Drop;
 import std::io::print;
 
-resource struct Guard {
+[resource] struct Guard {
 	tag: str,
 }
 impl Guard with Drop {

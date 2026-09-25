@@ -4438,12 +4438,13 @@ impl<'src> Printer<'src> {
     /// handled, so `format` falls back to the original source.
     fn print_item(&mut self, item: &Spanned<Node<'src>>) {
         match &item.0 {
-            // `[resource ][external ]struct Name[<…>][;|{ fields }]` — canonical
-            // modifier order is `resource external struct` (destruction.md §3).
+            // `[[resource] ][external ]struct Name[<…>][;|{ fields }]` — canonical
+            // order is `[resource] external struct` (destruction.md §3; B413's
+            // attribute, printed on the declaration's line as the keyword was).
             Node::Struct(name, generics, external, resource, body, labels) => {
                 self.print_item_labels(labels);
                 if *resource {
-                    self.out.push_str("resource ");
+                    self.out.push_str("[resource] ");
                 }
                 if *external {
                     self.out.push_str("external ");
@@ -4507,11 +4508,11 @@ impl<'src> Printer<'src> {
                     }
                 }
             }
-            // `[resource ]enum Name[<…>] { Variant[(payload)][ = backing value], … }`.
+            // `[[resource] ]enum Name[<…>] { Variant[(payload)][ = backing value], … }`.
             Node::Enum(name, generics, resource, variants, labels) => {
                 self.print_item_labels(labels);
                 if *resource {
-                    self.out.push_str("resource ");
+                    self.out.push_str("[resource] ");
                 }
                 self.out.push_str("enum ");
                 self.out.push_str(name.0);
@@ -8379,24 +8380,24 @@ mod reformats {
     #[test]
     fn resource_struct_modifier_round_trips() {
         assert_formats(
-            "resource struct S{x:i32}\n",
-            "resource struct S {\n\tx: i32,\n}\n",
+            "[resource] struct S{x:i32}\n",
+            "[resource] struct S {\n\tx: i32,\n}\n",
         );
     }
 
     #[test]
     fn resource_external_struct_keeps_canonical_order() {
         assert_formats(
-            "resource external struct Database;\n",
-            "resource external struct Database;\n",
+            "[resource] external struct Database;\n",
+            "[resource] external struct Database;\n",
         );
     }
 
     #[test]
     fn resource_enum_modifier_round_trips() {
         assert_formats(
-            "resource enum E{A,B}\n",
-            "resource enum E {\n\tA,\n\tB,\n}\n",
+            "[resource] enum E{A,B}\n",
+            "[resource] enum E {\n\tA,\n\tB,\n}\n",
         );
     }
 

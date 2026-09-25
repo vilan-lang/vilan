@@ -31,8 +31,8 @@ use crate::keystroke::{
 use crate::line_index::LineIndex;
 use crate::references::{Definition, DefinitionKind, ReferenceIndex};
 use vilan_ide::{
-    Analysis, BOOK_BASE, Completion, CompletionKind, ImportRoots, KEYWORD_DOCS, keyword_lexeme,
-    source_call_subject, span_of,
+    ATTRIBUTE_DOCS, Analysis, BOOK_BASE, Completion, CompletionKind, ImportRoots, KEYWORD_DOCS,
+    keyword_lexeme, source_call_subject, span_of,
 };
 
 /// A file's project context, resolved from the nearest `vilan.toml`: the build
@@ -3531,10 +3531,27 @@ impl Document {
         // document that doesn't compile — that was the point of doing this
         // before the `program` check.)
         let (tokens, _errors) = tokenize(self.analyzed_text());
-        let (token, _span) = tokens.iter().find(|(_, span)| {
+        let at = tokens.iter().position(|(_, span)| {
             let range = span.into_range();
             range.start <= offset && offset < range.end
         })?;
+        let (token, _span) = &tokens[at];
+        // B413: an attribute that changes what a declaration IS hovers like
+        // the keyword it replaced — the word between `[` and `]`.
+        if let vilan_core::token::Token::Ident(word) = token
+            && at > 0
+            && tokens[at - 1].0 == vilan_core::token::Token::Ctrl('[')
+            && tokens
+                .get(at + 1)
+                .is_some_and(|(next, _)| *next == vilan_core::token::Token::Ctrl(']'))
+            && let Some((_, sentence, path)) = ATTRIBUTE_DOCS
+                .iter()
+                .find(|(attribute, _, _)| attribute == word)
+        {
+            return Some(format!(
+                "**`[{word}]`**: {sentence}\n\n[The vilan book →]({BOOK_BASE}{path})"
+            ));
+        }
         let lexeme = keyword_lexeme(token)?;
         let (_, sentence, path) = KEYWORD_DOCS
             .iter()
@@ -12271,7 +12288,7 @@ pub(crate) mod tests {
     #[test]
     fn a_container_resource_in_a_module_publishes_on_the_module() {
         let module = "import std::io::print;\nimport std::drop::Drop;\n\
-                      resource struct Guard { label: str }\n\
+                      [resource] struct Guard { label: str }\n\
                       impl Guard with Drop { fun drop(&mut self) { print(self.label); } }\n\
                       fun keep() {\n\tmut arr: List<Guard> = [];\n}\n";
         let (dir, document) = analyze_workspace(&[
@@ -14731,17 +14748,19 @@ pub(crate) mod tests {
     }
 
     // WO-4 keywords: a keyword hovers as one crisp sentence + a book deep link.
-    // Covers the flagship memory-model word `resource` (spec link), a second
-    // memory-model word `own` (spec link), and a control-flow word `for` (tour
-    // link) — sentence AND URL asserted per case.
+    // Covers the flagship memory-model word `resource` (spec link — since B413
+    // the `[resource]` ATTRIBUTE, which hovers the way the keyword did), a
+    // second memory-model word `own` (spec link), and a control-flow word `for`
+    // (tour link) — sentence AND URL asserted per case.
     #[test]
     fn hover_on_a_keyword_shows_its_meaning_and_book_link() {
-        let hover = hover_at_cursor("resou|rce struct File { fd: i32 }\n\nfun main() {}\n")
-            .expect("hover on `resource`");
+        let hover = hover_at_cursor("[resou|rce] struct File { fd: i32 }\n\nfun main() {}\n")
+            .expect("hover on `[resource]`");
         assert!(
-            hover.contains("An owned value with exactly one owner, moved rather than copied"),
+            hover.contains("an owned value with exactly one owner, moved rather than copied"),
             "{hover}"
         );
+        assert!(hover.starts_with("**`[resource]`**"), "{hover}");
         assert!(
             hover.contains(
                 "https://vilan-lang.org/docs/spec/memory.html#68-resources-and-destruction"
@@ -14773,15 +14792,24 @@ pub(crate) mod tests {
     // purely lexical, ahead of any analysis.
     #[test]
     fn hover_on_a_keyword_works_without_a_program() {
-        let text = "fun main() {\n\tresource\n}\n"; // `resource` misused — analysis fails.
+        let text = "fun main() {\n\town\n}\n"; // `own` misused — analysis fails.
         let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
-        let offset = text.find("resource").unwrap() + 1;
+        let offset = text.find("own").unwrap() + 1;
         let hover = document
             .hover(offset)
             .expect("keyword hover without a program");
+        assert!(hover.contains("moves ownership into the callee"), "{hover}");
+        // B413: `resource` is a NAME now, so a bare one is no keyword and
+        // hovers no keyword sentence; only the attribute does.
+        let text = "fun main() {\n\tlet resource = 1;\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let offset = text.find("resource").unwrap() + 1;
         assert!(
-            hover.contains("An owned value with exactly one owner"),
-            "{hover}"
+            document
+                .hover(offset)
+                .is_none_or(|hover| !hover.contains("exactly one owner")),
+            "{:?}",
+            document.hover(offset)
         );
     }
 
@@ -18164,7 +18192,12 @@ pub(crate) mod tests {
             !offered.iter().any(|keyword| keyword == "return"),
             "`return` is not a vilan keyword — it is `ret`"
         );
-        for added in ["const", "borrows", "resource", "macro"] {
+        // B413: `resource` is an attribute now, not a keyword — never offered.
+        assert!(
+            !offered.iter().any(|keyword| keyword == "resource"),
+            "`resource` is the `[resource]` attribute, not a keyword"
+        );
+        for added in ["const", "borrows", "macro"] {
             assert!(
                 offered.iter().any(|keyword| keyword == added),
                 "the `{added}` keyword must be offered (it was missing from the old hand-list)"

@@ -5200,7 +5200,7 @@ fn an_early_ret_in_a_resource_owning_main_still_runs_teardown() {
         import std::io::print;
         import std::drop::{ Drop };
 
-        resource struct Res { tag: str }
+        [resource] struct Res { tag: str }
         impl Res with Drop {
         	fun drop(&mut self) {
         		print(i"drop {self.tag}");

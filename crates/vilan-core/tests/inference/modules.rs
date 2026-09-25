@@ -790,7 +790,7 @@ fn a_std_drop_with_a_by_value_receiver_is_caught_by_the_general_rule() {
     assert_fails_with(
         r#"
         import std::drop::Drop;
-        resource struct R { handle: i32 }
+        [resource] struct R { handle: i32 }
         impl R with Drop { fun drop(self) {} }
         fun main() { let r = R { handle = 1 }; }
         "#,
@@ -5816,7 +5816,7 @@ fn an_async_drop_in_a_module_is_attributed_to_the_module() {
             (
                 "alpha.vl",
                 "import std::drop::Drop;\n\
-                 resource struct Res { x: i32 }\n\
+                 [resource] struct Res { x: i32 }\n\
                  impl Res with Drop {\n\tasync fun drop(&mut self) {}\n}\n\
                  fun make(): Res { Res { x = 1 } }\n",
             ),

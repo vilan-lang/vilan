@@ -34,7 +34,7 @@ impl Nursery {
 	fun signal(self): CancelSignal   // the raw host AbortSignal
 }
 
-resource struct OwnedNursery { nursery: Nursery }
+[resource] struct OwnedNursery { nursery: Nursery }
 impl OwnedNursery {
 	fun new(): OwnedNursery                                       // a detached owner
 	fun enter<T>(&self, body: (|| T) context ambient_nursery): T  // spawns inside → owned

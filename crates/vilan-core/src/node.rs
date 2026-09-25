@@ -942,7 +942,7 @@ pub enum Node<'src> {
     // struct; the second marks a `resource` — the owned-resource declaration
     // modifier (destruction.md §3), SURFACE ONLY for now: parsed, carried, and
     // formatted, with no classification or affine checking yet. In source the
-    // modifiers read `resource external struct`; the node keeps `external` in
+    // modifiers read `[resource] external struct`; the node keeps `external` in
     // its original slot (so existing reads are undisturbed) and appends
     // `resource` after it. The body is `Some(fields)` for `{ .. }` and `None`
     // for a bodyless `;` declaration (only valid when `external`).

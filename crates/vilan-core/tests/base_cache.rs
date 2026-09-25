@@ -2861,13 +2861,13 @@ fn checked_cache_bytes_per_world() {
 /// value a world-half assertion must not be allowed to agree on vacuously.
 const M49_EMPTY_DIGEST: u64 = 0xcbf2_9ce4_8422_2325;
 
-const M49_MODULE: &str = "resource struct Held { slot: i32 }\n\n\
+const M49_MODULE: &str = "[resource] struct Held { slot: i32 }\n\n\
                           export fun make(slot: i32): Held {\n\tHeld { slot = slot }\n}\n\n\
                           export fun value(): i32 {\n\tlet total = 1;\n\ttotal\n}\n\n\
                           export fun doubled(): i32 {\n\tvalue() * 2\n}\n";
 /// The entry that DECLARES a resource. Its nominal set is std's plus `Handle`.
 const M49_ENTRY_RESOURCE: &str = "import pkg::loaded::value;\n\
-                                  resource struct Handle { slot: i32 }\n\
+                                  [resource] struct Handle { slot: i32 }\n\
                                   fun main() {\n\
                                   \tlet held = Handle { slot = value() };\n}\n";
 /// The entry that declares NONE. Same world, same key, same world-declared

@@ -504,7 +504,7 @@ fn a_drop_only_mistake_still_reports_beside_an_unrelated_one() {
         import std::fs::{ stat, write_file };
         import std::drop::Drop;
 
-        resource struct Logger { path: str }
+        [resource] struct Logger { path: str }
         impl Logger with Drop {
             fun drop(&mut self) { write_file(self.path, "closing"); }
         }
@@ -565,7 +565,7 @@ fn a_user_written_drop_anchors_at_its_own_off_platform_call() {
         import std::fs::write_file;
         import std::drop::Drop;
 
-        resource struct Logger { path: str }
+        [resource] struct Logger { path: str }
         impl Logger with Drop {
             fun drop(&mut self) { write_file(self.path, "closing"); }
         }

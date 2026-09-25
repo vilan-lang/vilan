@@ -87,7 +87,6 @@ pub const KEYWORDS: &[(&str, Token<'static>)] = &[
     ("own", Token::Own),
     ("borrows", Token::Borrows),
     ("ret", Token::Ret),
-    ("resource", Token::Resource),
     ("struct", Token::Struct),
     ("trait", Token::Trait),
     ("type", Token::Type),
@@ -1241,7 +1240,6 @@ mod tests {
             ("borrows", Token::Borrows),
             ("ret", Token::Ret),
             ("dyn", Token::Dyn),
-            ("resource", Token::Resource),
             ("struct", Token::Struct),
             ("trait", Token::Trait),
             ("type", Token::Type),
@@ -1257,6 +1255,9 @@ mod tests {
         assert_eq!(lex("await123"), vec![Token::Ident("await123")]);
         assert_eq!(lex("_foo"), vec![Token::Ident("_foo")]);
         assert_eq!(lex("_"), vec![Token::Ident("_")]);
+        // B413: `resource` is no keyword — the kind is the `[resource]`
+        // attribute, and the word is an ordinary name.
+        assert_eq!(lex("resource"), vec![Token::Ident("resource")]);
     }
 
     // --- Numbers ------------------------------------------------------------

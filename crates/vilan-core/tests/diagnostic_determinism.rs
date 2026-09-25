@@ -536,7 +536,7 @@ fn a_multi_file_programs_diagnostics_group_by_file_every_time() {
     // on where the resource is declared: the two `List<Guard>` spellings, one
     // per user file, are what it sorts.
     let guard = "import std::io::print;\nimport std::drop::Drop;\n\
-                 resource struct Guard { label: str }\n\
+                 [resource] struct Guard { label: str }\n\
                  impl Guard with Drop { fun drop(&mut self) { print(self.label); } }\n";
     let entry = "import pkg::guard::Guard;\nimport pkg::store::keep;\n\
                  fun main() {\n\tkeep();\n\tmut mine: List<Guard> = [];\n}\n";

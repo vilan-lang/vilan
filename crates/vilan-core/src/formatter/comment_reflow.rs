@@ -86,7 +86,7 @@ const CODE_OPENERS: &[&str] = &[
     "struct ",
     "enum ",
     "external ",
-    "resource ",
+    "[resource] ",
     "macro ",
     "mod ",
     "#[",

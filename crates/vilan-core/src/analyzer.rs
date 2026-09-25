@@ -8316,7 +8316,7 @@ impl<'src> Analyzer<'src> {
                         msg: format!(
                             "`{rendered}` implements `Drop` but is not a resource: \
                              destruction without move discipline is exactly the double-close \
-                             bug; declare it a `resource` so it moves instead of being copied"
+                             bug; mark it `[resource]` so it moves instead of being copied"
                         ),
                     },
                     impl_id,

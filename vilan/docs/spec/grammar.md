@@ -254,7 +254,7 @@ The same label rides every other declaration a reader may be steered
 away from: a **struct**, an **enum**, one enum **variant**, a **trait**
 and a **module binding** (`[internal("…")] let cache = …;`, the
 `labelled-let` statement of §3.4). On a struct, an enum or a trait it
-leads the declaration, ahead of `resource`; on a variant it leads the
+leads the declaration, ahead of `[resource]`; on a variant it leads the
 variant, as on a field. A label on a *local* `let` is refused — nothing
 outside the body can name a local, so the label would have no reader.
 The editor treats each exactly as it treats a function: hidden from
@@ -269,7 +269,7 @@ std's and a dependency's stay silent.
 ### Structs and enums
 
 ```text
-struct = [ deprecated-label ] [ internal-label ] [ platform-attr ] [ "resource" ]
+struct = [ deprecated-label ] [ internal-label ] [ platform-attr ] [ resource-attr ]
          [ "external" ] "struct"
          (IDENT | "null") [ generic-params ]
          ( "{" [ field { "," field } [ "," ] ] "}" | ";" ) ;
@@ -277,8 +277,9 @@ field  = [ internal-label ]
          [ "[" "expose" [ "(" "keyed" [ "=" type ] ")" ] "]" ] IDENT [ ":" type ] ;
 internal-label = "[" "internal" "(" STRING ")" "]" ;
 deprecated-label = "[" "deprecated" "(" STRING ")" "]" ;
+resource-attr    = "[" "resource" "]" ;   (* B413 *)
 
-enum          = [ deprecated-label ] [ internal-label ] [ platform-attr ] [ "resource" ]
+enum          = [ deprecated-label ] [ internal-label ] [ platform-attr ] [ resource-attr ]
                 "enum" IDENT
                 [ generic-params ] "{" [ variant { "," variant } [ "," ] ] "}" ;
 variant       = [ internal-label ] NAME [ "(" [ type { "," type } [ "," ] ] ")" ]
@@ -338,12 +339,15 @@ data-less siblings: an enum with any payload variant uses the tagged
 representation, in which a bare backing value has nowhere to put a
 payload.
 
-The leading `resource` modifier marks a type declaration as a *resource*:
+The `[resource]` attribute marks a type declaration as a *resource*:
 the owned-resource class, whose semantics are specified in
-[§6.8](memory.md). It
-precedes `external`, so the full modifier order is `resource external
-struct`, and it is accepted only on `struct` and `enum` declarations;
-`resource` before any other item is a parse error.
+[§6.8](memory.md). It closes the label prefix and precedes `external`, so
+the full order is `[resource] external struct`, and it is accepted only on
+`struct` and `enum` declarations; `[resource]` on any other item, a field
+or a variant is a parse error. `resource` is not a keyword (B413 dissolved
+it into the attribute): it is an ordinary name everywhere else, and the
+retired spelling `resource struct` is refused with a steer to
+`[resource] struct`.
 
 ### Impls and traits
 

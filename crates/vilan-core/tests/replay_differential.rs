@@ -110,7 +110,7 @@ fun m19_probe_refusal(): i32 {
 /// tranche buys the most from. The refusal names the binding, which is what
 /// the leg counts.
 const PROBE_RESOURCE: &str = r#"
-resource struct M19ProbeGuard { tag: str }
+[resource] struct M19ProbeGuard { tag: str }
 
 impl M19ProbeGuard with Drop {
 	fun drop(&mut self) {

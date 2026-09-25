@@ -1901,12 +1901,12 @@ fn a_generic_impl_grounds_the_traits_parameter_through_its_own_binder() {
 // --- B62: a pattern capture that takes ownership of a resource payload is
 // destroyed at its scope end (`proposal/affine-moves.md` §7) ------------------
 
-/// The `resource struct Res` + `Drop` preamble every B62 pin below shares.
+/// The `[resource] struct Res` + `Drop` preamble every B62 pin below shares.
 const B62_PRELUDE: &str = r#"
     import std::io::print;
     import std::option::Option::{ self, Some, None };
     import std::drop::{ Drop, drop };
-    resource struct Res {
+    [resource] struct Res {
         tag: str,
     }
     impl Res with Drop {
@@ -2001,7 +2001,7 @@ fn b62_two_captures_in_one_leg_destroy_in_reverse_order() {
     assert_compiles_and_runs(
         &b62_program(
             r#"
-            resource enum Both {
+            [resource] enum Both {
                 Pair(Res, Res),
                 Nothing,
             }
@@ -2430,7 +2430,7 @@ fn b62_a_capture_consumed_by_a_nested_match_is_destroyed_once() {
     assert_compiles_and_runs(
         &b62_program(
             r#"
-            resource enum Wrap {
+            [resource] enum Wrap {
                 Inner(Res),
                 Nothing,
             }
@@ -3020,7 +3020,7 @@ fn b66_a_generic_overwrite_that_would_drop_the_old_value_is_rejected() {
     let source = r#"
         import std::io::print;
         import std::drop::{ Drop, drop };
-        resource struct Db { tag: str }
+        [resource] struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun swap<T>(own a: T, own b: T): T {
             mut held = a;
@@ -3062,7 +3062,7 @@ fn b66_a_concrete_overwrite_still_drops_the_old_value() {
         r#"
         import std::io::print;
         import std::drop::{ Drop, drop };
-        resource struct Db { tag: str }
+        [resource] struct Db { tag: str }
         impl Db with Drop { fun drop(&mut self) { print(i"drop {self.tag}"); } }
         fun main() {
             mut held = Db { tag = "first" };
@@ -3090,7 +3090,7 @@ fn b101_program(body: &str) -> String {
         import std::io::print;
         import std::drop::{{ Drop, drop }};
         import std::option::Option::{{ self, Some, None }};
-        resource struct Guard {{ label: str }}
+        [resource] struct Guard {{ label: str }}
         impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
         {body}
         "#
@@ -3293,7 +3293,7 @@ fn b101_a_concrete_resource_written_inside_a_generic_body_is_not_r11s() {
     assert_compiles_and_runs(
         &b101_program(
             r#"
-        resource struct Slot { held: Guard }
+        [resource] struct Slot { held: Guard }
         fun bump<T>(own value: T, slot: &mut Slot): T {
             slot.held = Guard { label = "fresh" };
             value
@@ -3365,7 +3365,7 @@ fn b66_a_body_that_already_failed_the_move_scan_reports_once() {
     // CONSEQUENCE of that failure, not a second problem. `keep` still owns only
     // because `x` was used twice, which is already the error.
     let source = r#"
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun use_twice<T>(own x: T): T {
             let keep = x;
             x
@@ -4947,7 +4947,7 @@ fn a_resource_binding_runs_its_destructor() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Handle { id: i32 }
+        [resource] struct Handle { id: i32 }
         impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
         trait Named { fun name(self): str; }
         impl Handle with Named { fun name(self): str { "h" } }
@@ -4976,7 +4976,7 @@ fn a_trait_annotated_binding_cannot_swallow_a_resources_destructor() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Handle { id: i32 }
+        [resource] struct Handle { id: i32 }
         impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
         trait Named { fun name(self): str; }
         impl Handle with Named { fun name(self): str { "h" } }
@@ -4998,7 +4998,7 @@ fn a_resource_field_runs_its_destructor() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Handle { id: i32 }
+        [resource] struct Handle { id: i32 }
         impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
         trait Named { fun name(self): str; }
         impl Handle with Named { fun name(self): str { "h" } }
@@ -5022,7 +5022,7 @@ fn b184_a_trait_typed_field_cannot_swallow_a_resources_destructor_either() {
     const LEAK: &str = r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Handle { id: i32 }
+        [resource] struct Handle { id: i32 }
         impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
         trait Named { fun name(self): str; }
         impl Handle with Named { fun name(self): str { "h" } }
@@ -5055,7 +5055,7 @@ fn a_resource_field_keeps_its_single_owner() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Handle { id: i32 }
+        [resource] struct Handle { id: i32 }
         impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
         trait Named { fun name(self): str; }
         impl Handle with Named { fun name(self): str { "h" } }
@@ -5080,7 +5080,7 @@ fn a_bare_trait_field_cannot_launder_the_single_owner_rule() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Handle { id: i32 }
+        [resource] struct Handle { id: i32 }
         impl Handle with Drop { fun drop(&mut self): void { print("closing"); } }
         trait Named { fun name(self): str; }
         impl Handle with Named { fun name(self): str { "h" } }

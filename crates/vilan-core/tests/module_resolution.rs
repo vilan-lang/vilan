@@ -2395,7 +2395,7 @@ fn a_dependency_packages_overlaid_module_is_owned_and_reclaimed() {
 /// The `resource Guard` preamble the resource-rule cases share, since a `Guard`
 /// declaration is most of each of them.
 const GUARD_PREAMBLE: &str = "import std::io::print;\nimport std::drop::Drop;\n\
-    resource struct Guard { label: str }\n\
+    [resource] struct Guard { label: str }\n\
     impl Guard with Drop { fun drop(&mut self) { print(self.label); } }\n";
 
 fn guarded(body: &str) -> String {

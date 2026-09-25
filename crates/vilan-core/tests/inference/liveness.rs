@@ -379,7 +379,7 @@ fn an_elided_own_argument_is_still_a_move_to_the_checker() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Session { id: i32 }
+        [resource] struct Session { id: i32 }
         fun take(own s: Session): i32 { s.id }
         fun main() {
             let session = Session { id = 3 };
@@ -399,7 +399,7 @@ fn a_resource_beside_an_elided_copy_still_runs_its_single_owner() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        resource struct Session { id: i32 }
+        [resource] struct Session { id: i32 }
         fun take(own s: Session): i32 { s.id }
         struct Vault { held: List<List<i32>> }
         fun main() {

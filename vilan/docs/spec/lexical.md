@@ -37,8 +37,8 @@ keyword tokens and are never `IDENT`:
 async     await     borrows  const   css    dyn     else  enum
 export    external  for      fun     if     impl    import in
 is        jump      lazy     let     macro  match   mod   mut
-null      own       resource ret     struct trait   type  use
-with      true      false
+null      own       ret      struct  trait  type    use   with
+true      false
 ```
 
 (`true`/`false` lex as boolean literals; `null` as the null literal.)
@@ -46,10 +46,13 @@ with      true      false
 **Contextual keywords** lex as `IDENT` and take meaning only by position:
 `context` (the clause after a closure type, §3.9), `sync` (the marker
 opening a closure type, §3.9), `void` (the unit value/type), `self` and
-`Self` (receiver and receiver type), `derive`, `service`, `extern`,
-`must_use`, `rpc`, `trait_only`, `doc`, `expose`, `platform`,
-`deprecated` (attribute names in `[...]` position), and jump targets
-(`break`, `continue`) after `jump`. All remain usable as ordinary
+`Self` (receiver and receiver type; `self` is also the file's own module
+in `mod self;`, §3.1), `as` (the alias on an import path leaf, §3.2),
+`only` (the trailing modifier on an import, §3.2), `derive`, `service`,
+`extern`, `must_use`, `rpc`, `trait_only`, `doc`, `expose`, `platform`,
+`deprecated`, `internal`, `resource` (attribute names in `[...]`
+position — `resource` was a keyword until B413 made it the `[resource]`
+attribute), and jump targets (`break`, `continue`) after `jump`. All remain usable as ordinary
 identifiers elsewhere, with one exception: `void` may not be a
 BINDER's name (a `let`, a `for` binder, a function parameter, a match
 capture). An expression `void` is always the unit, so a binding by

@@ -3,8 +3,9 @@
 //!
 //! Two gates, test-only:
 //!
-//! 1. **The keyword-hover deep links resolve.** [`KEYWORD_DOCS`] carries 32
-//!    `page.html#anchor` links into the published book. Each page must exist
+//! 1. **The keyword-hover deep links resolve.** [`KEYWORD_DOCS`] carries one
+//!    `page.html#anchor` link into the published book per keyword, and
+//!    [`ATTRIBUTE_DOCS`] one per documented attribute (B413's `[resource]`). Each page must exist
 //!    under `vilan/docs/`, and each anchor must be the id mdBook gives one of
 //!    that page's headings. No renderer is required at test time (CI has no
 //!    `mdbook`; the docs gate is renderer-independent by design): mdBook's
@@ -33,7 +34,7 @@ use std::process::Command;
 use tower_lsp::lsp_types::{CodeActionKind, CodeActionProviderCapability, ServerCapabilities};
 
 use crate::server_capabilities;
-use vilan_ide::{BOOK_BASE, KEYWORD_DOCS};
+use vilan_ide::{ATTRIBUTE_DOCS, BOOK_BASE, KEYWORD_DOCS};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -312,7 +313,7 @@ fn book_pages() -> Vec<(String, String)> {
 fn keyword_hover_links_resolve_to_a_heading_in_the_book() {
     let mut headings: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut broken = Vec::new();
-    for (keyword, _, link) in KEYWORD_DOCS {
+    for (keyword, _, link) in KEYWORD_DOCS.iter().chain(ATTRIBUTE_DOCS) {
         let Some((page, anchor)) = link.split_once('#') else {
             broken.push(format!("`{keyword}` → {link}: no #anchor"));
             continue;

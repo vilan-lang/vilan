@@ -406,22 +406,25 @@ references above.
 
 ### The resource class
 
-- **`resource` is a declaration modifier**, written in `external`'s
-  position: `resource struct S`, `resource external struct D`, `resource
-  enum E`.
+- **`[resource]` is a declaration attribute**, written ahead of
+  `external`: `[resource] struct S`, `[resource] external struct D`,
+  `[resource] enum E`. It labels a struct or an enum and nothing else.
+  (`resource` was a keyword until B413; it is an ordinary name now, and
+  the old `resource struct` spelling is refused with a steer to the
+  attribute.)
 - **Containment infers.** An aggregate (struct, enum, tuple, or fixed
   array `[R; n]`) with a resource field, payload, element, or member type
   *is* a resource, recursively (the `Wire`/`Hashable` all-fields machinery
   with the polarity flipped: any resource member marks the whole). Declaring
-  `resource` on such a type is allowed and checked; omitting it never hides
+  `[resource]` on such a type is allowed and checked; omitting it never hides
   resource-ness.
-- **The modifier is required at leaves.** An `external struct` is opaque, so
+- **The attribute is required at leaves.** An `external struct` is opaque, so
   a host-object resource (`Database`) must declare itself one.
 - **Per-instantiation for generics.** `Option<Database>` is a resource
   instantiation; `Option<i32>` stays data. Resource-ness of a generic type
   is decided at each instantiation, like the platform and asyncness bits.
 - **`Drop` may be implemented only for a resource type** (see below); an
-  impl on a data type is an error steering to add `resource`.
+  impl on a data type is an error steering to add `[resource]`.
 
 ### The affine rules
 
@@ -452,7 +455,7 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   ```vilan
   import std::drop::Drop;
 
-  resource struct Guard { label: str }
+  [resource] struct Guard { label: str }
   impl Guard with Drop {
       fun drop(&mut self) { print(self.label); }
   }
@@ -493,7 +496,7 @@ view surface's. Unqualified `R`*n* on this page always means the affine rule.
   ```vilan
   import std::drop::Drop;
 
-  resource struct Guard { label: str }
+  [resource] struct Guard { label: str }
   impl Guard with Drop {
       fun drop(&mut self) { print(self.label); }
   }

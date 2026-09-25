@@ -9,12 +9,12 @@ would cancel the wrong tasks. These are **resources**: values with a single
 owner, that *move* instead of copying, and that are torn down
 deterministically at their owner's **last use**.
 
-You mark one with `resource` and, if it needs cleanup, give it a `Drop`:
+You mark one with `[resource]` and, if it needs cleanup, give it a `Drop`:
 
 ```vilan
 import std::drop::Drop;
 
-resource struct Guard {
+[resource] struct Guard {
 	label: str,
 }
 
@@ -62,7 +62,7 @@ values:
 ```vilan
 import std::drop::Drop;
 
-resource struct Guard { label: str }
+[resource] struct Guard { label: str }
 impl Guard with Drop {
 	fun drop(&mut self) { print(i"dropped {self.label}"); }
 }
@@ -103,7 +103,7 @@ nothing reads again is destroyed right where it was created:
 ```vilan
 import std::drop::Drop;
 
-resource struct Guard { label: str }
+[resource] struct Guard { label: str }
 impl Guard with Drop {
 	fun drop(&mut self) { print(i"dropped {self.label}"); }
 }
@@ -149,7 +149,7 @@ it:
 import std::drop::Drop;
 import std::option::Option::{ self, Some, None };
 
-resource struct Guard { label: str }
+[resource] struct Guard { label: str }
 impl Guard with Drop {
 	fun drop(&mut self) { print(i"dropped {self.label}"); }
 }
@@ -180,7 +180,7 @@ compiler find it. Move the resource into `drop`:
 ```vilan
 import std::drop::{ Drop, drop };
 
-resource struct Guard { label: str }
+[resource] struct Guard { label: str }
 impl Guard with Drop {
 	fun drop(&mut self) { print(i"dropped {self.label}"); }
 }
@@ -209,7 +209,7 @@ what "tear it down only if it's there" needs:
 import std::drop::{ Drop, drop };
 import std::option::Option::{ self, Some, None };
 
-resource struct Guard { label: str }
+[resource] struct Guard { label: str }
 impl Guard with Drop {
 	fun drop(&mut self) { print(i"dropped {self.label}"); }
 }

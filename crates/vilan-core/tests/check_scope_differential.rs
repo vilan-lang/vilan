@@ -885,7 +885,7 @@ fun m19_probe_refusal(): i32 {
 /// tranche buys the most from. The refusal names the binding, which is what
 /// the leg counts.
 const PROBE_RESOURCE: &str = r#"
-resource struct M19ProbeGuard { tag: str }
+[resource] struct M19ProbeGuard { tag: str }
 
 impl M19ProbeGuard with Drop {
 	fun drop(&mut self) {
@@ -1266,7 +1266,7 @@ fn an_edited_module_is_not_served_its_old_tables() {
 /// three, and it answers by walking each body's whole subtree — which is what
 /// a restored answer replaces.
 const M19_T1C_DROP_MODULE: &str = r#"
-resource struct M19T1cHandle {
+[resource] struct M19T1cHandle {
 	tag: i32,
 }
 
@@ -1428,7 +1428,7 @@ fn a_reused_modules_drop_scan_enrolment_is_restored_not_rewalked() {
 const M19_T1D_CONTAINER_MODULE: &str = r#"
 import std::drop::{ Drop, drop };
 
-resource struct T1dGuard { tag: str }
+[resource] struct T1dGuard { tag: str }
 
 impl T1dGuard with Drop {
 	fun drop(&mut self) {

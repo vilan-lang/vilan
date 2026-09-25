@@ -125,7 +125,7 @@ external fun __nursery_new_detached(): Nursery;
 /// children die at their next suspension. This is the owner for object-lifetime
 /// spawns that no function-scoped `nursery` can hold. The wrapped `Nursery` stays
 /// data (it is the ambient handle); ownership lives only in this wrapper.
-export resource struct OwnedNursery {
+export [resource] struct OwnedNursery {
 	nursery: Nursery,
 }
 
