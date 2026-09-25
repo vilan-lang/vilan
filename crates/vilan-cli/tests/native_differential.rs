@@ -124,7 +124,28 @@ const DEFAULT_SUITE: &[&str] = &[
     // payload view is carried through.
     "option-view.vl",
     "dyn-objects.vl",
+    // I5 S1: `usize`, the index type — the platform word natively, `u53` on JS,
+    // printing the same family surface on both.
+    "usize.vl",
+    // I5 S1 + B389: the literal law at `usize`, all 21 measured positions in one
+    // program — the literals' native widths are the record B389 writes.
+    "usize-literals.vl",
 ];
+
+/// Corpus programs that are OUTSIDE this differential by construction, named
+/// with the reason (I5 ruling 2, `proposal/index-type.md` §5.2).
+///
+/// Not refusals and not breakages: programs whose output the language leaves
+/// UNSPECIFIED, so the two backends legitimately print different things and
+/// "identical" is not a claim either could make. An underflowing `usize`
+/// subtraction goes negative on JS and panics in a native debug build; the
+/// corpus keeps its JS golden, and
+/// [`an_underflowing_usize_is_outside_the_differential_by_name`] pins the
+/// native half.
+const OUTSIDE_THE_DIFFERENTIAL: &[(&str, &str)] = &[(
+    "usize-underflow.vl",
+    "a `usize` subtracted past zero is unspecified: -1 on JS, a debug panic natively",
+)];
 
 /// The corpus's ASYNC programs (tracker J6, lane native-b-38).
 ///
@@ -207,8 +228,12 @@ pub fn platform_free_programs() -> Vec<String> {
             let reaches_a_platform = PLATFORM_MODULES
                 .iter()
                 .any(|module| source.contains(&format!("import {module}")));
-            if !reaches_a_platform {
-                programs.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let outside = OUTSIDE_THE_DIFFERENTIAL
+                .iter()
+                .any(|(excluded, _)| *excluded == name);
+            if !reaches_a_platform && !outside {
+                programs.push(name);
             }
         }
     }
@@ -338,6 +363,53 @@ fn the_default_suite_is_byte_identical_on_both_backends() {
         broken.is_empty(),
         "the native backend disagrees with the JS backend:\n{}",
         broken.join("\n")
+    );
+}
+
+/// I5 ruling 2: the one program [`OUTSIDE_THE_DIFFERENTIAL`] names does what
+/// the book says on each backend — JS prints the negative value and exits 0, a
+/// native debug build panics on the subtraction — and the enumeration leaves it
+/// out, so the sweep cannot call it broken.
+#[test]
+fn an_underflowing_usize_is_outside_the_differential_by_name() {
+    for (program, _) in OUTSIDE_THE_DIFFERENTIAL {
+        assert!(
+            corpus_dir().join(program).is_file(),
+            "{program} is named outside the differential but is not a corpus program"
+        );
+        assert!(
+            !platform_free_programs().contains(&program.to_string()),
+            "{program} is named outside the differential but the sweep still enumerates it"
+        );
+        assert!(
+            !DEFAULT_SUITE.contains(program),
+            "{program} is outside the differential and cannot be in its default suite"
+        );
+    }
+    let staged = stage();
+    let javascript = vilan(&staged)
+        .args(["run", "usize-underflow.vl"])
+        .output()
+        .expect("run the JS backend");
+    assert!(
+        javascript.status.success(),
+        "the JS leg runs through the underflow: {}",
+        String::from_utf8_lossy(&javascript.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&javascript.stdout),
+        "-1\ntrue\ntrue\n0\n"
+    );
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "usize-underflow.vl"])
+        .output()
+        .expect("run the native backend");
+    let stderr = String::from_utf8_lossy(&native.stderr);
+    assert!(
+        !native.status.success() && stderr.contains("attempt to subtract with overflow"),
+        "the native debug build panics on the subtraction, it does not print a value:\n\
+         stdout: {}\nstderr: {stderr}",
+        String::from_utf8_lossy(&native.stdout)
     );
 }
 

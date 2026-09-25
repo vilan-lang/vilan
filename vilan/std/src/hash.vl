@@ -104,6 +104,12 @@ export impl u53 with Hashable {
 	}
 }
 
+export impl usize with Hashable {
+	fun hash(self): Hash {
+		canonical_hash(self)
+	}
+}
+
 export impl f32 with Hashable {
 	fun hash(self): Hash {
 		canonical_hash(self)

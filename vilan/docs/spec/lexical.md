@@ -71,7 +71,8 @@ SUFFIX  = IDENT   (* immediately adjacent, no space *)
 
 The suffix names the literal's type: `i8 i16 i32 u8 u16 u32` (that
 two's-complement width), `i53`/`u53` (the wide integers; see below),
-`f` (`f64`), `f32`, `f64`, `n` (`BigInt`). An **unknown suffix is a
+`usize` (the index type; see below), `f` (`f64`), `f32`, `f64`, `n`
+(`BigInt`). An **unknown suffix is a
 compile error** (the retired `i64`/`u64` suffixes get a rename hint). An
 unsuffixed literal takes its type from its CONTEXT — the annotation, the
 parameter, the field, the return type it lands at, the other operand of a
@@ -97,6 +98,12 @@ double (the backing representation). The names deliberately follow
 JavaScript's safe-integer convention (53 bits of integer precision)
 rather than the two's-complement `iN` convention. There is no `i64`;
 integers beyond the window take `BigInt`.
+
+`usize`, the index type, spans [0, 2^53] as `u53` does — on every backend,
+although its native representation is the platform word. Subtracting a
+`usize` past zero is **unspecified, never memory-unsafe** (§7.2a): the JS
+backend lets the value go negative, a native debug build panics, and every
+subscript's bounds check still refuses the result as an index.
 
 In a hex literal the digit run is maximal, so a suffix must begin with a
 non-hex letter: `0xFFu8` is valid; `0xFFf` is a single hex number `0xFFF`,

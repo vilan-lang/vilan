@@ -420,6 +420,25 @@ impl u53 with Wire {
 	}
 }
 
+// `usize` rides the `i32` lane, NOT `u53`'s — and that is a protocol rule, not a
+// convenience (I5 ruling 5, `proposal/index-type.md` §6). A length or a position
+// that crosses rpc KEEPS its wire width: std's frames carry their positions as
+// `i32` today, and the day those positions are respelled `usize` the frames must
+// not move. Riding `u53`'s `i53` lane would write eight bytes where four were
+// written — the binary codec would corrupt every frame of a mixed-version
+// deployment while the JSON codec and the contract hash saw nothing. So a `usize`
+// past `i32::MAX` on the wire is a protocol error, not a widening; nothing in std
+// can produce one (a frame that large is not a frame).
+impl usize with Wire {
+	fun describe<S: Serialize>(self, serializer: &mut S) {
+		serializer.i32_value(self.as_i32());
+	}
+
+	fun rebuild<D: Deserialize>(deserializer: &mut D): usize {
+		deserializer.i32_value().as_usize()
+	}
+}
+
 impl f32 with Wire {
 	fun describe<S: Serialize>(self, serializer: &mut S) {
 		serializer.f64_value(self.as_f64());

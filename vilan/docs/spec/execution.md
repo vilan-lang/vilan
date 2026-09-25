@@ -131,6 +131,13 @@ range-checked at compile time (§2.3); runtime operations are not. An
 opt-in checked family (`add_safe`, …) is recorded future work; `BigInt`
 is the answer where the range itself is the problem.
 
+A `usize` subtracted past zero is this case, stated precisely: the result
+is unspecified, and it is never memory-unsafe. On the JS backend the value
+leaves the range and goes negative; natively a debug build panics and a
+release build wraps. No backend reaches memory through it — an index is
+bounds-checked on every backend, and a negative one fails the check.
+`usize` carries the defined answers, `checked_sub` and `saturating_sub`.
+
 ## 7.3 The async model
 
 Vilan is **await-by-default**. Asyncness is a property of *functions*,

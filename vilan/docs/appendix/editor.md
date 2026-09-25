@@ -229,7 +229,7 @@ sees it.
 
 ## Quick fixes
 
-Fifteen, each attached to the diagnostic that earns it:
+Sixteen, each attached to the diagnostic that earns it:
 
 | Action | Offered on |
 |---|---|
@@ -248,6 +248,7 @@ Fifteen, each attached to the diagnostic that earns it:
 | ``Remove `!important` `` | ``!important`` in a `css` block — a `Style` merges by record update, so a later declaration on the same property already wins. Takes the space before the marker with it |
 | ``Parenthesize the closure type`` | a `fun` whose RETURN type is an un-parenthesized closure type carrying a `context` clause (B343) — the type grammar's own `context` suffix is greedy, so the clause lands on the closure's own return type, which cannot carry one. The edit covers the written return type and adds the parentheses that give the clause to the FUNCTION; the refusal also names the other reading (the clause on the closure that is RETURNED), which is a second pair of parentheses and yours to choose |
 | ``Rewrite as `child(each(…))` `` | one of the six `View` methods A99 retired — `when`, `swap`, `swap_split`, `bind_each`, `bind_each_values`, `bind_each_by`. The edit covers the call alone, so the receiver, the chain around it and the arguments are untouched text; the `{each(…)}` hole the diagnostic also names is left to you, since whether a hole is right is a question about the markup around the call |
+| ``Convert with `.as_u53()` `` | ``Expected u53, but got i32 instead. There are no implicit numeric conversions; convert with `.as_u53()` `` — a value of one numeric width where another is declared (an argument, a `let` annotation, a reassignment, a return, a field). The edit writes the conversion the message names after the value, parenthesizing it first unless it is already a name, a field path or a call chain, so `xs.len() + 1` becomes `(xs.len() + 1).as_u53()` — the whole value, not its last operand |
 
 and two source actions:
 

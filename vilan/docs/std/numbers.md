@@ -10,6 +10,7 @@ and random values (`std::random`). Literal syntax and conversion semantics:
 |---|---|---|
 | `i8 i16 i32 i53` | signed | bare = `i32`; others suffixed (`100i53`) |
 | `u8 u16 u32 u53` | unsigned | suffixed (`0xFFu8`) |
+| `usize` | unsigned — the **index** type ([below](#usize-the-index-type)) | from context, or `42usize` |
 | `f64` | float | `2.5` or `10f` |
 | `f32` | float | `2.5f32` |
 | `BigInt` | arbitrary (`i128` on the native backend — see the [native guide](../guide/native.md#numbers)) | `7n` |
@@ -50,6 +51,7 @@ fun main() {
 | `u32` | `0` | `4294967295` |
 | `i53` | `-9007199254740992` | `9007199254740992` |
 | `u53` | `0` | `9007199254740992` |
+| `usize` | `0` | `9007199254740992` |
 
 **This spelling is a stopgap.** vilan has no associated constants — there is
 no static-member mechanism for `i32::MAX` to hang on — so the bounds ship as
@@ -116,8 +118,73 @@ impl f64 {
 }
 ```
 
-Every numeric type implements `Default` (zero), the operator traits, and
-comparison.
+Every numeric type implements `Default` (zero), the operator traits,
+comparison, and `Display` (the same text interpolation prints).
+
+## `usize`: the index type
+
+A position in a sequence, a length, a count, the answer of a search for a
+position — that is what `usize` is for. It is a **distinct** numeric type,
+not another name for `u53`: on the JS backend it is represented as `u53`
+is, and natively it is the platform word (Rust's `usize`), which is exactly
+what a native `len()` already answers.
+
+```vilan
+fun main() {
+	let letters = ["a", "b", "c", "d"];
+	let at: usize = 2;                  // a literal takes `usize` from context
+	print(letters[at]);                 // c
+	let step = 3usize;                  // the suffix exists, and is rarely needed
+	print(i"{at + step}");              // 5
+	print(i"{usize::max_value()}");     // 9007199254740992, on every backend
+	print(at.checked_sub(step).is_none());  // true
+	print(i"{at.saturating_sub(step)}");    // 0
+	print(i"{step.as_i32()} {7.as_usize()}");
+}
+```
+
+**Its range is the JavaScript guarantee on every backend**: [0, 2^53], the
+same window as `u53`, and `usize::max_value()` answers `9007199254740992`
+natively too — a program that printed the platform's real ceiling would
+print different things on the two backends. A program that wants the
+native word's ceiling is asking a native question.
+
+**Subtracting past zero is unspecified, never memory-unsafe.** No check is
+emitted for `a - b` with `b > a`. On the JS backend the value simply leaves
+the type's range and goes negative (`0usize - 1usize` prints `-1`);
+natively Rust's own rule applies — a panic in a debug build, a wrap in a
+release build. Neither can reach memory it should not: every subscript
+keeps its bounds check, and a negative index fails it
+(`index out of bounds: the length is 2 but the index is -1`). Because the
+two backends legitimately disagree, a program that underflows is outside
+what the [native differential](../guide/native.md#numbers) compares. When
+you want a defined answer, ask for one: `checked_sub` answers `None` past
+zero, and `saturating_sub` stops at `0`. A downward loop is written so that
+it never reaches the edge — `for i > 0 { i -= 1; … }`, not
+`for i >= 0 { …; i -= 1 }`, whose guard an unsigned counter can never make
+false.
+
+**Converting** goes through the family's `as_*` methods in both directions:
+every numeric type has `as_usize()`, and `usize` has `as_i8()` … `as_f64()`.
+A mismatch names the conversion it wants (``Expected usize, but got i32
+instead. There are no implicit numeric conversions; convert with
+`.as_usize()` ``), and the editor offers to write it.
+
+**On the wire** a `usize` travels at `i32`'s width, not `u53`'s — a length
+or a position that crosses rpc keeps the width it has always had, so frames
+do not grow when a position is respelled `usize` (see
+[Encoding](encoding.md)). A `usize` past `i32::MAX` is not describable on
+the wire, and nothing std builds can produce one.
+
+**What is not an index.** An identity (a channel, a connection, a row id)
+is not a position, nor is an element's VALUE (a byte, a character code), a
+duration or a port. A file offset is not an index either: it is a position
+in a stream that is not in memory, its range is the filesystem's, and
+`std::fs` keeps it `i53`.
+
+Today `xs[i]` accepts an index of either `i32` or `usize`, and std's own
+signatures (`len()`, `get(i)`, `index_of`) still speak `i32`; the release
+that moves them to `usize` is the migration the tracker calls I5 S2.
 
 `clamp` confines a value to a range. The integers inherit it from `Ord`; the
 floats are deliberately *not* `Ord` (NaN has no place in a total order), so

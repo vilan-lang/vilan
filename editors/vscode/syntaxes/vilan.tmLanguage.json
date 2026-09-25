@@ -357,7 +357,7 @@
     {
      "comment": "Primitive types.",
      "name": "support.type.primitive.vilan",
-     "match": "\\b(str|i32|u32|f64|i8|u8|i16|u16|i53|u53|f32|bool|void|any)\\b"
+     "match": "\\b(str|i32|u32|f64|i8|u8|i16|u16|i53|u53|usize|f32|bool|void|any)\\b"
     },
     {
      "comment": "User types / variants \u2014 PascalCase identifiers (and `Self`).",

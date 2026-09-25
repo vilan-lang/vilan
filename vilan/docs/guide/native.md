@@ -65,6 +65,17 @@ language promises, and a program that round-trips through both backends behaves
 the same only inside that range. Every other numeric type is its own width on
 both backends.
 
+**`usize` is Rust's `usize` here** — the platform word, which is what a native
+`len()` is — with the same JavaScript guarantee: `usize::max_value()` answers
+`9007199254740992` on both backends. Subtracting one past zero is unspecified,
+and the backends really do differ: JS prints the negative number, a native
+debug build panics with `attempt to subtract with overflow`, a release build
+wraps, and rustc refuses a subtraction it can see underflows at compile time. So
+a program that underflows is not one this backend promises to print the same
+bytes for, and the corpus's `usize-underflow.vl` is named outside the
+differential for exactly that reason. `checked_sub` and `saturating_sub` answer
+the same on both.
+
 **`BigInt` is an `i128` here, and that is a limit rather than a promise.** On
 the JS backend a `BigInt` is arbitrary precision; natively it is a 128-bit
 signed integer — ±170,141,183,460,469,231,731,687,303,715,884,105,727 — because

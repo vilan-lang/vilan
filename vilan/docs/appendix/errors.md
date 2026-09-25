@@ -161,7 +161,10 @@ says so — the shape has to change, or the dependency has to export it.
 **"Expected …, but got … instead."**
 The general type mismatch. One special case surprises people: an `i53`
 mixed with a bare integer literal: the literal is `i32`, and there are
-no implicit conversions. Suffix it (`stamp + 1000i53`).
+no implicit conversions. Suffix it (`stamp + 1000i53`). When both sides
+are numeric widths the message goes on to name the conversion —
+``There are no implicit numeric conversions; convert with `.as_u53()` `` —
+and the editor offers it as a quick fix.
 → [Values and types](../tour/values-and-types.md)
 
 **"generic parameter '…' is missing the bound ': …' required by this call"**
@@ -514,8 +517,9 @@ through it, and `lt`/`le`/`gt`/`ge` come free as defaults).
 → [Data and traits](../tour/data-and-traits.md)
 
 **"the literal `…` is out of range for `…` (…)"**
-The number doesn't fit the type. For `i53`/`u53` the range is ±2^53,
-JavaScript's exact-integer window. Bigger integers take `BigInt` (`7n`).
+The number doesn't fit the type. For `i53`/`u53`/`usize` the range is
+±2^53 (non-negative for the unsigned two), JavaScript's exact-integer
+window. Bigger integers take `BigInt` (`7n`).
 → [Values and types](../tour/values-and-types.md)
 
 **"unknown numeric suffix `…`"**

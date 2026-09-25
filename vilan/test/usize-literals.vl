@@ -1,0 +1,91 @@
+// The literal law at `usize` (tracker I5 S1, proposal/index-type.md §4): an
+// unsuffixed literal takes its type from its context in every position — the 21
+// positions `i5_literal_positions.sh` measured, one line each, in one program.
+// B389 closed the five that did not have the law yet (the left operand, a list
+// literal's elements, a match pattern, a generic call, a bare `let` used later).
+// Two positions are the MIGRATION'S boundary rather than the law's: std's
+// `get(index)` and `len()` still speak `i32` until S2, so they carry the one
+// conversion E218 names, and S2 deletes it.
+
+struct Holder {
+	at: usize,
+}
+
+fun take(count: usize): usize {
+	count
+}
+
+fun zero(): usize {
+	0
+}
+
+fun identity<T>(value: T): T {
+	value
+}
+
+fun main() {
+	let letters = ["a", "b", "c"];
+	// 1. a call argument
+	print(i"{take(3)}");
+	// 2. an annotated `let`
+	let annotated: usize = 0;
+	print(i"{annotated}");
+	// 3. the right operand, and 4. the left
+	let four: usize = 4;
+	let right = four + 1;
+	let left = 1 + four;
+	print(i"{right} {left}");
+	// 5. the elements of an annotated list literal
+	let positions: List<usize> = [0, 1, 2];
+	print(i"{positions.len()}");
+	// 6. a struct field
+	let holder = Holder { at = 0 };
+	print(i"{holder.at}");
+	// 7. a return position
+	print(i"{zero()}");
+	// 8. a comparison
+	print(four > 0);
+	// 9. a compound assignment
+	mut counted: usize = 4;
+	counted -= 1;
+	print(i"{counted}");
+	// 10. a literal match pattern
+	let named = match four {
+		0 => "zero",
+		4 => "four",
+		_ => "more",
+	};
+	print(named);
+	// 11. a tuple element
+	let pair: (usize, str) = (0, "a");
+	print(i"{pair.0} {pair.1}");
+	// 12. a closure parameter applied to a literal
+	let doubled = |n: usize| n * 2;
+	print(i"{doubled(7)}");
+	// 13. through a generic call
+	let through: usize = identity(5);
+	print(i"{through}");
+	// 14. a bare `let` used later as a `usize`
+	let bare = 0;
+	print(i"{take(bare)}");
+	// 15. `Some` into an `Option<usize>`
+	let found: Option<usize> = Some(0);
+	print(found.is_some());
+	// 16. a literal subscript, and 17. a `usize` one
+	let at: usize = 1;
+	print(letters[0]);
+	print(letters[at]);
+	// 18. `get` with a `usize` — the boundary: one conversion until S2
+	print(letters.get(at.as_i32()).unwrap_or("none"));
+	// 19. `len()` into a `usize` — the boundary: one conversion until S2
+	let length: usize = letters.len().as_usize();
+	print(i"{length}");
+	// 20. a downward loop that never reaches the edge
+	mut index: usize = length;
+	for index > 0 {
+		index -= 1;
+		print(letters[index]);
+	}
+	// 21. the underflow itself is `usize-underflow.vl`'s: the native
+	// differential cannot hold it, so it lives in its own program.
+}

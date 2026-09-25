@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tower_lsp::lsp_types::{Position, Range};
-use vilan_core::analyzer::{DERIVED_SOURCE, Expr, ExprIfBranch, Parameter, SourceId};
+use vilan_core::analyzer::{
+    DERIVED_SOURCE, Expr, ExprIfBranch, NUMERIC_CONVERSION_STEER, Parameter, SourceId,
+};
 use vilan_core::cancel::CancelToken;
 use vilan_core::formatter::{ModuleRescue, STYLE_BREAKPOINT_WIDTHS, STYLE_CONDITION_METHODS};
 use vilan_core::fx::{FxHashMap as HashMap, FxHashSet};
@@ -6373,6 +6375,10 @@ impl Document {
                 // §7.2 fix 2, the `#`'s twin: the one at-rule with a
                 // combinator spelling is a min-width media query.
                 fixes.push(fix);
+            } else if let Some(fix) = numeric_conversion_fix(&self.text, diagnostic) {
+                // E218: the mismatch names the one call that fixes it, and the
+                // fix writes that call at the value the diagnostic spans.
+                fixes.push(fix);
             } else if let Some(fix) = self.retired_slot_method_fix(diagnostic) {
                 // A99, the one arm: `parent.swap(s, r)` names a `View` method
                 // that no longer exists, and the value form is one edit away.
@@ -7964,6 +7970,82 @@ fn is_css_property(name: &str) -> bool {
     })
 }
 
+/// E218's quick fix: `.as_<width>()` written after the value a numeric
+/// mismatch spans — the conversion the message itself names, read back off it
+/// through [`NUMERIC_CONVERSION_STEER`] so the two cannot name different
+/// methods.
+///
+/// The value is parenthesized unless it is already a postfix operand (a name, a
+/// field path, a call chain): `xs.len()` becomes `xs.len().as_u53()`, and
+/// `xs.len() + 1` becomes `(xs.len() + 1).as_u53()`, which is the conversion of
+/// the whole value the diagnostic is about rather than of its last operand.
+fn numeric_conversion_fix(text: &str, diagnostic: &Error) -> Option<QuickFix> {
+    let at = diagnostic.msg.find(NUMERIC_CONVERSION_STEER)?;
+    let method = diagnostic.msg[at + NUMERIC_CONVERSION_STEER.len()..].strip_suffix("()`")?;
+    if !method.starts_with("as_")
+        || !method
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return None;
+    }
+    let written = text.get(diagnostic.span.into_range())?;
+    if written.trim().is_empty() || written.trim() != written {
+        return None;
+    }
+    let replacement = if is_postfix_operand(written) {
+        format!("{written}.{method}()")
+    } else {
+        format!("({written}).{method}()")
+    };
+    Some(QuickFix {
+        title: format!("Convert with `.{method}()`"),
+        span: diagnostic.span,
+        replacement,
+        target: None,
+    })
+}
+
+/// Whether `written` takes a method call as it stands: it starts with a name,
+/// and outside its brackets and string literals it is only names, `.` and `?`.
+/// A number literal is NOT one (`5.as_u53()` would lex the `5.` as a float), nor
+/// is anything carrying an operator or a space at the top level.
+fn is_postfix_operand(written: &str) -> bool {
+    if !written
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_alphabetic() || first == '_')
+    {
+        return false;
+    }
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for character in written.chars() {
+        if in_string {
+            match character {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => match depth.checked_sub(1) {
+                Some(outer) => depth = outer,
+                None => return false,
+            },
+            _ if depth > 0 => {}
+            _ if character.is_alphanumeric() || matches!(character, '_' | '.' | '?') => {}
+            _ => return false,
+        }
+    }
+    depth == 0 && !in_string
+}
+
 /// css-block.md §7.2 fix 2: `@media (min-width: 768px) {` → `.md {`.
 ///
 /// The diagnostic is the lexer's and one character wide, so the at-rule's head
@@ -9196,6 +9278,123 @@ pub(crate) mod tests {
             reanalyzed.diagnostics
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// E218: a numeric mismatch offers the conversion its message names,
+    /// written after the value — and parenthesized when the value is not a
+    /// postfix operand — and applying it leaves the file clean.
+    #[test]
+    fn quickfix_converts_a_numeric_mismatch_with_the_named_as_method() {
+        for (value, replacement) in [
+            ("xs.len()", "xs.len().as_u53()"),
+            ("xs.len() + 1", "(xs.len() + 1).as_u53()"),
+        ] {
+            let source = format!(
+                concat!(
+                    "import std::io::print;\n",
+                    "\n",
+                    "fun main() {{\n",
+                    "\tlet xs = [1, 2];\n",
+                    "\tlet n: u53 = {value};\n",
+                    "\tprint(i\"{{n}}\");\n",
+                    "}}\n",
+                    "main();\n",
+                ),
+                value = value
+            );
+            let (dir, document) = analyze_workspace(&[("main.vl", source.as_str())]);
+            let program = document.program.as_ref().unwrap();
+            let text = document.line_index.text();
+            let whole_file = Span {
+                start: 0,
+                end: text.len(),
+            };
+            let fixes = document.quickfixes(program, whole_file);
+            let convert: Vec<_> = fixes
+                .iter()
+                .filter(|fix| fix.title == "Convert with `.as_u53()`")
+                .collect();
+            assert_eq!(
+                convert.len(),
+                1,
+                "exactly one conversion fix is offered for `{value}`: {:?}",
+                fixes.iter().map(|fix| &fix.title).collect::<Vec<_>>()
+            );
+            assert_eq!(&text[convert[0].span.into_range()], value);
+            assert_eq!(convert[0].replacement, replacement);
+            let mut applied = text.to_string();
+            applied.replace_range(convert[0].span.into_range(), &convert[0].replacement);
+            let entry = dir.join("main.vl");
+            std::fs::write(&entry, &applied).unwrap();
+            let reanalyzed = Document::analyze(&applied, &std_root(), &entry);
+            assert!(
+                reanalyzed.diagnostics.is_empty(),
+                "applying the fix to `{value}` should leave the file clean: {:#?}",
+                reanalyzed.diagnostics
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// E218's negative: a mismatch that is not between two numeric widths
+    /// names no conversion, so none is offered.
+    #[test]
+    fn quickfix_offers_no_conversion_for_a_non_numeric_mismatch() {
+        let source = concat!(
+            "import std::io::print;\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet at: u53 = 1u53;\n",
+            "\tlet text: str = at;\n",
+            "\tprint(text);\n",
+            "}\n",
+            "main();\n",
+        );
+        let (dir, document) = analyze_workspace(&[("main.vl", source)]);
+        let program = document.program.as_ref().unwrap();
+        let text = document.line_index.text();
+        let whole_file = Span {
+            start: 0,
+            end: text.len(),
+        };
+        let fixes = document.quickfixes(program, whole_file);
+        assert!(
+            !document.diagnostics.is_empty(),
+            "the program is refused, so the negative is not vacuous"
+        );
+        assert!(
+            fixes
+                .iter()
+                .all(|fix| !fix.title.starts_with("Convert with")),
+            "no conversion is offered: {:?}",
+            fixes.iter().map(|fix| &fix.title).collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The operand rule behind the parentheses.
+    #[test]
+    fn a_postfix_operand_is_a_name_path_or_call_chain() {
+        for written in [
+            "n",
+            "xs.len()",
+            "self.cells[at].value",
+            "list.get(\"a b\")",
+            "a?",
+        ] {
+            assert!(is_postfix_operand(written), "{written} takes a method call");
+        }
+        for written in [
+            "5",
+            "-n",
+            "a + b",
+            "(a) + b",
+            "\"text\"",
+            "a)(",
+            "if c { a } else { b }",
+        ] {
+            assert!(!is_postfix_operand(written), "{written} needs parentheses");
+        }
     }
 
     // A99's negative: a call that simply misses a method on some OTHER type

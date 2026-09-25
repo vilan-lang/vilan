@@ -3091,7 +3091,7 @@ pub struct Scope<'src> {
 /// an unsigned id (`u53`) could not cross the wire and `std::json` — which
 /// carries the same family — was a strictly wider door than `std::wire`.
 const WIRE_SCALAR_NAMES: &[&str] = &[
-    "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64",
+    "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "usize", "f32", "f64",
 ];
 
 /// The scalars `Hashable` is satisfied by outright — the fast path
@@ -3101,7 +3101,8 @@ const WIRE_SCALAR_NAMES: &[&str] = &[
 /// accepts and the other rejects — a field the derive admits and a key the
 /// return check refuses, or the reverse — is no longer expressible.
 const HASHABLE_SCALAR_NAMES: &[&str] = &[
-    "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64", "Hash",
+    "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "usize", "f32", "f64",
+    "Hash",
 ];
 
 /// A `[derive(Wire)]` type awaiting the all-fields-Wire check: its name, its
@@ -5048,9 +5049,8 @@ fn removed_std_alias(root: &str, name: &str, at_std_root: bool) -> Option<String
         "print" | "panic" | "assert" => "io",
         "Default" => "default",
         "str" => "string",
-        "BigInt" | "f32" | "f64" | "i8" | "i16" | "i32" | "i53" | "u8" | "u16" | "u32" | "u53" => {
-            "number"
-        }
+        "BigInt" | "f32" | "f64" | "i8" | "i16" | "i32" | "i53" | "u8" | "u16" | "u32" | "u53"
+        | "usize" => "number",
         _ => return None,
     };
     // The primitives are ambient with no prelude at all (spec §4.7), so
@@ -5372,7 +5372,7 @@ fn contains_try_assert(node: &Node) -> bool {
 /// minus `null`, which has no operators. `bool` belongs to the same class but
 /// is a numeric *enum*, so it is handled beside this list, never in it.
 const NATIVE_OPERATOR_PRIMITIVES: &[&str] = &[
-    "i32", "u32", "f64", "BigInt", "str", "i8", "u8", "i16", "u16", "i53", "u53", "f32",
+    "i32", "u32", "f64", "BigInt", "str", "i8", "u8", "i16", "u16", "i53", "u53", "usize", "f32",
 ];
 
 /// The member a `str` concatenation routes a non-native operand through —
@@ -5381,6 +5381,23 @@ const NATIVE_OPERATOR_PRIMITIVES: &[&str] = &[
 /// declaring `to_string(self): str` carries it, whether it is `Display`, a
 /// trait with `Display` as a supertrait, or a program's own.
 pub const RENDER_MEMBER: &str = "to_string";
+
+/// E218: the sentence a numeric-to-numeric mismatch appends, up to the
+/// conversion's name — `Expected u53, but got i32 instead. There are no
+/// implicit numeric conversions; convert with `.as_u53()``. The language
+/// server reads the name back off the message for its quick fix, so the head
+/// is shared rather than spelled twice; [`Analyzer::type_mismatch_message`]
+/// writes the whole sentence literally (the diagnostics ledger searches the
+/// tree for it), and the server's quick-fix pin reds if the two drift apart.
+pub const NUMERIC_CONVERSION_STEER: &str =
+    "There are no implicit numeric conversions; convert with `.";
+
+/// E218: the numeric widths an `as_*` method converts INTO — every numeric
+/// primitive but `BigInt`, which no width converts to by method. Each of the
+/// eleven numeric types carries the whole row (`number.vl`).
+const CONVERTIBLE_NUMERIC_NAMES: &[&str] = &[
+    "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "usize", "f32", "f64",
+];
 
 fn is_overloadable_operator(op: BinaryOp) -> bool {
     operator_trait_method(op).is_some()
@@ -10506,7 +10523,8 @@ impl<'src> Analyzer<'src> {
         visiting: &mut HashSet<TypeId>,
     ) -> (bool, bool) {
         const SCALARS: &[&str] = &[
-            "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64",
+            "str", "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "usize", "f32",
+            "f64",
         ];
         let signal_id = self.primitive_struct_ids.get("SignalCell").copied();
         let shared_id = self.primitive_struct_ids.get("Shared").copied();
@@ -35527,7 +35545,8 @@ impl<'src> Analyzer<'src> {
             // (`0` against an `f64` field), defaulting to `i32`.
             Expr::Number(_, fraction, suffix) => {
                 const NUMERIC_PRIMITIVES: &[&str] = &[
-                    "f64", "u32", "i32", "BigInt", "i8", "u8", "i16", "u16", "i53", "u53", "f32",
+                    "f64", "u32", "i32", "BigInt", "i8", "u8", "i16", "u16", "i53", "u53", "usize",
+                    "f32",
                 ];
                 let name = match *suffix {
                     Some("u32") => "u32",
@@ -35541,6 +35560,7 @@ impl<'src> Analyzer<'src> {
                     Some("u16") => "u16",
                     Some("i53") => "i53",
                     Some("u53") => "u53",
+                    Some("usize") => "usize",
                     _ => {
                         // Unsuffixed: a fractional literal is a float (`f32`
                         // only by expectation); an integer takes the expected
@@ -40436,6 +40456,53 @@ impl<'src> Analyzer<'src> {
         Ok(Some(collected))
     }
 
+    /// The general type mismatch, "Expected A, but got B instead." — with the
+    /// conversion named when both sides are numeric widths (E218).
+    ///
+    /// There are no implicit conversions between the widths, and a value of
+    /// the wrong one is fixed by exactly one call, `.as_<expected>()`, which
+    /// every numeric type carries. The binary-operator refusal said so
+    /// (ledger 357); the positions that type a value against a DECLARED type
+    /// — an argument, a `let` annotation, a reassignment, a return, a field —
+    /// said only the plain sentence, which every index conversion meets (I5).
+    /// `BigInt` is left out as a target: nothing converts into it by method.
+    fn type_mismatch_message(
+        &self,
+        expected_type: &Type,
+        got_type: &Type,
+        substitution_context: &SubstitutionContext,
+    ) -> String {
+        let expected = self.pretty_print_type(expected_type, substitution_context);
+        let got = self.pretty_print_type(got_type, substitution_context);
+        match self.numeric_conversion_target(expected_type, got_type) {
+            Some(target) => format!(
+                "Expected {expected}, but got {got} instead. There are no implicit numeric \
+                 conversions; convert with `.as_{target}()`"
+            ),
+            None => format!("Expected {expected}, but got {got} instead."),
+        }
+    }
+
+    /// The width a value of `got_type` converts to with `.as_<width>()` to fit
+    /// `expected_type`, when both are distinct numeric widths and the target
+    /// has such a method (E218).
+    fn numeric_conversion_target(
+        &self,
+        expected_type: &Type,
+        got_type: &Type,
+    ) -> Option<&'static str> {
+        let numeric_name = |type_: &Type, names: &[&'static str]| match type_ {
+            Type::Struct(id, _) => names
+                .iter()
+                .find(|name| self.primitive_struct_ids.get(**name) == Some(id))
+                .copied(),
+            _ => None,
+        };
+        let target = numeric_name(expected_type, CONVERTIBLE_NUMERIC_NAMES)?;
+        let source = numeric_name(got_type, crate::type_::NUMERIC_PRIMITIVE_NAMES)?;
+        (target != source).then_some(target)
+    }
+
     /// Records a resolved call: a `FunctionCall` plus the `Expr::Call` entity.
     /// The diagnostic for an argument that does not fit its declared parameter
     /// — with the BARE TRAIT case steered (B72).
@@ -40464,9 +40531,8 @@ impl<'src> Analyzer<'src> {
         argument_type: &Type,
         substitution_context: &SubstitutionContext,
     ) -> (String, Option<crate::error::Note>) {
-        let expected = self.pretty_print_type(parameter_type, substitution_context);
         let got = self.pretty_print_type(argument_type, substitution_context);
-        let plain = format!("Expected {expected}, but got {got} instead.");
+        let plain = self.type_mismatch_message(parameter_type, argument_type, substitution_context);
         let Type::Trait(trait_id, _) = parameter_type else {
             return (plain, None);
         };
@@ -41206,11 +41272,23 @@ impl<'src> Analyzer<'src> {
                             ),
                             None => (String::new(), None),
                         };
+                    // A DECLARED parameter type is the E218 position: the
+                    // conversion is the fix. An inferred one keeps the
+                    // annotate-it steer, which is the more useful sentence.
+                    let msg = if origin.is_empty() {
+                        self.type_mismatch_message(
+                            &parameter_type,
+                            &argument_type,
+                            &substitution_context,
+                        )
+                    } else {
+                        format!("Expected {expected}, but got {got} instead.{origin}")
+                    };
                     self.diagnostics.push(Error {
                         trace: Vec::new(),
                         note,
                         span: **self.span_map.get(&argument_id).unwrap(),
-                        msg: format!("Expected {}, but got {} instead.{}", expected, got, origin),
+                        msg,
                     });
                 }
             }
@@ -41317,14 +41395,16 @@ impl<'src> Analyzer<'src> {
                             self.reconcile_type(&argument_type, &data_type, &substitution_context);
                         self.inferable_generics = previously_inferable;
                         if reconciled.is_none() {
-                            let expected =
-                                self.pretty_print_type(&data_type, &substitution_context);
-                            let got = self.pretty_print_type(&argument_type, &substitution_context);
+                            let msg = self.type_mismatch_message(
+                                &data_type,
+                                &argument_type,
+                                &substitution_context,
+                            );
                             self.diagnostics.push(Error {
                                 trace: Vec::new(),
                                 note: None,
                                 span: **self.span_map.get(&argument_id).unwrap(),
-                                msg: format!("Expected {}, but got {} instead.", expected, got),
+                                msg,
                             });
                         }
                     }
@@ -42922,13 +43002,13 @@ impl<'src> Analyzer<'src> {
                 .reconcile_type(&argument_type, &slot_type, &HashMap::default())
                 .is_none()
             {
-                let expected = self.pretty_print_type(&slot_type, &HashMap::default());
-                let got = self.pretty_print_type(&argument_type, &HashMap::default());
+                let msg =
+                    self.type_mismatch_message(&slot_type, &argument_type, &HashMap::default());
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&argument_id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!("Expected {}, but got {} instead.", expected, got),
+                    msg,
                 });
                 return Resolution::Failed;
             }
@@ -43063,13 +43143,16 @@ impl<'src> Analyzer<'src> {
                 .reconcile_type(&argument_type, &parameter_type, &HashMap::default())
                 .is_none()
             {
-                let expected = self.pretty_print_type(&parameter_type, &HashMap::default());
-                let got = self.pretty_print_type(&argument_type, &HashMap::default());
+                let msg = self.type_mismatch_message(
+                    &parameter_type,
+                    &argument_type,
+                    &HashMap::default(),
+                );
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&argument_id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!("Expected {}, but got {} instead.", expected, got),
+                    msg,
                 });
             }
         }
@@ -43265,14 +43348,16 @@ impl<'src> Analyzer<'src> {
                     }
                 }
                 None => {
-                    let expected_str =
-                        self.pretty_print_type(&variable_type, &substitution_context);
-                    let got_str = self.pretty_print_type(&value_type, &substitution_context);
+                    let msg = self.type_mismatch_message(
+                        &variable_type,
+                        &value_type,
+                        &substitution_context,
+                    );
                     self.diagnostics.push(Error {
                         trace: Vec::new(),
                         note: None,
                         span: **self.span_map.get(&first_value_id).unwrap(),
-                        msg: format!("Expected {}, but got {} instead.", expected_str, got_str),
+                        msg,
                     });
                 }
             }
@@ -43304,7 +43389,6 @@ impl<'src> Analyzer<'src> {
                 None => {
                     let expected_str =
                         self.pretty_print_type(&variable_type, &substitution_context);
-                    let got_str = self.pretty_print_type(&value_type, &substitution_context);
                     // The type the reassignment broke was inferred, not
                     // written — name the origin (B3).
                     let note = inferred_origin.map(|span| {
@@ -43315,11 +43399,16 @@ impl<'src> Analyzer<'src> {
                             ),
                         )
                     });
+                    let msg = self.type_mismatch_message(
+                        &variable_type,
+                        &value_type,
+                        &substitution_context,
+                    );
                     self.diagnostics.push(Error {
                         trace: Vec::new(),
                         note,
                         span: **self.span_map.get(&value_id).unwrap(),
-                        msg: format!("Expected {}, but got {} instead.", expected_str, got_str),
+                        msg,
                     });
                 }
             }
@@ -43867,9 +43956,7 @@ impl<'src> Analyzer<'src> {
                 "Expected {expected}, but got void instead: an `if` with no `else` produces void."
             )
         } else {
-            let expected = self.pretty_print_type(target_return_type, substitution_context);
-            let got = self.pretty_print_type(&body_type, substitution_context);
-            format!("Expected {}, but got {} instead.", expected, got)
+            self.type_mismatch_message(target_return_type, &body_type, substitution_context)
         };
         ReturnPositionCheck::Mismatched(msg)
     }
@@ -46510,11 +46597,7 @@ impl<'src> Analyzer<'src> {
                     trace: Vec::new(),
                     note: None,
                     span: value_span,
-                    msg: format!(
-                        "Expected {}, but got {} instead.",
-                        self.pretty_print_type(field_type, substitution_context),
-                        self.pretty_print_type(&value_type, substitution_context),
-                    ),
+                    msg: self.type_mismatch_message(field_type, &value_type, substitution_context),
                 });
                 FieldValueVerdict::Refused
             }
@@ -47174,6 +47257,18 @@ impl<'src> Analyzer<'src> {
             return true;
         }
         if index_type == expected {
+            return true;
+        }
+        // I5 S1: `usize` is admitted BESIDE `i32`, at the subscript only — a
+        // two-type admission for the one release in which both spellings are
+        // an index. The expectation above stays `i32`, so a literal index and
+        // every emitted subscript are unchanged; the message below keeps
+        // naming `i32` because it steers to the type `xs.get(i)` takes, which
+        // is still `i32` until S2. S2 (the std signatures move to `usize`)
+        // DELETES this admission and makes `usize` the expectation.
+        if let Some(usize_struct_id) = self.primitive_struct_ids.get("usize").copied()
+            && index_type == Type::Struct(usize_struct_id, Vec::new())
+        {
             return true;
         }
         let index_str = self.pretty_print_type(&index_type, &HashMap::default());
@@ -50629,9 +50724,11 @@ impl<'src> Analyzer<'src> {
                         self.division_generic_lhs.insert(binary_id, *constraint_id);
                     }
                     (_, Type::Struct(id, _))
-                        if ["i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53"]
-                            .iter()
-                            .any(|name| self.primitive_struct_ids.get(*name) == Some(id)) =>
+                        if [
+                            "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "usize",
+                        ]
+                        .iter()
+                        .any(|name| self.primitive_struct_ids.get(*name) == Some(id)) =>
                     {
                         self.integer_division.insert(binary_id);
                     }
@@ -51760,6 +51857,7 @@ impl<'src> Analyzer<'src> {
                 ("u32", 4_294_967_295, false),
                 ("i32", 2_147_483_648, true),
                 ("u53", 9_007_199_254_740_992, false),
+                ("usize", 9_007_199_254_740_992, false),
                 ("i53", 9_007_199_254_740_992, true),
             ];
             let Some((name, bound, signed)) = BOUNDS
@@ -51776,7 +51874,7 @@ impl<'src> Analyzer<'src> {
             if value.map(|value| value <= bound).unwrap_or(false) {
                 continue;
             }
-            let range = if matches!(name, "i53" | "u53") {
+            let range = if matches!(name, "i53" | "u53" | "usize") {
                 "exact integers span ±2^53 on the JS backend; use `BigInt` for larger values"
                     .to_string()
             } else if signed {
@@ -61401,6 +61499,7 @@ fn analyze_inner<'src>(
         ("u16", "number"),
         ("i53", "number"),
         ("u53", "number"),
+        ("usize", "number"),
         ("f32", "number"),
     ] {
         let id = module_scopes

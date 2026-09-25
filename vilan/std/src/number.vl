@@ -451,6 +451,36 @@ export impl u53 with Ord {
 	}
 }
 
+export impl usize with Eq {}
+
+export impl usize with PartialOrd {
+	fun partial_compare(self, b: usize): Option<Ordering> {
+		if self < b {
+			Some(Ordering::Less)
+		} else {
+			if self > b {
+				Some(Ordering::Greater)
+			} else {
+				Some(Ordering::Equal)
+			}
+		}
+	}
+}
+
+export impl usize with Ord {
+	fun compare(self, b: usize): Ordering {
+		if self < b {
+			Ordering::Less
+		} else {
+			if self > b {
+				Ordering::Greater
+			} else {
+				Ordering::Equal
+			}
+		}
+	}
+}
+
 export impl BigInt with Eq {}
 
 export impl BigInt with PartialOrd {
@@ -768,6 +798,15 @@ export external struct i53;
 
 export external struct u53;
 
+/// The index type (tracker I5, `proposal/index-type.md`): a position, a length,
+/// a count. A DISTINCT type, not an alias — `u53` on the JS targets, the
+/// platform word natively — whose range guarantee is the JS one, [0, 2^53], on
+/// every backend. Subtracting past zero is UNSPECIFIED, never memory-unsafe: on
+/// JS the value leaves the range and goes negative, natively Rust's own rule
+/// applies (a panic in a debug build). `checked_sub` and `saturating_sub` are the
+/// defined answers.
+export external struct usize;
+
 export external struct f32;
 
 // Conversions (`as_*`, numeric-types.md §4): truncate toward zero, then fold into
@@ -799,6 +838,9 @@ external fun label_i64(value: f64): i53;
 
 [extern("Number")]
 external fun label_u64(value: f64): u53;
+
+[extern("Number")]
+external fun label_usize(value: f64): usize;
 
 [extern("Number")]
 external fun label_f32(value: f64): f32;
@@ -921,6 +963,11 @@ export impl i8 {
 		label_u64(widened.trunc())
 	}
 
+	fun as_usize(self): usize {
+		let widened = self.as_f64();
+		label_usize(widened.trunc())
+	}
+
 	fun as_f32(self): f32 {
 		let widened = self.as_f64();
 		label_f32(widened)
@@ -993,6 +1040,11 @@ export impl u8 {
 	fun as_u53(self): u53 {
 		let widened = self.as_f64();
 		label_u64(widened.trunc())
+	}
+
+	fun as_usize(self): usize {
+		let widened = self.as_f64();
+		label_usize(widened.trunc())
 	}
 
 	fun as_f32(self): f32 {
@@ -1072,6 +1124,11 @@ export impl i16 {
 		label_u64(widened.trunc())
 	}
 
+	fun as_usize(self): usize {
+		let widened = self.as_f64();
+		label_usize(widened.trunc())
+	}
+
 	fun as_f32(self): f32 {
 		let widened = self.as_f64();
 		label_f32(widened)
@@ -1146,6 +1203,11 @@ export impl u16 {
 		label_u64(widened.trunc())
 	}
 
+	fun as_usize(self): usize {
+		let widened = self.as_f64();
+		label_usize(widened.trunc())
+	}
+
 	fun as_f32(self): f32 {
 		let widened = self.as_f64();
 		label_f32(widened)
@@ -1207,6 +1269,11 @@ export impl i32 {
 		label_u64(widened.trunc())
 	}
 
+	fun as_usize(self): usize {
+		let widened = self.as_f64();
+		label_usize(widened.trunc())
+	}
+
 	fun as_f32(self): f32 {
 		let widened = self.as_f64();
 		label_f32(widened)
@@ -1266,6 +1333,11 @@ export impl u32 {
 	fun as_u53(self): u53 {
 		let widened = self.as_f64();
 		label_u64(widened.trunc())
+	}
+
+	fun as_usize(self): usize {
+		let widened = self.as_f64();
+		label_usize(widened.trunc())
 	}
 
 	fun as_f32(self): f32 {
@@ -1348,6 +1420,11 @@ export impl i53 {
 		label_u64(widened.trunc())
 	}
 
+	fun as_usize(self): usize {
+		let widened = self.as_f64();
+		label_usize(widened.trunc())
+	}
+
 	fun as_f32(self): f32 {
 		let widened = self.as_f64();
 		label_f32(widened)
@@ -1420,6 +1497,113 @@ export impl u53 {
 	}
 
 	fun as_u53(self): u53 {
+		self
+	}
+
+	fun as_usize(self): usize {
+		let widened = self.as_f64();
+		label_usize(widened.trunc())
+	}
+
+	fun as_f32(self): f32 {
+		let widened = self.as_f64();
+		label_f32(widened)
+	}
+}
+
+export impl usize {
+	/// The largest `usize` — `9007199254740992`, the top of the [0, 2^53] window
+	/// the JS targets guarantee. The SAME on every backend (I5 §11 Q3): natively a
+	/// `usize` is the platform word and could hold more, but a program that printed
+	/// the platform's ceiling would differ by backend. Stopgap spelling for
+	/// `usize::MAX`; see the type bounds note above.
+	fun max_value(): usize {
+		9007199254740992usize
+	}
+
+	/// The smallest `usize` — `0`. Stopgap spelling for `usize::MIN`; see the type
+	/// bounds note above.
+	fun min_value(): usize {
+		0usize
+	}
+
+	[extern("Math.pow")]
+	external fun pow(self, exponent: usize): usize;
+
+	[extern("Math.min")]
+	external fun min(self, other: usize): usize;
+
+	[extern("Math.max")]
+	external fun max(self, other: usize): usize;
+
+	fun rem(self, m: usize): usize {
+		self - self / m * m
+	}
+
+	/// `self - other`, or `None` when `other` is larger — the defined answer to a
+	/// subtraction that would leave the type's range (a bare `-` past zero is
+	/// unspecified).
+	fun checked_sub(self, other: usize): Option<usize> {
+		if self >= other {
+			Some(self - other)
+		} else {
+			None
+		}
+	}
+
+	/// `self - other`, stopping at `0` rather than leaving the type's range.
+	fun saturating_sub(self, other: usize): usize {
+		if self >= other {
+			self - other
+		} else {
+			0usize
+		}
+	}
+
+	[extern("Number")]
+	external fun as_f64(self): f64;
+
+	fun as_i8(self): i8 {
+		let widened = self.as_f64();
+		label_i8(fold_signed(widened, 256f, 128f))
+	}
+
+	fun as_u8(self): u8 {
+		let widened = self.as_f64();
+		label_u8(fold_unsigned(widened, 256f))
+	}
+
+	fun as_i16(self): i16 {
+		let widened = self.as_f64();
+		label_i16(fold_signed(widened, 65536f, 32768f))
+	}
+
+	fun as_u16(self): u16 {
+		let widened = self.as_f64();
+		label_u16(fold_unsigned(widened, 65536f))
+	}
+
+	fun as_i32(self): i32 {
+		let widened = self.as_f64();
+		label_i32(fold_signed(widened, 4294967296f, 2147483648f))
+	}
+
+	fun as_u32(self): u32 {
+		let widened = self.as_f64();
+		label_u32(fold_unsigned(widened, 4294967296f))
+	}
+
+	fun as_i53(self): i53 {
+		let widened = self.as_f64();
+		label_i64(widened.trunc())
+	}
+
+	fun as_u53(self): u53 {
+		let widened = self.as_f64();
+		label_u64(widened.trunc())
+	}
+
+	fun as_usize(self): usize {
 		self
 	}
 
@@ -1511,6 +1695,11 @@ export impl f32 {
 		label_u64(widened.trunc())
 	}
 
+	fun as_usize(self): usize {
+		let widened = self.as_f64();
+		label_usize(widened.trunc())
+	}
+
 	fun as_f32(self): f32 {
 		self
 	}
@@ -1555,6 +1744,11 @@ export impl f64 {
 	fun as_u53(self): u53 {
 		let widened = self;
 		label_u64(widened.trunc())
+	}
+
+	fun as_usize(self): usize {
+		let widened = self;
+		label_usize(widened.trunc())
 	}
 
 	fun as_f32(self): f32 {
@@ -1609,6 +1803,11 @@ export impl BigInt {
 	fun as_u53(self): u53 {
 		let widened = self.as_f64();
 		label_u64(widened.trunc())
+	}
+
+	fun as_usize(self): usize {
+		let widened = self.as_f64();
+		label_usize(widened.trunc())
 	}
 
 	fun as_f32(self): f32 {
@@ -1829,6 +2028,42 @@ export impl u53 with Mul {
 
 export impl u53 with Div {
 	fun div(self, b: u53): u53 {
+		self / b
+	}
+}
+
+export impl usize with Default {
+	fun default(): usize {
+		0usize
+	}
+}
+
+export impl usize with PartialEq {
+	fun eq(self, b: usize): bool {
+		self == b
+	}
+}
+
+export impl usize with Add {
+	fun add(self, b: usize): usize {
+		self + b
+	}
+}
+
+export impl usize with Sub {
+	fun sub(self, b: usize): usize {
+		self - b
+	}
+}
+
+export impl usize with Mul {
+	fun mul(self, b: usize): usize {
+		self * b
+	}
+}
+
+export impl usize with Div {
+	fun div(self, b: usize): usize {
 		self / b
 	}
 }

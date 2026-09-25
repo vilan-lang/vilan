@@ -11,7 +11,8 @@ use crate::id::Id;
 /// carried its own copy of the names and never grew the `bool` case), which
 /// miscompiled a generic `&mut T` resolving to `bool`.
 pub const SCALAR_PRIMITIVE_NAMES: &[&str] = &[
-    "str", "i32", "u32", "f64", "BigInt", "null", "i8", "u8", "i16", "u16", "i53", "u53", "f32",
+    "str", "i32", "u32", "f64", "BigInt", "null", "i8", "u8", "i16", "u16", "i53", "u53", "usize",
+    "f32",
 ];
 
 /// The numeric PRIMITIVE type names — the scalar primitives minus the three
@@ -20,7 +21,7 @@ pub const SCALAR_PRIMITIVE_NAMES: &[&str] = &[
 /// of nothing else, so B370's context record is filtered by this list; beside
 /// `SCALAR_PRIMITIVE_NAMES` so the two cannot drift apart unnoticed.
 pub const NUMERIC_PRIMITIVE_NAMES: &[&str] = &[
-    "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f32", "f64", "BigInt",
+    "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "usize", "f32", "f64", "BigInt",
 ];
 
 /// The numeric-literal type suffixes the analyzer accepts (`42u32`, `1.5f`,
@@ -31,7 +32,7 @@ pub const NUMERIC_PRIMITIVE_NAMES: &[&str] = &[
 /// found the theme current and the TextMate grammar a release behind on the
 /// sibling primitive-type list, which is the drift that gate closes.
 pub const NUMERIC_SUFFIXES: &[&str] = &[
-    "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "f", "f32", "f64", "n",
+    "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "usize", "f", "f32", "f64", "n",
 ];
 
 // `Hash` because the resolved type is a memo KEY: impl selection over a

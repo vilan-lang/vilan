@@ -4413,7 +4413,9 @@ impl<'src> Transformer<'src> {
     /// Concrete verdicts were recorded by the analyzer; a generic operand
     /// resolves under the active monomorphization's substitution.
     fn binary_operands_are_integer(&self, binary_id: Id) -> bool {
-        const INTEGER_PRIMITIVES: &[&str] = &["i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53"];
+        const INTEGER_PRIMITIVES: &[&str] = &[
+            "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "usize",
+        ];
         if self.program.integer_division.contains(&binary_id) {
             return true;
         }

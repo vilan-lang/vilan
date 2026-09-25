@@ -27,8 +27,8 @@
 			className: "number",
 			variants: [
 				// GENERATED(number-suffixes): type_.rs NUMERIC_SUFFIXES — regenerate: VILAN_REGENERATE_GRAMMARS=1 cargo test -p vilan-cli --test grammar_sync generated
-				{ begin: "\\b0x[0-9a-fA-F]+(?:f32|f64|i16|i32|i53|u16|u32|u53|i8|u8|f|n)?" },
-				{ begin: "\\b\\d+(?:\\.\\d+)?(?:f32|f64|i16|i32|i53|u16|u32|u53|i8|u8|f|n)?" },
+				{ begin: "\\b0x[0-9a-fA-F]+(?:usize|f32|f64|i16|i32|i53|u16|u32|u53|i8|u8|f|n)?" },
+				{ begin: "\\b\\d+(?:\\.\\d+)?(?:usize|f32|f64|i16|i32|i53|u16|u32|u53|i8|u8|f|n)?" },
 				// END GENERATED(number-suffixes)
 			],
 		};
