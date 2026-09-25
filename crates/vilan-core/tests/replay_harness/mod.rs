@@ -72,8 +72,11 @@ pub fn module_entry(revision: u32) -> String {
 
 /// Everything the M19 differential compares, plus the census that says whether
 /// the run it came from actually reused anything (a differential that agreed
-/// because nothing was reused would be vacuous).
-pub type ReuseObservation = (String, String, Option<String>, (usize, usize, usize));
+/// because nothing was reused would be vacuous), and whether its world was
+/// SERVED from the base cache (N132) — the precondition of any reuse, so the
+/// pins can hold every pair that hit to reuse and leave a pair the LRU evicted
+/// to the hit-rate floor.
+pub type ReuseObservation = (String, String, Option<String>, (usize, usize, usize), bool);
 
 /// The source root a package's manifest declares, resolved against the
 /// manifest's own directory — what `pkg_root` has to be for a real package
@@ -185,6 +188,7 @@ pub fn observe_in_package(
                 warnings,
                 javascript,
                 vilan_core::analyzer::reuse_census(),
+                vilan_core::analyzer::served_from_base_cache(),
             )
         })
         .expect("spawn worker")
@@ -305,6 +309,7 @@ pub fn observe_open_module(
                 warnings,
                 javascript,
                 vilan_core::analyzer::reuse_census(),
+                vilan_core::analyzer::served_from_base_cache(),
             )
         })
         .expect("spawn worker")
