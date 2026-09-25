@@ -25,6 +25,7 @@ option-view	0	0
 dyn-objects	3	27
 usize	6	10
 usize-literals	1	3
+unsigned-saturate	0	17
 bytes-aliasing	2	7
 delta-law	21	53
 reactive-on-change	3	30

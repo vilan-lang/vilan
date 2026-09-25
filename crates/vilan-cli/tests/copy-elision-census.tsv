@@ -130,6 +130,7 @@ try-assert	2
 tuple-access	1
 tuple-spread	10
 unary-minus	0
+unsigned-saturate	0
 usize	6
 usize-literals	4
 usize-underflow	0

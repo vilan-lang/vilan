@@ -133,6 +133,9 @@ const DEFAULT_SUITE: &[&str] = &[
     // I5 S1 + B389: the literal law at `usize`, all 21 measured positions in one
     // program — the literals' native widths are the record B389 writes.
     "usize-literals.vl",
+    // I6 (RULED): a negative converted to `u53`/`usize` saturates to 0 — the
+    // JS clamp against Rust's own `f64 as u64`, every signed source width.
+    "unsigned-saturate.vl",
     // F33 (RULED (a)): `Bytes` is one shared, mutable buffer behind every
     // holder — two bindings, a parameter, a struct copy, a list and a closure
     // capture all write into the same bytes, as a `Uint8Array` does; `slice`

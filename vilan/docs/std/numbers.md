@@ -215,6 +215,18 @@ fun main() {
 }
 ```
 
+The two unsigned widths that do not fold, `u53` and `usize`, **saturate**
+instead: a negative converts to `0` on every backend, as a native `f64 as
+u64` does, and a positive truncates as usual.
+
+```vilan
+fun main() {
+	print((-5).as_usize());   // 0 — saturated, not folded
+	print((-2.5).as_u53());   // 0
+	print((7.9).as_usize());  // 7
+}
+```
+
 Conversions on literals fold at compile time.
 
 ## std::math

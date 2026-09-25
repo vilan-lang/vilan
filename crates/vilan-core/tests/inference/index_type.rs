@@ -611,3 +611,101 @@ fn a_usize_subtracted_past_zero_goes_negative_on_js() {
         "-1\n",
     );
 }
+
+// --- a negative converted to an unsigned width (I6, RULED) --------------------------
+//
+// `as_u53()` and `as_usize()` of a negative SATURATE to 0 on every backend
+// (the owner's ruling, 2026-09-25): a conversion is an explicit call and has
+// one defined answer. Natively that is Rust's own `f64 as u64`/`as usize`;
+// on JS the conversion used to truncate and keep the sign (`-5`), so the JS
+// half is the clamp these pins hold. One pin per SOURCE width that can be
+// negative; the unsigned sources never are. The narrow unsigned targets
+// (`as_u8`/`as_u16`/`as_u32`) FOLD, identically on both backends, and are
+// not this ruling's.
+
+#[test]
+fn a_negative_i8_saturates_to_zero_at_u53_and_usize() {
+    assert_compiles_and_runs(
+        "fun main() { let v = -5i8; print(i\"{v.as_u53()} {v.as_usize()}\"); }",
+        "0 0\n",
+    );
+}
+
+#[test]
+fn a_negative_i16_saturates_to_zero_at_u53_and_usize() {
+    assert_compiles_and_runs(
+        "fun main() { let v = -300i16; print(i\"{v.as_u53()} {v.as_usize()}\"); }",
+        "0 0\n",
+    );
+}
+
+#[test]
+fn a_negative_i32_saturates_to_zero_at_u53_and_usize() {
+    assert_compiles_and_runs(
+        "fun main() { let v = -1; print(i\"{v.as_u53()} {v.as_usize()}\"); }",
+        "0 0\n",
+    );
+}
+
+#[test]
+fn a_negative_i53_saturates_to_zero_at_u53_and_usize() {
+    assert_compiles_and_runs(
+        "fun main() { let v = -9007199254740000i53; print(i\"{v.as_u53()} {v.as_usize()}\"); }",
+        "0 0\n",
+    );
+}
+
+#[test]
+fn a_negative_f32_saturates_to_zero_at_u53_and_usize() {
+    // `-0.5` truncates to `-0` first, and the clamp answers a plain `0`
+    // rather than the `-0` node would print.
+    assert_compiles_and_runs(
+        concat!(
+            "fun main() {\n",
+            "\tlet v = -2.5f32;\n",
+            "\tlet w = -0.5f32;\n",
+            "\tprint(i\"{v.as_u53()} {v.as_usize()} {w.as_u53()} {w.as_usize()}\");\n",
+            "}\n",
+        ),
+        "0 0 0 0\n",
+    );
+}
+
+#[test]
+fn a_negative_f64_saturates_to_zero_at_u53_and_usize() {
+    assert_compiles_and_runs(
+        concat!(
+            "fun main() {\n",
+            "\tlet v = -7.9f;\n",
+            "\tlet w = -0.5f;\n",
+            "\tprint(i\"{v.as_u53()} {v.as_usize()} {w.as_u53()} {w.as_usize()}\");\n",
+            "}\n",
+        ),
+        "0 0 0 0\n",
+    );
+}
+
+#[test]
+fn a_negative_bigint_saturates_to_zero_at_u53_and_usize() {
+    assert_compiles_and_runs(
+        "fun main() { let v = -3n; print(i\"{v.as_u53()} {v.as_usize()}\"); }",
+        "0 0\n",
+    );
+}
+
+#[test]
+fn a_non_negative_value_converts_unchanged_at_u53_and_usize() {
+    // The clamp's other side: zero and a positive truncate as before.
+    assert_compiles_and_runs(
+        concat!(
+            "fun main() {\n",
+            "\tlet zero = 0;\n",
+            "\tlet v = 7.9f;\n",
+            "\tlet big = 9007199254740000i53;\n",
+            "\tprint(i\"{zero.as_u53()} {zero.as_usize()} {v.as_u53()} {v.as_usize()}\");\n",
+            "\tprint(i\"{big.as_u53()} {big.as_usize()}\");\n",
+            "}\n",
+        ),
+        "0 0 7 7\n9007199254740000 9007199254740000\n",
+    );
+}

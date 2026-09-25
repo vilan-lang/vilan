@@ -22,6 +22,16 @@ function fold_unsigned(value, modulus) {
 	}
 	return $f;
 }
+function saturate_unsigned(value) {
+	const truncated = Math.trunc(value);
+	let $k = null;
+	if (truncated > 0) {
+		$k = truncated;
+	} else {
+		$k = 0;
+	}
+	return $k;
+}
 function fold_signed(value, modulus, half) {
 	const wrapped = fold_unsigned(value, modulus);
 	let $g = null;
@@ -34,7 +44,7 @@ function fold_signed(value, modulus, half) {
 }
 function as_usize(self) {
 	const widened = Number(self);
-	return Number(Math.trunc(widened));
+	return Number(saturate_unsigned(widened));
 }
 function as_i32(self) {
 	const widened = Number(self);
