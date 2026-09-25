@@ -610,7 +610,14 @@ pub enum Node<'src> {
     // semantic token (E161: the wide span painted `type _: Source<type U>` as
     // one type-parameter run and the overlap filter then dropped every name
     // inside it).
-    TypeBinder(Spanned<&'src str>, Vec<Spanned<Self>>),
+    // A122: `impl type T: (2..) with Tuple` — a TUPLE-family bound in place of
+    // the trait-bound list (the two are exclusive, as on a generic parameter),
+    // boxed so the rare case costs the common one a pointer.
+    TypeBinder(
+        Spanned<&'src str>,
+        Vec<Spanned<Self>>,
+        Option<Box<TupleBound<'src>>>,
+    ),
     // `x = v` or a compound assignment like `x += v` (the operator is the
     // binary op the assignment applies, e.g. `Add` for `+=`). The target is an
     // lvalue: a local (`Accessor`) or a field place (`MemberAccessor`, e.g.
@@ -1169,9 +1176,15 @@ impl<'src> Node<'src> {
                 }
                 visit(body);
             }
-            Node::TypeBinder(_, bounds) => {
+            Node::TypeBinder(_, bounds, tuple_bound) => {
                 for bound in bounds {
                     visit(bound);
+                }
+                if let Some(element) = tuple_bound
+                    .as_ref()
+                    .and_then(|bound| bound.element.as_ref())
+                {
+                    visit(element);
                 }
             }
             Node::Assign(target, _, value) => {

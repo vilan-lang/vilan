@@ -93,7 +93,7 @@ fn collect_branch_selectors(branch: &ImportBranch<'_>, into: &mut Vec<Span>) {
 /// length) holds no binder and ends the descent.
 fn collect_selector_binders(node: &Spanned<Node<'_>>, into: &mut Vec<Span>) {
     match &node.0 {
-        Node::TypeBinder((name, _), bounds) => {
+        Node::TypeBinder((name, _), bounds, _) => {
             if *name != ANONYMOUS_TYPE_BINDER || !bounds.is_empty() {
                 into.push(node.1);
             }
@@ -5387,13 +5387,18 @@ impl<'a, 'src> Parser<'a, 'src> {
         // and what the binder's ENTITY must be spanned by is the thing an
         // editor selects for it (E161).
         let name_span = self.span_from(name_start);
-        let bounds = if self.eat_op(":") {
-            self.parse_type_bounds()?
+        // A122: a tuple-family bound (`type T: (2..)`) is tried before the
+        // trait-bound list, exactly as a generic parameter's is.
+        let (bounds, tuple_bound) = if self.eat_op(":") {
+            match self.parse_tuple_bound() {
+                Some(bound) => (Vec::new(), Some(Box::new(bound))),
+                None => (self.parse_type_bounds()?, None),
+            }
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
         Some((
-            Node::TypeBinder((name, name_span), bounds),
+            Node::TypeBinder((name, name_span), bounds, tuple_bound),
             self.span_from(start),
         ))
     }
@@ -8812,7 +8817,7 @@ mod tests {
                     .0
                     .into_iter()
                     .map(|argument| match argument.0 {
-                        Node::TypeBinder(name, bounds) => (name.0, bounds.len()),
+                        Node::TypeBinder(name, bounds, _) => (name.0, bounds.len()),
                         other => panic!("expected a TypeBinder argument, got {other:?}"),
                     })
                     .collect::<Vec<_>>(),
@@ -8845,7 +8850,7 @@ mod tests {
         match only_item("fun f(value: _) { }") {
             Node::Func(function) => {
                 match &function.parameters.0[0].declared_type.as_ref().unwrap().0 {
-                    Node::TypeBinder((name, name_span), bounds) => {
+                    Node::TypeBinder((name, name_span), bounds, _) => {
                         assert_eq!(*name, "_");
                         assert!(bounds.is_empty());
                         // The NAME's own span (E161), not the whole binder's.
@@ -9188,6 +9193,45 @@ mod tests {
         assert!(declines(
             "[internal(\"x\")] [deprecated(\"use B\")] struct A {}"
         ));
+    }
+
+    #[test]
+    fn an_impl_binder_takes_a_tuple_family_bound() {
+        // A122 (tuple-module.md §4.1): `impl type T: (2..) with Tuple` — the
+        // binder's bound is a tuple bound, tried before the trait-bound list
+        // as a generic parameter's is.
+        match only_item("impl type T: (2..) with Tuple { }") {
+            Node::Impl(subject, traits, _, _) => {
+                assert_eq!(traits.len(), 1);
+                match &subject.0 {
+                    Node::TypeBinder((name, _), bounds, Some(tuple_bound)) => {
+                        assert_eq!(*name, "T");
+                        assert!(bounds.is_empty());
+                        assert_eq!((tuple_bound.lo, tuple_bound.hi), (Some(2), None));
+                        assert!(tuple_bound.element.is_none());
+                    }
+                    other => panic!("expected a tuple-bounded binder, got {other:?}"),
+                }
+            }
+            other => panic!("expected an impl, got {other:?}"),
+        }
+        // The anonymous binder and an element bound take it too.
+        match only_item("impl _: (2..4: Display) with Tuple { }") {
+            Node::Impl(subject, ..) => assert!(matches!(
+                &subject.0,
+                Node::TypeBinder(_, _, Some(bound)) if bound.hi == Some(4) && bound.element.is_some()
+            )),
+            other => panic!("{other:?}"),
+        }
+        // A trait bound is still a trait bound.
+        match only_item("impl type T: Display with Show { }") {
+            Node::Impl(subject, ..) => {
+                assert!(
+                    matches!(&subject.0, Node::TypeBinder(_, bounds, None) if bounds.len() == 1)
+                );
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

@@ -4998,12 +4998,17 @@ impl<'src> Printer<'src> {
             // read as. A NAMED binder keeps its keyword; there the keyword is
             // the only thing saying "this introduces a name" in a position that
             // otherwise reads a type.
-            Node::TypeBinder((name, _name_span), bounds) => {
+            Node::TypeBinder((name, _name_span), bounds, tuple_bound) => {
                 if *name != ANONYMOUS_TYPE_BINDER {
                     self.out.push_str("type ");
                 }
                 self.out.push_str(name);
                 self.print_bounds(bounds);
+                // A122: the tuple-family bound, printed as a generic
+                // parameter's is.
+                if let Some(tuple_bound) = tuple_bound {
+                    self.print_tuple_bound(tuple_bound);
+                }
             }
             // `(A, B)` — a tuple type.
             Node::Tuple(elements) => {
@@ -5102,7 +5107,7 @@ impl<'src> Printer<'src> {
                 self.out.push_str(name);
                 self.print_split_type_arguments(arguments);
             }
-            Node::TypeBinder((name, _name_span), bounds) if !bounds.is_empty() => {
+            Node::TypeBinder((name, _name_span), bounds, None) if !bounds.is_empty() => {
                 if *name != ANONYMOUS_TYPE_BINDER {
                     self.out.push_str("type ");
                 }
@@ -5231,19 +5236,7 @@ impl<'src> Printer<'src> {
             // `(2..0)`. This was dropped entirely, which cost `reactive.vl` its
             // `combine<T: (2..)>` and, through the safety net, its whole file.
             if let Some(tuple_bound) = &parameter.tuple_bound {
-                self.out.push_str(": (");
-                if let Some(lo) = tuple_bound.lo {
-                    self.out.push_str(&lo.to_string());
-                }
-                self.out.push_str("..");
-                if let Some(hi) = tuple_bound.hi {
-                    self.out.push_str(&hi.to_string());
-                }
-                if let Some(element) = &tuple_bound.element {
-                    self.out.push_str(": ");
-                    self.print_type(&element.0);
-                }
-                self.out.push(')');
+                self.print_tuple_bound(tuple_bound);
             }
             if let Some(default) = &parameter.default {
                 self.out.push_str(" = ");
@@ -5316,6 +5309,25 @@ impl<'src> Printer<'src> {
             self.out.push_str(steer);
             self.out.push_str("\")] ");
         }
+    }
+
+    /// `: (lo..hi: element)` — a tuple-arity bound, on a generic parameter or
+    /// (A122) an impl subject's binder. Omitted endpoints stay omitted:
+    /// `(2..)` is not `(2..0)`.
+    fn print_tuple_bound(&mut self, tuple_bound: &crate::node::TupleBound<'src>) {
+        self.out.push_str(": (");
+        if let Some(lo) = tuple_bound.lo {
+            self.out.push_str(&lo.to_string());
+        }
+        self.out.push_str("..");
+        if let Some(hi) = tuple_bound.hi {
+            self.out.push_str(&hi.to_string());
+        }
+        if let Some(element) = &tuple_bound.element {
+            self.out.push_str(": ");
+            self.print_type(&element.0);
+        }
+        self.out.push(')');
     }
 
     /// `[platform("a", "b")]`, the patterns as written — a function's fence, an
@@ -8870,6 +8882,17 @@ mod idempotency {
         // B415: a host with no attribute on it reprints as itself.
         let bare = "mod self;\n\nfun f() {}\n";
         assert_eq!(format(bare), bare);
+    }
+
+    #[test]
+    fn a_tuple_bounded_impl_binder_survives_the_reprint() {
+        // A122: the binder's tuple bound prints as a generic parameter's does.
+        let source = concat!(
+            "impl type T: (2..) with Tuple {\n\tfun f(self) {}\n}\n\n",
+            "impl _: (2..4: Display) with Show {\n\tfun g(self) {}\n}\n",
+        );
+        assert_eq!(format(source), source);
+        assert_fixed_point("a122_binder", source);
     }
 
     #[test]

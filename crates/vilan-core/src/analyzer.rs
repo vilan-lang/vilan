@@ -5314,7 +5314,7 @@ fn subject_binder_bounds<'src>(subject: &Node<'src>) -> Vec<&'src str> {
         .0
         .iter()
         .filter_map(|argument| match &argument.0 {
-            Node::TypeBinder(_, bounds) => Some(bounds),
+            Node::TypeBinder(_, bounds, _) => Some(bounds),
             _ => None,
         })
         .flatten()
@@ -29400,11 +29400,28 @@ impl<'src> Analyzer<'src> {
     /// they constrain registers, so the nested ones register FIRST.
     fn register_subject_binders(&mut self, node: &'src Spanned<Node<'src>>, scope_id: Id) {
         match &node.0 {
-            Node::TypeBinder((name, name_span), bounds) => {
+            Node::TypeBinder((name, name_span), bounds, tuple_bound) => {
                 for bound in bounds {
                     self.register_subject_binders(bound, scope_id);
                 }
                 let constraint_type_id = self.register_binder(name, name_span, bounds, scope_id);
+                // A122: `impl type T: (2..)` — the tuple-family bound records
+                // against the binder's constraint exactly as a generic
+                // parameter's does (`register_generic_parameters`).
+                if let Some(tuple_bound) = tuple_bound {
+                    let element_bound = tuple_bound
+                        .element
+                        .as_deref()
+                        .map(|element| self.walk_trait_position_type_node(element, scope_id));
+                    self.tuple_bounds.insert(
+                        constraint_type_id,
+                        TupleBoundRequirement {
+                            lo: tuple_bound.lo,
+                            hi: tuple_bound.hi,
+                            element_bound,
+                        },
+                    );
+                }
                 self.withdraw_anonymous_binder_name(name, name_span, constraint_type_id, scope_id);
             }
             Node::AccessorWithGenerics(subject_name, generic_arguments) => {
@@ -29412,7 +29429,7 @@ impl<'src> Analyzer<'src> {
                 for (position, argument) in generic_arguments.0.iter().enumerate() {
                     // A bound-less `type T` directly under `Subject<..>` inherits
                     // `Subject`'s declared bound for this position, if known.
-                    if let Node::TypeBinder((binder_name, binder_span), bounds) = &argument.0
+                    if let Node::TypeBinder((binder_name, binder_span), bounds, None) = &argument.0
                         && bounds.is_empty()
                     {
                         if let Some(constraint_id) = inherited
@@ -33278,7 +33295,7 @@ impl<'src> Analyzer<'src> {
             // annotation, a field, a parameter): it falls through to the same
             // name resolution every other type spelling takes, which refuses it
             // and says what `_` is for.
-            Node::TypeBinder((name, name_span), _bounds) => {
+            Node::TypeBinder((name, name_span), _bounds, _) => {
                 match self
                     .anonymous_binder_parameters
                     .get(&(self.current_source_id, *name_span))

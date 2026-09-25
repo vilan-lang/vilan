@@ -7231,3 +7231,60 @@ fn b397_a_comprehension_over_scalar_elements_keeps_the_runtime_map() {
     assert_compiles_and_runs(source, "a=1 b=c\n");
     assert_emits_containing(source, ".map((c) =>");
 }
+
+/// A122's grammar alternative (tuple-module.md §4.1): an impl subject's binder
+/// takes a TUPLE-family bound, so `impl type T: (2..) with Arity` is a blanket
+/// over every tuple of arity ≥ 2 — one method, reached from a 2-tuple and a
+/// 3-tuple alike. Before this the binder's `:` read only a trait-bound list and
+/// the head failed at `found '2' expected a type`.
+#[test]
+fn a122_a_tuple_bounded_blanket_reaches_a_two_and_a_three_tuple() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "\n",
+            "trait Arity {\n",
+            "\tfun arity(self): str;\n",
+            "}\n",
+            "\n",
+            "impl type T: (2..) with Arity {\n",
+            "\tfun arity(self): str {\n",
+            "\t\t\"a tuple\"\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tprint((1, \"two\").arity());\n",
+            "\tprint((1, 2, 3).arity());\n",
+            "}\n",
+        ),
+        "a tuple\na tuple\n",
+    );
+}
+
+/// The bound is a bound: a value that is not a tuple of the family is not
+/// reached by the blanket — an `i32` has no `arity`, and neither does a tuple
+/// outside the arity range.
+#[test]
+fn a122_a_tuple_bounded_blanket_does_not_reach_outside_its_family() {
+    let blanket = concat!(
+        "trait Arity {\n",
+        "\tfun arity(self): str;\n",
+        "}\n",
+        "\n",
+        "impl type T: (3..) with Arity {\n",
+        "\tfun arity(self): str {\n",
+        "\t\t\"a tuple\"\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+    );
+    assert_fails_with(
+        &format!("{blanket}fun main() {{\n\tlet _ = 5.arity();\n}}\n"),
+        "'i32' is not a tuple",
+    );
+    assert_fails_with(
+        &format!("{blanket}fun main() {{\n\tlet _ = (1, 2).arity();\n}}\n"),
+        "the bound '(3..)' requires at least 3",
+    );
+}

@@ -367,6 +367,12 @@ wildcard's spelling, with the same optional bound (`impl
 Source<Option<_: Source<type U>>>`); each `_` is a parameter of its own, so
 two of them in one head are two parameters, exactly as `Some(_, _)` binds
 nothing twice. `type _` is accepted and `vilan fmt` prints it as `_`.
+A binder's bound may be a **tuple bound** instead of a trait-bound list,
+exactly as a generic parameter's may (§5.9): `impl type T: (2..) with
+Tuple { … }` is a blanket over every tuple of two or more elements, and
+impl selection admits a receiver the way a tuple-bounded parameter admits
+an argument — arity inside the range, every element satisfying the element
+bound.
 `with` lists the implemented trait(s). An impl without `with` provides
 inherent members. A trait's `with` lists supertraits.
 
@@ -699,7 +705,8 @@ recognized between two operands.
 
 ```text
 type = "&" [ "mut" ] type                       (* view type *)
-     | ( "type" IDENT | "_" ) [ ":" bound-list ] (* impl-subject binder *)
+     | ( "type" IDENT | "_" ) [ ":" ( bound-list | tuple-bound ) ]
+                                                 (* impl-subject binder *)
      | [ "async" | "sync" ] closure-type [ context-clause ]
      | "dyn" type-path                           (* trait object, §5.12 *)
      | type-path                                 (* nominal *)
