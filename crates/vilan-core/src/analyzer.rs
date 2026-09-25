@@ -19118,6 +19118,237 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// B408: `member_name` on a receiver typed by the caller's own bounded
+    /// parameter, answered by a BLANKET impl whose bounds the parameter's
+    /// declared bounds entail. `None` when no such blanket declares the name —
+    /// the caller then keeps its "has no method" verdict. On `Found` the call's
+    /// substitution is recorded: the blanket's binders bound to what the
+    /// caller's bounds say (`S` to the caller's `S`, `T` to the `i32` of its
+    /// `S: Src<i32>`), which the caller's instantiation grounds in turn.
+    fn resolve_blanket_through_bounds(
+        &mut self,
+        id: Id,
+        subject_type: &Type,
+        member_name: &'src str,
+    ) -> Option<ImplMemberResolution> {
+        let mut candidates = Vec::new();
+        for candidate in self.method_member_candidates(subject_type, member_name) {
+            if self.blanket_holds_through_bounds(candidate.impl_subject, subject_type) {
+                candidates.push(candidate);
+            }
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+        let resolution = self.rank_member_candidates(candidates.clone());
+        if let ImplMemberResolution::Found(member_id, impl_subject_id) = &resolution {
+            let bindings = self.blanket_bindings_through_bounds(*impl_subject_id, subject_type);
+            // A TRAIT's member the blanket provides (`impl type S: Src<i32>
+            // with Doubler`) is that trait's, and a trait member has ONE answer
+            // per type: the most specific impl of the trait at the concrete
+            // type, chosen at monomorphization like every call through a bound
+            // (spec types.md "Dispatch through a bound"). Wired to the blanket
+            // statically, a type with its own `impl Root with Doubler` would
+            // run the blanket's body here and its own everywhere else. The
+            // re-dispatch is sound because the more specific impl conforms to
+            // the trait's signature — the one checked here. An INHERENT
+            // blanket member has no trait to conform to, so it stays wired to
+            // the blanket (the concrete type's same-named inherent member may
+            // have any signature at all).
+            if let (Type::Generic(constraint_id), Some(candidate)) = (
+                subject_type,
+                candidates
+                    .iter()
+                    .find(|candidate| candidate.member_id == *member_id),
+            ) && let Some(trait_id) = candidate.home_trait
+            {
+                let arguments: Vec<TypeId> = candidate
+                    .home_arguments
+                    .iter()
+                    .map(|argument| {
+                        let argument = argument.get_type(self);
+                        self.substitute_type(&argument, &bindings).get_type_id(self)
+                    })
+                    .collect();
+                self.generic_dispatch.insert(
+                    id,
+                    GenericDispatch::OnConstraint(*constraint_id, member_name),
+                );
+                self.bound_dispatch_traits.insert(id, (trait_id, arguments));
+            }
+            if !bindings.is_empty() {
+                self.method_call_substitution.insert(id, bindings);
+            }
+        }
+        Some(resolution)
+    }
+
+    /// What a blanket's binders bind to when its receiver is the caller's own
+    /// parameter: the subject binder to the receiver itself, and every binder
+    /// its bounds write to what the receiver's DECLARED bounds provide there
+    /// (`bind_subject_bound_binders`, which reads a caller's parameter by its
+    /// bounds since B371).
+    fn blanket_bindings_through_bounds(
+        &mut self,
+        impl_subject_id: TypeId,
+        subject_type: &Type,
+    ) -> SubstitutionContext {
+        let impl_subject = impl_subject_id.get_type(self);
+        let mut bindings: SubstitutionContext = self
+            .reconcile_declaration(&impl_subject, subject_type, &impl_subject)
+            .map(|(_, bindings)| bindings.into_iter().collect())
+            .unwrap_or_default();
+        if let Type::Generic(binder) = impl_subject {
+            let receiver_type_id = subject_type.clone().get_type_id(self);
+            bindings.entry(binder).or_insert(receiver_type_id);
+        }
+        self.bind_subject_bound_binders(impl_subject_id, subject_type, &mut bindings);
+        bindings
+    }
+
+    /// B408: whether a blanket applies to an ABSTRACT receiver — the caller's
+    /// own parameter, known only by its declared bounds. A blanket's subject is
+    /// a bare binder (`impl type S: Src<type T>`) or a bare trait
+    /// (`impl Src<type T>`); anything with a written shape (`impl Box<type
+    /// T>`) cannot be read off an abstract type, and `impl_subject_admits`
+    /// has already refused a concrete one. Every binder the subject and its
+    /// bounds bind must then satisfy its own bounds: one bound to a caller's
+    /// parameter through that parameter's declared bounds (supertraits
+    /// included, at the arguments the chain passes), one bound to a concrete
+    /// type through its impls. A binder nothing binds is undecided and does not
+    /// refuse — `compare_type` never reads a bound's arguments, which is why
+    /// this check exists at all.
+    fn blanket_holds_through_bounds(
+        &mut self,
+        impl_subject_id: TypeId,
+        subject_type: &Type,
+    ) -> bool {
+        if !matches!(
+            impl_subject_id.get_type(self),
+            Type::Generic(_) | Type::Trait(..)
+        ) {
+            return false;
+        }
+        let bindings = self.blanket_bindings_through_bounds(impl_subject_id, subject_type);
+        let pairs: Vec<(TypeId, TypeId)> = bindings.iter().map(|(k, v)| (*k, *v)).collect();
+        for (binder, value_id) in pairs {
+            let value = value_id.get_type(self);
+            for (trait_id, arguments) in self.generic_bound_traits(binder) {
+                let required: Vec<TypeId> = arguments
+                    .iter()
+                    .map(|argument| {
+                        let argument = argument.get_type(self);
+                        self.substitute_type(&argument, &bindings).get_type_id(self)
+                    })
+                    .collect();
+                let holds = match self.callers_rigid_generic(&value) {
+                    Some(caller_generic) => {
+                        self.caller_generic_provides(caller_generic, trait_id, &required)
+                    }
+                    None if crate::impl_select::is_resolvable(&value) => {
+                        self.type_implements_trait_at(&value, trait_id, &required)
+                    }
+                    None => true,
+                };
+                if !holds {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// The arguments a caller's own parameter provides `trait_id` at, read off
+    /// its DECLARED bounds and their supertraits (`S: Sig<u32>` with `trait
+    /// Sig<T> with Src<T>` provides `Src<u32>`). `None` when no bound reaches
+    /// the trait — an abstract parameter implements nothing else (B173).
+    fn caller_generic_trait_arguments(
+        &mut self,
+        caller_generic: TypeId,
+        trait_id: Id,
+    ) -> Option<Vec<TypeId>> {
+        for (declared_trait_id, arguments) in self.generic_bound_traits(caller_generic) {
+            if let Some((_, reached)) = self
+                .trait_with_supertraits_at(declared_trait_id, &arguments)
+                .into_iter()
+                .find(|(reached_id, _)| *reached_id == trait_id)
+            {
+                return Some(reached);
+            }
+        }
+        None
+    }
+
+    /// Whether the caller's parameter provides `trait_id` at `required` — every
+    /// required position agreeing with what its bound writes there, a
+    /// still-unbound blanket binder agreeing with anything.
+    fn caller_generic_provides(
+        &mut self,
+        caller_generic: TypeId,
+        trait_id: Id,
+        required: &[TypeId],
+    ) -> bool {
+        let Some(provided) = self.caller_generic_trait_arguments(caller_generic, trait_id) else {
+            return false;
+        };
+        if required.is_empty() || provided.is_empty() {
+            return true;
+        }
+        provided.len() == required.len()
+            && provided
+                .iter()
+                .zip(required)
+                .all(|(provided, required)| self.bound_argument_agrees(*provided, *required, 0))
+    }
+
+    /// One position of a bound, as the caller's bound writes it (`provided`)
+    /// against what a blanket requires there. Stricter than `compare_type` on
+    /// purpose: a caller's parameter is RIGID here, so it agrees only with
+    /// itself or a blanket binder nothing has bound (a hole), never with a
+    /// concrete type it merely might be. The walk is depth-capped; giving up
+    /// answers NO, so a blanket is never admitted on an unproven bound.
+    fn bound_argument_agrees(&self, provided: TypeId, required: TypeId, depth: usize) -> bool {
+        if provided == required {
+            return true;
+        }
+        if depth > 16 {
+            return false;
+        }
+        let provided = provided.get_type(self);
+        let required = required.get_type(self);
+        match (&provided, &required) {
+            (_, Type::Generic(binder)) if !self.generic_is_rigid_here(*binder) => true,
+            (Type::Generic(left), Type::Generic(right)) => left == right,
+            (Type::Generic(_), _) | (_, Type::Generic(_)) => false,
+            (Type::Struct(left, left_arguments), Type::Struct(right, right_arguments))
+            | (Type::Enum(left, left_arguments), Type::Enum(right, right_arguments))
+            | (Type::Trait(left, left_arguments), Type::Trait(right, right_arguments))
+            | (Type::Dyn(left, left_arguments), Type::Dyn(right, right_arguments)) => {
+                left == right
+                    && (left_arguments.is_empty()
+                        || right_arguments.is_empty()
+                        || (left_arguments.len() == right_arguments.len()
+                            && left_arguments
+                                .iter()
+                                .zip(right_arguments)
+                                .all(|(left, right)| {
+                                    self.bound_argument_agrees(*left, *right, depth + 1)
+                                })))
+            }
+            (Type::Tuple(left), Type::Tuple(right)) => {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(left, right)| self.bound_argument_agrees(*left, *right, depth + 1))
+            }
+            (Type::Array(left, left_length), Type::Array(right, right_length)) => {
+                left_length == right_length && self.bound_argument_agrees(*left, *right, depth + 1)
+            }
+            _ => provided == required,
+        }
+    }
+
     fn bind_subject_bound_binders(
         &mut self,
         impl_subject_id: TypeId,
@@ -19131,10 +19362,19 @@ impl<'src> Analyzer<'src> {
         // impl decides the arguments the head wrote — `impl Read<type T>` on a
         // `Cell<i32>` binds `T = i32` exactly as `impl type S: Read<type T>`
         // does, because the two spellings mean the same thing.
+        //
+        // A receiver that is the CALLER's own parameter provides the trait at
+        // what its declared bounds write (B408's blanket reached through a
+        // bound), never at whatever impl its shape happens to reconcile with.
         if let Some(Type::Trait(trait_id, subject_arguments)) =
             self.type_id_to_type_map.get(&impl_subject_id).cloned()
             && !subject_arguments.is_empty()
-            && let Some(provided) = self.trait_args_for(subject_type, trait_id)
+            && let Some(provided) = match self.callers_rigid_generic(subject_type) {
+                Some(caller_generic) => {
+                    self.caller_generic_trait_arguments(caller_generic, trait_id)
+                }
+                None => self.trait_args_for(subject_type, trait_id),
+            }
             && provided.len() == subject_arguments.len()
         {
             for (pattern_id, actual_id) in subject_arguments.into_iter().zip(provided) {
@@ -19173,12 +19413,13 @@ impl<'src> Analyzer<'src> {
                 if bound_arguments.is_empty() {
                     continue;
                 }
+                // B408: a supertrait of a declared bound provides too, at the
+                // arguments the chain passes it (`S: Sig<u32>` provides
+                // `Src<u32>`).
                 let provided = match caller_generic {
-                    Some(caller_generic) => self
-                        .generic_bound_traits(caller_generic)
-                        .into_iter()
-                        .find(|(declared_trait_id, _)| *declared_trait_id == trait_id)
-                        .map(|(_, arguments)| arguments),
+                    Some(caller_generic) => {
+                        self.caller_generic_trait_arguments(caller_generic, trait_id)
+                    }
                     None => self.trait_args_for(&concrete, trait_id),
                 };
                 let Some(provided) = provided else {
@@ -42600,7 +42841,42 @@ impl<'src> Analyzer<'src> {
                                 .insert(id, (trait_id, trait_arguments));
                         }
                     }
-                    found(member)
+                    // B408: no bound DECLARES the name, but a BLANKET written
+                    // over what the bounds promise may provide it —
+                    // `impl type S: Src<type T> { fun twice(self) }` reached
+                    // through `fun f<S: Src<i32>>(s: S)`. The receiver's
+                    // declared bounds are the only evidence an abstract `S`
+                    // has, so a blanket is admitted exactly when those bounds
+                    // entail every bound its binders carry
+                    // (`blanket_holds_through_bounds`). The call is wired to
+                    // the blanket's member itself, with its binders bound to
+                    // the caller's own parameters: the caller's instantiation
+                    // grounds them, as it grounds every nested generic call.
+                    // `S` is opaque here (B359's rule) — the concrete type's
+                    // own same-named member is not in scope through the bound.
+                    let through_blanket = match member.is_none() && providers.is_empty() {
+                        true => self.resolve_blanket_through_bounds(id, &subject_type, member_name),
+                        false => None,
+                    };
+                    match through_blanket {
+                        Some(ImplMemberResolution::Found(member_id, _)) => {
+                            MethodLookup::Found(member_id)
+                        }
+                        Some(ImplMemberResolution::AmbiguousTraits(trait_ids)) => {
+                            MethodLookup::AmbiguousTraits(trait_ids)
+                        }
+                        Some(ImplMemberResolution::AmbiguousTraitArguments(homes)) => {
+                            MethodLookup::AmbiguousTraitArguments(homes)
+                        }
+                        Some(ImplMemberResolution::AmbiguousImpls(unranked)) => {
+                            MethodLookup::AmbiguousImpls(unranked)
+                        }
+                        Some(
+                            ImplMemberResolution::FoundInheritedDefault(..)
+                            | ImplMemberResolution::Missing,
+                        )
+                        | None => found(member),
+                    }
                 }
             }
             Type::Unresolved => MethodLookup::Defer,
