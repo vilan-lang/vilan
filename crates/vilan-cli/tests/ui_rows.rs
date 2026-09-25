@@ -3562,6 +3562,11 @@ fun main() {
 	let _heard = window().listen_capture("focusin", |event| {
 		print(i"focusin at={event.target().tab_index()} from={event.related_target().tab_index()}");
 	});
+	let _left = window().listen_capture("focusout", |event| {
+		let to = event.related_target();
+		let named = if is_null(to) { "null" } else { i"{to.tab_index()}" };
+		print(i"focusout at={event.target().tab_index()} to={named} active_null={is_null(active_element())}");
+	});
 	inner.focus();
 	print(i"descendants={root.query_selector_all("*").len()}");
 }
@@ -3571,7 +3576,10 @@ main();
 
 #[test]
 fn a121_the_dom_reads_a_focus_scope_needs_answer_off_the_host() {
-    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\n");
+    // The `blur()` after the program is A128's stub addition: focus leaving the
+    // document, which the host reports as a `focusout` whose `relatedTarget` is
+    // null.
+    let harness = format!("{DOM_STUB}\nrequire(\"./app.js\");\nactiveElement.blur();\n");
     let stdout = build_and_run("a121_reads", FOCUS_READS, &harness);
     let line = |key: &str| -> String {
         stdout
@@ -3631,6 +3639,22 @@ fn a121_the_dom_reads_a_focus_scope_needs_answer_off_the_host() {
         "a focus that takes DISPATCHES `focusin`, in the capture phase a \
          containment guard listens in, and `related_target` is where focus \
          came FROM; got:\n{stdout}"
+    );
+    let leaves: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.starts_with("focusout "))
+        .collect();
+    assert_eq!(
+        leaves,
+        [
+            "focusout at=3 to=0 active_null=true",
+            "focusout at=0 to=null active_null=true"
+        ],
+        "A128: a focus that takes dispatches `focusout` on the OLD holder \
+         first — while `active_element` is the body, as in the platform — and \
+         its `related_target` is where focus WENT; a `blur()` with nowhere to \
+         go dispatches one whose `related_target` is NULL, which is focus \
+         leaving the document; got:\n{stdout}"
     );
     assert_eq!(
         line("descendants="),
@@ -4309,6 +4333,191 @@ fn a121_the_ssr_twins_render_the_same_markup_and_trap_nothing() {
          client-side write (a served one would focus the element at the \
          browser's own initial parse, which is a behaviour change to every \
          server-rendered page that chains it)"
+    );
+}
+
+// --- A128: `FocusScope::on_leave`, the `focusout` path (focus-scope.md §S3) ---
+//
+// RULED 2026-09-25: the handler fires from a capture-phase `focusout` whose
+// `relatedTarget` lies outside the scope AND every scope above it, and a null
+// `relatedTarget` (focus left the document) does nothing. Q2 stands: `Wrap`
+// has no Tab-out arm, because under `Wrap` focus never leaves by Tab — which
+// the first pin below holds.
+
+/// Three scopes: a `Wrap` menu, a `Wrap` submenu that mounts BESIDE it (the
+/// portal shape — the submenu is above the menu on the stack and not inside
+/// it in the document), and a `Contain` modal opened on its own afterwards.
+/// Every handler prints which scope heard the leave and whether `to` is the
+/// element focus went to; the harness interleaves step markers, so the pin
+/// reads one ordered transcript and silence is as visible as a fire.
+const ON_LEAVE_SCOPES: &str = r#"import std::dom::window;
+import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ FocusContainment, View, focus_scope, mount_root, view, when };
+
+fun main() {
+	let menu: SignalCell<bool> = Signal::new(false);
+	let submenu: SignalCell<bool> = Signal::new(false);
+	let modal: SignalCell<bool> = Signal::new(false);
+	let root = mount_root("app", || {
+		view("div")
+			.child(view("input").attr("name", "outside").attr("data-outside", ""))
+			.child(view("input").attr("name", "elsewhere"))
+			.child(when(menu, || {
+				view("div")
+					.attr("name", "menu")
+					.on_mount(|element| {
+						let scope = focus_scope(element, FocusContainment::Wrap);
+						scope.on_leave(|to| print(i"leave menu to_outside={to.has_attribute("data-outside")}"));
+					})
+					.child(view("input").attr("name", "menu-first"))
+					.child(view("input").attr("name", "menu-last"))
+			}))
+			.child(when(submenu, || {
+				view("div")
+					.attr("name", "sub")
+					.on_mount(|element| {
+						let scope = focus_scope(element, FocusContainment::Wrap);
+						scope.on_leave(|to| print(i"leave sub to_outside={to.has_attribute("data-outside")}"));
+					})
+					.child(view("input").attr("name", "sub-item"))
+			}))
+			.child(when(modal, || {
+				view("div")
+					.attr("name", "modal")
+					.on_mount(|element| {
+						let scope = focus_scope(element, FocusContainment::Contain);
+						scope.on_leave(|to| print(i"leave modal to_outside={to.has_attribute("data-outside")}"));
+					})
+					.child(view("input").attr("name", "modal-first"))
+					.child(view("input").attr("name", "modal-last"))
+			}))
+	});
+	let _menu = root.take(window().listen("menu", |_event| {
+		menu.set(!menu.get());
+	}));
+	let _sub = root.take(window().listen("sub", |_event| {
+		submenu.set(!submenu.get());
+	}));
+	let _modal = root.take(window().listen("modal", |_event| {
+		modal.set(!modal.get());
+	}));
+	print("built");
+}
+
+main();
+"#;
+
+/// The steps, flat for `CONTAIN_STEPS`' reason. Each `step` line marks what
+/// the lines after it answer.
+const ON_LEAVE_STEPS: &str = r##"
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+const step = (name) => console.log("step " + name);
+(async () => {
+  window.fire("menu", {});
+  await tick();
+  step("wrap-tab");
+  findByName("menu-last").focus();
+  const forward = dispatchEvent(findByName("menu-last"), "keydown", { key: "Tab" });
+  const backward = dispatchEvent(activeElement, "keydown", { key: "Tab", shiftKey: true });
+  console.log("wrapped=" + at() + " prevented=" + !!forward.prevented + "," + !!backward.prevented);
+  step("within");
+  findByName("menu-first").focus();
+  step("into-scope-above");
+  window.fire("sub", {});
+  await tick();
+  findByName("sub-item").focus();
+  step("out-of-both");
+  findByName("outside").focus();
+  window.fire("sub", {});
+  await tick();
+  step("back-in");
+  findByName("menu-first").focus();
+  step("left-document");
+  activeElement.blur();
+  step("wrap-programmatic");
+  findByName("menu-last").focus();
+  findByName("outside").focus();
+  step("page-to-page");
+  findByName("elsewhere").focus();
+  window.fire("menu", {});
+  await tick();
+  window.fire("modal", {});
+  await tick();
+  findByName("modal-last").focus();
+  step("contain-tab");
+  dispatchEvent(findByName("modal-last"), "keydown", { key: "Tab" });
+  step("contain-click-outside");
+  findByName("outside").focus();
+  console.log("pulled=" + at());
+  step("contain-left-document");
+  activeElement.blur();
+  step("end");
+})();
+"##;
+
+#[test]
+fn a128_on_leave_fires_where_focus_went_and_only_when_it_left_every_scope() {
+    let harness =
+        format!("{DOM_STUB}{FOCUS_STUB_EXTRAS}\nrequire(\"./app.js\");\n{ON_LEAVE_STEPS}");
+    let stdout = build_and_run("a128_on_leave", ON_LEAVE_SCOPES, &harness);
+    let transcript: Vec<&str> = stdout
+        .lines()
+        .filter(|line| {
+            line.starts_with("step ")
+                || line.starts_with("leave ")
+                || line.starts_with("wrapped=")
+                || line.starts_with("pulled=")
+        })
+        .collect();
+    assert_eq!(
+        transcript,
+        [
+            // Q2 CONFIRMED: under `Wrap` focus never leaves by Tab — the wrap
+            // moves it from one end to the other, `focusout` names an element
+            // inside the scope, and nothing fires.
+            "step wrap-tab",
+            "wrapped=menu-last prevented=true,true",
+            // A move between two elements of one scope is not a leave.
+            "step within",
+            // Into the submenu: a SIBLING in the document, but ABOVE the menu
+            // on the stack — the portal case, silent by the ruling's "every
+            // scope above it".
+            "step into-scope-above",
+            // Out of the submenu to the page: it left the submenu AND the menu
+            // beneath it (the element it left reaches from both), and each
+            // handler hears where focus went. Registration order, outermost
+            // first.
+            "step out-of-both",
+            "leave menu to_outside=true",
+            "leave sub to_outside=true",
+            // Focus arriving from outside is `focusin` business; the
+            // `focusout` it causes is on an element no scope holds.
+            "step back-in",
+            // A NULL `relatedTarget` — focus left the document for the
+            // browser's chrome — does nothing.
+            "step left-document",
+            // `Wrap` lets focus leave by any route but Tab, and that route is
+            // a leave.
+            "step wrap-programmatic",
+            "leave menu to_outside=true",
+            // Focus moving between two page elements while the menu is open
+            // left nothing: the element it left was never the scope's.
+            "step page-to-page",
+            // `Contain`'s own wrap is silent as `Wrap`'s is.
+            "step contain-tab",
+            // A click outside a `Contain` scope: the leave fires WITH the
+            // target, and then the guard pulls focus back — whose `focusout`
+            // is on the outside element, not a leave.
+            "step contain-click-outside",
+            "leave modal to_outside=true",
+            "pulled=modal-first",
+            "step contain-left-document",
+            "step end",
+        ],
+        "`FocusScope::on_leave` fires from a capture-phase `focusout` whose \
+         `related_target` is outside the scope and every scope above it, with \
+         that element; a null target is silent; got:\n{stdout}"
     );
 }
 

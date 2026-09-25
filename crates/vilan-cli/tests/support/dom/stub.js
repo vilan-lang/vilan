@@ -247,10 +247,13 @@ class StubElement {
     // A121: a focus that takes DISPATCHES `focusin` — the event a containment
     // guard hears, and without it the guard cannot fire at all. The host
     // dispatches `blur`/`focusout` on the old holder and `focus`/`focusin` on
-    // the new one; the stub models the one a scope listens for, in the phase
+    // the new one; the stub models the two a scope listens for, in the phase
     // it listens in (`dispatchEvent` runs the window's capture listeners
-    // first). `relatedTarget` carries the element focus LEFT, as it does in
-    // the platform, so an S3 `focusout` path reads the same shape.
+    // first), in the platform's order — `focusout` on the old holder FIRST,
+    // while `document.activeElement` is the body (null here), then `focusin`
+    // on the new one. `relatedTarget` is each event's OTHER element: on the
+    // `focusout`, where focus WENT (A128's `on_leave` reads it); on the
+    // `focusin`, where it came FROM.
     focus() {
         // A121 §1: `focus()` is a request whose target must be a FOCUSABLE
         // AREA, and the platform's answer to anything else is to do nothing,
@@ -276,14 +279,32 @@ class StubElement {
             return;
         }
         const previous = global.activeElement;
+        // `global.window` is the dispatch's own precondition: a `focus()` before
+        // `installStubDocument` has no window to run capture listeners on.
+        // A holder that has left the document hears nothing: the platform's
+        // "focus fixup" moved focus to the body when it was removed, silently.
+        if (previous && previous !== this && inDocument(previous) && global.window) {
+            global.activeElement = null;
+            previous.focused = false;
+            dispatchEvent(previous, "focusout", { relatedTarget: this });
+        }
         this.focused = true;
         global.activeElement = this;
         global.focusLog.push(describe(this));
-        // `global.window` is the dispatch's own precondition: a `focus()` before
-        // `installStubDocument` has no window to run capture listeners on.
         if (previous !== this && global.window) {
             dispatchEvent(this, "focusin", { relatedTarget: previous || null });
         }
+    }
+    // A128: focus leaving the DOCUMENT — to the browser's chrome, another
+    // window, or a `blur()` with nowhere to go. The holder hears `focusout`
+    // with a NULL `relatedTarget`, and nothing hears a `focusin`: that null is
+    // the case a leave handler must stay silent for (focus-scope.md §S3).
+    blur() {
+        if (global.activeElement !== this) return;
+        global.activeElement = null;
+        this.focused = false;
+        global.focusLog.push(describe(this) + "~blur");
+        if (global.window) dispatchEvent(this, "focusout", { relatedTarget: null });
     }
     // `element.matches(":focus")` is how `View::autofocus` reads back whether
     // its request was honored (B271); the stub answers the one selector it is

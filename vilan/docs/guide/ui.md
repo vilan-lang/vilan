@@ -579,6 +579,22 @@ that boundary is disposed the scope pops, and focus goes back to whatever
 held it when the scope opened, unless the app moved focus deliberately in
 the meantime or the remembered element has since left the document.
 
+A scope can also tell you when focus **leaves** it, and for where:
+
+```vilan,fragment
+scope.on_leave(|to| close_menu());
+```
+
+The handler runs when focus moves from inside the scope to an element
+outside it AND outside every scope above it — so opening a submenu is not
+leaving the menu, and leaving the submenu for the page leaves both. It is
+handed the element focus went to. Focus leaving the document altogether
+(for the browser's chrome, another window) does nothing: there is no
+element to hand over, and the user has not gone anywhere on the page. A
+Tab never fires it under `Wrap`, which keeps Tab inside; under `Contain`
+a click outside fires it with the clicked element, and then the guard
+pulls focus back. The listener lives as long as the scope.
+
 `Element::tabbable()` is the query underneath, and it is public: a router
 that moves focus to the new page's heading, or a menu that implements
 arrow-key navigation, wants it too.
