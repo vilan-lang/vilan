@@ -27,7 +27,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 mod support;
 use support::port::{free_port, wait_for_port};
@@ -870,6 +870,10 @@ fn a_watch_round_clears_the_chunks_a_build_left() {
     // the round CLEARS the seed build's chunks, never that it clears them
     // quickly, and the 120 s that stood here was consumed outright on a box
     // running several overlapping suites.
+    // `Instant` is imported here, not at the top: this is its only reader and
+    // it is `cfg(unix)`, so a file-level import is unused on Windows, which
+    // `clippy -D warnings` over the tests there refuses (N130).
+    use std::time::Instant;
     let deadline = Instant::now() + support::WATCH_LIVENESS;
     let mut cleared = false;
     while Instant::now() < deadline {

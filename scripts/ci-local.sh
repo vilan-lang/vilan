@@ -21,11 +21,16 @@
 #
 # THE WINDOWS LEG. ci.yml's `test` job runs the suite on windows-latest as well;
 # nothing on a Linux box can. `windows` here is the stand-in and says so: a
-# `cargo check --target x86_64-pc-windows-msvc` over the workspace's tests,
+# `cargo clippy --target x86_64-pc-windows-msvc` over the workspace's tests,
 # which is what CLAUDE.md already asks of a `#[cfg(windows)]`-only pin. It
 # proves the tree BUILDS for that target and nothing about what it does when it
 # runs, so it is declared local-only (the pin holds it to that) and GitHub stays
-# the seal's final word.
+# the seal's final word. CLIPPY with `-D warnings`, not `check` (N130): the
+# `clippy` leg is ubuntu-only, so a `cfg`-gated import left unused on Windows
+# was a warning in every log and red nowhere. `vilan-rt-sqlite` is excluded
+# because its bundled SQLite is C, built by a compiler for the target, which a
+# Linux box does not have for msvc — the crate has no `cfg(windows)` code, and
+# CI's windows `test` leg builds it natively.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -136,7 +141,8 @@ leg_wasm() {
 
 # LOCAL ONLY. Not the windows suite — the windows COMPILE. See the header.
 leg_windows() {
-    cargo check --workspace --all-targets --target x86_64-pc-windows-msvc
+    cargo clippy --workspace --exclude vilan-rt-sqlite --all-targets \
+        --target x86_64-pc-windows-msvc -- -D warnings
 }
 
 # ── The runner ──────────────────────────────────────────────────────────────

@@ -17,7 +17,7 @@
 //! 2. **The script's leg list IS the job list.** Read out of the script's own
 //!    `LEGS=` line and held against ci.yml's jobs in both directions, so a leg
 //!    added to one side and not the other reds here rather than in six months.
-//! 3. **The local-only legs stay local-only.** `windows` is a `cargo check`
+//! 3. **The local-only legs stay local-only.** `windows` is a `cargo clippy`
 //!    cross-check standing in for a suite this box cannot run; if it ever
 //!    appears in a workflow it is being passed off as the real thing.
 //! 4. **Every declared leg has a function.** The script checks this at run time
