@@ -64,7 +64,12 @@ flag a test flips — is therefore private under nextest and shared under
 `cargo test`, and a test written against the first races under the second
 (`native_differential` failed 38 of 46 that way until its staging went per
 test, N129). Anything a test keys by `std::process::id()` or flips globally
-must be per TEST instead, or serialized by the test itself.
+must be per TEST instead, or serialized by the test itself. One binary is NOT
+equivalent today: `vilan-lsp`'s pins that read the compiler's process-global
+base cache are load-sensitive under `cargo test`, because every other
+analyzing test in that binary shares the cache with them (N131;
+`BASE_CACHE_LOCK`'s comment in `crates/vilan-lsp/src/document.rs` has the
+measurements). Run that binary under nextest.
 
 - **Never pipe it through `grep`, `head`, or `tail` and read the exit code.**
   The pipeline reports the *filter's* status, so a red suite looks green — this
