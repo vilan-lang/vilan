@@ -2535,7 +2535,9 @@ fn a_constant_overflow_is_reported_as_the_programs_not_the_backends() {
     let message = String::from_utf8_lossy(&native.stderr);
     assert!(
         message.contains("the PROGRAM overflows: rustc evaluated `((a_")
-            && message.contains("+ (1i32)))` (the emitted Rust, src/main.rs:")
+            // the emitted path is `src/main.rs` on unix and `src\main.rs` on windows
+            && message.contains("+ (1i32)))` (the emitted Rust, src")
+            && message.contains("main.rs:")
             && message.contains("attempt to compute `i32::MAX + 1_i32`, which would overflow")
             && message.contains("the JavaScript backend would have run on past it"),
         "the refusal names the program's overflow and the expression: {message}"
