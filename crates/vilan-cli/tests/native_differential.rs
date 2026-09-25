@@ -1819,6 +1819,45 @@ fn the_reactive_combinators_map_and_flatten_build_the_same_on_both_backends() {
     }
 }
 
+/// **F34 on A124 S2b's nodes**: a `.cell()` chain (`map` into a cached cell,
+/// mapped again and cached again) and a `.distinct()` node that passes a change
+/// on only when the value differs — its subscriber counts the changes that got
+/// through — build natively and print the same as node.
+#[test]
+fn a_cell_chain_and_a_distinct_node_build_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_cell.vl"), CELL_CHAIN_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_cell.vl"),
+        Verdict::Identical,
+        "a `.cell()` chain and a `.distinct()` must print the same on both backends"
+    );
+}
+
+const CELL_CHAIN_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ Signal, SignalCell, Source };\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet count = SignalCell::new(1);\n",
+    "\tlet scaled = count.map(|n| n * 10).cell();\n",
+    "\tlet labelled = scaled.map(|n| i\"#{n}\").cell();\n",
+    "\tlet parity = count.map(|n| n % 2).distinct();\n",
+    "\tmut changes = 0;\n",
+    "\tlet _watch = parity.sub(|value| {\n",
+    "\t\tchanges += 1;\n",
+    "\t});\n",
+    "\tcount.set(3);\n",
+    "\tcount.set(4);\n",
+    "\tcount.set(6);\n",
+    "\tlet now: i32 = scaled.get();\n",
+    "\tlet label: str = labelled.get();\n",
+    "\tlet odd: i32 = parity.get();\n",
+    "\tprint(i\"{now} {label} {odd} {changes}\");\n",
+    "}\n",
+);
+
 const MAP_PROBE: &str = concat!(
     "import std::io::print;\n",
     "import std::reactive::{ Signal, SignalCell, Source };\n",
