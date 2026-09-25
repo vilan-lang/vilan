@@ -33,7 +33,7 @@
 
 use std::path::Path;
 
-use crate::http::Bytes;
+use crate::bytes::Bytes;
 use crate::{Str, str_new};
 
 /// node's message shape for a failed call, so a native failure reads like the
@@ -82,8 +82,71 @@ pub async fn write_text(path: Str, contents: Str) {
 
 /// `writeFile(path, bytes)`.
 pub async fn write_bytes(path: Str, contents: Bytes) {
-    if let Err(error) = std::fs::write(Path::new(&*path), contents.as_slice()) {
+    if let Err(error) = std::fs::write(Path::new(&*path), &*contents.as_slice()) {
         fail("open", &path, &error);
+    }
+}
+
+/// node's `fs.Stats`, reduced to the three fields `std::fs` reads off it —
+/// `std::fs`'s `external struct RawStat` (F18 slice 3: `require_build` probes
+/// the build manifest with `stat` before it reads it, which puts this on
+/// `Server::builder().serve_build(..)`'s boot path).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RawStat {
+    size: i32,
+    mtime_ms: f64,
+    is_directory: bool,
+}
+
+impl RawStat {
+    /// `stats.size`. A file past `i32::MAX` bytes saturates, where the host's
+    /// double would carry it: `std::fs` declares the field `i32`.
+    pub fn size(&self) -> i32 {
+        self.size
+    }
+
+    /// `stats.mtimeMs` — milliseconds since the epoch, FRACTIONAL, as node's
+    /// plain (non-`bigint`) stat answers it.
+    pub fn mtime_ms(&self) -> f64 {
+        self.mtime_ms
+    }
+
+    /// `stats.isDirectory()`.
+    pub fn is_directory(&self) -> bool {
+        self.is_directory
+    }
+}
+
+impl crate::Js for RawStat {
+    fn js(&self) -> String {
+        crate::panic_with(
+            "printing an `fs.Stats` is a host object's own inspection, which the native backend \
+             does not reproduce",
+        )
+    }
+}
+
+/// `__fs_stat(path)` — `stat`, with a missing path answered `None` rather
+/// than thrown (`transformer.rs`'s helper of the same name catches `ENOENT`
+/// and nothing else), and every other failure thrown as node throws it.
+/// Symlinks are FOLLOWED, as `fs.promises.stat` follows them.
+pub async fn stat(path: Str) -> Option<RawStat> {
+    match std::fs::metadata(Path::new(&*path)) {
+        Ok(metadata) => {
+            let mtime_ms = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|since| since.as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            Some(RawStat {
+                size: i32::try_from(metadata.len()).unwrap_or(i32::MAX),
+                mtime_ms,
+                is_directory: metadata.is_dir(),
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => fail("stat", &path, &error),
     }
 }
 
@@ -169,6 +232,38 @@ mod tests {
         directory
     }
 
+    /// `stat` answers the three fields for a file and a directory, and `None`
+    /// — not a throw — for a path that is not there, which is the whole of
+    /// `__fs_stat`'s contract.
+    #[test]
+    fn stat_reads_a_file_and_a_directory_and_answers_none_for_a_missing_path() {
+        let directory = std::env::temp_dir().join(format!("vilan-rt-stat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create the directory");
+        let file = directory.join("five.txt");
+        std::fs::write(&file, b"12345").expect("write the file");
+        let probed = directory.clone();
+        crate::executor::block_on(async move {
+            let directory = probed;
+            let file_stat = stat(str_new(&file.to_string_lossy()))
+                .await
+                .expect("a file");
+            assert_eq!(file_stat.size(), 5);
+            assert!(!file_stat.is_directory());
+            assert!(file_stat.mtime_ms() > 1_000_000_000_000.0);
+            let directory_stat = stat(str_new(&directory.to_string_lossy()))
+                .await
+                .expect("a directory");
+            assert!(directory_stat.is_directory());
+            assert!(
+                stat(str_new(&directory.join("absent").to_string_lossy()))
+                    .await
+                    .is_none()
+            );
+        });
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     #[test]
     fn a_write_and_a_read_round_trip_text_and_bytes() {
         let directory = scratch("round-trip");
@@ -188,8 +283,8 @@ mod tests {
             );
             write_bytes(bytes_path.clone(), Bytes::from_vec(vec![0, 1, 255])).await;
             assert_eq!(
-                read_bytes(bytes_path.clone()).await.as_slice(),
-                &[0, 1, 255]
+                read_bytes(bytes_path.clone()).await.to_vec(),
+                vec![0, 1, 255]
             );
             // A directory lists what was written into it, in one order.
             let listed = read_dir(directory_path.clone()).await;

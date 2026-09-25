@@ -1,0 +1,69 @@
+// The browser half of the exit's SHAPE, run under node: the generated
+// `KoltClient` connects with the session token the login answered, holds a
+// PER-KEY subscription on the keyed mirror, and calls two rpcs.
+import std::io::print;
+import std::json::json_codec;
+import std::map::Map;
+import std::option::Option::{ self, None, Some };
+import std::process::{ env, exit };
+import std::reactive::{ Signal, SignalCell };
+import std::result::Result::{ self, Err, Ok };
+import std::rpc::rpc_protocols;
+import std::wire::{ Keyed, Wire };
+
+[derive(Wire, PartialEq, Debug)]
+struct Message {
+	id: str,
+	author: str,
+	body: str,
+}
+
+impl Message with Keyed<str> {
+	fun key(self): str {
+		self.id
+	}
+}
+
+[service(KoltClient)]
+struct KoltStore {
+	user: str,
+	[expose(keyed)] messages: SignalCell<Map<str, Message>>,
+}
+
+impl KoltStore {
+	[rpc]
+	fun post(self, id: str, body: str): i32 {
+		let author = self.user;
+		self.messages.update(|&mut store| {
+			store.insert(id, Message { id, author, body });
+		});
+		self.messages.get().len()
+	}
+
+	[rpc]
+	fun whoami(self): str {
+		self.user
+	}
+}
+
+fun main() {
+	let port = env("KOLT_PORT").unwrap_or("0");
+	let token = env("KOLT_TOKEN").unwrap_or("");
+	match KoltClient::connect_with(i"ws://localhost:{port}/", json_codec(), rpc_protocols(token)) {
+		Ok(let client) => {
+			let watch = client.messages.sub_key("m2", |value| match value {
+				Some(let message) => print(i"m2:{message.author}:{message.body}"),
+				None => print("m2:absent"),
+			});
+			print(i"who:{client.whoami().unwrap_or("?")}");
+			print(i"post:{client.post("m1", "hello").unwrap_or(0 - 1)}");
+			print(i"post:{client.post("m2", "world").unwrap_or(0 - 1)}");
+			print(i"post:{client.post("m2", "world again").unwrap_or(0 - 1)}");
+			print(i"hash:{client.contract_hash()}");
+			print(i"fault:{client.messages.fault().is_some()}");
+			watch.dispose();
+		},
+		Err(let error) => print(i"err:{error.debug()}"),
+	}
+	exit(0);
+}

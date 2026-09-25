@@ -705,7 +705,7 @@ fn discover_std_dir(start: &Path) -> PathBuf {
     // CLI does the same, so both tools see the identical std from any
     // directory. On a materialization failure (no writable home OR temp dir)
     // the path is left nonexistent and imports diagnose it.
-    vilan_embedded_std::materialize()
+    vilan_embedded::materialize()
         .unwrap_or_else(|_| PathBuf::from("<the embedded std could not be materialized>"))
 }
 

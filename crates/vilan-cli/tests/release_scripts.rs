@@ -1068,6 +1068,65 @@ fn both_scripts_are_committed_executable() {
     }
 }
 
+/// The release commit stages EVERY workspace member's manifest (N125, from
+/// the cut plan's dry run): `bump-version.sh` rewrites `crates/*/Cargo.toml`,
+/// and a hand-named list in `cut-release.sh` had gone stale — it named the six
+/// manifests v0.40.0 had and omitted `vilan-rt`, `vilan-rt-sqlite` and
+/// `vilan-rust`, so a `--commit` cut would have left three bumped manifests
+/// unstaged and tagged the wrong tree.
+///
+/// The pin RUNS the script's own `release_files` (extracted, so nothing else
+/// in the script executes) from the repository root and holds its manifests
+/// to the root `Cargo.toml`'s `members`, both directions — a crate that joins
+/// the workspace joins the release commit, and nothing outside it does.
+#[test]
+fn the_release_commit_stages_every_workspace_members_manifest() {
+    let root = repository_root();
+    let script = fs::read_to_string(root.join("scripts").join("cut-release.sh"))
+        .expect("read scripts/cut-release.sh");
+    let start = script
+        .find("release_files() {")
+        .expect("cut-release.sh defines `release_files`");
+    let end = start
+        + script[start..]
+            .find("\n}\n")
+            .expect("`release_files` has a closing brace")
+        + 3;
+    let definition = &script[start..end];
+    let listed = Command::new("sh")
+        .current_dir(&root)
+        .arg("-c")
+        .arg(format!("{definition}\nrelease_files"))
+        .output()
+        .expect("run release_files");
+    assert!(listed.status.success(), "release_files failed");
+    let staged: std::collections::BTreeSet<String> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter(|line| line.ends_with("Cargo.toml"))
+        .map(str::to_string)
+        .collect();
+
+    let workspace = fs::read_to_string(root.join("Cargo.toml")).expect("read Cargo.toml");
+    let members_start = workspace.find("members = [").expect("a members list");
+    let members_end = members_start + workspace[members_start..].find(']').expect("its end");
+    let members: std::collections::BTreeSet<String> = workspace[members_start..members_end]
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('"'))
+        .map(|line| format!("{}/Cargo.toml", line.trim_matches(|c| c == '"' || c == ',')))
+        .collect();
+
+    assert!(!members.is_empty(), "the workspace names its members");
+    assert_eq!(
+        staged, members,
+        "the release commit must stage exactly the workspace members' manifests"
+    );
+    assert!(
+        script.contains("RELEASE_FILES=\"$(release_files)\""),
+        "the staged list and the printed `git add` line are both `release_files`"
+    );
+}
+
 // --- The installer's checksum step (backlog §L item 15, the "S half") ------
 //
 // `scripts/install.sh` downloads a release tarball, verifies it against the

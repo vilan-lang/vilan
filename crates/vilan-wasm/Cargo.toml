@@ -17,7 +17,7 @@ vilan-core = { path = "../vilan-core" }
 # (K9, proposal/playground-completion.md §3) — core-only, so it builds for
 # wasm32 exactly as it does natively.
 vilan-ide = { path = "../vilan-ide" }
-vilan-embedded-std = { path = "../vilan-embedded-std" }
+vilan-embedded = { path = "../vilan-embedded" }
 
 # Only the binding layer needs wasm-bindgen, so the host build and the native
 # tests do not pull it in at all. The version is EXACT on purpose: the

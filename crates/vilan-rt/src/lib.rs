@@ -35,11 +35,13 @@ use std::fmt::Write as _;
 use std::rc;
 use std::rc::Rc;
 
+pub mod bytes;
 pub mod crypto;
 pub mod executor;
 pub mod fs;
 pub mod http;
 pub mod json;
+pub mod time;
 
 // ---------------------------------------------------------------- strings ---
 

@@ -5,7 +5,7 @@ members = [
     "crates/vilan-cli",
     "crates/vilan-lsp",
     "crates/vilan-ide",
-    "crates/vilan-embedded-std",
+    "crates/vilan-embedded",
     "crates/vilan-wasm",
     # The emit-Rust backend (tracker F1, slice S1a): the emitter, and the
     # runtime the programs it emits link against. `vilan-rt` is a member so the

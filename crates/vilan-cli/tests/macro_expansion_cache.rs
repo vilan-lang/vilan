@@ -114,7 +114,7 @@ fn cache_dir(dir: &Path) -> PathBuf {
 /// `~/.vilan/check-cache` — the toolchain's own answer, under its home rules
 /// (`USERPROFILE` first on Windows), so the test looks where the CLI writes.
 fn check_cache_root() -> PathBuf {
-    vilan_embedded_std::default_check_cache_root()
+    vilan_embedded::default_check_cache_root()
 }
 
 /// The BUILD's table, which stays where N63 put it: `dist/.cache`, inside the

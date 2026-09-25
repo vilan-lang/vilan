@@ -618,10 +618,19 @@ say ""
 run sh scripts/bump-version.sh "$VERSION"
 say ""
 
-RELEASE_FILES="CHANGELOG.md Cargo.lock crates/vilan-cli/Cargo.toml
-crates/vilan-core/Cargo.toml crates/vilan-embedded-std/Cargo.toml
-crates/vilan-lsp/Cargo.toml crates/vilan-wasm/Cargo.toml crates/vilan-ide/Cargo.toml
-editors/vscode/package.json editors/vscode/package-lock.json"
+# Every file the bump rewrites, which is exactly what the release commit stages:
+# the CHANGELOG, the lockfile, EVERY workspace member's manifest — DERIVED, the
+# way `bump-version.sh` derives the set it rewrites, because a named list goes
+# stale the day a crate joins the workspace (it did: `vilan-rt`,
+# `vilan-rt-sqlite` and `vilan-rust` were bumped and never staged, so a
+# `--commit` cut would have tagged a tree whose three manifests still said the
+# old version) — and the extension's two. `release_scripts.rs` holds this to
+# the workspace's `members`.
+release_files() {
+    printf '%s\n' CHANGELOG.md Cargo.lock crates/*/Cargo.toml \
+        editors/vscode/package.json editors/vscode/package-lock.json
+}
+RELEASE_FILES="$(release_files)"
 
 if [ "$DO_COMMIT" = 1 ]; then
     counts="$(awk -F"$TAB" '$1 == "E" { seen[$3]++ }

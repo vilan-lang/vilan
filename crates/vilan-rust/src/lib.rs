@@ -216,6 +216,22 @@ struct Emitter<'a, 'src> {
     /// type is not grounded, and only when it names the same declaration, so it
     /// can narrow an answer and never change one.
     expected_type: Option<TypeId>,
+    /// The CALLEE's substitution while a direct call's arguments are rendered,
+    /// so an argument's position is its parameter's type under the binding
+    /// the call makes (`Signal::new(Map::new())`: the argument's position is
+    /// `T`, which the CALL binds to `Map<str, i32>`). Consulted only to compute
+    /// that expectation — never while the argument itself is walked, where the
+    /// caller's substitution is the one in force.
+    argument_substitution: Option<HashMap<TypeId, TypeId>>,
+    /// How deep [`Emitter::pattern`] is inside a variant's payload or a tuple,
+    /// and the guards a `match` leg collects from the string literals it finds
+    /// there. A `str` literal at the TOP of a leg is matched against the
+    /// subject read as `&str`; one NESTED in a payload (`Some("api")` over an
+    /// `Option<str>`) cannot be — the payload is an `Rc<str>` — so it binds a
+    /// name and the leg gains `if &*name == "api"`. `None` outside a `match`,
+    /// where there is no guard to carry it and the pattern is refused by name.
+    pattern_nesting: usize,
+    literal_guards: Option<Vec<String>>,
     /// R3: the bindings boxed into a counted cell, and why they had to be.
     /// Computed over EVERY closure the program loaded, std's unreached ones
     /// included — it is a lookup the walk consults, not a measurement.
@@ -438,6 +454,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             current_self_traits: HashSet::new(),
             current_returns_view: false,
             expected_type: None,
+            argument_substitution: None,
+            pattern_nesting: 0,
+            literal_guards: None,
             boxed: HashSet::new(),
             boxed_emitted: HashSet::new(),
             module_bindings: HashSet::new(),
@@ -810,8 +829,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     }
                     Expr::ForEach(_, item, _) => declared.extend(item.iter().copied()),
                     Expr::Closure(closure_id) => {
+                        // A NESTED closure's destructured parameters too
+                        // (`|(k, _)| k == key` inside `get_post_var`): they are
+                        // not in `parameters`, and read as captures of the
+                        // OUTER closure they were cloned before they existed.
                         if let Some(closure) = self.program.closures.get(closure_id) {
-                            declared.extend(closure.parameters.iter().copied());
+                            declared.extend(self.closure_parameter_bindings(closure));
                         }
                     }
                     _ => {}
@@ -1192,6 +1215,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             Type::Closure(parameters, return_type_id, _) => {
                 out.push_str("Fn");
+                // A view parameter is a different Rust signature, so it keys
+                // apart from the same closure type over values.
+                if let Some(views) = self.program.closure_type_parameter_views.get(&type_id) {
+                    for view in views {
+                        out.push_str(match view {
+                            Some(true) => "M",
+                            Some(false) => "R",
+                            None => "V",
+                        });
+                    }
+                }
                 self.write_key_arguments(parameters, out);
                 out.push_str("->");
                 self.write_type_key(*return_type_id, out);
@@ -1300,6 +1334,63 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
         }
         substitution
+    }
+
+    /// Closes a call's OPEN bindings from the position the call fills (B370's
+    /// law, on the generic-call path — the rule [`Emitter::variant_arguments`]
+    /// and [`Emitter::struct_arguments_at`] already apply to a constructor).
+    ///
+    /// `let cell: SignalCell<List<i32>> = SignalCell::new([])` records `T` as
+    /// `List<?>` at the call — the empty literal says nothing, and the
+    /// annotation is what closes it — and `Signal::new(Map::new())` leaves both
+    /// of `Map`'s arguments open the same way. JavaScript has one array and
+    /// never had to ask; natively an open binding is a refusal (or, minted, a
+    /// second Rust type). So a binding that is not GROUNDED, or a generic
+    /// parameter the call left unbound, is bound by matching the callee's
+    /// declared return type against the position's type — only when the
+    /// position is itself grounded, and never over a binding that already is.
+    fn close_open_bindings_from_position(
+        &self,
+        substitution: &mut HashMap<TypeId, TypeId>,
+        target: Id,
+    ) {
+        let Some(expected) = self
+            .expected_type
+            .filter(|type_id| self.is_grounded(*type_id))
+        else {
+            return;
+        };
+        let Some(function) = self.program.functions.get(&target) else {
+            return;
+        };
+        let Some(returns) = function.return_type_id else {
+            return;
+        };
+        let mut open: Vec<TypeId> = substitution
+            .iter()
+            .filter(|(_, bound)| !self.is_grounded(**bound))
+            .map(|(constraint_id, _)| *constraint_id)
+            .collect();
+        // The callee's own parameters AND the ones its signature mentions from
+        // an enclosing declaration — `Map::new`'s `K` and `V` are the impl's,
+        // not the function's.
+        let mut unbound = function.generic_parameter_constraint_ids.clone();
+        unbound.extend(mono::signature_generics(self.program, target));
+        for constraint_id in unbound {
+            if !substitution.contains_key(&constraint_id) && !open.contains(&constraint_id) {
+                open.push(constraint_id);
+            }
+        }
+        if open.is_empty() {
+            return;
+        }
+        let mut bound: HashMap<TypeId, TypeId> = HashMap::default();
+        self.bind_parameters(&open, returns, self.concrete(expected), &mut bound);
+        for (constraint_id, type_id) in bound {
+            if self.is_grounded(type_id) {
+                substitution.insert(constraint_id, type_id);
+            }
+        }
     }
 
     /// The substitution a trait DEFAULT body is specialized under: the trait's
@@ -1415,9 +1506,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // Read and CLEAR: the flag belongs to this position's outermost
                 // closure, not to a closure nested inside its own signature.
                 let is_async = std::mem::take(&mut self.expects_async);
+                // A parameter WRITTEN as a view (`|&mut T| void`) is a reference
+                // in the signature, as the closure literal that lands here binds
+                // it (`move |list: &mut Vec<i32>|`) — the analyzer records the
+                // `&`/`&mut` the type itself erases.
+                let views = self
+                    .program
+                    .closure_type_parameter_views
+                    .get(&type_id)
+                    .cloned()
+                    .unwrap_or_default();
                 let mut parts = Vec::new();
-                for parameter in &parameters {
-                    parts.push(self.rust_type(*parameter, span)?);
+                for (index, parameter) in parameters.iter().enumerate() {
+                    let rendered = self.rust_type(*parameter, span)?;
+                    parts.push(match views.get(index).copied().flatten() {
+                        Some(true) => format!("&mut {rendered}"),
+                        Some(false) => format!("&{rendered}"),
+                        None => rendered,
+                    });
                 }
                 // B309: the `context` clause is part of the TYPE, and
                 // `context::thread_contexts` appends one hidden parameter per
@@ -1699,6 +1805,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // `remoteAddress`) ANSWER one — the dependency runs this way and
             // not the other.
             "JsonValue" => Ok("vilan_rt::json::JsonValue".to_string()),
+            // F18 slice 3: node:crypto's `Hash`, which `std::rpc_server`'s
+            // WebSocket handshake chains through (`create_hash` → `update` →
+            // `digest`). std names it `NodeHash` so it cannot be read as
+            // `std::hash::Hash`, the `"Hash"` arm above.
+            "NodeHash" => Ok("vilan_rt::crypto::NodeHash".to_string()),
+            // `std::fs`'s `fs.Stats`, which `stat` copies three fields out of.
+            "RawStat" => Ok("vilan_rt::fs::RawStat".to_string()),
             _ => {
                 let what = format!("the host type `{name}`");
                 self.host_gap(what, span).map(|_| "()".to_string())
@@ -2671,6 +2784,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let Some(type_id) = function.return_type_id {
             return Some(type_id);
         }
+        // The analyzer's own answer for an unannotated function, where it
+        // reached an exact one. A tail the walk below cannot type — a bare
+        // `true`, which carries no expression type — emitted `-> ()` for
+        // kolt's `is_fingerprinted`, and every `ret false` in it was refused.
+        if let Some(type_id) = self.program.inferred_return_types.get(&function.id) {
+            return Some(*type_id);
+        }
         let from_tail = self.value_type_of(function.body.1);
         if from_tail.is_some() {
             return from_tail;
@@ -2851,6 +2971,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// and `mut-parameters.vl` is the pin — `original.with_x(9)` leaves
     /// `original.x` at 0, so the receiver was copied. Reading it as a loan
     /// emitted `&Point` where the body assigns a field, which rustc refuses.
+    /// Whether a parameter is a VALUE in vilan that this backend receives by
+    /// reference — a bare, non-`mut` `self`, which nothing can write through,
+    /// so a `&T` is a copy nobody can tell apart from one.
+    fn is_a_value_received_by_reference(
+        &self,
+        parameter: &vilan_core::analyzer::Parameter<'_>,
+    ) -> bool {
+        parameter.convention == Convention::Bare && self.receiving_form(parameter) == Receiving::Ref
+    }
+
     fn receiving_form(&self, parameter: &vilan_core::analyzer::Parameter<'_>) -> Receiving {
         match parameter.convention {
             Convention::Ref => Receiving::Ref,
@@ -2903,7 +3033,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let rendered = if returns_the_loan {
                 self.expression(tail, depth)
             } else {
-                self.value_of(tail, depth)
+                let expecting = self.expected_type;
+                self.consumed_value_of_expecting(tail, expecting, depth)
             };
             self.expected_type = saved_expected;
             self.expects_async_value = false;
@@ -2947,6 +3078,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Ok(name.clone());
         }
         let span = self.span_of(id);
+        // A `const` expression's COMPUTED value replaces the whole subtree
+        // (const-eval.md §1), exactly as the JS emitter serializes it in place:
+        // `const asset::read("server-head.html")` is the file's text at build
+        // time, and the call itself — a compile-time-only channel — has no
+        // runtime body on either backend.
+        if let Some(value) = self.program.const_results.get(&id).cloned() {
+            // The const expression's own type where it records one, else the
+            // POSITION's (`let folded = const 1 + 2 * 3;` records nothing on
+            // the `const` node, and the binding's `i32` is the answer).
+            let type_id = self.type_of(id).or(self.expected_type);
+            return self.const_value(&value, type_id, span);
+        }
         let Some(expr) = self.program.entity_map.get(&id).cloned() else {
             return Ok("()".to_string());
         };
@@ -3022,7 +3165,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     self.expects_async_value = self.returns_an_async_closure;
                     let saved_expected =
                         std::mem::replace(&mut self.expected_type, self.current_return_type);
-                    let rendered = self.value_of(value, depth);
+                    let expecting = self.expected_type;
+                    let rendered = self.consumed_value_of_expecting(value, expecting, depth);
                     self.expected_type = saved_expected;
                     self.expects_async_value = false;
                     format!("return {}", rendered?)
@@ -3059,14 +3203,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     });
                 let mut parts = Vec::new();
                 for element in &elements {
-                    parts.push(self.value_of_expecting(*element, element_type, depth)?);
+                    parts.push(self.consumed_value_of_expecting(*element, element_type, depth)?);
                 }
                 format!("vec![{}]", parts.join(", "))
             }
             Expr::Tuple(elements) => {
                 let mut parts = Vec::new();
                 for element in &elements {
-                    parts.push(self.value_of(*element, depth)?);
+                    let expecting = self.expected_type;
+                    parts.push(self.consumed_value_of_expecting(*element, expecting, depth)?);
                 }
                 format!("({},)", parts.join(", "))
             }
@@ -3143,6 +3288,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.variant_path(enum_id, index, &arguments, span)?
             }
             Expr::TryAssert(receiver) => self.try_assert(id, receiver, depth, span)?,
+            // F34: `a?.b` and an expression-lifting region over `Option` and
+            // `Result` (`proposal/try-and-lift.md` §3, `expression-lifting.md`
+            // §4). A user `Lift` container's trait path stays refused by name.
+            Expr::Lift(subject, binder, continuation) => {
+                self.std_lift(id, subject, binder, continuation, depth, span)?
+            }
+            Expr::LiftRegion(steps, body) => self.std_lift_region(id, &steps, body, depth, span)?,
             Expr::Function(_)
             | Expr::Struct(_)
             | Expr::Enum(_)
@@ -3170,8 +3322,29 @@ impl<'a, 'src> Emitter<'a, 'src> {
         expecting: Option<TypeId>,
         depth: usize,
     ) -> Result<String, Error> {
+        self.value_of_expecting_in(id, expecting, depth, false)
+    }
+
+    /// [`Self::value_of_expecting`], and — when `consuming` — rule 1's copy of
+    /// a consumed place read, taken BEFORE a `dyn` erasure wraps the value, so
+    /// the object is built around the copy rather than copied after it (see
+    /// [`Self::consumed_value_of_expecting`]).
+    fn value_of_expecting_in(
+        &mut self,
+        id: Id,
+        expecting: Option<TypeId>,
+        depth: usize,
+        consuming: bool,
+    ) -> Result<String, Error> {
         let saved = std::mem::replace(&mut self.expected_type, expecting);
-        let rendered = self.value_of(id, depth);
+        let rendered = self.value_of_unerased(id, depth).and_then(|text| {
+            let text = if consuming && !self.is_natively_copy(id) {
+                self.copy_a_consumed_place_read(id, text)
+            } else {
+                text
+            };
+            self.erase_into_object(id, text)
+        });
         self.expected_type = saved;
         let rendered = rendered?;
         // F18 slice 2: a value landing in an `any` position is WRAPPED. On the
@@ -3347,6 +3520,34 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
+    /// Whether `id` names a binding that IS a mutable loan natively — a
+    /// parameter received `&mut` (a `&mut self` receiver among them), or a
+    /// local initialized with a written `&mut place` — so handing it to
+    /// another `&mut` position is a REBORROW rather than a fresh `&mut`.
+    ///
+    /// Only the bare binding: a field or subscript of the loan is a place
+    /// BEHIND it, and `&mut loan.field` already reborrows through the
+    /// reference by Rust's own auto-deref.
+    fn names_a_mutable_loan(&self, id: Id) -> bool {
+        let binding = match self.program.entity_map.get(&id) {
+            Some(Expr::Local(binding)) | Some(Expr::Parameter(binding)) => *binding,
+            _ => return false,
+        };
+        if let Some(parameter) = self.program.parameters.get(&binding) {
+            return self.receiving_form(parameter) == Receiving::RefMut;
+        }
+        self.program
+            .variables
+            .get(&binding)
+            .and_then(|variable| variable.initial)
+            .is_some_and(|initial| {
+                matches!(
+                    self.program.entity_map.get(&initial),
+                    Some(Expr::Reference(_, true))
+                )
+            })
+    }
+
     /// Whether `id` READS a binding whose type is a closure — the shape that
     /// owes a refcount bump. A closure LITERAL is a fresh value and owes
     /// nothing.
@@ -3445,7 +3646,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // wrote `(1i32)` against a `u64`.
             let expecting = expecting.or_else(|| self.cell_element_type(receiver));
             let receiver_text = self.expression(receiver, depth)?;
-            let value_text = self.value_of_expecting(value, expecting, depth)?;
+            let value_text = self.consumed_value_of_expecting(value, expecting, depth)?;
             return Ok(format!("({receiver_text}).set({value_text})"));
         }
         let named = match self.program.entity_map.get(&target) {
@@ -3454,21 +3655,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
         };
         if let Some(binding) = named {
             if self.boxed.contains(&binding) {
-                let value_text = self.value_of_expecting(value, expecting, depth)?;
+                let value_text = self.consumed_value_of_expecting(value, expecting, depth)?;
                 return Ok(format!("{}.set({value_text})", self.binding_name(binding)));
             }
             if self.module_bindings.contains(&binding) {
                 let cell = self.ensure_module_binding(binding, span)?;
-                let value_text = self.value_of_expecting(value, expecting, depth)?;
+                let value_text = self.consumed_value_of_expecting(value, expecting, depth)?;
                 return Ok(format!("{cell}.with(|cell| cell.set({value_text}))"));
             }
             if self.binding_holds_a_view(binding) {
-                let value_text = self.value_of_expecting(value, expecting, depth)?;
+                let value_text = self.consumed_value_of_expecting(value, expecting, depth)?;
                 return Ok(format!("*{} = {value_text}", self.binding_name(binding)));
             }
         }
         let target_text = self.mutable_place(target, depth)?;
-        let value_text = self.value_of_expecting(value, expecting, depth)?;
+        let value_text = self.consumed_value_of_expecting(value, expecting, depth)?;
         Ok(format!("{target_text} = {value_text}"))
     }
 
@@ -3864,7 +4065,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     ));
                 }
                 let saved = std::mem::replace(&mut self.declaring_a_view, holds_a_view);
-                let value = self.value_of_expecting(initial, Some(variable.type_id), depth);
+                let value = if holds_a_view {
+                    self.value_of_expecting(initial, Some(variable.type_id), depth)
+                } else {
+                    self.consumed_value_of_expecting(initial, Some(variable.type_id), depth)
+                };
                 self.declaring_a_view = saved;
                 let value = value?;
                 if self.boxed.contains(&binding) {
@@ -4119,9 +4324,72 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // rule 1's copy at a loaned read — so both operands go through it, and
         // `std::compare`'s `impl i32 with PartialEq { fun eq(self, b: i32) {
         // self == b } }` compiles for every scalar it is specialized at.
-        let left_text = self.value_of(left, depth)?;
-        let right_text = self.value_of(right, depth)?;
+        //
+        // A numeric operand's POSITION is its partner's type (B370's law, on
+        // the operator path): both sides of `+`, `==`, `<` … are one type in
+        // vilan, so an unsuffixed literal beside a `u32` IS a `u32`. The
+        // literal's own record is advisory ([`Emitter::number_literal`]) and a
+        // comparison inherits no numeric expectation at all — its result is a
+        // `bool` — so `unit >= 65` over a `u32` emitted `65i32` and rustc
+        // refused `std::string`'s `to_lowercase_ascii`. An inherited numeric
+        // expectation (an arithmetic result's) still wins, and a partner that
+        // is itself a bare literal says nothing (its record is the advisory
+        // one). The shifts are left alone: a shift COUNT is its own type.
+        let is_shift = matches!(op, BinaryOp::Shl | BinaryOp::Shr);
+        let inherited = self
+            .expected_type
+            .filter(|type_id| self.is_numeric_scalar(*type_id));
+        let partner_position = |emitter: &Self, partner: Id| {
+            if is_shift || inherited.is_some() {
+                return None;
+            }
+            emitter.numeric_type_of(partner)
+        };
+        let left_position = partner_position(self, right);
+        let right_position = partner_position(self, left);
+        let left_text = match left_position {
+            Some(position) => self.value_of_expecting(left, Some(position), depth)?,
+            None => self.value_of(left, depth)?,
+        };
+        let right_text = match right_position {
+            Some(position) => self.value_of_expecting(right, Some(position), depth)?,
+            None => self.value_of(right, depth)?,
+        };
         Ok(format!("({left_text} {symbol} {right_text})"))
+    }
+
+    /// The numeric scalar type an operand EVALUATES to, where something other
+    /// than a bare literal says so — its own record, else (for arithmetic,
+    /// which carries no record at its joints) the first operand that has one.
+    /// `None` for a bare literal: its record is the advisory one
+    /// ([`Emitter::number_literal`]), so it cannot be a partner's evidence.
+    fn numeric_type_of(&self, id: Id) -> Option<TypeId> {
+        let _guard = vilan_core::util::RecursionGuard::enter()?;
+        match self.program.entity_map.get(&id) {
+            Some(Expr::Number(..)) => None,
+            Some(&Expr::Binary(op, left, right))
+                if matches!(
+                    op,
+                    BinaryOp::Add
+                        | BinaryOp::Sub
+                        | BinaryOp::Mul
+                        | BinaryOp::Div
+                        | BinaryOp::Rem
+                        | BinaryOp::BitAnd
+                        | BinaryOp::BitOr
+                        | BinaryOp::BitXor
+                ) && !self.program.binary_op_dispatch.contains_key(&id) =>
+            {
+                self.type_of(id)
+                    .filter(|type_id| self.is_numeric_scalar(*type_id))
+                    .or_else(|| self.numeric_type_of(left))
+                    .or_else(|| self.numeric_type_of(right))
+            }
+            Some(&Expr::Unary('-', operand)) => self.numeric_type_of(operand),
+            _ => self
+                .type_of(id)
+                .filter(|type_id| self.is_numeric_scalar(*type_id)),
+        }
     }
 
     /// The conjuncts of a `&&` chain, left to right.
@@ -4254,6 +4522,61 @@ impl<'a, 'src> Emitter<'a, 'src> {
             "an interpolation of a value with its own `render`",
             span,
         ))
+    }
+
+    /// A computed `const` value as a Rust expression of `type_id`'s type.
+    ///
+    /// Plain data only: a string, a boolean, a number at the declared width,
+    /// and a `List` of those. Everything else a const result can be — a
+    /// `Map`/`Set`, `undefined`, a `BigInt`, G24's closure snapshot — is refused
+    /// by name until a program on the native path reaches one.
+    fn const_value(
+        &mut self,
+        value: &vilan_core::interpreter::ConstValue,
+        type_id: Option<TypeId>,
+        span: Span,
+    ) -> Result<String, Error> {
+        use vilan_core::interpreter::ConstValue;
+        match value {
+            ConstValue::Str(text) => Ok(format!("vilan_rt::str_new({text:?})")),
+            ConstValue::Bool(value) => Ok(value.to_string()),
+            ConstValue::Number(number) => {
+                // With no type anywhere, the literal's own default: an integral
+                // value is an `i32` and a fractional one an `f64`, as an
+                // unsuffixed literal is.
+                let rendered = match type_id {
+                    Some(type_id) => self.rust_type(type_id, span)?,
+                    None if number.fract() == 0.0 => "i32".to_string(),
+                    None => "f64".to_string(),
+                };
+                if scalar_type(&rendered).is_none()
+                    && !is_integer_type(&rendered)
+                    && rendered != "f64"
+                    && rendered != "f32"
+                {
+                    return Err(unsupported("a `const` number of a non-scalar type", span));
+                }
+                Ok(format!("(({number:?}f64) as {rendered})"))
+            }
+            ConstValue::Array(items) => {
+                let element =
+                    type_id
+                        .and_then(|type_id| self.resolve(type_id))
+                        .and_then(|resolved| match resolved {
+                            Type::Struct(_, arguments) => arguments.first().copied(),
+                            _ => None,
+                        });
+                let mut parts = Vec::new();
+                for item in items {
+                    parts.push(self.const_value(item, element, span)?);
+                }
+                Ok(format!("vec![{}]", parts.join(", ")))
+            }
+            _ => Err(unsupported(
+                "a `const` value that is not plain data (a string, a boolean, a number or a list of those)",
+                span,
+            )),
+        }
     }
 
     /// Whether an expression is a `str` — by its resolved type where it has
@@ -4422,7 +4745,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
             if leg.guard.is_some() {
                 return Err(unsupported("a guarded `match` leg", span));
             }
-            let pattern = self.pattern(&leg.pattern, subject_type, span)?;
+            let saved_guards = self.literal_guards.replace(Vec::new());
+            let pattern = self.pattern(&leg.pattern, subject_type, span);
+            let guards =
+                std::mem::replace(&mut self.literal_guards, saved_guards).unwrap_or_default();
+            let pattern = if guards.is_empty() {
+                pattern?
+            } else {
+                format!("{} if {}", pattern?, guards.join(" && "))
+            };
             if matches!(leg.pattern, ExprPattern::Wildcard | ExprPattern::Binding(_))
                 || self.pattern_is_bool(&leg.pattern)
             {
@@ -4500,9 +4831,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // `&str` ([`Emitter::match_expr`]), so the pattern is the bare Rust
             // literal, which is what a `&str` pattern is.
             ExprPattern::Literal(id) if Self::string_pattern_text(self.program, *id).is_some() => {
-                Ok(rust_string(
-                    Self::string_pattern_text(self.program, *id).expect("just tested"),
-                ))
+                let literal =
+                    rust_string(Self::string_pattern_text(self.program, *id).expect("just tested"));
+                if self.pattern_nesting == 0 {
+                    return Ok(literal);
+                }
+                let Some(guards) = self.literal_guards.as_mut() else {
+                    return Err(unsupported(
+                        "a `str` literal nested inside a pattern anywhere but a `match` leg",
+                        span,
+                    ));
+                };
+                let name = format!("__literal{}", guards.len());
+                guards.push(format!("&*{name} == {literal}"));
+                Ok(name)
             }
             ExprPattern::Literal(id) => self.expression(*id, 0),
             ExprPattern::Variant(enum_id, index, payload) => {
@@ -4543,7 +4885,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let payload_types = self.variant_payload_types(*enum_id, *index, &arguments);
                 let mut parts = Vec::new();
                 for (slot, sub) in payload.iter().enumerate() {
-                    parts.push(self.pattern(sub, payload_types.get(slot).copied(), span)?);
+                    self.pattern_nesting += 1;
+                    let part = self.pattern(sub, payload_types.get(slot).copied(), span);
+                    self.pattern_nesting -= 1;
+                    parts.push(part?);
                 }
                 Ok(format!("{path}({})", parts.join(", ")))
             }
@@ -4554,7 +4899,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 };
                 let mut parts = Vec::new();
                 for (slot, (element, _)) in elements.iter().enumerate() {
-                    parts.push(self.pattern(element, element_types.get(slot).copied(), span)?);
+                    self.pattern_nesting += 1;
+                    let part = self.pattern(element, element_types.get(slot).copied(), span);
+                    self.pattern_nesting -= 1;
+                    parts.push(part?);
                 }
                 Ok(format!("({},)", parts.join(", ")))
             }
@@ -4947,7 +5295,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             self.current_substitution = saved;
             // A field declared `async |T| U` takes a future-answering closure.
             self.expects_async_value = self.program.async_fields.contains(&(struct_id, *index));
-            let rendered = self.value_of_expecting(*value, Some(expecting), depth);
+            let rendered = self.consumed_value_of_expecting(*value, Some(expecting), depth);
             self.expects_async_value = false;
             parts.push(format!("{name}: {}", rendered?));
         }
@@ -5210,7 +5558,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     return true;
                 }
                 match self.program.parameters.get(binding) {
-                    Some(parameter) => self.receiving_form(parameter) == Receiving::ByValue,
+                    Some(parameter) => {
+                        self.receiving_form(parameter) == Receiving::ByValue
+                            || self.is_a_value_received_by_reference(parameter)
+                    }
                     None => self.program.variables.contains_key(binding),
                 }
             })
@@ -5224,6 +5575,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .iter()
             .map(|binding| {
                 let name = self.binding_name(*binding);
+                // A plain `self` arrives as a `&T` natively, and a closure the
+                // counted `Rc<dyn Fn>` stores cannot hold a borrow of the
+                // caller's frame — `ListCell::set` hands `SignalCell::update` a
+                // closure that records into `self.log`, and rustc refused the
+                // `'static` it needs. The receiver is a VALUE in vilan (a bare
+                // `self` is a copy), so the capture takes a copy of it, which is
+                // what capturing a by-value parameter already does.
+                if self
+                    .program
+                    .parameters
+                    .get(binding)
+                    .is_some_and(|parameter| self.is_a_value_received_by_reference(parameter))
+                {
+                    return format!("let {name} = (*{name}).clone(); ");
+                }
                 format!("let {name} = {name}.clone(); ")
             })
             .collect();
@@ -5589,14 +5955,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             // `new TextDecoder()` / `new TextEncoder()` — both stateless for
             // the one encoding vilan has.
+            // `new Uint8Array(size)` — `std::bytes`'s `alloc` (F33). Keyed on
+            // the vilan NAME as well as the symbol, because `bytes_of_buffer`
+            // is `new Uint8Array(buffer)` over an `ArrayBuffer`, which has no
+            // native twin and stays refused by name.
+            ExternBinding::New {
+                module: None,
+                symbol: "Uint8Array",
+            } if name == "alloc" => {
+                return Ok(Some(format!(
+                    "vilan_rt::bytes::Bytes::alloc({})",
+                    self.value_argument(argument_ids, 0, depth)?
+                )));
+            }
             ExternBinding::New {
                 module: None,
                 symbol: "TextDecoder",
-            } => return Ok(Some("vilan_rt::http::TextDecoder".to_string())),
+            } => return Ok(Some("vilan_rt::bytes::TextDecoder".to_string())),
             ExternBinding::New {
                 module: None,
                 symbol: "TextEncoder",
-            } => return Ok(Some("vilan_rt::http::TextEncoder".to_string())),
+            } => return Ok(Some("vilan_rt::bytes::TextEncoder".to_string())),
             ExternBinding::Function {
                 module: Some("node:stream/consumers"),
                 symbol: "text",
@@ -5731,12 +6110,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     self.place_argument(argument_ids, 0, depth)?
                 )
             }
-            // F18 slice 2: `std::bytes`'s READ accessors. The three that
-            // MUTATE (`alloc`, `fill`, `copy_into`) are deliberately absent:
-            // a `Uint8Array` is a mutable reference type there and `Bytes` is
-            // an immutable refcounted buffer here, so admitting them wants a
-            // decision about which `Bytes` is — its own item, and a wrong
-            // answer would be a silent miscompile rather than a refusal.
+            // F18 slice 2: `std::bytes`'s READ accessors, and since F33 (RULED
+            // (a)) the two that MUTATE in place. A `Uint8Array` is a mutable
+            // reference type on the other backend and `vilan_rt::bytes::Bytes`
+            // is the same thing natively — one shared buffer behind every
+            // holder — so a write through one binding is seen through every
+            // alias, and `fill` answers the SAME buffer (the host's `this`).
+            // `fill` and `fill_u32` widen their value to `i64` so the runtime
+            // takes the host's `ToUint8` (the low eight bits) from one width.
+            ("Bytes", "fill" | "fill_u32") => format!(
+                "({}).fill(({}) as i64, {}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?,
+                self.value_argument(argument_ids, 3, depth)?
+            ),
+            ("Bytes", "copy_into") => format!(
+                "({}).copy_into(&{}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?
+            ),
             ("Bytes", "len") => {
                 format!("({}).len()", self.place_argument(argument_ids, 0, depth)?)
             }
@@ -5766,6 +6160,29 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.place_argument(argument_ids, 0, depth)?,
                 self.value_argument(argument_ids, 1, depth)?
             ),
+            // --- RawStat (`std::fs`'s `fs.Stats`) ---
+            ("RawStat", "size") => {
+                format!("({}).size()", self.place_argument(argument_ids, 0, depth)?)
+            }
+            ("RawStat", "mtime_ms") => format!(
+                "({}).mtime_ms()",
+                self.place_argument(argument_ids, 0, depth)?
+            ),
+            ("RawStat", "is_directory") => format!(
+                "({}).is_directory()",
+                self.place_argument(argument_ids, 0, depth)?
+            ),
+            // --- NodeHash (node:crypto, `std::rpc_server`'s handshake) ---
+            ("NodeHash", "update") => format!(
+                "({}).update(&{})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            ("NodeHash", "digest") => format!(
+                "({}).digest(&{})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
             ("NodeSocket", "destroyed") => format!(
                 "({}).destroyed()",
                 self.place_argument(argument_ids, 0, depth)?
@@ -5773,6 +6190,178 @@ impl<'a, 'src> Emitter<'a, 'src> {
             _ => return Ok(None),
         };
         Ok(Some(rendered))
+    }
+
+    /// The good/bad split one `?` step makes: a `match` on the step's own
+    /// container that binds the payload as `binder` and runs `good`, and
+    /// rebuilds the bad half — `None`, or `Err` around the same error — which
+    /// is the JS emitter's "the result is the bad container as-is" in a
+    /// language where the two halves are two types (the `!` assertion's
+    /// reason, [`Emitter::try_assert`]).
+    fn lift_split(
+        &mut self,
+        step: Id,
+        binder: Id,
+        good: String,
+        fallback_enum: Option<Id>,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        // The step's own type, else the container the analyzer recorded for
+        // the lift (a step read out of a cell carries no type of its own).
+        let enum_id = match self.type_of(step).and_then(|type_id| self.resolve(type_id)) {
+            Some(Type::Enum(enum_id, _)) => Some(*enum_id),
+            _ => fallback_enum,
+        };
+        let is_result = match enum_id
+            .and_then(|enum_id| self.program.enums.get(&enum_id))
+            .map(|declaration| declaration.name)
+        {
+            Some("Option") => false,
+            Some("Result") => true,
+            Some(_) => return Err(unsupported("a `?` lift over a user `Lift` container", span)),
+            None => {
+                return Err(unsupported(
+                    "a `?` lift over a subject of unknown type",
+                    span,
+                ));
+            }
+        };
+        let mut subject = self.expression(step, depth)?;
+        // A pattern over a PLACE binds by reference under Rust's default
+        // binding modes; the payload is a copy by rule 1, as an `if let`'s is.
+        if matches!(
+            self.program.entity_map.get(&step),
+            Some(Expr::Local(_) | Expr::Parameter(_) | Expr::Field(_, _, _))
+        ) {
+            subject = format!("({subject}).clone()");
+        }
+        let name = self.binding_name(binder);
+        Ok(if is_result {
+            format!("match {subject} {{ Ok({name}) => {good}, Err(error) => Err(error) }}")
+        } else {
+            format!("match {subject} {{ Some({name}) => {good}, None => None }}")
+        })
+    }
+
+    /// The good half's value: the continuation as-is where the lift FLATTENS
+    /// (its value is already the container), else wrapped back into the
+    /// container's good variant.
+    /// The container a lift's dispatch names, where it names one.
+    fn lift_enum(&self, id: Id) -> Option<Id> {
+        match self.program.lift_dispatch.get(&id) {
+            Some(vilan_core::analyzer::LiftDispatch::Std { enum_id, .. }) => Some(*enum_id),
+            _ => None,
+        }
+    }
+
+    fn lift_wrap(&self, id: Id, value: String) -> String {
+        match self.program.lift_dispatch.get(&id) {
+            Some(vilan_core::analyzer::LiftDispatch::Std {
+                flatten: false,
+                enum_id,
+            }) => {
+                let good = match self
+                    .program
+                    .enums
+                    .get(enum_id)
+                    .map(|declaration| declaration.name)
+                {
+                    Some("Result") => "Ok",
+                    _ => "Some",
+                };
+                format!("{good}({value})")
+            }
+            _ => value,
+        }
+    }
+
+    /// `subject?.continuation` over `Option`/`Result` (F34 — `flatten`'s
+    /// `inner_subscription.read()?.dispose()`).
+    fn std_lift(
+        &mut self,
+        id: Id,
+        subject: Id,
+        binder: Id,
+        continuation: Id,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        if !matches!(
+            self.program.lift_dispatch.get(&id),
+            Some(vilan_core::analyzer::LiftDispatch::Std { .. }) | None
+        ) {
+            return Err(unsupported("a `?` lift over a user `Lift` container", span));
+        }
+        // The binder is bound by the split's `match` arm, exactly as an `if
+        // let`'s capture is, so a read of it inside the continuation names it.
+        self.is_captures.insert(binder);
+        let value = self.expecting_nothing(|emitter| emitter.expression(continuation, depth));
+        self.is_captures.remove(&binder);
+        let good = self.lift_wrap(id, value?);
+        let fallback = self.lift_enum(id);
+        self.lift_split(subject, binder, good, fallback, depth, span)
+    }
+
+    /// An expression-lifting region over `Option`/`Result`: its steps as
+    /// nested splits (an EVAL step a plain `let`), the body in the innermost
+    /// good arm, wrapped once.
+    fn std_lift_region(
+        &mut self,
+        id: Id,
+        steps: &[(Id, Id, bool)],
+        body: Id,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        if !matches!(
+            self.program.lift_dispatch.get(&id),
+            Some(vilan_core::analyzer::LiftDispatch::Std { .. }) | None
+        ) {
+            return Err(unsupported("a `?` lift over a user `Lift` container", span));
+        }
+        for (_, binder, _) in steps {
+            self.is_captures.insert(*binder);
+        }
+        let value = self.expecting_nothing(|emitter| emitter.expression(body, depth));
+        let mut rendered = match value {
+            Ok(value) => self.lift_wrap(id, value),
+            Err(error) => {
+                for (_, binder, _) in steps {
+                    self.is_captures.remove(binder);
+                }
+                return Err(error);
+            }
+        };
+        let fallback = self.lift_enum(id);
+        let rendered_steps = self.render_region_steps(steps, &mut rendered, fallback, depth, span);
+        for (_, binder, _) in steps {
+            self.is_captures.remove(binder);
+        }
+        rendered_steps?;
+        Ok(rendered)
+    }
+
+    /// The region's steps around its already-rendered body, innermost last.
+    fn render_region_steps(
+        &mut self,
+        steps: &[(Id, Id, bool)],
+        rendered: &mut String,
+        fallback: Option<Id>,
+        depth: usize,
+        span: Span,
+    ) -> Result<(), Error> {
+        for (step, binder, is_split) in steps.iter().rev() {
+            let inner = std::mem::take(rendered);
+            *rendered = if *is_split {
+                self.lift_split(*step, *binder, inner, fallback, depth, span)?
+            } else {
+                let name = self.binding_name(*binder);
+                let value = self.value_of(*step, depth)?;
+                format!("{{ let {name} = {value}; {inner} }}")
+            };
+        }
+        Ok(())
     }
 
     /// `expr!` — try-and-lift's assertion (`proposal/try-and-lift.md` §4), which
@@ -5984,6 +6573,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
         };
         match (*module, *symbol, name) {
             (None, "__sha256", _) => one(self, "crypto::sha256_bytes"),
+            // F18 slice 3: the two seams `std::rpc_server` reaches beyond
+            // `Bytes` — `std::time`'s host clock (the handshake rate limit
+            // stamps each attempt) and node:crypto's `createHash`, whose SHA-1
+            // is the WebSocket accept key. The hash's two methods are
+            // receiver-keyed in [`Emitter::http_host_binding`].
+            // `std::fs::stat`'s host glue: `require_build` probes the build
+            // manifest with it before reading, so `serve_build` reaches it at
+            // boot. The three `RawStat` getters are receiver-keyed in
+            // [`Emitter::http_host_binding`].
+            (None, "__fs_stat", "raw_stat") => one(self, "fs::stat"),
+            (None, "Date.now", "now_millis") => {
+                Ok(Some("vilan_rt::time::now_millis()".to_string()))
+            }
+            (Some("node:crypto"), "createHash", "create_hash") => Ok(Some(format!(
+                "vilan_rt::crypto::create_hash(&{})",
+                self.value_argument(argument_ids, 0, depth)?
+            ))),
             (Some("node:fs/promises"), "readFile", "read_bytes") => one(self, "fs::read_bytes"),
             (Some("node:fs/promises"), "readFile", "read_file_encoded") => {
                 two(self, "fs::read_text")
@@ -6521,7 +7127,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
         else {
             // A value call — `(h.f)()`. The subject is a counted closure.
             let subject = self.expression(function_call.subject_id, depth)?;
-            let arguments = self.value_arguments(&function_call.argument_ids, depth)?;
+            let callee_type = self.type_of(function_call.subject_id);
+            let arguments =
+                self.closure_call_arguments(callee_type, &function_call.argument_ids, depth)?;
             return Ok(format!("({subject})({})", arguments.join(", ")));
         };
         let target = *target;
@@ -6633,7 +7241,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
         {
             let concrete = self.concrete(type_id);
             let preferred = self.program.bound_dispatch_traits.get(&call_id).cloned();
-            if let Some(dispatch) = self.resolve_dispatch(concrete, member, &[], preferred, span)? {
+            let own_values = self
+                .program
+                .own_generic_call_bindings
+                .get(&call_id)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(dispatch) =
+                self.resolve_dispatch(concrete, member, &own_values, preferred, span)?
+            {
                 return self.emit_dispatch(dispatch, &function_call.argument_ids, depth, span);
             }
             return Err(unsupported(
@@ -6660,9 +7276,29 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // receiver lives in a cell, for the reason
             // [`Emitter::emit_intrinsic`] states: the borrow outlives the call
             // and a read of the same binding inside the item would meet it.
-            let item = self.value_argument(&function_call.argument_ids, 1, depth)?;
+            // The item is STORED, so it is a consuming position (see
+            // [`Emitter::consumed_value_of_expecting`]), and its position is
+            // the receiver's ELEMENT type: `ops.push(Delta::Reset(current))`
+            // on a `List<Delta<K, T>>` is where `Reset`'s `K` — which its
+            // payload does not mention — is closed, exactly as a `let`'s
+            // annotation closes it ([`Emitter::variant_arguments`]).
+            let element_type = function_call
+                .argument_ids
+                .first()
+                .and_then(|receiver| self.type_of(*receiver))
+                .and_then(|type_id| self.resolve(type_id))
+                .and_then(|resolved| match resolved {
+                    Type::Struct(_, arguments) => arguments.first().copied(),
+                    _ => None,
+                });
+            let item = match function_call.argument_ids.get(1) {
+                Some(argument) => {
+                    self.consumed_value_of_expecting(*argument, element_type, depth)?
+                }
+                None => "()".to_string(),
+            };
             let receiver = match function_call.argument_ids.first() {
-                Some(argument) => self.mutable_place(*argument, depth)?,
+                Some(argument) => self.mutable_receiver(*argument, depth)?,
                 None => "()".to_string(),
             };
             if function_call
@@ -6762,14 +7398,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if self.program.parameters.contains_key(&target)
             || self.program.variables.contains_key(&target)
         {
-            let arguments = self.value_arguments(&function_call.argument_ids, depth)?;
+            let callee_type = self.type_of(function_call.subject_id);
+            let arguments =
+                self.closure_call_arguments(callee_type, &function_call.argument_ids, depth)?;
             let callee = self.read_module_binding_or_local(target, span)?;
             return Ok(format!("({callee})({})", arguments.join(", ")));
         }
 
         // An ordinary call, monomorphized against whatever binds it.
-        let substitution =
+        let mut substitution =
             self.call_substitution(call_id, target, &function_call.generic_argument_ids);
+        self.close_open_bindings_from_position(&mut substitution, target);
         // F21: an `Option` whose payload is a VIEW is a `&`/`&mut` natively,
         // and the only position that carries it today is a `match` subject,
         // where the leg binds the reference and reads through it. Anywhere else
@@ -6799,13 +7438,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .ensure_function_with_bits(target, &substitution, &bits)?
             .name;
         let mut prelude = String::new();
+        self.argument_substitution = Some(substitution.clone());
         let arguments = self.call_arguments_adapting(
             target,
             &function_call.argument_ids,
             depth,
             &mut prelude,
             &bits,
-        )?;
+        );
+        self.argument_substitution = None;
+        let arguments = arguments?;
         Ok(Self::with_argument_prelude(
             prelude,
             format!("{name}({})", arguments.join(", ")),
@@ -6869,14 +7511,43 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .iter()
             .map(|parameter| self.receiving_form(parameter))
             .collect();
+        // Taken, not read: the arguments below are walked under the CALLER's
+        // substitution, and a call nested inside one sets its own.
+        let callee_substitution = self.argument_substitution.take();
         // Whether any argument will take a borrow of a cell that the arguments
         // after it must not be evaluated under.
         let borrows_a_cell = argument_ids.iter().enumerate().any(|(index, argument)| {
             matches!(conventions.get(index), Some(Receiving::RefMut))
                 && self.place_lives_in_a_cell(*argument)
         });
+        // The callee's WHOLE parameter list, hidden context parameters
+        // included (they have no `parameters` record, so `declared` omits
+        // them). A call can carry MORE arguments than that: the context pass
+        // threads a hidden argument at a trait call when SOME impl of the
+        // member needs the context, and the impl this instance dispatched to
+        // (`SignalCell::sub`, from `keyed_forward`'s `source.sub(..)`) declares
+        // none. JavaScript drops a surplus argument; a Rust call cannot take
+        // one, and a surplus argument can only be the pass's (the analyzer
+        // refuses a written one), so it is dropped here too.
+        let arity = self
+            .program
+            .functions
+            .get(&target)
+            .map(|function| function.parameters.len());
+        if let Some(span) = self.reentrant_view_read(&declared, argument_ids) {
+            return Err(unsupported(
+                "a closure handed a `&mut` view of a value that reads the same place again \
+                 inside it (`cell.update(|&mut list| cell.get())`: a read that aliases a live \
+                 write, which the JS backend answers with the in-progress value and safe Rust \
+                 cannot express)",
+                span,
+            ));
+        }
         let mut rendered = Vec::new();
         for (index, argument) in argument_ids.iter().enumerate() {
+            if arity.is_some_and(|arity| index >= arity) {
+                break;
+            }
             // F20: an argument standing in a `lazy` parameter is a cell, not a
             // value — see [`Emitter::lazy_argument`].
             if let Some(cell) = self.lazy_argument(*argument, depth) {
@@ -6891,9 +7562,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // read is indistinguishable from the place and costs no borrow that
             // could collide with another read in the same statement.
             let wants_a_mutable_place = matches!(conventions.get(index), Some(Receiving::RefMut));
-            let expecting = declared
-                .get(index)
-                .map(|parameter| self.concrete(parameter.type_id));
+            let expecting =
+                declared
+                    .get(index)
+                    .map(|parameter| match callee_substitution.clone() {
+                        Some(callee) => {
+                            let saved = self.enter_substitution(callee.into_iter().collect());
+                            let concrete = self.concrete(parameter.type_id);
+                            self.current_substitution = saved;
+                            concrete
+                        }
+                        None => self.concrete(parameter.type_id),
+                    });
             // A parameter declared `async |T| U` takes a future-answering
             // closure, so a sync literal at the call site is wrapped.
             // F22: an argument standing in a parameter this INSTANCE adapts is
@@ -6946,8 +7626,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .entity_map
                 .get(argument)
                 .is_some_and(|expr| matches!(expr, Expr::Reference(_, _)));
+            // A binding that is ALREADY a `&mut` loan is reborrowed, not
+            // borrowed again: `&mut counter` of a `counter: &mut Counter` is a
+            // `&mut &mut Counter`, which rustc only takes from a `mut` binding —
+            // and a parameter forwarding its loan (`fun forward(c: &mut
+            // Counter) { step(c) }`, a `&mut self` method calling another, and
+            // `[derive(Wire)]`'s `describe` handing its serializer on) was a
+            // refused build. `&mut *loan` is the reborrow, and it ends where
+            // the call does.
             let text = match conventions.get(index) {
                 Some(Receiving::Ref) if !already_a_reference => format!("&{text}"),
+                Some(Receiving::RefMut)
+                    if !already_a_reference && self.names_a_mutable_loan(*argument) =>
+                {
+                    format!("&mut *{text}")
+                }
                 Some(Receiving::RefMut) if !already_a_reference => format!("&mut {text}"),
                 _ => text,
             };
@@ -6987,6 +7680,116 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let mut rendered = Vec::new();
         for argument in argument_ids {
             rendered.push(self.consumed_value_of(*argument, depth)?);
+        }
+        Ok(rendered)
+    }
+
+    /// A call that hands a closure LITERAL a `&mut` view (a parameter whose
+    /// closure type writes `|&mut T| ..`) while that closure reads the call's
+    /// RECEIVER place again — `SignalCell::update(|&mut list| { ..
+    /// todos.get() .. })` over `todos`. On the JS backend the read sees the
+    /// in-progress value, because the view and the cell are one object;
+    /// natively the view is a live `RefMut` of the cell and the read a second
+    /// borrow of it, which safe Rust answers with a panic. So the shape is
+    /// refused by name at compile time — the span is the offending read.
+    ///
+    /// The test is the receiver's exact place (its binding and field path): a
+    /// read of a DIFFERENT field of the same `self` is not the cell and is left
+    /// alone, which is what kolt's store writes. A read through an ALIAS of the
+    /// cell is not seen here and still panics at run time with Rust's message.
+    fn reentrant_view_read(
+        &self,
+        declared: &[vilan_core::analyzer::Parameter<'src>],
+        argument_ids: &[Id],
+    ) -> Option<Span> {
+        let receiver = self.place_spine(*argument_ids.first()?)?;
+        for (index, parameter) in declared.iter().enumerate() {
+            let writes_a_view = self
+                .program
+                .closure_type_parameter_views
+                .get(&parameter.type_id)
+                .is_some_and(|views| views.contains(&Some(true)));
+            if !writes_a_view {
+                continue;
+            }
+            let Some(&argument) = argument_ids.get(index) else {
+                continue;
+            };
+            let Some(Expr::Closure(closure_id)) = self.program.entity_map.get(&argument) else {
+                continue;
+            };
+            let Some(closure) = self.program.closures.get(closure_id) else {
+                continue;
+            };
+            let mut pending = vec![closure.return_];
+            let mut visited = HashSet::new();
+            while let Some(expr_id) = pending.pop() {
+                if !visited.insert(expr_id) {
+                    continue;
+                }
+                if self.place_spine(expr_id).as_ref() == Some(&receiver) {
+                    return Some(self.span_of(expr_id));
+                }
+                pending.extend(self.children_of(expr_id));
+            }
+        }
+        None
+    }
+
+    /// A place as its binding and the field indices from it — `self.a.b` is
+    /// `(self, [a, b])` — or `None` for anything that is not a place.
+    fn place_spine(&self, id: Id) -> Option<(Id, Vec<usize>)> {
+        let _guard = vilan_core::util::RecursionGuard::enter()?;
+        match self.program.entity_map.get(&id)? {
+            Expr::Local(binding) | Expr::Parameter(binding) => Some((*binding, Vec::new())),
+            &Expr::Field(subject, _, index) => {
+                let (binding, mut path) = self.place_spine(subject)?;
+                path.push(index);
+                Some((binding, path))
+            }
+            _ => None,
+        }
+    }
+
+    /// The arguments of a call through a closure VALUE, against the closure
+    /// type's own parameters: a value parameter consumes its argument
+    /// ([`Self::value_arguments`]'s rule), and a parameter the type WROTE as a
+    /// view (`sync |&mut T| void`, recorded by the analyzer beside the type)
+    /// takes a PLACE — `SignalCell::update`'s `mutate(self.value.write())`
+    /// hands the cell's own storage to the closure, which is the whole of what
+    /// `update` is for. A place that is already a `&mut` loan is reborrowed;
+    /// anything else is borrowed and reaches the parameter through Rust's deref
+    /// coercion (a cell's `RefMut` guard included).
+    fn closure_call_arguments(
+        &mut self,
+        callee_type: Option<TypeId>,
+        argument_ids: &[Id],
+        depth: usize,
+    ) -> Result<Vec<String>, Error> {
+        let views = callee_type
+            .map(|type_id| self.concrete(type_id))
+            .and_then(|type_id| self.program.closure_type_parameter_views.get(&type_id))
+            .cloned()
+            .unwrap_or_default();
+        let mut rendered = Vec::new();
+        for (index, argument) in argument_ids.iter().enumerate() {
+            let already_a_reference = matches!(
+                self.program.entity_map.get(argument),
+                Some(Expr::Reference(_, _))
+            );
+            rendered.push(match views.get(index).copied().flatten() {
+                Some(_) if already_a_reference => self.expression(*argument, depth)?,
+                Some(true) => {
+                    let place = self.mutable_place(*argument, depth)?;
+                    if self.names_a_mutable_loan(*argument) {
+                        format!("&mut *{place}")
+                    } else {
+                        format!("&mut {place}")
+                    }
+                }
+                Some(false) => format!("&{}", self.expression(*argument, depth)?),
+                None => self.consumed_value_of(*argument, depth)?,
+            });
         }
         Ok(rendered)
     }
@@ -7034,6 +7837,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // for, taken at the position the find named: the CALL-ARGUMENT
             // path, where the position consumes by definition.
             Some(Expr::Index(_, _)) => true,
+            // A FIELD (or tuple slot) of a place is a place too, and moving a
+            // non-`Copy` one out is a PARTIAL move of its binding: `std::http`'s
+            // `path_matches_route(path, service.mount)` moved `mount` out of a
+            // `service` the next statement hands on whole, and rustc refused
+            // `Server::builder()`. The native-b-39 find ("a destructure of a
+            // FIELD read is not copied") is this. A `Copy` field moves nothing,
+            // so it is left alone — which also keeps every program that only
+            // ever read scalar fields byte-for-byte what it was.
+            Some(&Expr::Field(subject, _, _)) | Some(&Expr::TupleIndex(subject, _, _)) => {
+                self.spine_names_storage(subject) && !self.is_natively_copy(id)
+            }
             _ => false,
         };
         if reads_a_place {
@@ -7053,14 +7867,77 @@ impl<'a, 'src> Emitter<'a, 'src> {
         rendered
     }
 
+    /// Whether a place spine bottoms out in STORAGE a later read can still
+    /// reach — a binding (not a view, which a value read already copies out
+    /// of) or a subscript — rather than in a temporary (`f().field`), whose
+    /// field is free to move.
+    fn spine_names_storage(&self, id: Id) -> bool {
+        match self.program.entity_map.get(&id) {
+            Some(Expr::Local(binding)) | Some(Expr::Parameter(binding)) => {
+                (self.program.variables.contains_key(binding)
+                    || self.program.parameters.contains_key(binding))
+                    && !self.binding_holds_a_view(*binding)
+            }
+            Some(Expr::Index(_, _)) => true,
+            Some(&Expr::Field(subject, _, _)) | Some(&Expr::TupleIndex(subject, _, _)) => {
+                self.spine_names_storage(subject)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a value of `id`'s type is `Copy` natively — the numeric
+    /// scalars and `bool`, which a read never moves.
+    fn is_natively_copy(&self, id: Id) -> bool {
+        let Some(type_id) = self.type_of(id) else {
+            return false;
+        };
+        self.is_numeric_scalar(type_id)
+            || self
+                .resolve(type_id)
+                .is_some_and(|resolved| matches!(resolved, Type::Enum(enum_id, _) if self.program.bool_enum_id == Some(*enum_id)))
+    }
+
+    /// [`Self::value_of_expecting`] at a position that CONSUMES the value it
+    /// is handed — a `let`'s initializer, an assignment's value, a field of a
+    /// struct literal, an element of a list or tuple literal, a body's tail
+    /// and a `return`.
+    ///
+    /// The call-argument path has taken rule 1's copy at a consumed place read
+    /// since F20 ([`Self::copy_a_consumed_place_read`]); these positions did
+    /// not, and for every type `clone_sites` never marks — the ones the JS
+    /// backend treats as immutable values, `str` first, then `Option`/`Result`
+    /// and every enum, and the counted handles — a second read of the binding
+    /// was a use-after-move natively: `let copy = first; print(first)` over a
+    /// `str`, `let head = parts[0]` out of a `Vec`, `kept.push((address, at))`
+    /// followed by `address == remote`. All of them are in `Server::builder()`'s
+    /// std path. A natively `Copy` value is left alone, so a scalar `let`
+    /// renders exactly as it did.
+    fn consumed_value_of_expecting(
+        &mut self,
+        id: Id,
+        expecting: Option<TypeId>,
+        depth: usize,
+    ) -> Result<String, Error> {
+        self.value_of_expecting_in(id, expecting, depth, true)
+    }
+
     fn value_argument(
         &mut self,
         argument_ids: &[Id],
         index: usize,
         depth: usize,
     ) -> Result<String, Error> {
+        // A host binding's argument is a position of its OWN — the binding's
+        // declared parameter — and never the enclosing one: `let unit: u32 =
+        // "A".code_at(0)` handed the `let`'s `u32` down to the index, which is
+        // an `i32`, and rustc refused `(0u32)`. The literal's own record is
+        // the binding's parameter type, which is what it falls back to here.
         match argument_ids.get(index) {
-            Some(argument) => self.value_of(*argument, depth),
+            Some(argument) => {
+                let argument = *argument;
+                self.expecting_nothing(|emitter| emitter.value_of(argument, depth))
+            }
             None => Ok("()".to_string()),
         }
     }
@@ -7076,7 +7953,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
     ) -> Result<String, Error> {
         match argument_ids.get(index) {
-            Some(argument) => self.expression(*argument, depth),
+            Some(argument) => {
+                let argument = *argument;
+                self.expecting_nothing(|emitter| emitter.expression(argument, depth))
+            }
             None => Ok("()".to_string()),
         }
     }
@@ -7510,7 +8390,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .map(Some);
             }
             if let Some(default_id) = mono::trait_default_member(self.program, trait_id, member) {
-                let name = self.default_instance(default_id, type_id, span)?;
+                let name = self.default_instance(default_id, type_id, own_generic_values, span)?;
                 return Ok(Some(NativeDispatch::Call(name)));
             }
             // The preference did not materialize (it should not, for a call the
@@ -7528,7 +8408,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         else {
             return Ok(None);
         };
-        let name = self.default_instance(default_id, type_id, span)?;
+        let name = self.default_instance(default_id, type_id, own_generic_values, span)?;
         Ok(Some(NativeDispatch::Call(name)))
     }
 
@@ -7622,19 +8502,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
             type_id,
             &mut substitution,
         );
-        if !own_generic_values.is_empty()
-            && let Some(function) = self.program.functions.get(&member_id)
-        {
-            for (constraint_id, value) in function
-                .generic_parameter_constraint_ids
-                .iter()
-                .zip(own_generic_values.iter())
-            {
-                substitution.insert(*constraint_id, *value);
-            }
-        }
+        substitution.extend(self.own_generic_entries(member_id, own_generic_values));
         let name = self.ensure_function(member_id, &substitution)?.name;
         Ok(NativeDispatch::Call(name))
+    }
+
+    /// A member's OWN generic parameters bound for one call, from the values
+    /// the analyzer recorded for it in order (`own_generic_call_bindings`).
+    /// F34: an inherited DEFAULT reached through `OnType` had been handed none
+    /// at all, so `map<U>`'s `U` went unbound and the call was refused.
+    fn own_generic_entries(&self, member_id: Id, recorded: &[TypeId]) -> Vec<(TypeId, TypeId)> {
+        let Some(function) = self.program.functions.get(&member_id) else {
+            return Vec::new();
+        };
+        function
+            .generic_parameter_constraint_ids
+            .iter()
+            .copied()
+            .zip(recorded.iter().copied())
+            .collect()
     }
 
     /// Emits a resolved dispatch's call, with the receiver as the first
@@ -7762,10 +8648,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
         &mut self,
         default_id: Id,
         type_id: TypeId,
+        own_generic_values: &[TypeId],
         span: Span,
     ) -> Result<String, Error> {
         let type_id = self.concrete(type_id);
-        let key = (default_id, self.type_key(type_id));
+        // F34: a default with generic parameters of its OWN (`map<U>`) is one
+        // instance per binding of them, as well as per receiver type.
+        let own = self.own_generic_entries(default_id, own_generic_values);
+        let mut key_text = self.type_key(type_id);
+        for (_, value) in &own {
+            key_text.push('|');
+            key_text.push_str(&self.type_key(*value));
+        }
+        let key = (default_id, key_text);
         if let Some(reserved) = self.default_instances.get(&key) {
             return Ok(reserved.name.clone());
         }
@@ -7793,7 +8688,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // REPLACED rather than composed, exactly as the JS emitter does it: a
         // default body has no generic parameters of its own, and the trait's
         // arguments for THIS type are the whole binding it runs under.
-        let substitution = self.trait_parameter_substitution(default_id, type_id);
+        let mut substitution = self.trait_parameter_substitution(default_id, type_id);
+        substitution.extend(own);
         let saved_self = self.current_self_type.replace(type_id);
         let self_traits = self.self_traits_of(default_id);
         let saved_traits = std::mem::replace(&mut self.current_self_traits, self_traits);
@@ -7834,7 +8730,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let mut prelude = String::new();
             let mut arguments = Vec::new();
             for (index, argument) in argument_ids.iter().enumerate().skip(1) {
-                let value = self.value_of(*argument, depth)?;
+                // A mutating intrinsic STORES its arguments (an insert's key and
+                // value), so each is a consuming position.
+                let value = self.consumed_value_of_expecting(*argument, None, depth)?;
                 let name = format!("__borrowed{index}");
                 let _ = write!(prelude, "let {name} = {value}; ");
                 arguments.push(name);
@@ -7848,10 +8746,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
         for (index, argument) in argument_ids.iter().enumerate() {
             arguments.push(if index == 0 {
                 if mutating {
-                    self.mutable_place(*argument, depth)?
+                    self.mutable_receiver(*argument, depth)?
                 } else {
                     self.expression(*argument, depth)?
                 }
+            } else if mutating {
+                self.consumed_value_of_expecting(*argument, None, depth)?
             } else {
                 self.value_of(*argument, depth)?
             });
@@ -7904,6 +8804,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// is only a place if every node between the root and the write is one.
     /// `RefMut` derefs both ways, so a field, an index and a `&mut` all reach
     /// through it the way they reach through the value itself.
+    /// [`Self::mutable_place`] as the RECEIVER of a mutating intrinsic, which
+    /// the intrinsic borrows `&mut` itself: a binding that is already a `&mut`
+    /// loan (`update(|&mut list| list.push(x))`'s `list`) is dereferenced, so
+    /// the borrow is a reborrow of its target rather than a `&mut &mut` rustc
+    /// only takes from a `mut` binding.
+    fn mutable_receiver(&mut self, id: Id, depth: usize) -> Result<String, Error> {
+        let place = self.mutable_place(id, depth)?;
+        if self.names_a_mutable_loan(id) {
+            return Ok(format!("(*{place})"));
+        }
+        Ok(place)
+    }
+
     fn mutable_place(&mut self, id: Id, depth: usize) -> Result<String, Error> {
         // `boxed_emitted` is deliberately NOT written here: C15's count measures
         // what the walk EMITTED as a `Captured` cell, which is the DECLARATION's
@@ -8194,8 +9107,9 @@ fn scalar_type(name: &str) -> Option<&'static str> {
 /// executor's four handles are one: these are host types, so nothing in the
 /// source says what they are made of, and the mapping is the whole of what the
 /// backend knows about them. `NodeAddress` is `std::http`'s private
-/// `address()` result; `Bytes` is `std::bytes`'s, and it is here because the
-/// HTTP surface is the first thing that needs one.
+/// `address()` result; `Bytes` and the two codecs are `std::bytes`'s, and they
+/// are in this table because the HTTP surface was the first thing to need them
+/// (their runtime home is `vilan_rt::bytes` since F33).
 fn http_host_type(name: &str) -> Option<&'static str> {
     Some(match name {
         "NodeServer" => "vilan_rt::http::Server",
@@ -8203,13 +9117,12 @@ fn http_host_type(name: &str) -> Option<&'static str> {
         "NodeRequest" => "vilan_rt::http::Request",
         "NodeResponse" => "vilan_rt::http::Response",
         "NodeSocket" => "vilan_rt::http::Socket",
-        "Bytes" => "vilan_rt::http::Bytes",
+        "Bytes" => "vilan_rt::bytes::Bytes",
         // F18 slice 2: `std::bytes`'s two codec classes, which live beside
-        // `Bytes` in the runtime for the reason `Bytes` does — the HTTP
-        // surface is what first needs them (`Request::body` decodes the
-        // collected body).
-        "TextDecoder" => "vilan_rt::http::TextDecoder",
-        "TextEncoder" => "vilan_rt::http::TextEncoder",
+        // `Bytes` in the runtime — the HTTP surface is what first needed them
+        // (`Request::body` decodes the collected body).
+        "TextDecoder" => "vilan_rt::bytes::TextDecoder",
+        "TextEncoder" => "vilan_rt::bytes::TextEncoder",
         _ => return None,
     })
 }
@@ -8290,7 +9203,9 @@ fn host_handle_name(rendered: &str) -> Option<&'static str> {
         ("vilan_rt::http::Request", "NodeRequest"),
         ("vilan_rt::http::Response", "NodeResponse"),
         ("vilan_rt::http::Socket", "NodeSocket"),
-        ("vilan_rt::http::Bytes", "Bytes"),
+        ("vilan_rt::bytes::Bytes", "Bytes"),
+        ("vilan_rt::crypto::NodeHash", "NodeHash"),
+        ("vilan_rt::fs::RawStat", "RawStat"),
     ];
     HANDLES
         .iter()

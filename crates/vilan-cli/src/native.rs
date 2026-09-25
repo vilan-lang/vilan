@@ -136,7 +136,7 @@ fn runtime_crate(unit: &Unit) -> Result<PathBuf, String> {
             directory = current.parent();
         }
     }
-    vilan_embedded_std::materialize_rt()
+    vilan_embedded::materialize_rt()
 }
 
 /// The project directory for `unit` — `dist/native/<entry-stem>/`, beside the

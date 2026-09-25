@@ -8,7 +8,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use vilan_embedded_std::{
+use vilan_embedded::{
     CONTENT_HASH, FILES, RT_CONTENT_HASH, RT_FILES, RT_MANIFEST, materialize_into,
 };
 
@@ -133,7 +133,7 @@ fn the_runtime_materializes_completely_and_idempotently() {
     ));
     let _ = fs::remove_dir_all(&cache_root);
 
-    let crate_dir = vilan_embedded_std::materialize_rt_into(&cache_root).expect("first");
+    let crate_dir = vilan_embedded::materialize_rt_into(&cache_root).expect("first");
     assert!(crate_dir.ends_with(Path::new(RT_CONTENT_HASH).join("vilan-rt")));
     assert_eq!(
         fs::read_to_string(crate_dir.join("Cargo.toml")).expect("manifest"),
@@ -148,7 +148,7 @@ fn the_runtime_materializes_completely_and_idempotently() {
         .unwrap()
         .modified()
         .unwrap();
-    let again = vilan_embedded_std::materialize_rt_into(&cache_root).expect("second");
+    let again = vilan_embedded::materialize_rt_into(&cache_root).expect("second");
     assert_eq!(again, crate_dir);
     assert_eq!(
         before,
@@ -187,7 +187,7 @@ fn walk_rust(directory: &Path, prefix: &Path, out: &mut Vec<String>) {
 #[test]
 fn materialization_is_complete_and_idempotent() {
     let cache_root = scratch::root().join(format!(
-        "vilan-embedded-std-test-{}-{CONTENT_HASH}",
+        "vilan-embedded-test-{}-{CONTENT_HASH}",
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&cache_root);
@@ -224,10 +224,9 @@ fn materialization_is_complete_and_idempotent() {
 
 #[test]
 fn pruning_removes_only_entries_older_than_the_guard() {
-    use vilan_embedded_std::prune_stale;
+    use vilan_embedded::prune_stale;
 
-    let cache_root =
-        scratch::root().join(format!("vilan-embedded-std-prune-{}", std::process::id()));
+    let cache_root = scratch::root().join(format!("vilan-embedded-prune-{}", std::process::id()));
     let _ = fs::remove_dir_all(&cache_root);
     for entry in [
         "fresh-entry",
@@ -280,7 +279,7 @@ fn pruning_removes_only_entries_older_than_the_guard() {
 #[test]
 fn materializing_a_new_hash_prunes_a_stale_sibling_and_keeps_a_fresh_one() {
     let cache_root = scratch::root().join(format!(
-        "vilan-embedded-std-materialize-prune-{}",
+        "vilan-embedded-materialize-prune-{}",
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&cache_root);
@@ -321,7 +320,7 @@ fn materializing_a_new_hash_prunes_a_stale_sibling_and_keeps_a_fresh_one() {
 #[test]
 fn the_current_hash_survives_its_own_prune_however_old_it_is() {
     let cache_root = scratch::root().join(format!(
-        "vilan-embedded-std-current-survives-{}",
+        "vilan-embedded-current-survives-{}",
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&cache_root);
@@ -337,11 +336,11 @@ fn the_current_hash_survives_its_own_prune_however_old_it_is() {
     // And the sweep itself declines it, under the age guard and under `--all`.
     let one_day = std::time::Duration::from_secs(24 * 60 * 60);
     assert!(
-        vilan_embedded_std::prune(&cache_root, Some(one_day), false).is_empty(),
+        vilan_embedded::prune(&cache_root, Some(one_day), false).is_empty(),
         "this binary's own tree is never pruned by age"
     );
     assert!(
-        vilan_embedded_std::prune(&cache_root, None, false).is_empty(),
+        vilan_embedded::prune(&cache_root, None, false).is_empty(),
         "this binary's own tree is never pruned by `--all` either"
     );
     assert!(current.is_dir());
@@ -357,8 +356,7 @@ fn the_current_hash_survives_its_own_prune_however_old_it_is() {
 /// but that the first list is the second's, entry for entry.
 #[test]
 fn a_dry_run_names_what_would_go_and_removes_nothing() {
-    let cache_root =
-        scratch::root().join(format!("vilan-embedded-std-dry-run-{}", std::process::id()));
+    let cache_root = scratch::root().join(format!("vilan-embedded-dry-run-{}", std::process::id()));
     let _ = fs::remove_dir_all(&cache_root);
     for entry in ["fresh-entry", "stale-entry", ".staging-stale"] {
         fs::create_dir_all(cache_root.join(entry).join("std")).expect("seed entry");
@@ -370,7 +368,7 @@ fn a_dry_run_names_what_would_go_and_removes_nothing() {
         backdate(&cache_root.join(stale), long_ago);
     }
 
-    let would_go = vilan_embedded_std::prune(&cache_root, Some(one_day), true);
+    let would_go = vilan_embedded::prune(&cache_root, Some(one_day), true);
     let mut named: Vec<&str> = would_go.iter().map(|entry| entry.name.as_str()).collect();
     named.sort_unstable();
     assert_eq!(named, [".staging-stale", "stale-entry"]);
@@ -382,7 +380,7 @@ fn a_dry_run_names_what_would_go_and_removes_nothing() {
         assert!(cache_root.join(entry).is_dir(), "a dry run removed {entry}");
     }
 
-    let went = vilan_embedded_std::prune(&cache_root, Some(one_day), false);
+    let went = vilan_embedded::prune(&cache_root, Some(one_day), false);
     let mut really: Vec<&str> = went.iter().map(|entry| entry.name.as_str()).collect();
     really.sort_unstable();
     assert_eq!(really, named, "the dry run named something else than went");
@@ -395,10 +393,8 @@ fn a_dry_run_names_what_would_go_and_removes_nothing() {
 /// L21: `--all` drops the age guard and nothing else — `prune(.., None, ..)`.
 #[test]
 fn pruning_everything_ignores_the_age_guard_and_keeps_the_current_tree() {
-    let cache_root = scratch::root().join(format!(
-        "vilan-embedded-std-prune-all-{}",
-        std::process::id()
-    ));
+    let cache_root =
+        scratch::root().join(format!("vilan-embedded-prune-all-{}", std::process::id()));
     let _ = fs::remove_dir_all(&cache_root);
     materialize_into(&cache_root).expect("materialize");
     for entry in ["fresh-entry", "another-fresh-entry"] {
@@ -407,10 +403,10 @@ fn pruning_everything_ignores_the_age_guard_and_keeps_the_current_tree() {
 
     let one_day = std::time::Duration::from_secs(24 * 60 * 60);
     assert!(
-        vilan_embedded_std::prune(&cache_root, Some(one_day), false).is_empty(),
+        vilan_embedded::prune(&cache_root, Some(one_day), false).is_empty(),
         "nothing here is a day old"
     );
-    let went = vilan_embedded_std::prune(&cache_root, None, false);
+    let went = vilan_embedded::prune(&cache_root, None, false);
     assert_eq!(went.len(), 2, "`--all` takes both young siblings: {went:?}");
     assert!(
         cache_root.join(CONTENT_HASH).is_dir(),

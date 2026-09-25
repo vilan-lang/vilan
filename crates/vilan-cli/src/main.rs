@@ -420,15 +420,15 @@ fn run_cli() -> ExitCode {
 /// with the gesture that reaches the others, rather than accumulating a root
 /// this command does not know about.
 fn cache_prune(all: bool, dry_run: bool) -> ExitCode {
-    let max_age = (!all).then_some(vilan_embedded_std::STALE_AFTER);
+    let max_age = (!all).then_some(vilan_embedded::STALE_AFTER);
     let roots = [
         (
-            vilan_embedded_std::default_cache_root(),
+            vilan_embedded::default_cache_root(),
             Some("this binary's own tree is never pruned"),
         ),
-        (vilan_embedded_std::default_check_cache_root(), None),
+        (vilan_embedded::default_check_cache_root(), None),
         (
-            vilan_embedded_std::default_rt_cache_root(),
+            vilan_embedded::default_rt_cache_root(),
             Some("this binary's own runtime tree is never pruned"),
         ),
     ];
@@ -457,8 +457,8 @@ fn prune_one_cache_root(
     // its entries are one package's table each, and no package is "current".
     protected: Option<&str>,
 ) -> ExitCode {
-    let before = vilan_embedded_std::cache_entries(root).len();
-    let removed = vilan_embedded_std::prune(root, max_age, dry_run);
+    let before = vilan_embedded::cache_entries(root).len();
+    let removed = vilan_embedded::prune(root, max_age, dry_run);
     let kept = before - removed.len();
     let freed: u64 = removed.iter().map(|entry| entry.bytes).sum();
     if removed.is_empty() {
@@ -4059,7 +4059,7 @@ fn resolve_workspace(unit: &Unit) -> Result<Workspace, String> {
 /// byte-clean for `build --stdout`. Dim like `vilan upgrade`'s download line,
 /// TTY-gated by `paint` like every other status line.
 fn git_deps() -> vilan_core::git_dep::GitDeps {
-    vilan_core::git_dep::GitDeps::fetching(vilan_embedded_std::default_git_dep_root())
+    vilan_core::git_dep::GitDeps::fetching(vilan_embedded::default_git_dep_root())
         .reporting(|message| eprintln!("{}", paint::err(paint::Style::DIM, message)))
 }
 
@@ -4069,7 +4069,7 @@ fn git_deps() -> vilan_core::git_dep::GitDeps {
 /// pass that fetched would move the network ahead of the `[build]` hooks and
 /// change what the build does in order to describe it.
 fn git_deps_cached() -> vilan_core::git_dep::GitDeps {
-    vilan_core::git_dep::GitDeps::cache_only(vilan_embedded_std::default_git_dep_root())
+    vilan_core::git_dep::GitDeps::cache_only(vilan_embedded::default_git_dep_root())
 }
 
 /// Resolves a unit's workspace and compiles its entry for `platform`, returning the
@@ -4288,7 +4288,7 @@ fn expansion_cache_root(package_dir: &Path, goal: CompileGoal) -> PathBuf {
     let canonical = vilan_core::util::canonical_path(package_dir);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(&canonical, &mut hasher);
-    vilan_embedded_std::default_check_cache_root()
+    vilan_embedded::default_check_cache_root()
         .join(format!("{:016x}", std::hash::Hasher::finish(&hasher)))
 }
 
@@ -5681,7 +5681,7 @@ fn std_dir(entry: &Path) -> Result<PathBuf, String> {
             directory = current.parent();
         }
     }
-    vilan_embedded_std::materialize()
+    vilan_embedded::materialize()
 }
 
 /// Runs the full pipeline (lex -> parse -> analyze -> contexts -> async infer ->
