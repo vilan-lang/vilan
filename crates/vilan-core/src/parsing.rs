@@ -93,7 +93,7 @@ fn collect_branch_selectors(branch: &ImportBranch<'_>, into: &mut Vec<Span>) {
 /// length) holds no binder and ends the descent.
 fn collect_selector_binders(node: &Spanned<Node<'_>>, into: &mut Vec<Span>) {
     match &node.0 {
-        Node::TypeBinder((name, _), bounds) => {
+        Node::TypeBinder((name, _), bounds, _) => {
             if *name != ANONYMOUS_TYPE_BINDER || !bounds.is_empty() {
                 into.push(node.1);
             }
@@ -359,12 +359,19 @@ const DOC_HIDDEN_IS_SUPERSEDED: &str = "`[doc(hidden)]` is superseded by visibil
      marker is reached for: it stays exported and callable, and the editor hides it from \
      completion, dims it and leads its hover with the reason";
 
-/// F27 R1's placement rule: a module's `[platform(..)];` is the FILE's platform,
-/// so it leads the file — the one place a reader looks for what the whole file
-/// is. Curated: the rule states itself and names the move that satisfies it.
-pub const MODULE_PLATFORM_LEADS_THE_FILE: &str = "a module's `[platform(..)];` declares the platform of the whole file, so it is the file's \
-     first statement: move it above the first import. To fence one function instead, write the \
-     attribute on it with no `;`";
+/// B415's placement rule: `mod self;` hosts the FILE's own attributes (F27
+/// R1's `[platform(..)]` today), so it leads the file — the one place a reader
+/// looks for what the whole file is. Curated: the rule states itself and names
+/// the move that satisfies it.
+pub const MODULE_SELF_LEADS_THE_FILE: &str = "`mod self;` carries the attributes of the whole file, so it is the file's first statement: \
+     move it above the first import. To fence one function instead, write `[platform(..)]` on \
+     the function";
+
+/// B415's reserved name: `self` is the file's OWN module, the one `mod self;`
+/// declares, so no nested module may take it. Curated: it names the one
+/// legal `self` module and the move.
+pub const MODULE_SELF_IS_RESERVED: &str = "`self` is reserved for the file's own module — `mod self;`, with no body, as the file's \
+     first statement — so a nested module cannot take the name: give it another";
 
 /// B382's rule: a `[deprecated]` steer on an import is about the NAME a
 /// re-export publishes, so it needs the `export`. Curated: it names the move.
@@ -605,8 +612,8 @@ const PATTERN_BINDER_IS_ONE_WORD: &str = "a pattern binds mutably with `mut x`: 
 const BRACE_IN_AN_ISTRING: &str = "a `{` inside an `i\"…\"` string opens an interpolation hole, so this is being read as \
      an expression — write `\\{` (and `\\}`) for a literal brace";
 
-/// A keyword that declares an ITEM — `fun`/`struct`/…, plus the `external` and
-/// `resource` modifiers that lead one. An item is never part of an expression, so
+/// A keyword that declares an ITEM — `fun`/`struct`/…, plus the `external`
+/// modifier that leads one. An item is never part of an expression, so
 /// [`Parser::scan_to_sync_point`] may stop at one even inside a delimited region it
 /// is skipping (a `{` above it excepted: a block or closure body holds ordinary
 /// statements, and a nested `fun` is one of them).
@@ -687,7 +694,6 @@ fn starts_item(token: &Token<'_>) -> bool {
             | Token::Export
             | Token::Macro
             | Token::External
-            | Token::Resource
     )
 }
 
@@ -946,8 +952,9 @@ struct Parser<'a, 'src> {
     /// (variadic-generics.md §S.7), and clears it for the body it then parses:
     /// a `fun` declared inside a member's body is a free function.
     in_member_body: bool,
-    /// Whether the statement about to be read is the FILE's first (F27 R1):
-    /// the one position a module-level `[platform("…")];` may stand in. Set by
+    /// Whether the statement about to be read is the FILE's first (B415): the
+    /// one position `mod self;` — the host of the file's platform — may stand
+    /// in. Set by
     /// [`Parser::parse_program`] before its first statement and TAKEN by the
     /// first [`Parser::parse_statement_inner`] that runs — so a statement nested
     /// inside that first one (a function body's, a `mod`'s) already sees it
@@ -1111,6 +1118,7 @@ pub const KNOWN_ATTRIBUTE_MARKERS: &[&str] = &[
     "platform",
     "deprecated",
     "internal",
+    "resource",
 ];
 
 /// Whether `name` is one of [`KNOWN_ATTRIBUTE_MARKERS`]. Mirrors the chumsky
@@ -2348,14 +2356,15 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     /// [`Parser::parse_statement`]'s body, past the depth bound.
     fn parse_statement_inner(&mut self) -> Option<Spanned<Node<'src>>> {
-        // F27 R1: only the file's first statement may be its platform. Taken
-        // here, once, so every statement nested inside this one reads false.
+        // B415: only the file's first statement may be its `mod self;` (the
+        // host of F27 R1's platform). Taken here, once, so every statement
+        // nested inside this one reads false.
         let file_head = std::mem::take(&mut self.file_head);
-        if let Some(item) = self.attempt(Self::parse_module_platform) {
+        if let Some(item) = self.attempt(Self::parse_module_self) {
             if !file_head {
                 self.errors.push(ParseError {
                     span: item.1,
-                    reason: ParseErrorReason::Rule(MODULE_PLATFORM_LEADS_THE_FILE),
+                    reason: ParseErrorReason::Rule(MODULE_SELF_LEADS_THE_FILE),
                     context: self.context_stack.clone(),
                     hint: None,
                 });
@@ -5378,13 +5387,18 @@ impl<'a, 'src> Parser<'a, 'src> {
         // and what the binder's ENTITY must be spanned by is the thing an
         // editor selects for it (E161).
         let name_span = self.span_from(name_start);
-        let bounds = if self.eat_op(":") {
-            self.parse_type_bounds()?
+        // A122: a tuple-family bound (`type T: (2..)`) is tried before the
+        // trait-bound list, exactly as a generic parameter's is.
+        let (bounds, tuple_bound) = if self.eat_op(":") {
+            match self.parse_tuple_bound() {
+                Some(bound) => (Vec::new(), Some(Box::new(bound))),
+                None => (self.parse_type_bounds()?, None),
+            }
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
         Some((
-            Node::TypeBinder((name, name_span), bounds),
+            Node::TypeBinder((name, name_span), bounds, tuple_bound),
             self.span_from(start),
         ))
     }
@@ -6259,15 +6273,16 @@ impl<'a, 'src> Parser<'a, 'src> {
 
     // --- Structs / enums -----------------------------------------------------
 
-    /// `resource? external? struct (name | null) generics? ({ fields } | ;)`. The
-    /// `resource` modifier sits in `external`'s position (canonical order `resource
-    /// external struct`); the name may be the `null` keyword (the built-in `external
-    /// struct null`); a bodyless `;` form is valid only for an `external` struct
-    /// (checked past the parser).
+    /// `labels [resource]? external? struct (name | null) generics? ({ fields } |
+    /// ;)`. The `[resource]` attribute (B413; the keyword it replaced sat in the
+    /// same place) closes the label prefix, ahead of `external` (canonical order
+    /// `[resource] external struct`); the name may be the `null` keyword (the
+    /// built-in `external struct null`); a bodyless `;` form is valid only for an
+    /// `external` struct (checked past the parser).
     fn parse_struct(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         let labels = self.parse_item_labels();
-        let resource = self.eat(&Token::Resource);
+        let resource = self.parse_resource_kind();
         let external = self.eat(&Token::External);
         self.expect(&Token::Struct)?;
         let name_start = self.position;
@@ -6325,6 +6340,8 @@ impl<'a, 'src> Parser<'a, 'src> {
         // E213's label leads, as it does on a function: it is about the field
         // rather than about what crosses the wire.
         let internal = self.parse_internal_attribute();
+        // B413: a FIELD is no type declaration; refused, and parsed past.
+        self.refuse_misplaced_resource_attribute();
         let exposed = self.eat_expose_attribute();
         let name_start = self.position;
         let name = self.eat_ident()?;
@@ -6337,12 +6354,12 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some(((name, type_, exposed, internal), self.span_from(start)))
     }
 
-    /// `resource? enum name generics? { variants }`. There is no `external enum`, so
-    /// `resource` is the only leading modifier.
+    /// `labels [resource]? enum name generics? { variants }`. There is no
+    /// `external enum`, so `[resource]` (B413) is the only kind attribute.
     fn parse_enum(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         let labels = self.parse_item_labels();
-        let resource = self.eat(&Token::Resource);
+        let resource = self.parse_resource_kind();
         self.expect(&Token::Enum)?;
         let name_start = self.position;
         let name = self.eat_ident()?;
@@ -6372,6 +6389,8 @@ impl<'a, 'src> Parser<'a, 'src> {
         let start = self.position;
         // E221: a variant's label leads it, as a field's does (E213).
         let internal = self.parse_internal_attribute();
+        // B413: nor is a VARIANT; refused, and parsed past.
+        self.refuse_misplaced_resource_attribute();
         let name = self.eat_name()?;
         let data = self.attempt(|parser| {
             parser.expect_ctrl('(')?;
@@ -6502,11 +6521,23 @@ impl<'a, 'src> Parser<'a, 'src> {
         ))
     }
 
-    /// `mod name { statements }` — a nested module.
+    /// `mod name { statements }` — a nested module. `self` is the file's own
+    /// module (B415's `mod self;`), so a nested module by that name is refused
+    /// where it is written — and still parsed, so the reader gets the one
+    /// sentence and not a cascade.
     fn parse_module(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
         self.expect(&Token::Mod)?;
+        let name_span = self.here_span();
         let name = self.eat_ident()?;
+        if name == "self" {
+            self.errors.push(ParseError {
+                span: name_span,
+                reason: ParseErrorReason::Rule(MODULE_SELF_IS_RESERVED),
+                context: self.context_stack.clone(),
+                hint: None,
+            });
+        }
         let body = self.parse_item_body("module body")?;
         Some((Node::Module(name, body), self.span_from(start)))
     }
@@ -7556,14 +7587,21 @@ impl<'a, 'src> Parser<'a, 'src> {
         }))
     }
 
-    /// `[platform("…", …)];` — a FILE's platform (F27 R1): the function
-    /// fence's attribute with a `;` after it, which is what tells it from the
-    /// fence on a first item (the `export *;` shape — the marker is the
-    /// statement). Where it may stand is [`Parser::parse_statement_inner`]'s
-    /// rule, not this production's.
-    fn parse_module_platform(&mut self) -> Option<Spanned<Node<'src>>> {
+    /// `[platform("…", …)]? mod self;` — the host of the FILE's own
+    /// attributes (B415): today the file's platform (F27 R1), which R1 first
+    /// shipped as the bare `[platform(..)];`. `self` is the file's own module,
+    /// and a `mod` with no body is only ever this one. A host with no attribute
+    /// declares nothing (empty patterns). Where it may stand is
+    /// [`Parser::parse_statement_inner`]'s rule, not this production's; a
+    /// `mod self` WITH a body is [`Parser::parse_module`]'s refusal.
+    fn parse_module_self(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
-        let patterns = self.parse_platform_attribute()?;
+        let patterns = self.parse_platform_attribute().unwrap_or_default();
+        self.expect(&Token::Mod)?;
+        if self.peek() != Some(&Token::Ident("self")) {
+            return None;
+        }
+        self.bump();
         let span = self.span_from(start);
         self.expect_ctrl(';')?;
         Some((Node::ModulePlatform(patterns), span))
@@ -7701,15 +7739,19 @@ impl<'a, 'src> Parser<'a, 'src> {
         })
     }
 
-    /// `resource` NOT followed by `external` / `struct` / `enum` — the misplaced-
-    /// modifier steer (item 15 in the statement choice, after `struct`/`enum`, so a
-    /// valid `resource struct` / `resource external struct` / `resource enum` is
-    /// never shadowed). Emits a parse error and recovers to a `Node::Error` spanning
-    /// the `resource` keyword, leaving the offending token unconsumed (so
-    /// `fun`/`impl`/`let`/`trait` still parse on the next statement).
+    /// `[resource]` NOT followed by `external` / `struct` / `enum` — the
+    /// misplaced-attribute steer (item 15 in the statement choice, after
+    /// `struct`/`enum`, so a valid `[resource] struct` / `[resource] external
+    /// struct` / `[resource] enum` is never shadowed). Emits a parse error and
+    /// recovers to a `Node::Error` spanning the attribute, leaving the item after
+    /// it unconsumed (so `fun`/`impl`/`let`/`trait` still parse on the next
+    /// statement). B413 moved the kind from a keyword to this attribute; the
+    /// steer moved with it.
     fn parse_misplaced_resource(&mut self) -> Option<Spanned<Node<'src>>> {
         let start = self.position;
-        self.expect(&Token::Resource)?;
+        if !self.eat_marker_attribute("resource") {
+            return None;
+        }
         if matches!(
             self.peek(),
             Some(Token::External | Token::Struct | Token::Enum)
@@ -7717,16 +7759,66 @@ impl<'a, 'src> Parser<'a, 'src> {
             return None;
         }
         let span = self.span_from(start);
+        self.push_misplaced_resource(span);
+        Some((Node::Error, span))
+    }
+
+    /// The `[resource]` kind of a struct or an enum (B413), or `false`. The
+    /// RETIRED keyword spelling — `resource` as a word right before `struct`,
+    /// `external` or `enum`, which only a declaration can be — is taken too, as
+    /// the kind it meant, with ONE refusal steering to the attribute: the
+    /// declaration still parses, so the reader gets the sentence and not a
+    /// cascade.
+    fn parse_resource_kind(&mut self) -> bool {
+        if self.eat_marker_attribute("resource") {
+            return true;
+        }
+        if self.peek() == Some(&Token::Ident("resource"))
+            && matches!(
+                self.peek_at(1),
+                Some(Token::External | Token::Struct | Token::Enum)
+            )
+        {
+            let span = self.here_span();
+            self.bump();
+            self.errors.push(ParseError {
+                span,
+                reason: ParseErrorReason::Rule(
+                    "`resource` is an attribute, not a keyword: write `[resource]` before the \
+                     declaration (`[resource] struct`, `[resource] external struct`, \
+                     `[resource] enum`)",
+                ),
+                context: Vec::new(),
+                hint: None,
+            });
+            return true;
+        }
+        false
+    }
+
+    /// B413: `[resource]` where no type is declared — a field, a variant — is
+    /// the misplaced-attribute steer, and the position then parses as if it
+    /// were not there.
+    fn refuse_misplaced_resource_attribute(&mut self) {
+        let start = self.position;
+        if self.eat_marker_attribute("resource") {
+            let span = self.span_from(start);
+            self.push_misplaced_resource(span);
+        }
+    }
+
+    /// The one statement of the misplaced-`[resource]` rule, for every position
+    /// that refuses it.
+    fn push_misplaced_resource(&mut self, span: Span) {
         self.errors.push(ParseError {
             span,
             reason: ParseErrorReason::Rule(
-                "`resource` is a type-declaration modifier: it may appear only \
-                 before a `struct` or `enum` declaration",
+                "`[resource]` marks a type as a resource: it may label only a `struct` \
+                 or an `enum` declaration",
             ),
             context: Vec::new(),
             hint: None,
         });
-        Some((Node::Error, span))
     }
 
     /// The whole part of a `Number` token, consumed — the chumsky `integer`
@@ -8603,9 +8695,9 @@ mod tests {
             }
             other => panic!("expected Struct, got {other:?}"),
         }
-        // `resource external struct null;` — every modifier, the `null` name, the
+        // `[resource] external struct null;` — every modifier, the `null` name, the
         // bodyless `;` form.
-        match only_item("resource external struct null;") {
+        match only_item("[resource] external struct null;") {
             Node::Struct(name, _, external, resource, body, _) => {
                 assert_eq!(name.0, "null");
                 assert!(external && resource);
@@ -8651,8 +8743,8 @@ mod tests {
             }
             other => panic!("expected Enum, got {other:?}"),
         }
-        // `resource enum` — the only leading modifier on an enum.
-        match only_item("resource enum Handle { Open, Closed }") {
+        // `[resource] enum` — an enum takes the attribute too (B413).
+        match only_item("[resource] enum Handle { Open, Closed }") {
             Node::Enum(_, _, resource, _, _) => assert!(resource),
             other => panic!("expected a resource Enum, got {other:?}"),
         }
@@ -8725,7 +8817,7 @@ mod tests {
                     .0
                     .into_iter()
                     .map(|argument| match argument.0 {
-                        Node::TypeBinder(name, bounds) => (name.0, bounds.len()),
+                        Node::TypeBinder(name, bounds, _) => (name.0, bounds.len()),
                         other => panic!("expected a TypeBinder argument, got {other:?}"),
                     })
                     .collect::<Vec<_>>(),
@@ -8758,7 +8850,7 @@ mod tests {
         match only_item("fun f(value: _) { }") {
             Node::Func(function) => {
                 match &function.parameters.0[0].declared_type.as_ref().unwrap().0 {
-                    Node::TypeBinder((name, name_span), bounds) => {
+                    Node::TypeBinder((name, name_span), bounds, _) => {
                         assert_eq!(*name, "_");
                         assert!(bounds.is_empty());
                         // The NAME's own span (E161), not the whole binder's.
@@ -9104,10 +9196,49 @@ mod tests {
     }
 
     #[test]
-    fn a_file_leading_platform_is_the_modules_own() {
-        // F27 R1: the fence's attribute with a `;`, as the file's first
-        // statement.
-        let items = program("[platform(\"browser\")];\n\nimport std::ui::Region;\n");
+    fn an_impl_binder_takes_a_tuple_family_bound() {
+        // A122 (tuple-module.md §4.1): `impl type T: (2..) with Tuple` — the
+        // binder's bound is a tuple bound, tried before the trait-bound list
+        // as a generic parameter's is.
+        match only_item("impl type T: (2..) with Tuple { }") {
+            Node::Impl(subject, traits, _, _) => {
+                assert_eq!(traits.len(), 1);
+                match &subject.0 {
+                    Node::TypeBinder((name, _), bounds, Some(tuple_bound)) => {
+                        assert_eq!(*name, "T");
+                        assert!(bounds.is_empty());
+                        assert_eq!((tuple_bound.lo, tuple_bound.hi), (Some(2), None));
+                        assert!(tuple_bound.element.is_none());
+                    }
+                    other => panic!("expected a tuple-bounded binder, got {other:?}"),
+                }
+            }
+            other => panic!("expected an impl, got {other:?}"),
+        }
+        // The anonymous binder and an element bound take it too.
+        match only_item("impl _: (2..4: Display) with Tuple { }") {
+            Node::Impl(subject, ..) => assert!(matches!(
+                &subject.0,
+                Node::TypeBinder(_, _, Some(bound)) if bound.hi == Some(4) && bound.element.is_some()
+            )),
+            other => panic!("{other:?}"),
+        }
+        // A trait bound is still a trait bound.
+        match only_item("impl type T: Display with Show { }") {
+            Node::Impl(subject, ..) => {
+                assert!(
+                    matches!(&subject.0, Node::TypeBinder(_, bounds, None) if bounds.len() == 1)
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_file_leading_mod_self_hosts_the_files_platform() {
+        // B415: `[platform("…")] mod self;` as the file's first statement is
+        // the host for the file's own attributes (F27 R1's platform).
+        let items = program("[platform(\"browser\")] mod self;\n\nimport std::ui::Region;\n");
         match &items.0[0].0 {
             Node::ModulePlatform(patterns) => {
                 assert_eq!(
@@ -9117,11 +9248,17 @@ mod tests {
             }
             other => panic!("expected the module's platform, got {other:?}"),
         }
-        match only_item("[platform(\"@process\", \"browser\")];") {
+        match only_item("[platform(\"@process\", \"browser\")] mod self;") {
             Node::ModulePlatform(patterns) => assert_eq!(patterns.len(), 2),
             other => panic!("{other:?}"),
         }
-        // Without the `;` it is the first function's fence, as it always was.
+        // A host with no attribute on it declares nothing, and parses.
+        match only_item("mod self;") {
+            Node::ModulePlatform(patterns) => assert!(patterns.is_empty()),
+            other => panic!("{other:?}"),
+        }
+        // The attribute on a first function is that function's fence, as it
+        // always was.
         match only_item("[platform(\"browser\")] fun f() {}") {
             Node::Func(function) => assert_eq!(function.platform_fence.len(), 1),
             other => panic!("{other:?}"),
@@ -9129,24 +9266,62 @@ mod tests {
     }
 
     #[test]
-    fn a_module_platform_anywhere_but_the_files_head_is_refused() {
+    fn the_bare_file_platform_statement_is_gone() {
+        // B415 removes F27 R1's `[platform("…")];`: `mod self;` is its host,
+        // and the attribute with only a `;` after it is no statement at all.
+        assert!(
+            !matches!(
+                program("[platform(\"browser\")];\n")
+                    .0
+                    .first()
+                    .map(|item| &item.0),
+                Some(Node::ModulePlatform(_))
+            ),
+            "the bare form must not parse as the file's platform"
+        );
+    }
+
+    #[test]
+    fn mod_self_anywhere_but_the_files_head_is_refused() {
         for source in [
-            "import std::ui::Region;\n[platform(\"browser\")];\n",
-            "fun f() {\n\t[platform(\"browser\")];\n}\n",
-            "mod inner {\n\t[platform(\"browser\")];\n}\n",
+            "import std::ui::Region;\n[platform(\"browser\")] mod self;\n",
+            "import std::ui::Region;\nmod self;\n",
+            "fun f() {\n\t[platform(\"browser\")] mod self;\n}\n",
+            "mod inner {\n\t[platform(\"browser\")] mod self;\n}\n",
         ] {
             let (_, errors) = parse(source);
             assert!(
                 errors
                     .iter()
-                    .any(|error| render(error) == MODULE_PLATFORM_LEADS_THE_FILE),
+                    .any(|error| render(error) == MODULE_SELF_LEADS_THE_FILE),
                 "{source:?}: {errors:?}"
             );
         }
         // The head itself is clean, a leading comment notwithstanding.
         assert!(!declines(
-            "// the client's slot\n[platform(\"browser\")];\nfun f() {}\n"
+            "// the client's slot\n[platform(\"browser\")] mod self;\nfun f() {}\n"
         ));
+    }
+
+    #[test]
+    fn self_is_a_reserved_module_name() {
+        // B415: `self` names the file's own module, so no module may be
+        // declared by that name — at the head or anywhere else.
+        for source in [
+            "mod self {\n\tfun f() {}\n}\n",
+            "fun g() {}\nmod self {}\n",
+            "mod outer {\n\tmod self {}\n}\n",
+        ] {
+            let (_, errors) = parse(source);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| render(error) == MODULE_SELF_IS_RESERVED),
+                "{source:?}: {errors:?}"
+            );
+        }
+        // Any other name is a module, as it always was.
+        assert!(!declines("mod selfish {\n\tfun f() {}\n}\n"));
     }
 
     #[test]
@@ -9182,7 +9357,7 @@ mod tests {
         }
         assert_eq!(label_of("[internal(\"s\")] struct Region {}"), Some("s"));
         assert_eq!(
-            label_of("[internal(\"r\")] resource struct Handle { id: i32 }"),
+            label_of("[internal(\"r\")] [resource] struct Handle { id: i32 }"),
             Some("r")
         );
         assert_eq!(label_of("[internal(\"e\")] enum Side { Left }"), Some("e"));
@@ -9310,19 +9485,86 @@ mod tests {
 
     #[test]
     fn misplaced_resource_declines_but_a_valid_resource_declaration_parses() {
-        // `resource` before a non-declaration is the steer (an error) — declines.
-        assert!(declines("resource fun f() { }"));
-        assert!(declines("resource impl Foo { }"));
-        // But `resource struct` / `resource external struct` / `resource enum` are
-        // valid and parse cleanly (the steer never shadows them).
+        // `[resource]` before a non-declaration is the steer (an error) —
+        // declines (B413: the attribute, as the keyword was before it).
+        assert!(declines("[resource] fun f() { }"));
+        assert!(declines("[resource] impl Foo { }"));
+        // But `[resource] struct` / `[resource] external struct` /
+        // `[resource] enum` are valid and parse cleanly (the steer never
+        // shadows them).
         assert!(matches!(
-            only_item("resource struct File { }"),
+            only_item("[resource] struct File { }"),
             Node::Struct(_, _, false, true, _, _)
         ));
         assert!(matches!(
-            only_item("resource enum State { A, B }"),
+            only_item("[resource] enum State { A, B }"),
             Node::Enum(_, _, true, _, _)
         ));
+        // After the labels, in the prefix's order, and before `external`.
+        assert!(matches!(
+            only_item("[internal(\"r\")] [resource] external struct Db;"),
+            Node::Struct(_, _, true, true, _, Some(_))
+        ));
+    }
+
+    #[test]
+    fn the_resource_attribute_is_refused_on_everything_but_a_struct_or_an_enum() {
+        // B413: one rule, at every other position — an item, a local, a field
+        // and a variant.
+        for source in [
+            "[resource] fun f() {}\n",
+            "[resource] impl Foo {}\n",
+            "[resource] trait Foo {}\n",
+            "fun main() {\n\t[resource] let x = 1;\n}\n",
+            "struct S {\n\t[resource] handle: i32,\n}\n",
+            "enum E {\n\t[resource] Open,\n}\n",
+        ] {
+            let (_, errors) = parse(source);
+            let rendered: Vec<String> = errors.iter().map(render).collect();
+            assert!(
+                rendered.contains(
+                    &"`[resource]` marks a type as a resource: it may label only a `struct` \
+                      or an `enum` declaration"
+                        .to_string()
+                ),
+                "{source:?}: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_retired_resource_keyword_is_refused_with_the_attribute_steer() {
+        // B413: `resource struct` / `resource external struct` / `resource
+        // enum` — the spelling before the keyword dissolved — is ONE refusal
+        // naming the attribute, and the declaration still parses under it.
+        for source in [
+            "resource struct File { fd: i32 }\n",
+            "resource external struct Database;\n",
+            "resource enum State { A, B }\n",
+            "export resource struct File {}\n",
+        ] {
+            let (_, errors) = parse(source);
+            assert_eq!(
+                errors.iter().map(render).collect::<Vec<_>>(),
+                vec![
+                    "`resource` is an attribute, not a keyword: write `[resource]` before the \
+                     declaration (`[resource] struct`, `[resource] external struct`, \
+                     `[resource] enum`)"
+                        .to_string()
+                ],
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_is_an_ordinary_name_now() {
+        // B413: the word is no longer reserved — a binding, a field, a
+        // function and a member read may all be called `resource`.
+        assert!(!declines("fun main() {\n\tlet resource = 1;\n}\n"));
+        assert!(!declines("struct Lease {\n\tresource: i32,\n}\n"));
+        assert!(!declines("fun resource(): i32 {\n\t1\n}\n"));
+        assert!(!declines("fun f(x: Lease) {\n\tlet _ = x.resource;\n}\n"));
     }
 
     #[test]
@@ -9441,10 +9683,10 @@ mod tests {
     fn render_states_the_resource_language_rule() {
         // diagnostics-standard.md B6 — the prohibition explains itself.
         assert_eq!(
-            rendered_errors("resource fun foo() {}\n"),
+            rendered_errors("[resource] fun foo() {}\n"),
             vec![
-                "`resource` is a type-declaration modifier: it may appear only \
-                 before a `struct` or `enum` declaration"
+                "`[resource]` marks a type as a resource: it may label only a `struct` \
+                 or an `enum` declaration"
                     .to_string()
             ]
         );

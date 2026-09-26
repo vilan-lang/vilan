@@ -4285,7 +4285,7 @@ pub struct Analyzer<'src> {
     // (`[internal("reason")]`), keyed by its entity id. A function's own live
     // on `Function`, and a field's and a variant's on their records.
     item_labels: HashMap<Id, Labels<'src>>,
-    // F27 R1: each file's `[platform("…")];`, by the file.
+    // F27 R1: each file's `[platform("…")] mod self;` (B415), by the file.
     module_platforms: HashMap<SourceId, Vec<Spanned<&'src str>>>,
     // Every `lazy let` DECLARATION, in source order, before it is known whether
     // it is module-level (§2) or a local (§3, excluded). `record_lazy_bindings`
@@ -5318,7 +5318,7 @@ fn subject_binder_bounds<'src>(subject: &Node<'src>) -> Vec<&'src str> {
         .0
         .iter()
         .filter_map(|argument| match &argument.0 {
-            Node::TypeBinder(_, bounds) => Some(bounds),
+            Node::TypeBinder(_, bounds, _) => Some(bounds),
             _ => None,
         })
         .flatten()
@@ -8321,7 +8321,7 @@ impl<'src> Analyzer<'src> {
                         msg: format!(
                             "`{rendered}` implements `Drop` but is not a resource: \
                              destruction without move discipline is exactly the double-close \
-                             bug; declare it a `resource` so it moves instead of being copied"
+                             bug; mark it `[resource]` so it moves instead of being copied"
                         ),
                     },
                     impl_id,
@@ -26791,7 +26791,7 @@ impl<'src> Analyzer<'src> {
                 .join(", ");
             msg.push_str(&format!(
                 ". The `{other_layer}` twin of `std::{module}` declares `{member_name}` — \
-                 `[platform({attribute})];` at the top of the file analyzes it under that \
+                 `[platform({attribute})] mod self;` at the top of the file analyzes it under that \
                  platform, as an entry of that platform (or `--platform`) does"
             ));
         }
@@ -29646,11 +29646,28 @@ impl<'src> Analyzer<'src> {
     /// they constrain registers, so the nested ones register FIRST.
     fn register_subject_binders(&mut self, node: &'src Spanned<Node<'src>>, scope_id: Id) {
         match &node.0 {
-            Node::TypeBinder((name, name_span), bounds) => {
+            Node::TypeBinder((name, name_span), bounds, tuple_bound) => {
                 for bound in bounds {
                     self.register_subject_binders(bound, scope_id);
                 }
                 let constraint_type_id = self.register_binder(name, name_span, bounds, scope_id);
+                // A122: `impl type T: (2..)` — the tuple-family bound records
+                // against the binder's constraint exactly as a generic
+                // parameter's does (`register_generic_parameters`).
+                if let Some(tuple_bound) = tuple_bound {
+                    let element_bound = tuple_bound
+                        .element
+                        .as_deref()
+                        .map(|element| self.walk_trait_position_type_node(element, scope_id));
+                    self.tuple_bounds.insert(
+                        constraint_type_id,
+                        TupleBoundRequirement {
+                            lo: tuple_bound.lo,
+                            hi: tuple_bound.hi,
+                            element_bound,
+                        },
+                    );
+                }
                 self.withdraw_anonymous_binder_name(name, name_span, constraint_type_id, scope_id);
             }
             Node::AccessorWithGenerics(subject_name, generic_arguments) => {
@@ -29658,7 +29675,7 @@ impl<'src> Analyzer<'src> {
                 for (position, argument) in generic_arguments.0.iter().enumerate() {
                     // A bound-less `type T` directly under `Subject<..>` inherits
                     // `Subject`'s declared bound for this position, if known.
-                    if let Node::TypeBinder((binder_name, binder_span), bounds) = &argument.0
+                    if let Node::TypeBinder((binder_name, binder_span), bounds, None) = &argument.0
                         && bounds.is_empty()
                     {
                         if let Some(constraint_id) = inherited
@@ -30751,15 +30768,19 @@ impl<'src> Analyzer<'src> {
             // The marker IS the statement, so there is nothing under it to walk;
             // it takes the same module-level refusal `export` takes, for the same
             // reason.
-            // `[platform("…")];` (F27 R1) — the FILE's platform, recorded
+            // `[platform("…")] mod self;` (F27 R1, B415) — the FILE's platform, recorded
             // against the file being walked. The parser has already held it to
             // the file's first statement, so there is no position to refuse
             // here; `platform_color` reads the record (the requirement it seeds,
             // the promise it makes) and so does the resolver that chose the
             // platform this analysis runs under.
             Node::ModulePlatform(patterns) => {
-                self.module_platforms
-                    .insert(self.current_source_id, patterns.clone());
+                // B415: a bare `mod self;` hosts no attribute and declares
+                // nothing.
+                if !patterns.is_empty() {
+                    self.module_platforms
+                        .insert(self.current_source_id, patterns.clone());
+                }
                 Some(Expr::Void)
             }
             Node::ExportAll => {
@@ -33523,7 +33544,7 @@ impl<'src> Analyzer<'src> {
             // annotation, a field, a parameter): it falls through to the same
             // name resolution every other type spelling takes, which refuses it
             // and says what `_` is for.
-            Node::TypeBinder((name, name_span), _bounds) => {
+            Node::TypeBinder((name, name_span), _bounds, _) => {
                 match self
                     .anonymous_binder_parameters
                     .get(&(self.current_source_id, *name_span))
@@ -54537,7 +54558,7 @@ pub struct Program<'src> {
     pub item_labels: HashMap<Id, Labels<'src>>,
     /// The entry package's `[lints]` (E221), for `labels::check`.
     pub lints: crate::manifest::Lints,
-    /// F27 R1: each file's `[platform("…")];`, as written, by the file — the
+    /// F27 R1: each file's `[platform("…")] mod self;` (B415), as written, by the file — the
     /// platform everything the file declares requires (`platform_color`).
     pub module_platforms: HashMap<SourceId, Vec<Spanned<&'src str>>>,
     /// F27 R1: those declarations and every `[platform(..)] impl`'s, resolved

@@ -793,7 +793,7 @@ struct Requirement<'program> {
 
 // ── What a file, or an impl in it, DECLARES (F27 R1) ────────────────────────
 
-/// One declared platform requirement: `[platform("…")];` leading a file, or
+/// One declared platform requirement: `[platform("…")] mod self;` leading a file, or
 /// `[platform("…")]` on an `impl` block — "everything inside requires that
 /// platform". Resolved once per program by [`record_declared_platforms`], so
 /// the walks read parsed patterns rather than re-parsing text per node.
@@ -966,7 +966,7 @@ fn requirement_of<'program>(program: &'program Program, node: Id) -> Option<Requ
     if is_const_global(program, node) {
         return None;
     }
-    // F27 R1: a declaration outranks the layer — `[platform("browser")];`
+    // F27 R1: a declaration outranks the layer — `[platform("browser")] mod self;`
     // leading a file makes everything it declares require that platform, and
     // an `impl`'s does the same for its members.
     if let Some(declared) = program.declared_requirements.covering(program, node) {
@@ -1179,7 +1179,7 @@ pub enum PlatformReason {
     DefaultEntry(String),
     /// The caller overrode everything: `--platform <p>` on the command line.
     Flag,
-    /// The file said so itself (F27 R1): a leading `[platform("…")];`, or the
+    /// The file said so itself (F27 R1): a leading `[platform("…")] mod self;`, or the
     /// `[platform(..)]` its items carry. The declaration outranks inference and
     /// the `default-entry` colour; the clause names what was written.
     Declared(String),
@@ -1423,7 +1423,7 @@ fn colored_platform_choices(
 // ── Which platform a file DECLARES (F27 R1) ──────────────────────────────────
 
 /// What a file says about the platform it is ANALYZED under (F27 R1): a leading
-/// `[platform("…")];`, or the `[platform(..)]` fences and labels its items
+/// `[platform("…")] mod self;`, or the `[platform(..)]` fences and labels its items
 /// carry.
 ///
 /// **Why the items count at all.** A fenced function's body is written for its
@@ -1440,7 +1440,7 @@ pub struct DeclaredPlatform {
     /// The hosts every declaration admits, in [`known_hosts`] order — so a
     /// `@process` declaration analyzes under `node`.
     pub hosts: Vec<Platform>,
-    /// Whether a leading `[platform(..)];` decided it. It outranks the file's
+    /// Whether a leading `[platform(..)] mod self;` decided it. It outranks the file's
     /// colour outright; items only decide where no colour admits them.
     pub module_level: bool,
     /// The declaration as the reason clause names it:
@@ -1531,7 +1531,9 @@ pub fn declared_platform_in(root: &crate::node::NodeList) -> Option<DeclaredPlat
     };
     // The file's own line: only its FIRST statement may be one (the parser
     // refuses it anywhere else).
-    if let Some((crate::node::Node::ModulePlatform(patterns), _)) = root.first() {
+    if let Some((crate::node::Node::ModulePlatform(patterns), _)) = root.first()
+        && !patterns.is_empty()
+    {
         let written: Vec<&str> = patterns.iter().map(|(text, _)| *text).collect();
         let hosts = hosts_of(&written);
         return (!hosts.is_empty()).then(|| DeclaredPlatform {
@@ -1571,7 +1573,7 @@ pub fn declared_platform_in(root: &crate::node::NodeList) -> Option<DeclaredPlat
 
 /// A file's colours with its own declaration applied (F27 R1).
 ///
-/// - A leading `[platform(..)];` OUTRANKS the colour: of the colours the
+/// - A leading `[platform(..)] mod self;` OUTRANKS the colour: of the colours the
 ///   package gives the file, only those it admits are kept, and when it admits
 ///   none (the `default-entry` leg is a server, an unreached file, a package
 ///   target) the file is analyzed under the declared platform. A leg that
@@ -1635,13 +1637,13 @@ mod declared_tests {
 
     #[test]
     fn a_file_leading_platform_is_declared_at_module_level() {
-        let declared =
-            declared_platform("[platform(\"browser\")];\n\nfun f() {}\n").expect("declares");
+        let declared = declared_platform("[platform(\"browser\")] mod self;\n\nfun f() {}\n")
+            .expect("declares");
         assert!(declared.module_level);
         assert_eq!(declared.hosts, vec![Platform::Browser]);
         assert_eq!(declared.written, "`[platform(\"browser\")]`");
         // A family declares its first host first: `@process` analyzes as node.
-        let process = declared_platform("[platform(\"@process\")];\n").expect("declares");
+        let process = declared_platform("[platform(\"@process\")] mod self;\n").expect("declares");
         assert_eq!(process.hosts[0].runtime_name(), "node");
     }
 
@@ -1672,7 +1674,7 @@ mod declared_tests {
 
     #[test]
     fn a_module_declaration_outranks_the_colour() {
-        let declared = declared_platform("[platform(\"browser\")];\n").expect("declares");
+        let declared = declared_platform("[platform(\"browser\")] mod self;\n").expect("declares");
         // The owner's case: an unreached module, `default-entry` a server.
         let resolved = apply_declared(
             vec![choice(

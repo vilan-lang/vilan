@@ -1079,7 +1079,7 @@ fn e76_the_generic_leak_notes_sub_header_agrees_with_its_label() {
     let dir = temp_package(
         "e76_generic_leak",
         "import std::option::Option::{ self, Some };\n\
-         resource struct Db { handle: i32 }\n\
+         [resource] struct Db { handle: i32 }\n\
          fun main() {\n\
          \tlet db = Db { handle = 1 };\n\
          \tlet opt: Option<Db> = Some(db);\n\

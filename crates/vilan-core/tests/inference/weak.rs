@@ -268,7 +268,7 @@ fn weak_cannot_hold_a_resource() {
         import std::io::print;
         import std::shared::{ Shared, Weak };
 
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
 
         impl Guard with Drop {
             fun drop(&mut self) { print(self.label); }

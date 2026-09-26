@@ -99,7 +99,7 @@ import std::drop::Drop;
 import std::task::OwnedNursery;
 import std::time::sleep;
 
-resource struct Guard {
+[resource] struct Guard {
 	tag: str,
 }
 

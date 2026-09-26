@@ -238,7 +238,7 @@ row	flagship	key
 203	flagship	an async closure cannot adapt a trait/generic-dispatched call
 204	flagship	found {found} expected {expected} in {context}; {hint}
 205	flagship	unclosed `{delimiter}` in {production}: expected a matching `{close}`
-206	-	`resource` is a type-declaration modifier: it may appear only before a `struct` or `enum` declaration
+206	-	`[resource]` marks a type as a resource: it may label only a `struct` or an `enum` declaration
 207	-	found '{character}' expected a token
 208	-	if this was postfix `!` before a comparison, the space is required: `a! == b`
 209	flagship	{members} form an initialization cycle: module-level bindings initialize in dependency order, and a cycle has no such order
@@ -592,3 +592,4 @@ row	flagship	key
 568	-	`[deprecated(..)]` and `[internal(..)]` label a declaration a reader names, and nobody names an `impl` block — write the label on the members it is about
 569	-	Expected {expected}, but got {got} instead. There are no implicit numeric conversions; convert with `.as_{target}()`
 570	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out of range: a value of `{name}` cannot be below zero, and a sentinel for 'nothing here' is `None` in an `Option<{name}>`
+571	-	`resource` is an attribute, not a keyword: write `[resource]` before the declaration (`[resource] struct`, `[resource] external struct`, `[resource] enum`)

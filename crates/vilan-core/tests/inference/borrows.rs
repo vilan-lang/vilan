@@ -1612,7 +1612,7 @@ fn a_mut_parameter_never_takes_a_resource() {
     // rejection steers to `own` (transfer), the sanctioned resource intake.
     assert_fails_with(
         r#"
-        resource struct Conn { id: i32 }
+        [resource] struct Conn { id: i32 }
         impl Conn { fun close(own self) {} }
         fun misuse(mut c: Conn) {}
         fun main() {}
@@ -2021,7 +2021,7 @@ fn a_generic_capture_moves_a_resource_instantiation() {
         r#"
         import std::io::print;
         import std::option::Option::{ self, Some, None };
-        resource struct Res {
+        [resource] struct Res {
             n: i32,
         }
         fun main() {
@@ -2051,7 +2051,7 @@ fn a_moved_resource_instantiation_destroys_one_value() {
         import std::io::print;
         import std::option::Option::{ self, Some, None };
         import std::drop::{ Drop, drop };
-        resource struct Res {
+        [resource] struct Res {
             tag: str,
             n: i32,
         }
@@ -2091,7 +2091,7 @@ fn a_generic_aggregate_capture_moves_a_resource_instantiation() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Res {
+        [resource] struct Res {
             n: i32,
         }
         impl Res with Drop {
@@ -2651,7 +2651,7 @@ fn a_resource_capture_from_a_viewed_subject_loans_the_prematch_payload() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        resource struct Conn {
+        [resource] struct Conn {
             id: i32,
         }
         enum Slot {
@@ -2687,7 +2687,7 @@ fn a_resource_capture_from_a_place_subject_loans_the_prematch_payload() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        resource struct Conn {
+        [resource] struct Conn {
             id: i32,
         }
         enum Slot {
@@ -2898,7 +2898,7 @@ fn a_view_write_drops_the_overwritten_variants_resource() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop {
             fun drop(&mut self) {
                 print(i"dropped {self.label}");
@@ -2943,7 +2943,7 @@ fn a_view_write_of_the_same_variant_width_drops_the_old_payload() {
             r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard {{ label: str }}
+        [resource] struct Guard {{ label: str }}
         impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
         enum Holder {{ Full(Guard), Empty }}
         impl Holder {{ fun swap(&mut self) {{ self = Holder::Full(Guard {{ label = "second" }}); }} }}
@@ -2977,7 +2977,7 @@ fn a_view_write_that_grows_the_variant_drops_the_old_payload() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
         enum Holder { Small(Guard), Big(Guard, i32, i32), Empty }
         impl Holder {
@@ -3003,7 +3003,7 @@ fn a_view_write_to_a_struct_pointee_drops_the_old_value() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
         fun reset(g: &mut Guard) { g = Guard { label = "new" }; }
         fun main() {
@@ -3027,7 +3027,7 @@ fn a_view_write_drops_before_the_truncating_replace_clobbers_the_payload() {
     let source = r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
         enum Holder { Full(List<i32>, Guard), Empty }
         impl Holder { fun clear(&mut self) { self = Holder::Empty; } }
@@ -3065,7 +3065,7 @@ fn a_view_write_drops_the_payload_in_the_owned_paths_order() {
             r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard {{ label: str }}
+        [resource] struct Guard {{ label: str }}
         impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
         enum Holder {{ Pair(Guard, Guard), Empty }}
         impl Holder {{ fun clear(&mut self) {{ self = Holder::Empty; }} }}
@@ -3096,7 +3096,7 @@ fn a_view_write_through_a_mut_parameter_drops_the_old_value() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
         enum Holder { Full(Guard), Empty }
         fun clear(v: &mut Holder) { v = Holder::Empty; }
@@ -3120,7 +3120,7 @@ fn a_view_write_through_a_mut_local_drops_the_old_value() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
         enum Holder { Full(Guard), Empty }
         fun main() {
@@ -3144,7 +3144,7 @@ fn a_view_write_through_a_nested_reborrow_drops_the_old_value() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
         enum Holder { Full(Guard), Empty }
         fun inner(v: &mut Holder) { v = Holder::Empty; }
@@ -3170,7 +3170,7 @@ fn repeated_view_writes_drop_each_outgoing_value_exactly_once() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
         enum Holder { Full(Guard), Empty }
         impl Holder {
@@ -3202,7 +3202,7 @@ fn a_view_write_after_the_owner_moved_out_is_rejected() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
         enum Holder { Full(Guard), Empty }
         impl Holder { fun clear(&mut self) { self = Holder::Empty; } }
@@ -3229,7 +3229,7 @@ fn a_moved_out_binding_is_not_overwrite_dropped() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
         enum Holder { Full(Guard), Empty }
         fun main() {
@@ -3266,7 +3266,7 @@ fn a_mut_view_binding_of_a_resource_does_not_drop_it_at_scope_end() {
             r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard {{ label: str }}
+        [resource] struct Guard {{ label: str }}
         impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
         enum Holder {{ Full(Guard), Empty }}
         fun main() {{
@@ -3335,7 +3335,7 @@ fn b99_program(body: &str) -> String {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard {{ label: str }}
+        [resource] struct Guard {{ label: str }}
         impl Guard with Drop {{ fun drop(&mut self) {{ print(i"dropped {{self.label}}"); }} }}
         enum Holder {{ Full(Guard), Empty }}
         struct Slot {{ held: Holder }}
@@ -3940,7 +3940,7 @@ fn a_resource_capture_from_a_component_written_place_loans_the_prematch_payload(
     // does, and what the whole-assignment place twin already did. 1, not 6.
     let source = r#"
         import std::io::print;
-        resource struct Conn { id: i32 }
+        [resource] struct Conn { id: i32 }
         fun main() {
             mut slot = (Conn { id = 1 }, 0);
             if slot is (let c, let at) {
@@ -4060,7 +4060,7 @@ fn a_resource_capture_from_a_borrows_call_subject_loans_the_prematch_payload() {
     // twice. Both halves asserted: the value (1, not 6) and the absent copy.
     let source = r#"
         import std::io::print;
-        resource struct Conn { id: i32 }
+        [resource] struct Conn { id: i32 }
         struct Holder { slot: (Conn, i32) }
         impl Holder {
             fun view(&mut self): &mut (Conn, i32) borrows self { &mut self.slot }
@@ -4993,7 +4993,7 @@ fn a_resource_forwarded_out_of_a_loan_is_still_refused() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard {
             fun drop(own self) { print("drop " + self.tag); }
             fun take(&self): Guard { self }
@@ -5391,7 +5391,7 @@ fn a_reference_leaf_handing_back_a_resource_is_refused() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
         impl Holder {
@@ -5414,7 +5414,7 @@ fn a_borrows_call_leaf_handing_back_a_resource_is_refused() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
         fun peek(h: &Holder): &Guard borrows h { &h.g }
@@ -5437,7 +5437,7 @@ fn a_reference_leaf_loaning_a_resource_out_of_a_view_return_is_still_allowed() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
         impl Holder {
@@ -5585,7 +5585,7 @@ fn b116_the_ret_spelling_of_a_resource_reference_leaf_is_refused() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
         impl Holder {
@@ -5610,7 +5610,7 @@ fn b116_the_ret_spelling_of_a_resource_borrows_call_is_refused() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
         fun peek(h: &Holder): &Guard borrows h { &h.g }
@@ -5690,7 +5690,7 @@ fn b116_a_ret_only_resource_crossing_is_named_by_the_move_scan() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
         impl Holder {
@@ -6051,7 +6051,7 @@ fn b134_the_unannotated_ret_spelling_of_a_resource_reference_leaf_is_refused() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
         impl Holder {
@@ -6077,7 +6077,7 @@ fn b134_an_unannotated_ret_only_resource_crossing_is_named_by_the_move_scan() {
     assert_fails_with(
         r#"
         import std::io::print;
-        resource struct Guard { tag: str }
+        [resource] struct Guard { tag: str }
         impl Guard { fun drop(own self) { print("drop " + self.tag); } }
         struct Holder { g: Guard }
         impl Holder {
@@ -6758,7 +6758,7 @@ fn a_closures_own_is_capture_is_not_a_resource_capture() {
         r#"
         import std::io::print;
         import std::option::Option::{ self, Some, None };
-        resource struct Db { handle: i32 }
+        [resource] struct Db { handle: i32 }
         fun main() {
             let read = |o: Option<Db>| {
                 if o is Some(let d) { d.handle } else { 0 }
@@ -8755,7 +8755,7 @@ fn b224_an_else_if_condition_acquires_its_resource_only_when_reached() {
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
         impl Guard { fun ok(&self): bool { true } }
         fun probe(label: str): Guard {
@@ -8786,7 +8786,7 @@ fn b224_a_root_if_condition_still_lifts_its_resource_into_the_enclosing_block() 
         r#"
         import std::io::print;
         import std::drop::Drop;
-        resource struct Guard { label: str }
+        [resource] struct Guard { label: str }
         impl Guard with Drop { fun drop(&mut self) { print(i"dropped {self.label}"); } }
         impl Guard { fun ok(&self): bool { self.label == "yes" } }
         fun probe(label: str): Guard {

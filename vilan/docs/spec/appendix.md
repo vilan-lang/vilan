@@ -29,14 +29,15 @@ top-tier-only forms: `const expr` and struct initializers (§3.8).
 async     await     borrows  const   css    dyn     else  enum
 export    external  for      fun     if     impl    import in
 is        jump      lazy     let     macro  match   mod   mut
-null      own       resource ret     struct trait   type  use
-with      true      false
+null      own       ret      struct  trait  type    use   with
+true      false
 ```
 
 Contextual (identifier everywhere else): `context`, `sync`, `void`,
-`self`, `Self`, `break`/`continue` (after `jump`), and the attribute names
-`derive` `service` `extern` `must_use` `rpc` `trait_only` `doc`
-`expose` `platform` `deprecated`.
+`self`, `Self`, `as`, `only`, `break`/`continue` (after `jump`), and the
+attribute names `derive` `service` `extern` `must_use` `rpc` `trait_only`
+`doc` `expose` `platform` `deprecated` `internal` `resource` (`resource`
+was a keyword until B413 made it the `[resource]` attribute).
 
 ## A.3 Literal suffixes
 

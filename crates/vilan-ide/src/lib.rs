@@ -26,8 +26,8 @@ mod html_attributes_sync;
 
 pub use analysis::{Analysis, entity_spans, signature_label, source_call_subject, span_of};
 pub use completion::{
-    AUTO_IMPORT_COMPLETION_CAP, AutoImport, BOOK_BASE, CONSTRUCT_SNIPPETS, Completion,
-    CompletionFunctionCall, CompletionIndex, CompletionKind, ImportRoots, InsertText, KEYWORD_DOCS,
-    SnippetInsertion, call_insertion, keyword_lexeme,
+    ATTRIBUTE_DOCS, AUTO_IMPORT_COMPLETION_CAP, AutoImport, BOOK_BASE, CONSTRUCT_SNIPPETS,
+    Completion, CompletionFunctionCall, CompletionIndex, CompletionKind, ImportRoots, InsertText,
+    KEYWORD_DOCS, SnippetInsertion, call_insertion, keyword_lexeme,
 };
 pub use line_index::{LineIndex, Position};

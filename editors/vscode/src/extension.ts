@@ -415,7 +415,7 @@ async function closeGenericList(editor: TextEditor): Promise<void> {
 // status bar, the full reason in its tooltip, for the vilan file in front of
 // the author. The server answers from its last analysis
 // (`vilan/analysisPlatform`), so the line follows the file as it is edited —
-// type `[platform("browser")];` at the top and it turns to `declared`.
+// type `[platform("browser")] mod self;` at the top and it turns to `declared`.
 
 /// The server's status request, spelled exactly as `vilan-lsp`'s
 /// `ANALYSIS_PLATFORM` declares it; `book_sync` gates the two spellings.

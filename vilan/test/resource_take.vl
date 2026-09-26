@@ -9,7 +9,7 @@ import std::drop::{ Drop, drop };
 import std::io::print;
 import std::option::Option::{ self, None, Some };
 
-resource struct Res {
+[resource] struct Res {
 	tag: str,
 }
 impl Res with Drop {
@@ -18,12 +18,12 @@ impl Res with Drop {
 	}
 }
 
-resource enum Holder {
+[resource] enum Holder {
 	Full(Res),
 	Empty,
 }
 
-resource enum Couple {
+[resource] enum Couple {
 	Two(Res, Res),
 	Neither,
 }

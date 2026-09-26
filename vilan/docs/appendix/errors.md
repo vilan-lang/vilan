@@ -753,10 +753,10 @@ The other derives are unaffected: `PartialEq` and `Debug` read a resource's
 fields through the loan and stay available.
 → [Resources](../tour/resources.md), [Services](../guide/services.md)
 
-**"`…` implements `Drop` but is not a resource: … declare it a `resource` …"**
-`Drop` (the destruction hook) may be implemented only for a `resource`
+**"`…` implements `Drop` but is not a resource: … mark it `[resource]` …"**
+`Drop` (the destruction hook) may be implemented only for a resource
 type. A destructor without move discipline is the double-close bug:
-copy the value and each copy would run `drop`. Declare the type `resource`
+copy the value and each copy would run `drop`. Mark the type `[resource]`
 so it moves instead of being copied. (Plain-data, framework-driven teardown
 uses the cooperative `Disposable` protocol, not `Drop`.)
 → [Resources](../tour/resources.md)

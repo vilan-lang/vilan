@@ -254,7 +254,7 @@ fun main() {
 fn a_resource_cannot_be_erased() {
     assert_fails_with(
         "trait Shown { fun get(self): i32; }
-resource struct Handle { v: i32 }
+[resource] struct Handle { v: i32 }
 impl Handle with Shown { fun get(self): i32 { self.v } }
 fun main() { let h = Handle { v = 1 }; let x: dyn Shown = h; print(i\"{x.get()}\"); }
 ",

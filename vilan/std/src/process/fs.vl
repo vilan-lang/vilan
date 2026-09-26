@@ -458,7 +458,7 @@ export fun stat(path: str): Option<Stat> {
 /// below hands the body its file as a per-call parameter instead), and
 /// `List`/`Map`/`Set` cannot hold one — `Option<File>` is the sanctioned
 /// container, so "a pool of open files" is not expressible in v1.
-export resource external struct File;
+export [resource] external struct File;
 
 /// The raw host open. Kept behind the five named constructors: node's flags
 /// string is an untyped eleven-member enum whose failure mode is a runtime
@@ -736,7 +736,7 @@ export fun with_file_modify<T>(path: str, body: |File| T): T {
 /// file, which is exactly the property the host's hidden cursor would have
 /// destroyed. (R5 keeps the door one-way: the `File` cannot be moved out of a
 /// live `Reader`.)
-export resource struct Reader {
+export [resource] struct Reader {
 	file: File,
 	cursor: Shared<i53>,
 }
@@ -860,7 +860,7 @@ export impl Reader {
 /// The stop is not decoration: a watcher polls on a host timer, and a pending host
 /// timer KEEPS THE PROCESS ALIVE — exactly as `std::time::Timer` documents for
 /// itself. A watcher that is never dropped is a program that never exits.
-export resource external struct Watcher;
+export [resource] external struct Watcher;
 
 /// What happened to a path between two observations. Three variants and no
 /// catch-all, because comparing two stats leaves no fourth possibility — the

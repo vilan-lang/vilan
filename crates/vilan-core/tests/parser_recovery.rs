@@ -353,22 +353,23 @@ fn recovers_trailing_question_dot_member_keeping_receiver() {
 
 #[test]
 fn recovers_misplaced_resource_and_continues() {
-    // parser.rs ~1501: `resource` before anything but `struct`/`enum` steers — it
+    // parser.rs ~1501: `[resource]` (B413; the keyword before it) before anything
+    // but `struct`/`enum` steers — it
     // emits a diagnostic and a `Node::Error` placeholder, leaving the offending
     // token unconsumed so `fun`/`impl`/`let`/`trait` parse as themselves. The
     // MESSAGE is already pinned in the `inference` suite
     // (`resource_on_a_*_is_rejected`); this pins the RECOVERY half — the steer placeholder plus the fact that the
     // steered item AND every subsequent item still parse.
     for_each_frontend(
-        "resource fun foo() {}\nfun after() {}\n",
+        "[resource] fun foo() {}\nfun after() {}\n",
         |name, tree, errors| {
             assert!(
                 errors > 0,
                 "[{name}] the misplaced `resource` must report (c): {tree}"
             );
             assert!(
-                tree.contains("(Error, 0..8)"),
-                "[{name}] `resource` steered to a Node::Error placeholder (b); got: {tree}"
+                tree.contains("(Error, 0..10)"),
+                "[{name}] `[resource]` steered to a Node::Error placeholder (b); got: {tree}"
             );
             assert!(
                 tree.contains("(\"foo\"") && tree.contains("(\"after\""),
@@ -472,11 +473,12 @@ mod analyze {
 
     #[test]
     fn misplaced_resource_analyzes_the_rest_of_the_file() {
-        // The recovery half at the analyze level: after the steered `resource fun`,
-        // the following struct + function still analyze (the sole diagnostic is the
-        // steer message, and `Point` is usable downstream).
+        // The recovery half at the analyze level: after the steered `[resource]
+        // fun` (B413's attribute), the following struct + function still analyze
+        // (the sole diagnostic is the steer message, and `Point` is usable
+        // downstream).
         let (program, messages) = analyze(
-            "resource fun foo() {}\n\
+            "[resource] fun foo() {}\n\
              struct Point { x: i32 }\n\
              fun after() { let q = Point { x = 5 }; }\n",
         );
@@ -484,7 +486,7 @@ mod analyze {
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("type-declaration modifier")),
+                .any(|m| m.contains("may label only a `struct`")),
             "the steer diagnostic must be present; got: {messages:#?}"
         );
         assert!(

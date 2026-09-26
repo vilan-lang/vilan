@@ -4438,12 +4438,13 @@ impl<'src> Printer<'src> {
     /// handled, so `format` falls back to the original source.
     fn print_item(&mut self, item: &Spanned<Node<'src>>) {
         match &item.0 {
-            // `[resource ][external ]struct Name[<…>][;|{ fields }]` — canonical
-            // modifier order is `resource external struct` (destruction.md §3).
+            // `[[resource] ][external ]struct Name[<…>][;|{ fields }]` — canonical
+            // order is `[resource] external struct` (destruction.md §3; B413's
+            // attribute, printed on the declaration's line as the keyword was).
             Node::Struct(name, generics, external, resource, body, labels) => {
                 self.print_item_labels(labels);
                 if *resource {
-                    self.out.push_str("resource ");
+                    self.out.push_str("[resource] ");
                 }
                 if *external {
                     self.out.push_str("external ");
@@ -4507,11 +4508,11 @@ impl<'src> Printer<'src> {
                     }
                 }
             }
-            // `[resource ]enum Name[<…>] { Variant[(payload)][ = backing value], … }`.
+            // `[[resource] ]enum Name[<…>] { Variant[(payload)][ = backing value], … }`.
             Node::Enum(name, generics, resource, variants, labels) => {
                 self.print_item_labels(labels);
                 if *resource {
-                    self.out.push_str("resource ");
+                    self.out.push_str("[resource] ");
                 }
                 self.out.push_str("enum ");
                 self.out.push_str(name.0);
@@ -4679,8 +4680,16 @@ impl<'src> Printer<'src> {
             // `needs_semicolon` leaves it out of its exclusion list and the
             // statement printer supplies the `;`.
             Node::ExportAll => self.out.push_str("export *"),
-            // F27 R1: the file's platform; its `;` is the statement loop's.
-            Node::ModulePlatform(patterns) => self.print_platform_attribute(patterns),
+            // B415: `[platform(..)] mod self` — the host of the file's own
+            // attributes (F27 R1's platform), on one line; its `;` is the
+            // statement loop's.
+            Node::ModulePlatform(patterns) => {
+                if !patterns.is_empty() {
+                    self.print_platform_attribute(patterns);
+                    self.out.push(' ');
+                }
+                self.out.push_str("mod self");
+            }
             // `mod name { items }`.
             Node::Module(name, body) => {
                 self.out.push_str("mod ");
@@ -4989,12 +4998,17 @@ impl<'src> Printer<'src> {
             // read as. A NAMED binder keeps its keyword; there the keyword is
             // the only thing saying "this introduces a name" in a position that
             // otherwise reads a type.
-            Node::TypeBinder((name, _name_span), bounds) => {
+            Node::TypeBinder((name, _name_span), bounds, tuple_bound) => {
                 if *name != ANONYMOUS_TYPE_BINDER {
                     self.out.push_str("type ");
                 }
                 self.out.push_str(name);
                 self.print_bounds(bounds);
+                // A122: the tuple-family bound, printed as a generic
+                // parameter's is.
+                if let Some(tuple_bound) = tuple_bound {
+                    self.print_tuple_bound(tuple_bound);
+                }
             }
             // `(A, B)` — a tuple type.
             Node::Tuple(elements) => {
@@ -5093,7 +5107,7 @@ impl<'src> Printer<'src> {
                 self.out.push_str(name);
                 self.print_split_type_arguments(arguments);
             }
-            Node::TypeBinder((name, _name_span), bounds) if !bounds.is_empty() => {
+            Node::TypeBinder((name, _name_span), bounds, None) if !bounds.is_empty() => {
                 if *name != ANONYMOUS_TYPE_BINDER {
                     self.out.push_str("type ");
                 }
@@ -5222,19 +5236,7 @@ impl<'src> Printer<'src> {
             // `(2..0)`. This was dropped entirely, which cost `reactive.vl` its
             // `combine<T: (2..)>` and, through the safety net, its whole file.
             if let Some(tuple_bound) = &parameter.tuple_bound {
-                self.out.push_str(": (");
-                if let Some(lo) = tuple_bound.lo {
-                    self.out.push_str(&lo.to_string());
-                }
-                self.out.push_str("..");
-                if let Some(hi) = tuple_bound.hi {
-                    self.out.push_str(&hi.to_string());
-                }
-                if let Some(element) = &tuple_bound.element {
-                    self.out.push_str(": ");
-                    self.print_type(&element.0);
-                }
-                self.out.push(')');
+                self.print_tuple_bound(tuple_bound);
             }
             if let Some(default) = &parameter.default {
                 self.out.push_str(" = ");
@@ -5307,6 +5309,25 @@ impl<'src> Printer<'src> {
             self.out.push_str(steer);
             self.out.push_str("\")] ");
         }
+    }
+
+    /// `: (lo..hi: element)` — a tuple-arity bound, on a generic parameter or
+    /// (A122) an impl subject's binder. Omitted endpoints stay omitted:
+    /// `(2..)` is not `(2..0)`.
+    fn print_tuple_bound(&mut self, tuple_bound: &crate::node::TupleBound<'src>) {
+        self.out.push_str(": (");
+        if let Some(lo) = tuple_bound.lo {
+            self.out.push_str(&lo.to_string());
+        }
+        self.out.push_str("..");
+        if let Some(hi) = tuple_bound.hi {
+            self.out.push_str(&hi.to_string());
+        }
+        if let Some(element) = &tuple_bound.element {
+            self.out.push_str(": ");
+            self.print_type(&element.0);
+        }
+        self.out.push(')');
     }
 
     /// `[platform("a", "b")]`, the patterns as written — a function's fence, an
@@ -8371,24 +8392,24 @@ mod reformats {
     #[test]
     fn resource_struct_modifier_round_trips() {
         assert_formats(
-            "resource struct S{x:i32}\n",
-            "resource struct S {\n\tx: i32,\n}\n",
+            "[resource] struct S{x:i32}\n",
+            "[resource] struct S {\n\tx: i32,\n}\n",
         );
     }
 
     #[test]
     fn resource_external_struct_keeps_canonical_order() {
         assert_formats(
-            "resource external struct Database;\n",
-            "resource external struct Database;\n",
+            "[resource] external struct Database;\n",
+            "[resource] external struct Database;\n",
         );
     }
 
     #[test]
     fn resource_enum_modifier_round_trips() {
         assert_formats(
-            "resource enum E{A,B}\n",
-            "resource enum E {\n\tA,\n\tB,\n}\n",
+            "[resource] enum E{A,B}\n",
+            "[resource] enum E {\n\tA,\n\tB,\n}\n",
         );
     }
 
@@ -8849,7 +8870,7 @@ mod idempotency {
     fn a_platform_declaration_survives_the_reprint_at_every_f27_position() {
         // F27 R1: the file's own line, an impl's label and a nominal's.
         let source = concat!(
-            "[platform(\"browser\")];\n\n",
+            "[platform(\"browser\")] mod self;\n\n",
             "import std::ui::Region;\n\n",
             "[platform(\"browser\")]\n",
             "struct Slot {}\n\n",
@@ -8858,6 +8879,20 @@ mod idempotency {
         );
         assert_eq!(format(source), source);
         assert_fixed_point("platform_f27", source);
+        // B415: a host with no attribute on it reprints as itself.
+        let bare = "mod self;\n\nfun f() {}\n";
+        assert_eq!(format(bare), bare);
+    }
+
+    #[test]
+    fn a_tuple_bounded_impl_binder_survives_the_reprint() {
+        // A122: the binder's tuple bound prints as a generic parameter's does.
+        let source = concat!(
+            "impl type T: (2..) with Tuple {\n\tfun f(self) {}\n}\n\n",
+            "impl _: (2..4: Display) with Show {\n\tfun g(self) {}\n}\n",
+        );
+        assert_eq!(format(source), source);
+        assert_fixed_point("a122_binder", source);
     }
 
     #[test]

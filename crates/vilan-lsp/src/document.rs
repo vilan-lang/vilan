@@ -31,8 +31,8 @@ use crate::keystroke::{
 use crate::line_index::LineIndex;
 use crate::references::{Definition, DefinitionKind, ReferenceIndex};
 use vilan_ide::{
-    Analysis, BOOK_BASE, Completion, CompletionKind, ImportRoots, KEYWORD_DOCS, keyword_lexeme,
-    source_call_subject, span_of,
+    ATTRIBUTE_DOCS, Analysis, BOOK_BASE, Completion, CompletionKind, ImportRoots, KEYWORD_DOCS,
+    keyword_lexeme, source_call_subject, span_of,
 };
 
 /// A file's project context, resolved from the nearest `vilan.toml`: the build
@@ -3531,10 +3531,27 @@ impl Document {
         // document that doesn't compile — that was the point of doing this
         // before the `program` check.)
         let (tokens, _errors) = tokenize(self.analyzed_text());
-        let (token, _span) = tokens.iter().find(|(_, span)| {
+        let at = tokens.iter().position(|(_, span)| {
             let range = span.into_range();
             range.start <= offset && offset < range.end
         })?;
+        let (token, _span) = &tokens[at];
+        // B413: an attribute that changes what a declaration IS hovers like
+        // the keyword it replaced — the word between `[` and `]`.
+        if let vilan_core::token::Token::Ident(word) = token
+            && at > 0
+            && tokens[at - 1].0 == vilan_core::token::Token::Ctrl('[')
+            && tokens
+                .get(at + 1)
+                .is_some_and(|(next, _)| *next == vilan_core::token::Token::Ctrl(']'))
+            && let Some((_, sentence, path)) = ATTRIBUTE_DOCS
+                .iter()
+                .find(|(attribute, _, _)| attribute == word)
+        {
+            return Some(format!(
+                "**`[{word}]`**: {sentence}\n\n[The vilan book →]({BOOK_BASE}{path})"
+            ));
+        }
         let lexeme = keyword_lexeme(token)?;
         let (_, sentence, path) = KEYWORD_DOCS
             .iter()
@@ -3928,6 +3945,14 @@ impl Document {
             };
             internal | deprecated
         };
+        // B415: `self` in the file's `[platform(..)] mod self;` DECLARES the
+        // file's own module. No entity stands for it (the file is the module),
+        // so it is read off the text — a namespace declaration, as a `mod`'s
+        // name is, rather than the receiver colour the TextMate layer gives
+        // every `self`.
+        if let Some(span) = mod_self_name_span(self.analyzed_index().text()) {
+            tokens.push((span, TokenKind::Namespace, MODIFIER_DECLARATION));
+        }
         // Declaration names.
         for (id, function) in &program.functions {
             if entry(*id) {
@@ -8501,16 +8526,50 @@ fn internal_lead(program: &Program, declaration_id: Id) -> Option<String> {
     }
 }
 
-/// F27 R1: the `[platform(..)];` an overlay note recommends — the attribute
-/// the note spells, read back off the one sentence that states it, so the fix
-/// and the diagnostic cannot name two different attributes.
+/// B415: the span of `self` in the file's leading `[platform(..)]? mod self;`,
+/// or `None` when the file does not open with one. The byte scan first, so the
+/// overwhelming majority of files — which never write `mod` before `self` —
+/// pay no lex: only a file that might is tokenized, and then only its head is
+/// read (the parser refuses the host anywhere else).
+fn mod_self_name_span(text: &str) -> Option<Span> {
+    let candidate = text
+        .match_indices("mod")
+        .any(|(at, _)| text[at + 3..].trim_start().starts_with("self"));
+    if !candidate {
+        return None;
+    }
+    let (tokens, _errors) = tokenize(text);
+    let mut rest = tokens.iter();
+    let mut next = rest.next()?;
+    if next.0 == vilan_core::token::Token::Ctrl('[') {
+        let mut depth = 1usize;
+        while depth > 0 {
+            next = rest.next()?;
+            match next.0 {
+                vilan_core::token::Token::Ctrl('[') => depth += 1,
+                vilan_core::token::Token::Ctrl(']') => depth -= 1,
+                _ => {}
+            }
+        }
+        next = rest.next()?;
+    }
+    if next.0 != vilan_core::token::Token::Mod {
+        return None;
+    }
+    let name = rest.next()?;
+    (name.0 == vilan_core::token::Token::Ident("self")).then_some(name.1)
+}
+
+/// F27 R1: the `[platform(..)] mod self;` (B415) an overlay note recommends —
+/// the declaration the note spells, read back off the one sentence that states
+/// it, so the fix and the diagnostic cannot name two different attributes.
 fn declared_platform_attribute(note: &str) -> Option<&str> {
     let tail = " at the top of the file analyzes it under that platform";
     let end = note.find(tail)?;
     let head = &note[..end];
     let start = head.rfind("`[platform(")?;
     let attribute = head[start..].strip_prefix('`')?.strip_suffix('`')?;
-    attribute.ends_with(")];").then_some(attribute)
+    attribute.ends_with(")] mod self;").then_some(attribute)
 }
 
 /// E221: a variant reached through its enum's PATH (`Side::Auto`) is one
@@ -11514,8 +11573,9 @@ pub(crate) mod tests {
 
     #[test]
     fn f27_a_declared_module_is_analyzed_as_declared_over_the_default_entry() {
-        let (dir, document) =
-            f27_workspace(&format!("[platform(\"browser\")];\n\n{F27_UNDECLARED}"));
+        let (dir, document) = f27_workspace(&format!(
+            "[platform(\"browser\")] mod self;\n\n{F27_UNDECLARED}"
+        ));
         assert!(
             document.diagnostics.is_empty(),
             "no field error in the wrong twin: {:?}",
@@ -11551,7 +11611,7 @@ pub(crate) mod tests {
         // the author just typed. The buffer is what the file IS.
         let (dir, _undeclared) = f27_workspace(F27_UNDECLARED);
         let path = dir.join("src/slot.vl");
-        let live = format!("[platform(\"browser\")];\n\n{F27_UNDECLARED}");
+        let live = format!("[platform(\"browser\")] mod self;\n\n{F27_UNDECLARED}");
         let document = Document::analyze(&live, &std_root(), &path);
         assert!(
             document.diagnostics.is_empty(),
@@ -11585,14 +11645,14 @@ pub(crate) mod tests {
             });
         assert_eq!(
             fix.title,
-            "Analyze this file under its platform: add `[platform(\"browser\")];`"
+            "Analyze this file under its platform: add `[platform(\"browser\")] mod self;`"
         );
         assert_eq!(
             fix.span.into_range(),
             0..0,
             "the file's first line, the one legal place"
         );
-        assert_eq!(fix.replacement, "[platform(\"browser\")];\n\n");
+        assert_eq!(fix.replacement, "[platform(\"browser\")] mod self;\n\n");
         // Applying it is a file that analyzes clean — the fix is the whole move.
         let fixed = format!("{}{F27_UNDECLARED}", fix.replacement);
         let document = Document::analyze(&fixed, &std_root(), &dir.join("src/slot.vl"));
@@ -11602,6 +11662,71 @@ pub(crate) mod tests {
             document.diagnostics
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn b415_mod_self_paints_its_name_as_the_files_own_namespace() {
+        // B415: `self` in `[platform(..)] mod self;` is the file's module,
+        // DECLARED there — painted as a namespace declaration, not the
+        // receiver colour the TextMate layer gives every `self`.
+        let text = "[platform(\"browser\")] mod self;\n\nfun main() {}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let at = text.find("self;").expect("the name");
+        let token = document
+            .semantic_tokens()
+            .into_iter()
+            .find(|(span, _, _)| span.into_range() == (at..at + 4));
+        assert_eq!(
+            token.map(|(_, kind, modifiers)| (kind, modifiers & MODIFIER_DECLARATION)),
+            Some((TokenKind::Namespace, MODIFIER_DECLARATION)),
+            "{:?}",
+            document.semantic_tokens()
+        );
+        // A receiver `self` further down is not that token.
+        let text = "struct A {}\nimpl A {\n\tfun f(self) {}\n}\nfun main() {}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let at = text.find("self").expect("the receiver");
+        assert!(
+            !document
+                .semantic_tokens()
+                .iter()
+                .any(|(span, kind, _)| span.into_range() == (at..at + 4)
+                    && *kind == TokenKind::Namespace),
+            "a receiver is no namespace"
+        );
+    }
+
+    #[test]
+    fn b415_the_files_head_completes_the_mod_self_host_and_nowhere_else() {
+        let head = completion_items_at_cursor("mo|\n\nfun main() {}\n");
+        let host = head
+            .iter()
+            .find(|completion| completion.label.contains("mod self"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the host at the head: {:?}",
+                    head.iter().map(|c| &c.label).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            host.snippet
+                .as_ref()
+                .is_some_and(|snippet| snippet.body.contains("] mod self;")),
+            "the snippet writes the whole declaration"
+        );
+        // After the first statement, and inside a body, `mod self;` is refused
+        // — so it is not offered.
+        for source in [
+            "import std::io::print;\nmo|\nfun main() {}\n",
+            "fun main() {\n\tmo|\n}\n",
+        ] {
+            assert!(
+                !completions_at_cursor(source)
+                    .iter()
+                    .any(|label| label.contains("mod self")),
+                "{source:?}"
+            );
+        }
     }
 
     // ── E221: the label on the nominal, variant, trait and binding positions ──
@@ -12163,7 +12288,7 @@ pub(crate) mod tests {
     #[test]
     fn a_container_resource_in_a_module_publishes_on_the_module() {
         let module = "import std::io::print;\nimport std::drop::Drop;\n\
-                      resource struct Guard { label: str }\n\
+                      [resource] struct Guard { label: str }\n\
                       impl Guard with Drop { fun drop(&mut self) { print(self.label); } }\n\
                       fun keep() {\n\tmut arr: List<Guard> = [];\n}\n";
         let (dir, document) = analyze_workspace(&[
@@ -14623,17 +14748,19 @@ pub(crate) mod tests {
     }
 
     // WO-4 keywords: a keyword hovers as one crisp sentence + a book deep link.
-    // Covers the flagship memory-model word `resource` (spec link), a second
-    // memory-model word `own` (spec link), and a control-flow word `for` (tour
-    // link) — sentence AND URL asserted per case.
+    // Covers the flagship memory-model word `resource` (spec link — since B413
+    // the `[resource]` ATTRIBUTE, which hovers the way the keyword did), a
+    // second memory-model word `own` (spec link), and a control-flow word `for`
+    // (tour link) — sentence AND URL asserted per case.
     #[test]
     fn hover_on_a_keyword_shows_its_meaning_and_book_link() {
-        let hover = hover_at_cursor("resou|rce struct File { fd: i32 }\n\nfun main() {}\n")
-            .expect("hover on `resource`");
+        let hover = hover_at_cursor("[resou|rce] struct File { fd: i32 }\n\nfun main() {}\n")
+            .expect("hover on `[resource]`");
         assert!(
-            hover.contains("An owned value with exactly one owner, moved rather than copied"),
+            hover.contains("an owned value with exactly one owner, moved rather than copied"),
             "{hover}"
         );
+        assert!(hover.starts_with("**`[resource]`**"), "{hover}");
         assert!(
             hover.contains(
                 "https://vilan-lang.org/docs/spec/memory.html#68-resources-and-destruction"
@@ -14665,15 +14792,24 @@ pub(crate) mod tests {
     // purely lexical, ahead of any analysis.
     #[test]
     fn hover_on_a_keyword_works_without_a_program() {
-        let text = "fun main() {\n\tresource\n}\n"; // `resource` misused — analysis fails.
+        let text = "fun main() {\n\town\n}\n"; // `own` misused — analysis fails.
         let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
-        let offset = text.find("resource").unwrap() + 1;
+        let offset = text.find("own").unwrap() + 1;
         let hover = document
             .hover(offset)
             .expect("keyword hover without a program");
+        assert!(hover.contains("moves ownership into the callee"), "{hover}");
+        // B413: `resource` is a NAME now, so a bare one is no keyword and
+        // hovers no keyword sentence; only the attribute does.
+        let text = "fun main() {\n\tlet resource = 1;\n}\n";
+        let document = Document::analyze(text, &std_root(), Path::new("test.vl"));
+        let offset = text.find("resource").unwrap() + 1;
         assert!(
-            hover.contains("An owned value with exactly one owner"),
-            "{hover}"
+            document
+                .hover(offset)
+                .is_none_or(|hover| !hover.contains("exactly one owner")),
+            "{:?}",
+            document.hover(offset)
         );
     }
 
@@ -18056,7 +18192,12 @@ pub(crate) mod tests {
             !offered.iter().any(|keyword| keyword == "return"),
             "`return` is not a vilan keyword — it is `ret`"
         );
-        for added in ["const", "borrows", "resource", "macro"] {
+        // B413: `resource` is an attribute now, not a keyword — never offered.
+        assert!(
+            !offered.iter().any(|keyword| keyword == "resource"),
+            "`resource` is the `[resource]` attribute, not a keyword"
+        );
+        for added in ["const", "borrows", "macro"] {
             assert!(
                 offered.iter().any(|keyword| keyword == added),
                 "the `{added}` keyword must be offered (it was missing from the old hand-list)"

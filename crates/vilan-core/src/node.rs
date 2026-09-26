@@ -610,7 +610,14 @@ pub enum Node<'src> {
     // semantic token (E161: the wide span painted `type _: Source<type U>` as
     // one type-parameter run and the overlap filter then dropped every name
     // inside it).
-    TypeBinder(Spanned<&'src str>, Vec<Spanned<Self>>),
+    // A122: `impl type T: (2..) with Tuple` — a TUPLE-family bound in place of
+    // the trait-bound list (the two are exclusive, as on a generic parameter),
+    // boxed so the rare case costs the common one a pointer.
+    TypeBinder(
+        Spanned<&'src str>,
+        Vec<Spanned<Self>>,
+        Option<Box<TupleBound<'src>>>,
+    ),
     // `x = v` or a compound assignment like `x += v` (the operator is the
     // binary op the assignment applies, e.g. `Add` for `+=`). The target is an
     // lvalue: a local (`Accessor`) or a field place (`MemberAccessor`, e.g.
@@ -796,8 +803,10 @@ pub enum Node<'src> {
     // `export *;` — every item of this module is exported (B318 §2.1). A
     // module-level item with no inner statement: the marker IS the statement.
     ExportAll,
-    // `[platform("browser")];` — the FILE's platform (F27 R1): a file-leading
-    // statement, `export *;`'s shape (the marker is the statement). Everything
+    // `[platform("browser")] mod self;` — the FILE's platform (F27 R1), on the
+    // host B415 gave file-level attributes: `self` is the file's own module,
+    // and the statement must lead the file (a bare `mod self;` carries no
+    // patterns and declares nothing). Everything
     // the file declares requires that platform, and it is the platform the file
     // is analyzed under — outranking every heuristic and the `default-entry`
     // colour. The patterns are carried as written, with their spans, exactly as
@@ -940,7 +949,7 @@ pub enum Node<'src> {
     // struct; the second marks a `resource` — the owned-resource declaration
     // modifier (destruction.md §3), SURFACE ONLY for now: parsed, carried, and
     // formatted, with no classification or affine checking yet. In source the
-    // modifiers read `resource external struct`; the node keeps `external` in
+    // modifiers read `[resource] external struct`; the node keeps `external` in
     // its original slot (so existing reads are undisturbed) and appends
     // `resource` after it. The body is `Some(fields)` for `{ .. }` and `None`
     // for a bodyless `;` declaration (only valid when `external`).
@@ -1167,9 +1176,15 @@ impl<'src> Node<'src> {
                 }
                 visit(body);
             }
-            Node::TypeBinder(_, bounds) => {
+            Node::TypeBinder(_, bounds, tuple_bound) => {
                 for bound in bounds {
                     visit(bound);
+                }
+                if let Some(element) = tuple_bound
+                    .as_ref()
+                    .and_then(|bound| bound.element.as_ref())
+                {
+                    visit(element);
                 }
             }
             Node::Assign(target, _, value) => {

@@ -35,14 +35,14 @@ fn a_platform_fence_rejects_an_off_platform_reach() {
 
 // --- F27 R1: a file's and an impl's own `[platform(..)]` -------------------
 
-/// A file's `[platform("browser")];` makes everything in it require browser:
+/// A file's `[platform("browser")] mod self;` makes everything in it require browser:
 /// reached from a node entry, the reach is the chain error, anchored at the
 /// user's call — here the entry itself is in the file, so `main` is refused.
 #[test]
 fn a_file_declared_browser_refuses_a_node_build_that_reaches_it() {
     assert_fails_with(
         concat!(
-            "[platform(\"browser\")];\n\n",
+            "[platform(\"browser\")] mod self;\n\n",
             "fun greet(): str {\n\t\"hi\"\n}\n\n",
             "fun main() {\n\tlet _ = greet();\n}\n",
         ),
@@ -51,7 +51,7 @@ fn a_file_declared_browser_refuses_a_node_build_that_reaches_it() {
     // …and a browser build of the same file is clean.
     assert!(
         compile_browser(concat!(
-            "[platform(\"browser\")];\n\n",
+            "[platform(\"browser\")] mod self;\n\n",
             "fun greet(): str {\n\t\"hi\"\n}\n\n",
             "fun main() {\n\tlet _ = greet();\n}\n",
         ))
@@ -66,7 +66,7 @@ fn a_file_declared_browser_refuses_a_node_build_that_reaches_it() {
 fn a_file_declaration_fences_its_functions_as_one_promise() {
     assert_fails_once_with(
         concat!(
-            "[platform(\"browser\")];\n\n",
+            "[platform(\"browser\")] mod self;\n\n",
             "import std::fs::stat;\n\n",
             "fun probe(): bool {\n\tstat(\"cache\").is_some()\n}\n\n",
             "fun probe_twice(): bool {\n\tprobe()\n}\n",
@@ -98,7 +98,7 @@ fn an_impl_declared_browser_requires_it_of_its_members_alone() {
 fn an_unknown_pattern_in_a_file_declaration_is_reported_once() {
     assert_fails_once_with(
         concat!(
-            "[platform(\"browsr\")];\n\n",
+            "[platform(\"browsr\")] mod self;\n\n",
             "fun a() {}\n\nfun b() {}\n\nfun main() {}\n",
         ),
         "unknown platform pattern `browsr`",
@@ -504,7 +504,7 @@ fn a_drop_only_mistake_still_reports_beside_an_unrelated_one() {
         import std::fs::{ stat, write_file };
         import std::drop::Drop;
 
-        resource struct Logger { path: str }
+        [resource] struct Logger { path: str }
         impl Logger with Drop {
             fun drop(&mut self) { write_file(self.path, "closing"); }
         }
@@ -565,7 +565,7 @@ fn a_user_written_drop_anchors_at_its_own_off_platform_call() {
         import std::fs::write_file;
         import std::drop::Drop;
 
-        resource struct Logger { path: str }
+        [resource] struct Logger { path: str }
         impl Logger with Drop {
             fun drop(&mut self) { write_file(self.path, "closing"); }
         }
