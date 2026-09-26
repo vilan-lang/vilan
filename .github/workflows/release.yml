@@ -128,7 +128,7 @@ jobs:
       # ever saw, so this gate is the last thing standing between that commit
       # and five publishing channels, several of which are one-way. It has to
       # be the same instrument. Change these two legs and ci.yml's together.
-      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
         with:
           tool: cargo-nextest
       - name: The suite is green
@@ -184,7 +184,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # The same installer the suite legs use for nextest, same pin.
-      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
         with:
           tool: cargo-audit
       - name: No advisory against the dependency tree
