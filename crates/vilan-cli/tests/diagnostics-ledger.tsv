@@ -595,3 +595,5 @@ row	flagship	key
 571	-	`resource` is an attribute, not a keyword: write `[resource]` before the declaration (`[resource] struct`, `[resource] external struct`, `[resource] enum`)
 572	-	Expected usize (an index: a position, a length or a count), but got {got} instead. There are no implicit numeric conversions; convert with `.as_usize()`
 573	-	Expected {expected}, but got usize (an index: a position, a length or a count) instead. There are no implicit numeric conversions; convert with `.as_{target}()`
+NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out of range: a value of `{name}` cannot be below zero, and a sentinel for 'nothing here' is `None` in an `Option<{name}>`
+574	-	the literal `{literal}` is fractional, and the other operand of `{symbol}` is `{integer}`: an integer has no fractional part, so the literal would be typed `{integer}` and the arithmetic done in integers. Convert the integer first — `{peer}.as_f64()` — or write an integer literal

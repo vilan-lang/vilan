@@ -92,8 +92,12 @@ argument, an operand beside a typed value (`i < xs.len()`), an
 assignment — and the default only when no use states one. That holds for an expression of unsuffixed
 literals as well as for a lone one, including the operator it is
 computed with: `let ratio: f64 = 7 / 2;` is float division and `3.5`,
-where the same expression with no annotation truncates to `3`. Every
-integer literal is **range-checked** against its type at compile time.
+where the same expression with no annotation truncates to `3`. A
+FRACTIONAL literal never takes an integer type from its context: to the
+right of an integer operand (`y / 2.0` with `y: i32`) it is a compile error
+whose fix is the other operand's conversion (`y.as_f64() / 2.0`). Every
+integer literal is **range-checked** against its type at compile time, and
+a negative one at an unsigned type (`let n: usize = -1`) is out of range.
 
 `i53` spans the symmetric range ±2^53 and `u53` spans [0, 2^53]: the
 window in which every integer is exactly representable in an IEEE-754

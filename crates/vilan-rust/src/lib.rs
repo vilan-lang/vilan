@@ -9458,7 +9458,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Ok(NativeDispatch::Host(member_id));
         }
         let mut substitution = HashMap::default();
-        impl_select::bind_subject(
+        impl_select::bind_subject_and_bounds(
             self.program,
             selected.impl_subject,
             type_id,

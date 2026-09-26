@@ -9643,7 +9643,29 @@ impl<'src> Transformer<'src> {
             let emission = self.record_keyed(|recorder, id| {
                 recorder.defaults.insert(key.clone(), id);
             });
-            let substitution = self.trait_parameter_substitution(default_id, type_id);
+            let mut substitution = self.trait_parameter_substitution(default_id, type_id);
+            // The receiver may still NAME the enclosing instance's parameters
+            // (`Mapped<S, i32, str>` built inside `fun doubled<S: Src<i32>>`
+            // and read through a default there): its binders bind TO them
+            // (`S := S`), and the body runs under this substitution alone, so
+            // the enclosing instance's `S := Root` was dropped at the door and
+            // the impl's `self.up.get()` reached `Src`'s body-less `get` (the
+            // never-silent internal error). Resolve what the receiver binds
+            // through the enclosing substitution, and carry the bindings of
+            // the parameters the receiver's own type mentions. The instance
+            // key (`type_key`) already spells those parameters resolved.
+            for value in substitution.values_mut() {
+                *value = self.resolve_type_id(*value);
+            }
+            let mut mentioned = Vec::new();
+            crate::mono::collect_type_generics(self.program, type_id, 0, &mut mentioned);
+            for generic in mentioned {
+                if !substitution.contains_key(&generic)
+                    && let Some(bound) = self.current_substitution.get(&generic).copied()
+                {
+                    substitution.insert(generic, self.resolve_type_id(bound));
+                }
+            }
             let saved_self = self.current_self_type.replace(type_id);
             let saved_substitution =
                 std::mem::replace(&mut self.current_substitution, substitution);

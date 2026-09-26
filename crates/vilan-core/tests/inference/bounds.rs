@@ -12881,6 +12881,39 @@ fn b406_kolts_signal_new_literal_takes_the_annotated_width() {
     );
 }
 
+/// index-42's residual, in BOTH field orders: an EARLIER field of the same
+/// literal holding a `Shared<i32>` (a literal, and a binding) no longer leaves
+/// the later field's constructor without its expectation — the shape std's
+/// `rpc.vl` `RemoteSource`/`KeyedSource` write.
+#[test]
+fn b406_a_later_fields_constructor_literal_takes_its_type_in_either_order() {
+    for (fields, expected) in [
+        ("channel = Shared::new(5), count = Shared::new(0)", "5 0\n"),
+        ("count = Shared::new(0), channel = Shared::new(5)", "5 0\n"),
+        (
+            "channel = Shared::new(seed), count = Shared::new(0)",
+            "3 0\n",
+        ),
+        (
+            "count = Shared::new(0), channel = Shared::new(seed)",
+            "3 0\n",
+        ),
+    ] {
+        let program = format!(
+            "{}{}{}{fields}{}{}",
+            "import std::io::print;\nimport std::shared::Shared;\n",
+            "struct Rs { channel: Shared<i32>, count: Shared<usize> }\n",
+            "fun make(seed: i32): Rs {\n\tRs { ",
+            " }\n}\n",
+            "fun main() {\n\tlet r = make(3);\n\tprint(i\"{r.channel.read()} {r.count.read()}\");\n}\n",
+        );
+        match compile_and_run(&program) {
+            Ok(stdout) => assert_eq!(stdout, expected, "{fields}"),
+            Err(errors) => panic!("`{fields}` was refused: {errors:#?}"),
+        }
+    }
+}
+
 /// The control: a non-numeric field still refuses a numeric literal.
 #[test]
 fn b406_a_literal_constructor_argument_still_mismatches_a_non_numeric_field() {
@@ -13043,6 +13076,100 @@ fn a_fractional_left_literal_already_divided_as_floats() {
     );
 }
 
+// --- B405 (RULED 2026-09-25): a FRACTIONAL literal at an INTEGER-typed
+// --- position is refused with an `as_f64()` steer. `let y: i32 = 3; y / 2.0`
+// --- printed `1`: the literal took the left operand's `i32` under B389's
+// --- rule and the division truncated, with no diagnostic. The literal-only
+// --- case above (B402's) has no integer peer and stays a float division.
+
+/// The item's shape: the fractional literal on the RIGHT of an `i32`.
+#[test]
+fn b405_a_fractional_literal_right_of_an_integer_is_refused_with_the_steer() {
+    assert_fails_with(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet y: i32 = 3;\n",
+            "\tprint(y / 2.0);\n",
+            "}\n",
+        ),
+        "the literal `2.0` is fractional, and the other operand of `/` is `i32`: an integer \
+         has no fractional part, so the literal would be typed `i32` and the arithmetic done \
+         in integers. Convert the integer first — `y.as_f64()` — or write an integer literal",
+    );
+}
+
+/// Under every arithmetic operator and a comparison, at other integer widths.
+#[test]
+fn b405_a_fractional_literal_right_of_an_integer_is_refused_at_every_operator() {
+    for (operation, width) in [
+        ("n * 2.5", "u53"),
+        ("n + 0.5", "i53"),
+        ("n - 1.5", "u32"),
+        ("n % 2.5", "i32"),
+        ("n < 0.5", "usize"),
+    ] {
+        let program = format!(
+            "import std::io::print;\nfun main() {{\n\tlet n: {width} = 3;\n\tprint({operation});\n}}\n"
+        );
+        assert_fails_with(&program, "is fractional, and the other operand of");
+        assert_fails_with(&program, &format!("is `{width}`"));
+    }
+}
+
+/// A fractional literal on the LEFT types the expression `f64` itself — the
+/// shape `vilan/benchmarks`' report writes (`1000.0 * count / elapsed_ms`) —
+/// so it is a float product, not this refusal (the numeric mixing B148
+/// deferred stays deferred).
+#[test]
+fn b405_a_fractional_literal_left_of_an_integer_stays_a_float_expression() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet count: i32 = 3;\n",
+            "\tprint(2.5 * count);\n",
+            "}\n",
+        ),
+        "7.5\n",
+    );
+}
+
+/// A negative fractional literal is the same literal.
+#[test]
+fn b405_a_negative_fractional_literal_is_refused_too() {
+    assert_fails_with(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet y: i32 = 3;\n",
+            "\tprint(y * -0.5);\n",
+            "}\n",
+        ),
+        "is fractional, and the other operand of `*` is `i32`",
+    );
+}
+
+/// The controls: a float peer, two literals, and the converted spelling the
+/// steer names all run.
+#[test]
+fn b405_a_float_peer_and_the_converted_spelling_still_run() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet f: f64 = 3.0;\n",
+            "\tprint(f / 2.0);\n",
+            "\tlet y: i32 = 3;\n",
+            "\tprint(y.as_f64() / 2.0);\n",
+            "\tprint(3 / 2.0);\n",
+            "\tprint(y / 2);\n",
+            "}\n",
+        ),
+        "1.5\n1.5\n1.5\n1\n",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // E218: a numeric mismatch names its conversion
 // ---------------------------------------------------------------------------
@@ -13198,5 +13325,94 @@ fn e218_a_bigint_target_carries_no_conversion() {
         }
         "#,
         E218_STEER,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B410 — MISCOMPILE: an override selected through a bound whose trait
+// argument is a TUPLE
+// ---------------------------------------------------------------------------
+//
+// `through<T, S: Src<T>>(s) { s.label() }` with `T = (i32, i32)` ran the
+// trait's DEFAULT `label` where the impl overrides it (JS printed `default`).
+// The emitter re-dispatches the call through the impl that provides
+// `Src<(i32, i32)>`, and its instantiation filter (`instantiation_agrees`)
+// compared a TUPLE argument by its type ids — minted per spelling, never
+// interned — so the wanted `(i32, i32)` never agreed with the provided one,
+// the impl was turned down, and the trait's default answered. Arrays had the
+// same hole. Tuples and arrays now compare element-wise.
+
+/// reactive-41's repro: five instantiations, every one the override.
+#[test]
+fn b410_an_override_is_selected_through_a_bound_at_a_tuple_argument() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> {\n",
+            "\tfun get(self): T;\n",
+            "\tfun label(self): str { \"default\" }\n",
+            "}\n",
+            "struct Id<T> { v: T }\n",
+            "impl Id<type T> with Src<T> {\n",
+            "\tfun get(self): T { self.v }\n",
+            "\tfun label(self): str { \"id override\" }\n",
+            "}\n",
+            "fun through<T, S: Src<T>>(s: S): str { s.label() }\n",
+            "fun through2<S: Src<(i32, i32)>>(s: S): str { s.label() }\n",
+            "fun main() {\n",
+            "\tprint(through(Id { v = 1 }));\n",
+            "\tlet b = Id { v = (1, 2) };\n",
+            "\tprint(through(b));\n",
+            "\tprint(through2(b));\n",
+            "\tprint(through(Id { v = [1] }));\n",
+            "\tprint(through(Id { v = Some(1) }));\n",
+            "}\n",
+        ),
+        "id override\nid override\nid override\nid override\nid override\n",
+    );
+}
+
+/// A fixed ARRAY argument, and a tuple nested inside a nominal one.
+#[test]
+fn b410_an_override_is_selected_through_a_bound_at_an_array_and_a_nested_tuple() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> {\n",
+            "\tfun get(self): T;\n",
+            "\tfun label(self): str { \"default\" }\n",
+            "}\n",
+            "struct Id<T> { v: T }\n",
+            "impl Id<type T> with Src<T> {\n",
+            "\tfun get(self): T { self.v }\n",
+            "\tfun label(self): str { \"id override\" }\n",
+            "}\n",
+            "fun through<T, S: Src<T>>(s: S): str { s.label() }\n",
+            "fun main() {\n",
+            "\tlet pair: [i32; 2] = [1, 2];\n",
+            "\tprint(through(Id { v = pair }));\n",
+            "\tprint(through(Id { v = Some((1, \"a\")) }));\n",
+            "}\n",
+        ),
+        "id override\nid override\n",
+    );
+}
+
+/// The instantiation filter still SEPARATES tuple arguments that differ: two
+/// impls of one trait at `(i32, i32)` and `(str, str)` each answer their own.
+#[test]
+fn b410_two_tuple_instantiations_of_one_trait_stay_apart_through_a_bound() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Tag<T> { fun tag(self): str; }\n",
+            "struct Box {}\n",
+            "impl Box with Tag<(i32, i32)> { fun tag(self): str { \"ints\" } }\n",
+            "impl Box with Tag<(str, str)> { fun tag(self): str { \"strs\" } }\n",
+            "fun ints<S: Tag<(i32, i32)>>(s: S): str { s.tag() }\n",
+            "fun strs<S: Tag<(str, str)>>(s: S): str { s.tag() }\n",
+            "fun main() { print(ints(Box {})); print(strs(Box {})); }\n",
+        ),
+        "ints\nstrs\n",
     );
 }

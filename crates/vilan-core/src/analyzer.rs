@@ -29671,7 +29671,25 @@ impl<'src> Analyzer<'src> {
                 self.withdraw_anonymous_binder_name(name, name_span, constraint_type_id, scope_id);
             }
             Node::AccessorWithGenerics(subject_name, generic_arguments) => {
-                let inherited = self.declared_generic_constraint_ids(subject_name, scope_id);
+                // B409: a TRAIT's head (`Src<type X>` in a binder's bound, or a
+                // bare-trait subject) lends its binders its parameters'
+                // BOUNDS, never its parameters' IDS. Aliased, `type X` in
+                // `impl M<type S: Src<type X>, X, type U> with Src<U>` WAS
+                // `Src`'s own `T` — so the `with` clause's `T := U` rebound it,
+                // and an inherited default was checked at `S: Src<U>` (`Root
+                // does not implement Src<str>`), the upstream's argument lost
+                // to the implemented one. A type's head keeps the alias (B77:
+                // the impl can only ever apply to that type, whose parameter
+                // it is). A trait declared later in the file already took the
+                // fresh-binder path below, so the answer no longer depends on
+                // declaration order either.
+                let subject_is_trait = self
+                    .try_get_type_id_by_name(subject_name, scope_id)
+                    .is_some_and(|id| self.traits.contains_key(&id));
+                let inherited = match subject_is_trait {
+                    true => None,
+                    false => self.declared_generic_constraint_ids(subject_name, scope_id),
+                };
                 for (position, argument) in generic_arguments.0.iter().enumerate() {
                     // A bound-less `type T` directly under `Subject<..>` inherits
                     // `Subject`'s declared bound for this position, if known.
@@ -46986,15 +47004,7 @@ impl<'src> Analyzer<'src> {
         // value is about to DECIDE, not a target for it, and seeding it let a
         // `list.map(..)` bind its `U` to the open `List<T>` and take nothing
         // from its closure (B225's kolt shape compiled clean).
-        let expected = self.substitute_type(field_type, substitution_context);
-        let mut mentioned = Vec::new();
-        self.collect_generics(&expected, 0, &mut mentioned);
-        if !mentioned
-            .iter()
-            .any(|generic| self.inferable_generics.contains(generic))
-        {
-            self.seed_expectation(value_id, &expected);
-        }
+        self.seed_field_expectation(value_id, field_type, substitution_context);
         let value_type = self.infer_type(value_id, field_type, substitution_context);
         if let Type::Unresolved = value_type {
             return FieldValueVerdict::Deferred;
@@ -47028,6 +47038,27 @@ impl<'src> Analyzer<'src> {
                 });
                 FieldValueVerdict::Refused
             }
+        }
+    }
+
+    /// B406's seed, one field: the field's type as its value's expectation,
+    /// under this literal's substitution, when that type is closed under the
+    /// literal's open parameters (`inferable_generics`) — see
+    /// [`Self::check_field_value`].
+    fn seed_field_expectation(
+        &mut self,
+        value_id: Id,
+        field_type: &Type,
+        substitution_context: &SubstitutionContext,
+    ) {
+        let expected = self.substitute_type(field_type, substitution_context);
+        let mut mentioned = Vec::new();
+        self.collect_generics(&expected, 0, &mut mentioned);
+        if !mentioned
+            .iter()
+            .any(|generic| self.inferable_generics.contains(generic))
+        {
+            self.seed_expectation(value_id, &expected);
         }
     }
 
@@ -47226,6 +47257,31 @@ impl<'src> Analyzer<'src> {
             if let Some(generic_constraint) = literal_param_ids.get(index) {
                 substitution_context.insert(*generic_constraint, *generic_argument_id);
             }
+        }
+        // B406, every field at once: a value's expectation is seeded before
+        // ANY field is checked. The per-field seed in `check_field_value` runs
+        // only once the loop reaches that field, and the loop stops at the
+        // first field still deferred — so in `Rs { channel = Shared::new(5),
+        // count = Shared::new(0) }` the second call resolved on its own while
+        // the first deferred, with no expectation, and took `i32` (swap the
+        // fields and it compiled). Seeding is idempotent and never overrides a
+        // nearer expectation, so the loop's own seed stays for the fields a
+        // bound parameter only closes later.
+        {
+            let previously_inferable =
+                std::mem::replace(&mut self.inferable_generics, literal_param_ids.clone());
+            for (field_name, field_value, _, _) in &constraint.fields {
+                let Some(struct_field) = struct_fields
+                    .iter()
+                    .find(|field| *field.name == **field_name)
+                else {
+                    continue;
+                };
+                let field_type = struct_field.type_id.get_type(self);
+                let field_type = self.rename_into_literal(field_type, &literal_rename);
+                self.seed_field_expectation(*field_value, &field_type, &substitution_context);
+            }
+            self.inferable_generics = previously_inferable;
         }
         let mut deferred = false;
         for (field_name, field_value, field_value_span, field_name_span) in &constraint.fields {
@@ -51244,6 +51300,63 @@ impl<'src> Analyzer<'src> {
                         }
                     }
                     continue;
+                }
+                // B405 (RULED 2026-09-25): a FRACTIONAL literal at an
+                // INTEGER-typed position is refused. A binary takes its type
+                // from its LEFT operand, so a fractional literal on the RIGHT
+                // of an integer is computed in that integer type: `y / 2.0`
+                // over `y: i32` truncated and printed `1` with no diagnostic.
+                // The fix the reader means is the other operand's conversion,
+                // so that is the steer. A fractional literal on the LEFT types
+                // the expression `f64` itself (`1000.0 * count` is a float
+                // product), which is B148's deferred numeric mixing and not
+                // this; two literals (`1 / 4.0`) have no integer peer and stay
+                // floats (B402).
+                if self.fractional_literal_default(rhs_id).is_some()
+                    && !self.is_unsuffixed_numeric(lhs_id)
+                {
+                    let (literal_id, peer_id) = (rhs_id, lhs_id);
+                    let peer_type = lhs_type.clone();
+                    let integer_peer = match &peer_type {
+                        Type::Struct(id, _) => [
+                            "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "usize", "BigInt",
+                        ]
+                        .iter()
+                        .find(|name| self.primitive_struct_ids.get(**name) == Some(id))
+                        .copied(),
+                        _ => None,
+                    };
+                    if let Some(integer) = integer_peer {
+                        let literal = self
+                            .span_map
+                            .get(&literal_id)
+                            .and_then(|span| {
+                                let source = self.source_of_id(literal_id)?;
+                                self.source_text(source)?.get(span.into_range())
+                            })
+                            .unwrap_or("this literal")
+                            .to_string();
+                        let peer = self
+                            .receiver_spelling(peer_id)
+                            .unwrap_or("the other operand")
+                            .to_string();
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: **self.span_map.get(&literal_id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "the literal `{literal}` is fractional, and the other operand of \
+                                     `{symbol}` is `{integer}`: an integer has no fractional part, so \
+                                     the literal would be typed `{integer}` and the arithmetic done in \
+                                     integers. Convert the integer first — `{peer}.as_f64()` — or \
+                                     write an integer literal"
+                                ),
+                            },
+                            binary_id,
+                        );
+                        continue;
+                    }
                 }
                 let is_bool = |type_: &Type| match type_ {
                     Type::Enum(id, _) => self.bool_enum_id == Some(*id),
