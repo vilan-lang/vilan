@@ -4090,6 +4090,10 @@ pub struct Analyzer<'src> {
     // Integer literals awaiting their post-solve range check
     // (proposal/numeric-types.md §3), in walk order.
     prepped_number_literals: Vec<Id>,
+    // B407: each number literal written directly under a unary `-`, with the
+    // negation's own id — the literal's type may be recorded at either (an
+    // annotated `let n: usize = -1` seeds the NEGATION's expectation).
+    negated_number_literals: HashMap<Id, Id>,
     // `context`-typed closure parameters (proposal/ambient-owner.md §5):
     // parameter entity -> the context bindings its clause names, in written
     // order (the hidden-argument order). The CONTEXT PASS is its only consumer
@@ -6094,6 +6098,7 @@ impl<'src> Analyzer<'src> {
             integer_division: HashSet::default(),
             division_generic_lhs: HashMap::default(),
             prepped_number_literals: Vec::new(),
+            negated_number_literals: HashMap::default(),
             parameter_contexts: HashMap::default(),
             prepped_type_context_clauses: Vec::new(),
             prepped_function_context_clauses: Vec::new(),
@@ -30915,6 +30920,9 @@ impl<'src> Analyzer<'src> {
                 }
                 let operand_id = self.walk_expr_node(operand, scope_id);
                 self.condition_polarity = outer_polarity;
+                if *operator == '-' && matches!(operand.0, Node::Number(..)) {
+                    self.negated_number_literals.insert(operand_id, id);
+                }
                 self.prepped_unary_ops.push((id, *operator, operand_id));
                 Some(Expr::Unary(*operator, operand_id))
             }
@@ -52193,12 +52201,27 @@ impl<'src> Analyzer<'src> {
             // re-inferred out of context — under-checking, never a false
             // positive. (Threading constraint expectations into the record is
             // the follow-up.)
+            //
+            // B407: B389's `literal_types` is such a record too — the width a
+            // concrete context settled the literal at (a call argument, a
+            // `match` arm, a literal binding's first typed use) — and a
+            // literal under a unary `-` may carry its type on the NEGATION
+            // instead, whose expectation an annotated `let` seeds.
+            let negation = self.negated_number_literals.get(&literal_id).copied();
             let literal_type = if suffix.is_some() {
                 self.infer_type(literal_id, &Type::Unknown, &HashMap::default())
             } else if let Some(type_id) = self
                 .expected_types
                 .get(&literal_id)
                 .or_else(|| self.expr_id_to_type_id_map.get(&literal_id))
+                .or_else(|| self.literal_types.get(&literal_id))
+                .or_else(|| {
+                    negation.and_then(|negation_id| {
+                        self.expected_types
+                            .get(&negation_id)
+                            .or_else(|| self.expr_id_to_type_id_map.get(&negation_id))
+                    })
+                })
             {
                 type_id.get_type(self)
             } else {
@@ -52229,6 +52252,36 @@ impl<'src> Analyzer<'src> {
                 Some(hex) => u128::from_str_radix(hex, 16),
                 None => whole.parse::<u128>(),
             };
+            // B407: an UNSIGNED type has no negative values, so a literal
+            // under a `-` is out of range whatever its magnitude — the check
+            // below reads the literal UNDER the minus (`1` fits a `usize`), so
+            // `let n: usize = -1` compiled and printed `-1`, and every `-1`
+            // sentinel B389's literal law types as a `usize` would have
+            // compiled silently. Zero is not negative and stays admitted.
+            if negation.is_some() && !signed && value.as_ref().is_ok_and(|value| *value > 0) {
+                let range = match name {
+                    "u53" | "usize" => "0 ..= 2^53 on the JS backend".to_string(),
+                    _ => format!("0 ..= {bound}"),
+                };
+                if let Some(span) = negation.and_then(|negation_id| self.span_map.get(&negation_id))
+                {
+                    let span = **span;
+                    self.push_anchored(
+                        Error {
+                            trace: Vec::new(),
+                            note: None,
+                            span,
+                            msg: format!(
+                                "`{name}` is unsigned ({range}), so the negative literal `-{whole}` is \
+                                 out of range: a value of `{name}` cannot be below zero, and a sentinel \
+                                 for 'nothing here' is `None` in an `Option<{name}>`"
+                            ),
+                        },
+                        literal_id,
+                    );
+                }
+                continue;
+            }
             if value.map(|value| value <= bound).unwrap_or(false) {
                 continue;
             }

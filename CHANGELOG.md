@@ -26,6 +26,9 @@ written down.
 ## Unreleased
 
 <!-- family: fix -->
+**A negative literal at an unsigned type is refused, naming the range: `let n: usize = -1;` (and `u53`, `u8`, `u16`, `u32`, `-1usize`) is "`usize` is unsigned (0 ..= 2^53 on the JS backend), so the negative literal `-1` is out of range", where it compiled and printed `-1`.** The literal range check read the literal under the minus (`1`, which fits). With B389's literal law a `-1` sentinel takes `usize` from its context — a `push` into a `List<usize>`, a `match` arm, `unwrap_or(-1)` on an `Option<usize>`, a binding later read as an index — so each of the seven sentinels the index migration has to rewrite would have compiled silently; every one is refused now. The range check also reads the width B389 recorded for a literal typed by its context alone, so `Shared::new(300)` landing in a `Shared<u8>` field is out of range too. Zero and negative literals at signed types are unchanged. (B407)
+
+<!-- family: fix -->
 **A literal passed to a generic constructor takes its type from where the call lands: `S { count = Shared::new(0) }` against `count: Shared<u53>` compiles, as do `let x: Shared<u53> = Shared::new(3)` and a `Shared::new(4)` returned as a `Shared<u53>` — each was refused "Expected Shared<u53>, but got Shared<i32>".** B389's literal law binds a generic only a literal argument fixes from the call's expectation, but asked only about the function's OWN generics — and `Shared::new`'s `T` belongs to `impl Shared<type T>`, the path it is reached through, so the literal defaulted to `i32` at every position. A struct literal's field also never recorded its type as the value's expectation. Both now hold, so std's `rpc.vl` needs no `0usize` suffixes under the index migration. (B406)
 
 <!-- family: miscompile -->
