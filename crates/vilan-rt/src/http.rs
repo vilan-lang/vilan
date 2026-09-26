@@ -710,7 +710,7 @@ impl Response {
         let length = if self.0.head_sent.get() {
             None
         } else {
-            Some(body.len() as usize)
+            Some(body.len())
         };
         self.send_head(length);
         self.0.connection.enqueue(&body.as_slice());

@@ -72,14 +72,14 @@ impl Feed {
 	fun step(&mut self): str {
 		if self is Feed::Ready(let items, let at) {
 			self = Feed::Ready(items, at + 1);
-			ret items[at];
+			ret items[at.as_usize()];
 		}
 		"-"
 	}
 
 	fun width(&self): i32 {
 		if self is Feed::Ready(let items, let at) {
-			ret items.len() + at;
+			ret (items.len() + at.as_usize()).as_i32();
 		}
 		0
 	}
@@ -89,7 +89,7 @@ fun viewed_guarded(pair: &mut (List<i32>, i32)): i32 {
 	match pair {
 		(let cells, let weight) if weight > 0 => {
 			pair.1 = 9;
-			cells.len() + weight
+			cells.len().as_i32() + weight
 		}
 		_ => 0,
 	}
@@ -99,7 +99,7 @@ fun place_component(): i32 {
 	mut cell = ([1, 2], 3);
 	if cell is (let cells, let weight) {
 		cell.1 = 9;
-		ret cells.len() + weight;
+		ret cells.len().as_i32() + weight;
 	}
 	0
 }
@@ -108,7 +108,7 @@ fun place_rebound(): i32 {
 	mut cell = ([1, 2], 3);
 	if cell is (let cells, let weight) {
 		cell = ([4], 5);
-		ret cells.len() + weight;
+		ret cells.len().as_i32() + weight;
 	}
 	0
 }
@@ -118,7 +118,7 @@ fun place_guarded(): i32 {
 	match cell {
 		(let cells, let weight) if weight > 0 => {
 			cell.1 = 9;
-			cells.len() + weight
+			cells.len().as_i32() + weight
 		}
 		_ => 0,
 	}
@@ -137,7 +137,7 @@ fun sum_over(entries: List<(i32, i32)>): i32 {
 }
 
 fun total_width(rows: List<(List<i32>, i32)>): i32 {
-	mut total = 0;
+	mut total: usize = 0;
 	for row in rows {
 		match row {
 			(let cells, let weight) => {
@@ -145,11 +145,11 @@ fun total_width(rows: List<(List<i32>, i32)>): i32 {
 			}
 		}
 	}
-	total
+	total.as_i32()
 }
 
 fun guarded_width(rows: List<(List<i32>, i32)>): i32 {
-	mut total = 0;
+	mut total: usize = 0;
 	for row in rows {
 		match row {
 			(let cells, let weight) if weight > 1 => {
@@ -158,7 +158,7 @@ fun guarded_width(rows: List<(List<i32>, i32)>): i32 {
 			_ => {}
 		}
 	}
-	total
+	total.as_i32()
 }
 
 fun first_or(held: Option<List<i32>>, fallback: List<i32>): List<i32> {
@@ -178,7 +178,7 @@ fun first_or_guarded(held: Option<List<i32>>, limit: i32, fallback: List<i32>): 
 fun grow_first(pair: (List<i32>, i32)): i32 {
 	if pair is (mut cells, let weight) {
 		cells.push(weight);
-		ret cells.len();
+		ret cells.len().as_i32();
 	}
 	0
 }
@@ -200,7 +200,7 @@ fun called_component(): i32 {
 	mut cell = Cell { pair = ([1, 2], 3) };
 	if cell.slot() is (let cells, let weight) {
 		cell.pair.1 = 9;
-		ret cells.len() + weight;
+		ret cells.len().as_i32() + weight;
 	}
 	0
 }
@@ -209,7 +209,7 @@ fun called_readonly(): i32 {
 	mut cell = Cell { pair = ([1, 2], 3) };
 	if cell.peek() is (let cells, let weight) {
 		cell.pair.1 = 9;
-		ret cells.len() + weight;
+		ret cells.len().as_i32() + weight;
 	}
 	0
 }
@@ -220,7 +220,7 @@ fun fresh_pair(): (List<i32>, i32) {
 
 fun owned_call(): i32 {
 	if fresh_pair() is (let cells, let weight) {
-		ret cells.len() + weight;
+		ret cells.len().as_i32() + weight;
 	}
 	0
 }

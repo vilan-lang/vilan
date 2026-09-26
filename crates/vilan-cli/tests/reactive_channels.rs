@@ -55,10 +55,11 @@ impl Row with Keyed<str> {
 }
 
 fun frame_bytes(frame: Frame): i32 {
-	match frame {
+	let length = match frame {
 		Frame::Text(let value) => value.len(),
 		Frame::Binary(let bytes) => bytes.len(),
-	}
+	};
+	length.as_i32()
 }
 
 fun metered_link(down: Shared<i32>): (DuplexEnd, DuplexEnd) {
@@ -75,7 +76,7 @@ fun metered_link(down: Shared<i32>): (DuplexEnd, DuplexEnd) {
 /// Generic over the READ trait — the call that did not compile before A55.
 fun held_by<S: Source<Option<List<Row>>>>(source: S): i32 {
 	match source.get() {
-		Some(let list) => list.len(),
+		Some(let list) => list.len().as_i32(),
 		None => -1,
 	}
 }
@@ -84,7 +85,7 @@ fun held_by<S: Source<Option<List<Row>>>>(source: S): i32 {
 /// generic consumer reaches the mirror's counted one.
 fun watch<S: Source<Option<List<Row>>>>(source: S, seen: SignalCell<i32>): Subscription {
 	source.on_change(|value| match value {
-		Some(let list) => seen.set(list.len()),
+		Some(let list) => seen.set(list.len().as_i32()),
 		None => seen.set(-1),
 	})
 }
@@ -712,10 +713,11 @@ impl Message with Keyed<str> {
 }
 
 fun frame_bytes(frame: Frame): i32 {
-	match frame {
+	let length = match frame {
 		Frame::Text(let value) => value.len(),
 		Frame::Binary(let bytes) => bytes.len(),
-	}
+	};
+	length.as_i32()
 }
 
 /// A duplex pair with the server→client leg metered.
@@ -994,10 +996,11 @@ impl Row with Keyed<str> {
 }
 
 fun frame_bytes(frame: Frame): i32 {
-	match frame {
+	let length = match frame {
 		Frame::Text(let value) => value.len(),
 		Frame::Binary(let bytes) => bytes.len(),
-	}
+	};
+	length.as_i32()
 }
 
 fun metered_link(down: Shared<i32>): (DuplexEnd, DuplexEnd) {
@@ -1135,7 +1138,7 @@ fun main() {
 	let codec = json_codec();
 	let stray: List<Delta<str, Row>> = [Delta::Update("zzz", Row { id = "zzz", value = 9 })];
 	wire_end.send(encode_patch(codec, channel, |mut serializer: Serializer| {
-		serializer.begin_list(stray.len());
+		serializer.begin_list(stray.len().as_i32());
 		for op in stray {
 			op.describe(&mut serializer);
 		}
@@ -1147,7 +1150,7 @@ fun main() {
 	// Sticky: the first fault is the one kept.
 	let second: List<Delta<str, Row>> = [Delta::Remove("yyy")];
 	wire_end.send(encode_patch(codec, channel, |mut serializer: Serializer| {
-		serializer.begin_list(second.len());
+		serializer.begin_list(second.len().as_i32());
 		for op in second {
 			op.describe(&mut serializer);
 		}
@@ -1564,7 +1567,7 @@ struct Store {
 impl Store {
 	[rpc]
 	fun touch(self): i32 {
-		self.tasks.get().len()
+		self.tasks.get().len().as_i32()
 	}
 }
 

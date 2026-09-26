@@ -28,8 +28,17 @@ function $d(self) {
 function $f(self) {
 	return __list_get(self, 0);
 }
+function $h(self) {
+	return self.length === 0;
+}
 function $g(self) {
-	return __list_get(self, self.length - 1);
+	let $i = null;
+	if ($h(self)) {
+		$i = [ 1 ];
+	} else {
+		$i = __list_get(self, self.length - 1);
+	}
+	return $i;
 }
 let xs = [  ];
 xs.push(10);

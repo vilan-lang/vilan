@@ -134,7 +134,7 @@ impl KoltStore {
 		self.messages.update(|&mut store| {
 			store.insert(id, Message { id, author, body });
 		});
-		self.messages.get().len()
+		self.messages.get().len().as_i32()
 	}
 
 	[rpc]
@@ -226,7 +226,7 @@ fun is_fingerprinted(path: str) {
 		ret false;
 	}
 	for i in Range::new(0, 8) {
-		let c = hash.code_at(i);
+		let c = hash.code_at(i.as_usize());
 		let is_digit = c >= 48 && c <= 57;
 		let is_af = c >= 97 && c <= 102;
 		if !is_digit && !is_af {

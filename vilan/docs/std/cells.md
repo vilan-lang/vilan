@@ -118,7 +118,7 @@ impl Arena<type T> {
 	fun set(&mut self, handle: Handle<T>, value: T): bool
 	fun remove(&mut self, handle: Handle<T>): Option<T>
 	fun contains(self, handle: Handle<T>): bool
-	fun len(self): i32
+	fun len(self): usize
 	fun is_empty(self): bool
 }
 ```

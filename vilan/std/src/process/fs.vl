@@ -476,7 +476,7 @@ external struct RawReadResult;
 
 impl RawReadResult {
 	[extern(get, "bytesRead")]
-	external fun bytes_read(self): i32;
+	external fun bytes_read(self): usize;
 }
 
 /// One `FileHandle.write()` result (`{ bytesWritten, buffer }`).
@@ -484,7 +484,7 @@ external struct RawWriteResult;
 
 impl RawWriteResult {
 	[extern(get, "bytesWritten")]
-	external fun bytes_written(self): i32;
+	external fun bytes_written(self): usize;
 }
 
 export impl File {
@@ -528,8 +528,8 @@ export impl File {
 	async external fun raw_read(
 		self,
 		buffer: Bytes,
-		offset: i32,
-		length: i32,
+		offset: usize,
+		length: usize,
 		position: i53,
 	): RawReadResult;
 
@@ -537,8 +537,8 @@ export impl File {
 	async external fun raw_write(
 		self,
 		buffer: Bytes,
-		offset: i32,
-		length: i32,
+		offset: usize,
+		length: usize,
 		position: i53,
 	): RawWriteResult;
 
@@ -550,7 +550,7 @@ export impl File {
 	/// one handle cannot silently interleave through hidden host-side position
 	/// state — which is why the host's implicit-position read mode is deliberately
 	/// not bound (proposal/filesystem.md §3.4).
-	fun read_at(self, buffer: Bytes, position: i53): i32 {
+	fun read_at(self, buffer: Bytes, position: i53): usize {
 		self.raw_read(buffer, 0, buffer.len(), position).bytes_read()
 	}
 
@@ -558,7 +558,7 @@ export impl File {
 	/// write reaches past the end); returns the number of bytes written. Positional
 	/// and stateless, like `read_at` — and on an `append_to` handle the position is
 	/// ignored (see there).
-	fun write_at(self, buffer: Bytes, position: i53): i32 {
+	fun write_at(self, buffer: Bytes, position: i53): usize {
 		self.raw_write(buffer, 0, buffer.len(), position).bytes_written()
 	}
 
@@ -780,7 +780,7 @@ export impl Reader {
 	/// Each call allocates a fresh buffer and hands back a slice of exactly what
 	/// was read, so a chunk is never a window on a buffer the next call overwrites.
 	/// A caller reusing one buffer across reads wants `read_at` directly.
-	fun next(self, size: i32): Bytes {
+	fun next(self, size: usize): Bytes {
 		let buffer = Bytes::alloc(size);
 		let count = self.file.read_at(buffer, self.cursor.read());
 		self.cursor.write() = self.cursor.read() + count.as_i53();

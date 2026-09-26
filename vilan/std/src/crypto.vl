@@ -39,7 +39,7 @@ async external fun sha512(data: Bytes): Bytes;
 
 /// `length` cryptographically random bytes.
 [extern("__random_bytes")]
-external fun random_bytes(length: i32): Bytes;
+external fun random_bytes(length: usize): Bytes;
 
 /// A random UUID string (host `crypto.randomUUID`).
 [extern("crypto.randomUUID")]
@@ -52,8 +52,8 @@ fun equals_constant_time(a: Bytes, b: Bytes): bool {
 		ret false;
 	}
 	mut acc = 0;
-	for index in Range::new(0, a.len()) {
-		acc = acc | (a.get(index) ^ b.get(index));
+	for index in Range::new(0, a.len().as_i32()) {
+		acc = acc | (a.get(index.as_usize()) ^ b.get(index.as_usize()));
 	}
 	acc == 0
 }

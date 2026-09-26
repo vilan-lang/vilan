@@ -4764,6 +4764,12 @@ fun next_random(bound: i32): i32 {
 	(state % bound.as_i53()).as_i32()
 }
 
+/// A random POSITION below `bound` — the same draw, at the index type the
+/// sequence surface takes.
+fun pick(bound: usize): usize {
+	next_random(bound.as_i32()).as_usize()
+}
+
 /// Every row gets an id no other row has had, so the keys stay unique.
 let ids: Shared<i32> = Shared::new(0);
 
@@ -4849,27 +4855,27 @@ fun main() {
 				if choice < 7 || size == 0 {
 					walk.push(fresh());
 				} else if choice < 10 {
-					walk.insert_at(next_random(size + 1), fresh());
+					walk.insert_at(pick(size + 1), fresh());
 				} else if choice < 12 {
-					walk.remove_at(next_random(size));
+					walk.remove_at(pick(size));
 				} else if choice < 13 {
 					// An element changed in place: a new row under the same key.
-					let at = next_random(size);
+					let at = pick(size);
 					let held = walk.get()[at];
 					walk.set_at(at, Row { id = held.id, text = held.text + "'" });
 				} else if choice < 14 {
 					// ...and an element replaced by a different key.
-					walk.set_at(next_random(size), fresh());
+					walk.set_at(pick(size), fresh());
 				} else if choice < 17 {
-					let from = next_random(size);
-					let count = 1 + next_random(size - from);
-					walk.move_range(from, count, next_random(size - count + 1));
+					let from = pick(size);
+					let count = 1 + pick(size - from);
+					walk.move_range(from, count, pick(size - count + 1));
 				} else if choice < 18 {
 					walk.pop();
 				} else if choice < 19 && size > 12 {
-					walk.remove_range(next_random(size), 1 + next_random(4));
+					walk.remove_range(pick(size), 1 + pick(4));
 				} else if choice < 20 && size > 20 {
-					walk.truncate(next_random(size));
+					walk.truncate(pick(size));
 				} else if choice < 21 && size > 16 {
 					// The wholesale write: a `Reset`, the pass.
 					mut rows: List<Row> = [];
@@ -4882,13 +4888,13 @@ fun main() {
 				} else if choice < 22 {
 					// The compat door: one element edited, one appended.
 					mut edited = walk.get();
-					let at = next_random(size);
+					let at = pick(size);
 					edited[at] = Row { id = edited[at].id, text = edited[at].text + "~" };
 					edited.push(fresh());
 					walk.reconcile_to(edited);
 				} else {
 					// The batch door, inside the batch.
-					let at = next_random(size);
+					let at = pick(size);
 					walk.edit(|&mut list| {
 						list.insert_at(at, fresh());
 						list.remove_at(0);
@@ -5480,7 +5486,7 @@ fun main() {
 	print(i"move_range wholes={wholes()}");
 	let size = cell.size();
 	print(i"size={size} wholes={wholes()}");
-	let total: i32 = cell.peek(|list| list.len());
+	let total: usize = cell.peek(|list| list.len());
 	let third: Option<Row> = cell.peek(|list| list.get(2));
 	let text = match third {
 		Some(let found) => found.text,

@@ -859,6 +859,20 @@ fun fold_unsigned(value: f64, modulus: f64): f64 {
 	}
 }
 
+/// `value` truncated toward zero and SATURATED at zero — the conversion into the
+/// two unsigned widths that do not fold, `u53` and `usize`. A negative answers `0`
+/// on every backend (I6, RULED 2026-09-25): natively that is Rust's own
+/// `f64 as u64`, and here it is this clamp, where the conversion used to keep the
+/// sign. A NaN answers `0` with it, as it does natively.
+fun saturate_unsigned(value: f64): f64 {
+	let truncated = value.trunc();
+	if truncated > 0f {
+		truncated
+	} else {
+		0f
+	}
+}
+
 /// The signed fold: two's-complement at `modulus`, so `half ..` goes negative.
 fun fold_signed(value: f64, modulus: f64, half: f64): f64 {
 	let wrapped = fold_unsigned(value, modulus);
@@ -960,12 +974,12 @@ export impl i8 {
 
 	fun as_u53(self): u53 {
 		let widened = self.as_f64();
-		label_u64(widened.trunc())
+		label_u64(saturate_unsigned(widened))
 	}
 
 	fun as_usize(self): usize {
 		let widened = self.as_f64();
-		label_usize(widened.trunc())
+		label_usize(saturate_unsigned(widened))
 	}
 
 	fun as_f32(self): f32 {
@@ -1121,12 +1135,12 @@ export impl i16 {
 
 	fun as_u53(self): u53 {
 		let widened = self.as_f64();
-		label_u64(widened.trunc())
+		label_u64(saturate_unsigned(widened))
 	}
 
 	fun as_usize(self): usize {
 		let widened = self.as_f64();
-		label_usize(widened.trunc())
+		label_usize(saturate_unsigned(widened))
 	}
 
 	fun as_f32(self): f32 {
@@ -1266,12 +1280,12 @@ export impl i32 {
 
 	fun as_u53(self): u53 {
 		let widened = self.as_f64();
-		label_u64(widened.trunc())
+		label_u64(saturate_unsigned(widened))
 	}
 
 	fun as_usize(self): usize {
 		let widened = self.as_f64();
-		label_usize(widened.trunc())
+		label_usize(saturate_unsigned(widened))
 	}
 
 	fun as_f32(self): f32 {
@@ -1417,12 +1431,12 @@ export impl i53 {
 
 	fun as_u53(self): u53 {
 		let widened = self.as_f64();
-		label_u64(widened.trunc())
+		label_u64(saturate_unsigned(widened))
 	}
 
 	fun as_usize(self): usize {
 		let widened = self.as_f64();
-		label_usize(widened.trunc())
+		label_usize(saturate_unsigned(widened))
 	}
 
 	fun as_f32(self): f32 {
@@ -1692,12 +1706,12 @@ export impl f32 {
 
 	fun as_u53(self): u53 {
 		let widened = self.as_f64();
-		label_u64(widened.trunc())
+		label_u64(saturate_unsigned(widened))
 	}
 
 	fun as_usize(self): usize {
 		let widened = self.as_f64();
-		label_usize(widened.trunc())
+		label_usize(saturate_unsigned(widened))
 	}
 
 	fun as_f32(self): f32 {
@@ -1743,12 +1757,12 @@ export impl f64 {
 
 	fun as_u53(self): u53 {
 		let widened = self;
-		label_u64(widened.trunc())
+		label_u64(saturate_unsigned(widened))
 	}
 
 	fun as_usize(self): usize {
 		let widened = self;
-		label_usize(widened.trunc())
+		label_usize(saturate_unsigned(widened))
 	}
 
 	fun as_f32(self): f32 {
@@ -1802,12 +1816,12 @@ export impl BigInt {
 
 	fun as_u53(self): u53 {
 		let widened = self.as_f64();
-		label_u64(widened.trunc())
+		label_u64(saturate_unsigned(widened))
 	}
 
 	fun as_usize(self): usize {
 		let widened = self.as_f64();
-		label_usize(widened.trunc())
+		label_usize(saturate_unsigned(widened))
 	}
 
 	fun as_f32(self): f32 {

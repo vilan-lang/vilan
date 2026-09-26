@@ -3358,14 +3358,25 @@ fn substring_admits_its_boundary_ranges() {
     );
 }
 
+// A position is a `usize` since I5 S2, so the "computed negative" these two
+// pins were written for has no signed spelling left: what reaches `substring`
+// now is an UNDERFLOWED `usize`. Ruling 2 leaves that value unspecified (JS: it
+// goes negative; native: a debug panic at the subtraction) and promises only
+// that it is never read out of range — the bounds check refuses it. That is
+// what these pin, on the JS backend, and they spell the underflow out (`zero -
+// 1` over a declared `usize`) rather than leaning on a literal's inference.
+// B407 refuses a negative LITERAL at an unsigned type; a constant-folded
+// `0 - 1` is not refused (measured on B407's merge) — reported, not pinned here.
+
 #[test]
-fn substring_with_a_computed_negative_start_panics() {
+fn substring_with_an_underflowed_start_is_refused_by_the_bounds_check() {
     assert_run_panics(
         r#"
         import std::io::print;
         fun main() {
             let s = "hello";
-            let start = 0 - 1;
+            let zero: usize = 0;
+            let start = zero - 1;
             print(s.substring(start, 3));
         }
         main();
@@ -3375,14 +3386,15 @@ fn substring_with_a_computed_negative_start_panics() {
 }
 
 #[test]
-fn substring_with_a_computed_negative_end_panics() {
+fn substring_with_an_underflowed_end_is_refused_by_the_bounds_check() {
     assert_run_panics(
         r#"
         import std::io::print;
         fun main() {
             let s = "hello, world";
             let offset = 7;
-            let end = 0 - 1;
+            let zero: usize = 0;
+            let end = zero - 1;
             print(s.substring(offset, end));
         }
         main();
@@ -3432,7 +3444,7 @@ fn substring_out_of_range_fails_const_evaluation() {
     assert_fails_with(
         r#"
         import std::io::print;
-        fun cut(text: str, start: i32, end: i32): str { text.substring(start, end) }
+        fun cut(text: str, start: usize, end: usize): str { text.substring(start, end) }
         fun main() { let bad = const cut("hello", 4, 2); print(bad); }
         main();
         "#,
@@ -3566,13 +3578,13 @@ fn an_absent_needle_is_none_not_minus_one() {
         r#"
         import std::io::print;
         fun main() {
-            print("abc".index_of("z").unwrap_or(-99));
-            print("abc".last_index_of("z").unwrap_or(-99));
+            print("abc".index_of("z").is_none());
+            print("abc".last_index_of("z").is_none());
         }
         main();
         "#,
-        "-99
--99
+        "true
+true
 ",
     );
 }
@@ -3585,9 +3597,9 @@ fn an_empty_needle_sits_at_each_end() {
         r#"
         import std::io::print;
         fun main() {
-            print("abc".index_of("").unwrap_or(-1));
-            print("abc".last_index_of("").unwrap_or(-1));
-            print("".index_of("").unwrap_or(-1));
+            print("abc".index_of("").unwrap_or(99));
+            print("abc".last_index_of("").unwrap_or(99));
+            print("".index_of("").unwrap_or(99));
         }
         main();
         "#,

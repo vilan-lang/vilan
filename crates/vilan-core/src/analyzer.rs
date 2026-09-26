@@ -40792,6 +40792,13 @@ impl<'src> Analyzer<'src> {
     /// — an argument, a `let` annotation, a reassignment, a return, a field —
     /// said only the plain sentence, which every index conversion meets (I5).
     /// `BigInt` is left out as a target: nothing converts into it by method.
+    ///
+    /// When one side is `usize` the sentence NAMES it (I5 §8.2): an index is a
+    /// position, a length or a count, and after S2 moved std's signatures that
+    /// is what a reader meeting this message has to learn — `len()` answers
+    /// one, `get` takes one — not only that two widths differ. The tail is the
+    /// same steer either way, which the quick fix and `vilan check --fix` read
+    /// the conversion off.
     fn type_mismatch_message(
         &self,
         expected_type: &Type,
@@ -40801,12 +40808,26 @@ impl<'src> Analyzer<'src> {
         let expected = self.pretty_print_type(expected_type, substitution_context);
         let got = self.pretty_print_type(got_type, substitution_context);
         match self.numeric_conversion_target(expected_type, got_type) {
+            Some("usize") => format!(
+                "Expected usize (an index: a position, a length or a count), but got {got} \
+                 instead. There are no implicit numeric conversions; convert with `.as_usize()`"
+            ),
+            Some(target) if self.is_usize(got_type) => format!(
+                "Expected {expected}, but got usize (an index: a position, a length or a count) \
+                 instead. There are no implicit numeric conversions; convert with `.as_{target}()`"
+            ),
             Some(target) => format!(
                 "Expected {expected}, but got {got} instead. There are no implicit numeric \
                  conversions; convert with `.as_{target}()`"
             ),
             None => format!("Expected {expected}, but got {got} instead."),
         }
+    }
+
+    /// Whether `type_` is the index type, `usize`.
+    fn is_usize(&self, type_: &Type) -> bool {
+        matches!(type_, Type::Struct(id, _)
+            if self.primitive_struct_ids.get("usize") == Some(id))
     }
 
     /// The width a value of `got_type` converts to with `.as_<width>()` to fit
@@ -40859,6 +40880,25 @@ impl<'src> Analyzer<'src> {
     ) -> (String, Option<crate::error::Note>) {
         let got = self.pretty_print_type(argument_type, substitution_context);
         let plain = self.type_mismatch_message(parameter_type, argument_type, substitution_context);
+        // I5 §8.2: an index mismatch at an argument notes the parameter's
+        // declaration — which may be in std, where S2 moved it — the way B72's
+        // steer below does for a bare trait.
+        if self
+            .numeric_conversion_target(parameter_type, argument_type)
+            .is_some()
+            && (self.is_usize(parameter_type) || self.is_usize(argument_type))
+        {
+            let declared = self.pretty_print_type(parameter_type, substitution_context);
+            let note = self
+                .span_map
+                .get(&parameter_id)
+                .map(|span| crate::error::Note {
+                    span: **span,
+                    msg: format!("'{parameter_name}' is declared `{declared}` here"),
+                    source: self.source_of_id(parameter_id),
+                });
+            return (plain, note);
+        }
         let Type::Trait(trait_id, _) = parameter_type else {
             return (plain, None);
         };
@@ -47615,24 +47655,26 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// The INDEX half of `subject[index]`: a position, so it is an `i32` —
-    /// the very type `List::get` and `List::set` take.
+    /// The INDEX half of `subject[index]`: a position, so it is a `usize` —
+    /// the very type `List::get` and `List::set` take (I5 S2; `i32` until the
+    /// migration, when S1 admitted both).
     ///
-    /// Nothing checked it. `xs[1.5]`, `xs["a"]`, `xs[true]` and the write form
-    /// `xs[k] = v` all passed `vilan check` and went straight to the emitted
-    /// array subscript, where JS answered `undefined` for a position that does
-    /// not exist — so a program read a hole and failed somewhere else entirely
-    /// (`TypeError: Cannot read properties of undefined`), or tripped the
-    /// bounds check with a non-number in the message.
+    /// Nothing checked it once. `xs[1.5]`, `xs["a"]`, `xs[true]` and the write
+    /// form `xs[k] = v` all passed `vilan check` and went straight to the
+    /// emitted array subscript, where JS answered `undefined` for a position
+    /// that does not exist (B386).
+    ///
+    /// A NUMERIC index of another width carries E218's conversion, so the
+    /// migration's codemod and the editor's quick fix both write
+    /// `.as_usize()` at it.
     ///
     /// Lenient about what is not yet a type: an index still `Unknown` or
     /// `Unresolved` is reported by the fixpoint's own leftover sweep, and a
     /// GENERIC one is left alone rather than refused here — a parameter's
     /// bounds are the only thing that could make it an index, and the language
-    /// has no such bound to write yet. Both are holes this deliberately does
-    /// not close; the concrete wrong types are the miscompile.
+    /// has no such bound to write yet.
     fn subscript_index_is_an_index(&mut self, index_id: Id) -> bool {
-        let Some(index_struct_id) = self.primitive_struct_ids.get("i32").copied() else {
+        let Some(index_struct_id) = self.primitive_struct_ids.get("usize").copied() else {
             return true;
         };
         let expected = Type::Struct(index_struct_id, Vec::new());
@@ -47646,28 +47688,22 @@ impl<'src> Analyzer<'src> {
         if index_type == expected {
             return true;
         }
-        // I5 S1: `usize` is admitted BESIDE `i32`, at the subscript only — a
-        // two-type admission for the one release in which both spellings are
-        // an index. The expectation above stays `i32`, so a literal index and
-        // every emitted subscript are unchanged; the message below keeps
-        // naming `i32` because it steers to the type `xs.get(i)` takes, which
-        // is still `i32` until S2. S2 (the std signatures move to `usize`)
-        // DELETES this admission and makes `usize` the expectation.
-        if let Some(usize_struct_id) = self.primitive_struct_ids.get("usize").copied()
-            && index_type == Type::Struct(usize_struct_id, Vec::new())
-        {
-            return true;
-        }
         let index_str = self.pretty_print_type(&index_type, &HashMap::default());
+        let conversion = match self.numeric_conversion_target(&expected, &index_type) {
+            Some(target) => format!(
+                ". There are no implicit numeric conversions; convert with `.as_{target}()`"
+            ),
+            None => String::new(),
+        };
         self.diagnostics.push(Error {
             trace: Vec::new(),
             note: None,
             span: **self.span_map.get(&index_id).unwrap_or(&&EMPTY_SPAN),
             msg: format!(
-                "an index must be an `i32`, and this one is `{index_str}`: a list and an \
+                "an index must be a `usize`, and this one is `{index_str}`: a list and an \
                  array are POSITIONAL, so `xs[i]` takes the index `xs.get(i)` takes — \
                  anything else names no element, and the emitted subscript read `undefined` \
-                 back instead of failing"
+                 back instead of failing{conversion}"
             ),
         });
         false

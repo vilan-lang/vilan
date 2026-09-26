@@ -26,6 +26,7 @@ option-view	0	0
 dyn-objects	10	0
 usize	0	0
 usize-literals	0	0
+unsigned-saturate	0	0
 bytes-aliasing	0	0
 delta-law	2842	14
 reactive-on-change	28	0

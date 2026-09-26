@@ -4804,9 +4804,9 @@ fn calling_a_method_call_result_binds_first() {
         r#"
         import std::io::print;
         import std::shared::Shared;
-        struct Holder { hook: Shared<|str| i32> }
+        struct Holder { hook: Shared<|str| usize> }
         impl Holder {
-            fun call_it(self, a: str): i32 {
+            fun call_it(self, a: str): usize {
                 let hook = self.hook.read();
                 hook(a)
             }
@@ -4828,9 +4828,9 @@ fn calling_a_method_call_result_directly_parses() {
     assert_compiles(
         r#"
         import std::shared::Shared;
-        struct Holder { hook: Shared<|str| i32> }
+        struct Holder { hook: Shared<|str| usize> }
         impl Holder {
-            fun call_it(self, a: str): i32 {
+            fun call_it(self, a: str): usize {
                 self.hook.read()(a)
             }
         }
@@ -7394,7 +7394,7 @@ fn the_registry_cannot_be_read_before_evaluation_has_finished() {
     assert_fails_with(
         r#"
         import std::asset::{ stage, staged };
-        fun contribute(): i32 {
+        fun contribute(): usize {
             stage("probe", "token", "line");
             staged("probe").len()
         }

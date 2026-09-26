@@ -55,7 +55,7 @@ fun main() {
 	// `to_set` / `to_map`: bounded, so they live on `List`.
 	print([1, 2, 2, 3].iter().filter(|n| n > 1).to_list().to_set().len());
 	let lengths = ["alpha", "hi"].iter().map(|word| (word, word.len())).to_list().to_map();
-	print(lengths.get("hi").unwrap_or(-1));
+	print(lengths.get("hi").unwrap_or(0));
 
 	// `iter()` snapshots (rule 1): the push is not walked, and the list is
 	// untouched by the chain.

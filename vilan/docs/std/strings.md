@@ -12,7 +12,7 @@ or a `bool`. Everything else needs `to_string()` first.
 
 ```vilan,fragment
 impl str {
-	fun len(self): i32
+	fun len(self): usize
 	fun is_empty(self): bool
 	fun trim(self): str
 	fun to_uppercase(self): str                      // full Unicode; see below
@@ -23,12 +23,12 @@ impl str {
 	fun starts_with(self, prefix: str): bool
 	fun ends_with(self, suffix: str): bool
 	fun replace(self, from: str, to: str): str       // all occurrences
-	fun repeat(self, count: i32): str
+	fun repeat(self, count: usize): str
 	fun split(self, separator: str): List<str>
 	fun substring(self, start: i32, end: i32): str   // end-exclusive; see below
-	fun code_at(self, index: i32): u32               // UTF-16 code unit
-	fun index_of(self, needle: str): Option<i32>     // declared in std::option
-	fun last_index_of(self, needle: str): Option<i32> // likewise
+	fun code_at(self, index: usize): u32             // UTF-16 code unit
+	fun index_of(self, needle: str): Option<usize>   // declared in std::option
+	fun last_index_of(self, needle: str): Option<usize> // likewise
 	fun strip_prefix(self, prefix: str): Option<str> // likewise
 	fun strip_suffix(self, suffix: str): Option<str> // likewise
 	fun parse_i32(self): Option<i32>                 // likewise
@@ -92,7 +92,7 @@ fun main() {
 		}
 		None => print("no separator"),
 	}
-	print("a.b.c".last_index_of(".").unwrap_or(-1));      // 3 — the final one
+	print("a.b.c".last_index_of(".").is_some_and(|at| at == 3)); // true — the final one
 }
 ```
 

@@ -1778,14 +1778,10 @@ pub fn hashes_equal(left: &Hash, right: &Hash) -> bool {
 
 // ----------------------------------------------------------- list helpers ---
 
-/// `List::get` — `__list_get`. Out of range is `None`, never a panic; the index
-/// is signed because a vilan `i32` index can be negative and that is a miss,
-/// not an overflow.
-pub fn list_get<T: Clone>(list: &[T], index: i64) -> Option<T> {
-    if index < 0 {
-        return None;
-    }
-    list.get(index as usize).cloned()
+/// `List::get` — `__list_get`. Out of range is `None`, never a panic. The index
+/// is a `usize` (I5), which is what a native `Vec` indexes by.
+pub fn list_get<T: Clone>(list: &[T], index: usize) -> Option<T> {
+    list.get(index).cloned()
 }
 
 /// `List::pop` — `__list_pop`.
@@ -1793,14 +1789,14 @@ pub fn list_pop<T>(list: &mut Vec<T>) -> Option<T> {
     list.pop()
 }
 
-/// `List::remove` — `remove(&mut self, index: i32): T`, so it answers the
+/// `List::remove` — `remove(&mut self, index: usize): T`, so it answers the
 /// ELEMENT, not an `Option`. An out-of-range index is a panic with a message
 /// rather than a silent `undefined`.
-pub fn list_remove<T>(list: &mut Vec<T>, index: i64) -> T {
-    if index < 0 || index as usize >= list.len() {
+pub fn list_remove<T>(list: &mut Vec<T>, index: usize) -> T {
+    if index >= list.len() {
         panic_with("List::remove: index out of range");
     }
-    list.remove(index as usize)
+    list.remove(index)
 }
 
 /// `List::insert` — a past-the-end index appends, as the JS `splice` does.
@@ -1818,22 +1814,18 @@ pub fn list_sort_by<T: Clone>(list: &[T], compare: impl Fn(T, T) -> i32) -> Vec<
     sorted
 }
 
-pub fn list_insert<T>(list: &mut Vec<T>, index: i64, value: T) {
-    let at = if index < 0 {
-        0
-    } else {
-        (index as usize).min(list.len())
-    };
+pub fn list_insert<T>(list: &mut Vec<T>, index: usize, value: T) {
+    let at = index.min(list.len());
     list.insert(at, value);
 }
 
 // ---------------------------------------------------------- str intrinsics --
 
-pub fn str_len(text: &str) -> i32 {
+pub fn str_len(text: &str) -> usize {
     // JavaScript's `.length` counts UTF-16 code units, and the corpus's strings
     // are ASCII, where the two agree. A non-ASCII program is a KNOWN divergence
     // and the differential reports it rather than this pretending otherwise.
-    text.chars().map(|c| c.len_utf16() as i32).sum()
+    text.chars().map(char::len_utf16).sum()
 }
 
 pub fn str_trim(text: &str) -> Str {
@@ -1864,8 +1856,8 @@ pub fn str_replace(text: &str, from: &str, to: &str) -> Str {
     Rc::from(text.replace(from, to).as_str())
 }
 
-pub fn str_repeat(text: &str, times: i32) -> Str {
-    Rc::from(text.repeat(times.max(0) as usize).as_str())
+pub fn str_repeat(text: &str, times: usize) -> Str {
+    Rc::from(text.repeat(times).as_str())
 }
 
 pub fn str_split(text: &str, separator: &str) -> Vec<Str> {
@@ -1880,20 +1872,15 @@ pub fn str_split(text: &str, separator: &str) -> Vec<Str> {
 
 /// `str::substring` — JavaScript's, which CLAMPS rather than panicking and
 /// swaps a reversed pair.
-pub fn str_substring(text: &str, start: i32, end: i32) -> Str {
+pub fn str_substring(text: &str, start: usize, end: usize) -> Str {
     let characters: Vec<char> = text.chars().collect();
-    let length = characters.len() as i64;
-    let mut first = (start as i64).clamp(0, length);
-    let mut last = (end as i64).clamp(0, length);
+    let length = characters.len();
+    let mut first = start.min(length);
+    let mut last = end.min(length);
     if first > last {
         std::mem::swap(&mut first, &mut last);
     }
-    Rc::from(
-        characters[first as usize..last as usize]
-            .iter()
-            .collect::<String>()
-            .as_str(),
-    )
+    Rc::from(characters[first..last].iter().collect::<String>().as_str())
 }
 
 /// `Math.round` — JavaScript's, which rounds a half UP (toward `+∞`) where
@@ -1935,11 +1922,8 @@ pub fn js_math_sign(value: f64) -> f64 {
 /// contract, so `0` is the answer here — the one value a hash or a parser
 /// treats as "nothing", and the same thing `NaN | 0` gives on the other side
 /// wherever the result is used arithmetically.
-pub fn str_code_at(text: &str, index: i32) -> u32 {
-    if index < 0 {
-        return 0;
-    }
-    let mut remaining = index as usize;
+pub fn str_code_at(text: &str, index: usize) -> u32 {
+    let mut remaining = index;
     for character in text.chars() {
         let width = character.len_utf16();
         if remaining < width {
@@ -2006,7 +1990,6 @@ mod tests {
         assert_eq!(str_code_at("\u{1f600}", 0), 0xd83d);
         assert_eq!(str_code_at("\u{1f600}", 1), 0xde00);
         assert_eq!(str_code_at("abc", 3), 0, "past the end");
-        assert_eq!(str_code_at("abc", -1), 0, "before the start");
     }
 
     #[test]

@@ -12,10 +12,10 @@ struct Counter {
 
 impl Counter {
 	fun next_mut(&mut self): Option<&mut i32> {
-		if self.pos < self.items.len() {
+		if self.pos.as_usize() < self.items.len() {
 			let index = self.pos;
 			self.pos = self.pos + 1;
-			Some(&mut self.items[index])
+			Some(&mut self.items[index.as_usize()])
 		} else {
 			None
 		}

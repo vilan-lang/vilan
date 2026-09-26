@@ -20,7 +20,7 @@ import pkg::wire::{ Codec, Deserialize, Deserializer, Frame, Serialize, Serializ
 /// these two were `Shared` cells until the visitor's receivers moved.
 export struct BinaryWriter {
 	buffer: Bytes,
-	used: i32,
+	used: usize,
 }
 
 export impl BinaryWriter {
@@ -29,7 +29,7 @@ export impl BinaryWriter {
 	}
 
 	/// Grow (doubling) until `extra` more bytes fit.
-	fun ensure(&mut self, extra: i32) {
+	fun ensure(&mut self, extra: usize) {
 		let needed = self.used + extra;
 		mut capacity = self.buffer.len();
 		if needed > capacity {
@@ -82,7 +82,7 @@ export impl BinaryWriter {
 	/// `u32` byte length + UTF-8 bytes.
 	fun write_str(&mut self, value: str) {
 		let encoded = encode_utf8(value);
-		self.write_i32(encoded.len());
+		self.write_i32(encoded.len().as_i32());
 		self.ensure(encoded.len());
 		self.buffer.copy_into(encoded, self.used);
 		self.used = self.used + encoded.len();
@@ -159,7 +159,7 @@ export impl BinaryWriter with Serialize {
 /// headnote gives (A108).
 struct BinaryReader {
 	bytes: Bytes,
-	cursor: i32,
+	cursor: usize,
 	error: Option<str>,
 }
 
@@ -185,7 +185,7 @@ impl BinaryReader {
 	}
 
 	/// Whether `count` more bytes exist; fails sticky when they don't.
-	fun expect(&mut self, count: i32): bool {
+	fun expect(&mut self, count: usize): bool {
 		if !self.ok() {
 			ret false;
 		}
@@ -243,13 +243,13 @@ impl BinaryReader {
 
 	/// A length prefix that must fit the remaining frame (each prefixed item is at
 	/// least one byte, so a larger claim is hostile or truncated).
-	fun read_length(&mut self): i32 {
+	fun read_length(&mut self): usize {
 		let length = self.read_i32();
-		if length < 0 || self.cursor + length > self.bytes.len() {
+		if length < 0 || self.cursor + length.as_usize() > self.bytes.len() {
 			self.report("length prefix exceeds frame");
 			ret 0;
 		}
-		length
+		length.as_usize()
 	}
 
 	fun read_str(&mut self): str {
@@ -282,7 +282,7 @@ export impl BinaryReader with Deserialize {
 	fun end_struct(&mut self) {}
 
 	fun begin_list(&mut self): i32 {
-		self.read_length()
+		self.read_length().as_i32()
 	}
 
 	fun end_list(&mut self) {}

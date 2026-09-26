@@ -11,6 +11,7 @@ use ariadne::{Color, Label, Report, ReportKind, sources};
 use clap::{Parser as _, Subcommand};
 mod bindgen;
 mod explain;
+mod fix;
 mod hmr;
 mod init;
 mod job;
@@ -123,6 +124,13 @@ enum Command {
         /// Re-check whenever a watched `.vl` source file changes (Ctrl-C to stop).
         #[arg(long)]
         watch: bool,
+        /// Before checking, apply the fix every numeric mismatch carries — the
+        /// `.as_*()` conversion its message names, or a literal-bound counter
+        /// declared `usize` — to the package's own files, repeating until a
+        /// round finds nothing more to fix (the migration to `usize` indexes).
+        /// What is left is reported as usual.
+        #[arg(long, conflicts_with = "watch")]
+        fix: bool,
     },
     /// Build and run a source file, forwarding any trailing arguments to the
     /// program (reach them with `import std::process;` and `process::args()`).
@@ -372,8 +380,16 @@ fn run_cli() -> ExitCode {
             backend,
             debug,
             watch,
+            fix,
         } => match effective_backend(backend.as_deref()) {
             Err(message) => report_error(&message),
+            Ok(_backend) if fix => match fix_project(file.clone(), platform.as_deref()) {
+                Err(message) => report_error(&message),
+                Ok(fixed) => {
+                    fix::report(&fixed);
+                    check_once(file, platform, debug).into()
+                }
+            },
             Ok(_backend) => {
                 let roots = watch.then(|| watch_roots(&file));
                 run_or_watch(roots, move || {
@@ -743,6 +759,43 @@ fn check_once(file: Option<PathBuf>, platform: Option<String>, debug: bool) -> R
         Project::Workspace { members, .. } => check_workspace(&members, debug),
         Project::Library { dir, name } => check_library(&dir, &name),
     })
+}
+
+/// `vilan check --fix`'s pass over the project `check` would check, under
+/// every platform it would check it under: each unit's numeric mismatches
+/// fixed to a fixed point ([`fix::fix_unit`]). A standalone library has no
+/// program to analyze, so it has nothing to fix.
+fn fix_project(file: Option<PathBuf>, platform: Option<&str>) -> Result<fix::Fixed, String> {
+    let mut fixed = fix::Fixed::default();
+    match resolve_project(file)? {
+        Project::Single {
+            unit,
+            platform: package_platform,
+            shared_platforms,
+            ..
+        } => {
+            let first = effective_platform(platform, package_platform)?;
+            let mut platforms = vec![first];
+            if platform.is_none() {
+                platforms.extend(shared_platforms);
+            }
+            for platform in platforms {
+                fix::fix_unit(&unit, platform, &mut fixed)?;
+            }
+        }
+        Project::Workspace { members, .. } => {
+            for (unit, platform) in &members {
+                fix::fix_unit(unit, *platform, &mut fixed)?;
+            }
+        }
+        Project::Library { name, .. } => {
+            return Err(format!(
+                "`{name}` is a library: `--fix` analyzes a program, and a library is compiled \
+                 only as a dependency of one — run it from a package that uses `{name}`"
+            ));
+        }
+    }
+    Ok(fixed)
 }
 
 /// Builds and runs the project once with Node, waiting for it to exit and

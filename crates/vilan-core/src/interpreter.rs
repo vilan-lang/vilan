@@ -2410,7 +2410,14 @@ impl<'a> Interpreter<'a> {
             }
             "String" => Ok(Value::Str(Rc::from(self.to_js_string(&take(0))?.as_str()))),
             "Boolean" => Ok(Value::Bool(truthy(&take(0)))),
-            "Number" => to_number(&take(0)).map(Value::Number),
+            // `Number(x)` is ToNumber everywhere but a BigInt, which the
+            // constructor converts (to the nearest double) where ToNumber
+            // throws — the path `BigInt::as_f64` and every `as_*` out of a
+            // `BigInt` take in the emitted JS.
+            "Number" => match take(0) {
+                Value::BigInt(number) => Ok(Value::Number(number as f64)),
+                other => to_number(&other).map(Value::Number),
+            },
             "Number.isNaN" => Ok(Value::Bool(
                 matches!(take(0), Value::Number(n) if n.is_nan()),
             )),

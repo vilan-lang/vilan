@@ -146,8 +146,8 @@ const VISITOR_STATE_UNBOXED: &[(&str, &str)] = &[
     ("json.vl", "\tstack: List<JsonValue>,"),
     ("json.vl", "\terror: Option<str>,"),
     ("binary.vl", "\tbuffer: Bytes,"),
-    ("binary.vl", "\tused: i32,"),
-    ("binary.vl", "\tcursor: i32,"),
+    ("binary.vl", "\tused: usize,"),
+    ("binary.vl", "\tcursor: usize,"),
     ("binary.vl", "\terror: Option<str>,"),
 ];
 

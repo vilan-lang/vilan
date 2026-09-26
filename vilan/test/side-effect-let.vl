@@ -5,7 +5,7 @@ import std::shared::Shared;
 // initializer (here a call that mutates through `&mut`) must still run.
 fun bump(xs: &mut List<i32>): i32 {
 	xs.push(1);
-	xs.len()
+	xs.len().as_i32()
 }
 
 // B377 — the same rule for every OTHER initializer shape. The predicate that

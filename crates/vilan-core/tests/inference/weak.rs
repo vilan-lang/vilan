@@ -535,7 +535,7 @@ fn a_weak_handle_works_in_the_const_interpreter() {
             }
         }
 
-        const fun through_get(): i32 {
+        const fun through_get(): usize {
             let cell: Shared<List<i32>> = Shared::new([1, 2, 3]);
             let weak: Weak<List<i32>> = cell.downgrade();
             match weak.get() {
@@ -545,7 +545,7 @@ fn a_weak_handle_works_in_the_const_interpreter() {
         }
 
         const let upgraded: i32 = through_upgrade();
-        const let counted: i32 = through_get();
+        const let counted: usize = through_get();
 
         fun main() {
             print(i"{upgraded} {counted}");

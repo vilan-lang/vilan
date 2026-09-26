@@ -743,7 +743,7 @@ fn b126_a_nested_closures_rets_stay_on_the_closures_frame() {
         }
 
         fun main() {
-        	let y: i32 = outer(true);
+        	let y: usize = outer(true);
         	print(y);
         }
         "#,
@@ -2333,7 +2333,7 @@ fn b125_a_closure_parameter_disagreeing_with_the_receiver_reports_once() {
         fun main() {
         	mut points: List<Point> = List::new();
         	points.push(Point { x = 1, y = 10 });
-        	let widths: List<i32> = points.map(|point: str| point.len());
+        	let widths: List<usize> = points.map(|point: str| point.len());
         	print(widths.len());
         }
         "#;
@@ -2341,7 +2341,7 @@ fn b125_a_closure_parameter_disagreeing_with_the_receiver_reports_once() {
     assert_fails_spanning(
         source,
         "|point: str| point.len()",
-        "Expected |Point| i32, but got |str| i32 instead.",
+        "Expected |Point| usize, but got |str| usize instead.",
     );
 }
 
@@ -4178,7 +4178,7 @@ fn a_user_lift_container_dispatches_to_its_own_map_and_and_then() {
         	let boxed = Boxy { value = Profile { name = "ada" }, tag = "outer" };
         	let mapped: Boxy<str> = boxed?.name;
         	print(i"{mapped.value} [{mapped.tag}]");
-        	let lengths: Boxy<i32> = boxed?.name.len();
+        	let lengths: Boxy<usize> = boxed?.name.len();
         	print(format(lengths.value));
         	let flat: Boxy<str> = boxed?.boxed_name();
         	print(i"{flat.value} [{flat.tag}]");

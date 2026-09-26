@@ -38,8 +38,8 @@ impl Outer {
 	// A conditional element view — the `Arena::get` shape: `Some(..)` in one
 	// branch, `None` in the other.
 	fun item_mut(&mut self, index: i32): Option<&mut i32> {
-		if index < self.items.len() {
-			Some(&mut self.items[index])
+		if index.as_usize() < self.items.len() {
+			Some(&mut self.items[index.as_usize()])
 		} else {
 			None
 		}

@@ -148,7 +148,7 @@ mutates the storage **in place** — assigning through a **view**, writing a
 a `&mut self` method that does either. None of it is visible through a capture:
 
 ```vilan
-enum Feed { Ready(List<str>, i32), Done }
+enum Feed { Ready(List<str>, usize), Done }
 
 impl Feed {
 	fun step(&mut self): str {

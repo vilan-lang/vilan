@@ -22,6 +22,16 @@ function fold_unsigned(value, modulus) {
 	}
 	return $f;
 }
+function saturate_unsigned(value) {
+	const truncated = Math.trunc(value);
+	let $h = null;
+	if (truncated > 0) {
+		$h = truncated;
+	} else {
+		$h = 0;
+	}
+	return $h;
+}
 function fold_signed(value, modulus, half) {
 	const wrapped = fold_unsigned(value, modulus);
 	let $g = null;
@@ -34,11 +44,14 @@ function fold_signed(value, modulus, half) {
 }
 function as_usize(self) {
 	const widened = Number(self);
-	return Number(Math.trunc(widened));
+	return Number(saturate_unsigned(widened));
 }
 function as_i32(self) {
 	const widened = Number(self);
 	return Number(fold_signed(widened, 4294967296, 2147483648));
+}
+function as_usize2(self) {
+	return self;
 }
 function take(count) {
 	return count;
@@ -53,16 +66,16 @@ function $d(self) {
 	const $e = self;
 	return $e[0] === 0;
 }
-function $h(self, fallback) {
-	const $i = self;
-	let $j = null;
-	if ($i[0] === 0) {
-		const x = __clone($i[1]);
-		$j = x;
+function $i(self, fallback) {
+	const $j = self;
+	let $k = null;
+	if ($j[0] === 0) {
+		const x = __clone($j[1]);
+		$k = x;
 	} else {
-		$j = __clone(fallback);
+		$k = __clone(fallback);
 	}
-	return $j;
+	return $k;
 }
 const letters = [ "a", "b", "c" ];
 console.log("" + take(3));
@@ -107,8 +120,8 @@ console.log($d(found));
 const at = 1;
 console.log(__at(letters, 0));
 console.log(__at(letters, at));
-console.log($h(__list_get(letters, as_i32(at)), "none"));
-const length = as_usize(letters.length);
+console.log($i(__list_get(letters, as_usize(as_i32(at))), "none"));
+const length = as_usize2(letters.length);
 console.log("" + length);
 let index = length;
 while (index > 0) {

@@ -122,24 +122,24 @@ function drain(turn) {
 function reissued(subscriber) {
 	return [ subscriber[0], subscriber[1], subscriber[2], subscriber[3] ];
 }
-function dispose(self, $D) {
-	const $E = $D;
-	let $F = null;
-	if ($E[0] === 0) {
-		const established = $E[1];
-		$F = [ 0, established ];
+function dispose(self, $F) {
+	const $G = $F;
+	let $H = null;
+	if ($G[0] === 0) {
+		const established = $G[1];
+		$H = [ 0, established ];
 	} else {
-		$F = $p(draining_turns.v);
+		$H = $p(draining_turns.v);
 	}
-	const ambient = $F;
+	const ambient = $H;
 	release_under(self, ambient);
 }
 function release_under(handle, ambient) {
 	handle[2].v = false;
-	const $G = [ 0, handle[0] ];
-	let $H = null;
-	if ($G[0] === 0) {
-		const subscribers = $G[1];
+	const $I = [ 0, handle[0] ];
+	let $J = null;
+	if ($I[0] === 0) {
+		const subscribers = $I[1];
 		let kept = [  ];
 		for (const subscriber of subscribers.v) {
 			if (subscriber[0] !== handle[1]) {
@@ -147,15 +147,15 @@ function release_under(handle, ambient) {
 			}
 		}
 		subscribers.v = kept;
-		$H = undefined;
+		$J = undefined;
 	} else {
-		$H = undefined;
+		$J = undefined;
 	}
-	$H;
-	const $I = ambient;
-	let $J = null;
-	if ($I[0] === 0) {
-		const turn = $I[1];
+	$J;
+	const $K = ambient;
+	let $L = null;
+	if ($K[0] === 0) {
+		const turn = $K[1];
 		let kept_pending = [  ];
 		for (const subscriber2 of turn[0].v) {
 			if (subscriber2[0] !== handle[1]) {
@@ -172,40 +172,40 @@ function release_under(handle, ambient) {
 		}
 		turn[1].v = kept_derived;
 		turn[3].v.delete(hash(handle[1]));
-		$J = undefined;
+		$L = undefined;
 	} else {
-		$J = undefined;
+		$L = undefined;
 	}
-	$J;
-	const $K = handle[3].v;
-	let $L = null;
-	if ($K[0] === 0) {
-		const release = $K[1];
+	$L;
+	const $M = handle[3].v;
+	let $N = null;
+	if ($M[0] === 0) {
+		const release = $M[1];
 		handle[3].v = [ 1 ];
 		releasing_turns.v.push(ambient);
 		__with_finally(release, () => {
 			__list_pop(releasing_turns.v);
 			return;
 		});
-		$L = undefined;
+		$N = undefined;
 	} else {
-		$L = undefined;
+		$N = undefined;
 	}
-	return $L;
+	return $N;
 }
 function new2() {
 	return [ __shared_new([  ]), __shared_new(false) ];
 }
-function register_with_owner(subscription, $x, $y) {
-	const $z = $y;
-	let $A = null;
-	if ($z[0] === 0) {
-		const owner2 = $z[1];
-		$A = $B(owner2, subscription, $x);
+function register_with_owner(subscription, $z, $A) {
+	const $B = $A;
+	let $C = null;
+	if ($B[0] === 0) {
+		const owner2 = $B[1];
+		$C = $D(owner2, subscription, $z);
 	} else {
-		$A = __clone(subscription);
+		$C = __clone(subscription);
 	}
-	return $A;
+	return $C;
 }
 function $b(value) {
 	let subscribers = [  ];
@@ -221,7 +221,13 @@ function $o(self) {
 	return self.length === 0;
 }
 function $p(self) {
-	return __list_get(self, self.length - 1);
+	let $r = null;
+	if ($o(self)) {
+		$r = [ 1 ];
+	} else {
+		$r = __list_get(self, self.length - 1);
+	}
+	return $r;
 }
 function $j(self, $k) {
 	const $l = $k;
@@ -230,20 +236,20 @@ function $j(self, $k) {
 		const turn = $l[1];
 		$m = enqueue(turn, self[1].v);
 	} else {
-		const $q = $p(draining_turns.v);
-		let $r = null;
-		if ($q[0] === 0) {
-			const draining = $q[1];
-			$r = enqueue(draining, self[1].v);
+		const $s = $p(draining_turns.v);
+		let $t = null;
+		if ($s[0] === 0) {
+			const draining = $s[1];
+			$t = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
 				if (subscriber[2].v) {
 					subscriber[1]();
 				}
 			}
-			$r = undefined;
+			$t = undefined;
 		}
-		$m = $r;
+		$m = $t;
 	}
 	return $m;
 }
@@ -251,33 +257,33 @@ function $h(self, value, $i) {
 	self[0].v = __clone(value);
 	$j(self, $i);
 }
-function $w(signal, subscriber) {
+function $y(signal, subscriber) {
 	signal[1].v.push(reissued(subscriber));
 	return [ signal[1], subscriber[0], subscriber[2], __shared_new([ 1 ]) ];
 }
-function $t(signal, observer) {
+function $v(signal, observer) {
 	const cell = signal[0];
-	return $w(signal, mint_subscriber(() => {
-		const $u = [ 0, cell ];
-		let $v = null;
-		if ($u[0] === 0) {
-			const live = $u[1];
-			$v = observer(live.v);
+	return $y(signal, mint_subscriber(() => {
+		const $w = [ 0, cell ];
+		let $x = null;
+		if ($w[0] === 0) {
+			const live = $w[1];
+			$x = observer(live.v);
 		} else {
-			$v = undefined;
+			$x = undefined;
 		}
-		return $v;
+		return $x;
 	}));
 }
-function $s(self, observer) {
-	return $t(self, observer);
+function $u(self, observer) {
+	return $v(self, observer);
 }
-function $B(self, item, $C) {
+function $D(self, item, $E) {
 	if (self[1].v) {
-		dispose(item, $C);
+		dispose(item, $E);
 	} else {
 		self[0].v.push(() => {
-			dispose(item, $C);
+			dispose(item, $E);
 			return;
 		});
 	}
@@ -286,47 +292,47 @@ function $B(self, item, $C) {
 function $c(self, transform, $d, $e) {
 	const derived = $b(transform($f(self)));
 	as_derivation();
-	register_with_owner($s(self, (value) => {
+	register_with_owner($u(self, (value) => {
 		$h(derived, transform(value), $d);
 		return;
 	}), $d, $e);
 	return derived;
 }
-function $M(self, observer) {
-	const subscription = $t(self, observer);
+function $O(self, observer) {
+	const subscription = $v(self, observer);
 	observer($f(self));
 	return subscription;
 }
-function $O(self, $k) {
-	const $P = $k;
-	let $Q = null;
-	if ($P[0] === 0) {
-		const turn = $P[1];
-		$Q = enqueue(turn, self[1].v);
+function $Q(self, $k) {
+	const $R = $k;
+	let $S = null;
+	if ($R[0] === 0) {
+		const turn = $R[1];
+		$S = enqueue(turn, self[1].v);
 	} else {
-		const $R = $p(draining_turns.v);
-		let $S = null;
-		if ($R[0] === 0) {
-			const draining = $R[1];
-			$S = enqueue(draining, self[1].v);
+		const $T = $p(draining_turns.v);
+		let $U = null;
+		if ($T[0] === 0) {
+			const draining = $T[1];
+			$U = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
 				if (subscriber[2].v) {
 					subscriber[1]();
 				}
 			}
-			$S = undefined;
+			$U = undefined;
 		}
-		$Q = $S;
+		$S = $U;
 	}
-	return $Q;
+	return $S;
 }
-function $N(self, value, $i) {
+function $P(self, value, $i) {
 	self[0].v = __clone(value);
-	$O(self, $i);
+	$Q(self, $i);
 }
-function $T(self, transform, $U) {
-	$N(self, transform($f(self)), $U);
+function $V(self, transform, $W) {
+	$P(self, transform($f(self)), $W);
 }
 const minting_derivation = __shared_new(false);
 const next_subscriber_id = __shared_new(0);
@@ -337,15 +343,15 @@ const count = $a(0);
 const doubled = $c(count, (n) => {
 	return n * 2;
 }, [ 1 ], [ 1 ]);
-$B(owner, $M(doubled, (n) => {
+$D(owner, $O(doubled, (n) => {
 	return console.log(n);
 }), [ 1 ]);
-$N(count, 1, [ 1 ]);
-$T(count, (n) => {
+$P(count, 1, [ 1 ]);
+$V(count, (n) => {
 	return n + 4;
 }, [ 1 ]);
 console.log($f(doubled));
-$B(owner, $M(count, (n) => {
+$D(owner, $O(count, (n) => {
 	return console.log(n);
 }), [ 1 ]);
-$N(count, 20, [ 1 ]);
+$P(count, 20, [ 1 ]);

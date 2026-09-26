@@ -1,10 +1,12 @@
-//! I5 S1: `usize`, the index type (`proposal/index-type.md`).
+//! I5: `usize`, the index type (`proposal/index-type.md`).
 //!
 //! A DISTINCT numeric type — `u53` on the JS targets, the platform word
 //! natively — with the whole sized family's surface (§2.3), a `42usize`
 //! suffix (§11 Q5), the JS range guarantee on every backend (§11 Q3), a `Wire`
-//! impl at `i32`'s width (§6), and the subscript admitting it beside `i32`
-//! until S2 moves std's signatures. No std signature moves in S1.
+//! impl at `i32`'s width (§6). S1 built the type; S2 moved std's positions,
+//! lengths and counts to it and made it the subscript's one index type; the
+//! naming diagnostic (§8.2) and I6's saturating conversions are pinned here
+//! too.
 //!
 //! One subject module of the `inference` test binary; the harness it is
 //! written against lives in `support.rs`.
@@ -25,8 +27,8 @@ fn usize_is_a_distinct_type_not_an_alias_of_u53() {
             "\tprint(i\"{id}\");\n",
             "}\n",
         ),
-        "Expected u53, but got usize instead. There are no implicit numeric conversions; \
-         convert with `.as_u53()`",
+        "Expected u53, but got usize (an index: a position, a length or a count) instead. \
+         There are no implicit numeric conversions; convert with `.as_u53()`",
     );
 }
 
@@ -35,13 +37,13 @@ fn an_i32_does_not_flow_into_a_usize() {
     assert_fails_with(
         concat!(
             "fun main() {\n",
-            "\tlet xs = [1, 2];\n",
-            "\tlet n: usize = xs.len();\n",
+            "\tlet count: i32 = 2;\n",
+            "\tlet n: usize = count;\n",
             "\tprint(i\"{n}\");\n",
             "}\n",
         ),
-        "Expected usize, but got i32 instead. There are no implicit numeric conversions; \
-         convert with `.as_usize()`",
+        "Expected usize (an index: a position, a length or a count), but got i32 instead. \
+         There are no implicit numeric conversions; convert with `.as_usize()`",
     );
 }
 
@@ -469,28 +471,14 @@ fn a_usize_rides_the_wire_at_i32s_width_on_both_codecs() {
         concat!(
             "import std::binary::{ encode_binary, decode_binary };\n",
             "import std::json::{ encode_json, decode_json };\n",
-            "import std::bytes::Bytes;\n",
-            "\n",
-            "fun hex_of(bytes: Bytes): str {\n",
-            "\tlet digits = \"0123456789abcdef\";\n",
-            "\tmut out = \"\";\n",
-            "\tmut index = 0;\n",
-            "\tfor index < bytes.len() {\n",
-            "\t\tlet byte = bytes.get(index);\n",
-            "\t\tout = out + digits.substring(byte / 16, byte / 16 + 1);\n",
-            "\t\tout = out + digits.substring(byte % 16, byte % 16 + 1);\n",
-            "\t\tindex = index + 1;\n",
-            "\t}\n",
-            "\tout\n",
-            "}\n",
             "\n",
             "fun main() {\n",
             "\tlet positions: List<usize> = [0usize, 3usize, 2147483647usize];\n",
             "\tlet control: List<i32> = [0, 3, 2147483647];\n",
             "\tlet wide: List<u53> = [0u53, 3u53, 2147483647u53];\n",
-            "\tlet binary = hex_of(encode_binary(positions));\n",
-            "\tprint(binary == hex_of(encode_binary(control)));\n",
-            "\tprint(binary == hex_of(encode_binary(wide)));\n",
+            "\tlet binary = encode_binary(positions).to_hex();\n",
+            "\tprint(binary == encode_binary(control).to_hex());\n",
+            "\tprint(binary == encode_binary(wide).to_hex());\n",
             "\tprint(binary);\n",
             "\tlet text = encode_json(positions);\n",
             "\tprint(text == encode_json(control));\n",
@@ -532,12 +520,12 @@ fn a_derived_wire_struct_carries_a_usize_field() {
     );
 }
 
-// --- the subscript (B386's check, S1's admission) ----------------------------------
+// --- the subscript (B386's check; `usize` since S2) --------------------------------
 
 #[test]
 fn a_usize_index_reads_a_list_an_array_and_a_write() {
-    // S1 admits `usize` BESIDE `i32` at the subscript; S2 deletes the `i32`
-    // half when std's signatures move.
+    // S1 admitted `usize` BESIDE `i32` at the subscript; S2 made it the one
+    // index type, the one `xs.get(i)` takes.
     assert_compiles_and_runs(
         concat!(
             "fun main() {\n",
@@ -557,7 +545,8 @@ fn a_usize_index_reads_a_list_an_array_and_a_write() {
 
 #[test]
 fn a_u53_index_is_still_refused() {
-    // The admission is exactly two types, not "any unsigned integer".
+    // The index type is `usize`, not "any unsigned integer" — and a numeric
+    // index of another width is told the conversion.
     assert_fails_with(
         concat!(
             "fun main() {\n",
@@ -566,26 +555,68 @@ fn a_u53_index_is_still_refused() {
             "\tprint(xs[at]);\n",
             "}\n",
         ),
-        "an index must be an `i32`, and this one is `u53`",
+        "an index must be a `usize`, and this one is `u53`: a list and an array are \
+         POSITIONAL, so `xs[i]` takes the index `xs.get(i)` takes — anything else names no \
+         element, and the emitted subscript read `undefined` back instead of failing. There are \
+         no implicit numeric conversions; convert with `.as_usize()`",
+    );
+}
+
+#[test]
+fn an_i32_index_is_refused_since_s2_with_the_conversion() {
+    // S2 deleted S1's two-type admission: an `i32` is a value, not an index.
+    assert_fails_with(
+        concat!(
+            "fun main() {\n",
+            "\tlet xs: List<str> = [\"a\", \"b\"];\n",
+            "\tlet at: i32 = 1;\n",
+            "\tprint(xs[at]);\n",
+            "}\n",
+        ),
+        "an index must be a `usize`, and this one is `i32`",
+    );
+    assert_fails_with(
+        concat!(
+            "fun main() {\n",
+            "\tmut xs: List<str> = [\"a\", \"b\"];\n",
+            "\tlet at: i32 = 1;\n",
+            "\txs[at] = \"z\";\n",
+            "}\n",
+        ),
+        "convert with `.as_usize()`",
     );
 }
 
 #[test]
 fn a_usize_index_emits_the_same_subscript_as_an_i32_one() {
-    // §5.4: the JS emission does not change — a number is a number.
+    // §5.4: the JS emission does not change — a number is a number. Since S2
+    // an `i32` cannot index, so the i32 twin walks its list by `get` over a
+    // counter it converts, and the two loops' arithmetic, comparison and
+    // subscript text are compared where they are the same program: a counter
+    // that is a `usize` and one that is an `i32` emit identically.
     let with_usize = compile(concat!(
         "fun main() {\n",
         "\tlet xs: List<str> = [\"a\", \"b\"];\n",
-        "\tlet at: usize = 1;\n",
-        "\tprint(xs[at]);\n",
+        "\tmut at: usize = 0;\n",
+        "\tfor at < 2 {\n",
+        "\t\tprint(i\"{at}\");\n",
+        "\t\tat = at + 1;\n",
+        "\t}\n",
+        "\tlet last: usize = 1;\n",
+        "\tprint(xs[last]);\n",
         "}\n",
     ))
     .expect("the usize program compiles");
     let with_i32 = compile(concat!(
         "fun main() {\n",
         "\tlet xs: List<str> = [\"a\", \"b\"];\n",
-        "\tlet at: i32 = 1;\n",
-        "\tprint(xs[at]);\n",
+        "\tmut at: i32 = 0;\n",
+        "\tfor at < 2 {\n",
+        "\t\tprint(i\"{at}\");\n",
+        "\t\tat = at + 1;\n",
+        "\t}\n",
+        "\tlet last: usize = 1;\n",
+        "\tprint(xs[last]);\n",
         "}\n",
     ))
     .expect("the i32 program compiles");
@@ -609,5 +640,223 @@ fn a_usize_subtracted_past_zero_goes_negative_on_js() {
             "}\n",
         ),
         "-1\n",
+    );
+}
+
+// --- a negative converted to an unsigned width (I6, RULED) --------------------------
+//
+// `as_u53()` and `as_usize()` of a negative SATURATE to 0 on every backend
+// (the owner's ruling, 2026-09-25): a conversion is an explicit call and has
+// one defined answer. Natively that is Rust's own `f64 as u64`/`as usize`;
+// on JS the conversion used to truncate and keep the sign (`-5`), so the JS
+// half is the clamp these pins hold. One pin per SOURCE width that can be
+// negative; the unsigned sources never are. The narrow unsigned targets
+// (`as_u8`/`as_u16`/`as_u32`) FOLD, identically on both backends, and are
+// not this ruling's.
+
+#[test]
+fn a_negative_i8_saturates_to_zero_at_u53_and_usize() {
+    assert_compiles_and_runs(
+        "fun main() { let v = -5i8; print(i\"{v.as_u53()} {v.as_usize()}\"); }",
+        "0 0\n",
+    );
+}
+
+#[test]
+fn a_negative_i16_saturates_to_zero_at_u53_and_usize() {
+    assert_compiles_and_runs(
+        "fun main() { let v = -300i16; print(i\"{v.as_u53()} {v.as_usize()}\"); }",
+        "0 0\n",
+    );
+}
+
+#[test]
+fn a_negative_i32_saturates_to_zero_at_u53_and_usize() {
+    assert_compiles_and_runs(
+        "fun main() { let v = -1; print(i\"{v.as_u53()} {v.as_usize()}\"); }",
+        "0 0\n",
+    );
+}
+
+#[test]
+fn a_negative_i53_saturates_to_zero_at_u53_and_usize() {
+    assert_compiles_and_runs(
+        "fun main() { let v = -9007199254740000i53; print(i\"{v.as_u53()} {v.as_usize()}\"); }",
+        "0 0\n",
+    );
+}
+
+#[test]
+fn a_negative_f32_saturates_to_zero_at_u53_and_usize() {
+    // `-0.5` truncates to `-0` first, and the clamp answers a plain `0`
+    // rather than the `-0` node would print.
+    assert_compiles_and_runs(
+        concat!(
+            "fun main() {\n",
+            "\tlet v = -2.5f32;\n",
+            "\tlet w = -0.5f32;\n",
+            "\tprint(i\"{v.as_u53()} {v.as_usize()} {w.as_u53()} {w.as_usize()}\");\n",
+            "}\n",
+        ),
+        "0 0 0 0\n",
+    );
+}
+
+#[test]
+fn a_negative_f64_saturates_to_zero_at_u53_and_usize() {
+    assert_compiles_and_runs(
+        concat!(
+            "fun main() {\n",
+            "\tlet v = -7.9f;\n",
+            "\tlet w = -0.5f;\n",
+            "\tprint(i\"{v.as_u53()} {v.as_usize()} {w.as_u53()} {w.as_usize()}\");\n",
+            "}\n",
+        ),
+        "0 0 0 0\n",
+    );
+}
+
+#[test]
+fn a_negative_bigint_saturates_to_zero_at_u53_and_usize() {
+    assert_compiles_and_runs(
+        "fun main() { let v = -3n; print(i\"{v.as_u53()} {v.as_usize()}\"); }",
+        "0 0\n",
+    );
+}
+
+#[test]
+fn a_non_negative_value_converts_unchanged_at_u53_and_usize() {
+    // The clamp's other side: zero and a positive truncate as before.
+    assert_compiles_and_runs(
+        concat!(
+            "fun main() {\n",
+            "\tlet zero = 0;\n",
+            "\tlet v = 7.9f;\n",
+            "\tlet big = 9007199254740000i53;\n",
+            "\tprint(i\"{zero.as_u53()} {zero.as_usize()} {v.as_u53()} {v.as_usize()}\");\n",
+            "\tprint(i\"{big.as_u53()} {big.as_usize()}\");\n",
+            "}\n",
+        ),
+        "0 0 7 7\n9007199254740000 9007199254740000\n",
+    );
+}
+
+// --- the naming diagnostic (§8.2) -------------------------------------------------
+//
+// A mismatch with `usize` on either side NAMES it as an index, so a reader
+// migrating to S2's signatures learns what changed, not only that two widths
+// differ; the tail is still E218's steer, which the quick fix and
+// `vilan check --fix` read the conversion off. A mismatch between two
+// non-index widths keeps E218's plain sentence (`inference::bounds` pins it).
+
+#[test]
+fn a_value_meeting_a_usize_is_told_it_is_an_index() {
+    assert_fails_with(
+        concat!(
+            "fun main() {\n",
+            "\tlet width: i32 = 3;\n",
+            "\tlet at: usize = width;\n",
+            "\tprint(i\"{at}\");\n",
+            "}\n",
+        ),
+        "Expected usize (an index: a position, a length or a count), but got i32 instead. \
+         There are no implicit numeric conversions; convert with `.as_usize()`",
+    );
+}
+
+#[test]
+fn a_usize_meeting_a_value_is_told_it_is_an_index() {
+    assert_fails_with(
+        concat!(
+            "fun main() {\n",
+            "\tlet at: usize = 3;\n",
+            "\tlet width: i32 = at;\n",
+            "\tprint(i\"{width}\");\n",
+            "}\n",
+        ),
+        "Expected i32, but got usize (an index: a position, a length or a count) instead. \
+         There are no implicit numeric conversions; convert with `.as_i32()`",
+    );
+}
+
+#[test]
+fn a_usize_meeting_a_float_is_told_it_is_an_index() {
+    assert_fails_with(
+        concat!(
+            "fun main() {\n",
+            "\tlet at: usize = 3;\n",
+            "\tlet scale: f64 = at;\n",
+            "\tprint(i\"{scale}\");\n",
+            "}\n",
+        ),
+        "Expected f64, but got usize (an index: a position, a length or a count) instead. \
+         There are no implicit numeric conversions; convert with `.as_f64()`",
+    );
+}
+
+#[test]
+fn an_index_argument_notes_the_parameter_declaration() {
+    // §8.2: the note anchors on the parameter's declaration, as B72's does.
+    assert_fails_noting(
+        concat!(
+            "fun pick(xs: List<str>, at: usize): str {\n",
+            "\txs[at]\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet which: i32 = 1;\n",
+            "\tprint(pick([\"a\", \"b\"], which));\n",
+            "}\n",
+        ),
+        "Expected usize (an index: a position, a length or a count), but got i32 instead.",
+        "at",
+        "'at' is declared `usize` here",
+    );
+}
+
+#[test]
+fn a_usize_argument_to_a_value_parameter_notes_the_declaration() {
+    assert_fails_noting(
+        concat!(
+            "fun double(value: i32): i32 {\n",
+            "\tvalue * 2\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet at: usize = 2;\n",
+            "\tprint(i\"{double(at)}\");\n",
+            "}\n",
+        ),
+        "Expected i32, but got usize (an index: a position, a length or a count) instead.",
+        "value",
+        "'value' is declared `i32` here",
+    );
+}
+
+#[test]
+fn a_non_index_numeric_argument_keeps_the_plain_steer_and_no_note() {
+    // The control: two widths neither of which is an index.
+    assert_fails_with(
+        concat!(
+            "fun widen(value: u53): u53 {\n",
+            "\tvalue\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet small: i32 = 2;\n",
+            "\tprint(i\"{widen(small)}\");\n",
+            "}\n",
+        ),
+        "Expected u53, but got i32 instead. There are no implicit numeric conversions; \
+         convert with `.as_u53()`",
+    );
+    assert_fails_without(
+        concat!(
+            "fun widen(value: u53): u53 {\n",
+            "\tvalue\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet small: i32 = 2;\n",
+            "\tprint(i\"{widen(small)}\");\n",
+            "}\n",
+        ),
+        "an index",
     );
 }

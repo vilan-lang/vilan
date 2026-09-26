@@ -24,18 +24,18 @@ function hash(self) {
 function show(plan) {
 	let out = "";
 	for (const step of plan[0]) {
-		const $g = step;
-		let $h = null;
-		if ($g[0] === 0) {
-			const index = $g[1];
-			$h = "K" + index + " ";
-		} else if ($g[0] === 1) {
-			const index2 = $g[1];
-			$h = "R" + index2 + " ";
+		const $j = step;
+		let $k = null;
+		if ($j[0] === 0) {
+			const index = $j[1];
+			$k = "K" + index + " ";
+		} else if ($j[0] === 1) {
+			const index2 = $j[1];
+			$k = "R" + index2 + " ";
 		} else {
-			$h = "F ";
+			$k = "F ";
 		}
-		const rendered = $h;
+		const rendered = $k;
 		out = out + rendered;
 	}
 	out = out + "| removed:";
@@ -53,62 +53,77 @@ function $a(old_keys, old_items, items, key_of, same) {
 	let first = new Map();
 	let next_same = [  ];
 	for (const _ of old_keys) {
-		next_same.push(-(1));
+		next_same.push([ 1 ]);
 	}
-	let build = held - 1;
-	while (build >= 0) {
-		const canonical = hash(__at(old_keys, build));
-		const $b = __map_get(first, canonical);
-		let $c = null;
-		if ($b[0] === 0) {
-			const after = $b[1];
-			$c = __at_put(next_same, build, after);
-		} else {
-			$c = undefined;
-		}
-		$c;
-		first.set(canonical, build);
+	let build = held;
+	while (build > 0) {
 		build = build - 1;
+		const canonical = hash(__at(old_keys, build));
+		__at_put(next_same, build, __map_get(first, canonical));
+		first.set(canonical, build);
 	}
 	let steps = [  ];
 	for (const item of items) {
 		const item_key = key_of(item);
 		const canonical2 = hash(item_key);
-		const $d = __map_get(first, canonical2);
+		let head = __map_get(first, canonical2);
+		let advancing = true;
+		while (advancing) {
+			const $b = head;
+			let $c = null;
+			if ($b[0] === 0) {
+				const at = $b[1];
+				if (__at(claimed, at)) {
+					head = __at(next_same, at);
+				} else {
+					advancing = false;
+				}
+				$c = undefined;
+			} else {
+				$c = advancing = false;
+			}
+			$c;
+		}
+		const $d = head;
 		let $e = null;
 		if ($d[0] === 0) {
-			const at = $d[1];
-			$e = at;
+			const at2 = $d[1];
+			$e = first.set(canonical2, at2);
 		} else {
-			$e = -(1);
+			$e = first.delete(canonical2);
 		}
-		let head = $e;
-		while (head >= 0) {
-			if (!(__at(claimed, head))) {
-				break;
-			}
-			head = __at(next_same, head);
-		}
-		first.set(canonical2, head);
-		let found = -(1);
+		$e;
+		let found = [ 1 ];
 		let walk = head;
-		while (walk >= 0) {
-			if (!(__at(claimed, walk)) && __at(old_keys, walk) === item_key) {
-				found = walk;
-				break;
+		let walking = true;
+		while (walking) {
+			const $f = walk;
+			let $g = null;
+			if ($f[0] === 0) {
+				const at3 = $f[1];
+				if (!(__at(claimed, at3)) && __at(old_keys, at3) === item_key) {
+					found = [ 0, at3 ];
+					walking = false;
+				} else {
+					walk = __at(next_same, at3);
+				}
+				$g = undefined;
+			} else {
+				$g = walking = false;
 			}
-			walk = __at(next_same, walk);
+			$g;
 		}
 		let step = [ 2 ];
-		if (found >= 0) {
-			__at_put(claimed, found, true);
-			let $f = null;
-			if (same(__at(old_items, found), item)) {
-				$f = [ 0, found ];
+		const $h = found;
+		if ($h[0] === 0) {
+			__at_put(claimed, $h[1], true);
+			let $i = null;
+			if (same(__at(old_items, $h[1]), item)) {
+				$i = [ 0, $h[1] ];
 			} else {
-				$f = [ 1, found ];
+				$i = [ 1, $h[1] ];
 			}
-			step = $f;
+			step = $i;
 		}
 		steps.push(step);
 	}

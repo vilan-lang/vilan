@@ -1391,7 +1391,7 @@ fn a_mixed_literal_under_a_list_of_any_parameter_is_legitimate() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        fun describe(values: List<any>): i32 {
+        fun describe(values: List<any>): usize {
             values.len()
         }
         fun main() {
@@ -4336,7 +4336,7 @@ fn adaptation_rides_through_a_forwarding_helper() {
         r#"
         import std::io::print;
         import std::time::sleep;
-        fun helper(urls: List<str>, f: |str| i32): List<i32> {
+        fun helper(urls: List<str>, f: |str| usize): List<usize> {
             urls.map(f)
         }
         fun main() {

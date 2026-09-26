@@ -11,7 +11,7 @@ struct Frame {
 }
 
 fun poke(target: Bytes, index: i32, value: i32) {
-	target.set(index, value);
+	target.set(index.as_usize(), value);
 }
 
 fun main() {
@@ -33,10 +33,12 @@ fun main() {
 	filled.set(2, 0);
 	print(i"{a.to_hex()} {filled.to_hex()}");
 
-	// `copy_into` writes in place; reads see it through the alias, and a
-	// negative index counts from the end.
+	// `copy_into` writes in place; reads see it through the alias, the last
+	// byte included. (An index is a `usize` since I5 S2, so the host's
+	// count-from-the-end `get(-1)` has no spelling; the last byte is asked for
+	// by its position.)
 	a.copy_into(c, 2);
-	print(i"{b.to_hex()} {b.get(3)} {b.get(-1)}");
+	print(i"{b.to_hex()} {b.get(3)} {b.get(b.len() - 1)}");
 
 	// `concat` is a new buffer.
 	let joined = Bytes::concat(a, c);
@@ -53,7 +55,7 @@ fun main() {
 	// A list of holders, and a closure that writes through its capture.
 	let shared = Bytes::alloc(3);
 	let holders = [shared, shared.slice(0, 3), shared];
-	let write = |index: i32| shared.set_u32(index, 0x1FF);
+	let write = |index: i32| shared.set_u32(index.as_usize(), 0x1FF);
 	write(1);
 	for holder in holders {
 		print(holder.to_hex());

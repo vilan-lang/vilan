@@ -486,7 +486,7 @@ struct JsonReader {
 	/// papers-39). `begin_list` records one; `end_list` checks it, so a document
 	/// whose list is LONGER than what the caller read is a decode failure rather
 	/// than an element left lying on the stack for whatever reads next to take.
-	list_marks: List<i32>,
+	list_marks: List<usize>,
 }
 
 impl JsonReader {
@@ -663,12 +663,13 @@ export impl JsonReader with Deserialize {
 			// Where the stack stands once every element has been read: what
 			// `end_list` holds the caller to.
 			self.list_marks.push(self.stack.len());
-			mut index = elements.len() - 1;
-			for index >= 0 {
-				self.stack.push(elements[index]);
+			mut index = elements.len();
+			for index > 0 {
 				index -= 1;
+				self.stack.push(elements[index]);
 			}
-			elements.len()
+			// WIRE: `begin_list` answers the codec's `i32` length (§2.2).
+			elements.len().as_i32()
 		} else {
 			0
 		}
@@ -712,10 +713,10 @@ export impl JsonReader with Deserialize {
 					self.stack.push(payload);
 				} else {
 					let elements = payload.elements();
-					mut index = elements.len() - 1;
-					for index >= 0 {
-						self.stack.push(elements[index]);
+					mut index = elements.len();
+					for index > 0 {
 						index -= 1;
+						self.stack.push(elements[index]);
 					}
 				}
 			} else {

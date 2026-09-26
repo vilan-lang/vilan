@@ -109,8 +109,8 @@ impl List<type T: PartialEq> {
 	}
 
 	/// The index of the FIRST element equal to `value` — `None` when there is none.
-	fun index_of(self, value: T): Option<i32> {
-		mut index = 0;
+	fun index_of(self, value: T): Option<usize> {
+		mut index: usize = 0;
 		for item in self {
 			if item.eq(value) {
 				ret Some(index);

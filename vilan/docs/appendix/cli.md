@@ -203,6 +203,21 @@ artifacts; a check has neither, and creating one would make a read-only
 command mutate the tree it was pointed at. `vilan cache prune` sweeps the
 check tables beside the std trees.
 
+**`--fix`** is the one exception to "writes nothing", and it is asked for
+by name. Before checking, it applies the fix every **numeric mismatch**
+carries — the `.as_*()` conversion the message names, or `: usize` on a
+counter bound by a bare literal — to the package's own files (never to
+std or a dependency), analyzes again, and repeats until a round finds
+nothing more to fix; then it checks as usual and reports what is left.
+It prints one line first, `fixed 12 numeric mismatches in 3 files`. The
+edits are the editor's quick fixes (**Convert with `.as_usize()`**,
+**Declare `at` a `usize`**), computed by the same function, so the two
+never disagree. It is the migration tool for the release that moved
+std's positions, lengths and counts to [`usize`](../std/numbers.md): what
+it cannot decide — a `-1` "not found", a `for i >= 0` loop, signed
+arithmetic that should convert once at its end — stays a diagnostic, for
+a person. It cannot be combined with `--watch`.
+
 One thing it does that `build` does not: when the file has a **syntax
 error**, `check` reports it and then type-checks the rest of the file
 anyway. The parser recovers at the next statement or item boundary, so a

@@ -33,45 +33,55 @@ function hash(self) {
 	return __hash(self);
 }
 function from_json(text) {
-	const $l = __try_parse_json(text);
-	let $m = null;
-	if ($l[0] === 0) {
-		const value = $l[1];
-		$m = from_json_value(value);
-	} else {
-		$m = [ 1, "not valid JSON" ];
-	}
-	return $m;
-}
-function from_json_value(value) {
+	const $m = __try_parse_json(text);
 	let $n = null;
-	if (__json_kind(value) === "number") {
-		$n = [ 0, Number(value) ];
+	if ($m[0] === 0) {
+		const value = $m[1];
+		$n = from_json_value(value);
 	} else {
-		$n = [ 1, "expected a number" ];
+		$n = [ 1, "not valid JSON" ];
 	}
 	return $n;
+}
+function from_json_value(value) {
+	let $o = null;
+	if (__json_kind(value) === "number") {
+		$o = [ 0, Number(value) ];
+	} else {
+		$o = [ 1, "expected a number" ];
+	}
+	return $o;
 }
 function fold_unsigned(value, modulus) {
 	const truncated = Math.trunc(value);
 	const wrapped = truncated % modulus;
-	let $i = null;
+	let $j = null;
 	if (wrapped < 0) {
-		$i = wrapped + modulus;
+		$j = wrapped + modulus;
 	} else {
-		$i = wrapped;
+		$j = wrapped;
+	}
+	return $j;
+}
+function saturate_unsigned(value) {
+	const truncated = Math.trunc(value);
+	let $i = null;
+	if (truncated > 0) {
+		$i = truncated;
+	} else {
+		$i = 0;
 	}
 	return $i;
 }
 function fold_signed(value, modulus, half) {
 	const wrapped = fold_unsigned(value, modulus);
-	let $j = null;
+	let $k = null;
 	if (wrapped >= half) {
-		$j = wrapped - modulus;
+		$k = wrapped - modulus;
 	} else {
-		$j = wrapped;
+		$k = wrapped;
 	}
-	return $j;
+	return $k;
 }
 function as_usize(self) {
 	const widened = Number(self);
@@ -79,7 +89,7 @@ function as_usize(self) {
 }
 function as_usize2(self) {
 	const widened = Number(self);
-	return Number(Math.trunc(widened));
+	return Number(saturate_unsigned(widened));
 }
 function max_value() {
 	return 9007199254740992;
@@ -118,7 +128,7 @@ function as_i32(self) {
 }
 function as_usize3(self) {
 	const widened = self;
-	return Number(Math.trunc(widened));
+	return Number(saturate_unsigned(widened));
 }
 function div(self, b) {
 	return Math.trunc(self / b);
@@ -141,28 +151,28 @@ function $f(self, fallback) {
 	}
 	return $h;
 }
-function $k(value) {
+function $l(value) {
 	return to_string(value);
 }
-function $q() {
+function $r() {
 	const table = new Map();
 	return [ table ];
 }
-function $r(self, key, value) {
+function $s(self, key, value) {
 	self[0].set(hash(key), [ __clone(key), __clone(value) ]);
 }
-function $s(self, key) {
-	const $t = __map_get(self[0], hash(key));
-	let $u = null;
-	if ($t[0] === 0) {
-		const entry = $t[1];
-		$u = [ 0, __clone(entry[1]) ];
+function $t(self, key) {
+	const $u = __map_get(self[0], hash(key));
+	let $v = null;
+	if ($u[0] === 0) {
+		const entry = $u[1];
+		$v = [ 0, __clone(entry[1]) ];
 	} else {
-		$u = [ 1 ];
+		$v = [ 1 ];
 	}
-	return $u;
+	return $v;
 }
-function $y(self) {
+function $z(self) {
 	let result = "[";
 	let first = true;
 	for (const element of self) {
@@ -174,32 +184,32 @@ function $y(self) {
 	}
 	return result + "]";
 }
-function $C(value) {
-	let $D = null;
+function $D(value) {
+	let $E = null;
 	if (__json_kind(value) !== "array") {
 		return [ 1, "expected an array" ];
 	}
-	$D;
+	$E;
 	let result = [  ];
 	for (const element of value) {
-		const $E = from_json_value(element);
-		if ($E[0] === 1) {
-			return $E;
+		const $F = from_json_value(element);
+		if ($F[0] === 1) {
+			return $F;
 		}
-		result.push($E[1]);
+		result.push($F[1]);
 	}
 	return [ 0, result ];
 }
-function $z(text) {
-	const $A = __try_parse_json(text);
-	let $B = null;
-	if ($A[0] === 0) {
-		const value = $A[1];
-		$B = $C(value);
+function $A(text) {
+	const $B = __try_parse_json(text);
+	let $C = null;
+	if ($B[0] === 0) {
+		const value = $B[1];
+		$C = $D(value);
 	} else {
-		$B = [ 1, "not valid JSON" ];
+		$C = [ 1, "not valid JSON" ];
 	}
-	return $B;
+	return $C;
 }
 const count = 42;
 const step = 5;
@@ -229,33 +239,33 @@ console.log("" + from_i32 + " " + from_f64 + " " + from_u8 + " " + to_i32 + " " 
 const letters = [ "a", "b", "c", "d" ];
 const at = 2;
 console.log(__at(letters, at));
-console.log($k(count));
+console.log($l(count));
 console.log(JSON.stringify(count));
 console.log(JSON.stringify(count));
-const $o = from_json("17");
-let $p = null;
-if ($o[0] === 0) {
-	const parsed = $o[1];
-	$p = console.log("" + parsed);
+const $p = from_json("17");
+let $q = null;
+if ($p[0] === 0) {
+	const parsed = $p[1];
+	$q = console.log("" + parsed);
 } else {
-	const reason = $o[1];
-	$p = console.log(reason);
+	const reason = $p[1];
+	$q = console.log(reason);
 }
-$p;
-let rows = $q();
-$r(rows, 3, "three");
-console.log($f($s(rows, 3), "none"));
+$q;
+let rows = $r();
+$s(rows, 3, "three");
+console.log($f($t(rows, 3), "none"));
 const positions = [ 0, 3, 2147483647 ];
-const encoded = $y(positions);
+const encoded = $z(positions);
 console.log(encoded);
-const decoded = $z(encoded);
-const $F = decoded;
-let $G = null;
-if ($F[0] === 0) {
-	const back2 = $F[1];
-	$G = console.log("" + back2.length + " " + __at(back2, 2));
+const decoded = $A(encoded);
+const $G = decoded;
+let $H = null;
+if ($G[0] === 0) {
+	const back2 = $G[1];
+	$H = console.log("" + back2.length + " " + __at(back2, 2));
 } else {
-	const reason2 = $F[1];
-	$G = console.log(reason2);
+	const reason2 = $G[1];
+	$H = console.log(reason2);
 }
-process.exit($G);
+process.exit($H);

@@ -1354,7 +1354,7 @@ export fun encode_request(codec: Codec, method: str, args: List<|Serializer| voi
 	(serializer.field)("method");
 	(serializer.str_value)(method);
 	(serializer.field)("args");
-	(serializer.begin_list)(args.len());
+	(serializer.begin_list)(args.len().as_i32());
 	for describe in args {
 		describe(serializer);
 	}
@@ -1619,7 +1619,7 @@ export fun call<T: Wire, Tx: Transport>(
 /// at the call site — reads are positional and once-each; see `RpcRequest`). A
 /// missing/garbled argument poisons the request's deserializer; check
 /// `decode_failed` before running the impl.
-export fun arg<T: Wire>(request: RpcRequest, index: i32): T {
+export fun arg<T: Wire>(request: RpcRequest, index: usize): T {
 	// The record is a bag of closures over the request's own reader, so the `mut`
 	// copy that `rebuild`'s `&mut D` asks for costs a copy of the bag and pulls
 	// from the same cursor — successive `arg` calls stay positional and once-each
@@ -2971,11 +2971,11 @@ fun keyed_diff<K: Wire + Hashable, T: Wire + PartialEq>(
 	key_of: sync |T| K,
 ): List<Delta<K, T>> {
 	mut previous_at: Map<Hash, i32> = Map::new();
-	mut index = 0;
+	mut index: usize = 0;
 	for element in previous {
 		let key = key_of(element).hash();
 		if !previous_at.contains_key(key) {
-			previous_at.insert(key, index);
+			previous_at.insert(key, index.as_i32());
 		}
 		index += 1;
 	}
@@ -3015,7 +3015,7 @@ fun keyed_diff<K: Wire + Hashable, T: Wire + PartialEq>(
 	for element in current {
 		match previous_at.get(key_of(element).hash()) {
 			None => {},
-			Some(let at) => match previous.get(at) {
+			Some(let at) => match previous.get(at.as_usize()) {
 				None => {},
 				Some(let before) => {
 					if !before.eq(element) {
@@ -3241,7 +3241,7 @@ export impl ReactiveClient {
 		RemoteSource {
 			channel = channel_cell,
 			subscribe = Shared::new(encode_control(self.codec, "Subscribe", channel)),
-			count = Shared::new(0),
+			count = Shared::new(0usize),
 			closing = Shared::new(false),
 			settle_id = fresh_id(),
 			codec = self.codec,
@@ -3283,7 +3283,7 @@ export impl ReactiveClient {
 			transport = self.transport,
 			cache,
 			fault,
-			count = Shared::new(0),
+			count = Shared::new(0usize),
 			closing = Shared::new(false),
 			settle_id = fresh_id(),
 			leases = Shared::new([]),
@@ -3530,7 +3530,7 @@ export struct RemoteSource<T> {
 	// Live demand: how many leases are outstanding. A cell, so every copy of the
 	// handle counts into the same total; a rebind re-subscribes only a mirror that
 	// is actually watched (`count > 0`).
-	count: Shared<i32>,
+	count: Shared<usize>,
 	// A 1→0 that has not yet been flushed as an `Unsubscribe`. Cancelled by a 0→1
 	// in the same turn: the channel never actually closed.
 	closing: Shared<bool>,
@@ -4040,7 +4040,7 @@ export struct KeyedCell<K, T> {
 	elements: SignalCell<List<T>>,
 	/// Where each held key sits in `elements`, by hash. What makes `update(key, …)`
 	/// and `remove(key)` a lookup instead of a scan.
-	positions: Shared<Map<Hash, i32>>,
+	positions: Shared<Map<Hash, usize>>,
 	/// The positional op log — `DeltaLog`'s cursors, trim and lag fallback (A112
 	/// S1), at `delta_log_limit`. `since` translates what it holds into the
 	/// `Delta<K, T>` a forward sends; the `DeltaSource` impl strips the keys back
@@ -4165,7 +4165,7 @@ export impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
 	/// into 1,000 keys — where `.get(at)` on the cell's own storage copies the one
 	/// element it names. `SignalCell::get` IS that storage's read (`value.read()`),
 	/// so nothing about what is read, or when, changes.
-	fun locate(self, key: K): Option<(i32, T)> {
+	fun locate(self, key: K): Option<(usize, T)> {
 		match self.positions.read().get(key.hash()) {
 			None => None,
 			Some(let at) => match self.elements.value.read().get(at) {
@@ -4176,7 +4176,7 @@ export impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
 	}
 
 	/// Re-record the position of every element from `from` onward.
-	fun reindex(self, list: List<T>, from: i32) {
+	fun reindex(self, list: List<T>, from: usize) {
 		mut index = from;
 		let length = list.len();
 		for index < length {
@@ -4400,7 +4400,7 @@ export struct KeyedSource<K, T> {
 	/// consequence rather than a second fact.
 	fault: SignalCell<Option<str>>,
 	/// Whole-collection demand.
-	count: Shared<i32>,
+	count: Shared<usize>,
 	closing: Shared<bool>,
 	settle_id: i32,
 	/// Per-key demand — one entry per key ever leased on this mirror.
@@ -4412,7 +4412,7 @@ export struct KeyedSource<K, T> {
 	/// whose whole point is that a change is O(change). The index is maintained by
 	/// `apply` alone (nothing else writes the cache's contents) and cleared
 	/// wherever the cache is.
-	positions: Shared<Map<Hash, i32>>,
+	positions: Shared<Map<Hash, usize>>,
 	/// The call that minted this mirror (A79), or `None` for the `[expose]`d field
 	/// twin — `RemoteSource.origin`'s field, at the keyed type, meaning exactly
 	/// what it means there: a mirror that can ask for a fresh channel whenever one
@@ -4555,9 +4555,9 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	fun demand(self): i32 {
 		mut total = self.count.read();
 		for lease in self.leases.read() {
-			total = total + lease.count.read();
+			total = total + lease.count.read().as_usize();
 		}
-		total
+		total.as_i32()
 	}
 
 	/// Whether this mirror is pointed at a real channel (`RemoteSource::minted`).
@@ -4849,7 +4849,7 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	}
 
 	/// Where `key` sits in the mirror's list, if at all — the index, in O(1).
-	fun index_of(self, list: List<T>, key: K): Option<i32> {
+	fun index_of(self, list: List<T>, key: K): Option<usize> {
 		match self.positions.read().get(key.hash()) {
 			None => None,
 			Some(let at) => match list.get(at) {
@@ -4862,7 +4862,7 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	/// Re-record the position of every element from `from` onward — what an
 	/// insertion or a removal owes the index, and nothing more: an op at the END of
 	/// the collection (the append a message platform does) costs one entry, not N.
-	fun reindex(self, list: List<T>, from: i32) {
+	fun reindex(self, list: List<T>, from: usize) {
 		mut index = from;
 		let length = list.len();
 		for index < length {

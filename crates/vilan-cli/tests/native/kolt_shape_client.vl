@@ -37,7 +37,7 @@ impl KoltStore {
 		self.messages.update(|&mut store| {
 			store.insert(id, Message { id, author, body });
 		});
-		self.messages.get().len()
+		self.messages.get().len().as_i32()
 	}
 
 	[rpc]

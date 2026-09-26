@@ -64,7 +64,7 @@ fun scan_reconcile<T, K: PartialEq>(
 		}
 		steps.push(step);
 	}
-	mut removed: List<i32> = [];
+	mut removed: List<usize> = [];
 	mut index = 0;
 	for index < old_keys.len() {
 		if !claimed[index] {

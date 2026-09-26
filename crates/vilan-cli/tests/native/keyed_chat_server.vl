@@ -37,7 +37,7 @@ impl Chat {
 		self.messages.update(|&mut store| {
 			store.insert(id, Message { id, channel, body });
 		});
-		self.messages.get().len()
+		self.messages.get().len().as_i32()
 	}
 
 	[rpc]

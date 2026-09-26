@@ -297,7 +297,7 @@ fn a_user_impl_on_list_does_not_report_against_stds_own_list_methods() {
         import std::io::print;
 
         impl List<type T> {
-            fun second_len(self): i32 {
+            fun second_len(self): usize {
                 self.len()
             }
         }
@@ -717,8 +717,6 @@ fn take_of_zero_yields_nothing_and_take_past_the_end_stops_early() {
             fun main() {
                 mut nothing = [1, 2, 3].iter().take(0);
                 print(nothing.next().is_none());
-                mut negative = [1, 2, 3].iter().take(-4);
-                print(negative.next().is_none());
                 mut over = [1, 2].iter().take(9);
                 mut seen = 0;
                 for _value in over {
@@ -728,7 +726,24 @@ fn take_of_zero_yields_nothing_and_take_past_the_end_stops_early() {
             }
             "#,
         ),
-        "true\ntrue\n2\n",
+        "true\n2\n",
+    );
+}
+
+#[test]
+fn take_of_a_negative_count_is_refused() {
+    // A count is a `usize` since I5 S2, so the negative `take` the pin above
+    // used to run (and answer nothing for) has no spelling: B407 refuses it.
+    assert_fails_with(
+        &adapter_program(
+            r#"
+            fun main() {
+                mut negative = [1, 2, 3].iter().take(-4);
+                print(negative.next().is_none());
+            }
+            "#,
+        ),
+        "so the negative literal `-4` is out of range",
     );
 }
 
@@ -1070,7 +1085,7 @@ fn a_protocol_loop_over_a_user_iterator_keeps_its_tuple_element() {
 
         struct Cursor<T> {
             items: List<T>,
-            index: i32,
+            index: usize,
         }
 
         impl Cursor<type T> {
@@ -1166,7 +1181,7 @@ fn a_protocol_loop_keeps_an_enum_subjects_element_type() {
         import std::io::print;
         import std::option::Option::{ self, Some, None };
 
-        enum Feed<T> { Ready(List<T>, i32), Done }
+        enum Feed<T> { Ready(List<T>, usize), Done }
 
         impl Feed<type T> {
             fun next(&mut self): Option<T> {
@@ -1208,7 +1223,7 @@ fn a_mut_view_loop_keeps_its_element_type_through_a_generic() {
         import std::io::print;
         import std::option::Option::{ self, Some, None };
 
-        struct Bag<T> { items: List<T>, cursor: i32 }
+        struct Bag<T> { items: List<T>, cursor: usize }
 
         impl Bag<type T> {
             fun next_mut(&mut self): Option<&mut T> {
@@ -1678,7 +1693,7 @@ fn an_inherited_default_on_a_generic_subject_keeps_its_element_type() {
             fun next(&mut self): Option<T> { self.take() }
         }
 
-        struct Bag<T> { items: List<T>, cursor: i32 }
+        struct Bag<T> { items: List<T>, cursor: usize }
         impl Bag<type T> with Feed<T> {
             fun take(&mut self): Option<T> {
                 if self.cursor < self.items.len() {
@@ -1716,7 +1731,7 @@ fn a_next_mut_inherited_from_a_trait_default_drives_a_mut_loop() {
             fun next_mut(&mut self): Option<&mut T> { self.step() }
         }
 
-        struct Bag2 { items: List<i32>, cursor: i32 }
+        struct Bag2 { items: List<i32>, cursor: usize }
         impl Bag2 with Walk<i32> {
             fun step(&mut self): Option<&mut i32> {
                 if self.cursor < self.items.len() {
@@ -2989,15 +3004,15 @@ fn to_map_builds_a_map_out_of_pairs_and_the_last_key_wins() {
         fun main() {
             let lengths = ["aa", "b"].iter().map(|word| (word, word.len())).to_list().to_map();
             print(lengths.len());
-            print(lengths.get("aa").unwrap_or(-1));
-            print(lengths.get("zz").unwrap_or(-1));
+            print(lengths.get("aa").unwrap_or(0));
+            print(lengths.get("zz").is_none());
             let repeated = [(1, "first"), (1, "second")].to_map();
             print(repeated.get(1).unwrap_or("miss"));
             let empty: List<(i32, str)> = [];
             print(empty.to_map().len());
         }
         "#,
-        "2\n2\n-1\nsecond\n0\n",
+        "2\n2\ntrue\nsecond\n0\n",
     );
 }
 
@@ -3128,7 +3143,7 @@ fn a_dispatched_call_is_not_colored_by_a_same_named_async_static() {
         struct Gate {}
 
         impl Gate {
-            async fun scan(items: List<i32>): i32 {
+            async fun scan(items: List<i32>): usize {
                 items.len()
             }
         }

@@ -166,9 +166,12 @@ false.
 
 **Converting** goes through the family's `as_*` methods in both directions:
 every numeric type has `as_usize()`, and `usize` has `as_i8()` … `as_f64()`.
-A mismatch names the conversion it wants (``Expected usize, but got i32
+A mismatch names the conversion it wants, and names an index as one
+(``Expected usize (an index: a position, a length or a count), but got i32
 instead. There are no implicit numeric conversions; convert with
-`.as_usize()` ``), and the editor offers to write it.
+`.as_usize()` ``); the editor offers to write it, or to declare a
+literal-bound counter `usize` instead, and `vilan check --fix` writes
+every one of them in a package (see the [CLI](../appendix/cli.md)).
 
 **On the wire** a `usize` travels at `i32`'s width, not `u53`'s — a length
 or a position that crosses rpc keeps the width it has always had, so frames
@@ -182,9 +185,18 @@ duration or a port. A file offset is not an index either: it is a position
 in a stream that is not in memory, its range is the filesystem's, and
 `std::fs` keeps it `i53`.
 
-Today `xs[i]` accepts an index of either `i32` or `usize`, and std's own
-signatures (`len()`, `get(i)`, `index_of`) still speak `i32`; the release
-that moves them to `usize` is the migration the tracker calls I5 S2.
+**std speaks it everywhere.** Every length, count and position in std is a
+`usize`: `len()` on a list, a string, a map, a set and `Bytes`; the index
+`get(i)`, `insert(i, ..)`, `remove(i)`, `substring(from, to)` and
+`code_at(i)` take; `index_of`'s answer; `take(n)`/`skip(n)`/`repeat(n)`;
+`enumerate()`'s counter (`(usize, T)`); and `xs[i]`, whose index is a
+`usize` and nothing else. The values beside them keep their own types — a
+byte `Bytes::get` answers is still an `i32`, an id is still an id. A program
+written against the `i32` spellings migrates with `vilan check --fix` (see
+the [CLI](../appendix/cli.md)); what it cannot decide is a `-1` "not found"
+(an `Option<usize>` or a real fallback), a `for i >= 0` loop (count down
+from `len` with `for i > 0 { i -= 1; … }`), and signed arithmetic that
+should stay signed and convert once.
 
 `clamp` confines a value to a range. The integers inherit it from `Ord`; the
 floats are deliberately *not* `Ord` (NaN has no place in a total order), so
@@ -212,6 +224,18 @@ fun main() {
 	let wide = 9007199254740992i53;
 	print(wide.as_i32());
 	print((255u8).as_f64() / 2.0);
+}
+```
+
+The two unsigned widths that do not fold, `u53` and `usize`, **saturate**
+instead: a negative converts to `0` on every backend, as a native `f64 as
+u64` does, and a positive truncates as usual.
+
+```vilan
+fun main() {
+	print((-5).as_usize());   // 0 — saturated, not folded
+	print((-2.5).as_u53());   // 0
+	print((7.9).as_usize());  // 7
 }
 ```
 

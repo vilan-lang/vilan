@@ -2248,7 +2248,7 @@ fn b184_a_written_generic_beside_a_trait_typed_field_still_works_as_dyn() {
     assert_compiles_and_runs(
         &format!(
             r#"{HELD}
-            fun count<T>(held: Held<T>): i32 {{ held.list.get().len() }}
+            fun count<T>(held: Held<T>): usize {{ held.list.get().len() }}
             fun first<T>(held: Held<T>): T {{ held.first }}
             fun main() {{
                 let numbers: Held<i32> = Held {{ first = 0, list = SignalCell::new([1, 2]) }};
@@ -2782,7 +2782,7 @@ fn a52_a_generic_service_subject_is_refused_by_the_expansion() {
         }
         impl Store<type T: Wire + PartialEq> {
             [rpc]
-            fun count(self): i32 { self.items.get().len() }
+            fun count(self): usize { self.items.get().len() }
         }
         fun main() { print("store"); }
         main();
@@ -2851,7 +2851,7 @@ fn a52_an_expose_of_a_user_source_type_is_accepted() {
         }
         impl Store {
             [rpc]
-            fun count(self): i32 { self.items.get().len() }
+            fun count(self): usize { self.items.get().len() }
         }
         fun main() { print(Store { items = Stored { inner = Signal::new([]) } }.contract_hash()); }
         main();
@@ -2951,7 +2951,7 @@ fn both_keyed_expose_spellings_compile_side_by_side() {
         }
         impl Store {
             [rpc]
-            fun count(self): i32 { self.by_list.get().len() }
+            fun count(self): usize { self.by_list.get().len() }
         }
         fun main() {
             print(Store { by_map = Signal::new(Map::new()), by_list = Signal::new([]) }.contract_hash());
@@ -3045,7 +3045,7 @@ fn a56_an_expose_keyed_argument_that_agrees_with_the_map_key_still_compiles() {
         }
         impl Store {
             [rpc]
-            fun count(self): i32 { self.tasks.get().len() }
+            fun count(self): usize { self.tasks.get().len() }
         }
         fun main() {
             print(Store { tasks = Signal::new(Map::new()) }.contract_hash());

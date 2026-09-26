@@ -58,13 +58,10 @@ impl Bytes {
 
     /// `new Uint8Array(size)` — `std::bytes`'s `alloc`: `size` zero bytes.
     ///
-    /// A negative size is the host's `RangeError`, which natively is the abort
-    /// every host throw takes.
-    pub fn alloc(size: i32) -> Bytes {
-        if size < 0 {
-            crate::panic_with(&format!("RangeError: Invalid typed array length: {size}"));
-        }
-        Bytes::from_vec(vec![0; size as usize])
+    /// The size is a `usize`, the index type (I5), so the host's `RangeError`
+    /// for a negative one has nothing left to catch.
+    pub fn alloc(size: usize) -> Bytes {
+        Bytes::from_vec(vec![0; size])
     }
 
     /// The bytes, borrowed for as long as the caller holds the guard.
@@ -81,8 +78,8 @@ impl Bytes {
         self.0.borrow().clone()
     }
 
-    pub fn len(&self) -> i32 {
-        self.0.borrow().len() as i32
+    pub fn len(&self) -> usize {
+        self.0.borrow().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -94,29 +91,11 @@ impl Bytes {
     /// JavaScript's `at` answers `undefined` out of range, and the vilan
     /// signature types the result an integer, so there is no `undefined` to
     /// hand back: `0` is the answer, and `std::bytes` documents the index as
-    /// the caller's contract exactly as `str::code_at` does. A NEGATIVE index
-    /// counts from the end there, and does here.
-    pub fn at(&self, index: i32) -> i32 {
-        let bytes = self.0.borrow();
-        let length = bytes.len() as i64;
-        let resolved = if index < 0 {
-            length + index as i64
-        } else {
-            index as i64
-        };
-        if resolved < 0 || resolved >= length {
-            return 0;
-        }
-        bytes[resolved as usize] as i32
-    }
-
-    /// A relative index as `TypedArray.prototype.slice` and `fill` resolve one:
-    /// a negative index counts from the end, and the result is clamped into
-    /// `0..=length`.
-    fn relative(length: usize, index: i32) -> usize {
-        let length = length as i64;
-        let index = index as i64;
-        if index < 0 { length + index } else { index }.clamp(0, length) as usize
+    /// the caller's contract exactly as `str::code_at` does. The index is a
+    /// `usize` (I5), so the host's count-from-the-end reading of a negative one
+    /// has no spelling left.
+    pub fn at(&self, index: usize) -> i32 {
+        self.0.borrow().get(index).map_or(0, |byte| *byte as i32)
     }
 
     /// `bytes.slice(from, to)` — a COPY of the half-open range, with
@@ -124,10 +103,10 @@ impl Bytes {
     /// end and a reversed pair answers empty (which is where `slice` differs
     /// from `str::substring`, whose host swaps them). A copy on both backends:
     /// `slice` is the one reader that makes a NEW buffer.
-    pub fn slice(&self, from: i32, to: i32) -> Bytes {
+    pub fn slice(&self, from: usize, to: usize) -> Bytes {
         let bytes = self.0.borrow();
-        let start = Bytes::relative(bytes.len(), from);
-        let end = Bytes::relative(bytes.len(), to);
+        let start = from.min(bytes.len());
+        let end = to.min(bytes.len());
         if end <= start {
             return Bytes::from_vec(Vec::new());
         }
@@ -142,11 +121,11 @@ impl Bytes {
     /// eight bits — `value as u8` for every width the emitter passes (it widens
     /// to `i64` first, so `i32` and `u32` arrive the same). The range resolves
     /// as [`Bytes::slice`]'s does, and a reversed one writes nothing.
-    pub fn fill(&self, value: i64, from: i32, to: i32) -> Bytes {
+    pub fn fill(&self, value: i64, from: usize, to: usize) -> Bytes {
         {
             let mut bytes = self.0.borrow_mut();
-            let start = Bytes::relative(bytes.len(), from);
-            let end = Bytes::relative(bytes.len(), to);
+            let start = from.min(bytes.len());
+            let end = to.min(bytes.len());
             if start < end {
                 bytes[start..end].fill(value as u8);
             }
@@ -157,20 +136,19 @@ impl Bytes {
     /// `target.set(source, offset)` — `std::bytes`'s `copy_into`: all of
     /// `source` written into this buffer starting at `offset`, in place.
     ///
-    /// The host throws a `RangeError` for a negative offset and for a source
-    /// that would run past the end, and so does this (the abort every host
-    /// throw takes natively). The source is read OUT before the write, which is
+    /// The host throws a `RangeError` for a source that would run past the end,
+    /// and so does this (the abort every host throw takes natively); the
+    /// offset is a `usize` (I5), so a negative one has no spelling left. The source is read OUT before the write, which is
     /// what the host specifies for two views of one buffer and what makes
     /// `a.copy_into(a, 0)` a no-op here rather than a double borrow.
-    pub fn copy_into(&self, source: &Bytes, offset: i32) {
+    pub fn copy_into(&self, source: &Bytes, offset: usize) {
         let data = source.to_vec();
         let mut bytes = self.0.borrow_mut();
-        if offset < 0 || offset as usize + data.len() > bytes.len() {
+        if offset + data.len() > bytes.len() {
             drop(bytes);
             crate::panic_with("RangeError: offset is out of bounds");
         }
-        let start = offset as usize;
-        bytes[start..start + data.len()].copy_from_slice(&data);
+        bytes[offset..offset + data.len()].copy_from_slice(&data);
     }
 }
 
@@ -279,17 +257,28 @@ mod tests {
         assert_eq!(first.to_vec(), vec![7, 44, 0, 0]);
     }
 
-    /// `fill`'s range is `slice`'s: negatives count from the end, bounds clamp,
-    /// a reversed range writes nothing; the stored byte is the low eight bits.
+    /// `fill`'s range is `slice`'s: bounds clamp to the length, a reversed
+    /// range writes nothing; the stored byte is the low eight bits.
     #[test]
     fn fill_resolves_its_range_and_its_byte_as_the_host_does() {
         let bytes = Bytes::alloc(5);
-        bytes.fill(-1, -2, 99);
+        bytes.fill(-1, 3, 99);
         assert_eq!(bytes.to_vec(), vec![0, 0, 0, 255, 255]);
         bytes.fill(0x1_02, 3, 1);
         assert_eq!(bytes.to_vec(), vec![0, 0, 0, 255, 255], "reversed: nothing");
-        bytes.fill(0x1_02, -99, 1);
+        bytes.fill(0x1_02, 0, 1);
         assert_eq!(bytes.to_vec(), vec![2, 0, 0, 255, 255]);
+    }
+
+    /// `at` past the end answers `0`, and `slice` clamps both bounds.
+    #[test]
+    fn at_and_slice_clamp_past_the_end() {
+        let bytes = Bytes::from_vec(vec![1, 2, 3]);
+        assert_eq!(bytes.at(2), 3);
+        assert_eq!(bytes.at(3), 0);
+        assert_eq!(bytes.slice(1, 99).to_vec(), vec![2, 3]);
+        assert_eq!(bytes.slice(9, 99).to_vec(), Vec::<u8>::new());
+        assert_eq!(bytes.len(), 3);
     }
 
     /// A buffer copied into ITSELF reads its source out first, so it is the

@@ -12,6 +12,31 @@ function __sleep(ms, signal) {
 		}, { once: true });
 	});
 }
+function fold_unsigned(value, modulus) {
+	const truncated = Math.trunc(value);
+	const wrapped = truncated % modulus;
+	let $h = null;
+	if (wrapped < 0) {
+		$h = wrapped + modulus;
+	} else {
+		$h = wrapped;
+	}
+	return $h;
+}
+function fold_signed(value, modulus, half) {
+	const wrapped = fold_unsigned(value, modulus);
+	let $i = null;
+	if (wrapped >= half) {
+		$i = wrapped - modulus;
+	} else {
+		$i = wrapped;
+	}
+	return $i;
+}
+function as_i32(self) {
+	const widened = Number(self);
+	return Number(fold_signed(widened, 4294967296, 2147483648));
+}
 async function sleep(ms, $a) {
 	await (__sleep(ms, ambient_signal($a)));
 }
@@ -46,7 +71,7 @@ function $f(self, fn) {
 async function $g(f) {
 	return await (f()) + 100;
 }
-async function $h(urls, f) {
+async function $j(urls, f) {
 	return await ($e(urls, f));
 }
 (async () => {
@@ -67,11 +92,11 @@ async function $h(urls, f) {
 	console.log(run(() => {
 		return 1;
 	}));
-	console.log(await ($h(urls, async (url) => {
+	console.log(await ($j(urls, async (url) => {
 		await (sleep(1, [ 1 ]));
-		return url.length + 10;
+		return as_i32(url.length) + 10;
 	})));
-})().catch(($i) => {
-	console.error(String($i));
+})().catch(($l) => {
+	console.error(String($l));
 	process.exit(1);
 });
