@@ -4638,6 +4638,18 @@ impl<'src> Transformer<'src> {
         if let Some((subject_type_id, trait_id, trait_arguments)) =
             self.program.dyn_coercions.get(&id).cloned()
         {
+            // B412: a site erasing the enclosing declaration's own parameter
+            // may be instantiated at an OBJECT (a `dyn Source<T>` handed to a
+            // generic), and an object landing in a `dyn` position is already
+            // the pair — wrapping it again would nest one inside the other.
+            if matches!(
+                self.program
+                    .type_id_to_type_map
+                    .get(&self.resolve_type_id(subject_type_id)),
+                Some(Type::Dyn(..))
+            ) {
+                return Some(node);
+            }
             let vtable = self.emit_vtable(subject_type_id, trait_id, &trait_arguments);
             return Some(js::Node::Array(vec![node, js::Node::Local(vtable)]));
         }

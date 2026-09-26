@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: feature -->
+**A generic parameter erases to a trait object its bounds promise: inside a blanket over `S: Source<X>`, `let object: dyn Source<X> = self` compiles, as do `fun erase<S: Src<i32>>(s: S): dyn Src<i32> { s }`, `show(s)` into a `dyn` parameter, a `List<dyn Src<i32>>` element, and a generic caller's `(a, b)` into a mapped `(U in T: dyn Source<U>)` — each was "Expected dyn Source<X>, but got S".** Only a concrete value could be erased. The enclosing declaration's own parameter now erases where its declared bounds (supertraits included) provide the object's trait at the object's arguments, and the pair is built per instance on both backends; an instance at which the parameter is itself an object passes it through rather than wrapping it twice. A parameter bounded by another trait, or by this one at other arguments, is still refused. (B412)
+
 <!-- family: fix -->
 **A default's closure parameter is typed through a nested binder: with `impl Sw<type I: Src<type U>> with Src<U>`, `s.show(|v| i"{v + 1}")` compiles and prints `2`, where `v` was the bare `U` and `v + 1` was refused.** An inherited default was specialized with the trait's `T := U` while `U` itself was still a hole: the receiver's shape binds `I`, and nothing grounded the binder written inside `I`'s bound. The default's bindings now ground a subject's bound binders from the receiver's own impls first, as a declared member's call already did — on both backends (the native default instance grounds them too). A node can read its value type out of the source it selects (`Sw<S, T, I>` with `I: Src<type U>`) instead of carrying it as a phantom parameter. (B411)
 
