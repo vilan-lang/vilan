@@ -411,6 +411,7 @@ std/reactive.md h2 signal-and-signalcell
 std/reactive.md h2 source
 std/reactive.md h3 on_settle--the-attach-a-node-author-writes
 std/reactive.md h3 cell-and-distinct--the-stateful-node-and-the-comparing-one
+std/reactive.md h3 resource--a-value-that-may-still-be-loading
 std/reactive.md h3 scoped_effect--an-owner-per-run
 std/reactive.md h2 selector--per-key-selection
 std/reactive.md h2 writing-a-signal

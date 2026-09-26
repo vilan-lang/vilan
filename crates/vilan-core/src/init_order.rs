@@ -135,6 +135,96 @@ pub fn check_cycles(program: &mut Program) {
     }
 }
 
+/// A130: a `.cell()` written in a module binding's initializer is refused, with
+/// a steer to `.cell_global()` (`proposal/reactive-pipeline.md` §2.4).
+///
+/// `std::reactive`'s `.cell()` is OWNER-TIED: its registration on the upstream
+/// is handed to the ambient owner, and released with it. A module binding's
+/// initializer has no owner, so the registration stays for the life of the
+/// program — the upstream's list holds the cell's record, the record holds the
+/// chain above it, and the chain holds the upstream: a loop nothing will ever
+/// release, behind a name that promised a scope. `.cell_global()` is the same
+/// node with that lifetime in its name, and the no-cycle gate excludes it by
+/// that name.
+///
+/// STATIC-ONLY, by ruling (A130, R-e at Order 42's GO): the check reads the
+/// calls the initializer ITSELF makes, which is the call graph's
+/// `initializer_calls_of` — a closure the initializer merely creates is its own
+/// node there, so `let LATER = || source.cell();` is not refused (creating a
+/// closure is inert, the §2 rule above), and a `.cell()` reached THROUGH a call
+/// from module init is the documented remainder, not caught. The direct spelling
+/// is the mistake this exists for.
+///
+/// A `lazy` binding is skipped: its initializer is already refused for reading
+/// an ambient context (`lazy.md` §1 — a `.cell()` reads the owner), and one
+/// mistake is one diagnostic.
+pub fn check_module_level_cells(program: &mut Program) {
+    let Some(cell) = std_reactive_cell(program) else {
+        return;
+    };
+    let mut found: Vec<(Error, SourceId)> = Vec::new();
+    {
+        let graph = program.call_graph();
+        let mut bindings = program.module_level_bindings();
+        bindings.sort_by_key(canonical_key);
+        for binding in bindings {
+            if program.lazy_cells.contains(&binding) {
+                continue;
+            }
+            for call in graph.initializer_calls_of(binding) {
+                if !matches!(call.target, CallTarget::Function(callee) if callee == cell) {
+                    continue;
+                }
+                let span = program
+                    .member_name_spans
+                    .get(&call.call_id)
+                    .copied()
+                    .unwrap_or_else(|| span_of(program, call.call_id));
+                let name = binding_name(program, binding);
+                found.push(program.anchored(
+                    Error {
+                        trace: Vec::new(),
+                        span,
+                        msg: format!(
+                            "`.cell()` in the initializer of the module binding `{name}` ties \
+                             the cell to an owner, and a module binding has none: its \
+                             subscription would stay on the upstream for the life of the \
+                             program. Build it under the owner that reads it (inside the view, \
+                             or an `owner_scope.run`), or write `.cell_global()`, which says \
+                             that lifetime"
+                        ),
+                        note: None,
+                    },
+                    call.call_id,
+                ));
+            }
+        }
+    }
+    for (error, source) in found {
+        program.push_diagnostic(error, source);
+    }
+}
+
+/// The `.cell()` blanket `std::reactive` declares, if `reactive.vl` loaded: the
+/// function named `cell` whose declaration sits in std's `reactive.vl`. A user's
+/// own `cell` (an inherent method, a free function) is a different declaration
+/// in a different file and is never matched.
+fn std_reactive_cell(program: &Program) -> Option<Id> {
+    program.functions.values().find_map(|function| {
+        if function.name != "cell" {
+            return None;
+        }
+        let source = program.source_of(function.id)?;
+        let in_std_reactive = program.std_sources.contains(&source)
+            && program
+                .sources
+                .get(source.0 as usize)
+                .and_then(|path| path.file_name())
+                .is_some_and(|file| file == "reactive.vl");
+        in_std_reactive.then_some(function.id)
+    })
+}
+
 /// Every initialization cycle in the program, as diagnostics paired with the
 /// source file each is anchored in, ordered by the canonical key of each
 /// cycle's first member.

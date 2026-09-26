@@ -350,9 +350,10 @@ fn logical_or_operator() {
 #[test]
 fn reactive_combine_variadic() {
     // The driving example: `combine` is variadic over its inputs' distinct types
-    // via a mapped-tuple parameter, yielding a `Signal` of the tuple that
-    // recomputes when any input changes. The consumer destructures the tuple with
-    // a closure tuple binder.
+    // via a mapped-tuple parameter, yielding a source of the tuple that changes
+    // when any input changes. The consumer destructures the tuple with a closure
+    // tuple binder. Since A124 S2c `combine` answers a `Combine` node, so the
+    // `SignalCell` this annotation names is its `.cell()`.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -362,7 +363,7 @@ fn reactive_combine_variadic() {
             let a = Signal::new(1);
             let b = Signal::new("x");
             let c = Signal::new(true);
-            let combined: SignalCell<(i32, str, bool)> = combine((a, b, c));
+            let combined: SignalCell<(i32, str, bool)> = combine((a, b, c)).cell();
             combined.sub(|(n, s, flag)| print(i"{n.to_string()} {s} {flag}"));
             a.set(2);
             b.set("y");

@@ -127,8 +127,48 @@ function drain(turn) {
 		});
 	}
 }
+function defer_subscriber(turn, subscriber) {
+	const $ag = turn;
+	let $ah = null;
+	if ($ag[0] === 0) {
+		const ambient = $ag[1];
+		$ah = enqueue(ambient, [ reissued(subscriber) ]);
+	} else {
+		const $ai = $r(draining_turns.v);
+		let $aj = null;
+		if ($ai[0] === 0) {
+			const draining = $ai[1];
+			$aj = enqueue(draining, [ reissued(subscriber) ]);
+		} else {
+			if (subscriber[2].v) {
+				subscriber[1]();
+			}
+			$aj = undefined;
+		}
+		$ah = $aj;
+	}
+	return $ah;
+}
 function reissued(subscriber) {
 	return [ subscriber[0], subscriber[1], subscriber[2], subscriber[3] ];
+}
+function wake(subscriber) {
+	defer_subscriber([ 1 ], subscriber);
+}
+function also_retiring(handle, subscriber) {
+	const previous = handle[3].v;
+	handle[3].v = [ 0, () => {
+		subscriber[2].v = false;
+		const $ak = previous;
+		let $al = null;
+		if ($ak[0] === 0) {
+			const release = $ak[1];
+			$al = release();
+		} else {
+			$al = undefined;
+		}
+		return $al;
+	} ];
 }
 function dispose(self, $w) {
 	const $x = $w;
@@ -241,17 +281,6 @@ function dispose2(self) {
 function get_owner($J) {
 	return $J;
 }
-function register_with_owner(subscription, $ai, $aj) {
-	const $ak = $aj;
-	let $al = null;
-	if ($ak[0] === 0) {
-		const owner = $ak[1];
-		$al = $K(owner, subscription, $ai);
-	} else {
-		$al = __clone(subscription);
-	}
-	return $al;
-}
 function $b(value) {
 	let subscribers = [  ];
 	return [ __shared_new(value), __shared_new(subscribers) ];
@@ -260,8 +289,9 @@ function $a(value) {
 	return $b(value);
 }
 function $g(signal, subscriber) {
+	const handle = [ signal[1], subscriber[0], subscriber[2], __shared_new([ 1 ]) ];
 	signal[1].v.push(reissued(subscriber));
-	return [ signal[1], subscriber[0], subscriber[2], __shared_new([ 1 ]) ];
+	return handle;
 }
 function $d(signal, observer) {
 	const cell = signal[0];
@@ -362,60 +392,38 @@ function $V(self, observer) {
 	observer($X(self));
 	return subscription;
 }
-function $ad(self, $m) {
-	const $ae = $m;
-	let $af = null;
-	if ($ae[0] === 0) {
-		const turn = $ae[1];
-		$af = enqueue(turn, self[1].v);
-	} else {
-		const $ag = $r(draining_turns.v);
-		let $ah = null;
-		if ($ag[0] === 0) {
-			const draining = $ag[1];
-			$ah = enqueue(draining, self[1].v);
-		} else {
-			for (const subscriber of self[1].v) {
-				if (subscriber[2].v) {
-					subscriber[1]();
-				}
-			}
-			$ah = undefined;
-		}
-		$af = $ah;
-	}
-	return $af;
+function $Y(self, transform) {
+	return [ __clone(self), transform ];
 }
-function $ac(self, value, $k) {
-	self[0].v = __clone(value);
-	$ad(self, $k);
+function $Z(self) {
+	return self[1]($X(self[0]));
 }
-function $Y(self, transform, $Z, $aa) {
-	const derived = $b(transform($X(self)));
+function $ad(source, observer) {
+	return mint_subscriber(() => {
+		return observer($Z(source));
+	});
+}
+function $af(self, subscriber) {
 	as_derivation();
-	register_with_owner($W(self, (value) => {
-		$ac(derived, transform(value), $Z);
-		return;
-	}), $Z, $aa);
-	return derived;
+	const relayed = $W(self, (_value) => {
+		return wake(subscriber);
+	});
+	also_retiring(relayed, subscriber);
+	return relayed;
 }
-function $ao(signal, observer) {
-	const cell = signal[0];
-	return $g(signal, mint_subscriber(() => {
-		const $ap = [ 0, cell ];
-		let $aq = null;
-		if ($ap[0] === 0) {
-			const live = $ap[1];
-			$aq = observer(live.v);
-		} else {
-			$aq = undefined;
-		}
-		return $aq;
-	}));
+function $ae(self, subscriber) {
+	return $af(self[0], subscriber);
 }
-function $an(self, observer) {
-	const subscription = $ao(self, observer);
-	observer($h(self));
+function $ac(source, observer) {
+	const subscriber = $ad(source, observer);
+	return $ae(source, subscriber);
+}
+function $ab(self, observer) {
+	return $ac(self, observer);
+}
+function $aa(self, observer) {
+	const subscription = $ab(self, observer);
+	observer($Z(self));
 	return subscription;
 }
 const minting_derivation = __shared_new(false);
@@ -458,9 +466,9 @@ $j(stored[0], 12, [ 1 ]);
 dispose(watched, [ 1 ]);
 const labelled = $Y(stored, (value) => {
 	return "n=" + value;
-}, [ 1 ], [ 1 ]);
-console.log($h(labelled));
-const shown = $an(labelled, (value) => {
+});
+console.log($Z(labelled));
+const shown = $aa(labelled, (value) => {
 	return console.log("label " + value);
 });
 $j(stored[0], 13, [ 1 ]);

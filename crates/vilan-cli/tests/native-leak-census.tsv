@@ -29,8 +29,8 @@ usize-literals	0	0
 unsigned-saturate	0	0
 bytes-aliasing	0	0
 delta-law	2842	14
-reactive-on-change	28	0
-reactive-flatten	25	0
+reactive-on-change	27	0
+reactive-flatten	8	0
 list-cell	2231	92
 reactive-selector	32	0
 native_probe_board	13	0

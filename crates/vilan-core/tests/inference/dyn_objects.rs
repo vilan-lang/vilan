@@ -688,8 +688,8 @@ fn a_dyn_source_field_holds_a_root_a_map_node_and_a_cell() {
 struct Holder { s: dyn Source<i32> }
 fun main() {
 \tlet root = SignalCell::new(1);
-\tlet cold = root.map_node(|n| n + 100);
-\tlet cached = root.map_node(|n| n * 10).cell();
+\tlet cold = root.map(|n| n + 100);
+\tlet cached = root.map(|n| n * 10).cell();
 \tlet hs: List<Holder> = [ Holder { s = root }, Holder { s = cold }, Holder { s = cached } ];
 \tfor h in hs { print(h.s.get()); }
 \troot.set(5);
@@ -721,28 +721,27 @@ fun main() {
     );
 }
 
-/// dyn-40's ruling, pinned where A124 S2c will flip it: `map` is a GENERIC
-/// DEFAULT on `Source` today, so it has no table slot and a call through a
-/// `dyn Source` is refused by name. The flip moves `map` to a blanket over
-/// `S: Source<T>`, which an object satisfies — and this pin becomes a pass in
-/// the saved S2c patch.
+/// dyn-40's ruling, flipped by A124 S2c: `map` was a GENERIC DEFAULT on
+/// `Source`, with no table slot, and a call through a `dyn Source` was refused
+/// by name. It is a blanket over `S: Source<T>` now, which an object satisfies,
+/// so the call reaches through the object and builds a cold node over it.
 #[test]
-fn a124_map_through_a_dyn_source_is_refused_until_the_flip() {
-    assert_fails_with(
+fn a124_map_through_a_dyn_source_is_the_blanket_node() {
+    assert_compiles_and_runs(
         "import std::reactive::{ Source, SignalCell };
 fun main() {
 \tlet cell = SignalCell::new(1);
 \tlet object: dyn Source<i32> = cell;
 \tlet mapped = object.map(|n| n + 1);
+\tcell.set(4);
 \tprint(mapped.get());
 }
 ",
-        "`Source::map` is generic, so it is not reachable through `dyn Source<i32>`",
+        "5\n",
     );
 }
 
-/// ...while the BLANKET spelling of the same node already reaches the object —
-/// the shape S2c gives `map` itself (`proposal/reactive-pipeline.md` §3.4): a
+/// The blanket reaches the object — `proposal/reactive-pipeline.md` §3.4: a
 /// cold node over a `dyn Source<i32>` upstream, read by pull, notified through
 /// the object's `on_settle` slot, and materialised by `.cell()`.
 #[test]
@@ -752,7 +751,7 @@ fn a124_the_blanket_node_spelling_reaches_through_a_dyn_source() {
 fun main() {
 \tlet cell = SignalCell::new(1);
 \tlet object: dyn Source<i32> = cell;
-\tlet mapped = object.map_node(|n| n + 1);
+\tlet mapped = object.map(|n| n + 1);
 \tlet cached = mapped.cell();
 \tlet watch = mapped.on_change(|n| print(i\"saw {n}\"));
 \tcell.set(5);

@@ -66,7 +66,7 @@ let remove_button = const button + style::style().margin_left(style::Length::aut
 let empty_note = const style::style().opacity(0.6);
 
 fun todos(client: TodoClient<SocketTransport>): View {
-	let items = client.todos.or([]);
+	let items = client.todos.or([]).cell();
 	let draft = Signal::new("");
 	let filter = Signal::new("all"); // "all" | "active" | "done"
 
@@ -78,7 +78,7 @@ fun todos(client: TodoClient<SocketTransport>): View {
 			}
 		}
 		open
-	});
+	}).cell();
 
 	let visible: SignalCell<List<Todo>> = combine((items, filter)).map(|(list, current)| {
 		mut shown: List<Todo> = [];
@@ -91,7 +91,7 @@ fun todos(client: TodoClient<SocketTransport>): View {
 			}
 		}
 		shown
-	});
+	}).cell();
 
 	let add = || {
 		let label = draft.get(); // a one-shot SAMPLE — we want the value, not a dependency

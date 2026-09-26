@@ -219,47 +219,56 @@ fn an_on_change_only_source_gets_a_working_eager_sub() {
     );
 }
 
-/// `combine` seeds its derived signal from the snapshot and then attaches
-/// LAZILY, instead of letting each input's eager `sub` re-set that same value
-/// once per input.
+/// `combine` attaches to its inputs WITHOUT a first call — re-derived at A124
+/// S2c, where `combine` is a cold `Combine` node and the claim moves into the
+/// node's attach.
 ///
-/// A DECLARATION gate, deliberately. The redundant writes happen inside
-/// `combine`'s own body, before the derived cell it just created can have a
-/// single subscriber, and `SignalCell::set` over an empty subscriber list is a
-/// no-op in every observable respect — no notification, no id, no allocation a
-/// vilan program can count. There is therefore no program whose output moves,
-/// and the honest pin is over the line that carries the claim. (The corpus byte
-/// gate is the second half: `combine`'s emitted body is in a golden, so a
-/// revert to `sub` diverges it.)
+/// The pre-flip gate held `combine`'s own body: it seeded a derived cell from a
+/// snapshot and then attached each input with `on_change` (never the eager `sub`,
+/// which would have re-set the seed once per input), marking each attach a
+/// derivation. The node seeds nothing and builds nothing, so the same two claims
+/// now live in `Combine`'s `on_settle`: it FORWARDS the leaf's record to every
+/// input's `on_settle` — no payload attach (`on_change`), no eager one (`sub`),
+/// no subscriber minted of its own (the record carries the leaf's id and class,
+/// which is what lets a turn's dedup collapse a diamond) — and `combine` itself
+/// is one struct literal. A DECLARATION gate, deliberately, for the reason the
+/// pre-flip one gave: an eager attach inside the node would be observable only as
+/// a duplicate call that a turn's dedup also hides.
 #[test]
 fn combine_attaches_to_its_inputs_without_the_first_call() {
     let source = std::fs::read_to_string(std_dir().join("src/reactive.vl"))
         .expect("read std::reactive's source");
-    let body = source
+    let combine = source
         .split_once("fun combine<T: (2..)>")
         .expect("combine is declared in std::reactive")
         .1;
-    let body = body
+    let combine = combine
         .split_once("\n}\n")
         .expect("combine's body is delimited")
         .0;
     assert!(
-        body.contains("source.on_change("),
-        "combine must attach to each input with on_change; its body is:\n{body}"
+        combine.contains("Combine<T> { sources }") && !combine.contains("on_change("),
+        "combine must build the cold node and attach nothing; its body is:\n{combine}"
+    );
+    let node = source
+        .split_once("impl Combine<type T> with Source<T> {")
+        .expect("Combine implements Source")
+        .1;
+    let node = node.split_once("\n}\n").expect("the impl is delimited").0;
+    let attach = node
+        .split_once("fun on_settle(")
+        .expect("Combine overrides on_settle")
+        .1;
+    assert!(
+        attach.contains("source.on_settle(subscriber)"),
+        "Combine must forward the leaf's record to each input; its attach is:\n{attach}"
     );
     assert!(
-        !body.contains("source.sub("),
-        "combine must not attach eagerly — each eager attach re-sets the \
-         derived signal to the value it was just seeded with; its body is:\n{body}"
-    );
-    // And each attach is a DERIVATION (A110 door 2): it publishes rather than
-    // acts, so it belongs in the wave's first phase. The mark rides the
-    // ELEMENT expression of the mapped tuple, because `observe` spends one mark
-    // per subscriber and the tuple mints one per input.
-    assert!(
-        body.contains("on_change(as_derivation_for("),
-        "combine's per-input attach must be marked as a derivation, inside the \
-         mapped tuple's element expression; its body is:\n{body}"
+        !attach.contains(".sub(")
+            && !attach.contains(".on_change(")
+            && !attach.contains("mint_subscriber("),
+        "Combine's attach must not attach eagerly, with a payload, or under an id of \
+         its own; its attach is:\n{attach}"
     );
 }
 

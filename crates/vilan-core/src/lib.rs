@@ -1132,6 +1132,11 @@ pub fn post_analysis_passes(
     // declaration order (b33-emission-order.md §3), so it is an error
     // rather than a load-time `ReferenceError`. Runs last: the relation is
     // only meaningful for a program that analyzed cleanly.
+    // A130: a `.cell()` in a module binding's initializer, refused with its
+    // steer. It reads the installed graph's initializer calls, and — unlike the
+    // cycle check below — it does not need a clean program to be meaningful: a
+    // resolved call to std's `.cell()` is a fact whatever else failed.
+    init_order::check_module_level_cells(program);
     let phase_init_start = PhaseClock::now();
     init_order::check_cycles(program);
     let phase_init = phase_init_start.elapsed();

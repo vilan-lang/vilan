@@ -217,25 +217,30 @@ require("./app.js");
 // --- The standing no-cycle gate ----------------------------------------------
 
 /// The exemplar: everything §5 named, in one mounted app. A derivation made
-/// OUTSIDE every boundary (the module-level `route`, which nothing disposes and
-/// which therefore is what the post-disposal walk still sees), a bound text, a
-/// two-way input, a handler that writes signals the view reads (V4), a keyed
-/// list, and a live reactive RPC session on an in-process duplex.
+/// OUTSIDE every boundary — the module-level `depth`, which nothing disposes and
+/// which therefore is what the post-disposal walk still sees; since A130 it is
+/// spelled `.cell_global()`, the one loop the gate excludes by name — a cached
+/// derivation made INSIDE the mounted view (`route`, whose `.cell()` meets the
+/// view's owner and goes with it: A124 S2c's ruling), a bound text, a two-way
+/// input, a handler that writes signals the view reads (V4), a keyed list, and a
+/// live reactive RPC session on an in-process duplex.
 const CYCLE_EXEMPLAR: &str = r#"import std::json::json_codec;
 import std::reactive::{ Disposable, Signal, SignalCell };
 import std::rpc::{ ReactiveClient, ReactiveServer, RemoteSource, duplex_pair };
 import std::ui::{ View, each, mount_root, view };
 
 let path: SignalCell<str> = Signal::new("/");
-let route: SignalCell<str> = path.map(|value| "route" + value);
+let depth: SignalCell<usize> = path.map(|value| value.len()).cell_global();
 
 fun row(item: str): View {
 	view("li").text(item)
 }
 
 fun app(items: SignalCell<List<str>>, draft: SignalCell<str>): View {
+	let route: SignalCell<str> = path.map(|value| "route" + value).cell();
 	view("main")
 		.child(view("h1").bind_text(route))
+		.child(view("p").bind_text(depth.map(|n| i"{n}")))
 		.child(view("input").bind_value(draft))
 		.child(view("button").text("add").on("click", || {
 			items.update(|&mut list| { list.push(draft.get()); });
@@ -261,7 +266,7 @@ fun main() {
 	// Everything stays reachable from the harness, so nothing is "acyclic"
 	// merely by having been collected.
 	keep(path);
-	keep(route);
+	keep(depth);
 	keep(items);
 	keep(draft);
 	keep(server);
@@ -313,8 +318,11 @@ global.__scc_unmounted = () => {{
 require("./app.js");
 
 for (const phase of ["mounted", "unmounted"]) {{
-    const result = analyze(`./${{phase}}.heapsnapshot`, {{ rootEdgeName: "__vilan_scc_roots" }});
-    console.log(`${{phase}} reachable=${{result.reachable}} cycles=${{result.components.length}}`);
+    const result = analyze(`./${{phase}}.heapsnapshot`, {{
+        rootEdgeName: "__vilan_scc_roots",
+        designedLoops: ["cell_global_refresh"],
+    }});
+    console.log(`${{phase}} reachable=${{result.reachable}} cycles=${{result.components.length}} designed=${{result.designed.length}}`);
     if (result.components.length > 0) console.log(result.report);
 }}
 "#
@@ -338,9 +346,22 @@ for (const phase of ["mounted", "unmounted"]) {{
         stdout.contains("mounted reachable="),
         "the walk must reach the mounted app; got:\n{stdout}"
     );
+    let unmounted = stdout
+        .lines()
+        .find(|line| line.starts_with("unmounted reachable="))
+        .unwrap_or_else(|| panic!("the walk must reach the unmounted app; got:\n{stdout}"));
     assert!(
-        stdout.contains("unmounted reachable=") && stdout.contains("cycles=0"),
+        unmounted.contains("cycles=0"),
         "a disposed app must hold no reactive cycle; got:\n{stdout}"
+    );
+    // The exclusion is by NAME, so it is held to having matched: the
+    // module-level `.cell_global()` keeps its loop for the life of the program
+    // (A130, by design), and a walk that stopped seeing it — the closure
+    // renamed, the global inlined away — would pass `cycles=0` vacuously.
+    assert!(
+        unmounted.contains("designed=1"),
+        "the module-level `.cell_global()` loop must be seen and excluded by name; \
+         got:\n{stdout}"
     );
 }
 
@@ -619,7 +640,7 @@ import std::reactive::{ Disposable, Owner, Signal, SignalCell, Source, owner_sco
 
 fun main() {
 	let route: SignalCell<i32> = Signal::new(0);
-	let shell: SignalCell<i32> = route.map(|value| value / 10);
+	let shell: SignalCell<i32> = route.map(|value| value / 10).cell();
 	let boundary = Owner::new();
 	let fired: SignalCell<i32> = Signal::new(0);
 
@@ -719,7 +740,7 @@ fun main() {
 	// it from inside that wave. The outer is created FIRST, so ascending
 	// subscriber id runs it first (A110 door 2).
 	let path: SignalCell<i32> = Signal::new(0);
-	let gate: SignalCell<i32> = path.map(|value| value / 10);
+	let gate: SignalCell<i32> = path.map(|value| value / 10).cell();
 	let later_boundary = Owner::new();
 	let later_fired: SignalCell<i32> = Signal::new(0);
 	let _later_outer = path.on_change(|_value: i32| {
@@ -848,7 +869,7 @@ fun main() {
 	// `turn_scope` IS established and the scrub always worked.
 	let second_turn = Turn::new();
 	let second_trigger: SignalCell<i32> = Signal::new(0);
-	let second_derived: SignalCell<i32> = second_trigger.map(|value| value * 10);
+	let second_derived: SignalCell<i32> = second_trigger.map(|value| value * 10).cell();
 	let second_boundary = Owner::new();
 	let second_fired: Shared<i32> = Shared::new(0);
 	owner_scope.run(second_boundary, || {
@@ -944,7 +965,7 @@ import std::reactive::{
 fun main() {
 	// --- order: the outer runs first, and both run.
 	let source: SignalCell<i32> = Signal::new(0);
-	let coarse: SignalCell<i32> = source.map(|value| value / 10);
+	let coarse: SignalCell<i32> = source.map(|value| value / 10).cell();
 	let host = Owner::new();
 	mut wired = false;
 	run_with_owner(host, || {
@@ -965,7 +986,7 @@ fun main() {
 	// --- nested: the outer's run replaces the instantiation the inner belongs
 	// to, so the inner never runs at all.
 	let route: SignalCell<i32> = Signal::new(0);
-	let shell: SignalCell<i32> = route.map(|value| value / 10);
+	let shell: SignalCell<i32> = route.map(|value| value / 10).cell();
 	let boundary = Owner::new();
 	let built: SignalCell<i32> = Signal::new(0);
 	let torn: SignalCell<i32> = Signal::new(0);
@@ -1052,8 +1073,8 @@ import std::reactive::{
 
 fun main() {
 	let root: SignalCell<i32> = Signal::new(1);
-	let once: SignalCell<i32> = root.map(|value| value * 2);
-	let twice: SignalCell<i32> = once.map(|value| value + 1);
+	let once: SignalCell<i32> = root.map(|value| value * 2).cell();
+	let twice: SignalCell<i32> = once.map(|value| value + 1).cell();
 	let seen: SignalCell<str> = Signal::new("");
 	let watcher = Owner::new();
 	run_with_owner(watcher, || {
@@ -1103,14 +1124,14 @@ fn a110_door2_an_effect_reads_a_derivation_chains_final_value_once() {
 /// of pushing the leaf's record: `fixpoint=5/11,5/11,`.
 const A124_S2A_COLD_DIAMOND: &str = r#"import std::io::print;
 import std::reactive::{
-	FlushPolicy, Owner, Signal, SignalCell, Source, combine_node, run_with_owner, turn,
+	FlushPolicy, Owner, Signal, SignalCell, Source, combine, run_with_owner, turn,
 };
 
 fun main() {
 	let root: SignalCell<i32> = Signal::new(1);
-	let twice = root.map_node(|value| value * 2).map_node(|value| value + 1);
+	let twice = root.map(|value| value * 2).map(|value| value + 1);
 	let arms: (dyn Source<i32>, dyn Source<i32>) = (root, twice);
-	let pair = combine_node(arms);
+	let pair = combine(arms);
 	let seen: SignalCell<str> = Signal::new("");
 	let watcher = Owner::new();
 	run_with_owner(watcher, || {
@@ -1366,16 +1387,18 @@ fn a114_a_throwing_scoped_effect_body_does_not_leak_the_run_it_started() {
 /// requirement is static (no owner, no compile). One subscriber each while the
 /// boundary lives, none after it goes.
 ///
-/// **Row 3 — the derivation combinators.** `map`, `combine`, `selector` and
-/// `flatten` all route their subscription through `register_with_owner`, so
-/// inside a boundary all four detach with it — A28's measured leak, closed. And
-/// OUTSIDE every boundary the derivation lives as long as its source, which is
-/// **deliberate and RULED (R3 at Order 39's GO: KEEP)**: refusing the ownerless
-/// case is the stronger law and a breaking change to a documented idiom
-/// (`current_path().map(parse)` at the top of `main`), so it stays
-/// leak-as-today and it is pinned as the contract rather than left to a reader.
-/// `RemoteSource::map` is the one combinator that DOES refuse it, because its
-/// subscription costs a network frame.
+/// **Row 3 — the derivations.** Re-derived at A124 S2c: the combinators (`map`,
+/// `combine`, `flatten`) are COLD NODES that register nothing at all, inside a
+/// boundary or out (`cold: map=0 combine=0+0 flatten=0+0`) — there is nothing for
+/// a boundary to release. What registers is the materialising end: a `.cell()`
+/// of each, and `selector`, route their subscription through
+/// `register_with_owner`, so inside a boundary every one detaches with it —
+/// A28's measured leak, closed, now at the node that holds state. OUTSIDE every
+/// boundary a `.cell()` lives as long as its source, which is **deliberate and
+/// RULED (R3 at Order 39's GO: KEEP)** — in a function body; in a module
+/// binding's initializer the direct spelling is refused and `.cell_global()`
+/// says the lifetime (A130). The pre-flip pin read `map=1` inside and
+/// `ownerless map=1` for the bare `map`; those `1`s are the `.cell()`'s now.
 const A113_OWNED_FORMS: &str = r#"import std::io::print;
 import std::reactive::{
 	Disposable, Owner, Signal, SignalCell, Source, combine, run_with_owner, selector,
@@ -1404,20 +1427,30 @@ fun main() {
 	let picked: SignalCell<i32> = Signal::new(0);
 	let inner: SignalCell<i32> = Signal::new(0);
 	let outer: SignalCell<SignalCell<i32>> = Signal::new(inner);
-	let derivations = Owner::new();
-	run_with_owner(derivations, || {
+	let cold = Owner::new();
+	run_with_owner(cold, || {
 		let _m = mapped.map(|value| value + 1);
 		let _c = combine((left, right));
-		let _s = selector(picked);
 		let _f = outer.flatten();
+	});
+	print(i"row3: cold map={mapped.subscribers.read().len()} combine={left.subscribers.read().len()}+{right.subscribers.read().len()} flatten={outer.subscribers.read().len()}+{inner.subscribers.read().len()}");
+	cold.dispose();
+
+	let derivations = Owner::new();
+	run_with_owner(derivations, || {
+		let _m = mapped.map(|value| value + 1).cell();
+		let _c = combine((left, right)).cell();
+		let _s = selector(picked);
+		let _f = outer.flatten().cell();
 	});
 	counts("inside-live", mapped, left, right, picked, outer, inner);
 	derivations.dispose();
 	counts("inside-disposed", mapped, left, right, picked, outer, inner);
 
 	let module_level: SignalCell<i32> = Signal::new(0);
-	let _ownerless = module_level.map(|value| value + 1);
-	print(i"row3: ownerless map={module_level.subscribers.read().len()}");
+	let _cold = module_level.map(|value| value + 1);
+	let _ownerless = module_level.map(|value| value + 1).cell();
+	print(i"row3: ownerless cell={module_level.subscribers.read().len()}");
 }
 "#;
 
@@ -1431,14 +1464,16 @@ fn a113_the_owned_forms_and_every_derivation_detach_with_their_boundary() {
         vec![
             "row1: live eager=1 quiet=1",
             "row1: disposed eager=0 quiet=0",
-            // All four combinators, one subscription each into their inputs —
-            // `combine` one per input, `flatten` one outer and one inner.
+            // A cold node registers nothing, owner or not.
+            "row3: cold map=0 combine=0+0 flatten=0+0",
+            // Each `.cell()` (and `selector`), one subscription into each input
+            // — `combine` one per input, `flatten` one outer and one inner.
             "row3: inside-live map=1 combine=1+1 selector=1 flatten=1+1",
             "row3: inside-disposed map=0 combine=0+0 selector=0 flatten=0+0",
-            // The ownerless derivation KEEPS its subscription (R3). This line
-            // reading 0 would mean the idiom stopped working; reading 1 is the
-            // documented answer.
-            "row3: ownerless map=1",
+            // The ownerless `.cell()` KEEPS its subscription (R3) and the cold
+            // `map` beside it adds none. Reading 0 would mean the idiom stopped
+            // working; reading 1 is the documented answer.
+            "row3: ownerless cell=1",
         ],
         "the owned forms and the derivation combinators must release their \
          observers with their boundary, and an ownerless derivation must keep \

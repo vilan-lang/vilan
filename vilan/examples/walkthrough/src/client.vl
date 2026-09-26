@@ -17,7 +17,7 @@ import pkg::views::screen;
 
 async fun main() {
 	let token = Signal::new(storage::get("notes-token"));
-	let route = current_path().map(parse);
+	let route = current_path().map(parse).cell();
 
 	match NotesClient::connect("/", json_codec()) {
 		Ok(let client) => {

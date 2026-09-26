@@ -45,9 +45,8 @@ impl RemoteSource<type T> with Source<Option<T>> {
 }
 
 impl RemoteSource<type T> {
-	fun map<U>(self, transform: sync |Option<T>| U): SignalCell<U>   // counted, owner-scoped: the `Option` confronted once
 	fun status(self): SignalCell<Status>                      // passive: what the mirror was last told
-	fun or(self, initial: T): SignalCell<T>                   // counted, owner-scoped: `initial` until the first update
+	fun or(self, initial: T): Map<RemoteSource<T>, Option<T>, T>   // a cold node: `initial` until the first update
 	[must_use]
 	fun sub(self, observer: |T| void): Subscription       // counted, manual: present values; dispose to release
 }
@@ -76,19 +75,26 @@ value: the inherent one hands the observer a present `T`, the trait's hands it
 the `Option<T>`, and the observer's own parameter type picks between them.
 
 A mirror holds `Option<T>` — `None` until the first `Update` lands — and
-**subscribes by demand**: every `or`, `map`, and `sub` takes a counted lease
-on the channel. The 0→1 lease sends `Subscribe` (the server answers with
+**subscribes by demand**: every subscribing leaf — a `sub`, an `effect`, a
+`.cell()`, a binding or an `each` — takes a counted lease on the channel, on
+the mirror itself or on any node over it (`mirror.map(..)`, `mirror.or(..)`). The 0→1 lease sends `Subscribe` (the server answers with
 the current value at once); the 1→0 release sends `Unsubscribe`, deferred
 to the end of the ambient turn so a same-turn re-subscribe (a view
 re-rendering in place) sends nothing. A second watcher on an open channel
 sends no frame. On reconnect a watched mirror (count > 0) re-subscribes on
 its fresh channel; an unwatched one does not.
 
-`or` and `map` hand the lease to the ambient owner (the enclosing view, or
-a `run_with_owner`), so it is released at unmount; calling either where no
-owner is ambient is a compile error (context coverage), by design — a
-network subscription must have a releaser. `sub` is the manual form for
-code with no owner: you hold the `Subscription` and `dispose` it.
+`map` (the blanket every source has) and `or` are **cold nodes**: building one
+opens nothing, anywhere — `map` is where the `Option` is confronted once, and
+`or` is `map` for the same-type fallback. The owner is asked at the
+**subscribing leaf**, where the lease is taken: `effect` and
+`effect_on_change` on the mirror or a node over it hand the lease to the
+ambient owner and are a compile error (context coverage) where none is — a
+network subscription must have a releaser; a `.cell()` of it takes one lease
+and ties it to the ambient owner (inside a view, the view's); a binding or an
+`each` leases under the view that places it. `sub` and `on_change` are the
+manual form for code with no owner: you hold the `Subscription` and
+`dispose` it, which releases the lease.
 
 `get` and `status` open nothing. **A `status` observer alone never sees
 `Waiting → Ready`**: `status` reports, it does not ask; until something
@@ -102,11 +108,10 @@ costs nothing on either side. What the call answered is then `status()`:
 `Absent` for a `None` reply, `Failed(error)` for a call that failed, and
 the next 0→1 lease asks again in both cases.
 
-The `SignalCell<T>` that `or`/`map` return is a local derivative: writing it
-writes nothing back (the server owns the source) and the next update
-overwrites it. An empty-list `initial` needs no annotation — the `[]`
-takes its element type from the mirror
-(`let notes = client.notes.or([]);` is a `SignalCell<List<Note>>`).
+A `.cell()` of `or`/`map` is a local derivative: writing it writes nothing
+back (the server owns the source) and the next update overwrites it. An
+empty-list `initial` needs no annotation — the `[]` takes its element type from
+the mirror (`let notes = client.notes.or([]);` is a source of `List<Note>`).
 
 ## Keyed mirrors: `KeyedSource<K, T>`
 
@@ -129,13 +134,12 @@ impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> with Source<O
 	[must_use]
 	fun sub(self, observer: |Option<List<T>>| void): Subscription         // counted, eager
 	fun effect(self, observer: |Option<List<T>>| void)                    // counted, eager, owner-scoped
-	fun map<U>(self, transform: sync |Option<List<T>>| U): SignalCell<U>
 }
 
 impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 	fun status(self): SignalCell<Status>                      // passive: `Waiting` until the first patch
 	fun fault(self): Option<str>                              // passive: the first protocol fault, sticky
-	fun or(self, initial: List<T>): SignalCell<List<T>>       // counted, owner-scoped: the whole collection
+	fun or(self, initial: List<T>): Map<KeyedSource<K, T>, Option<List<T>>, List<T>>   // a cold node: the whole collection
 	[must_use]
 	fun sub(self, observer: |List<T>| void): Subscription     // counted, manual: the whole collection
 	fun of(self, key: K): SignalCell<Option<T>>               // counted per KEY, owner-scoped

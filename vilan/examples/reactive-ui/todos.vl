@@ -40,7 +40,7 @@ fun todos(): View {
 			}
 		}
 		open
-	});
+	}).cell();
 
 	// `visible` depends on BOTH `items` and `filter`. `combine` is variadic — it
 	// takes a tuple of the dependencies (a `Signal` viewed as `.source()`) and
@@ -58,7 +58,7 @@ fun todos(): View {
 			}
 		}
 		shown
-	});
+	}).cell();
 
 	let add = || {
 		let label = draft.get(); // a one-shot SAMPLE — we want the value, not a dependency

@@ -193,8 +193,9 @@ function $n(self, value, $o) {
 	$p(self, $o);
 }
 function $E(signal, subscriber) {
+	const handle = [ signal[1], subscriber[0], subscriber[2], __shared_new([ 1 ]) ];
 	signal[1].v.push(reissued(subscriber));
-	return [ signal[1], subscriber[0], subscriber[2], __shared_new([ 1 ]) ];
+	return handle;
 }
 function $B(signal, observer) {
 	const cell = signal[0];
