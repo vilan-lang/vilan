@@ -21205,6 +21205,14 @@ impl<'src> Analyzer<'src> {
             .reconcile_declaration(&impl_subject, subject_type, &impl_subject)
             .map(|(_, bindings)| bindings.into_iter().collect())
             .unwrap_or_default();
+        // B411: an impl may read the trait's argument out of a NESTED binder
+        // (`impl Sw<type I: Src<type U>> with Src<U>`): `U` is written in `I`'s
+        // bound, not in the subject's shape, so the reconciliation above left it
+        // a hole and the default's `T := U` handed a closure parameter the bare
+        // `U` (`s.show(|v| i"{v + 1}")` refused `v + 1`). Ground the bound's
+        // binders from the receiver's own impls first — the step a DECLARED
+        // member's call already takes (B300(a)).
+        self.bind_subject_bound_binders(impl_subject_id, subject_type, &mut bindings);
         for (chain_trait_id, chain_arguments) in
             self.trait_with_supertraits_at(trait_id, trait_arguments)
         {

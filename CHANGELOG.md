@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: fix -->
+**A default's closure parameter is typed through a nested binder: with `impl Sw<type I: Src<type U>> with Src<U>`, `s.show(|v| i"{v + 1}")` compiles and prints `2`, where `v` was the bare `U` and `v + 1` was refused.** An inherited default was specialized with the trait's `T := U` while `U` itself was still a hole: the receiver's shape binds `I`, and nothing grounded the binder written inside `I`'s bound. The default's bindings now ground a subject's bound binders from the receiver's own impls first, as a declared member's call already did — on both backends (the native default instance grounds them too). A node can read its value type out of the source it selects (`Sw<S, T, I>` with `I: Src<type U>`) instead of carrying it as a phantom parameter. (B411)
+
 <!-- family: miscompile -->
 **A trait override is selected through a bound whose trait argument is a tuple or an array: `fun through<T, S: Src<T>>(s: S) { s.label() }` at `T = (i32, i32)` runs the impl's `label`, where it ran the trait's DEFAULT (JS printed `default`).** Re-dispatch through a bound asks for the impl providing `Src<(i32, i32)>`, and the instantiation filter compared a tuple argument by its type ids — minted per spelling, never interned — so the wanted `(i32, i32)` never matched the provided one and the impl was turned down. Tuples and fixed arrays now compare element by element, on both backends; two impls of one trait at different tuple arguments still stay apart. (B410)
 

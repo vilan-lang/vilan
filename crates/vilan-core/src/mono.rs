@@ -212,7 +212,12 @@ pub fn trait_parameter_substitution(
     else {
         return substitution;
     };
-    impl_select::bind_subject(program, implementation.subject, type_id, &mut substitution);
+    impl_select::bind_subject_and_bounds(
+        program,
+        implementation.subject,
+        type_id,
+        &mut substitution,
+    );
     let Some((_, arguments)) = implementation
         .trait_args
         .iter()
