@@ -3117,6 +3117,77 @@ fn a_call_missing_a_context_argument_is_refused_by_name() {
     }
 }
 
+/// **F38**: `and_then<U>`'s `U` — a callee's OWN generic parameter that no
+/// written argument names and the analyzer records nothing for — is closed
+/// from the closure the call is handed: the declared `|T| Result<U, E>`
+/// against the literal's parameters and its body's tail. A tail the analyzer
+/// typed nowhere (`Ok(n * 2)`) is read through the constructor's arguments,
+/// an arithmetic operand through its left side, a concatenation as `str`.
+/// `Result` and `Option` both, chained, on the `Err` path, and at a `U` that is
+/// not the receiver's `T` (`str`, `bool`).
+///
+/// Red before F38: refused by name, "a value of an unbound generic type
+/// parameter (parameter 1 of `and_then`)".
+#[test]
+fn and_thens_own_parameter_is_closed_from_its_closure_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_and_then.vl"), AND_THEN_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_and_then.vl"),
+        Verdict::Identical,
+        "`and_then` must print the same bytes on both backends"
+    );
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "native_probe_and_then.vl"])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "20\n-1\n-2\ntext 10\n4\ntrue\n"
+    );
+}
+
+const AND_THEN_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun half(n: i32): Result<i32, str> {\n",
+    "\tif n % 2 == 0 {\n",
+    "\t\tOk(n / 2)\n",
+    "\t} else {\n",
+    "\t\tErr(i\"odd {n}\")\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet ok: Result<i32, str> = Ok(10);\n",
+    "\tlet err: Result<i32, str> = Err(\"boom\");\n",
+    "\tprint(ok.and_then(|n| Ok(n * 2)).unwrap_or(0));\n",
+    "\tprint(err.and_then(|n| Ok(n * 2)).unwrap_or(-1));\n",
+    "\tprint(ok.and_then(|n| half(n)).and_then(|n| half(n)).unwrap_or(-2));\n",
+    "\tprint(ok.and_then(|n| Ok(i\"text {n}\")).unwrap_or(\"none\"));\n",
+    "\tlet some: Option<i32> = Some(3);\n",
+    "\tprint(some.and_then(|n| Some(n + 1)).unwrap_or(0));\n",
+    "\tprint(some.and_then(|n| Some(n > 2)).unwrap_or(false));\n",
+    "}\n",
+);
+
+/// F38's boundary: `result-combinators.vl` now stops at `or_else<F>` over an
+/// `Ok`-only closure (`err.or_else(|e| Ok(7))`), whose `F` NOTHING in the
+/// program constrains — the analyzer records `any` and JavaScript never needs
+/// a type. Natively a type has to be chosen, which is a ruling, not a
+/// lowering, so it stays refused by name at the new wall.
+#[test]
+fn an_unconstrained_generic_parameter_is_refused_by_name() {
+    let staged = stage();
+    match compare(&staged, "result-combinators.vl") {
+        Verdict::Refused(reason) => {
+            assert!(reason.contains("parameter 1 of `or_else`"), "{reason}")
+        }
+        other => panic!("expected a refusal by name, got {other:?}"),
+    }
+}
+
 /// **F18 slice 2**: a closure declared SYNCHRONOUS, answering nothing, whose
 /// body awaits.
 ///

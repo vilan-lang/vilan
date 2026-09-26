@@ -1432,6 +1432,211 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
+    /// Closes a call's still-OPEN own generic parameters from the ARGUMENTS it
+    /// is handed (F38) — the channel [`Self::close_open_bindings_from_position`]
+    /// is the return-side twin of.
+    ///
+    /// `ok.and_then(|n| Ok(n * 2))`: the analyzer records `T` and `E` (the
+    /// receiver's) and nothing for `and_then<U>`'s own `U`, because no written
+    /// argument names it and the position — a receiver of `.unwrap_or(0)` — has
+    /// no type of its own to close it from. The closure's recorded type
+    /// (`|i32| Result<i32, ?>`) against the declared `|T| Result<U, E>` does.
+    /// Only a parameter the substitution leaves unbound or ungrounded is
+    /// touched, and only with a grounded answer — the rule the position channel
+    /// keeps.
+    fn close_open_bindings_from_arguments(
+        &mut self,
+        substitution: &mut HashMap<TypeId, TypeId>,
+        target: Id,
+        argument_ids: &[Id],
+    ) {
+        let Some(function) = self.program.functions.get(&target).cloned() else {
+            return;
+        };
+        let open: Vec<TypeId> = function
+            .generic_parameter_constraint_ids
+            .iter()
+            .copied()
+            .filter(|constraint_id| {
+                substitution
+                    .get(constraint_id)
+                    .is_none_or(|bound| !self.is_grounded(*bound))
+            })
+            .collect();
+        if open.is_empty() {
+            return;
+        }
+        let mut bound: HashMap<TypeId, TypeId> = HashMap::default();
+        // The call's own bindings are in force while the arguments are read, so
+        // a closure parameter typed at the receiver's `T` reads as what `T` is
+        // here.
+        let saved = self.enter_substitution(substitution.clone().into_iter().collect());
+        for (parameter_id, argument) in function.parameters.iter().zip(argument_ids) {
+            let Some(parameter) = self.program.parameters.get(parameter_id) else {
+                continue;
+            };
+            // A closure LITERAL carries no type of its own: its parts do. The
+            // declared closure type's return binds against the body's tail,
+            // and its parameters against the literal's parameters.
+            if let Some(Expr::Closure(closure_id)) = self.program.entity_map.get(argument)
+                && let Some(closure) = self.program.closures.get(closure_id)
+                && let Some(Type::Closure(declared_parameters, declared_return, _)) =
+                    self.program.type_id_to_type_map.get(&parameter.type_id)
+            {
+                for (declared, literal) in declared_parameters.iter().zip(&closure.parameters) {
+                    if let Some(literal) = self.program.parameters.get(literal) {
+                        self.bind_parameters(
+                            &open,
+                            *declared,
+                            self.concrete(literal.type_id),
+                            &mut bound,
+                        );
+                    }
+                }
+                let (declared_return, tail) = (*declared_return, closure.return_);
+                match closure.return_type_id.or_else(|| self.type_of(tail)) {
+                    Some(tail_type) => {
+                        self.bind_parameters(
+                            &open,
+                            declared_return,
+                            self.concrete(tail_type),
+                            &mut bound,
+                        );
+                    }
+                    // A tail the analyzer typed nowhere — a variant
+                    // constructor, `Ok(n * 2)` — is read through the
+                    // constructor's own arguments, which is the answer
+                    // [`Self::variant_arguments`] already gives its emission.
+                    None => {
+                        self.bind_through_a_constructor(&open, declared_return, tail, &mut bound)
+                    }
+                }
+                continue;
+            }
+            let Some(actual) = self.type_of(*argument) else {
+                continue;
+            };
+            self.bind_parameters(&open, parameter.type_id, self.concrete(actual), &mut bound);
+        }
+        self.current_substitution = saved;
+        for (constraint_id, type_id) in bound {
+            if self.is_grounded(type_id) {
+                substitution.insert(constraint_id, type_id);
+            }
+        }
+    }
+
+    /// Binds `open` against a variant-constructor CALL whose enum `pattern`
+    /// names, through the arguments the constructor instantiates its enum at.
+    fn bind_through_a_constructor(
+        &mut self,
+        open: &[TypeId],
+        pattern: TypeId,
+        constructed: Id,
+        out: &mut HashMap<TypeId, TypeId>,
+    ) {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&constructed) else {
+            return;
+        };
+        let Some(call) = self.program.function_calls.get(call_id) else {
+            return;
+        };
+        let argument_ids = call.argument_ids.clone();
+        let variant = match self.program.entity_map.get(&call.subject_id) {
+            Some(&Expr::EnumVariant(enum_id, index)) => Some((enum_id, index)),
+            Some(Expr::Local(declaration)) => match self.program.entity_map.get(declaration) {
+                Some(&Expr::EnumVariant(enum_id, index)) => Some((enum_id, index)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some((enum_id, index)) = variant else {
+            return;
+        };
+        let Some(Type::Enum(pattern_enum, pattern_arguments)) =
+            self.program.type_id_to_type_map.get(&pattern).cloned()
+        else {
+            return;
+        };
+        if pattern_enum != enum_id {
+            return;
+        }
+        let Some(declaration) = self.program.enums.get(&enum_id).cloned() else {
+            return;
+        };
+        let Some(variant) = declaration.variants.get(index) else {
+            return;
+        };
+        // The enum's own parameters from the constructor's arguments, as
+        // [`Self::variant_arguments`] binds them — and then each one the
+        // pattern names at the same position.
+        let parameters = &declaration.generic_parameter_constraint_ids;
+        let mut enum_bound: HashMap<TypeId, TypeId> = HashMap::default();
+        for (data_type_id, argument) in variant.data_type_ids.iter().zip(&argument_ids) {
+            if let Some(argument_type) = self.operand_type(*argument) {
+                let concrete = self.concrete(argument_type);
+                self.bind_parameters(parameters, *data_type_id, concrete, &mut enum_bound);
+            }
+        }
+        for (parameter, inner_pattern) in parameters.iter().zip(&pattern_arguments) {
+            if let Some(argument) = enum_bound.get(parameter) {
+                self.bind_parameters(open, *inner_pattern, *argument, out);
+            }
+        }
+    }
+
+    /// An operand's type where the analyzer banked none for the expression
+    /// itself: an ARITHMETIC binary expression is its LEFT operand's type
+    /// (vilan has no implicit widening — both sides are one type, and a literal
+    /// takes its partner's), so `n * 2` is `n`'s. Only the left is read, and
+    /// never through a `+` that touches a string: `"" + "text " + n` is an
+    /// i-string's concatenation and a `str`, which reading an operand would
+    /// get wrong — so that answers nothing and the parameter stays unbound
+    /// (a refusal by name, never a guess).
+    fn operand_type(&self, id: Id) -> Option<TypeId> {
+        if let Some(recorded) = self.type_of(id) {
+            return Some(recorded);
+        }
+        match self.program.entity_map.get(&id)? {
+            Expr::Binary(
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem,
+                left,
+                _,
+            ) if !self.concatenates_a_string(id) => self.operand_type(*left),
+            // A concatenation IS a `str` — the one answer the operands cannot
+            // be trusted for, so it is read off the type table instead.
+            Expr::Binary(BinaryOp::Add, _, _) => self.str_type(),
+            _ => None,
+        }
+    }
+
+    /// The type table's `str`, if the program interned one (every program
+    /// that concatenates did).
+    fn str_type(&self) -> Option<TypeId> {
+        self.program
+            .type_id_to_type_map
+            .iter()
+            .filter(|(_, resolved)| {
+                matches!(resolved, Type::Struct(struct_id, arguments)
+                    if arguments.is_empty()
+                        && self.program.structs.get(struct_id).is_some_and(|declaration| declaration.name == "str"))
+            })
+            .map(|(type_id, _)| *type_id)
+            .min_by_key(|type_id| type_id.0)
+    }
+
+    /// Whether a `+` chain has a string literal or a `str`-typed operand
+    /// anywhere in it.
+    fn concatenates_a_string(&self, id: Id) -> bool {
+        match self.program.entity_map.get(&id) {
+            Some(Expr::String(_) | Expr::MultilineString(_)) => true,
+            Some(Expr::Binary(BinaryOp::Add, left, right)) => {
+                self.concatenates_a_string(*left) || self.concatenates_a_string(*right)
+            }
+            _ => self.is_str(id),
+        }
+    }
+
     /// The substitution a trait DEFAULT body is specialized under: the trait's
     /// own generic parameters bound to the arguments `type_id` implements the
     /// trait at, plus the providing impl's binders bound from the concrete
@@ -5367,6 +5572,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     self.bind_parameters(parameters, *inner_pattern, *inner_concrete, out);
                 }
             }
+            // F38: a closure type binds through its parameters and its return —
+            // `and_then<U>(self, fn: |T| Result<U, E>)` learns `U` from the
+            // closure it is handed.
+            Some(Type::Closure(pattern_parameters, pattern_return, _)) => {
+                let (pattern_parameters, pattern_return) =
+                    (pattern_parameters.clone(), *pattern_return);
+                let Some(Type::Closure(concrete_parameters, concrete_return, _)) =
+                    self.program.type_id_to_type_map.get(&concrete).cloned()
+                else {
+                    return;
+                };
+                for (inner_pattern, inner_concrete) in
+                    pattern_parameters.iter().zip(concrete_parameters.iter())
+                {
+                    self.bind_parameters(parameters, *inner_pattern, *inner_concrete, out);
+                }
+                self.bind_parameters(parameters, pattern_return, concrete_return, out);
+            }
             _ => {}
         }
     }
@@ -7766,6 +7989,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let mut substitution =
             self.call_substitution(call_id, target, &function_call.generic_argument_ids);
         self.close_open_bindings_from_position(&mut substitution, target);
+        self.close_open_bindings_from_arguments(
+            &mut substitution,
+            target,
+            &function_call.argument_ids,
+        );
         // F21: an `Option` whose payload is a VIEW is a `&`/`&mut` natively,
         // and the only position that carries it today is a `match` subject,
         // where the leg binds the reference and reads through it. Anywhere else
