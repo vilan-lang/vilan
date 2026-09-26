@@ -34838,11 +34838,7 @@ impl<'src> Analyzer<'src> {
         callee_id: Id,
         substitution: &mut SubstitutionContext,
     ) {
-        let Some(expected_id) = self.expected_types.get(&call_id).copied() else {
-            return;
-        };
-        let expected = expected_id.get_type(self);
-        if matches!(expected, Type::Unknown | Type::Unresolved | Type::Any) {
+        if !self.expected_types.contains_key(&call_id) {
             return;
         }
         let Some((_, own_generics)) = self.method_signature(callee_id) else {
@@ -34852,7 +34848,31 @@ impl<'src> Analyzer<'src> {
             .into_iter()
             .filter(|generic| !substitution.contains_key(generic))
             .collect();
+        self.bind_open_generics_from_expectation(call_id, callee_id, open, substitution);
+    }
+
+    /// The expectation step itself, over an explicit OPEN set: the callee's
+    /// own generics for [`Self::bind_callee_own_generics_from_expectation`],
+    /// and — for B389's literal step — every generic a literal argument alone
+    /// would fix, which includes an IMPL binder a static reaches through its
+    /// path (`Shared::new(0)`'s `T`, from `impl Shared<type T>`): those are no
+    /// generic of the function's own, so the own-generics filter dropped them
+    /// and the literal took `i32` at every position (B406).
+    fn bind_open_generics_from_expectation(
+        &mut self,
+        call_id: Id,
+        callee_id: Id,
+        open: Vec<TypeId>,
+        substitution: &mut SubstitutionContext,
+    ) {
         if open.is_empty() {
+            return;
+        }
+        let Some(expected_id) = self.expected_types.get(&call_id).copied() else {
+            return;
+        };
+        let expected = expected_id.get_type(self);
+        if matches!(expected, Type::Unknown | Type::Unresolved | Type::Any) {
             return;
         }
         let declared_return_id = match self.expr_id_to_expr_map.get(&callee_id) {
@@ -44092,7 +44112,12 @@ impl<'src> Analyzer<'src> {
             return;
         }
         let mut trial = substitution.clone();
-        self.bind_callee_own_generics_from_expectation(call_id, callee_id, &mut trial);
+        self.bind_open_generics_from_expectation(
+            call_id,
+            callee_id,
+            literal_generics.clone(),
+            &mut trial,
+        );
         for generic in literal_generics {
             if let Some(bound) = trial.get(&generic).copied()
                 && self.numeric_primitive_name(&bound.get_type(self)).is_some()
@@ -46880,6 +46905,27 @@ impl<'src> Analyzer<'src> {
         substitution_context: &SubstitutionContext,
         value_span: Span,
     ) -> FieldValueVerdict {
+        // B406: the field's type is the value's EXPECTATION, not only its
+        // constraint. A generic call binds a generic only a literal argument
+        // fixes from `expected_types` (B389's channel, the one an annotated
+        // `let` and a block tail seed), so `S { count = Shared::new(0) }`
+        // against `count: Shared<u53>` typed the literal `i32` and was
+        // refused. Seeded under this literal's substitution, and never over an
+        // expectation something nearer already recorded — and ONLY when the
+        // field's type is closed under it: a position still naming one of the
+        // literal's own open parameters (`inferable_generics`) is what this
+        // value is about to DECIDE, not a target for it, and seeding it let a
+        // `list.map(..)` bind its `U` to the open `List<T>` and take nothing
+        // from its closure (B225's kolt shape compiled clean).
+        let expected = self.substitute_type(field_type, substitution_context);
+        let mut mentioned = Vec::new();
+        self.collect_generics(&expected, 0, &mut mentioned);
+        if !mentioned
+            .iter()
+            .any(|generic| self.inferable_generics.contains(generic))
+        {
+            self.seed_expectation(value_id, &expected);
+        }
         let value_type = self.infer_type(value_id, field_type, substitution_context);
         if let Type::Unresolved = value_type {
             return FieldValueVerdict::Deferred;

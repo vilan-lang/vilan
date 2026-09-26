@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: fix -->
+**A literal passed to a generic constructor takes its type from where the call lands: `S { count = Shared::new(0) }` against `count: Shared<u53>` compiles, as do `let x: Shared<u53> = Shared::new(3)` and a `Shared::new(4)` returned as a `Shared<u53>` — each was refused "Expected Shared<u53>, but got Shared<i32>".** B389's literal law binds a generic only a literal argument fixes from the call's expectation, but asked only about the function's OWN generics — and `Shared::new`'s `T` belongs to `impl Shared<type T>`, the path it is reached through, so the literal defaulted to `i32` at every position. A struct literal's field also never recorded its type as the value's expectation. Both now hold, so std's `rpc.vl` needs no `0usize` suffixes under the index migration. (B406)
+
 <!-- family: miscompile -->
 **A tuple passed to a mapped `dyn` position erases each element: `reads((a, b))` for `fun reads<T: (2..)>(sources: (U in T: dyn Source<U>)): T` returns `(1, "b")`, where it type-checked and then threw `s[1].get is not a function`.** A tuple literal landing at a mapped position typed its elements with no expectation, so no element was recorded as coerced into its object and the raw values reached a comprehension that reads each element as a `(value, table)` pair. The mapped position now directs its elements the way a written tuple of `dyn` always did, once the source tuple is known: each element lands at its own `dyn Source<X>` and is erased there, and an element that is already an object is not wrapped twice. (B398)
 
