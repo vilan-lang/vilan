@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: miscompile -->
+**A value erases to a trait object only at the object's arguments: `show(root.mapped(|n| { n * 2; }))` for `fun show(source: dyn Src<i32>)` is refused "Expected dyn Src<i32>, but got Mapped<Root, i32, void>", where it checked clean and printed `NaN`.** The closure's `;` made the node a `Src<void>`, and the coercion asked only whether the value implements `Src` at all. It now asks at the arguments the object names; a value that provides the trait at them — or whose arguments are not yet decided — erases as before. (B421)
+
 <!-- family: diagnostics -->
 **A comprehension over a value of a tuple-bounded parameter names the bound: `(x in source.get() => ..)` with `source.get(): T` and `T: (2..)` now says "got T, a type parameter bounded `(2..)`: the bound makes it a tuple, but a VALUE of a bounded tuple parameter is not a comprehension source today …", where it read as though `T` were no tuple at all.** A concrete tuple source keeps the plain sentence. (E223)
 

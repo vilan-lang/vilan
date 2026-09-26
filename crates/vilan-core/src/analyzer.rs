@@ -38636,17 +38636,29 @@ impl<'src> Analyzer<'src> {
             // `note_dyn_coercion` takes it at the one seam where the value's own
             // type and its position's expectation are both known, which is the
             // seam B340's `Callable` coercion already uses.
+            //
+            // B421: AT the object's arguments. The value must implement the
+            // trait as the object names it — `Mapped<Root, i32, void>`
+            // implements `Src<void>`, not `Src<i32>` — or a closure whose body
+            // ends in `;` became a `dyn Src<i32>` whose `get` answered
+            // `undefined` (`NaN` one `+ 1` later). `type_implements_trait_at`
+            // is conservative: only a value that positively provides the trait
+            // at OTHER arguments is turned away.
             (
                 Type::Dyn(trait_id, dyn_arguments),
                 Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..),
-            ) if self.type_implements_trait(b, *trait_id) => {
+            ) if self.type_implements_trait(b, *trait_id)
+                && self.type_implements_trait_at(b, *trait_id, dyn_arguments) =>
+            {
                 let bindings = self.dyn_erasure_bindings(b, *trait_id, dyn_arguments);
                 (a.clone(), bindings)
             }
             (
                 Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..),
                 Type::Dyn(trait_id, dyn_arguments),
-            ) if self.type_implements_trait(a, *trait_id) => {
+            ) if self.type_implements_trait(a, *trait_id)
+                && self.type_implements_trait_at(a, *trait_id, dyn_arguments) =>
+            {
                 let bindings = self.dyn_erasure_bindings(a, *trait_id, dyn_arguments);
                 (b.clone(), bindings)
             }
@@ -38663,9 +38675,13 @@ impl<'src> Analyzer<'src> {
             // known — `note_dyn_coercion`, the same seam that records the
             // erasure.
             (
-                Type::Dyn(trait_id, _),
+                Type::Dyn(trait_id, dyn_arguments),
                 Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..),
-            ) if self.type_implements_trait(b, *trait_id) => (a.clone(), Vec::new()),
+            ) if self.type_implements_trait(b, *trait_id)
+                && self.type_implements_trait_at(b, *trait_id, dyn_arguments) =>
+            {
+                (a.clone(), Vec::new())
+            }
             // The same trait on both sides (e.g. `self` typed `Iterator<T>` in an
             // `impl Iterator<type T>` block, returned where `Iterator<T>` is
             // declared): reconcile like the nominal arms above.

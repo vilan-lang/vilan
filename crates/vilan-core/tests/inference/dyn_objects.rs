@@ -958,3 +958,65 @@ fn b412_a_parameter_not_bounded_by_the_objects_trait_is_still_refused() {
         "Expected dyn Src<i32>, but got S",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B421 — MISCOMPILE: a `dyn` coercion checked the trait, not its ARGUMENTS
+// ---------------------------------------------------------------------------
+//
+// `show(root.mapped(|n| { n * 2; }))` for `fun show(source: dyn Src<i32>)`
+// checked clean and printed `NaN`: the closure's `;` made the node a
+// `Mapped<Root, i32, void>` — a `Src<void>` — and the erasure asked only
+// whether the value implements `Src` at all. The coercion now asks at the
+// object's arguments (conservatively: only a value that positively provides
+// the trait at OTHER arguments is refused).
+
+const B421_NODE: &str = concat!(
+    "import std::io::print;\n",
+    "trait Src<T> { fun get(self): T; }\n",
+    "struct Root { value: i32 }\n",
+    "impl Root with Src<i32> { fun get(self): i32 { self.value } }\n",
+    "struct Mapped<S, T, U> { up: S, transform: |T| U }\n",
+    "impl Mapped<type S: Src<type T>, T, type U> with Src<U> {\n",
+    "\tfun get(self): U { (self.transform)(self.up.get()) }\n",
+    "}\n",
+    "impl type S: Src<type T> {\n",
+    "\tfun mapped<U>(self, transform: |T| U): Mapped<S, T, U> { Mapped<S, T, U> { up = self, transform } }\n",
+    "}\n",
+    "fun show(source: dyn Src<i32>) { print(source.get() + 1); }\n",
+);
+
+/// reactive-42's repro: refused where it printed `NaN`.
+#[test]
+fn b421_a_void_closure_node_does_not_erase_to_an_object_of_i32() {
+    assert_fails_with(
+        &format!(
+            "{B421_NODE}{}",
+            concat!(
+                "fun main() {\n",
+                "\tlet root = Root { value = 4 };\n",
+                "\tshow(root.mapped(|n| {\n",
+                "\t\tn * 2;\n",
+                "\t}));\n",
+                "}\n",
+            )
+        ),
+        "Expected dyn Src<i32>, but got Mapped<Root, i32, void> instead.",
+    );
+}
+
+/// The control: the same node with a value-producing body erases and runs.
+#[test]
+fn b421_a_node_at_the_objects_arguments_still_erases() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B421_NODE}{}",
+            concat!(
+                "fun main() {\n",
+                "\tlet root = Root { value = 4 };\n",
+                "\tshow(root.mapped(|n| n * 2));\n",
+                "}\n",
+            )
+        ),
+        "9\n",
+    );
+}
