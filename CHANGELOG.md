@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: miscompile -->
+**An unsuffixed literal its context types `BigInt` is emitted as a BigInt: `tb(3)` for `fun tb(v: BigInt): BigInt { v + 1n }` prints `4n`, where it threw "Cannot mix BigInt and other types" at run time.** The literal law typed the `3` as `BigInt` from the parameter (and from an annotated `let`, or the other operand of a binary), and the emitter still wrote the JS number `3`. It now writes `3n` wherever the literal's settled type is `BigInt`. (B404)
+
 <!-- family: feature -->
 **A generic parameter erases to a trait object its bounds promise: inside a blanket over `S: Source<X>`, `let object: dyn Source<X> = self` compiles, as do `fun erase<S: Src<i32>>(s: S): dyn Src<i32> { s }`, `show(s)` into a `dyn` parameter, a `List<dyn Src<i32>>` element, and a generic caller's `(a, b)` into a mapped `(U in T: dyn Source<U>)` — each was "Expected dyn Source<X>, but got S".** Only a concrete value could be erased. The enclosing declaration's own parameter now erases where its declared bounds (supertraits included) provide the object's trait at the object's arguments, and the pair is built per instance on both backends; an instance at which the parameter is itself an object passes it through rather than wrapping it twice. A parameter bounded by another trait, or by this one at other arguments, is still refused. (B412)
 

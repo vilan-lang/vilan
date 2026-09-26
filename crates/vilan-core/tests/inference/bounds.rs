@@ -13170,6 +13170,32 @@ fn b405_a_float_peer_and_the_converted_spelling_still_run() {
     );
 }
 
+// --- B404: an UNSUFFIXED literal typed `BigInt` by its context emits a
+// --- BigInt. B370/B389's literal law types `3` as `BigInt` at `tb(3)` for
+// --- `fun tb(v: BigInt)`, but the emitter wrote `3` — a JS number — and
+// --- `v + 1n` inside threw "Cannot mix BigInt and other types".
+
+/// Every position the literal law types from: an argument, an annotated
+/// `let`, a negative argument, and the right operand beside a `BigInt`.
+#[test]
+fn b404_an_unsuffixed_literal_typed_bigint_emits_a_bigint() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun tb(v: BigInt): BigInt { v + 1n }\n",
+            "fun main() {\n",
+            "\tprint(tb(3));\n",
+            "\tlet b: BigInt = 7;\n",
+            "\tprint(b * 2n);\n",
+            "\tprint(tb(-4));\n",
+            "\tlet c: BigInt = 5n;\n",
+            "\tprint(c + 1);\n",
+            "}\n",
+        ),
+        "4n\n14n\n-3n\n6n\n",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // E218: a numeric mismatch names its conversion
 // ---------------------------------------------------------------------------

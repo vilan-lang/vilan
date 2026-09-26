@@ -44062,9 +44062,10 @@ impl<'src> Analyzer<'src> {
         let Some(name) = self.numeric_primitive_name(constraint) else {
             return;
         };
-        // An unsuffixed literal typed `BigInt` still EMITS as a JS number
-        // (`tb(3)` for `fun tb(v: BigInt)` throws "Cannot mix BigInt and other
-        // types" today), so a binding is not steered into that.
+        // A binding is not steered into `BigInt`. The reason given when this
+        // was written — an unsuffixed literal typed `BigInt` emitted as a JS
+        // number — is gone since B404; admitting `BigInt` here is a change to
+        // what an unannotated binding means, and it is left for its own item.
         if name == "BigInt" || self.literal_let_expectations.contains_key(&variable_id) {
             return;
         }
