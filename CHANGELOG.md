@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: miscompile -->
+**A trait override is selected through a bound whose trait argument is a tuple or an array: `fun through<T, S: Src<T>>(s: S) { s.label() }` at `T = (i32, i32)` runs the impl's `label`, where it ran the trait's DEFAULT (JS printed `default`).** Re-dispatch through a bound asks for the impl providing `Src<(i32, i32)>`, and the instantiation filter compared a tuple argument by its type ids — minted per spelling, never interned — so the wanted `(i32, i32)` never matched the provided one and the impl was turned down. Tuples and fixed arrays now compare element by element, on both backends; two impls of one trait at different tuple arguments still stay apart. (B410)
+
 <!-- family: fix -->
 **A fractional literal beside an integer operand is refused with the conversion that fixes it: `let y: i32 = 3; y / 2.0` is "the literal `2.0` is fractional, and the other operand of `/` is `i32` … Convert the integer first — `y.as_f64()` — or write an integer literal", where it printed `1`.** A binary takes its type from its left operand, so a fractional literal on the RIGHT of an integer was computed in that integer type: the division truncated with no diagnostic. The refusal covers every binary operator (`n * 2.5`, `n < 0.5`, `y * -0.5`). A fractional literal on the LEFT types the expression `f64` itself (`1000.0 * count` is a float product — the numeric mixing B148 deferred), and two literals (`3 / 2.0` is `1.5`), a float peer and a suffixed float are unchanged. (B405)
 

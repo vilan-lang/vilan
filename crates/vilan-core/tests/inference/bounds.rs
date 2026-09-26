@@ -13326,3 +13326,92 @@ fn e218_a_bigint_target_carries_no_conversion() {
         E218_STEER,
     );
 }
+
+// ---------------------------------------------------------------------------
+// B410 — MISCOMPILE: an override selected through a bound whose trait
+// argument is a TUPLE
+// ---------------------------------------------------------------------------
+//
+// `through<T, S: Src<T>>(s) { s.label() }` with `T = (i32, i32)` ran the
+// trait's DEFAULT `label` where the impl overrides it (JS printed `default`).
+// The emitter re-dispatches the call through the impl that provides
+// `Src<(i32, i32)>`, and its instantiation filter (`instantiation_agrees`)
+// compared a TUPLE argument by its type ids — minted per spelling, never
+// interned — so the wanted `(i32, i32)` never agreed with the provided one,
+// the impl was turned down, and the trait's default answered. Arrays had the
+// same hole. Tuples and arrays now compare element-wise.
+
+/// reactive-41's repro: five instantiations, every one the override.
+#[test]
+fn b410_an_override_is_selected_through_a_bound_at_a_tuple_argument() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> {\n",
+            "\tfun get(self): T;\n",
+            "\tfun label(self): str { \"default\" }\n",
+            "}\n",
+            "struct Id<T> { v: T }\n",
+            "impl Id<type T> with Src<T> {\n",
+            "\tfun get(self): T { self.v }\n",
+            "\tfun label(self): str { \"id override\" }\n",
+            "}\n",
+            "fun through<T, S: Src<T>>(s: S): str { s.label() }\n",
+            "fun through2<S: Src<(i32, i32)>>(s: S): str { s.label() }\n",
+            "fun main() {\n",
+            "\tprint(through(Id { v = 1 }));\n",
+            "\tlet b = Id { v = (1, 2) };\n",
+            "\tprint(through(b));\n",
+            "\tprint(through2(b));\n",
+            "\tprint(through(Id { v = [1] }));\n",
+            "\tprint(through(Id { v = Some(1) }));\n",
+            "}\n",
+        ),
+        "id override\nid override\nid override\nid override\nid override\n",
+    );
+}
+
+/// A fixed ARRAY argument, and a tuple nested inside a nominal one.
+#[test]
+fn b410_an_override_is_selected_through_a_bound_at_an_array_and_a_nested_tuple() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> {\n",
+            "\tfun get(self): T;\n",
+            "\tfun label(self): str { \"default\" }\n",
+            "}\n",
+            "struct Id<T> { v: T }\n",
+            "impl Id<type T> with Src<T> {\n",
+            "\tfun get(self): T { self.v }\n",
+            "\tfun label(self): str { \"id override\" }\n",
+            "}\n",
+            "fun through<T, S: Src<T>>(s: S): str { s.label() }\n",
+            "fun main() {\n",
+            "\tlet pair: [i32; 2] = [1, 2];\n",
+            "\tprint(through(Id { v = pair }));\n",
+            "\tprint(through(Id { v = Some((1, \"a\")) }));\n",
+            "}\n",
+        ),
+        "id override\nid override\n",
+    );
+}
+
+/// The instantiation filter still SEPARATES tuple arguments that differ: two
+/// impls of one trait at `(i32, i32)` and `(str, str)` each answer their own.
+#[test]
+fn b410_two_tuple_instantiations_of_one_trait_stay_apart_through_a_bound() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Tag<T> { fun tag(self): str; }\n",
+            "struct Box {}\n",
+            "impl Box with Tag<(i32, i32)> { fun tag(self): str { \"ints\" } }\n",
+            "impl Box with Tag<(str, str)> { fun tag(self): str { \"strs\" } }\n",
+            "fun ints<S: Tag<(i32, i32)>>(s: S): str { s.tag() }\n",
+            "fun strs<S: Tag<(str, str)>>(s: S): str { s.tag() }\n",
+            "fun main() { print(ints(Box {})); print(strs(Box {})); }\n",
+        ),
+        "ints\nstrs\n",
+    );
+}

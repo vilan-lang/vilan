@@ -528,10 +528,35 @@ fn ground(program: &Program, type_id: TypeId, bindings: &HashMap<TypeId, TypeId>
 /// treated as agreeing — the same leniency the transformer's older
 /// `trait_instantiation_conflicts` applied, so a program whose arguments were
 /// already unambiguous keeps its answer.
+///
+/// A TUPLE and an ARRAY compare element-wise too (B410). Their element types
+/// are ids, minted per spelling and never interned, so the bare `left ==
+/// right` below compared two spellings of `(i32, i32)` by id and answered no:
+/// an impl providing `Src<(i32, i32)>` was turned down for exactly that
+/// instantiation, and a call through a `Src<T>` bound at `T = (i32, i32)` ran
+/// the trait's DEFAULT where the impl overrides it.
 fn instantiation_agrees(program: &Program, wanted: &Type, provided: &Type) -> bool {
+    // A walk that gives up proves nothing, so it answers NO.
+    let Some(_guard) = crate::util::RecursionGuard::enter() else {
+        return false;
+    };
     if !is_resolvable(wanted) || !is_resolvable(provided) {
         return true;
     }
+    let elements_agree = |left: &[TypeId], right: &[TypeId]| {
+        left.len() == right.len()
+            && left.iter().zip(right).all(|(wanted_id, provided_id)| {
+                match (
+                    program.type_id_to_type_map.get(wanted_id),
+                    program.type_id_to_type_map.get(provided_id),
+                ) {
+                    (Some(wanted), Some(provided)) => {
+                        instantiation_agrees(program, wanted, provided)
+                    }
+                    _ => true,
+                }
+            })
+    };
     match (wanted, provided) {
         (Type::Struct(left, left_arguments), Type::Struct(right, right_arguments))
         | (Type::Enum(left, left_arguments), Type::Enum(right, right_arguments)) => {
@@ -541,17 +566,16 @@ fn instantiation_agrees(program: &Program, wanted: &Type, provided: &Type) -> bo
             if left_arguments.is_empty() || right_arguments.is_empty() {
                 return true;
             }
-            left_arguments.len() == right_arguments.len()
-                && left_arguments.iter().zip(right_arguments).all(
-                    |(wanted_id, provided_id)| match (
-                        program.type_id_to_type_map.get(wanted_id),
-                        program.type_id_to_type_map.get(provided_id),
-                    ) {
-                        (Some(wanted), Some(provided)) => {
-                            instantiation_agrees(program, wanted, provided)
-                        }
-                        _ => true,
-                    },
+            elements_agree(left_arguments, right_arguments)
+        }
+        (Type::Tuple(left_elements), Type::Tuple(right_elements)) => {
+            elements_agree(left_elements, right_elements)
+        }
+        (Type::Array(left_element, left_length), Type::Array(right_element, right_length)) => {
+            left_length == right_length
+                && elements_agree(
+                    std::slice::from_ref(left_element),
+                    std::slice::from_ref(right_element),
                 )
         }
         (left, right) => left == right,
