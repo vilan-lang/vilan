@@ -12808,6 +12808,92 @@ fn b389_the_thirteen_passing_positions_stay_passing_f64() {
     b389_controls("f64");
 }
 
+// --- B406: B389's remaining gap — a literal passed to a GENERIC CONSTRUCTOR
+// --- inside a struct literal's FIELD takes its type from the field.
+// --- `S { count = Shared::new(0) }` against `count: Shared<u53>` was refused
+// --- "Expected Shared<u53>, but got Shared<i32>": the field's type reached the
+// --- value as a constraint, and the call binds a literal-only generic from its
+// --- EXPECTATION (B389's channel), which a field never seeded. std's rpc.vl
+// --- carried two `0usize` suffixes for it (index-41's gap patch).
+
+/// The item's shape, at the widths the index migration meets it at and one
+/// float: a literal argument to `Shared::new` inside a field.
+fn b406_field_constructor(ty: &str) {
+    b389_runs(
+        ty,
+        "import std::shared::Shared;\nstruct Counter { count: Shared<WIDTH> }\n",
+        "\tlet c = Counter { count = Shared::new(3) };\n\tprint(take(c.count.read()));",
+        "3\n",
+    );
+}
+
+#[test]
+fn b406_a_generic_constructors_literal_in_a_field_takes_the_fields_type_u53() {
+    b406_field_constructor("u53");
+}
+
+#[test]
+fn b406_a_generic_constructors_literal_in_a_field_takes_the_fields_type_usize() {
+    b406_field_constructor("usize");
+}
+
+#[test]
+fn b406_a_generic_constructors_literal_in_a_field_takes_the_fields_type_u8() {
+    b406_field_constructor("u8");
+}
+
+#[test]
+fn b406_a_generic_constructors_literal_in_a_field_takes_the_fields_type_f64() {
+    b406_field_constructor("f64");
+}
+
+/// The premise, corrected: the gap was never the FIELD's alone. The literal
+/// generic of a STATIC reached through its impl's path (`Shared::new`'s `T`,
+/// an `impl Shared<type T>` binder, not a generic of `new`'s own) was left out
+/// of B389's expectation step at every position — an annotated `let` and a
+/// declared return refused the same program.
+#[test]
+fn b406_an_impl_binder_literal_takes_the_expectation_at_a_let_and_a_return() {
+    b389_runs(
+        "u53",
+        "import std::shared::Shared;\nfun made(): Shared<WIDTH> { Shared::new(4) }\n",
+        "\tlet x: Shared<WIDTH> = Shared::new(3);\n\tprint(take(x.read()));\n\tprint(take(made().read()));",
+        "3\n4\n",
+    );
+}
+
+/// index-42's relay, kolt's shape: `let selected_index: SignalCell<usize> =
+/// Signal::new(0)` — a static reached through another type's path whose
+/// return names the binder.
+#[test]
+fn b406_kolts_signal_new_literal_takes_the_annotated_width() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ Signal, SignalCell };\n",
+            "fun main() {\n",
+            "\tlet selected_index: SignalCell<usize> = Signal::new(0);\n",
+            "\tlet a: SignalCell<u53> = SignalCell::new(3);\n",
+            "\tprint(i\"{selected_index.get()} {a.get()}\");\n",
+            "}\n",
+        ),
+        "0 3\n",
+    );
+}
+
+/// The control: a non-numeric field still refuses a numeric literal.
+#[test]
+fn b406_a_literal_constructor_argument_still_mismatches_a_non_numeric_field() {
+    assert_fails_with(
+        concat!(
+            "import std::shared::Shared;\n",
+            "struct Named { name: Shared<str> }\n",
+            "fun main() { let n = Named { name = Shared::new(0) }; }\n",
+        ),
+        "Expected Shared<str>, but got Shared<i32>",
+    );
+}
+
 // --- B396: a SECOND bound over `T` on a generic function's `S` stopped the
 // --- argument that determines `T` from binding it. `trait_args_for` answers a
 // --- blanket's still-abstract arguments as its fallback, and

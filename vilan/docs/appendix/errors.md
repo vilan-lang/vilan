@@ -519,7 +519,10 @@ through it, and `lt`/`le`/`gt`/`ge` come free as defaults).
 **"the literal `…` is out of range for `…` (…)"**
 The number doesn't fit the type. For `i53`/`u53`/`usize` the range is
 ±2^53 (non-negative for the unsigned two), JavaScript's exact-integer
-window. Bigger integers take `BigInt` (`7n`).
+window. Bigger integers take `BigInt` (`7n`). A negative literal at an
+unsigned type (`let n: usize = -1`) is refused with its own message, which
+names the type's range: an unsigned value is never below zero, and a
+"nothing here" sentinel is `None` in an `Option<usize>`.
 → [Values and types](../tour/values-and-types.md)
 
 **"unknown numeric suffix `…`"**

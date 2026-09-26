@@ -435,10 +435,10 @@ impl SignalCell<type T> with MaybeSignal<T> {      // signals, reactively
 fun badge<V: MaybeSignal<str>>(label: V) { … }  // takes both, no ceremony
 ```
 
-A blanket implementation is reachable from a **concrete** type this way,
-and never from an **abstract** one. Whether a generic parameter satisfies
-a bound is answered from that parameter's own **declared bounds alone** —
-no impl is consulted, blanket or otherwise:
+A blanket implementation satisfies a bound for a **concrete** type this
+way, and never for an **abstract** one. Whether a generic parameter
+satisfies a bound is answered from that parameter's own **declared bounds
+alone** — no impl is consulted, blanket or otherwise:
 
 ```vilan,fragment
 trait Wrap<T> { fun unwrap(self): T; }
@@ -459,6 +459,19 @@ reach. Monomorphization is where the question has a real answer, so the
 concrete check is the one that counts and a declared bound is what an
 abstract call may lean on. The refusal names the parameter and the bound
 it lacks, which is the edit that fixes it.
+
+A blanket's **methods** are the other direction, and they are reachable
+from an abstract parameter. A member that a blanket written over the
+parameter's declared bounds provides answers a call on it — `impl type S:
+Src<type T> { fun twice(self): (T, T) { … } }` answers `s.twice()` inside
+`fun f<S: Src<i32>>(s: S)` — because every instantiation satisfies those
+bounds and so reaches the blanket. The bounds must entail the blanket's,
+arguments included: a blanket over `Src<str>` is not reached through
+`S: Src<i32>`. Through the bound the parameter stays opaque. An inherent
+blanket member is called as written, and the concrete type's own
+same-named inherent member is out of scope there; a trait member the
+blanket provides dispatches at monomorphization to the most specific impl
+of that trait, as every call through a bound does.
 
 Because the instantiation is decided first, a `SignalCell<str>` reaches the
 `Signal` impl under a `MaybeSignal<str>` bound and the blanket under a

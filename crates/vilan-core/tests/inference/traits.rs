@@ -7097,3 +7097,279 @@ fn e220_the_directly_implemented_trait_is_rendered_at_its_clause() {
         "'Cell' does not implement trait 'Base<i32>': missing 'read'; declare `fun read(self): i32`",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B408 — a BLANKET method reached through an ABSTRACT bound
+// ---------------------------------------------------------------------------
+//
+// `fun f<S: Src<i32>>(s: S) { s.twice() }` was refused "S has no method
+// 'twice'" when `twice` is a blanket over `S: Src<T>`: the bounded-parameter
+// arm of method lookup searched the bound TRAITS for the name and nothing
+// else, so no blanket was ever consulted for an abstract receiver — while the
+// same call on a concrete receiver resolved. std met it as `.cell()` and
+// `.distinct()` in generic code, and A124 S2c's blanket `map` would have met it
+// at every generic `s.map(..)`. A blanket now answers when the parameter's
+// DECLARED bounds entail every bound its binders carry; the call binds the
+// blanket's binders to the caller's own parameters and composes per instance.
+
+/// The item's repro, the explicit generic spelling.
+#[test]
+fn b408_a_blanket_method_is_reachable_through_an_explicit_generic_bound() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> { fun get(self): T; }\n",
+            "struct Root { v: i32 }\n",
+            "impl Root with Src<i32> { fun get(self): i32 { self.v } }\n",
+            "impl type S: Src<type T> { fun twice(self): (T, T) { (self.get(), self.get()) } }\n",
+            "fun through<S: Src<i32>>(s: S): i32 {\n",
+            "\tlet (a, b) = s.twice();\n",
+            "\ta + b\n",
+            "}\n",
+            "fun main() { print(through(Root { v = 2 })); }\n",
+        ),
+        "4\n",
+    );
+}
+
+/// The implicit spelling (B186): a trait written as the parameter's type is
+/// the same bounded parameter, and reaches the same blanket.
+#[test]
+fn b408_a_blanket_method_is_reachable_through_an_implicit_trait_parameter() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> { fun get(self): T; }\n",
+            "struct Root { v: i32 }\n",
+            "impl Root with Src<i32> { fun get(self): i32 { self.v } }\n",
+            "impl type S: Src<type T> { fun twice(self): (T, T) { (self.get(), self.get()) } }\n",
+            "fun through(s: Src<i32>): i32 {\n",
+            "\tlet (a, b) = s.twice();\n",
+            "\ta + b\n",
+            "}\n",
+            "fun main() { print(through(Root { v = 5 })); }\n",
+        ),
+        "10\n",
+    );
+}
+
+/// The blanket's bare-trait subject spelling (`impl Src<type T>`, B299) is the
+/// same blanket and is reached the same way.
+#[test]
+fn b408_a_bare_trait_subject_blanket_is_reachable_through_a_bound() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> { fun get(self): T; }\n",
+            "struct Root { v: i32 }\n",
+            "impl Root with Src<i32> { fun get(self): i32 { self.v } }\n",
+            "impl Src<type T> { fun twice(self): (T, T) { (self.get(), self.get()) } }\n",
+            "fun through<S: Src<i32>>(s: S): i32 {\n",
+            "\tlet (a, b) = s.twice();\n",
+            "\ta + b\n",
+            "}\n",
+            "fun main() { print(through(Root { v = 3 })); }\n",
+        ),
+        "6\n",
+    );
+}
+
+/// A SUPERTRAIT of the declared bound carries the blanket's bound, at the
+/// arguments the chain passes (`S: Sig<i32>` provides `Src<i32>`); the
+/// blanket's `T` is the caller's own `T` where the bound writes one, so two
+/// instantiations each get their own; and the blanket member's own generic
+/// binds at the call.
+#[test]
+fn b408_a_blanket_is_reached_through_a_supertrait_a_caller_parameter_and_own_generics() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> { fun get(self): T; }\n",
+            "trait Sig<T> with Src<T> { fun name(self): str; }\n",
+            "struct Root { v: i32 }\n",
+            "impl Root with Src<i32> { fun get(self): i32 { self.v } }\n",
+            "impl Root with Sig<i32> { fun name(self): str { \"root\" } }\n",
+            "struct Word { w: str }\n",
+            "impl Word with Src<str> { fun get(self): str { self.w } }\n",
+            "impl type S: Src<type T> {\n",
+            "\tfun twice(self): (T, T) { (self.get(), self.get()) }\n",
+            "\tfun pair_with<U>(self, u: U): (T, U) { (self.get(), u) }\n",
+            "}\n",
+            "fun through<S: Sig<i32>>(s: S): i32 { let (a, b) = s.twice(); a + b }\n",
+            "fun first<T, S: Src<T>>(s: S): T { let (a, _) = s.twice(); a }\n",
+            "fun paired<S: Src<i32>>(s: S): str { let (n, w) = s.pair_with(\"x\"); i\"{n}{w}\" }\n",
+            "fun main() {\n",
+            "\tprint(through(Root { v = 2 }));\n",
+            "\tprint(first(Root { v = 3 }));\n",
+            "\tprint(first(Word { w = \"hi\" }));\n",
+            "\tprint(paired(Root { v = 4 }));\n",
+            "}\n",
+        ),
+        "4\n3\nhi\n4x\n",
+    );
+}
+
+/// A blanket that provides a TRAIT's member (`impl type S: Src<i32> with
+/// Doubler`) is reached through a bound that never names that trait.
+#[test]
+fn b408_a_trait_member_a_blanket_provides_is_reachable_through_a_bound() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> { fun get(self): T; }\n",
+            "trait Doubler { fun doubled(self): i32; }\n",
+            "struct Root { v: i32 }\n",
+            "impl Root with Src<i32> { fun get(self): i32 { self.v } }\n",
+            "impl type S: Src<i32> with Doubler { fun doubled(self): i32 { self.get() * 2 } }\n",
+            "fun through<S: Src<i32>>(s: S): i32 { s.doubled() }\n",
+            "fun main() { print(through(Root { v = 21 })); }\n",
+        ),
+        "42\n",
+    );
+}
+
+/// std's shape, the item's own: `.cell()` and `.distinct()` — blankets over
+/// `S: Source<T>` — called in generic code, and what they return read at the
+/// concrete caller after a write.
+#[test]
+fn b408_std_cell_and_distinct_are_reachable_in_generic_code() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ Distinct, Signal, SignalCell, Source };\n",
+            "fun cached<S: Source<i32>>(s: S): SignalCell<i32> { s.cell() }\n",
+            "fun deduped<S: Source<i32>>(s: S): Distinct<S, i32> { s.distinct() }\n",
+            "fun main() {\n",
+            "\tlet a = Signal::new(3);\n",
+            "\tlet c = cached(a);\n",
+            "\tlet d = deduped(a);\n",
+            "\ta.set(5);\n",
+            "\tprint(i\"{c.get()} {d.get()}\");\n",
+            "}\n",
+        ),
+        "5 5\n",
+    );
+}
+
+/// The blanket's bound must be ENTAILED, arguments included: a blanket over
+/// `Src<str>` is not reached through `S: Src<i32>` (`compare_type` would have
+/// admitted it — it never reads a bound's arguments).
+#[test]
+fn b408_a_blanket_bounded_at_other_arguments_is_not_reached() {
+    assert_fails_with(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> { fun get(self): T; }\n",
+            "struct Root { v: i32 }\n",
+            "impl Root with Src<i32> { fun get(self): i32 { self.v } }\n",
+            "impl type S: Src<str> { fun shout(self): str { self.get() } }\n",
+            "fun through<S: Src<i32>>(s: S): str { s.shout() }\n",
+            "fun main() { print(through(Root { v = 2 })); }\n",
+        ),
+        "S has no method 'shout'",
+    );
+}
+
+/// A blanket over a trait the parameter is NOT bounded by is not reached — an
+/// abstract parameter implements what its bounds say and nothing else (B173).
+#[test]
+fn b408_a_blanket_over_an_unrelated_trait_is_not_reached() {
+    assert_fails_with(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> { fun get(self): T; }\n",
+            "trait Other { fun o(self): i32; }\n",
+            "struct Root { v: i32 }\n",
+            "impl Root with Src<i32> { fun get(self): i32 { self.v } }\n",
+            "impl type S: Other { fun twice(self): i32 { self.o() * 2 } }\n",
+            "fun through<S: Src<i32>>(s: S): i32 { s.twice() }\n",
+            "fun main() { print(through(Root { v = 2 })); }\n",
+        ),
+        "S has no method 'twice'",
+    );
+}
+
+/// A NESTED binder's bound (`Src<type T: PartialEq>`) must hold of what the
+/// caller's bound writes there: refused where the caller's `T` carries no
+/// `PartialEq`, reached where it does.
+#[test]
+fn b408_a_nested_binder_bound_must_hold_of_the_callers_argument() {
+    let blanket = concat!(
+        "import std::io::print;\n",
+        "import std::compare::PartialEq;\n",
+        "trait Src<T> { fun get(self): T; }\n",
+        "struct Root { v: i32 }\n",
+        "impl Root with Src<i32> { fun get(self): i32 { self.v } }\n",
+        "impl type S: Src<type T: PartialEq> { fun steady(self): bool { self.get() == self.get() } }\n",
+    );
+    assert_compiles_and_runs(
+        &format!(
+            "{blanket}{}",
+            concat!(
+                "fun held<T: PartialEq, S: Src<T>>(s: S): bool { s.steady() }\n",
+                "fun main() { print(held(Root { v = 1 })); }\n",
+            )
+        ),
+        "true\n",
+    );
+    assert_fails_with(
+        &format!(
+            "{blanket}{}",
+            concat!(
+                "fun unheld<T, S: Src<T>>(s: S): bool { s.steady() }\n",
+                "fun main() { print(unheld(Root { v = 1 })); }\n",
+            )
+        ),
+        "S has no method 'steady'",
+    );
+}
+
+/// Through the bound `S` is OPAQUE (B359's rule for a default body, Rust's for
+/// a bound): the concrete type's own same-named inherent member is not in
+/// scope there, so the blanket answers — while the concrete call keeps the
+/// inherent (B300's ranking).
+#[test]
+fn b408_through_a_bound_the_blanket_answers_not_the_concrete_inherent() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> { fun get(self): T; }\n",
+            "struct Root { v: i32 }\n",
+            "impl Root with Src<i32> { fun get(self): i32 { self.v } }\n",
+            "impl Root { fun label(self): str { \"inherent\" } }\n",
+            "impl type S: Src<type T> { fun label(self): str { \"blanket\" } }\n",
+            "fun through<S: Src<i32>>(s: S): str { s.label() }\n",
+            "fun main() { print(Root { v = 1 }.label()); print(through(Root { v = 1 })); }\n",
+        ),
+        "inherent\nblanket\n",
+    );
+}
+
+/// A TRAIT's member a blanket provides keeps ONE answer per type: through the
+/// bound the call re-dispatches at monomorphization to the most specific impl
+/// of the trait (spec types.md "Dispatch through a bound"), so a type with its
+/// own `impl Root with Doubler` runs its own body there exactly as at a
+/// concrete call, and a type with none runs the blanket's.
+#[test]
+fn b408_a_blanket_provided_trait_member_re_dispatches_to_the_most_specific_impl() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> { fun get(self): T; }\n",
+            "trait Doubler { fun doubled(self): i32; }\n",
+            "struct Root { v: i32 }\n",
+            "struct Leaf { v: i32 }\n",
+            "impl Root with Src<i32> { fun get(self): i32 { self.v } }\n",
+            "impl Leaf with Src<i32> { fun get(self): i32 { self.v } }\n",
+            "impl type S: Src<i32> with Doubler { fun doubled(self): i32 { self.get() * 2 } }\n",
+            "impl Root with Doubler { fun doubled(self): i32 { 1000 } }\n",
+            "fun through<S: Src<i32>>(s: S): i32 { s.doubled() }\n",
+            "fun main() {\n",
+            "\tprint(Root { v = 21 }.doubled());\n",
+            "\tprint(through(Root { v = 21 }));\n",
+            "\tprint(through(Leaf { v = 4 }));\n",
+            "}\n",
+        ),
+        "1000\n1000\n8\n",
+    );
+}

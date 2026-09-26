@@ -763,3 +763,87 @@ fun main() {
         "saw 6\n6 6\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B398 — a MAPPED-TUPLE position over a `dyn` element coerces its elements
+// ---------------------------------------------------------------------------
+//
+// `(U in T: dyn Source<U>)` type-checked and then threw `s[1].get is not a
+// function`: a tuple literal landing at a mapped position typed its elements
+// with no expectation, so no element was recorded as erased and the raw
+// values reached a comprehension that reads each as a `(value, table)` pair.
+// A concrete tuple of `dyn` (`(dyn Source<i32>, dyn Source<str>)`) always
+// coerced; the mapped position now directs its elements the same way once its
+// source is known.
+
+/// papers-41's probe `a122_09`: a mapped `dyn` parameter read through a
+/// comprehension.
+#[test]
+fn b398_a_mapped_dyn_parameter_coerces_each_element_of_a_tuple_literal() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ SignalCell, Source };\n",
+            "fun reads<T: (2..)>(sources: (U in T: dyn Source<U>)): T {\n",
+            "\t(s in sources => s.get())\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet a = SignalCell::new(1);\n",
+            "\tlet b = SignalCell::new(\"b\");\n",
+            "\tlet (x, y) = reads((a, b));\n",
+            "\tprint(i\"{x} {y}\");\n",
+            "}\n",
+        ),
+        "1 b\n",
+    );
+}
+
+/// reactive-41's `combine` repro: the mapped tuple of objects is STORED in a
+/// struct field and read later, through a method — three elements of three
+/// types, so every position's table is its own.
+#[test]
+fn b398_a_stored_mapped_dyn_tuple_reads_through_its_tables() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ Signal, SignalCell, Source };\n",
+            "struct Both<T: (2..)> { sources: (U in T: dyn Source<U>) }\n",
+            "impl Both<type T> {\n",
+            "\tfun read(self): T { (source in self.sources => source.get()) }\n",
+            "}\n",
+            "fun make<T: (2..)>(sources: (U in T: dyn Source<U>)): Both<T> { Both<T> { sources } }\n",
+            "fun main() {\n",
+            "\tlet a = Signal::new(1);\n",
+            "\tlet b = Signal::new(\"x\");\n",
+            "\tlet c = SignalCell::new(true);\n",
+            "\tlet both = make((a, b, c));\n",
+            "\ta.set(2);\n",
+            "\tlet (n, s, flag) = both.read();\n",
+            "\tprint(i\"{n} {s} {flag}\");\n",
+            "}\n",
+        ),
+        "2 x true\n",
+    );
+}
+
+/// An element that is ALREADY an object is not wrapped a second time; its
+/// neighbour, a concrete value, is.
+#[test]
+fn b398_an_element_already_an_object_is_not_wrapped_again() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ SignalCell, Source };\n",
+            "fun reads<T: (2..)>(sources: (U in T: dyn Source<U>)): T {\n",
+            "\t(s in sources => s.get())\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet a: dyn Source<i32> = SignalCell::new(7);\n",
+            "\tlet b = SignalCell::new(\"q\");\n",
+            "\tlet (x, y) = reads((a, b));\n",
+            "\tprint(i\"{x} {y}\");\n",
+            "}\n",
+        ),
+        "7 q\n",
+    );
+}

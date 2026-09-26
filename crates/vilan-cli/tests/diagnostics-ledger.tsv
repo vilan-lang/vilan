@@ -591,3 +591,4 @@ row	flagship	key
 567	-	`{name}` is a local binding, and `[internal(..)]` labels an item on a module's surface: nothing outside this body can name it, so the label has no reader — delete it
 568	-	`[deprecated(..)]` and `[internal(..)]` label a declaration a reader names, and nobody names an `impl` block — write the label on the members it is about
 569	-	Expected {expected}, but got {got} instead. There are no implicit numeric conversions; convert with `.as_{target}()`
+570	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out of range: a value of `{name}` cannot be below zero, and a sentinel for 'nothing here' is `None` in an `Option<{name}>`

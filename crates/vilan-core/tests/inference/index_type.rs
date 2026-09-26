@@ -79,6 +79,197 @@ fn the_top_of_the_js_guarantee_is_a_usize_literal() {
     );
 }
 
+// --- B407: a NEGATIVE literal at an UNSIGNED type is refused -----------------
+//
+// `let n: usize = -1;` (and `u53`, `u8`) compiled and printed `-1`: the literal
+// range check read the literal UNDER the minus, `1`, which fits. With B389's
+// literal law every `-1` sentinel of index-type.md §3.4 would compile silently
+// as a `usize` after I5 S2 — the class the migration most needs to catch. The
+// seven sentinel shapes are pinned at `usize` below (spelled over user
+// functions: std's signatures move in S2, not here).
+
+fn b407_refused(program: &str, type_name: &str) {
+    assert_fails_with(program, &format!("`{type_name}` is unsigned"));
+    assert_fails_with(program, "so the negative literal `-1` is out of range");
+}
+
+#[test]
+fn b407_a_negative_literal_is_refused_at_an_annotated_usize() {
+    b407_refused(
+        "fun main() {\n\tlet n: usize = -1;\n\tprint(i\"{n}\");\n}\n",
+        "usize",
+    );
+}
+
+#[test]
+fn b407_a_negative_literal_is_refused_at_an_annotated_u53() {
+    b407_refused(
+        "fun main() {\n\tlet n: u53 = -1;\n\tprint(i\"{n}\");\n}\n",
+        "u53",
+    );
+}
+
+#[test]
+fn b407_a_negative_literal_is_refused_at_an_annotated_u8() {
+    b407_refused(
+        "fun main() {\n\tlet n: u8 = -1;\n\tprint(i\"{n}\");\n}\n",
+        "u8",
+    );
+}
+
+/// The range is named, per width.
+#[test]
+fn b407_the_refusal_names_the_types_range() {
+    assert_fails_with(
+        "fun main() {\n\tlet n: u8 = -1;\n\tprint(i\"{n}\");\n}\n",
+        "`u8` is unsigned (0 ..= 255)",
+    );
+    assert_fails_with(
+        "fun main() {\n\tlet n: u32 = -7;\n\tprint(i\"{n}\");\n}\n",
+        "`u32` is unsigned (0 ..= 4294967295), so the negative literal `-7` is out of range",
+    );
+    assert_fails_with(
+        "fun main() {\n\tlet n: usize = -1;\n\tprint(i\"{n}\");\n}\n",
+        "`usize` is unsigned (0 ..= 2^53 on the JS backend)",
+    );
+}
+
+/// A SUFFIX names the unsigned type as surely as an annotation does.
+#[test]
+fn b407_a_negative_suffixed_unsigned_literal_is_refused() {
+    b407_refused(
+        "fun main() {\n\tlet n = -1usize;\n\tprint(i\"{n}\");\n}\n",
+        "usize",
+    );
+}
+
+/// Sentinel S1 (`reconcile`'s `next_same.push(-1)`): a push into a
+/// `List<usize>` — the literal typed through the method's generic argument.
+#[test]
+fn b407_sentinel_a_negative_pushed_into_a_list_of_usize_is_refused() {
+    b407_refused(
+        concat!(
+            "fun main() {\n",
+            "\tlet mut next_same: List<usize> = [];\n",
+            "\tnext_same.push(-1);\n",
+            "\tprint(i\"{next_same.len()}\");\n",
+            "}\n",
+        ),
+        "usize",
+    );
+}
+
+/// Sentinel S2 (`None => -1`): a `match` arm whose value is a `usize`.
+#[test]
+fn b407_sentinel_a_negative_match_arm_at_usize_is_refused() {
+    b407_refused(
+        concat!(
+            "fun found(): Option<usize> { None }\n",
+            "fun main() {\n",
+            "\tlet at: usize = match found() {\n",
+            "\t\tSome(let index) => index,\n",
+            "\t\tNone => -1,\n",
+            "\t};\n",
+            "\tprint(i\"{at}\");\n",
+            "}\n",
+        ),
+        "usize",
+    );
+}
+
+/// Sentinels S3 and S5 (`mut candidate = -1` / `mut last_applied = -1`, later
+/// assigned an index and read AS one — db.vl's `migrations[last_applied]`):
+/// B389's bare binding takes `usize` from that typed use.
+#[test]
+fn b407_sentinel_a_negative_binding_assigned_a_usize_later_is_refused() {
+    b407_refused(
+        concat!(
+            "fun name_at(names: List<str>, at: usize): str { names[at] }\n",
+            "fun main() {\n",
+            "\tlet names = [\"a\", \"b\", \"c\"];\n",
+            "\tlet index: usize = 2usize;\n",
+            "\tmut last_applied = -1;\n",
+            "\tif names.len() > 0 { last_applied = index; }\n",
+            "\tprint(name_at(names, last_applied));\n",
+            "}\n",
+        ),
+        "usize",
+    );
+}
+
+/// Sentinel S4 (`mut highest = -1` in `settled_steps`, then compared against
+/// and assigned a step): typed by the comparison.
+#[test]
+fn b407_sentinel_a_negative_binding_compared_with_a_usize_is_refused() {
+    b407_refused(
+        concat!(
+            "fun main() {\n",
+            "\tlet step: usize = 3usize;\n",
+            "\tmut highest = -1;\n",
+            "\tif step > highest { highest = step; }\n",
+            "\tprint(i\"{highest}\");\n",
+            "}\n",
+        ),
+        "usize",
+    );
+}
+
+/// Sentinels S6 and S7 (the corpus's `index_of(..).unwrap_or(-1)`): the
+/// literal typed through `Option<usize>::unwrap_or`'s argument.
+#[test]
+fn b407_sentinel_a_negative_unwrap_or_default_at_usize_is_refused() {
+    b407_refused(
+        concat!(
+            "fun position(xs: List<i32>, wanted: i32): Option<usize> {\n",
+            "\tmut at = 0usize;\n",
+            "\tfor x in xs {\n",
+            "\t\tif x == wanted { ret Some(at); }\n",
+            "\t\tat += 1;\n",
+            "\t}\n",
+            "\tNone\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet xs = [10, 20, 30];\n",
+            "\tprint(i\"{position(xs, 20).unwrap_or(-1)}\");\n",
+            "}\n",
+        ),
+        "usize",
+    );
+}
+
+/// The controls: a negative literal at a SIGNED type, the signed minimum
+/// written as a minus over the literal, and zero at an unsigned type.
+#[test]
+fn b407_negative_literals_at_signed_types_and_zero_stay_accepted() {
+    assert_compiles_and_runs(
+        concat!(
+            "fun main() {\n",
+            "\tlet a: i32 = -1;\n",
+            "\tlet b = -128i8;\n",
+            "\tlet c: i53 = -5;\n",
+            "\tlet d: usize = 0;\n",
+            "\tprint(i\"{a} {b} {c} {d}\");\n",
+            "}\n",
+        ),
+        "-1 -128 -5 0\n",
+    );
+}
+
+/// B389's `literal_types` now reaches the range check too: a literal typed by
+/// its context alone (B406's field-typed constructor argument) is checked at
+/// that width rather than skipped.
+#[test]
+fn b407_a_context_typed_literal_is_range_checked_at_its_width() {
+    assert_fails_with(
+        concat!(
+            "import std::shared::Shared;\n",
+            "struct Counter { count: Shared<u8> }\n",
+            "fun main() { let c = Counter { count = Shared::new(300) }; }\n",
+        ),
+        "the literal `300` is out of range for `u8`",
+    );
+}
+
 #[test]
 fn usize_bounds_are_the_js_guarantee() {
     // §11 Q3: `max_value()` answers 2^53 on every backend, as R6 of Order 37
