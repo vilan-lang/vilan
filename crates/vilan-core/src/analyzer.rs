@@ -29654,7 +29654,25 @@ impl<'src> Analyzer<'src> {
                 self.withdraw_anonymous_binder_name(name, name_span, constraint_type_id, scope_id);
             }
             Node::AccessorWithGenerics(subject_name, generic_arguments) => {
-                let inherited = self.declared_generic_constraint_ids(subject_name, scope_id);
+                // B409: a TRAIT's head (`Src<type X>` in a binder's bound, or a
+                // bare-trait subject) lends its binders its parameters'
+                // BOUNDS, never its parameters' IDS. Aliased, `type X` in
+                // `impl M<type S: Src<type X>, X, type U> with Src<U>` WAS
+                // `Src`'s own `T` — so the `with` clause's `T := U` rebound it,
+                // and an inherited default was checked at `S: Src<U>` (`Root
+                // does not implement Src<str>`), the upstream's argument lost
+                // to the implemented one. A type's head keeps the alias (B77:
+                // the impl can only ever apply to that type, whose parameter
+                // it is). A trait declared later in the file already took the
+                // fresh-binder path below, so the answer no longer depends on
+                // declaration order either.
+                let subject_is_trait = self
+                    .try_get_type_id_by_name(subject_name, scope_id)
+                    .is_some_and(|id| self.traits.contains_key(&id));
+                let inherited = match subject_is_trait {
+                    true => None,
+                    false => self.declared_generic_constraint_ids(subject_name, scope_id),
+                };
                 for (position, argument) in generic_arguments.0.iter().enumerate() {
                     // A bound-less `type T` directly under `Subject<..>` inherits
                     // `Subject`'s declared bound for this position, if known.

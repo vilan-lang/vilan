@@ -601,6 +601,23 @@ fn provides_wanted_instantiation(
         })
 }
 
+/// [`bind_subject`], then the binders the subject's BOUNDS introduce
+/// ([`bind_bound_binders`]) — everything an impl's body can name, grounded from
+/// one concrete receiver. An emitter that has to SPELL every type (the native
+/// one) needs the second half: `impl type S: Source<type T> with Upstream<T>`
+/// names `T` in its members' signatures, and `T` is written in `S`'s bound, not
+/// in the shape `S` matches. (Before B409 that `T` was `Source`'s own parameter
+/// id, which some other binding happened to ground.)
+pub fn bind_subject_and_bounds(
+    program: &Program,
+    subject: TypeId,
+    type_id: TypeId,
+    out: &mut HashMap<TypeId, TypeId>,
+) {
+    bind_subject(program, subject, type_id, out);
+    bind_bound_binders(program, subject, out);
+}
+
 /// Grounds the binders a subject's BOUNDS introduce (B165): in
 /// `impl type S: Src<type T> with Maybe<T>`, `S` binds from the receiver and
 /// `T` binds from the receiver's OWN `Src` implementation — `Cell: Src<i32>`
@@ -616,6 +633,12 @@ fn provides_wanted_instantiation(
 /// that was never a `Cell`, and printed `undefined`. A silent miscompile, and
 /// only expressible once a binder could be written inside a bound at all.
 fn bind_bound_binders(program: &Program, subject: TypeId, bindings: &mut HashMap<TypeId, TypeId>) {
+    // The walk recurses through a BLANKET provider's own bounds
+    // (`provided_trait_arguments`), so it carries the shared depth guard; a
+    // walk that gives up binds nothing further.
+    let Some(_guard) = crate::util::RecursionGuard::enter() else {
+        return;
+    };
     let mut binders = Vec::new();
     collect_subject_binders(program, subject, &mut binders);
     for binder in binders {
@@ -637,8 +660,22 @@ fn bind_bound_binders(program: &Program, subject: TypeId, bindings: &mut HashMap
             if provided.len() != bound_arguments.len() {
                 continue;
             }
+            // What the subject itself bound is the receiver's own answer and
+            // is never overwritten by a bound's — a bound argument grounded no
+            // further than a provider's binder would otherwise replace the
+            // receiver's `i32` with that binder (B409's native half).
+            let mut from_bound = HashMap::default();
             for (pattern, actual) in bound_arguments.iter().zip(provided) {
-                bind_subject(program, *pattern, actual, bindings);
+                if matches!(
+                    program.type_id_to_type_map.get(&actual),
+                    Some(Type::Generic(_))
+                ) {
+                    continue;
+                }
+                bind_subject(program, *pattern, actual, &mut from_bound);
+            }
+            for (binder, value) in from_bound {
+                bindings.entry(binder).or_insert(value);
             }
         }
     }
@@ -676,6 +713,11 @@ fn provided_trait_arguments(
         }
         let mut bindings = HashMap::default();
         bind_subject(program, implementation.subject, concrete, &mut bindings);
+        // A BLANKET provider writes its arguments in its bound's binders
+        // (`impl type S: Source<type T> with Upstream<T>`): ground those from
+        // the receiver's own impls too, or `Upstream`'s argument comes back as
+        // the blanket's bare `T` (B379's analyzer half, here for emission).
+        bind_bound_binders(program, implementation.subject, &mut bindings);
         return Some(
             written
                 .iter()

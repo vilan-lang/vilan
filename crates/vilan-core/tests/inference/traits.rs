@@ -7373,3 +7373,125 @@ fn b408_a_blanket_provided_trait_member_re_dispatches_to_the_most_specific_impl(
         "1000\n1000\n8\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B409 — a SAME-TRAIT bound checked at the implemented arguments
+// ---------------------------------------------------------------------------
+//
+// `impl M<type S: Src<type X>, X, type U> with Src<U>`: a default inherited
+// through that impl was checked at `S: Src<U>` — "Root does not implement
+// Src<str>" — instead of the upstream's `S: Src<X>`. The binder written in a
+// TRAIT's head (`Src<type X>`) was registered as `Src`'s own parameter id (the
+// B77 alias an impl subject's `Wrapper<type T>` takes for its TYPE's
+// parameter), so the `with Src<U>` clause binding `Src`'s `T := U` rebound
+// `X` too. A trait's head now lends its binders its parameters' bounds, not
+// their ids. std::reactive's private `Upstream` blanket was the workaround.
+
+/// reactive-41's repro: the inherited default runs at the implemented
+/// argument while the bound holds at the upstream's.
+#[test]
+fn b409_a_same_trait_bound_is_checked_at_the_upstreams_arguments() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> {\n",
+            "\tfun get(self): T;\n",
+            "\tfun twice(self): (T, T) { (self.get(), self.get()) }\n",
+            "}\n",
+            "struct Root { v: i32 }\n",
+            "impl Root with Src<i32> { fun get(self): i32 { self.v } }\n",
+            "struct M<S, X, U> { up: S, f: |X| U }\n",
+            "impl M<type S: Src<type X>, X, type U> with Src<U> {\n",
+            "\tfun get(self): U { (self.f)(self.up.get()) }\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet m = M<Root, i32, str> { up = Root { v = 2 }, f = |n| i\"<{n}>\" };\n",
+            "\tlet (a, b) = m.twice();\n",
+            "\tprint(a + b);\n",
+            "}\n",
+        ),
+        "<2><2>\n",
+    );
+}
+
+/// The node shape std's `Map` has, read through GENERIC code: built inside
+/// `fun doubled<S: Src<i32>>` and read through a trait default in a second
+/// generic function. The default's instance ran under its own substitution
+/// alone, dropping the enclosing `S := Root`, and the impl's `self.up.get()`
+/// reached `Src`'s body-less requirement (the never-silent internal error) —
+/// the second wall between std's nodes and a plain `Source` bound.
+#[test]
+fn b409_a_node_over_a_callers_parameter_reads_through_an_inherited_default() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> {\n",
+            "\tfun get(self): T;\n",
+            "\tfun twice(self): (T, T) { (self.get(), self.get()) }\n",
+            "}\n",
+            "struct Root { value: i32 }\n",
+            "impl Root with Src<i32> { fun get(self): i32 { self.value } }\n",
+            "struct Mapped<S, T, U> { up: S, transform: |T| U }\n",
+            "impl Mapped<type S: Src<type T>, T, type U> with Src<U> {\n",
+            "\tfun get(self): U { (self.transform)(self.up.get()) }\n",
+            "}\n",
+            "fun read_twice<U, R: Src<U>>(source: R): (U, U) { source.twice() }\n",
+            "fun doubled<S: Src<i32>>(source: S): (str, str) {\n",
+            "\tread_twice(Mapped<S, i32, str> { up = source, transform = |n| i\"<{n * 2}>\" })\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet (a, b) = doubled(Root { value = 4 });\n",
+            "\tprint(a + b);\n",
+            "}\n",
+        ),
+        "<8><8>\n",
+    );
+}
+
+/// The answer no longer depends on declaration ORDER: with the trait written
+/// after the impl (the path that always minted a fresh binder), the same.
+#[test]
+fn b409_the_trait_declared_after_the_impl_answers_the_same() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "struct Root { v: i32 }\n",
+            "struct M<S, X, U> { up: S, f: |X| U }\n",
+            "impl M<type S: Src<type X>, X, type U> with Src<U> {\n",
+            "\tfun get(self): U { (self.f)(self.up.get()) }\n",
+            "}\n",
+            "trait Src<T> {\n",
+            "\tfun get(self): T;\n",
+            "\tfun twice(self): (T, T) { (self.get(), self.get()) }\n",
+            "}\n",
+            "impl Root with Src<i32> { fun get(self): i32 { self.v } }\n",
+            "fun main() {\n",
+            "\tlet m = M<Root, i32, str> { up = Root { v = 3 }, f = |n| i\"[{n}]\" };\n",
+            "\tlet (a, b) = m.twice();\n",
+            "\tprint(a + b);\n",
+            "}\n",
+        ),
+        "[3][3]\n",
+    );
+}
+
+/// What the alias carried is kept: a binder in a trait's head still INHERITS
+/// the bound the trait declares for that position (`trait Holds<T: Named>`),
+/// so the blanket's body may call `name()` on it.
+#[test]
+fn b409_a_binder_in_a_trait_head_still_inherits_the_parameters_bound() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Named { fun name(self): str; }\n",
+            "trait Holds<T: Named> { fun held(self): T; }\n",
+            "struct Dog {}\n",
+            "impl Dog with Named { fun name(self): str { \"dog\" } }\n",
+            "struct Kennel { dog: Dog }\n",
+            "impl Kennel with Holds<Dog> { fun held(self): Dog { self.dog } }\n",
+            "impl type S: Holds<type X> { fun held_name(self): str { self.held().name() } }\n",
+            "fun main() { print(Kennel { dog = Dog {} }.held_name()); }\n",
+        ),
+        "dog\n",
+    );
+}
