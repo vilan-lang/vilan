@@ -12881,6 +12881,39 @@ fn b406_kolts_signal_new_literal_takes_the_annotated_width() {
     );
 }
 
+/// index-42's residual, in BOTH field orders: an EARLIER field of the same
+/// literal holding a `Shared<i32>` (a literal, and a binding) no longer leaves
+/// the later field's constructor without its expectation — the shape std's
+/// `rpc.vl` `RemoteSource`/`KeyedSource` write.
+#[test]
+fn b406_a_later_fields_constructor_literal_takes_its_type_in_either_order() {
+    for (fields, expected) in [
+        ("channel = Shared::new(5), count = Shared::new(0)", "5 0\n"),
+        ("count = Shared::new(0), channel = Shared::new(5)", "5 0\n"),
+        (
+            "channel = Shared::new(seed), count = Shared::new(0)",
+            "3 0\n",
+        ),
+        (
+            "count = Shared::new(0), channel = Shared::new(seed)",
+            "3 0\n",
+        ),
+    ] {
+        let program = format!(
+            "{}{}{}{fields}{}{}",
+            "import std::io::print;\nimport std::shared::Shared;\n",
+            "struct Rs { channel: Shared<i32>, count: Shared<usize> }\n",
+            "fun make(seed: i32): Rs {\n\tRs { ",
+            " }\n}\n",
+            "fun main() {\n\tlet r = make(3);\n\tprint(i\"{r.channel.read()} {r.count.read()}\");\n}\n",
+        );
+        match compile_and_run(&program) {
+            Ok(stdout) => assert_eq!(stdout, expected, "{fields}"),
+            Err(errors) => panic!("`{fields}` was refused: {errors:#?}"),
+        }
+    }
+}
+
 /// The control: a non-numeric field still refuses a numeric literal.
 #[test]
 fn b406_a_literal_constructor_argument_still_mismatches_a_non_numeric_field() {

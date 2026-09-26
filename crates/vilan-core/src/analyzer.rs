@@ -46943,15 +46943,7 @@ impl<'src> Analyzer<'src> {
         // value is about to DECIDE, not a target for it, and seeding it let a
         // `list.map(..)` bind its `U` to the open `List<T>` and take nothing
         // from its closure (B225's kolt shape compiled clean).
-        let expected = self.substitute_type(field_type, substitution_context);
-        let mut mentioned = Vec::new();
-        self.collect_generics(&expected, 0, &mut mentioned);
-        if !mentioned
-            .iter()
-            .any(|generic| self.inferable_generics.contains(generic))
-        {
-            self.seed_expectation(value_id, &expected);
-        }
+        self.seed_field_expectation(value_id, field_type, substitution_context);
         let value_type = self.infer_type(value_id, field_type, substitution_context);
         if let Type::Unresolved = value_type {
             return FieldValueVerdict::Deferred;
@@ -46985,6 +46977,27 @@ impl<'src> Analyzer<'src> {
                 });
                 FieldValueVerdict::Refused
             }
+        }
+    }
+
+    /// B406's seed, one field: the field's type as its value's expectation,
+    /// under this literal's substitution, when that type is closed under the
+    /// literal's open parameters (`inferable_generics`) — see
+    /// [`Self::check_field_value`].
+    fn seed_field_expectation(
+        &mut self,
+        value_id: Id,
+        field_type: &Type,
+        substitution_context: &SubstitutionContext,
+    ) {
+        let expected = self.substitute_type(field_type, substitution_context);
+        let mut mentioned = Vec::new();
+        self.collect_generics(&expected, 0, &mut mentioned);
+        if !mentioned
+            .iter()
+            .any(|generic| self.inferable_generics.contains(generic))
+        {
+            self.seed_expectation(value_id, &expected);
         }
     }
 
@@ -47183,6 +47196,31 @@ impl<'src> Analyzer<'src> {
             if let Some(generic_constraint) = literal_param_ids.get(index) {
                 substitution_context.insert(*generic_constraint, *generic_argument_id);
             }
+        }
+        // B406, every field at once: a value's expectation is seeded before
+        // ANY field is checked. The per-field seed in `check_field_value` runs
+        // only once the loop reaches that field, and the loop stops at the
+        // first field still deferred — so in `Rs { channel = Shared::new(5),
+        // count = Shared::new(0) }` the second call resolved on its own while
+        // the first deferred, with no expectation, and took `i32` (swap the
+        // fields and it compiled). Seeding is idempotent and never overrides a
+        // nearer expectation, so the loop's own seed stays for the fields a
+        // bound parameter only closes later.
+        {
+            let previously_inferable =
+                std::mem::replace(&mut self.inferable_generics, literal_param_ids.clone());
+            for (field_name, field_value, _, _) in &constraint.fields {
+                let Some(struct_field) = struct_fields
+                    .iter()
+                    .find(|field| *field.name == **field_name)
+                else {
+                    continue;
+                };
+                let field_type = struct_field.type_id.get_type(self);
+                let field_type = self.rename_into_literal(field_type, &literal_rename);
+                self.seed_field_expectation(*field_value, &field_type, &substitution_context);
+            }
+            self.inferable_generics = previously_inferable;
         }
         let mut deferred = false;
         for (field_name, field_value, field_value_span, field_name_span) in &constraint.fields {
