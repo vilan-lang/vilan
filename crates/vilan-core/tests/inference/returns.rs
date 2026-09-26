@@ -1617,26 +1617,26 @@ fn missing_return_value_regime_3_through_a_free_functions_generic_binding() {
     );
 }
 
-// `Signal::map<U>` — the shape the todo example annotates around; `sync |T|
-// U` binds the same way as `List::map`'s `|T| U`.
+// `Source::map<U>` — `sync |T| U` binds the same way as `List::map`'s `|T| U`.
+// Re-derived at A124 S2c: `map` answers a `Map<S, T, U>` node now, so the
+// expectation that binds `U` is the node's annotation (the pre-flip pin wrote
+// `SignalCell<i32>`, which a node is not). Written `count.map(..).cell()` under
+// a `SignalCell<i32>` annotation, the expectation stops at `.cell()`'s receiver
+// and the diagnostic is the plainer "Expected SignalCell<i32>, but got
+// SignalCell<void>" over the chain — no steer (reported with Order 42's finds).
 #[test]
 fn missing_return_value_regime_3_through_a_signal_maps_generic_binding() {
     assert_fails_spanning_nth(
         r#"
         import std::io::print;
-        import std::reactive::{ Owner, Signal, SignalCell, owner_scope };
+        import std::reactive::{ Map, Signal, SignalCell, Source };
 
         fun main() {
-        	let scope = Owner::new();
-        	let n = owner_scope.run(scope, || {
-        		let count = Signal::new(1);
-        		let doubled: SignalCell<i32> = count.map(|n| {
-        			n * 2;
-        		});
-        		doubled.get()
+        	let count: SignalCell<i32> = Signal::new(1);
+        	let doubled: Map<SignalCell<i32>, i32, i32> = count.map(|n| {
+        		n * 2;
         	});
-        	print(n);
-        	scope.dispose();
+        	print(doubled.get());
         }
         "#,
         "}",

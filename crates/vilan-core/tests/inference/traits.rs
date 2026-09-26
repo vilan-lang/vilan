@@ -2437,12 +2437,19 @@ fn b243_a_one_block_sub_trait_impl_grounds_a_supertrait_defaults_closure_paramet
 }
 
 #[test]
-fn b243_a_one_block_signal_impl_reaches_source_map_and_effect_on_change() {
-    // The shape the item was filed on, against std's own traits: `map` and
+fn b243_a_one_block_signal_impl_reaches_source_sub_and_effect_on_change() {
+    // The shape the item was filed on, against std's own traits: `sub` and
     // `effect_on_change` are `Source` defaults, the impl writes one block of
-    // `Signal<T>`, and the derived cell tracks the writes. `10` is the
-    // owner-registered effect firing on the change, `2` and `10` the derived
+    // `Signal<T>`, and a subscriber tracks the writes. `15` is the
+    // owner-registered effect firing on the change, `2` and `10` the doubled
     // value before and after.
+    //
+    // Re-derived at A124 S2c: the pin was written over `c.map(..)`, which was a
+    // `Source` DEFAULT then and is a BLANKET over `S: Source<T>` now — and a
+    // blanket is not found on a type that implements `Source` only through a
+    // one-block sub-trait impl (B419, filed from this lane with a std-free
+    // repro; Order 43). The defaults B243 is about are still reached, and
+    // this pin holds them.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -2462,7 +2469,8 @@ fn b243_a_one_block_signal_impl_reaches_source_map_and_effect_on_change() {
 
         fun main() {
             let c = Cell { inner = Signal::new(1) };
-            let doubled = c.map(|v| v * 2);
+            let doubled: SignalCell<i32> = Signal::new(0);
+            let _watch = c.sub(|v| doubled.set(v * 2));
             print(doubled.get());
             let (_built, scope) = comp(|| {
                 c.effect_on_change(|v| print(v + 10));
@@ -2474,6 +2482,44 @@ fn b243_a_one_block_signal_impl_reaches_source_map_and_effect_on_change() {
         main();
         "#,
         "2\n15\n10\n",
+    );
+}
+
+/// The half of the pre-flip b243 pin the flip moved out of reach: `map` is a
+/// blanket over `S: Source<T>` since A124 S2c, and a blanket is not found on a
+/// type that implements `Source` only through a one-block `impl .. with
+/// Signal<T>` — "Cell<i32> has no method 'map'". Kept as the program the pin
+/// used to be, so the fix turns it green as written.
+#[test]
+#[ignore = "B419: a blanket over a supertrait is not found through a one-block sub-trait impl"]
+fn b419_a_blanket_map_reaches_a_one_block_signal_impl() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, Source, SignalCell, Subscription };
+
+        struct Cell<T> { inner: SignalCell<T> }
+
+        impl Cell<type T> with Signal<T> {
+            fun get(self): T { self.inner.get() }
+            [must_use]
+            fun on_change(self, observer: |T| void): Subscription {
+                self.inner.on_change(observer)
+            }
+            fun set(self, value: T) { self.inner.set(value) }
+            fun notify(self) { self.inner.notify() }
+        }
+
+        fun main() {
+            let c = Cell { inner = Signal::new(1) };
+            let doubled = c.map(|v| v * 2);
+            print(doubled.get());
+            c.set(5);
+            print(doubled.get());
+        }
+        main();
+        "#,
+        "2\n10\n",
     );
 }
 
@@ -4404,7 +4450,10 @@ fn b371_the_members_result_carries_the_callers_bound() {
 }
 
 /// The item's repro: `switch` as a blanket method over std's `flatten`,
-/// following the inner cell across a set.
+/// following the inner cell across a set. Since A124 S2c `map(f).flatten()`
+/// answers a cold node, so the four B371 bodies end in `.cell()` — the
+/// `SignalCell<U>` their signatures name; the generic `map` reaching the body
+/// at all is B408's.
 #[test]
 fn b371_switch_over_std_flatten_runs_as_a_blanket_method() {
     assert_compiles_and_runs(
@@ -4414,7 +4463,7 @@ fn b371_switch_over_std_flatten_runs_as_a_blanket_method() {
 
         impl type S: Source<type T> {
             fun switch_to<U, I: Source<U>>(self, f: sync |T| I): SignalCell<U> {
-                self.map(f).flatten()
+                self.map(f).flatten().cell()
             }
         }
 
@@ -4441,7 +4490,7 @@ fn b371_switch_over_std_flatten_runs_as_a_free_function() {
         import std::reactive::{ Signal, SignalCell, Source, run_with_owner, Owner };
 
         fun switch_to<T, U, S: Source<T>, I: Source<U>>(source: S, f: sync |T| I): SignalCell<U> {
-            source.map(f).flatten()
+            source.map(f).flatten().cell()
         }
 
         fun main() {
@@ -4470,7 +4519,7 @@ fn b371_the_result_infers_without_an_annotation() {
 
         impl type S: Source<type T> {
             fun switch_to<U, I: Source<U>>(self, f: sync |T| I): SignalCell<U> {
-                self.map(f).flatten()
+                self.map(f).flatten().cell()
             }
         }
 
@@ -4499,7 +4548,7 @@ fn b371_the_optional_twin_is_unchanged() {
 
         impl type S: Source<type T> {
             fun and_then_to<U, I: Source<U>>(self, f: sync |T| Option<I>): SignalCell<Option<U>> {
-                self.map(f).flatten()
+                self.map(f).flatten().cell()
             }
         }
 

@@ -618,8 +618,9 @@ function $af(self, from, count, to, $ag) {
 	$J(self, $ag);
 }
 function $ao(signal, subscriber) {
+	const handle = [ signal[1], subscriber[0], subscriber[2], __shared_new([ 1 ]) ];
 	signal[1].v.push(reissued(subscriber));
-	return [ signal[1], subscriber[0], subscriber[2], __shared_new([ 1 ]) ];
+	return handle;
 }
 function $al(signal, observer) {
 	const cell = signal[0];

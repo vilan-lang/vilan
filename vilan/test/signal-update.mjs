@@ -295,8 +295,9 @@ function $D(self, mutate, $d) {
 	$u(self, $d);
 }
 function $O(signal, subscriber) {
+	const handle = [ signal[1], subscriber[0], subscriber[2], __shared_new([ 1 ]) ];
 	signal[1].v.push(reissued(subscriber));
-	return [ signal[1], subscriber[0], subscriber[2], __shared_new([ 1 ]) ];
+	return handle;
 }
 function $L(signal, observer) {
 	const cell = signal[0];

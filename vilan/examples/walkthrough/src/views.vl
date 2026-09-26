@@ -65,7 +65,7 @@ fun screen(
 	// and released when this view is unmounted — the channel is open while,
 	// and only while, the screen is showing. The empty `[]` takes its element
 	// type from the mirror.
-	let notes = client.notes.or([]);
+	let notes = client.notes.or([]).cell();
 	view("div")
 		.styled(shell)
 		.child(connection_banner(client))
@@ -198,7 +198,7 @@ fun note_page(
 			}
 		}
 		found
-	});
+	}).cell();
 	let present = entry.map(|current| current is Some(let _note));
 
 	view("div")

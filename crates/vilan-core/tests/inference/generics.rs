@@ -1879,24 +1879,30 @@ fn lone_set_notifies_synchronously() {
 
 #[test]
 fn batch_commits_value_immediately_but_defers_notification() {
-    // Inside a `batch`, a root's value is committed at once (`s.get()` is fresh), but a
-    // *derived* value recomputes only at the flush boundary — so mid-batch it is stale,
-    // then settles. Pins the "defer notification, not the value" divergence.
+    // Inside a `batch`, a root's value is committed at once (`s.get()` is
+    // fresh), and what is DEFERRED is the notification, not the value. Re-derived
+    // at A124 S2c: a cold derivation (`map`) stores nothing, so a read inside
+    // the batch PULLS the committed root and is fresh too (`doubled=10` — the
+    // pre-flip pin read `doubled=0`, when `map` answered a cell); the stale
+    // mid-batch read is now what a CACHED derivation shows — `.cell()` is
+    // settled by the notification the batch defers (`cached=0`), and reads the
+    // settled value after the flush. One program, both halves of the claim.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, SignalCell, batch };
+        import std::reactive::{ Signal, SignalCell, Source, batch };
         fun main() {
             let s = Signal::new(0);
             let doubled = s.map(|n| n * 2);
+            let cached = doubled.cell();
             batch(|| {
                 s.set(5);
-                print(i"in-batch s={s.get()} doubled={doubled.get()}");   // s=5 fresh, doubled=0 stale
+                print(i"in-batch s={s.get()} doubled={doubled.get()} cached={cached.get()}");
             });
-            print(i"after doubled={doubled.get()}");                      // 10 (settled at flush)
+            print(i"after doubled={doubled.get()} cached={cached.get()}");
         }
         "#,
-        "in-batch s=5 doubled=0\nafter doubled=10\n",
+        "in-batch s=5 doubled=10 cached=0\nafter doubled=10 cached=10\n",
     );
 }
 
@@ -6282,7 +6288,7 @@ fn b225_the_kolt_shape_two_fields_of_one_parameter_in_the_subjects_own_impl() {
         struct Searchable<T> { list: SignalCell<List<T>>, table: SignalCell<List<T>> }
         impl Searchable<type T> {
             fun new(list: SignalCell<List<T>>, key: sync |T| str) {
-                Searchable { table = list.map(|l| l.map(|x| key(x).to_lowercase())), list }
+                Searchable { table = list.map(|l| l.map(|x| key(x).to_lowercase())).cell(), list }
             }
         }
         fun main() {

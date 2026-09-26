@@ -257,6 +257,9 @@ fn flatten_still_joins_a_plain_cell_of_cells() {
 // `owner_scope.run` encloses still compiles and still tracks its source, which
 // is what a module-level `current_path().map(parse)` needs. Making this an
 // error is the stronger law and a breaking change — the owner's call, not std's.
+// Since A124 S2c a module-level derivation that CACHES is spelled
+// `.cell_global()` (A130 refuses `.cell()` here): the lifetime this pin holds is
+// the one that name says.
 #[test]
 fn a_derivation_outside_every_owner_still_tracks_its_source() {
     assert_compiles_and_runs(
@@ -265,7 +268,7 @@ fn a_derivation_outside_every_owner_still_tracks_its_source() {
         import std::reactive::{ Signal, SignalCell };
 
         let count: SignalCell<i32> = Signal::new(1);
-        let doubled: SignalCell<i32> = count.map(|n| n * 2);
+        let doubled: SignalCell<i32> = count.map(|n| n * 2).cell_global();
 
         fun main() {
             print(doubled.get());
@@ -323,15 +326,21 @@ fn switch_follows_the_source_its_selector_answers_and_detaches_from_the_last() {
 }
 
 #[test]
-fn switch_calls_its_selector_once_per_value_of_the_source() {
-    // The reason this is not `self.map(select).flatten()`: that form evaluates
-    // the selector a SECOND time for the value the derived cell was built from
-    // and orphans the node it answered. One call per value, the initial one
-    // included — three sets, four calls.
+fn switch_calls_its_selector_when_it_is_read_and_never_at_construction() {
+    // Re-derived at A124 S2c from `proposal/reactive-pipeline.md` §2.2: a
+    // `Switch` is a cold node whose `get` is "select, then pull". So building
+    // one calls `select` NOWHERE (`built 0` — the pre-flip cell called it once
+    // here), writes nobody reads call it nowhere (`unread 0`), and one read is
+    // one call. Subscribed — a `.cell()` below it — it keeps its rolling
+    // registration: the attach selects once to wire the first inner and the
+    // cell's seed pulls once (`cell 3`), and every value of the source costs
+    // TWO calls, one to re-follow the new inner and one for the leaf's pull
+    // (three writes, `9`). The pre-flip pin read `1\n4\n20\n` (one call per
+    // value, construction included), which was the cell model's number.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, SignalCell };
+        import std::reactive::{ Signal, SignalCell, Source };
 
         fun main() {
             let which = Signal::new(0);
@@ -342,17 +351,23 @@ fn switch_calls_its_selector_once_per_value_of_the_source() {
                 calls.set(calls.get() + 1);
                 if n == 0 { first } else { second }
             });
-            print(calls.get());
+            print(i"built {calls.get()}");
             which.set(1);
             which.set(0);
             which.set(1);
-            print(calls.get());
-            print(picked.get());
+            print(i"unread {calls.get()}");
+            print(i"read {picked.get()} {calls.get()}");
+            let cached = picked.cell();
+            print(i"cell {calls.get()}");
+            which.set(0);
+            which.set(1);
+            which.set(0);
+            print(i"cell-after {cached.get()} {calls.get()}");
         }
 
         main();
         "#,
-        "1\n4\n20\n",
+        "built 0\nunread 0\nread 20 1\ncell 3\ncell-after 10 9\n",
     );
 }
 
@@ -471,8 +486,8 @@ fn a_switch_is_a_derivation_so_an_effect_reads_its_chain_settled() {
             let which: SignalCell<i32> = Signal::new(0);
             let first: SignalCell<i32> = Signal::new(10);
             let second: SignalCell<i32> = Signal::new(20);
-            let picked: SignalCell<i32> = which.switch(|n| if n == 0 { first } else { second });
-            let plus: SignalCell<i32> = picked.map(|value| value + 1);
+            let picked: SignalCell<i32> = which.switch(|n| if n == 0 { first } else { second }).cell();
+            let plus: SignalCell<i32> = picked.map(|value| value + 1).cell();
             let seen: SignalCell<str> = Signal::new("");
             let watcher = Owner::new();
             run_with_owner(watcher, || {
@@ -508,8 +523,8 @@ fn an_and_then_is_a_derivation_so_an_effect_reads_its_chain_settled() {
             let outer: SignalCell<Option<i32>> = Signal::new(Some(1));
             let one: SignalCell<Option<i32>> = Signal::new(Some(10));
             let two: SignalCell<Option<i32>> = Signal::new(Some(20));
-            let followed: SignalCell<Option<i32>> = outer.and_then(|id| if id == 1 { one } else { two });
-            let plus: SignalCell<i32> = followed.map(|value| value.unwrap_or(0) + 1);
+            let followed: SignalCell<Option<i32>> = outer.and_then(|id| if id == 1 { one } else { two }).cell();
+            let plus: SignalCell<i32> = followed.map(|value| value.unwrap_or(0) + 1).cell();
             let seen: SignalCell<str> = Signal::new("");
             let watcher = Owner::new();
             run_with_owner(watcher, || {
@@ -530,22 +545,26 @@ fn an_and_then_is_a_derivation_so_an_effect_reads_its_chain_settled() {
 }
 
 #[test]
-fn switch_and_and_then_mint_two_subscribers_where_the_composed_form_mints_three() {
-    // The "one derived cell" claim, counted. `fresh_id` is the program's
-    // subscriber counter, so the delta across a construction is the number of
-    // subscribers it minted — two `fresh_id()` calls of its own included, hence
-    // the `- 1`.
+fn switch_and_and_then_mint_nothing_until_a_leaf_and_the_composed_form_costs_the_same() {
+    // Re-derived at A124 S2c. `fresh_id` is the program's subscriber counter,
+    // so the delta across a step is the number of subscribers it minted — two
+    // `fresh_id()` calls of its own included, hence the `- 1`.
     //
-    // The pin carries its OWN control: the third line builds the same dynamic
-    // dependency the composed way (`map(select).flatten()`, spelled at a
-    // concrete type because the generic body hits B371) in the same program.
-    // Two subscribers and one cell against three subscribers and two cells is
-    // the whole reason A123 is written over `on_change`.
+    // The pre-flip pin counted "one derived cell rather than two": `switch` and
+    // `and_then` minted TWO subscribers at construction where the composed
+    // `map(select).flatten()` minted THREE (`2\n2\n3\n`). Under the cold model
+    // (`proposal/reactive-pipeline.md` §2.2, "construction does nothing") all
+    // three mint NOTHING when built, and a leaf on each mints the same THREE:
+    // the leaf's own record, the node's relay on the outer, and the rolling
+    // relay on whichever inner is current (§2.2's "the one place a node must
+    // keep a registration of its OWN"). The composed form IS a `Switch` over a
+    // `Map` now, so the reason `switch` was written over `on_change` — one
+    // cell fewer — is gone with the cells; what remains is the spelling.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         import std::option::Option::{ self, Some, None };
-        import std::reactive::{ Signal, SignalCell, fresh_id };
+        import std::reactive::{ Signal, SignalCell, Source, fresh_id };
 
         fun main() {
             let which = Signal::new(0);
@@ -563,9 +582,18 @@ fn switch_and_and_then_mint_two_subscribers_where_the_composed_form_mints_three(
             print(fresh_id() - before_and_then - 1);
 
             let before_composed = fresh_id();
-            let composed: SignalCell<i32> =
-                which.map(|n| if n == 0 { first } else { second }).flatten();
+            let composed = which.map(|n| if n == 0 { first } else { second }).flatten();
             print(fresh_id() - before_composed - 1);
+
+            let before_a = fresh_id();
+            let _a = picked.on_change(|value| {});
+            print(fresh_id() - before_a - 1);
+            let before_b = fresh_id();
+            let _b = composed.on_change(|value| {});
+            print(fresh_id() - before_b - 1);
+            let before_c = fresh_id();
+            let _c = followed.on_change(|value| {});
+            print(fresh_id() - before_c - 1);
 
             // Every one of the three is live, so none of the counts is the
             // count of a chain that failed to attach.
@@ -577,7 +605,7 @@ fn switch_and_and_then_mint_two_subscribers_where_the_composed_form_mints_three(
 
         main();
         "#,
-        "2\n2\n3\n20\n20\n5\n",
+        "0\n0\n0\n3\n3\n3\n20\n20\n5\n",
     );
 }
 
@@ -586,8 +614,7 @@ fn switch_and_and_then_mint_two_subscribers_where_the_composed_form_mints_three(
 // The paper's S1 probe (`proposal/reactive-pipeline.md` §7) measured the
 // cold-node model over today's `Source` in a module of its own. Its nodes are
 // `std::reactive`'s since S2b and the probe file is gone; these four pins are
-// its numbers, now held against the real nodes (built through the `[internal]`
-// `_node` spellings until the flip, S2c).
+// its numbers, now held against the real nodes.
 
 #[test]
 fn a124_s1_a_cold_chain_with_no_subscriber_evaluates_nothing() {
@@ -605,11 +632,11 @@ fn a124_s1_a_cold_chain_with_no_subscriber_evaluates_nothing() {
             let root: SignalCell<i32> = Signal::new(1);
             let evals: Shared<i32> = Shared::new(0);
             let chain = root
-                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
-                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
-                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
-                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
-                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 });
+                .map(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map(|x| { evals.write() = evals.read() + 1; x + 1 });
             print(evals.read());
             root.set(2);
             root.set(3);
@@ -641,11 +668,11 @@ fn a124_s1_a_cold_chain_evaluates_once_per_leaf_subscriber() {
             let root: SignalCell<i32> = Signal::new(1);
             let evals: Shared<i32> = Shared::new(0);
             let chain = root
-                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
-                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
-                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
-                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 })
-                .map_node(|x| { evals.write() = evals.read() + 1; x + 1 });
+                .map(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map(|x| { evals.write() = evals.read() + 1; x + 1 })
+                .map(|x| { evals.write() = evals.read() + 1; x + 1 });
             let _one = chain.on_change(|_value| {});
             evals.write() = 0;
             root.set(2);
@@ -678,13 +705,13 @@ fn a124_s1_a_cell_between_runs_the_segment_above_it_once() {
             let upper: Shared<i32> = Shared::new(0);
             let lower: Shared<i32> = Shared::new(0);
             let cached = root
-                .map_node(|x| { upper.write() = upper.read() + 1; x + 1 })
-                .map_node(|x| { upper.write() = upper.read() + 1; x + 1 })
+                .map(|x| { upper.write() = upper.read() + 1; x + 1 })
+                .map(|x| { upper.write() = upper.read() + 1; x + 1 })
                 .cell();
             let below = cached
-                .map_node(|x| { lower.write() = lower.read() + 1; x + 1 })
-                .map_node(|x| { lower.write() = lower.read() + 1; x + 1 })
-                .map_node(|x| { lower.write() = lower.read() + 1; x + 1 });
+                .map(|x| { lower.write() = lower.read() + 1; x + 1 })
+                .map(|x| { lower.write() = lower.read() + 1; x + 1 })
+                .map(|x| { lower.write() = lower.read() + 1; x + 1 });
             let _a = below.on_change(|_value| {});
             let _b = below.on_change(|_value| {});
             upper.write() = 0;
@@ -712,17 +739,17 @@ fn a124_s1_a_diamond_pulls_a_settled_pair_and_fires_twice() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ Signal, SignalCell, Source, combine_node };
+        import std::reactive::{ Signal, SignalCell, Source, combine };
         import std::shared::Shared;
 
         fun main() {
             let source: SignalCell<i32> = Signal::new(1);
             let seen: Shared<str> = Shared::new("");
             let arms: (dyn Source<i32>, dyn Source<i32>) = (
-                source.map_node(|x| x * 10),
-                source.map_node(|x| x + 100)
+                source.map(|x| x * 10),
+                source.map(|x| x + 100)
             );
-            let diamond = combine_node(arms);
+            let diamond = combine(arms);
             let _leaf = diamond.on_change(|pair| {
                 let (left, right) = pair;
                 seen.write() = i"{seen.read()}({left},{right})";
@@ -757,17 +784,17 @@ fn a124_s2a_a_diamond_in_a_turn_fires_once_with_the_settled_pair() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ FlushPolicy, Signal, SignalCell, Source, combine_node, turn };
+        import std::reactive::{ FlushPolicy, Signal, SignalCell, Source, combine, turn };
         import std::shared::Shared;
 
         fun main() {
             let source: SignalCell<i32> = Signal::new(1);
             let seen: Shared<str> = Shared::new("");
             let arms: (dyn Source<i32>, dyn Source<i32>) = (
-                source.map_node(|x| x * 10),
-                source.map_node(|x| x + 100)
+                source.map(|x| x * 10),
+                source.map(|x| x + 100)
             );
-            let diamond = combine_node(arms);
+            let diamond = combine(arms);
             let _leaf = diamond.on_change(|pair| {
                 let (left, right) = pair;
                 seen.write() = i"{seen.read()}({left},{right})";
@@ -806,7 +833,7 @@ fn a124_s2a_a_leaf_disposed_by_an_earlier_effect_in_its_wave_does_not_fire() {
                 held.read()?.dispose();
                 print("first disposed the leaf");
             });
-            held.write() = Some(source.map_node(|x| x * 10).on_change(|value| {
+            held.write() = Some(source.map(|x| x * 10).on_change(|value| {
                 print(i"leaf saw {value}");
             }));
             turn(FlushPolicy::AtEnd, || {
@@ -834,7 +861,7 @@ fn a124_s2a_the_default_bridge_dedups_a_diamond_over_a_root_that_only_has_on_cha
         r#"
         import std::io::print;
         import std::reactive::{
-            FlushPolicy, Signal, SignalCell, Source, Subscription, combine_node, turn,
+            FlushPolicy, Signal, SignalCell, Source, Subscription, combine, turn,
         };
         import std::shared::Shared;
 
@@ -857,10 +884,10 @@ fn a124_s2a_the_default_bridge_dedups_a_diamond_over_a_root_that_only_has_on_cha
             let root = Stored { inner = cell };
             let seen: Shared<str> = Shared::new("");
             let arms: (dyn Source<i32>, dyn Source<i32>) = (
-                root.map_node(|x| x * 10),
-                root.map_node(|x| x + 100)
+                root.map(|x| x * 10),
+                root.map(|x| x + 100)
             );
-            let diamond = combine_node(arms);
+            let diamond = combine(arms);
             let _leaf = diamond.on_change(|pair| {
                 let (left, right) = pair;
                 seen.write() = i"{seen.read()}({left},{right})";
@@ -882,9 +909,8 @@ fn a124_s2a_the_default_bridge_dedups_a_diamond_over_a_root_that_only_has_on_cha
 
 // --- A124 S2b: the nodes, `.cell()`, `.distinct()` and `Resource<T>` ---------
 //
-// The node types are `std::reactive`'s; `map`/`switch`/`combine` still return
-// cells until the flip (S2c), so the nodes are built through the `[internal]`
-// `map_node`/`switch_node`/`combine_node` spellings, and `.cell()` and
+// The node types are `std::reactive`'s; since the flip (S2c) `map`, `switch`,
+// both `flatten`s, `and_then` and `combine` build them, and `.cell()` and
 // `.distinct()` are public.
 
 #[test]
@@ -903,11 +929,11 @@ fn a124_s2b_a_cell_does_not_compare_and_a_distinct_does() {
             let root: SignalCell<i32> = Signal::new(1);
             let cell_log: Shared<str> = Shared::new("");
             let distinct_log: Shared<str> = Shared::new("");
-            let cached = root.map_node(|x| x / 10).cell();
+            let cached = root.map(|x| x / 10).cell();
             let _c = cached.on_change(|value| {
                 cell_log.write() = i"{cell_log.read()}{value},";
             });
-            let _d = root.map_node(|x| x / 10).distinct().on_change(|value| {
+            let _d = root.map(|x| x / 10).distinct().on_change(|value| {
                 distinct_log.write() = i"{distinct_log.read()}{value},";
             });
             root.set(2);
@@ -947,7 +973,7 @@ fn a124_s2b_a_cell_is_a_derivation_an_effect_reads_settled() {
                     None => {},
                 }
             });
-            holder.write() = Some(root.map_node(|x| x * 2 + 1).cell());
+            holder.write() = Some(root.map(|x| x * 2 + 1).cell());
             turn(FlushPolicy::AtEnd, || {
                 root.set(5);
             });
@@ -974,7 +1000,7 @@ fn a124_s2b_a_cell_made_under_an_owner_releases_its_upstream_with_it() {
         fun main() {
             let root: SignalCell<i32> = Signal::new(1);
             let owner = Owner::new();
-            let cached = run_with_owner(owner, || root.map_node(|x| x * 10).cell());
+            let cached = run_with_owner(owner, || root.map(|x| x * 10).cell());
             root.set(2);
             print(i"before={root.subscribers.read().len()} cell={cached.get()}");
             owner.dispose();
@@ -1010,7 +1036,7 @@ fn a124_s2b_the_owners_disposal_releases_a_switchs_rolling_inner_registration() 
             let owner = Owner::new();
             run_with_owner(owner, || {
                 which
-                    .switch_node(|n| if n == 0 { first } else { second })
+                    .switch(|n| if n == 0 { first } else { second })
                     .effect_on_change(|value| {
                         log.write() = i"{log.read()}{value},";
                     });
@@ -1056,9 +1082,9 @@ fn a124_s2b_a_default_inherited_by_a_node_types_its_observer_from_the_node() {
         fun main() {
             let which: SignalCell<i32> = Signal::new(0);
             let first: SignalCell<i32> = Signal::new(10);
-            let _switched = which.switch_node(|n| first).sub(|value| print(value + 1));
+            let _switched = which.switch(|n| first).sub(|value| print(value + 1));
             let _distinct = which.distinct().sub(|value| print(value + 2));
-            let labelled = which.map_node(|n| i"n{n}").map(|label| label.len());
+            let labelled = which.map(|n| i"n{n}").map(|label| label.len());
             print(labelled.get());
         }
 
@@ -1077,16 +1103,16 @@ fn a124_s2b_combine_over_the_tuple_bound_joins_three_kinds_of_source() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        import std::reactive::{ FlushPolicy, Signal, SignalCell, Source, combine_node, turn };
+        import std::reactive::{ FlushPolicy, Signal, SignalCell, Source, combine, turn };
 
         fun main() {
             let count: SignalCell<i32> = Signal::new(1);
             let arms: (dyn Source<i32>, dyn Source<str>, dyn Source<bool>) = (
                 count,
-                count.map_node(|n| i"n{n}"),
-                count.map_node(|n| n > 2).cell()
+                count.map(|n| i"n{n}"),
+                count.map(|n| n > 2).cell()
             );
-            let all = combine_node(arms);
+            let all = combine(arms);
             let _leaf = all.on_change(|triple| {
                 let (n, label, big) = triple;
                 print(i"{n} {label} {big}");
@@ -1121,7 +1147,7 @@ fn a124_s2b_pending_or_zero_reads_zero_before_completion_and_the_value_after() {
 
         fun main() {
             let id: SignalCell<i32> = Signal::new(1);
-            let user: Resource<i32> = id.resource_node(|n| {
+            let user: Resource<i32> = id.load(|n| {
                 sleep(5);
                 Ok(n * 10)
             });
@@ -1484,6 +1510,75 @@ fn a130_cell_global_ignores_an_ambient_owner_where_cell_is_released_with_it() {
         main();
         "#,
         "global=2 owned=1 left=1\n",
+    );
+}
+
+#[test]
+fn a124_s2c_combine_erases_a_cell_and_a_node_at_the_call() {
+    // The flip's `combine`: its mapped-tuple parameter `(U in T: dyn Source<U>)`
+    // erases each element at the call, so a root cell and a cold node mix in one
+    // literal with NO annotated tuple of `dyn`s (B398 made the position coerce
+    // its elements; before, this type-checked and threw `source[1].get is not a
+    // function` at the first read). Building it registers nothing (`built=0`);
+    // a leaf registers one record per arm on the root (`subscribed=2`), and one
+    // write fires it once in a turn with the settled pair.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ FlushPolicy, Signal, SignalCell, Source, combine, turn };
+
+        fun main() {
+            let name: SignalCell<str> = Signal::new("ada");
+            let both = combine((name, name.map(|value| value.len())));
+            print(i"built={name.subscribers.read().len()}");
+            let (first, length) = both.get();
+            print(i"{first} {length}");
+            let _leaf = both.on_change(|pair| {
+                let (value, size) = pair;
+                print(i"changed {value} {size}");
+            });
+            print(i"subscribed={name.subscribers.read().len()}");
+            turn(FlushPolicy::AtEnd, || {
+                name.set("grace");
+            });
+        }
+
+        main();
+        "#,
+        "built=0\nada 3\nsubscribed=2\nchanged grace 5\n",
+    );
+}
+
+#[test]
+fn a124_s2c_a_node_over_a_tuple_upstream_forwards_through_its_bound() {
+    // B410 retired at S2c: a `map` over a `combine` reaches the `Combine`'s
+    // `on_settle` through its bound at a TUPLE trait argument, and the override
+    // answers — it forwards the leaf's record, so subscribing the leaf mints
+    // exactly ONE subscriber (the leaf's own). Before B410 the bound selected
+    // `Source::on_settle`'s payload bridge here instead, which minted a relay of
+    // its own (S2b's note: "costs one relay"). Planted — `Combine` without its
+    // `on_settle` override, so the bridge answers — this reds: the bridge calls
+    // back into `Combine::on_change`, which calls `on_settle`, and the two recurse
+    // (`RangeError: Maximum call stack size exceeded`), the failure the S2b-era
+    // "call your OWN `on_settle`" rule existed to avoid.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, SignalCell, Source, combine, fresh_id };
+
+        fun main() {
+            let a: SignalCell<i32> = Signal::new(1);
+            let b: SignalCell<i32> = Signal::new(2);
+            let sum = combine((a, b)).map(|(x, y)| x + y);
+            let before = fresh_id();
+            let _leaf = sum.on_change(|value| print(i"sum {value}"));
+            print(i"minted {fresh_id() - before - 1}");
+            a.set(10);
+        }
+
+        main();
+        "#,
+        "minted 1\nsum 12\n",
     );
 }
 

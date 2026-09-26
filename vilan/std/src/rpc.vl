@@ -39,6 +39,7 @@ import pkg::reactive::{
 	DeltaSource,
 	Disposable,
 	FlushPolicy,
+	Map as MapNode,
 	SeqOp,
 	SignalCell,
 	Source,
@@ -3634,52 +3635,23 @@ export impl RemoteSource<type T> with Source<Option<T>> {
 	fun effect(self, observer: |Option<T>| void) {
 		get_owner().take(self.lease(observer));
 	}
-
-	/// Observe the mirror through `transform`, as a plain `SignalCell<U>` — the
-	/// one seam into the ordinary reactive world (`each`, `bind_text`,
-	/// `{…}` embedding all take a `Signal`). COUNTED: this is a subscription —
-	/// it opens the channel if nothing else has, and the lease is released when
-	/// the enclosing owner is disposed, which for a view is unmount. So it
-	/// requires an ambient owner, STATICALLY (`get_owner`, not the trait
-	/// default's `register_with_owner`): calling it where no `owner_scope.run`
-	/// encloses is a compile error, which makes "a network subscription must
-	/// have an owner" a compile-time law (A25). The trait's default is
-	/// deliberately owner-OPTIONAL, because `current_path().map(parse)` at
-	/// module level is a documented idiom and a network subscription at module
-	/// level is not one.
-	///
-	/// An OVERRIDE of the trait's `map`, which is what makes the strict law reach a
-	/// generic `S: Source<Option<T>>` too and not merely a concrete
-	/// `mirror.map(..)`. It was inherent until B258: overriding a default that the
-	/// receiver's own field type inherits used to promote `status`'s own
-	/// `self.cache.map(..)` — a call on a `SignalCell` field, which inherits the
-	/// OWNER-OPTIONAL default — to this strict body's flavor, and
-	/// `register_with_owner` ran with an undefined owner.
-	///
-	/// `transform` sees `None` until the first frame lands — the one place the
-	/// `Option` is confronted, and where a fallback of a DIFFERENT type than `T`
-	/// belongs (`"Loading…"` from a `RemoteSource<i32>`).
-	fun map<U>(self, transform: sync |Option<T>| U): SignalCell<U> {
-		let derived = SignalCell::new(transform(self.get()));
-		// A DERIVATION (A110 door 2), exactly as `Source::map` is: `lease` bottoms
-		// out in `cache.sub`, and `acquire` mints no subscriber on the way, so the
-		// mark reaches that one attach. Without it the mapped cell is EFFECT-class
-		// and a lower-id effect on the same mirror reads it stale for one wave.
-		as_derivation();
-		get_owner().take(self.lease(|value| {
-			derived.set(transform(value));
-		}));
-		derived
-	}
 }
 
 export impl RemoteSource<type T> {
-	/// `map` for the same-type case: `initial` until the first frame, the
-	/// mirrored value after. Counted and owner-released exactly like `map`,
-	/// because it IS `map` — `client.notes.or([])` inside a view replaces the
-	/// hand-built `SignalCell::new([])` + never-disposed `sub` pair, and the
-	/// subscription now dies with the view instead of with the tab.
-	fun or(self, initial: T): SignalCell<T> {
+	/// `initial` until the first frame, the mirrored value after — a cold `map`
+	/// node over the mirror (A124 S2c). It stores nothing and leases nothing:
+	/// building it opens no channel, anywhere, owner or not.
+	///
+	/// A25's law — "a network subscription must have an owner" — is asked where the
+	/// subscription is MADE, at the subscribing leaf, since the flip took the
+	/// mirror's own strict `map` away (a blanket `map` is what every source has
+	/// now): `effect`/`effect_on_change` on it lease under the ambient owner and
+	/// refuse to compile without one; a `.cell()` of it leases once and ties the
+	/// lease to the ambient owner (inside a view, the view's); a binding or `each`
+	/// leases under the view that places it; `sub`/`on_change` hand the lease back
+	/// as a `Subscription` for you to dispose. Each leaf takes its own lease on the
+	/// one count, so two leaves send one `Subscribe`.
+	fun or(self, initial: T): MapNode<RemoteSource<T>, Option<T>, T> {
 		self.map(|value| match value {
 			Some(let present) => present,
 			None => initial,
@@ -3688,11 +3660,12 @@ export impl RemoteSource<type T> {
 
 	/// What is locally KNOWN about this mirror, as a `SignalCell<Status>`. Passive:
 	/// opens no channel, takes no lease, needs no owner — derived from the cache
-	/// alone, so it is callable at the top of `main` where `map` is not. The honest
+	/// alone, so it is callable at the top of `main`, where an `effect` is not. The honest
 	/// sentence: a `status` observer ALONE never sees `Waiting → Ready`. `status`
 	/// reports; it does not ask. If nothing else is subscribed, the mirror stays
 	/// `Waiting` forever, and that is correct — the channel was never opened. Any
-	/// path that renders the value when it arrives (`sub`, `map`, `or`) subscribes;
+	/// leaf that renders the value when it arrives (`sub`, an `effect`, a `.cell()`
+	/// of `or`) subscribes;
 	/// the count is what makes that harmless.
 	///
 	/// TWO cells feed it since A92 — the cache and what the last mint said — so it
@@ -3700,8 +3673,8 @@ export impl RemoteSource<type T> {
 	/// thing in one line and cannot be used: it is variadic over DISTINCT element
 	/// types, and a `RemoteSource<Status>` would hand it two
 	/// `SignalCell<Option<Status>>`s. Both subscriptions are
-	/// `register_with_owner`'s, exactly as `SignalCell::map`'s one is, so `status`
-	/// stays owner-OPTIONAL and callable at the top of `main`.
+	/// `register_with_owner`'s, exactly as a `.cell()`'s one is, so `status` stays
+	/// owner-OPTIONAL and callable at the top of `main`.
 	fun status(self): SignalCell<Status> {
 		let derived = SignalCell::new(self.known());
 		let _cached = register_with_owner(self.cache.on_change(|_value| {
@@ -4377,10 +4350,10 @@ export struct KeyLease {
 /// element-grained deltas, with demand expressed per key.
 ///
 /// ONE mirror per channel, holding exactly what this client asked for. A
-/// whole-collection lease (`sub`, `map`, `or`) seeds it with a `Reset` and tracks
-/// every change; a per-key lease (`sub_key`, `of`) adds one element to it and
-/// tracks only that element. The two compose: a view showing a channel's index plus
-/// the three messages on screen holds one whole-collection lease and three key
+/// whole-collection lease (`sub`, a leaf over `or`) seeds it with a `Reset` and
+/// tracks every change; a per-key lease (`sub_key`, `of`) adds one element to it
+/// and tracks only that element. The two compose: a view showing a channel's index
+/// plus the three messages on screen holds one whole-collection lease and three key
 /// leases, and the server forwards each independently.
 ///
 /// The counted-lease rule is `RemoteSource`'s, per demand rather than per
@@ -4494,29 +4467,6 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> with S
 	/// owner.
 	fun effect(self, observer: |Option<List<T>>| void) {
 		get_owner().take(self.lease(observer));
-	}
-
-	/// Observe through `transform`, as a plain `SignalCell<U>` — the seam into the
-	/// ordinary reactive world. Counted and owner-released exactly like
-	/// `RemoteSource::map`, and with the same static requirement: an enclosing
-	/// `owner_scope.run`.
-	///
-	/// An OVERRIDE of the trait's `map` rather than an inherent member, for B258's
-	/// reason (`RemoteSource::map` carries it at length): an inherent override
-	/// would promote `status`'s own `self.cache.map(…)` — a call on a `SignalCell`
-	/// field, which inherits the owner-OPTIONAL default — to this strict body's
-	/// flavor, and `register_with_owner` would run with an undefined owner.
-	fun map<U>(self, transform: sync |Option<List<T>>| U): SignalCell<U> {
-		let derived = SignalCell::new(transform(self.get()));
-		// A DERIVATION (A110 door 2), exactly as `Source::map` is: `lease` bottoms
-		// out in `cache.sub`, and `acquire` mints no subscriber on the way, so the
-		// mark reaches that one attach. Without it the mapped cell is EFFECT-class
-		// and a lower-id effect on the same mirror reads it stale for one wave.
-		as_derivation();
-		get_owner().take(self.lease(|value| {
-			derived.set(transform(value));
-		}));
-		derived
 	}
 }
 
@@ -4650,8 +4600,8 @@ export impl KeyedSource<type K: Wire + Hashable, type T: Wire + Keyed<K>> {
 		subscription
 	}
 
-	/// `map` for the same-type case: `initial` until the first patch.
-	fun or(self, initial: List<T>): SignalCell<List<T>> {
+	/// `initial` until the first patch — `RemoteSource::or`'s cold node.
+	fun or(self, initial: List<T>): MapNode<KeyedSource<K, T>, Option<List<T>>, List<T>> {
 		self.map(|value| match value {
 			Some(let present) => present,
 			None => initial,
@@ -5293,7 +5243,7 @@ export macro fun route_block(name: str, statements: List<str>): str {
 /// constraint `[expose]` lives under, where the element is read off the
 /// annotation's sole type argument and the analyzer refuses afterwards what
 /// the spelling could not carry (B202). `SignalCell<T>` is the canonical cell
-/// and the one every derivation produces (`map`, `or`, `combine` all answer
+/// and the one a derivation materialises into (`.cell()` answers
 /// `SignalCell<U>`), so it is the spelling a handle is written in. A method
 /// returning some OTHER `Source` implementation is not read as a handle and
 /// falls to the ordinary `[rpc]` Wire rule, which refuses it by name — loudly,

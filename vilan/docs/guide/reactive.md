@@ -107,9 +107,14 @@ feature.)
 
 ## Derived state: `map`, `combine`, `flatten`
 
-Build state as a graph and let it recompute itself:
+Build state as a graph and let it compute itself. Every combinator below
+returns a **node** — a description of a value, holding the source it reads and
+what it does to it, and nothing else. A node computes when it is READ: `get()`
+pulls through the chain, and a subscriber is told "something changed" and pulls
+too. Building one registers nothing and runs nothing.
 
-- `signal.map(transform)` gives a signal of the transformed value:
+- `signal.map(transform)` gives a source of the transformed value, computed
+  when it is read:
 
   ```vilan
   import std::reactive::{ Signal, SignalCell };
@@ -121,8 +126,9 @@ Build state as a graph and let it recompute itself:
   	print(doubled.get());
   }
   ```
-- `combine((a, b, …))` gives a signal of the tuple of several
-  signals' values. It fires when any of them changes. Takes two or more.
+- `combine((a, b, …))` gives a source of the tuple of several sources'
+  values — cells, nodes and mirrors mixed freely. It fires when any of
+  them changes. Takes two or more.
 - `nested.flatten()` on **any source whose element is a source** follows
   whichever inner signal is current, and detaches from a replaced one — a
   `SignalCell<SignalCell<U>>`, a `map` result that picks between signals, a
@@ -152,8 +158,8 @@ A dependency is **static** when the expression fixes what the result reads —
 that is `map` and `combine` — and **dynamic** when the current value decides
 *which* source to follow next, which is what "the selected channel's unread
 count" needs. `flatten` is the primitive underneath the dynamic half; two
-combinators are its everyday spelling, and each is one derived cell rather
-than a chain:
+combinators are its everyday spelling, and each is one node rather than a
+chain:
 
 - `source.switch(select)` follows whichever source `select` answers for the
   current value and re-follows when this one changes — Rx's `switchMap`. It
@@ -184,10 +190,11 @@ fun main() {
 }
 ```
 
-Both are derivations, like `map`: they publish rather than act, so an effect
-downstream of one reads the settled value in a single wave, and both hand
-their subscriptions — the outer one and whichever inner is live — to the
-ambient owner, so a disposed boundary leaves nothing behind.
+Both are nodes, like `map`, with one difference: subscribed, they keep a
+registration of their own on whichever inner is current, and re-wire it at
+every switch. The handle the subscriber holds owns that registration, so an
+effect made inside a boundary releases the outer and the live inner together
+when the boundary goes.
 
 ### Where a derivation lives: `.cell()` and `dyn Source<T>`
 
@@ -236,11 +243,35 @@ fun main() {
 notifies. When an unchanged value should stay quiet, `.distinct()` is the node
 that compares (it asks `T: PartialEq`, and nothing else in the chain does).
 
-In this release `map`, `combine`, `flatten`, `switch` and `and_then` still hand
-back a `SignalCell` — every step of a chain is still a cell, as it always was.
-v0.41.0 makes them return the cold nodes. Writing `.cell()` today where a value
-is shared or read hot, and `dyn Source<T>` where one is stored, is the code that
-is right on both sides of that change.
+**What a node's type is, and where you write it.** `map` answers a
+`Map<S, T, U>`, `switch` and the total `flatten` a `Switch`, the `Option`
+`flatten` a `FlattenOption`, `and_then` an `AndThen`, `combine` a `Combine` —
+types you rarely spell. Leave a binding unannotated, take a parameter as a
+`Source<T>` bound (any node satisfies it), store one as `dyn Source<T>`, or
+`.cell()` it where a `SignalCell<T>` is what you mean. An annotation of
+`SignalCell<U>` on a `map` is the one spelling that no longer fits, and so is
+handing a node to a `Signal<T>` parameter, which is the WRITABLE half — a node
+cannot be written to; a `.cell()` of it can (and the next change overwrites
+what you wrote).
+
+**At module level, `.cell_global()`.** A `.cell()` ties its registration to the
+ambient owner, and a module binding's initializer has none, so there the
+compiler refuses `.cell()` and steers you to build it under the owner that reads
+it — or to write `.cell_global()`, which says the cell lives for the program:
+
+```vilan
+import std::reactive::{ Signal, SignalCell, Source };
+
+let path: SignalCell<str> = Signal::new("/docs/intro");
+let is_deep = path.map(|value: str| value.len() > 5);            // a node: fine anywhere
+let segments: SignalCell<usize> = path.map(|value: str| value.len()).cell_global();
+
+fun main() {
+	print(is_deep.get());
+	path.set("/");
+	print(segments.get());
+}
+```
 
 ### Selection over a list: `selector`
 
@@ -352,8 +383,9 @@ Five rules, and they are the whole answer:
 |---|---|---|
 | `signal.effect(..)` / `effect_on_change(..)` | the ambient owner (required, *statically*) | the boundary is disposed |
 | `signal.sub(..)` / `on_change(..)` / `observe(..)` | **nobody** — you hold the `Subscription` | you call `dispose()`, or the owner you gave it to is disposed |
-| `map` / `combine` / `flatten` / `selector` **inside** a boundary | the ambient owner | the boundary is disposed |
-| `map` / `combine` / `flatten` / `selector` **outside** every boundary | nobody — it lives as long as its source | never (deliberate: see below) |
+| `map` / `combine` / `flatten` / `switch` / `and_then` | nothing to release — a node registers nothing until a leaf subscribes | — |
+| `.cell()` / `selector` **inside** a boundary | the ambient owner | the boundary is disposed |
+| `.cell()` / `selector` **outside** every boundary (a function body), `.cell_global()` anywhere | nobody — it lives as long as its source | never (deliberate: see below) |
 | `signal.scoped_effect(..)`, and anything its body registers | that **run's** owner | before the next run, and with the boundary |
 
 Two of those rows are worth a sentence.
@@ -363,13 +395,15 @@ destructors here, so a handle you forget about keeps firing. Hold it and
 `dispose()` it, hand it to an owner (`owner.take(..)`), or use `effect`,
 which does that for you — and `effect` is the one to reach for.
 
-**A derivation made outside every boundary lives as long as its
-source, on purpose.** `current_path().map(parse)` at the top of `main`
-is a documented idiom, and the derivation is meant to last as long as
-the program. Refusing it would be the stricter rule and would break
-that idiom, so vilan does not. Inside a boundary the derivation dies
-with the boundary, which is what a component wants. The one exception
-is a *mirror*: `RemoteSource::map` requires an owner, because its
+**A cached derivation made outside every boundary lives as long as its
+source, on purpose.** `current_path().map(parse)` at the top of `main` is a
+node and costs nothing until something reads it; a `.cell()` of it there is
+meant to last as long as the program. Refusing that would be the stricter rule
+and would break the idiom, so vilan does not — except in a module binding's
+initializer, where the lifetime is spelled `.cell_global()`. Inside a boundary
+a `.cell()` dies with the boundary, which is what a component wants. A
+*mirror* is where the owner is asked strictly: an `effect` on a
+`RemoteSource` (or on a node over one) requires an owner, because its
 subscription costs a network frame.
 
 A disposed owner is **single-use**: a `take` or `defer` that arrives
@@ -761,8 +795,11 @@ element: its result is kept, and nothing re-runs it.
   and let the owner handle it.
 - Disposal stops *future* deliveries. A watcher already queued in the
   currently-settling turn may fire one final time.
-- Derived signals (`map`/`combine`/`flatten`) take the ambient owner when
-  there is one, so a derivation built inside a view dies with the view.
-  Built where no owner is ambient — module level, the top of `main` — it
-  lives as long as its source, which is what a module-level
-  `current_path().map(parse)` is for. Either way you never hold a handle.
+- Derivations (`map`/`combine`/`flatten`/`switch`/`and_then`) are nodes:
+  they register nothing, so there is nothing to dispose. A `.cell()` takes
+  the ambient owner when there is one, so one built inside a view dies with
+  the view; built at the top of `main` it lives as long as its source, and
+  at module level it is spelled `.cell_global()`. Either way you never hold
+  a handle.
+- Two readers of one node each evaluate it. When a derivation is expensive
+  or read in several places, `.cell()` it once and share the cell.

@@ -21,11 +21,11 @@ import std::reactive::{
 
 | Item | Kind | One line |
 |---|---|---|
-| `Source<T>` | trait | anything readable + subscribable (requires `get`/`on_change`; `on_settle`/`sub`/`effect`/`effect_on_change`/`scoped_effect`/`scoped_effect_on_change`/`map` are defaults) |
+| `Source<T>` | trait | anything readable + subscribable (requires `get`/`on_change`; `on_settle`/`sub`/`effect`/`effect_on_change`/`scoped_effect`/`scoped_effect_on_change` are defaults; `map`/`switch`/`flatten`/`and_then`/`cell`/`distinct` are blankets over it) |
 | `Subscriber` | struct | one observer's record — its id (a turn's dedup key), `notify`, liveness and class; what `on_settle` carries |
 | `.cell()`, `.cell_global()`, `.distinct()` | blanket methods | on any `Source`: materialise into a cached cell (no comparison), owner-tied — or, `.cell_global()`, for the life of the program; pass a change on only when the value differs (`T: PartialEq`) |
-| `Map`, `Switch`, `Combine`, `Distinct` | structs | the cold pipeline nodes (A124): hold their upstream, compute when read; built by `map`/`switch`/`combine` from v0.41.0 |
-| `Resource<T>`, `ResourceState<T>` | struct/enum | a value that may still be loading — pending, settled, failed — and its fallbacks; std-internal until v0.41.0 |
+| `Map`, `Switch`, `FlattenOption`, `AndThen`, `Combine`, `Distinct` | structs | the cold pipeline nodes (A124): hold their upstream, compute when read; what `map`/`switch`/`flatten`/`and_then`/`combine` return |
+| `Resource<T>`, `ResourceState<T>` | struct/enum | a value that may still be loading — pending, settled, failed — built by `source.load(fetch)` or `Resource::pending()`, read through its fallbacks |
 | `Signal<T>` | trait | the writable half (`set`/`notify`/`set_with`); `Source` is its supertrait |
 | `SignalCell<T>` | struct | the canonical cell — mutable value plus subscribers |
 | `MaybeSignal<T>` | trait | a component value that may be static OR reactive |
@@ -85,26 +85,26 @@ impl SignalCell<type T> with Source<T> {
 	// from the trait defaults:
 	fun effect(self, observer: |T| void)    // fires now + on change; owner-registered
 	fun effect_on_change(self, observer: |T| void)  // on change only; owner-registered
-	fun map<U>(self, transform: sync |T| U): SignalCell<U>
 }
 // A BLANKET over the read trait, not a member of the cell (A86): any source
 // whose element is itself a source joins — a `map` result, a derived cell, a
 // mirror, a plain `SignalCell`.
 impl type S: Source<type I: Source<type U>> {
-	fun flatten(self): SignalCell<U>            // follow the current inner signal
+	fun flatten(self): Switch<S, I, I, U>       // follow the current inner source
 }
 impl type S: Source<Option<type I: Source<type U>>> {
-	fun flatten(self): SignalCell<Option<U>>    // `None` detaches; `Some` follows
+	fun flatten(self): FlattenOption<S, I, U>   // `None` detaches; `Some` follows
 }
 // The DYNAMIC pair (A123), written over `on_change` rather than over the join:
 // which source to follow is decided by the value this one currently holds.
 impl type S: Source<type T> {
-	fun switch<U, I: Source<U>>(self, select: sync |T| I): SignalCell<U>
+	fun map<U>(self, transform: sync |T| U): Map<S, T, U>     // cold: computed when read
+	fun switch<U, I: Source<U>>(self, select: sync |T| I): Switch<S, T, I, U>
 }
 impl type S: Source<Option<type T>> {
 	fun and_then<U, I: Source<Option<U>>>(
 		self, select: sync |T| I
-	): SignalCell<Option<U>>
+	): AndThen<S, T, I, U>
 }
 ```
 
@@ -263,7 +263,6 @@ trait Source<T> {
 	fun effect(self, observer: |T| void)                    // default; owner-registered, eager
 	fun scoped_effect(self, body: (sync |T| void) context owner_scope)
 	fun scoped_effect_on_change(self, body: (sync |T| void) context owner_scope)
-	fun map<U>(self, transform: sync |T| U): SignalCell<U>  // default; derived signal
 }
 ```
 
@@ -458,7 +457,7 @@ name — it registers with no owner even inside one, and nothing releases it:
 import std::reactive::{ Signal, SignalCell, Source };
 
 let path: SignalCell<str> = Signal::new("/");
-let depth: SignalCell<i32> = path.map(|value| value.len()).cell_global();
+let depth: SignalCell<usize> = path.map(|value| value.len()).cell_global();
 
 fun main() {
 	path.set("/docs");
@@ -489,11 +488,56 @@ fun main() {
 }
 ```
 
-Until v0.41.0, `map`, `switch` and `combine` still return a `SignalCell`, so
-`.cell()` on one of their results copies a cell that already caches. The flip
-makes them return the cold nodes (`Map`, `Switch`, `Combine`), and `.cell()` is
-then what you write where you want the cache — the
+`map`, `switch`, `flatten` and `and_then` return these cold nodes, and
+`.cell()` is where you want a cache — the
 [guide](../guide/reactive.md#derived-state-map-combine-flatten) has the rule.
+
+### Resource — a value that may still be loading
+
+```vilan,fragment
+enum ResourceState<T> { Pending, Settled(T), Failed(str) }
+
+impl type S: Source<type T> {
+	fun load<U>(self, fetch: async |T| Result<U, str>): Resource<U>   // re-fetch at every change
+}
+impl Resource<type T> {
+	fun pending(): Resource<T>                     // the hand-driven form
+	fun settle(self, value: T)
+	fun fail(self, reason: str)
+	fun pend(self)
+	fun state(self): SignalCell<ResourceState<T>>
+	fun or(self, default: T): Map<..>              // `default` while pending or failed — RESETS on a re-pend
+	fun latest(self, default: T): Map<..>          // HOLDS the last settled value across a re-pend
+	fun optional(self): Map<..>                    // `None` while pending or failed
+	fun is_pending(self): Map<..>                  // the spinner
+}
+```
+
+A fetch in flight is not a `Source` — it cannot answer `get` — so it is a
+`Resource`, a three-state machine (pending → settled → pending again when its
+source changes; failed is a third state a retry re-pends), and it becomes a
+source only through a **fallback**. That is where the `Option` of "not there
+yet" is confronted, once, instead of in every `map` below it. `source.load(fetch)`
+runs `fetch` for the source's current value and again at every change; the newest
+load wins. `.or` and `.latest` differ exactly on a re-pend: `.or` shows the
+default again (a spinner's product), `.latest` keeps the old value on screen
+while the new one loads.
+
+```vilan
+import std::reactive::{ Resource, Signal, SignalCell, Source };
+import std::result::Result::{ self, Ok };
+
+async fun fetch_name(id: i32): Result<str, str> {
+	Ok(i"user {id}")
+}
+
+fun main() {
+	let id: SignalCell<i32> = Signal::new(1);
+	let user: Resource<str> = id.load(|n| fetch_name(n));
+	let shown = user.or("loading…").map(|name| name + "!");
+	print(shown.get());      // loading…! — the fetch has not landed
+}
+```
 
 ### scoped_effect — an owner per run
 
@@ -692,26 +736,28 @@ that is why `bind` may only be called under one.
 ## combine
 
 ```vilan,fragment
-fun combine<T: (2..)>(sources: (U in T: SignalCell<U>)): SignalCell<T>
+fun combine<T: (2..)>(sources: (U in T: dyn Source<U>)): Combine<T>
 ```
 
-A signal of the tuple of the sources' current values, firing when any source
-changes. Variadic over tuples of signals of mixed element types:
+A source of the tuple of the sources' current values, changing when any source
+changes. Variadic over tuples of mixed element types, and each element is any
+`Source` — a cell, a node, a mirror — erased to `dyn Source<U>` at the call:
 
 ```vilan
-import std::reactive::{ Signal, SignalCell, combine };
+import std::reactive::{ Signal, SignalCell, Source, combine };
 
 fun main() {
 	let flag = Signal::new(true);
 	let count = Signal::new(2);
-	let both: SignalCell<(bool, i32)> = combine((flag, count));
+	let both = combine((flag, count.map(|n: i32| n * 10)));
 	let (_on, current) = both.get();
 	print(current);
 }
 ```
 
 (Destructuring names the parts, which reads better than positions;
-`both.get().1` also works.)
+`both.get().1` also works.) Like `map`, it is a cold node: `.cell()` it where
+the tuple is shared or read hot.
 
 ## Subscription, Disposable
 

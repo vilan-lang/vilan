@@ -304,15 +304,15 @@ A mirror is a `RemoteSource<T>`, not a `SignalCell<T>`, for one honest
 reason: before the first update lands it has **no value**, and nothing
 about the type pretends otherwise. You read it one of four ways:
 
-- `mirror.or(initial): SignalCell<T>` — the common one, for a view. A plain
-  signal you hand to `each`, `bind_text`, or a `{…}` hole: `initial`
-  until the first sync, the mirrored value after. Write it inside the
-  view (not in `main`), because it is a **subscription**: it opens the
-  channel, and it is released when the view that created it is unmounted.
-- `mirror.map(|value| …): SignalCell<U>` — the same, with the `Option<T>`
-  in your hands once, which is where a fallback of a *different* type
-  belongs (`"loading…"` from a `RemoteSource<i32>`). `or` is `map` for
-  the same-type case.
+- `mirror.or(initial)` — the common one, for a view. A source you hand
+  to `each`, `bind_text`, or a `{…}` hole: `initial` until the first sync,
+  the mirrored value after. It is a cold node — building it opens nothing —
+  and the view that places it is what **subscribes**: that opens the
+  channel, and it is released when the view is unmounted.
+- `mirror.map(|value| …)` — the same, with the `Option<T>` in your hands
+  once, which is where a fallback of a *different* type belongs
+  (`"loading…"` from a `RemoteSource<i32>`). `or` is `map` for the
+  same-type case. Add `.cell()` where one value is read in several places.
 - `mirror.sub(|value| …): Subscription` — the manual form: an observer
   of present values, and a handle you dispose yourself. For code with no
   view and no owner (a probe, a script).
@@ -373,19 +373,22 @@ async fun main() {
 }
 ```
 
-**Subscription follows demand.** Every `or`, `map`, and `sub` takes a
-counted lease on the channel: the first one sends `Subscribe`, the last
-release sends `Unsubscribe` (deferred to the end of the turn, so a view
-that re-renders in place churns nothing). Ten bindings on one mirror
-cost one channel; unmounting the page closes it. Which is also why
-`or`/`map` must be called where an owner is ambient (inside a view, or
-under `run_with_owner`): a network subscription with nobody to release
-it is a compile error, not a slow leak.
+**Subscription follows demand.** Every subscribing leaf — a binding, an
+`each`, an `effect`, a `.cell()`, a `sub` — takes a counted lease on the
+channel, whether it sits on the mirror or on an `or`/`map` over it: the
+first one sends `Subscribe`, the last release sends `Unsubscribe`
+(deferred to the end of the turn, so a view that re-renders in place
+churns nothing). Ten bindings on one mirror cost one channel; unmounting
+the page closes it. The owner is asked where the lease is taken: an
+`effect` on a mirror (or on its `or`) needs an ambient owner (inside a
+view, or under `run_with_owner`) — a network subscription with nobody to
+release it is a compile error, not a slow leak — and a `.cell()` ties its
+lease to the owner that is ambient.
 
 One sentence to keep in mind: **`status` reports; it does not ask.** A
 `status()` observer alone never sees `Waiting → Ready`, because nothing
 opened the channel — the mirror stays `Waiting` until something that
-renders the value (`or`, `map`, `sub`) subscribes. That is the passive
+renders the value (a binding over `or`, an `effect`, a `sub`) subscribes. That is the passive
 read being honest, and the count is what makes the active ones cheap.
 
 ### Handles: a method that returns a source

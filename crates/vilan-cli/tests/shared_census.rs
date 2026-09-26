@@ -87,7 +87,7 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "reactive.vl",
-        39,
+        37,
         "R + O + E: turns, owners, cells, drafts, the subscriber liveness flag \
          (A110 door 1 — one per OBSERVER, minted by `subscriber_of` and \
          shared with every handle to it, since A124 S2a split `observe` into \
@@ -106,7 +106,10 @@ const CENSUS: &[(&str, usize, &str)] = &[
          nodes; `Distinct`'s last-passed value, one per attach; a \
          `Resource`'s latest settled value and its load generation, the \
          `Draft` shape). `.cell()` adds NONE: its state is a `SignalCell`, \
-         whose two cells are `SignalCell::new`'s",
+         whose two cells are `SignalCell::new`'s. −2 at A124 S2c: the four \
+         cell-returning joins (`switch`, both `flatten`s, `and_then`) each held \
+         a rolling inner subscription; the total `flatten` is a `Switch` now and \
+         the other two are the `FlattenOption`/`AndThen` nodes, one each",
     ),
     (
         "rpc.vl",
@@ -229,7 +232,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 143,
+        total, 141,
         "the total number of `Shared` construction sites in std changed"
     );
 
