@@ -43615,13 +43615,43 @@ impl<'src> Analyzer<'src> {
             // have no single binder type); only mapped sources, which combine uses.
             other => {
                 let got = self.pretty_print_type(&other, &HashMap::default());
+                // E223: a type parameter carrying a TUPLE bound (`T: (2..)`) is
+                // not "unbounded" and not a stray non-tuple — the bound says it
+                // is a tuple, and the refusal is about what a comprehension
+                // walks: a mapped tuple's elements each have a template the
+                // body is checked against once, and a bounded parameter's have
+                // none yet (A122's ask).
+                let bounded_tuple = match &other {
+                    Type::Generic(constraint_id) => self
+                        .tuple_bounds
+                        .get(constraint_id)
+                        .cloned()
+                        .map(|requirement| {
+                            let element = requirement.element_bound.map(|element| {
+                                let element = element.get_type(self);
+                                self.pretty_print_type(&element, &HashMap::default())
+                            });
+                            requirement.label(element.as_deref())
+                        }),
+                    _ => None,
+                };
+                let msg = match bounded_tuple {
+                    Some(bound) => format!(
+                        "a tuple comprehension's source must be a mapped tuple, got {got}, a type \
+                         parameter bounded `{bound}`: the bound makes it a tuple, but a VALUE of \
+                         a bounded tuple parameter is not a comprehension source today — its \
+                         elements have no template the body can be checked against once. Walk \
+                         a mapped tuple `(U in {got}: F<U>)` instead"
+                    ),
+                    None => {
+                        format!("a tuple comprehension's source must be a mapped tuple, got {got}")
+                    }
+                };
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!(
-                        "a tuple comprehension's source must be a mapped tuple, got {got}"
-                    ),
+                    msg,
                 });
                 Resolution::Failed
             }

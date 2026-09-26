@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: diagnostics -->
+**A comprehension over a value of a tuple-bounded parameter names the bound: `(x in source.get() => ..)` with `source.get(): T` and `T: (2..)` now says "got T, a type parameter bounded `(2..)`: the bound makes it a tuple, but a VALUE of a bounded tuple parameter is not a comprehension source today …", where it read as though `T` were no tuple at all.** A concrete tuple source keeps the plain sentence. (E223)
+
 <!-- family: miscompile -->
 **An unsuffixed literal its context types `BigInt` is emitted as a BigInt: `tb(3)` for `fun tb(v: BigInt): BigInt { v + 1n }` prints `4n`, where it threw "Cannot mix BigInt and other types" at run time.** The literal law typed the `3` as `BigInt` from the parameter (and from an annotated `let`, or the other operand of a binary), and the emitter still wrote the JS number `3`. It now writes `3n` wherever the literal's settled type is `BigInt`. (B404)
 
