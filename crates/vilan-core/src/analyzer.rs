@@ -21205,6 +21205,14 @@ impl<'src> Analyzer<'src> {
             .reconcile_declaration(&impl_subject, subject_type, &impl_subject)
             .map(|(_, bindings)| bindings.into_iter().collect())
             .unwrap_or_default();
+        // B411: an impl may read the trait's argument out of a NESTED binder
+        // (`impl Sw<type I: Src<type U>> with Src<U>`): `U` is written in `I`'s
+        // bound, not in the subject's shape, so the reconciliation above left it
+        // a hole and the default's `T := U` handed a closure parameter the bare
+        // `U` (`s.show(|v| i"{v + 1}")` refused `v + 1`). Ground the bound's
+        // binders from the receiver's own impls first — the step a DECLARED
+        // member's call already takes (B300(a)).
+        self.bind_subject_bound_binders(impl_subject_id, subject_type, &mut bindings);
         for (chain_trait_id, chain_arguments) in
             self.trait_with_supertraits_at(trait_id, trait_arguments)
         {
@@ -35587,10 +35595,22 @@ impl<'src> Analyzer<'src> {
         if matches!(inferred, Type::Dyn(..)) {
             return;
         }
-        if !matches!(
-            inferred,
-            Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..)
-        ) {
+        // B412: the enclosing declaration's own parameter erases too, when its
+        // declared bounds carry the trait — the pair is built per instance, from
+        // what the parameter is bound to there.
+        let erasable_parameter = match inferred {
+            Type::Generic(constraint_id) => {
+                self.generic_is_rigid_here(*constraint_id)
+                    && self.caller_generic_provides(*constraint_id, *trait_id, trait_arguments)
+            }
+            _ => false,
+        };
+        if !erasable_parameter
+            && !matches!(
+                inferred,
+                Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..)
+            )
+        {
             return;
         }
         if !matches!(
@@ -35607,7 +35627,7 @@ impl<'src> Analyzer<'src> {
         ) {
             return;
         }
-        if !self.type_implements_trait(inferred, *trait_id) {
+        if !erasable_parameter && !self.type_implements_trait(inferred, *trait_id) {
             return;
         }
         let subject_type_id = inferred.clone().get_type_id(self);
@@ -38304,6 +38324,43 @@ impl<'src> Analyzer<'src> {
             (Type::Unresolved, _) | (_, Type::Unresolved) => {
                 return None;
             }
+            // B412: the enclosing declaration's OWN parameter meets a `dyn`
+            // position — `let object: dyn Source<X> = self` inside a blanket
+            // over `S: Source<X>`. The parameter is rigid, so it binds nothing
+            // and nothing binds it; what it may do is ERASE, exactly as a
+            // concrete value implementing the trait does, when its declared
+            // bounds provide the object's trait at the object's arguments. Every
+            // instantiation then implements it, and the table is built per
+            // instance (`note_dyn_coercion` records the site; the emitters
+            // resolve the parameter before building the pair). A rigid
+            // parameter whose bounds do not promise the trait still falls
+            // through to the refusal below.
+            (Type::Dyn(trait_id, dyn_arguments), Type::Generic(constraint_id))
+            | (Type::Generic(constraint_id), Type::Dyn(trait_id, dyn_arguments))
+                if self.generic_is_rigid_here(*constraint_id)
+                    && self.caller_generic_provides(*constraint_id, *trait_id, dyn_arguments) =>
+            {
+                // The object's still-open arguments bind from what the bound
+                // provides — a mapped `(U in T: dyn Source<U>)` recovers each
+                // element's `U` this way (B398's inversion over B412's
+                // parameters).
+                let mut bindings = Vec::new();
+                if let Some(provided) =
+                    self.caller_generic_trait_arguments(*constraint_id, *trait_id)
+                    && provided.len() == dyn_arguments.len()
+                {
+                    for (wanted, got) in dyn_arguments.clone().iter().zip(provided) {
+                        let wanted = wanted.get_type(self);
+                        let got = got.get_type(self);
+                        if let Some((_, mut argument_bindings)) =
+                            self.reconcile_type(&wanted, &got, substitution_context)
+                        {
+                            bindings.append(&mut argument_bindings);
+                        }
+                    }
+                }
+                (Type::Dyn(*trait_id, dyn_arguments.clone()), bindings)
+            }
             // A bound generic reconciles its resolved type against the other side,
             // unless that would re-enter a generic already being reconciled on this
             // path: the one-step self-map (`T -> T`, which reconciling an impl's own
@@ -38600,17 +38657,29 @@ impl<'src> Analyzer<'src> {
             // `note_dyn_coercion` takes it at the one seam where the value's own
             // type and its position's expectation are both known, which is the
             // seam B340's `Callable` coercion already uses.
+            //
+            // B421: AT the object's arguments. The value must implement the
+            // trait as the object names it — `Mapped<Root, i32, void>`
+            // implements `Src<void>`, not `Src<i32>` — or a closure whose body
+            // ends in `;` became a `dyn Src<i32>` whose `get` answered
+            // `undefined` (`NaN` one `+ 1` later). `type_implements_trait_at`
+            // is conservative: only a value that positively provides the trait
+            // at OTHER arguments is turned away.
             (
                 Type::Dyn(trait_id, dyn_arguments),
                 Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..),
-            ) if self.type_implements_trait(b, *trait_id) => {
+            ) if self.type_implements_trait(b, *trait_id)
+                && self.type_implements_trait_at(b, *trait_id, dyn_arguments) =>
+            {
                 let bindings = self.dyn_erasure_bindings(b, *trait_id, dyn_arguments);
                 (a.clone(), bindings)
             }
             (
                 Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..),
                 Type::Dyn(trait_id, dyn_arguments),
-            ) if self.type_implements_trait(a, *trait_id) => {
+            ) if self.type_implements_trait(a, *trait_id)
+                && self.type_implements_trait_at(a, *trait_id, dyn_arguments) =>
+            {
                 let bindings = self.dyn_erasure_bindings(a, *trait_id, dyn_arguments);
                 (b.clone(), bindings)
             }
@@ -38627,9 +38696,13 @@ impl<'src> Analyzer<'src> {
             // known — `note_dyn_coercion`, the same seam that records the
             // erasure.
             (
-                Type::Dyn(trait_id, _),
+                Type::Dyn(trait_id, dyn_arguments),
                 Type::Struct(..) | Type::Enum(..) | Type::Tuple(..) | Type::Array(..),
-            ) if self.type_implements_trait(b, *trait_id) => (a.clone(), Vec::new()),
+            ) if self.type_implements_trait(b, *trait_id)
+                && self.type_implements_trait_at(b, *trait_id, dyn_arguments) =>
+            {
+                (a.clone(), Vec::new())
+            }
             // The same trait on both sides (e.g. `self` typed `Iterator<T>` in an
             // `impl Iterator<type T>` block, returned where `Iterator<T>` is
             // declared): reconcile like the nominal arms above.
@@ -38810,6 +38883,17 @@ impl<'src> Analyzer<'src> {
                 if self.generic_is_rigid_here(*constraint_id) =>
             {
                 self.generic_bound_carries_trait(*constraint_id, *trait_id)
+            }
+            // B412's read-only twin: a rigid parameter erases into an object
+            // over a trait its declared bounds carry (`reconcile_type` checks
+            // the arguments; this comparison, like the `Trait` arm above,
+            // reads the trait).
+            (Type::Generic(constraint_id), Type::Dyn(trait_id, _))
+            | (Type::Dyn(trait_id, _), Type::Generic(constraint_id))
+                if self.generic_is_rigid_here(*constraint_id)
+                    && self.generic_bound_carries_trait(*constraint_id, *trait_id) =>
+            {
+                true
             }
             (Type::Generic(left_id), Type::Generic(right_id))
                 if self.generic_is_rigid_here(*left_id)
@@ -43608,13 +43692,43 @@ impl<'src> Analyzer<'src> {
             // have no single binder type); only mapped sources, which combine uses.
             other => {
                 let got = self.pretty_print_type(&other, &HashMap::default());
+                // E223: a type parameter carrying a TUPLE bound (`T: (2..)`) is
+                // not "unbounded" and not a stray non-tuple — the bound says it
+                // is a tuple, and the refusal is about what a comprehension
+                // walks: a mapped tuple's elements each have a template the
+                // body is checked against once, and a bounded parameter's have
+                // none yet (A122's ask).
+                let bounded_tuple = match &other {
+                    Type::Generic(constraint_id) => self
+                        .tuple_bounds
+                        .get(constraint_id)
+                        .cloned()
+                        .map(|requirement| {
+                            let element = requirement.element_bound.map(|element| {
+                                let element = element.get_type(self);
+                                self.pretty_print_type(&element, &HashMap::default())
+                            });
+                            requirement.label(element.as_deref())
+                        }),
+                    _ => None,
+                };
+                let msg = match bounded_tuple {
+                    Some(bound) => format!(
+                        "a tuple comprehension's source must be a mapped tuple, got {got}, a type \
+                         parameter bounded `{bound}`: the bound makes it a tuple, but a VALUE of \
+                         a bounded tuple parameter is not a comprehension source today — its \
+                         elements have no template the body can be checked against once. Walk \
+                         a mapped tuple `(U in {got}: F<U>)` instead"
+                    ),
+                    None => {
+                        format!("a tuple comprehension's source must be a mapped tuple, got {got}")
+                    }
+                };
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!(
-                        "a tuple comprehension's source must be a mapped tuple, got {got}"
-                    ),
+                    msg,
                 });
                 Resolution::Failed
             }
@@ -44055,9 +44169,10 @@ impl<'src> Analyzer<'src> {
         let Some(name) = self.numeric_primitive_name(constraint) else {
             return;
         };
-        // An unsuffixed literal typed `BigInt` still EMITS as a JS number
-        // (`tb(3)` for `fun tb(v: BigInt)` throws "Cannot mix BigInt and other
-        // types" today), so a binding is not steered into that.
+        // A binding is not steered into `BigInt`. The reason given when this
+        // was written — an unsuffixed literal typed `BigInt` emitted as a JS
+        // number — is gone since B404; admitting `BigInt` here is a change to
+        // what an unannotated binding means, and it is left for its own item.
         if name == "BigInt" || self.literal_let_expectations.contains_key(&variable_id) {
             return;
         }

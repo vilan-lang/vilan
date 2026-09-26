@@ -4638,6 +4638,18 @@ impl<'src> Transformer<'src> {
         if let Some((subject_type_id, trait_id, trait_arguments)) =
             self.program.dyn_coercions.get(&id).cloned()
         {
+            // B412: a site erasing the enclosing declaration's own parameter
+            // may be instantiated at an OBJECT (a `dyn Source<T>` handed to a
+            // generic), and an object landing in a `dyn` position is already
+            // the pair — wrapping it again would nest one inside the other.
+            if matches!(
+                self.program
+                    .type_id_to_type_map
+                    .get(&self.resolve_type_id(subject_type_id)),
+                Some(Type::Dyn(..))
+            ) {
+                return Some(node);
+            }
             let vtable = self.emit_vtable(subject_type_id, trait_id, &trait_arguments);
             return Some(js::Node::Array(vec![node, js::Node::Local(vtable)]));
         }
@@ -4792,8 +4804,24 @@ impl<'src> Transformer<'src> {
             Expr::Bool(x) => js::Node::Bool(*x),
             Expr::Number(whole, fraction, suffix) => {
                 // `n`-suffixed literals are JS BigInts (`5n`); other suffixes
-                // only affect typing and are dropped in the output.
-                let whole = if matches!(*suffix, Some("n")) {
+                // only affect typing and are dropped in the output. B404: an
+                // UNSUFFIXED integer literal its context typed `BigInt` (`tb(3)`
+                // for `fun tb(v: BigInt)`, `let b: BigInt = 7`) is a BigInt too —
+                // written as a JS number it met `v + 1n` and threw "Cannot mix
+                // BigInt and other types".
+                let typed_bigint = suffix.is_none()
+                    && fraction.is_none()
+                    && self
+                        .program
+                        .expr_type_ids
+                        .get(&id)
+                        .and_then(|type_id| self.program.type_id_to_type_map.get(type_id))
+                        .is_some_and(|type_| {
+                            matches!(type_, Type::Struct(struct_id, _)
+                                if self.program.structs.get(struct_id)
+                                    .is_some_and(|struct_| struct_.name == "BigInt"))
+                        });
+                let whole = if matches!(*suffix, Some("n")) || typed_bigint {
                     format!("{whole}n")
                 } else {
                     whole.to_string()

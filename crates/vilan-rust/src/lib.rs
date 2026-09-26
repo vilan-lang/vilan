@@ -3854,6 +3854,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
         else {
             return Ok(text);
         };
+        // B412: a site erasing a generic parameter may be instantiated at an
+        // OBJECT, which is already the erased value — no second pointer.
+        if matches!(
+            self.program
+                .type_id_to_type_map
+                .get(&self.concrete(subject)),
+            Some(Type::Dyn(..))
+        ) {
+            return Ok(text);
+        }
         let span = self.span_of(id);
         let object = self.ensure_object_impl(subject, trait_id, &arguments, span)?;
         Ok(format!(

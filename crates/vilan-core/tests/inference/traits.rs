@@ -7544,3 +7544,99 @@ fn b409_a_binder_in_a_trait_head_still_inherits_the_parameters_bound() {
         "dog\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B411 — a default's closure parameter typed through a NESTED binder
+// ---------------------------------------------------------------------------
+//
+// `impl Sw<type I: Src<type U>> with Src<U>` reads the trait's argument out of
+// `I`'s BOUND. A default the impl inherits (`show(self, f: |T| str)`) was
+// specialized with `T := U` while `U` itself was still a hole — the receiver's
+// shape binds `I`, and nothing grounded the binder written inside its bound —
+// so the closure's parameter was the bare `U` and `s.show(|v| i"{v + 1}")` was
+// refused. The inherited default now grounds the bound's binders from the
+// receiver's own impls, as a declared member's call already did (B300(a)).
+// std::reactive's nodes carry phantom parameters (`Switch<S, T, I, U>`) to
+// avoid exactly this shape.
+
+/// reactive-41's repro.
+#[test]
+fn b411_a_defaults_closure_parameter_is_typed_through_a_nested_binder() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> {\n",
+            "\tfun get(self): T;\n",
+            "\tfun show(self, f: |T| str): str { f(self.get()) }\n",
+            "}\n",
+            "struct Root { v: i32 }\n",
+            "impl Root with Src<i32> { fun get(self): i32 { self.v } }\n",
+            "struct Sw<I> { inner: I }\n",
+            "impl Sw<type I: Src<type U>> with Src<U> {\n",
+            "\tfun get(self): U { self.inner.get() }\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet s = Sw { inner = Root { v = 1 } };\n",
+            "\tprint(s.show(|v| i\"{v + 1}\"));\n",
+            "}\n",
+        ),
+        "2\n",
+    );
+}
+
+/// Two levels of nesting, and a default whose closure RETURNS the nested
+/// type (`map_to<V>(self, f: |T| V): V`) — the own generic binds from it.
+#[test]
+fn b411_a_doubly_nested_binder_types_a_defaults_closure() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> {\n",
+            "\tfun get(self): T;\n",
+            "\tfun map_to<V>(self, f: |T| V): V { f(self.get()) }\n",
+            "}\n",
+            "struct Root { v: str }\n",
+            "impl Root with Src<str> { fun get(self): str { self.v } }\n",
+            "struct Sw<I> { inner: I }\n",
+            "impl Sw<type I: Src<type U>> with Src<U> {\n",
+            "\tfun get(self): U { self.inner.get() }\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet s = Sw { inner = Sw { inner = Root { v = \"ab\" } } };\n",
+            "\tprint(s.map_to(|text| text.len()));\n",
+            "}\n",
+        ),
+        "2\n",
+    );
+}
+
+/// The node shape std's `Switch` would take without its phantom `U`
+/// (`Sw<S, T, I>` with `I: Src<type U>` in the impl's head): read through an
+/// inherited default directly and through a generic caller.
+#[test]
+fn b411_a_switch_shaped_node_reads_its_value_type_from_the_selected_source() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> {\n",
+            "\tfun get(self): T;\n",
+            "\tfun show(self, f: |T| str): str { f(self.get()) }\n",
+            "}\n",
+            "struct Root { v: i32 }\n",
+            "impl Root with Src<i32> { fun get(self): i32 { self.v } }\n",
+            "struct Word { w: str }\n",
+            "impl Word with Src<str> { fun get(self): str { self.w } }\n",
+            "struct Sw<S, T, I> { up: S, select: |T| I }\n",
+            "impl Sw<type S: Src<type T>, T, type I: Src<type U>> with Src<U> {\n",
+            "\tfun get(self): U { (self.select)(self.up.get()).get() }\n",
+            "}\n",
+            "fun shown<U, R: Src<U>>(r: R, f: |U| str): str { r.show(f) }\n",
+            "fun main() {\n",
+            "\tlet s = Sw<Root, i32, Word> { up = Root { v = 2 }, select = |n| Word { w = i\"w{n}\" } };\n",
+            "\tprint(s.show(|text| text + \"!\"));\n",
+            "\tprint(shown(s, |text| text + \"?\"));\n",
+            "}\n",
+        ),
+        "w2!\nw2?\n",
+    );
+}

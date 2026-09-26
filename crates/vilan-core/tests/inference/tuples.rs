@@ -7288,3 +7288,45 @@ fn a122_a_tuple_bounded_blanket_does_not_reach_outside_its_family() {
         "the bound '(3..)' requires at least 3",
     );
 }
+
+// ---------------------------------------------------------------------------
+// E223 — the mapped-tuple refusal names a tuple-BOUNDED parameter's bound
+// ---------------------------------------------------------------------------
+//
+// A comprehension over a VALUE of type `T: (2..)` was refused "a tuple
+// comprehension's source must be a mapped tuple, got T", which read as though
+// `T` were unbounded or not a tuple at all. It names the bound now and says
+// what the refusal is about (papers-41's probe `a122_02`).
+
+#[test]
+fn e223_a_tuple_bounded_parameter_source_names_its_bound() {
+    assert_fails_with(
+        concat!(
+            "import std::reactive::SignalCell;\n",
+            "fun divorce<T: (2..)>(source: SignalCell<T>): (U in T: SignalCell<U>) {\n",
+            "\t(x in source.get() => SignalCell::new(x))\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet s = SignalCell::new((1, \"one\"));\n",
+            "\tlet _parts = divorce(s);\n",
+            "}\n",
+        ),
+        "a tuple comprehension's source must be a mapped tuple, got T, a type parameter \
+         bounded `(2..)`: the bound makes it a tuple, but a VALUE of a bounded tuple \
+         parameter is not a comprehension source today",
+    );
+}
+
+/// The concrete-tuple refusal keeps its plain sentence.
+#[test]
+fn e223_a_concrete_tuple_source_keeps_the_plain_refusal() {
+    assert_fails_without(
+        concat!(
+            "fun main() {\n",
+            "\tlet t = (1, 2);\n",
+            "\tlet u = (x in t => x + 1);\n",
+            "}\n",
+        ),
+        "a type parameter bounded",
+    );
+}

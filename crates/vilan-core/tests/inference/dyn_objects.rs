@@ -846,3 +846,176 @@ fn b398_an_element_already_an_object_is_not_wrapped_again() {
         "7 q\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// B412 — a generic `S: Trait<X>` VALUE erases to `dyn Trait<X>`
+// ---------------------------------------------------------------------------
+//
+// Inside a generic body, a value typed by the enclosing declaration's own
+// parameter could not be erased: `let object: dyn Source<X> = self` in a
+// blanket over `S: Source<X>` was "Expected dyn Source<X>, but got S". The
+// bound guarantees the impl at every instantiation, so the erasure is
+// admitted where the parameter's declared bounds provide the object's trait at
+// the object's arguments, and the pair is built per instance.
+
+/// reactive-41's repro, over std's `Source`.
+#[test]
+fn b412_a_blanket_receiver_erases_to_an_object_of_its_bound() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ Signal, SignalCell, Source };\n",
+            "impl type S: Source<type X> {\n",
+            "\tfun erased(self): dyn Source<X> {\n",
+            "\t\tlet object: dyn Source<X> = self;\n",
+            "\t\tobject\n",
+            "\t}\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet a = Signal::new(1);\n",
+            "\tprint(a.erased().get());\n",
+            "}\n",
+        ),
+        "1\n",
+    );
+}
+
+/// The three landings — a return, an argument, a list element — at two
+/// instantiations, one of them itself an OBJECT (not wrapped a second time).
+#[test]
+fn b412_a_generic_parameter_erases_at_a_return_an_argument_and_an_element() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "trait Src<T> { fun get(self): T; }\n",
+            "struct Root { v: i32 }\n",
+            "impl Root with Src<i32> { fun get(self): i32 { self.v } }\n",
+            "struct Twice { v: i32 }\n",
+            "impl Twice with Src<i32> { fun get(self): i32 { self.v * 2 } }\n",
+            "fun show(source: dyn Src<i32>): i32 { source.get() }\n",
+            "fun erase<S: Src<i32>>(s: S): dyn Src<i32> { s }\n",
+            "fun shown<S: Src<i32>>(s: S): i32 { show(s) }\n",
+            "fun listed<S: Src<i32>>(s: S): i32 {\n",
+            "\tlet all: List<dyn Src<i32>> = [s];\n",
+            "\tall[0].get()\n",
+            "}\n",
+            "fun main() {\n",
+            "\tprint(erase(Root { v = 1 }).get());\n",
+            "\tprint(shown(Twice { v = 2 }));\n",
+            "\tprint(listed(Root { v = 3 }));\n",
+            "\tlet object: dyn Src<i32> = Twice { v = 5 };\n",
+            "\tprint(erase(object).get());\n",
+            "}\n",
+        ),
+        "1\n4\n3\n10\n",
+    );
+}
+
+/// With B398: a generic caller hands its own parameters to a mapped `dyn`
+/// position — `combine`'s shape in generic code.
+#[test]
+fn b412_generic_parameters_erase_into_a_mapped_dyn_tuple() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ SignalCell, Source };\n",
+            "fun reads<T: (2..)>(sources: (U in T: dyn Source<U>)): T {\n",
+            "\t(s in sources => s.get())\n",
+            "}\n",
+            "fun both<A: Source<i32>, B: Source<str>>(a: A, b: B): str {\n",
+            "\tlet (x, y) = reads((a, b));\n",
+            "\ti\"{x} {y}\"\n",
+            "}\n",
+            "fun main() {\n",
+            "\tprint(both(SignalCell::new(1), SignalCell::new(\"b\")));\n",
+            "}\n",
+        ),
+        "1 b\n",
+    );
+}
+
+/// A parameter whose bounds do NOT provide the trait — or provide it at other
+/// arguments — is still refused.
+#[test]
+fn b412_a_parameter_not_bounded_by_the_objects_trait_is_still_refused() {
+    let prelude = concat!(
+        "trait Src<T> { fun get(self): T; }\n",
+        "trait Other { fun o(self): i32; }\n",
+    );
+    assert_fails_with(
+        &format!(
+            "{prelude}{}",
+            "fun erase<S: Other>(s: S): dyn Src<i32> { s }\nfun main() {}\n"
+        ),
+        "Expected dyn Src<i32>, but got S",
+    );
+    assert_fails_with(
+        &format!(
+            "{prelude}{}",
+            "fun erase<S: Src<str>>(s: S): dyn Src<i32> { s }\nfun main() {}\n"
+        ),
+        "Expected dyn Src<i32>, but got S",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B421 — MISCOMPILE: a `dyn` coercion checked the trait, not its ARGUMENTS
+// ---------------------------------------------------------------------------
+//
+// `show(root.mapped(|n| { n * 2; }))` for `fun show(source: dyn Src<i32>)`
+// checked clean and printed `NaN`: the closure's `;` made the node a
+// `Mapped<Root, i32, void>` — a `Src<void>` — and the erasure asked only
+// whether the value implements `Src` at all. The coercion now asks at the
+// object's arguments (conservatively: only a value that positively provides
+// the trait at OTHER arguments is refused).
+
+const B421_NODE: &str = concat!(
+    "import std::io::print;\n",
+    "trait Src<T> { fun get(self): T; }\n",
+    "struct Root { value: i32 }\n",
+    "impl Root with Src<i32> { fun get(self): i32 { self.value } }\n",
+    "struct Mapped<S, T, U> { up: S, transform: |T| U }\n",
+    "impl Mapped<type S: Src<type T>, T, type U> with Src<U> {\n",
+    "\tfun get(self): U { (self.transform)(self.up.get()) }\n",
+    "}\n",
+    "impl type S: Src<type T> {\n",
+    "\tfun mapped<U>(self, transform: |T| U): Mapped<S, T, U> { Mapped<S, T, U> { up = self, transform } }\n",
+    "}\n",
+    "fun show(source: dyn Src<i32>) { print(source.get() + 1); }\n",
+);
+
+/// reactive-42's repro: refused where it printed `NaN`.
+#[test]
+fn b421_a_void_closure_node_does_not_erase_to_an_object_of_i32() {
+    assert_fails_with(
+        &format!(
+            "{B421_NODE}{}",
+            concat!(
+                "fun main() {\n",
+                "\tlet root = Root { value = 4 };\n",
+                "\tshow(root.mapped(|n| {\n",
+                "\t\tn * 2;\n",
+                "\t}));\n",
+                "}\n",
+            )
+        ),
+        "Expected dyn Src<i32>, but got Mapped<Root, i32, void> instead.",
+    );
+}
+
+/// The control: the same node with a value-producing body erases and runs.
+#[test]
+fn b421_a_node_at_the_objects_arguments_still_erases() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B421_NODE}{}",
+            concat!(
+                "fun main() {\n",
+                "\tlet root = Root { value = 4 };\n",
+                "\tshow(root.mapped(|n| n * 2));\n",
+                "}\n",
+            )
+        ),
+        "9\n",
+    );
+}
