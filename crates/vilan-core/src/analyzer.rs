@@ -55051,6 +55051,22 @@ pub fn reuse_census() -> (usize, usize, usize) {
     REUSE_CENSUS.with(std::cell::Cell::get)
 }
 
+// Whether the last top-level analysis on this thread to reach its entry tail
+// was SERVED its world from the base cache (N132) — the one input of T1's reuse
+// that a census of zero cannot tell apart: "hit, and replayed nothing" is a seam
+// defect, "missed" is the LRU doing its job. The replay differential asserts
+// exact reuse over the pairs that hit rather than over every pair. Thread-local
+// for `REUSE_CENSUS`'s reason, and written by the same rule: a macro world is a
+// nested analysis on this thread and leaves it alone.
+thread_local! {
+    static SERVED_FROM_BASE_CACHE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[doc(hidden)]
+pub fn served_from_base_cache() -> bool {
+    SERVED_FROM_BASE_CACHE.with(std::cell::Cell::get)
+}
+
 // M76's count, in the same family: how many sources this analysis held back
 // from the checks-reuse record because they reach the OPEN FILE through
 // `pkg::`. Zero on every shape but an entry-shaped world, where it is the
@@ -61936,6 +61952,9 @@ fn analyze_over_world<'src>(
     analyzer.platform = platform;
     analyzer.platform_reason = workspace.platform_reason.clone();
     analyzer.prelude_repair = workspace.prelude_repair;
+    if !crate::macros::in_macro_world() {
+        SERVED_FROM_BASE_CACHE.with(|served| served.set(from_base_cache));
+    }
     // M26's RESOLVE boundary (`editor-latency.md` §4.2, `crate::cancel`). The
     // world is resolved and — on the store path — already in the base cache,
     // which is what makes the whole entry tail below skippable: from here every

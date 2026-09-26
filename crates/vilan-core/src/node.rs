@@ -1017,7 +1017,14 @@ impl<'src> Node<'src> {
     /// deliberately exhaustive with no catch-all: adding a `Node` variant must
     /// extend it or compilation fails here — a container variant silently
     /// missing from the scan is exactly the bug this prevents.
+    ///
+    /// It is also the FIFTH stack-probe funnel (N128, `stack_guard`): every
+    /// syntactic visitor that recurses through here — `collect_module_paths`
+    /// first among them, which runs before the analyzer's walk — passes one
+    /// probe per level, so a runaway on a declared stack is refused rather than
+    /// aborting in the guard page before the analyzer's own funnels are reached.
     pub fn for_each_child<'a>(&'a self, visit: &mut dyn FnMut(&'a Spanned<Node<'src>>)) {
+        crate::stack_guard::ensure_sufficient_stack("a syntactic tree walk");
         fn visit_generic_parameters<'a, 'src>(
             parameters: Option<&'a GenericParameters<'src>>,
             visit: &mut dyn FnMut(&'a Spanned<Node<'src>>),

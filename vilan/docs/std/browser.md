@@ -322,6 +322,13 @@ topmost at event time, and a scope pops when the owner that installed it is
 disposed — restoring focus to whatever held it before, if focus is still inside
 the scope and the remembered element is still in the document.
 
+`FocusScope::on_leave(handler: |Element| void)` hears focus LEAVING the scope,
+from a capture-phase `focusout`: the handler runs with `relatedTarget` — the
+element focus went to — when that element lies outside the scope and every
+scope above it on the stack. A null `relatedTarget` (focus left the document)
+does nothing. The listener is released with the scope; the SSR twin accepts
+the handler and drops it.
+
 ### The slot values
 
 The conditional, the dynamic subtree and the keyed run are **values**, not

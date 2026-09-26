@@ -7,9 +7,23 @@
 //! right standing gate for M19 T1 — and it costs 60-170 s, which made it the
 //! wrong thing to have inside `check_scope_differential`: a targeted
 //! `-p vilan-core --test check_scope_differential` and every whole-crate gate
-//! paid a corpus sweep to ask about the S1 seam. One test, one binary, and
+//! paid a corpus sweep to ask about the S1 seam. One binary, and
 //! `.config/nextest.toml` starts it first, because a leg this long scheduled
-//! late IS the critical path.
+//! late IS the critical path. It holds TWO tests since M76 (the module-shaped
+//! sweep and the entry-shaped one), and both flip the process-global
+//! `set_world_reuse` switch — so they take [`SWITCH_LOCK`], which nextest's
+//! process-per-test never contends and plain `cargo test`, whose tests are
+//! threads of one process, needs (N132, N129's class).
+//!
+//! **What "reused" is held to** (N132). The replaying leg's pairs share the base
+//! cache's LRU with fifteen other workers, and a pair whose first analysis runs
+//! long can find its world evicted before its second analysis reads it: a cold
+//! miss that replays nothing and says nothing about the seam. So each pin holds
+//! every pair that was SERVED from the base cache
+//! (`vilan_core::analyzer::served_from_base_cache`) to reuse — exactly, no
+//! exceptions — and holds the hit rate to a 90% floor, so a pin cannot pass on a
+//! cache that served nothing. The budget is left at its default; lifting it to
+//! unlimited (Order 41's fix) cost ~410 MiB of peak RSS for the run.
 //!
 //! The fixtures it builds are `replay_harness`'s, shared with the fast T1 pins
 //! that stayed behind.
@@ -22,6 +36,45 @@ use std::path::PathBuf;
 use replay_harness::{
     ReuseObservation, warm_open_pair, warm_pair, write_module_package, write_open_module_package,
 };
+
+/// Serializes the two tests: both flip `set_world_reuse`, which is
+/// process-global (see the module comment).
+static SWITCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The replaying leg's non-vacuity, in the one form an LRU cannot flake
+/// (N132): every pair whose world was SERVED from the base cache reused at
+/// least one module, and at least 90% of the pairs were served. A pair the LRU
+/// evicted before its second analysis is a miss, not a seam defect, and is
+/// counted against the floor rather than failing the pin.
+fn assert_every_hit_reused(replayed: &[ReuseObservation], names: &[PathBuf], leg: &str) {
+    let hits: Vec<usize> = (0..replayed.len())
+        .filter(|&index| replayed[index].4)
+        .collect();
+    let hit_but_idle: Vec<String> = hits
+        .iter()
+        .filter(|&&index| replayed[index].3.0 == 0)
+        .map(|&index| {
+            names[index]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert!(
+        hit_but_idle.is_empty(),
+        "{leg}: {} pair(s) were served their world from the base cache and reused \
+         nothing — the seam, not the LRU: {hit_but_idle:?}",
+        hit_but_idle.len()
+    );
+    assert!(
+        hits.len() * 10 >= replayed.len() * 9,
+        "{leg}: only {} of {} pairs were served from the base cache — under the \
+         90% floor, so the differential is close to vacuous",
+        hits.len(),
+        replayed.len()
+    );
+}
 
 /// The Class A WARNING probe appended to every corpus module: a deprecated
 /// function and a local call to it. A warning rather than a refusal, so the
@@ -89,10 +142,9 @@ fun m19_probe_resource() {
 /// both legs.
 #[test]
 fn corpus_agrees_between_replayed_and_rederived_module_checks() {
-    // No `OVERRIDE_LOCK` here, where `check_scope_differential` takes one:
-    // that lock exists because `set_full_scan_checks` and `set_world_reuse` are
-    // process-global and that file's tests share a process. This binary holds
-    // ONE test, so the process-global switch has no one to leak to.
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/test");
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&corpus)
         .expect("corpus directory")
@@ -200,16 +252,7 @@ fn corpus_agrees_between_replayed_and_rederived_module_checks() {
     // Non-vacuity, in both directions: the replaying leg must have reused, and
     // the re-deriving leg must not have. A differential over two runs that
     // both did the same thing proves nothing.
-    let reusing = replayed
-        .iter()
-        .filter(|observation| observation.3.0 > 0)
-        .count();
-    assert!(
-        reusing * 10 >= replayed.len() * 9,
-        "only {reusing} of {} programs reused a module — the differential is \
-         nearly vacuous; the packages are not hitting the base cache",
-        replayed.len()
-    );
+    assert_every_hit_reused(&replayed, &paths, "the module-shaped sweep");
     assert!(
         derived.iter().all(|observation| observation.3.0 == 0),
         "the re-deriving leg reused a module: the switch leaked"
@@ -266,6 +309,9 @@ fn corpus_agrees_between_replayed_and_rederived_module_checks() {
 /// sequential leg would have doubled the binary's wall.
 #[test]
 fn an_entry_shaped_world_agrees_between_replayed_and_rederived_module_checks() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/test");
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&corpus)
         .expect("corpus directory")
@@ -319,17 +365,11 @@ fn an_entry_shaped_world_agrees_between_replayed_and_rederived_module_checks() {
         })
     };
 
-    // The budget is lifted for both legs, because the reuse assertion below
-    // is EXACT and an LRU is a scheduler, not a claim: sixteen workers store a
-    // world each on their first analysis, the default budget held ~29 of
-    // them at Order 41, and a pair whose first analysis runs long past its
-    // store (a large program's checks) can find its world evicted by the
-    // others before its second analysis reads it — a cold miss that reuses
-    // nothing and says nothing about the seam. The budget is
-    // `base_cache.rs`'s subject; this leg's subject is replay against
-    // re-derivation, so every world stays until its pair has read it.
-    let budget_before = vilan_core::analyzer::base_cache_budget();
-    vilan_core::analyzer::set_base_cache_budget(usize::MAX);
+    // The budget stays at its default (N132): sixteen workers store a world
+    // each, the default budget holds ~28-30 of them, and a pair whose first
+    // analysis runs long can find its world evicted before its second reads
+    // it. That miss is the LRU's, and the reuse assertion below counts it
+    // against a hit-rate floor instead of failing on it.
     vilan_core::analyzer::set_world_reuse(false);
     vilan_core::analyzer::base_cache_clear();
     let derived = observe_all();
@@ -337,7 +377,6 @@ fn an_entry_shaped_world_agrees_between_replayed_and_rederived_module_checks() {
     vilan_core::analyzer::base_cache_clear();
     let replayed = observe_all();
     vilan_core::analyzer::base_cache_clear();
-    vilan_core::analyzer::set_base_cache_budget(budget_before);
 
     for (directory, _) in &packages {
         let _ = std::fs::remove_dir_all(directory);
@@ -373,17 +412,7 @@ fn an_entry_shaped_world_agrees_between_replayed_and_rederived_module_checks() {
     // entry-shaped world whose only reused sources were std's would prove
     // nothing about M76, because std's Class A diagnostics are known absent
     // through S1's freeze whatever this seam does.
-    let reused: usize = replayed
-        .iter()
-        .filter(|observation| observation.3.0 > 0)
-        .count();
-    assert_eq!(
-        reused,
-        packages.len(),
-        "every entry-shaped warm pair must reuse on the replaying leg; {} of {} did",
-        reused,
-        packages.len()
-    );
+    assert_every_hit_reused(&replayed, &paths, "the entry-shaped sweep");
     let rederived: usize = derived
         .iter()
         .filter(|observation| observation.3.0 > 0)

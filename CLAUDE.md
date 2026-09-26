@@ -37,9 +37,10 @@ and it can afford to — there is no deadline pressure. Hold the bar high:
 - **Docs are gated and part of done.** Every fenced example in `vilan/docs/` is compiled by `cargo test --test docs`; a change to std, a framework, or the language updates the affected docs page **in the same commit** (see `proposals/projects/vilan/proposal/documentation.md`).
 - **"Fixed" and "closed" require a pinned test — per case, not per example.** Do not claim a bug fixed, or a class of bugs closed, on the strength of a green suite plus one representative program. Each distinct case needs its own passing (or, if still open, `#[ignore]`d) test. Edge cases without a test are how a "closed" item silently regresses or turns out never to have been covered.
 - **A `#[cfg(windows)]`-only pin is compiled here and verified only by CI** — the
-  cross-check (`cargo check --target x86_64-pc-windows-msvc -p vilan-cli -p vilan-core --tests`)
-  proves it builds, nothing on this machine can run it, and a report that lands
-  one must say so by name.
+  cross-check (`scripts/ci-local.sh windows`: `cargo clippy --target x86_64-pc-windows-msvc`
+  over the workspace's tests with `-D warnings`) proves it builds and is lint-clean
+  there, nothing on this machine can run it, and a report that lands one must say
+  so by name.
 - **A pin that waits on a process** — a watcher, a hook, a server — **is a race
   until its ordering is proven by the harness's own sequencing**, never by a
   sleep.
@@ -56,7 +57,19 @@ Run it when it is the right instrument, not as a way of finding out what you
 just did. Two instrument notes: nextest does not run doc-tests (all empty
 today; CI's `cargo test --workspace --doc` leg guards the gap), and plain
 `cargo test --workspace --no-fail-fast` remains a correct, slower
-equivalent.
+equivalent — ON ONE CONDITION the runners do not share: nextest gives every
+test its own PROCESS, and `cargo test` runs a binary's tests as THREADS of one.
+Process-wide state — a staging directory keyed by the process id, a global
+flag a test flips — is therefore private under nextest and shared under
+`cargo test`, and a test written against the first races under the second
+(`native_differential` failed 38 of 46 that way until its staging went per
+test, N129). Anything a test keys by `std::process::id()` or flips globally
+must be per TEST instead, or serialized by the test itself. One binary is NOT
+equivalent today: `vilan-lsp`'s pins that read the compiler's process-global
+base cache are load-sensitive under `cargo test`, because every other
+analyzing test in that binary shares the cache with them (N131;
+`BASE_CACHE_LOCK`'s comment in `crates/vilan-lsp/src/document.rs` has the
+measurements). Run that binary under nextest.
 
 - **Never pipe it through `grep`, `head`, or `tail` and read the exit code.**
   The pipeline reports the *filter's* status, so a red suite looks green — this

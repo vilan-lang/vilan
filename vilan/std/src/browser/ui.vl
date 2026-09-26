@@ -2247,12 +2247,15 @@ export enum FocusContainment {
 ///
 /// The `id` is what the STACK is read by — the nesting is consulted at event time
 /// rather than captured at registration, which is what lets a nested scope take
-/// over and hand back — and `focused` is the latch that makes `focus_initial`
-/// idempotent.
+/// over and hand back — `focused` is the latch that makes `focus_initial`
+/// idempotent, and `owner` is the boundary the scope was installed in, which is
+/// what an `on_leave` listener is handed to so it lives exactly as long as the
+/// scope.
 export struct FocusScope {
 	id: i32,
 	root: Element,
 	focused: Shared<bool>,
+	owner: Owner,
 }
 
 export impl FocusScope {
@@ -2296,6 +2299,45 @@ export impl FocusScope {
 			self.focused.write() = true;
 		}
 		took
+	}
+
+	/// Run `handler` whenever focus LEAVES this scope, with the element it went to
+	/// (A128, focus-scope.md §S3).
+	///
+	/// "Leaves" is read off a capture-phase `focusout` on the window: the element
+	/// losing focus lies inside this scope or inside a scope ABOVE it, and the
+	/// element gaining it (`relatedTarget`) lies inside neither. It is the stack's
+	/// own reach test, the one the wrap and the guard use, so a submenu opened from
+	/// a menu — a portal, beside the menu in the document and not inside it — is
+	/// not somewhere the menu was left for, and focus leaving the submenu for the
+	/// page has left the menu too.
+	///
+	/// A NULL target does nothing. It is focus leaving the DOCUMENT — for the
+	/// browser's chrome, another window, a devtools pane — and a scope the user has
+	/// not left for anything on the page should not react to it; nor would there be
+	/// an element to hand over.
+	///
+	/// Under `Wrap` a Tab never fires this: the wrap moves focus from one end of
+	/// the scope to the other, and focus that leaves a `Wrap` scope has left by
+	/// some other route — a click, a programmatic `focus()`. Under `Contain` a
+	/// click outside fires it WITH the element clicked, and then the guard pulls
+	/// focus back: the handler learns where the user tried to go before the scope
+	/// refuses it.
+	///
+	/// The listener belongs to the owner the scope was installed under, so it is
+	/// released with the scope. Registered on a scope whose owner is already
+	/// disposed, it is released on the spot and never fires.
+	fun on_leave(self, handler: |Element| void) {
+		let id = self.id;
+		self.owner.take(window().listen_capture("focusout", |event| {
+			let to = event.related_target();
+			if is_null(to) {
+				ret;
+			}
+			if focus_reaches_from(id, event.target()) && !focus_reaches_from(id, to) {
+				handler(to);
+			}
+		}));
 	}
 }
 
@@ -2414,7 +2456,7 @@ export fun focus_scope(root: Element, containment: FocusContainment): FocusScope
 			}
 		}));
 	}
-	FocusScope { id, root, focused = Shared::new(false) }
+	FocusScope { id, root, focused = Shared::new(false), owner }
 }
 
 /// Whether `target` lies inside the scope `id` names, or inside any scope ABOVE it

@@ -13,6 +13,10 @@
 //! `0x408`, which with the pushes and the two return addresses is exactly the
 //! 42,464 gdb reads. That local area is ONE `sub rsp` taken on every call, so
 //! every level of nesting pays for every arm's locals whichever arm runs.
+//! N128 re-measured it (2026-09-25, `VILAN_DEPTH_STATS` over 13/33/103/203/403
+//! levels, the CLI's debug and release binaries): ~47,400 bytes (46.3 KiB) a
+//! level unoptimized — the frame has grown ~12% since N97's count — and
+//! ~2,120 bytes optimized; the gdb decomposition below is N97's.
 //! It was ~36 KiB when this comment was written; Order 36's lazy,
 //! const, callable and visibility arms landed IN that frame while the
 //! recursion stayed put, which is how a nine-level module-cycle pin came to
@@ -213,7 +217,11 @@ fn a_5000_deep_parenthesized_expression_is_refused_cleanly() {
 /// | debug | 42,464 B (41.5 KiB) | 1.49 MiB |
 /// | release | ~4,650 B (4.5 KiB) | 0.23 MiB |
 ///
-/// So the debug leg — the one the suite runs — sits at 75% of a 2 MiB thread,
+/// (N128, 2026-09-25: debug ~47,400 B and 1.66 MiB at 33 levels — 83% of the
+/// thread; release ~2,120 B and 0.16 MiB. The frame grew; the canary did not
+/// red, and the margin it guards is now about a sixth.)
+///
+/// So the debug leg — the one the suite runs — sat at 75% of a 2 MiB thread,
 /// and the canary reds when the frame grows by about a third, or when twelve
 /// more levels of it are needed. Optimized, the same walk costs a NINTH of
 /// that, which is why nothing the binaries do has ever been near the cliff and
@@ -828,21 +836,19 @@ fn analyze_on_a_declared_stack(
 /// The plant is a 490-link method chain: under the walk's 500-level bound, so
 /// nothing refuses it by DEPTH, and flat to the parser. The stack is declared
 /// at 2 MiB, so the probe refuses past 1 MiB (the red zone's minimum). Measured
-/// with `VILAN_DEPTH_STATS` at this sha, the chain's walk needs ~1.2 MiB
-/// optimized (~2.4 KiB a level; the 11.3 KiB the CLI's comment records is an
-/// older frame) and ~20 MiB unoptimized (42,464 bytes a level), so the probe
+/// with `VILAN_DEPTH_STATS` (N128, 2026-09-25), the chain's walk needs ~1 MiB
+/// optimized (~2.1 KiB a level; the 11.3 KiB AGENTS.md once recorded was an
+/// older frame) and ~21 MiB unoptimized (~47,400 bytes a level), so the probe
 /// refuses it under both profiles.
 ///
-/// The THREAD is 16 MiB, larger than the declaration, for one reason: the
-/// syntactic visitors that run before the walk (`collect_module_paths`, over
-/// `Node::for_each_child`) recurse once per link too and are NOT probed — they
-/// need over 2 MiB for this chain unoptimized, and on a 2 MiB thread they
-/// overflow before any probe is reached. 16 MiB is still smaller than the
-/// unoptimized walk, so without the probe this pin reds as a real SIGABRT in
-/// the debug suite (read the sentence, not the assertion, as
-/// `a_thirty_level_chain_still_fits_libtests_own_two_mib_thread` says) and on
-/// "no program" optimized. Planted red by removing the `walk_expr_node` probe:
-/// `thread '<unknown>' has overflowed its stack`.
+/// The THREAD is 16 MiB, larger than the declaration: it was the headroom the
+/// UNPROBED syntactic visitors needed before N128 (`collect_module_paths`, over
+/// `Node::for_each_child`, recurses once per link and needs over 2 MiB here
+/// unoptimized). Since N128 `for_each_child` probes, so in the debug suite this
+/// plant is refused THERE, before the walk starts — which is why the walk's own
+/// probe has its isolating pin below
+/// (`the_walks_own_probe_refuses_the_chain_when_the_visitors_fit`); optimized,
+/// the visitors fit under the floor and the refusal here is still the walk's.
 #[test]
 fn a_walk_that_would_overflow_a_declared_stack_is_refused_with_the_fences_diagnostic() {
     let source = format!(
@@ -861,6 +867,71 @@ fn a_walk_that_would_overflow_a_declared_stack_is_refused_with_the_fences_diagno
                 .to_string()
         ],
         "the fence answers the refusal with its one internal-error diagnostic"
+    );
+}
+
+/// The walk's own funnel, isolated in the debug suite (N128). Since the
+/// syntactic visitors are probed, the 2 MiB declaration above is refused in
+/// `for_each_child` before the walk starts when unoptimized, so that pin no
+/// longer isolates the WALK's probe there. Declared at 16 MiB, the visitors'
+/// ~2.4 MiB fits under the floor (14 MiB used) and the walk's ~20 MiB does
+/// not, so the refusal is the walk's; the 32 MiB thread keeps even the
+/// unprobed walk off the guard page, so removing the probe reds as a program
+/// PRODUCED rather than as an abort. Debug only: optimized, the walk needs
+/// ~1.2 MiB and nothing refuses — the pin above covers that profile.
+///
+/// Planted red by removing the `walk_expr_node` probe.
+#[cfg(debug_assertions)]
+#[test]
+fn the_walks_own_probe_refuses_the_chain_when_the_visitors_fit() {
+    let source = format!(
+        "fun main() {{\n\tlet x = \"seed\"{};\n}}\n",
+        ".trim()".repeat(490)
+    );
+    let Analysis {
+        produced, messages, ..
+    } = analyze_on_a_declared_stack(32 * 1024 * 1024, 16 * 1024 * 1024, source);
+    assert!(!produced, "a refused analysis lands no program");
+    assert_eq!(messages.len(), 1, "{messages:#?}");
+    assert!(
+        messages[0].starts_with("internal error: the compiler panicked"),
+        "{messages:#?}"
+    );
+}
+
+/// N128: the SYNTACTIC visitors are probed too. The same 490-link chain on a
+/// thread that is exactly its declared 2 MiB — no hidden headroom beneath the
+/// declaration, which is what the pin above needs its 16 MiB thread for.
+///
+/// `collect_module_paths` (and every other whole-tree scan) recurses through
+/// `Node::for_each_child` once per link BEFORE the analyzer's walk starts, and
+/// unoptimized that needs more than 2 MiB for this chain. With no probe on that
+/// path the thread runs into its guard page and the process ABORTS
+/// (`thread '<unknown>' has overflowed its stack`, SIGABRT — a red with no
+/// assertion message, read the sentence); the probe in `for_each_child` is the
+/// fifth funnel, and it turns the abort into the fence's diagnostic. Optimized,
+/// the visitors fit and the walk's own probe refuses — the same answer.
+///
+/// Planted red by removing the `for_each_child` probe: the debug suite aborted.
+#[test]
+fn a_syntactic_walk_that_would_overflow_a_declared_stack_is_refused_too() {
+    let source = format!(
+        "fun main() {{\n\tlet x = \"seed\"{};\n}}\n",
+        ".trim()".repeat(490)
+    );
+    let Analysis {
+        produced, messages, ..
+    } = analyze_on_a_declared_stack(2 * 1024 * 1024, 2 * 1024 * 1024, source);
+    assert!(!produced, "a refused analysis lands no program");
+    assert_eq!(
+        messages,
+        vec![
+            "internal error: the compiler panicked analyzing this file (this is a bug; the \
+             details are on stderr)"
+                .to_string()
+        ],
+        "the fence answers the syntactic walk's refusal with its one internal-error \
+         diagnostic"
     );
 }
 

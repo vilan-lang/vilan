@@ -8646,6 +8646,34 @@ pub(crate) mod tests {
     /// it in the test body, before `on_big_stack`: the guard is not `Send`,
     /// and it does not need to be, because that call blocks until its thread
     /// joins.
+    ///
+    /// **What it does NOT buy under plain `cargo test` (N131).** It serializes
+    /// the pins that TAKE it against each other, and nothing else: every other
+    /// test in this binary that analyzes — ~850 of them, the references and
+    /// server pins included — stores, hits and evicts worlds in the same cache
+    /// at the same time. So under `cargo test` at load, a pin that reads the
+    /// cache's GLOBAL state reads a stranger's world as well as its own:
+    /// `base_cache_overlay_claims()` counted `(2, 164)` for one claimed copy of
+    /// 35 bytes, an LRU eviction another thread's store triggered released a
+    /// world's leak tally on THIS thread (an outstanding count of -93), and the
+    /// "first analysis of a new key must MISS" pin read 904 misses for 900
+    /// (`m24_budget_eviction`, `overlay_module_reclaim`, `m23_scripted_session`,
+    /// `session_growth`; three runs at loadavg 30-55 on d65d4e75: red, red,
+    /// green). Those pins are LOAD-SENSITIVE under `cargo test` by construction
+    /// and exact under nextest, which is the gate.
+    ///
+    /// The `references::` pins' M19 replay panic ("the world's `sources` vector
+    /// moved") is the same shared cache meeting a second std ROOT: the pins
+    /// here analyze with `std_root()` (the tree, spelled through
+    /// `crates/vilan-lsp/../..`), the server pins resolve std through
+    /// `discover_std_dir`, which for a document under the temp directory is the
+    /// MATERIALIZED embedded std (`~/.vilan/std-cache/<hash>`). The two are
+    /// byte-identical, and the base-cache key carries no std root, so both
+    /// analyses file under one key; a checks record written from one root's
+    /// world was read on a hit of the other's. Measured, not inferred: the
+    /// panic's two fingerprints are exactly those of `sources[1..]` for
+    /// `import std::io::print` under the tree std (5909227631414359650) and
+    /// under the materialized std (3214450399013780599).
     pub(crate) static BASE_CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Takes [`BASE_CACHE_LOCK`], recovering from a poisoned one: a pin that
