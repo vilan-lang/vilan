@@ -1236,7 +1236,7 @@ SOFTWARE.
 --------------------------------------------------------------------------------
 MIT License
 
-Covers: vilan-cli 0.40.0, vilan-core 0.40.0, vilan-embedded 0.40.0, vilan-ide 0.40.0, vilan-lsp 0.40.0, vilan-rt 0.40.0, vilan-rt-crypto 0.40.0, vilan-rt-sqlite 0.40.0, vilan-rust 0.40.0, vilan-wasm 0.40.0, block2 0.6.2, dispatch2 0.3.1, objc2-encode 4.1.0, objc2 0.6.4, r-efi 5.3.0, tower-lsp-macros 0.9.0, windows-link 0.2.1, windows-sys 0.61.2
+Covers: vilan-cli 0.41.0, vilan-core 0.41.0, vilan-embedded 0.41.0, vilan-ide 0.41.0, vilan-lsp 0.41.0, vilan-rt 0.41.0, vilan-rt-crypto 0.41.0, vilan-rt-sqlite 0.41.0, vilan-rust 0.41.0, vilan-wasm 0.41.0, block2 0.6.2, dispatch2 0.3.1, objc2-encode 4.1.0, objc2 0.6.4, r-efi 5.3.0, tower-lsp-macros 0.9.0, windows-link 0.2.1, windows-sys 0.61.2
 
 MIT License
 

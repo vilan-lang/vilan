@@ -14,7 +14,7 @@
 # path dependency on this directory.
 [package]
 name = "vilan-rt"
-version = "0.40.0"
+version = "0.41.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "The runtime for programs the vilan compiler emits as Rust."

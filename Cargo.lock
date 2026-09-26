@@ -1162,7 +1162,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vilan-cli"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "ariadne",
  "clap",
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "vilan-core"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "indexmap",
  "serde",
@@ -1188,18 +1188,18 @@ dependencies = [
 
 [[package]]
 name = "vilan-embedded"
-version = "0.40.0"
+version = "0.41.0"
 
 [[package]]
 name = "vilan-ide"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "vilan-core",
 ]
 
 [[package]]
 name = "vilan-lsp"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "dashmap 6.2.1",
  "libc",
@@ -1214,11 +1214,11 @@ dependencies = [
 
 [[package]]
 name = "vilan-rt"
-version = "0.40.0"
+version = "0.41.0"
 
 [[package]]
 name = "vilan-rt-crypto"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "getrandom",
  "vilan-rt",
@@ -1226,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "vilan-rt-sqlite"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "rusqlite",
  "vilan-rt",
@@ -1234,14 +1234,14 @@ dependencies = [
 
 [[package]]
 name = "vilan-rust"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "vilan-core",
 ]
 
 [[package]]
 name = "vilan-wasm"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "vilan-core",
  "vilan-embedded",

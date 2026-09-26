@@ -15,7 +15,7 @@
 # for. The price is one C compile, cached by cargo like any other.
 [package]
 name = "vilan-rt-sqlite"
-version = "0.40.0"
+version = "0.41.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "The SQLite half of the runtime for programs the vilan compiler emits as Rust."

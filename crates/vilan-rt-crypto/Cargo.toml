@@ -19,7 +19,7 @@
 # getrandom's, at the syscall.
 [package]
 name = "vilan-rt-crypto"
-version = "0.40.0"
+version = "0.41.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "The OS-randomness and key-derivation half of the runtime for programs the vilan compiler emits as Rust."
