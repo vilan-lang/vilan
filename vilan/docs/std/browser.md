@@ -377,8 +377,13 @@ push into 1,000 rows builds ONE row and reads one key, a removal cuts one row,
 and under `each` an element changed to an equal value costs nothing. Under
 `each_by` an element changed in place under the same key is written into that
 row's cell and nothing is built — and only that row's cell, where the pass
-writes into every surviving row's. A wholesale `set` and a `move_range` fall
-back to the pass. The server twin keeps its one read (a server render reads
+writes into every surviving row's. A change that removes rows and puts others
+in their place — a `set_all`, a `reconcile_to` that edits one element and
+appends another — is matched by KEY within the span it covers, exactly as the
+pass matches the whole run, so a row whose key survives it is kept and the rows
+either side of it are not touched: the op path never builds more for one change
+than the pass would. A wholesale `set` and a `move_range` fall back to the pass,
+and a `set` that follows other changes in the same turn supersedes them. The server twin keeps its one read (a server render reads
 the list once, so it has no change to follow).
 
 **A row, a body or a branch can be any `Slot`.** A render closure returns

@@ -497,8 +497,12 @@ export trait SequenceCell<T> {
 	}
 
 	/// Everything leaves and `values` arrive — the wholesale write expressed as ONE
-	/// op, which is what makes it cheaper than `set`: a consumer sees a `Splice` it
-	/// can apply rather than a `Reset` it has to rebuild from.
+	/// `Splice` over the whole run.
+	///
+	/// It is NOT cheaper than `set`, and costs no more (A129): `each` and `each_by`
+	/// match a splice's span by KEY exactly as they match a `Reset`, so a row whose
+	/// key survives is kept either way, and a derivation runs once per element for
+	/// both. The door that records only what changed is `reconcile_to`.
 	fun set_all(self, values: List<T>) {
 		self.splice(0, self.size(), values) // I5
 	}

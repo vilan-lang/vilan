@@ -1379,6 +1379,54 @@ fun settled_steps(steps: List<RowStep>): List<bool> {
 	}
 }
 
+/// The rows at `at .. at + count` of a run's held list, as a list of their own
+/// (A129). The whole run is copied as a whole, exactly as the pass has always
+/// copied it (`Shared::read()` bound to a local is a copy, shared.vl §6.1); a span
+/// is copied one element at a time, so what a splice's span costs to read is the
+/// span, not a copy of the run. I5: POSITION parameters
+fun held_span<E>(held: Shared<List<E>>, at: i32, count: i32): List<E> {
+	if at == 0 && count == held.read().len() {
+		let run = held.read();
+		ret run;
+	}
+	mut span: List<E> = [];
+	mut index = at;
+	for index < at + count {
+		span.push(held.read()[index]);
+		index += 1;
+	}
+	span
+}
+
+/// A drain's ops from its LAST `Reset` on (A129). A `Reset` says what the
+/// collection BECAME, whatever it was, so every op ahead of it in the same drain is
+/// superseded — and applying them would build rows the reset's pass then cuts,
+/// where the pass alone, reading only the list the drain settles on, never builds
+/// them.
+fun live_ops<T>(ops: List<SeqOp<T>>): List<SeqOp<T>> {
+	mut last = -1;
+	mut index = 0;
+	for op in ops {
+		match op {
+			SeqOp::Reset(let _items) => {
+				last = index;
+			},
+			_ => {},
+		}
+		index += 1;
+	}
+	if last <= 0 {
+		ret ops;
+	}
+	mut live: List<SeqOp<T>> = [];
+	index = last;
+	for index < ops.len() {
+		live.push(ops[index]);
+		index += 1;
+	}
+	live
+}
+
 /// A98: the marker each step must insert BEFORE — the next settled row's marker, or
 /// the region's anchor when no settled row follows.
 ///
@@ -1418,7 +1466,9 @@ fun row_references(
 /// its OPS: a push builds one row, a removal cuts one, and nothing else in the run
 /// is read. Any other `Source<List<T>>` — every plain `SignalCell` — keeps the
 /// whole-list PASS, exactly as before; the pass is also what a `Reset` and a `Move`
-/// fall back to on the op path.
+/// fall back to on the op path, and a splice that both removes and inserts is the
+/// pass over its own SPAN (A129), so a key that leaves and arrives in one splice
+/// keeps its row.
 fun place_each<T: PartialEq, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 	parent: View,
 	source: S,
@@ -1444,18 +1494,38 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 		}
 		region.close();
 	});
-	// The whole-list pass: diff what the run holds against `list` and apply the
-	// plan. This is `each` as it has always been.
-	let reconcile_pass = |list: List<T>| {
-		let plan = reconcile(row_keys.read(), row_items.read(), list, key, |before, after| {
-			before == after
-		});
-		let previous_rows = row_rows.read();
-		let previous_owners = row_owners.read();
+	// The keyed pass over ONE SPAN of the run — the rows at `at .. at + count` —
+	// against `list`: diff what the span holds against `list` and apply the plan,
+	// leaving every row outside the span where it is (A129). The whole-list pass
+	// is this over the whole run, which is `each` as it has always been; the op
+	// path hands it a `Splice` that both removes and inserts, so a row whose key
+	// leaves and comes back inside one splice is KEPT, exactly as the pass keeps
+	// it, instead of being cut and rebuilt by position — the op path never builds
+	// more than the pass would. I5: POSITION parameters
+	let reconcile_span = |at: i32, count: i32, list: List<T>| {
+		// Over the whole run each list is read as the pass has always read it; over
+		// a span, only the span's own elements are copied (`held_span`).
+		let whole = at == 0 && count == row_rows.read().len();
+		let previous_rows = held_span(row_rows, at, count);
+		let previous_owners = held_span(row_owners, at, count);
+		// What bounds the span on the right: the marker of the first row after it —
+		// which nothing here moves — or the anchor when the span runs to the end.
+		// It is to the span what the anchor is to the whole run.
+		let boundary = if at + count < row_rows.read().len() {
+			row_rows.read()[at + count].marker
+		} else {
+			region.anchor
+		};
+		let same = |before: T, after: T| before == after;
+		let plan = if whole {
+			reconcile(row_keys.read(), row_items.read(), list, key, same)
+		} else {
+			reconcile(held_span(row_keys, at, count), held_span(row_items, at, count), list, key, same)
+		};
 		// A98: the rows that already stand in their new relative order, and the
 		// marker every other row is threaded in before.
 		let settled = settled_steps(plan.steps);
-		let references = row_references(plan.steps, previous_rows, settled, region.anchor);
+		let references = row_references(plan.steps, previous_rows, settled, boundary);
 		mut staying: List<bool> = [];
 		mut fill = 0;
 		for fill < previous_rows.len() {
@@ -1481,23 +1551,23 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 		// — it keeps its marker, its nodes and its place — and a `None` in `cut` is
 		// exactly "this row did not move".
 		mut cut: List<Option<Element>> = [];
-		mut at = 0;
+		mut index = 0;
 		for row in previous_rows {
-			if staying[at] {
+			if staying[index] {
 				cut.push(None);
 			} else {
-				let end = if at + 1 < previous_rows.len() {
-					previous_rows[at + 1].marker
+				let end = if index + 1 < previous_rows.len() {
+					previous_rows[index + 1].marker
 				} else {
-					region.anchor
+					boundary
 				};
 				cut.push(Some(region.cut_row(row, end)));
 			}
-			at += 1;
+			index += 1;
 		}
-		for index in plan.removed {
-			previous_owners[index].dispose();
-			region.drop_row(previous_rows[index]);
+		for gone in plan.removed {
+			previous_owners[gone].dispose();
+			region.drop_row(previous_rows[gone]);
 		}
 		mut next_rows: List<Row> = [];
 		mut next_owners: List<Owner> = [];
@@ -1510,19 +1580,19 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 			let item = list[position];
 			let reference = references[position];
 			match step {
-				RowStep::Keep(let index) => {
-					match cut[index] {
+				RowStep::Keep(let kept) => {
+					match cut[kept] {
 						Some(let content) => {
-							region.insert_row(previous_rows[index], content, reference);
+							region.insert_row(previous_rows[kept], content, reference);
 						},
 						None => {},
 					}
-					next_rows.push(previous_rows[index]);
-					next_owners.push(previous_owners[index]);
+					next_rows.push(previous_rows[kept]);
+					next_owners.push(previous_owners[kept]);
 				},
-				RowStep::Refresh(let index) => {
-					previous_owners[index].dispose();
-					region.drop_row(previous_rows[index]);
+				RowStep::Refresh(let kept) => {
+					previous_owners[kept].dispose();
+					region.drop_row(previous_rows[kept]);
 					let owner = Owner::new();
 					next_rows.push(run_with_owner(owner, || {
 						region.open_row_before(render(item), reference)
@@ -1539,18 +1609,41 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 			}
 			position += 1;
 		}
-		// A88: the region holds the run it now shows, so a disposal in a parent
-		// that survives takes these rows out of the document. `row_rows` IS the
-		// region's list, so this one write is both.
-		region.hold_rows(next_rows);
 		mut next_keys: List<K> = [];
 		for item in list {
 			next_keys.push(key(item));
 		}
-		row_keys.write() = next_keys;
-		row_items.write() = list;
-		row_owners.write() = next_owners;
+		if whole {
+			// A88: the region holds the run it now shows, so a disposal in a parent
+			// that survives takes these rows out of the document. `row_rows` IS the
+			// region's list, so this one write is both.
+			region.hold_rows(next_rows);
+			row_keys.write() = next_keys;
+			row_items.write() = list;
+			row_owners.write() = next_owners;
+		} else {
+			// The span's entries replaced IN PLACE, for `splice_rows`'s reason: a
+			// splice pays for the span, not for a copy of the run.
+			mut taken = 0; // I5
+			for taken < count {
+				let _row = row_rows.write().remove(at);
+				let _owner = row_owners.write().remove(at);
+				let _key = row_keys.write().remove(at);
+				let _item = row_items.write().remove(at);
+				taken += 1;
+			}
+			mut offset = 0; // I5
+			for offset < next_rows.len() {
+				row_rows.write().insert(at + offset, next_rows[offset]);
+				row_owners.write().insert(at + offset, next_owners[offset]);
+				row_keys.write().insert(at + offset, next_keys[offset]);
+				row_items.write().insert(at + offset, list[offset]);
+				offset += 1;
+			}
+		}
 	};
+	// The whole-list pass: the span that is the whole run.
+	let reconcile_pass = |list: List<T>| reconcile_span(0, row_rows.read().len(), list);
 	// A112 S3: `removed` rows leave at `at` and `inserted` arrive there, applied
 	// to the run directly — no list read, no key projection for a row that stays,
 	// no plan and no settled-run scan, because the op already says where the
@@ -1611,10 +1704,18 @@ fun place_each<T: PartialEq, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 			// and for its reason: the cursor was minted at the sequence the seed is
 			// read at, so the seed is exactly the state the cursor names.
 			source.effect_on_change(|_published| {
-				for op in source.delta_since(cursor) {
+				for op in live_ops(source.delta_since(cursor)) {
 					match op {
+						// A splice that only removes or only inserts cannot re-meet
+						// a key, so it is applied by position. One that does both
+						// is the pass over its span (A129): a key that leaves and
+						// arrives in the same splice keeps its row.
 						SeqOp::Splice(let at, let removed, let inserted) => {
-							splice_rows(at, removed.len(), inserted); // I5
+							if removed.len() == 0 || inserted.len() == 0 {
+								splice_rows(at, removed.len(), inserted); // I5
+							} else {
+								reconcile_span(at, removed.len(), inserted); // I5
+							}
 						},
 						// An element changed IN PLACE. The pass's rule, one row at
 						// a time: the same key holding an equal item is a `Keep`
@@ -1697,21 +1798,35 @@ fun place_each_by<T, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 		}
 		region.close();
 	});
-	// The whole-list pass: `each_by` as it has always been.
-	let reconcile_pass = |list: List<T>| {
+	// The keyed pass over ONE SPAN of the run, as `place_each`'s is (A129): the
+	// whole-list pass is this over the whole run, which is `each_by` as it has
+	// always been, and a `Splice` that both removes and inserts is this over its
+	// own span — a surviving key keeps its row and takes the new item through its
+	// CELL, so nothing is built for it. I5: POSITION parameters
+	let reconcile_span = |at: i32, count: i32, list: List<T>| {
+		let whole = at == 0 && count == row_rows.read().len();
+		let previous_cells = held_span(row_cells, at, count);
+		let previous_rows = held_span(row_rows, at, count);
+		let previous_owners = held_span(row_owners, at, count);
+		// What bounds the span on the right, as in `place_each`.
+		let boundary = if at + count < row_rows.read().len() {
+			row_rows.read()[at + count].marker
+		} else {
+			region.anchor
+		};
 		// A surviving key is ALWAYS kept: the row's cell carries the new item,
 		// so there is nothing for a `Refresh` to rebuild.
-		let plan = reconcile(row_keys.read(), row_items.read(), list, key, |_before, _after| {
-			true
-		});
-		let previous_cells = row_cells.read();
-		let previous_rows = row_rows.read();
-		let previous_owners = row_owners.read();
+		let same = |_before: T, _after: T| true;
+		let plan = if whole {
+			reconcile(row_keys.read(), row_items.read(), list, key, same)
+		} else {
+			reconcile(held_span(row_keys, at, count), held_span(row_items, at, count), list, key, same)
+		};
 		// A98, exactly as `place_each` reads it: the rows already in their new
 		// relative order stay put, and every other row is threaded in before the
 		// next settled row's marker.
 		let settled = settled_steps(plan.steps);
-		let references = row_references(plan.steps, previous_rows, settled, region.anchor);
+		let references = row_references(plan.steps, previous_rows, settled, boundary);
 		mut staying: List<bool> = [];
 		mut fill = 0;
 		for fill < previous_rows.len() {
@@ -1733,23 +1848,23 @@ fun place_each_by<T, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 		// Cut what moves first, in old document order — `place_each`'s two halves,
 		// for `place_each`'s reason (A91).
 		mut cut: List<Option<Element>> = [];
-		mut at = 0;
+		mut index = 0;
 		for row in previous_rows {
-			if staying[at] {
+			if staying[index] {
 				cut.push(None);
 			} else {
-				let end = if at + 1 < previous_rows.len() {
-					previous_rows[at + 1].marker
+				let end = if index + 1 < previous_rows.len() {
+					previous_rows[index + 1].marker
 				} else {
-					region.anchor
+					boundary
 				};
 				cut.push(Some(region.cut_row(row, end)));
 			}
-			at += 1;
+			index += 1;
 		}
-		for index in plan.removed {
-			previous_owners[index].dispose();
-			region.drop_row(previous_rows[index]);
+		for gone in plan.removed {
+			previous_owners[gone].dispose();
+			region.drop_row(previous_rows[gone]);
 		}
 		mut next_cells: List<SignalCell<T>> = [];
 		mut next_rows: List<Row> = [];
@@ -1759,34 +1874,34 @@ fun place_each_by<T, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 			let item = list[position];
 			let reference = references[position];
 			match step {
-				RowStep::Keep(let index) => {
-					let cell = previous_cells[index];
+				RowStep::Keep(let kept) => {
+					let cell = previous_cells[kept];
 					cell.set(item);
 					next_cells.push(cell);
-					match cut[index] {
+					match cut[kept] {
 						Some(let content) => {
-							region.insert_row(previous_rows[index], content, reference);
+							region.insert_row(previous_rows[kept], content, reference);
 						},
 						None => {},
 					}
-					next_rows.push(previous_rows[index]);
-					next_owners.push(previous_owners[index]);
+					next_rows.push(previous_rows[kept]);
+					next_owners.push(previous_owners[kept]);
 				},
 				// Unreachable: `same` above is constantly true, so `reconcile`
 				// never refreshes here. Kept in step with `Keep` rather than left
 				// to rot differently.
-				RowStep::Refresh(let index) => {
-					let cell = previous_cells[index];
+				RowStep::Refresh(let kept) => {
+					let cell = previous_cells[kept];
 					cell.set(item);
 					next_cells.push(cell);
-					match cut[index] {
+					match cut[kept] {
 						Some(let content) => {
-							region.insert_row(previous_rows[index], content, reference);
+							region.insert_row(previous_rows[kept], content, reference);
 						},
 						None => {},
 					}
-					next_rows.push(previous_rows[index]);
-					next_owners.push(previous_owners[index]);
+					next_rows.push(previous_rows[kept]);
+					next_owners.push(previous_owners[kept]);
 				},
 				RowStep::Fresh => {
 					let cell: SignalCell<T> = SignalCell::new(item);
@@ -1800,19 +1915,43 @@ fun place_each_by<T, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 			}
 			position += 1;
 		}
-		// A88: the region holds the run it now shows, so a disposal in a parent
-		// that survives takes these rows out of the document. `row_rows` IS the
-		// region's list, so this one write is both.
-		region.hold_rows(next_rows);
 		mut next_keys: List<K> = [];
 		for item in list {
 			next_keys.push(key(item));
 		}
-		row_keys.write() = next_keys;
-		row_items.write() = list;
-		row_cells.write() = next_cells;
-		row_owners.write() = next_owners;
+		if whole {
+			// A88: the region holds the run it now shows, so a disposal in a parent
+			// that survives takes these rows out of the document. `row_rows` IS the
+			// region's list, so this one write is both.
+			region.hold_rows(next_rows);
+			row_keys.write() = next_keys;
+			row_items.write() = list;
+			row_cells.write() = next_cells;
+			row_owners.write() = next_owners;
+		} else {
+			// The span's entries replaced IN PLACE, as in `place_each`.
+			mut taken = 0; // I5
+			for taken < count {
+				let _row = row_rows.write().remove(at);
+				let _owner = row_owners.write().remove(at);
+				let _cell = row_cells.write().remove(at);
+				let _key = row_keys.write().remove(at);
+				let _item = row_items.write().remove(at);
+				taken += 1;
+			}
+			mut offset = 0; // I5
+			for offset < next_rows.len() {
+				row_rows.write().insert(at + offset, next_rows[offset]);
+				row_owners.write().insert(at + offset, next_owners[offset]);
+				row_cells.write().insert(at + offset, next_cells[offset]);
+				row_keys.write().insert(at + offset, next_keys[offset]);
+				row_items.write().insert(at + offset, list[offset]);
+				offset += 1;
+			}
+		}
 	};
+	// The whole-list pass: the span that is the whole run.
+	let reconcile_pass = |list: List<T>| reconcile_span(0, row_rows.read().len(), list);
 	// `place_each`'s `splice_rows`, with the row's cell kept in step: `removed`
 	// rows leave at `at` and `inserted` arrive there, each arrival built against a
 	// fresh cell holding its element. The four `Shared` lists are edited IN PLACE
@@ -1863,10 +2002,17 @@ fun place_each_by<T, K: PartialEq + Hashable, S: DeltaFeed<T>, C: Slot>(
 			// Attached WITHOUT the immediate call, then seeded — `place_each`'s
 			// order, for its reason.
 			source.effect_on_change(|_published| {
-				for op in source.delta_since(cursor) {
+				for op in live_ops(source.delta_since(cursor)) {
 					match op {
+						// Positional when it only removes or only inserts; the pass
+						// over its span when it does both (A129), as in
+						// `place_each`.
 						SeqOp::Splice(let at, let removed, let inserted) => {
-							splice_rows(at, removed.len(), inserted); // I5
+							if removed.len() == 0 || inserted.len() == 0 {
+								splice_rows(at, removed.len(), inserted); // I5
+							} else {
+								reconcile_span(at, removed.len(), inserted); // I5
+							}
 						},
 						// An element changed IN PLACE. The pass's rule, one row at
 						// a time: the same key is a `Keep`, and a kept row takes
