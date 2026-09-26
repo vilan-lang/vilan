@@ -19,6 +19,11 @@ members = [
     # dependency (SQLite) lives apart from the dependency-free `vilan-rt`, and a
     # program that does not reach `std::db` never links it.
     "crates/vilan-rt-sqlite",
+    # F40 (RULED (a), Order 42): OS randomness needs a dependency or `unsafe`,
+    # and `vilan-rt` takes neither — so `getrandom`, with the SHA-512 family,
+    # HMAC and PBKDF2 beside it, is a second optional crate, linked only by a
+    # program that reaches one of them.
+    "crates/vilan-rt-crypto",
 ]
 
 # The clippy gate's exception list (backlog N21). `cargo clippy --workspace

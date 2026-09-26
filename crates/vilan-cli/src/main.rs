@@ -6935,7 +6935,7 @@ fn compile_to_js(
                             emitted.consumed_copies_elided,
                         );
                         native::record_host_gaps(emitted.host_gaps);
-                        native::record_reaches_sqlite(emitted.reaches_sqlite);
+                        native::record_optional_crates(emitted.optional_crates);
                         emitted.source
                     })
                 }

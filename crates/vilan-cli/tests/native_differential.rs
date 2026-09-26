@@ -147,6 +147,15 @@ const DEFAULT_SUITE: &[&str] = &[
     // seal.
     "reactive-on-change.vl",
     "reactive-flatten.vl",
+    // F35: `ListCell`, the two sequence traits and `map_each` — with a named
+    // function handed where a closure stands, a trait default writing through
+    // `&mut self` while reading it, a `&mut` view forwarded, and the 300-turn
+    // walk whose `edited[next_random(size)] = next_random(100)` is the
+    // assignment-order pin's corpus witness.
+    "list-cell.vl",
+    // F36: `i"{one.get()}"` — a generic call's result, interpolated, judged at
+    // the type the call binds its parameter to.
+    "reactive-selector.vl",
 ];
 
 /// Corpus programs that are OUTSIDE this differential by construction, named
@@ -2092,6 +2101,19 @@ fn the_keyed_rpc_service_answers_a_node_client_the_same_from_a_native_server() {
 ///
 /// Non-vacuous by content: the bodies and the client's lines are asserted
 /// verbatim, and the two logins differ only in the password.
+///
+/// **F40: the REAL password path.** The shape hashes as kolt's `store.vl` does —
+/// PBKDF2-HMAC-SHA-512 at 100,000 rounds through a node:crypto `pbkdf2Sync` the
+/// program binds itself, read back through the `Buffer`'s `toString("hex")`, a
+/// salt and a session token from `std::crypto::random_bytes` — so both legs run
+/// `vilan-rt-crypto`'s arithmetic against node's. The tokens are random by
+/// design and are compared MASKED ([`mask_session_tokens`]); the authorized
+/// client carries the real one, so a token the store did not keep is a refused
+/// client. PBKDF2's bytes themselves are held to node's in
+/// [`the_crypto_surface_answers_nodes_bytes_on_both_backends`]; kolt's own
+/// `server.vl`, built natively on a scratch copy, is measured beside the
+/// order's census (`sweeps/order42/native-42/`), where one backend's hash is
+/// verified by the other over one database file.
 #[test]
 fn the_kolt_server_shape_serves_a_login_and_a_keyed_subscription_from_a_native_build() {
     let staged = stage();
@@ -2160,11 +2182,27 @@ fn the_kolt_server_shape_serves_a_login_and_a_keyed_subscription_from_a_native_b
         );
         (exchanges, authorized, refused)
     };
-    let native = serve(&mut native_command);
-    let javascript = serve(&mut node_command);
+    let mut native = serve(&mut native_command);
+    let mut javascript = serve(&mut node_command);
+    // F40: the salt and the session token are `random_bytes(32).to_hex()`
+    // on both legs, as in kolt, so each body is compared with its tokens
+    // MASKED — and the tokens themselves are held to what random ones must
+    // be: 64 lowercase hex digits, fresh per session, never the other leg's.
+    let native_tokens = mask_session_tokens(&mut native.0);
+    let node_tokens = mask_session_tokens(&mut javascript.0);
     assert_eq!(
         native.0, javascript.0,
         "the six HTTP exchanges must be the same from both servers"
+    );
+    for tokens in [&native_tokens, &node_tokens] {
+        assert_eq!(tokens.len(), 2, "register and login each open a session");
+        assert_ne!(tokens[0], tokens[1], "a session token is fresh per session");
+    }
+    assert!(
+        native_tokens
+            .iter()
+            .all(|token| !node_tokens.contains(token)),
+        "two processes never draw the same token: {native_tokens:?} {node_tokens:?}"
     );
     assert_eq!(
         native.1, javascript.1,
@@ -2183,8 +2221,8 @@ fn the_kolt_server_shape_serves_a_login_and_a_keyed_subscription_from_a_native_b
     assert_eq!(
         bodies[..4],
         [
-            "{\"ok\":true,\"token\":\"81ff4294f07c6f3c\",\"message\":\"welcome ada\"}",
-            "{\"ok\":true,\"token\":\"81ff4294f07c6f3c\",\"message\":\"welcome ada\"}",
+            "{\"ok\":true,\"token\":\"<session token>\",\"message\":\"welcome ada\"}",
+            "{\"ok\":true,\"token\":\"<session token>\",\"message\":\"welcome ada\"}",
             "{\"ok\":false,\"token\":\"\",\"message\":\"wrong password\"}",
             "malformed call",
         ]
@@ -2224,6 +2262,38 @@ fn the_kolt_server_shape_serves_a_login_and_a_keyed_subscription_from_a_native_b
         native.1
     );
     assert_eq!(native.2.trim(), "err:Unauthorized");
+}
+
+/// Replaces every session token in `exchanges`' bodies — a run of exactly 64
+/// lowercase hex digits, which is `random_bytes(32).to_hex()` — with a
+/// placeholder, and answers the tokens in order. Anything that LOOKS like a
+/// token but is not 64 lowercase hex stays in the body and fails the compare.
+fn mask_session_tokens(exchanges: &mut [ServedRequest]) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for exchange in exchanges {
+        let mut masked = String::new();
+        let mut rest = exchange.body.as_str();
+        while let Some(start) = rest.find("\"token\":\"") {
+            let (before, after) = rest.split_at(start + "\"token\":\"".len());
+            masked.push_str(before);
+            let end = after.find('"').unwrap_or(after.len());
+            let token = &after[..end];
+            if token.len() == 64
+                && token
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            {
+                tokens.push(token.to_string());
+                masked.push_str("<session token>");
+            } else {
+                masked.push_str(token);
+            }
+            rest = &after[end..];
+        }
+        masked.push_str(rest);
+        exchange.body = masked;
+    }
+    tokens
 }
 
 /// The three exchanges the exit drives, over one spawned server.
@@ -2642,6 +2712,882 @@ const SEAMS_PROBE: &str = concat!(
     "\tprint(i\"{later.millis >= sampled.as_i53()}\");\n",
     "}\n",
 );
+
+/// **F40 (RULED (a))**: `std::crypto`'s OS randomness, SHA-384/512, HMAC and
+/// PBKDF2 natively, through the separate `vilan-rt-crypto` crate — and
+/// node:crypto's `pbkdf2Sync` bound by the PROGRAM, with the `Buffer` it answers
+/// declared as an `external struct` of the program's own naming and read back
+/// through `toString(encoding)`, which is how kolt's `store.vl` hashes a
+/// password.
+///
+/// Every deterministic line is compared byte for byte against node AND held
+/// verbatim (each value is node's own answer), so a digest, an HMAC or a PBKDF2
+/// that is wrong in any bit reds here; the random lines print only what two
+/// processes can agree on — the lengths, that two draws differ, the UUID's
+/// version nibble. The last line is `Shared::identity`'s stamp, which counts
+/// from 1 in first-ask order on both backends (the native `i64` address it had
+/// been did not even compile against std's `i32` declaration, which is the wall
+/// kolt's server met past its host gaps).
+///
+/// And the reach is RECORDED: this program's manifest names `vilan-rt-crypto`,
+/// and a program that reaches no crypto names neither optional crate.
+///
+/// Red before F40: refused by name (`random_bytes`, `sha384`, `sha512`,
+/// `hmac_sha512`, `pbkdf2_sha512`, `pbkdf2_sync`, `to_string_encoded`).
+#[test]
+fn the_crypto_surface_answers_nodes_bytes_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_crypto.vl"), CRYPTO_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_crypto.vl"),
+        Verdict::Identical,
+        "the crypto surface must print the same bytes on both backends"
+    );
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "native_probe_crypto.vl"])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        concat!(
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f\n",
+            "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7\n",
+            "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737\n",
+            "e1d9c16aa681708a45f5c7c4e215ceb66e011a2e9f0040713f18aefdb866d53cf76cab2868a39b9f7840edce4fef5a82be67335c77a6068e04112754f27ccf4e\n",
+            "9c549ce63c45f8df93229c0fac3d6457dc31b241409e21ef1b4e45c97c11001333ddb86821b04cb42fdfa9e3cb9996f4cee97ff6a7e62be799a5b23a83fc5a7f\n",
+            "6mwBTcctb4zNHtkqzh1B8NjeiVc=\n",
+            "rk0Mla9rRtMtCt_5KPBt0CowP47zwlHf1uLYWpVHTEM\n",
+            "32 64 false\n",
+            "36 4\n",
+            "1 2 1\n",
+        ),
+        "node's own answers, and what two processes can agree on about randomness"
+    );
+    let manifest_of = |program: &str| {
+        std::fs::read_to_string(
+            staged
+                .join("dist")
+                .join("native")
+                .join(program)
+                .join("Cargo.toml"),
+        )
+        .expect("read the generated manifest")
+    };
+    let manifest = manifest_of("native_probe_crypto");
+    assert!(
+        manifest.contains("vilan-rt-crypto") && !manifest.contains("vilan-rt-sqlite"),
+        "a program reaching `std::crypto`'s randomness names the crypto crate, and only it:\n\
+         {manifest}"
+    );
+    let plain = vilan(&staged)
+        .args(["build", "--backend", "rust", "bool.vl"])
+        .output()
+        .expect("build a program that reaches no optional crate");
+    assert!(plain.status.success());
+    let manifest = manifest_of("bool");
+    assert!(
+        !manifest.contains("vilan-rt-crypto") && !manifest.contains("vilan-rt-sqlite"),
+        "a program that reaches neither names neither:\n{manifest}"
+    );
+}
+
+const CRYPTO_PROBE: &str = concat!(
+    "import std::bytes::encode_utf8;\n",
+    "import std::crypto::{ hmac_sha512, pbkdf2_sha512, random_bytes, random_uuid, sha384, sha512 };\n",
+    "import std::io::print;\n",
+    "import std::shared::Shared;\n",
+    "\n",
+    "external struct HashBuffer;\n",
+    "\n",
+    "impl HashBuffer {\n",
+    "\t[extern(method, \"toString\")]\n",
+    "\texternal fun to_string_encoded(self, encoding: str): str;\n",
+    "}\n",
+    "\n",
+    "[extern(\"node:crypto\", \"pbkdf2Sync\")]\n",
+    "external fun pbkdf2_sync(password: str, salt: str, iterations: i32, key_length: i32, digest: str): HashBuffer;\n",
+    "\n",
+    "async fun main() {\n",
+    "\tprint(sha512(encode_utf8(\"abc\")).to_hex());\n",
+    "\tprint(sha384(encode_utf8(\"abc\")).to_hex());\n",
+    "\tprint(hmac_sha512(encode_utf8(\"Jefe\"), encode_utf8(\"what do ya want for nothing?\")).to_hex());\n",
+    "\tprint(pbkdf2_sha512(encode_utf8(\"password\"), encode_utf8(\"salt\"), 2, 512).to_hex());\n",
+    "\tlet derived = pbkdf2_sync(\"lovelace1\", \"0123456789abcdef\", 100000, 64, \"sha512\");\n",
+    "\tprint(derived.to_string_encoded(\"hex\"));\n",
+    "\tprint(pbkdf2_sync(\"password\", \"salt\", 2, 20, \"sha1\").to_string_encoded(\"base64\"));\n",
+    "\tprint(pbkdf2_sync(\"password\", \"salt\", 2, 32, \"SHA256\").to_string_encoded(\"base64url\"));\n",
+    "\tlet first = random_bytes(32);\n",
+    "\tlet second = random_bytes(32);\n",
+    "\tprint(i\"{first.len()} {first.to_hex().len()} {first.to_hex() == second.to_hex()}\");\n",
+    "\tlet uuid = random_uuid();\n",
+    "\tprint(i\"{uuid.len()} {uuid.substring(14, 15)}\");\n",
+    "\tlet cell = Shared::new(1);\n",
+    "\tlet other = Shared::new(2);\n",
+    "\tlet same = cell;\n",
+    "\tprint(i\"{cell.identity()} {other.identity()} {same.identity()}\");\n",
+    "}\n",
+);
+
+/// **F35's find — a native MISCOMPILE**: an assignment evaluates its place's
+/// SUBSCRIPTS before its value, in source order, as JavaScript does.
+///
+/// Rust evaluates an assignment's right-hand side BEFORE its place, so
+/// `list[next()] = next() * 10` gave the first draw to the value and the second
+/// to the index, and wrote `10` into slot 2 where node writes `20` into slot 1 —
+/// no error anywhere, a different answer. `list-cell.vl`'s random walk met it
+/// (`edited[next_random(size)] = next_random(100)` edited a different element,
+/// and `map_each` then ran `g` 1,105 times against node's 1,081). One line per
+/// place shape: a subscript, two nested subscripts, a subscript under a field
+/// write, and the compound form (B105's hoist, unchanged, as the control).
+#[test]
+fn an_assignment_evaluates_its_subscripts_before_its_value_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_order.vl"), ORDER_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_order.vl"),
+        Verdict::Identical,
+        "an assignment's order of evaluation must be the same on both backends"
+    );
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "native_probe_order.vl"])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "0 20 0 0\n0 5 0 0 0\n7 0\n9 20\n",
+        "node's answers: every subscript drawn before the value"
+    );
+}
+
+const ORDER_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::shared::Shared;\n",
+    "\n",
+    "let counter: Shared<i32> = Shared::new(0);\n",
+    "\n",
+    "fun next(): i32 {\n",
+    "\tcounter.write() = counter.read() + 1;\n",
+    "\tcounter.read()\n",
+    "}\n",
+    "\n",
+    "struct Point {\n",
+    "\tx: i32,\n",
+    "\ty: i32,\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut list = [0, 0, 0, 0];\n",
+    "\tlist[next()] = next() * 10;\n",
+    "\tprint(i\"{list[0]} {list[1]} {list[2]} {list[3]}\");\n",
+    "\tmut grid = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];\n",
+    "\tgrid[next() - 3][next() - 3] = next();\n",
+    "\tprint(i\"{grid[0][0]} {grid[0][1]} {grid[1][0]} {grid[1][2]} {grid[2][1]}\");\n",
+    "\tmut points = [Point { x = 0, y = 0 }, Point { x = 0, y = 0 }];\n",
+    "\tpoints[next() - 6].x = next();\n",
+    "\tprint(i\"{points[0].x} {points[1].x}\");\n",
+    "\tlist[next() - 8] += next();\n",
+    "\tprint(i\"{list[0]} {list[1]}\");\n",
+    "}\n",
+);
+
+/// **F35**: the three lowering classes `ListCell` and `map_each` met past the
+/// `any` wall the item was filed on (which an earlier order had already
+/// lifted — the premise, re-measured, had moved):
+///
+/// 1. a NAMED FUNCTION in a value position (`apply(values, twice)`, `let named =
+///    twice`) — the emitted instance behind the same counted handle a closure
+///    literal is;
+/// 2. a `&mut self` method whose later argument READS the receiver
+///    (`self.place(self.size(), value)`, a trait default's `push` over
+///    `splice`) — the value is evaluated ahead of the `&mut` borrow, since
+///    Rust's two-phase borrow covers only an autoref method receiver (E0502);
+/// 3. a `&mut` the source WROTE over a binding that is already a `&mut` loan
+///    (`fill(&mut target)` with `target: &mut Stack`) — a reborrow, not a
+///    `&mut &mut` (E0596).
+///
+/// Each line is node's answer; each class was a refusal or a rustc error
+/// before F35.
+#[test]
+fn a_named_function_value_and_a_forwarded_loan_build_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_loans.vl"), LOANS_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_loans.vl"),
+        Verdict::Identical,
+        "the three classes must print the same bytes on both backends"
+    );
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "native_probe_loans.vl"])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "1 102 203 304\n2 4 6 42\n"
+    );
+}
+
+const LOANS_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Stack {\n",
+    "\titems: List<i32>,\n",
+    "}\n",
+    "\n",
+    "impl Stack {\n",
+    "\tfun size(self): i32 {\n",
+    "\t\tself.items.len()\n",
+    "\t}\n",
+    "\n",
+    "\tfun place(&mut self, at: i32, value: i32) {\n",
+    "\t\tself.items.push(at * 100 + value);\n",
+    "\t}\n",
+    "\n",
+    "\tfun push(&mut self, value: i32) {\n",
+    "\t\tself.place(self.size(), value);\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun fill(target: &mut Stack) {\n",
+    "\ttarget.push(1);\n",
+    "\ttarget.push(2);\n",
+    "}\n",
+    "\n",
+    "fun refill(target: &mut Stack) {\n",
+    "\tfill(&mut target);\n",
+    "\ttarget.push(3);\n",
+    "}\n",
+    "\n",
+    "fun twice(value: i32): i32 {\n",
+    "\tvalue * 2\n",
+    "}\n",
+    "\n",
+    "fun apply(values: List<i32>, f: |i32| i32): List<i32> {\n",
+    "\tvalues.map(f)\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tmut stack = Stack { items = [] };\n",
+    "\trefill(&mut stack);\n",
+    "\tstack.push(4);\n",
+    "\tprint(i\"{stack.items[0]} {stack.items[1]} {stack.items[2]} {stack.items[3]}\");\n",
+    "\tlet doubled = apply([1, 2, 3], twice);\n",
+    "\tlet named = twice;\n",
+    "\tprint(i\"{doubled[0]} {doubled[1]} {doubled[2]} {named(21)}\");\n",
+    "}\n",
+);
+
+/// **F36 (a)**: interpolating a GENERIC call's result. The call's recorded type
+/// is the callee's own parameter (`Source<T>::get`'s `T`), which is neither a
+/// scalar nor a `str` until the call's substitution binds it — so every
+/// `i"{source.get()}"` was refused as "a value with its own `render`". The
+/// operand is now judged at the type THIS call binds (`i32`, `str`, `bool`),
+/// through the substitution the call itself is emitted under.
+///
+/// Written over `Source` BOUNDS, not `SignalCell` return types, so reactive-42's
+/// combinator flip (`map` answering a node) keeps it green: `show` and `shout`
+/// take any `S: Source<..>`, and the derived value is only ever handed to one.
+#[test]
+fn a_generic_calls_result_interpolates_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_interpolate.vl"),
+        INTERPOLATE_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_interpolate.vl"),
+        Verdict::Identical,
+        "an interpolated generic call must print the same bytes on both backends"
+    );
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "native_probe_interpolate.vl"])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "count 1\ndoubled 10\nname ada <ada> true 6\n"
+    );
+}
+
+const INTERPOLATE_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::reactive::{ SignalCell, Source };\n",
+    "\n",
+    "fun show<S: Source<i32>>(label: str, source: S) {\n",
+    "\tprint(i\"{label} {source.get()}\");\n",
+    "}\n",
+    "\n",
+    "fun shout<S: Source<str>>(source: S): str {\n",
+    "\ti\"<{source.get()}>\"\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet count = SignalCell::new(1);\n",
+    "\tshow(\"count\", count);\n",
+    "\tlet doubled = count.map(|n| n * 2);\n",
+    "\tcount.set(5);\n",
+    "\tshow(\"doubled\", doubled);\n",
+    "\tlet name = SignalCell::new(\"ada\");\n",
+    "\tlet flag = SignalCell::new(true);\n",
+    "\tprint(i\"name {name.get()} {shout(name)} {flag.get()} {count.get() + 1}\");\n",
+    "}\n",
+);
+
+/// **F36 (b), premise CORRECTED**: `encode_json` over a `List<i32>` — the item
+/// recorded rustc's E0596 (a `&mut` through an immutable binding), and on this
+/// base every shape re-measured builds and prints node's bytes: a local, a
+/// `mut` local, a parameter, a field through `self`, a call's result, a
+/// closure's parameter, a literal, a `List<usize>`, a cell's value, a nested
+/// list, and a `[derive(Wire)]` struct holding one. The lowering that closed it
+/// is the loan REBORROW native-41 landed for `[derive(Wire)]`'s `describe`
+/// handing its serializer on; this is its regression pin, green from the
+/// first run — there was nothing left to turn red.
+#[test]
+fn encode_json_over_a_list_prints_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_encode.vl"), ENCODE_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_encode.vl"),
+        Verdict::Identical,
+        "`encode_json` over a list must print the same bytes on both backends"
+    );
+}
+
+const ENCODE_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::json::encode_json;\n",
+    "import std::reactive::{ SignalCell, Source };\n",
+    "import std::wire::Wire;\n",
+    "\n",
+    "[derive(Wire)]\n",
+    "struct Bag {\n",
+    "\tvalues: List<i32>,\n",
+    "\tname: str,\n",
+    "}\n",
+    "\n",
+    "impl Bag {\n",
+    "\tfun text(self): str {\n",
+    "\t\tencode_json(self.values)\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun make(): List<i32> {\n",
+    "\t[4, 5]\n",
+    "}\n",
+    "\n",
+    "fun show(values: List<i32>): str {\n",
+    "\tencode_json(values)\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet values: List<i32> = [1, 2, 3];\n",
+    "\tprint(encode_json(values));\n",
+    "\tmut grown: List<i32> = [1];\n",
+    "\tgrown.push(2);\n",
+    "\tprint(encode_json(grown));\n",
+    "\tprint(show(values));\n",
+    "\tlet bag = Bag { values, name = \"h\" };\n",
+    "\tprint(bag.text());\n",
+    "\tprint(encode_json(bag));\n",
+    "\tprint(encode_json(make()));\n",
+    "\tlet render = |list: List<i32>| encode_json(list);\n",
+    "\tprint(render([9]));\n",
+    "\tprint(encode_json([1, 2, 3]));\n",
+    "\tlet sizes: List<usize> = [1, 2];\n",
+    "\tprint(encode_json(sizes));\n",
+    "\tlet cell = SignalCell::new([6, 7]);\n",
+    "\tprint(encode_json(cell.get()));\n",
+    "\tlet nested: List<List<i32>> = [[1], [2, 3]];\n",
+    "\tprint(encode_json(nested));\n",
+    "}\n",
+);
+
+/// F36's boundary, named: `blanket-impl.vl` got past the interpolation and met
+/// a call that threads FEWER context arguments than its callee's instance
+/// declares (`badge("static")` from `main`, whose instance takes the ambient
+/// `Owner` because one impl of the trait member it dispatches through reaches
+/// it; JavaScript passes `undefined`). rustc refused that as E0061 — a BROKEN
+/// verdict — so it is refused by name instead, which is what the whole-set
+/// sweep's zero-broken gate needs. The context pass is the analyzer's, and the
+/// fix that makes the call emittable is there.
+#[test]
+fn a_call_missing_a_context_argument_is_refused_by_name() {
+    let staged = stage();
+    match compare(&staged, "blanket-impl.vl") {
+        Verdict::Refused(reason) => assert!(
+            reason.contains("a call to `badge` that threads fewer context arguments"),
+            "{reason}"
+        ),
+        other => panic!("expected a refusal by name, got {other:?}"),
+    }
+}
+
+/// **F38**: `and_then<U>`'s `U` — a callee's OWN generic parameter that no
+/// written argument names and the analyzer records nothing for — is closed
+/// from the closure the call is handed: the declared `|T| Result<U, E>`
+/// against the literal's parameters and its body's tail. A tail the analyzer
+/// typed nowhere (`Ok(n * 2)`) is read through the constructor's arguments,
+/// an arithmetic operand through its left side, a concatenation as `str`.
+/// `Result` and `Option` both, chained, on the `Err` path, and at a `U` that is
+/// not the receiver's `T` (`str`, `bool`).
+///
+/// Red before F38: refused by name, "a value of an unbound generic type
+/// parameter (parameter 1 of `and_then`)".
+#[test]
+fn and_thens_own_parameter_is_closed_from_its_closure_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_and_then.vl"), AND_THEN_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_and_then.vl"),
+        Verdict::Identical,
+        "`and_then` must print the same bytes on both backends"
+    );
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "native_probe_and_then.vl"])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "20\n-1\n-2\ntext 10\n4\ntrue\n"
+    );
+}
+
+const AND_THEN_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun half(n: i32): Result<i32, str> {\n",
+    "\tif n % 2 == 0 {\n",
+    "\t\tOk(n / 2)\n",
+    "\t} else {\n",
+    "\t\tErr(i\"odd {n}\")\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet ok: Result<i32, str> = Ok(10);\n",
+    "\tlet err: Result<i32, str> = Err(\"boom\");\n",
+    "\tprint(ok.and_then(|n| Ok(n * 2)).unwrap_or(0));\n",
+    "\tprint(err.and_then(|n| Ok(n * 2)).unwrap_or(-1));\n",
+    "\tprint(ok.and_then(|n| half(n)).and_then(|n| half(n)).unwrap_or(-2));\n",
+    "\tprint(ok.and_then(|n| Ok(i\"text {n}\")).unwrap_or(\"none\"));\n",
+    "\tlet some: Option<i32> = Some(3);\n",
+    "\tprint(some.and_then(|n| Some(n + 1)).unwrap_or(0));\n",
+    "\tprint(some.and_then(|n| Some(n > 2)).unwrap_or(false));\n",
+    "}\n",
+);
+
+/// F38's boundary: `result-combinators.vl` now stops at `or_else<F>` over an
+/// `Ok`-only closure (`err.or_else(|e| Ok(7))`), whose `F` NOTHING in the
+/// program constrains — the analyzer records `any` and JavaScript never needs
+/// a type. Natively a type has to be chosen, which is a ruling, not a
+/// lowering, so it stays refused by name at the new wall.
+#[test]
+fn an_unconstrained_generic_parameter_is_refused_by_name() {
+    let staged = stage();
+    match compare(&staged, "result-combinators.vl") {
+        Verdict::Refused(reason) => {
+            assert!(reason.contains("parameter 1 of `or_else`"), "{reason}")
+        }
+        other => panic!("expected a refusal by name, got {other:?}"),
+    }
+}
+
+/// **F37**: a PARTIAL move where the source's order asks for one, and the
+/// conservative copies the last-use rule used to take at a field or on an
+/// exclusive branch.
+///
+/// The item's own repro (`let h = r.live; push(copy_of(r))`) already built on
+/// this base — native-41's consumed-FIELD copy covered it, conservatively.
+/// What F37 builds is the PRECISION: the liveness pass reads a field by its
+/// PATH (a field read is its field's last use when every later read of the
+/// binding touches a disjoint field, so `Rec { live = r.live, name = r.name,
+/// n = r.n }` moves all three), and it forks at an `if`/`else` chain and an
+/// unguarded `match` (a read that is last on its own exclusive path moves).
+/// `keep` is the attach order reactive-41 had to write around — the handle
+/// built first from two fields, the record handed on whole as its last use —
+/// and it builds and answers node's bytes. The overlap cases keep their copies:
+/// a field read twice, and a nested path followed by its parent.
+///
+/// The copy count is held too: 5 copied / 3 moved. With the path and the
+/// branch halves planted out ("a field never moves, and branches are walked
+/// in sequence") the same program takes 7 copies and moves 1.
+#[test]
+fn a_field_and_a_branch_read_move_at_their_own_last_use_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_moves.vl"), MOVES_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_moves.vl"),
+        Verdict::Identical,
+        "partial moves must print the same bytes on both backends"
+    );
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "native_probe_moves.vl"])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "a 1 false\nb 2\ncc\nxxy\nd!\ne\nf\n"
+    );
+    assert_eq!(
+        copy_census_of(&staged, "native_probe_moves.vl"),
+        (5, 3),
+        "the copies the path- and branch-aware last use leaves"
+    );
+}
+
+const MOVES_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::shared::Shared;\n",
+    "\n",
+    "struct Rec {\n",
+    "\tlive: Shared<bool>,\n",
+    "\tname: str,\n",
+    "\tn: i32,\n",
+    "}\n",
+    "\n",
+    "struct Handle {\n",
+    "\tlive: Shared<bool>,\n",
+    "\tname: str,\n",
+    "}\n",
+    "\n",
+    "struct Inner {\n",
+    "\tlabel: str,\n",
+    "}\n",
+    "\n",
+    "struct Outer {\n",
+    "\tinner: Inner,\n",
+    "\ttag: str,\n",
+    "}\n",
+    "\n",
+    "// The attach order reactive-41 had to avoid: the handle built FIRST from two\n",
+    "// fields, then the record handed on whole as its last use.\n",
+    "fun keep(record: Rec, into: Shared<List<Rec>>): Handle {\n",
+    "\tlet made = Handle { live = record.live, name = record.name };\n",
+    "\tinto.write().push(record);\n",
+    "\tmade\n",
+    "}\n",
+    "\n",
+    "// Four disjoint fields, each its own last use.\n",
+    "fun rebuild(record: Rec): Rec {\n",
+    "\tRec { live = record.live, name = record.name, n = record.n }\n",
+    "}\n",
+    "\n",
+    "// An overlapping later read keeps the earlier copy: the name is read twice.\n",
+    "fun twice(record: Rec): str {\n",
+    "\tlet first = record.name;\n",
+    "\tfirst + record.name\n",
+    "}\n",
+    "\n",
+    "// A nested path, then its parent — the parent read overlaps.\n",
+    "fun nested(outer: Outer): str {\n",
+    "\tlet label = outer.inner.label;\n",
+    "\tlet inner = outer.inner;\n",
+    "\tlabel + inner.label + outer.tag\n",
+    "}\n",
+    "\n",
+    "// Exclusive arms: each arm's read is its path's last.\n",
+    "fun choose(record: Rec, flag: bool): str {\n",
+    "\tif flag {\n",
+    "\t\trecord.name\n",
+    "\t} else if record.n > 1 {\n",
+    "\t\trecord.name + \"!\"\n",
+    "\t} else {\n",
+    "\t\t\"none\"\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun pick(value: Option<Rec>, fallback: Rec): Rec {\n",
+    "\tmatch value {\n",
+    "\t\tSome(let found) => found,\n",
+    "\t\tNone => fallback,\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet into: Shared<List<Rec>> = Shared::new([]);\n",
+    "\tlet handle = keep(Rec { live = Shared::new(true), name = \"a\", n = 1 }, into);\n",
+    "\thandle.live.write() = false;\n",
+    "\tprint(i\"{handle.name} {into.read().len()} {into.read()[0].live.read()}\");\n",
+    "\tlet again = rebuild(Rec { live = Shared::new(true), name = \"b\", n = 2 });\n",
+    "\tprint(i\"{again.name} {again.n}\");\n",
+    "\tprint(twice(Rec { live = Shared::new(true), name = \"c\", n = 3 }));\n",
+    "\tprint(nested(Outer { inner = Inner { label = \"x\" }, tag = \"y\" }));\n",
+    "\tprint(choose(Rec { live = Shared::new(true), name = \"d\", n = 2 }, false));\n",
+    "\tprint(choose(Rec { live = Shared::new(true), name = \"e\", n = 2 }, true));\n",
+    "\tprint(pick(None, Rec { live = Shared::new(true), name = \"f\", n = 0 }).name);\n",
+    "}\n",
+);
+
+/// **F39 (decided: the compile-time check follows aliases)**: a reentrant read
+/// through an ALIAS of the cell being `update`d is refused by name, as the
+/// same-place read already was — `let t2 = todos;` copies the cell's HANDLES,
+/// so `t2.get()` inside `todos.update(..)` is the same cell, and so is the
+/// reverse. The control stays identical: a VALUE read out of the cell before
+/// the update (`let before = todos.get();`) is a copy of the list, not an
+/// alias of the cell, and a field alias of a DIFFERENT cell is not the cell.
+#[test]
+fn a_reentrant_read_through_an_alias_is_refused_by_name() {
+    let staged = stage();
+    for (name, body) in [
+        (
+            "native_probe_alias_forward.vl",
+            "\tlet t2 = todos;\n\ttodos.update(|&mut list| {\n\t\tlist.push(2);\n\t\tprint(t2.get().len());\n\t});\n",
+        ),
+        (
+            "native_probe_alias_reverse.vl",
+            "\tlet t2 = todos;\n\tt2.update(|&mut list| {\n\t\tlist.push(2);\n\t\tprint(todos.get().len());\n\t});\n",
+        ),
+        (
+            "native_probe_alias_chain.vl",
+            "\tlet t2 = todos;\n\tlet t3 = t2;\n\tt3.update(|&mut list| {\n\t\tlist.push(2);\n\t\tprint(todos.get().len());\n\t});\n",
+        ),
+    ] {
+        std::fs::write(
+            staged.join(name),
+            format!(
+                "import std::io::print;\nimport std::reactive::{{ Signal, SignalCell }};\n\nfun main() {{\n\tlet todos: SignalCell<List<i32>> = Signal::new([1]);\n{body}}}\n"
+            ),
+        )
+        .expect("write the probe");
+        match compare(&staged, name) {
+            Verdict::Refused(reason) => assert!(
+                reason.contains("reads the same place again"),
+                "{name}: refused, and for this reason: {reason}"
+            ),
+            other => panic!("{name}: a reentrant read through an alias must be refused: {other:?}"),
+        }
+    }
+    std::fs::write(
+        staged.join("native_probe_alias_value.vl"),
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ Signal, SignalCell };\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet todos: SignalCell<List<i32>> = Signal::new([1]);\n",
+            "\tlet before = todos.get();\n",
+            "\ttodos.update(|&mut list| {\n",
+            "\t\tlist.push(before.len() + 1);\n",
+            "\t});\n",
+            "\tprint(todos.get());\n",
+            "}\n",
+        ),
+    )
+    .expect("write the control");
+    assert_eq!(
+        compare(&staged, "native_probe_alias_value.vl"),
+        Verdict::Identical,
+        "a value read before the update is not an alias of the cell"
+    );
+}
+
+/// **F39's runtime half**: an alias no static walk can see — the SAME cell
+/// handed to two parameters — still stops natively (the JS backend answers
+/// the in-progress value, which safe Rust has no second view of storage to
+/// read), but with the runtime's own sentence and node's exit code, not
+/// Rust's `already mutably borrowed`. Outside the differential by
+/// construction: the two backends answer differently, and that is the claim.
+#[test]
+fn a_reentrant_read_the_compiler_cannot_see_stops_with_the_runtimes_sentence() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_alias_parameter.vl"),
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ Signal, SignalCell };\n",
+            "\n",
+            "fun touch(a: SignalCell<List<i32>>, b: SignalCell<List<i32>>) {\n",
+            "\ta.update(|&mut list| {\n",
+            "\t\tlist.push(2);\n",
+            "\t\tprint(b.get().len());\n",
+            "\t});\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet todos: SignalCell<List<i32>> = Signal::new([1]);\n",
+            "\ttouch(todos, todos);\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe");
+    let native = vilan(&staged)
+        .args([
+            "run",
+            "--backend",
+            "rust",
+            "native_probe_alias_parameter.vl",
+        ])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(
+        native.status.code(),
+        Some(1),
+        "node's exit code for a throw"
+    );
+    let stderr = String::from_utf8_lossy(&native.stderr);
+    assert!(
+        stderr.contains("a cell was read while it is being updated"),
+        "the runtime names the shape:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("already mutably borrowed"),
+        "not Rust's own sentence:\n{stderr}"
+    );
+    let javascript = vilan(&staged)
+        .args(["run", "native_probe_alias_parameter.vl"])
+        .output()
+        .expect("run the JS backend");
+    assert_eq!(
+        String::from_utf8_lossy(&javascript.stdout),
+        "2\n",
+        "the JS backend answers the in-progress value"
+    );
+}
+
+/// **C14, re-scoped: the NATIVE LEAK GATE** — the counted-`Shared` census S4's
+/// exit test became once F1 S1a made `Shared`/`Weak` a real `Rc`/`Weak`
+/// natively (retain on clone, release on drop, by construction).
+///
+/// `VILAN_NATIVE_LEAK_CENSUS=1` runs the program on a thread of its own and,
+/// after that thread has exited — `main`'s frame gone, the event loop drained,
+/// every thread-local (the module-level bindings, the executor's queues)
+/// destroyed — prints how many cells it minted and how many are still live.
+/// What is live then is what NOTHING can release: a cycle of counted cells.
+///
+/// The table is [`DEFAULT_SUITE`] plus the board probe, as the copy census is.
+/// Its claim is `live = 0` wherever the program's cells form no cycle; a
+/// non-zero row is a leak, found, and named in the report that moved it —
+/// not a number to regenerate past. Regenerate with
+/// `VILAN_REGENERATE_NATIVE_LEAK_CENSUS=1` only after reading the difference.
+///
+/// The F18/F40 exit — kolt's server and its shape — is NOT a row: a server is
+/// stopped by a signal, and `vilan_rt::http` has no graceful stop to reach
+/// process end through (recorded in the lane's report).
+#[test]
+fn the_native_leak_census_matches_its_table() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_board.vl"), BOARD_PROBE)
+        .expect("write the board probe");
+    let mut rows = Vec::new();
+    for program in DEFAULT_SUITE
+        .iter()
+        .copied()
+        .chain(std::iter::once("native_probe_board.vl"))
+    {
+        let (minted, live) = leak_census_of(&staged, program);
+        rows.push(format!(
+            "{}\t{minted}\t{live}",
+            program.trim_end_matches(".vl")
+        ));
+    }
+    let measured = format!(
+        "{}{}\n",
+        concat!(
+            "# Counted cells each program MINTED, and the ones still LIVE after its\n",
+            "# thread (and every thread-local) is gone: a live cell is a cycle (C14's\n",
+            "# native leak gate). Regenerate with\n",
+            "# VILAN_REGENERATE_NATIVE_LEAK_CENSUS=1 cargo test -p vilan-cli \
+             --test native_differential\n",
+        ),
+        rows.join("\n")
+    );
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(NATIVE_LEAK_CENSUS);
+    if std::env::var_os("VILAN_REGENERATE_NATIVE_LEAK_CENSUS").is_some() {
+        std::fs::write(&path, &measured).expect("write the census");
+        return;
+    }
+    let committed = std::fs::read_to_string(&path).expect("read the committed census");
+    assert_eq!(
+        committed, measured,
+        "the native leak census moved; read the difference, then regenerate with \
+         VILAN_REGENERATE_NATIVE_LEAK_CENSUS=1"
+    );
+}
+
+const NATIVE_LEAK_CENSUS: &str = "crates/vilan-cli/tests/native-leak-census.tsv";
+
+/// Runs `program` natively under `VILAN_NATIVE_LEAK_CENSUS=1` and answers
+/// `(minted, live)` from the line the runtime prints on stderr.
+fn leak_census_of(staged: &Path, program: &str) -> (u64, u64) {
+    let output = vilan(staged)
+        .env("VILAN_NATIVE_LEAK_CENSUS", "1")
+        .args(["run", "--backend", "rust", program])
+        .output()
+        .expect("run the program natively");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = stderr
+        .lines()
+        .find(|line| line.starts_with("vilan-native: cells minted="))
+        .unwrap_or_else(|| panic!("{program} reported no leak census:\n{stderr}"));
+    let mut numbers = line
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|piece| !piece.is_empty())
+        .map(|piece| piece.parse::<u64>().expect("a count"));
+    let minted = numbers.next().expect("the minted count");
+    let live = numbers.next().expect("the live count");
+    (minted, live)
+}
+
+/// The leak gate's instrument, held both ways: a program whose cells form no
+/// cycle — module-level cells included, which are released with their
+/// thread-locals — ends with none live, and a program that closes ONE cycle (a
+/// `Link` whose `next` cell is written to hold the link itself) ends with
+/// exactly that cell live. A census that could not see a cycle would pass the first and
+/// fail the second.
+#[test]
+fn the_leak_census_sees_a_cycle_and_nothing_else() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_no_cycle.vl"),
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "\n",
+            "let counter: Shared<i32> = Shared::new(0);\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet cell: Shared<List<|| i32>> = Shared::new([]);\n",
+            "\tlet other: Shared<i32> = Shared::new(3);\n",
+            "\tcell.write().push(|| other.read());\n",
+            "\tcounter.write() = counter.read() + 1;\n",
+            "\tprint(cell.read().len());\n",
+            "}\n",
+        ),
+    )
+    .expect("write the acyclic probe");
+    std::fs::write(
+        staged.join("native_probe_cycle.vl"),
+        concat!(
+            "import std::io::print;\n",
+            "import std::option::Option::{ self, None, Some };\n",
+            "import std::shared::Shared;\n",
+            "\n",
+            "struct Link {\n",
+            "\tname: str,\n",
+            "\tnext: Shared<Option<Link>>,\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet link = Link { name = \"loop\", next = Shared::new(None) };\n",
+            "\tlink.next.write() = Some(link);\n",
+            "\tprint(link.name);\n",
+            "}\n",
+        ),
+    )
+    .expect("write the cyclic probe");
+    let (minted, live) = leak_census_of(&staged, "native_probe_no_cycle.vl");
+    assert_eq!(live, 0, "no cycle, nothing live ({minted} minted)");
+    let (_, live) = leak_census_of(&staged, "native_probe_cycle.vl");
+    assert_eq!(live, 1, "the one cell the closure closes a cycle through");
+}
 
 /// **F18 slice 2**: a closure declared SYNCHRONOUS, answering nothing, whose
 /// body awaits.
@@ -3449,22 +4395,30 @@ fn the_native_copy_census_matches_its_table() {
 /// F29: a program whose host bindings sit ONLY inside a refused call — in its
 /// arguments, and in the body of a closure among them.
 ///
-/// `random_uuid` is reached nowhere but inside the argument of the refused
-/// `random_bytes` call; `range_i32` nowhere but inside the body of the closure
+/// `host_name` is reached nowhere but inside the argument of the refused
+/// `set_priority` call; `range_i32` nowhere but inside the body of the closure
 /// the refused `hmr_register_teardown` takes. Neither was in the census before
 /// the walk continued past a refusal, which is how `createServer`'s handler hid
 /// nine bindings from the census that sized F18.
+///
+/// The argument pair is the PROGRAM's own `node:os` bindings, which no backend
+/// table will ever answer: the pair had been `random_bytes(random_uuid()..)`,
+/// and F40 lowered both, which turned the pin's shape into a program with
+/// nothing hidden in it. A pair the runtime cannot grow into keeps it measuring
+/// the walk rather than the runtime's coverage.
 const CENSUS_PROBE: &str = concat!(
-    "import std::crypto::{ random_bytes, random_uuid };\n",
     "import std::random::range_i32;\n",
     "import std::rpc::hmr_register_teardown;\n",
-    "import std::bytes::Bytes;\n",
     "import std::io::print;\n",
     "\n",
-    "fun consume(value: Bytes) {}\n",
+    "[extern(\"node:os\", \"hostname\")]\n",
+    "external fun host_name(): str;\n",
+    "\n",
+    "[extern(\"node:os\", \"setPriority\")]\n",
+    "external fun set_priority(name: str): i32;\n",
     "\n",
     "fun main() {\n",
-    "\tconsume(random_bytes(random_uuid().len()));\n",
+    "\tprint(set_priority(host_name()));\n",
     "\thmr_register_teardown(|| { print(range_i32(1, 4)); });\n",
     "}\n",
 );
@@ -3500,7 +4454,7 @@ fn the_host_census_walks_past_a_refusal_into_its_arguments_and_closure_bodies() 
     let census = String::from_utf8_lossy(&output.stdout);
     for hidden in [
         // Reached only inside the ARGUMENT of a refused host binding's call.
-        "the host binding `random_uuid`",
+        "the host binding `host_name`",
         // Reached only inside the BODY of a closure handed to a refused one.
         "the intrinsic `RandomInt`",
     ] {
@@ -3512,7 +4466,7 @@ fn the_host_census_walks_past_a_refusal_into_its_arguments_and_closure_bodies() 
     // And the refusals themselves are still reported, which is what the walk is
     // a continuation OF.
     for refused in [
-        "the host binding `random_bytes`",
+        "the host binding `set_priority`",
         "the host binding `hmr_register_teardown`",
     ] {
         assert!(

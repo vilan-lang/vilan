@@ -68,14 +68,21 @@ pub fn record_host_gaps(gaps: Vec<String>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = gaps;
 }
 
-/// Whether the last emit reached `std::db`, and so whether the cargo project
-/// written for it depends on `vilan-rt-sqlite` (F18 slice 2; Order 39's R1).
-/// Recorded on the same terms as the two above, for the same reason: the fact
-/// belongs to the COMPILE and the manifest is written after it.
-static REACHES_SQLITE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The optional runtime crates the last emit reached, and so which of them the
+/// cargo project written for it depends on (F18 slice 2's `vilan-rt-sqlite`,
+/// F40's `vilan-rt-crypto`). Recorded on the same terms as the three above, for
+/// the same reason: the fact belongs to the COMPILE and the manifest is written
+/// after it.
+static OPTIONAL_CRATES: std::sync::Mutex<vilan_rust::OptionalCrates> =
+    std::sync::Mutex::new(vilan_rust::OptionalCrates {
+        sqlite: false,
+        crypto: false,
+    });
 
-pub fn record_reaches_sqlite(reaches: bool) {
-    REACHES_SQLITE.store(reaches, Ordering::Relaxed);
+pub fn record_optional_crates(reached: vilan_rust::OptionalCrates) {
+    *OPTIONAL_CRATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = reached;
 }
 
 /// Where the runtime crate lives (tracker F19).
@@ -223,7 +230,9 @@ fn write_project(
     let manifest = vilan_rust::cargo_manifest(
         &name,
         &runtime.to_string_lossy(),
-        REACHES_SQLITE.load(Ordering::Relaxed),
+        *OPTIONAL_CRATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
     );
     if let Err(error) = std::fs::write(directory.join("Cargo.toml"), manifest) {
         eprintln!(

@@ -301,7 +301,46 @@ pub fn panic_with(message: &str) -> ! {
 /// The hook is installed for the body's duration rather than for the process,
 /// because [`guarded`] installs its own around a `guarded` region and a
 /// process-wide hook here would fight it.
-pub fn main_guard(body: impl FnOnce()) {
+///
+/// **C14's native leak gate.** With `VILAN_NATIVE_LEAK_CENSUS` set, the body
+/// runs on a THREAD of its own and the census is taken after that thread has
+/// exited: by then `main`'s frame is gone, the event loop has drained, and
+/// every thread-local has been destroyed — the module-level bindings (each a
+/// `thread_local!` cell) and the executor's queues among them. So what is
+/// still live is exactly what nothing can ever release: a cycle of counted
+/// cells. The line goes to stderr, so the differential's stdout comparison
+/// never sees it; without the variable nothing here changes.
+pub fn main_guard(body: impl FnOnce() + Send + 'static) {
+    if std::env::var_os("VILAN_NATIVE_LEAK_CENSUS").is_some() {
+        // The main thread's own stack, not a spawned thread's 2 MiB default:
+        // the census must not turn a deep recursion the plain build runs into
+        // an overflow.
+        const CENSUS_STACK: usize = 64 << 20;
+        let failed = std::thread::Builder::new()
+            .stack_size(CENSUS_STACK)
+            .spawn(move || run_guarded_main(body))
+            .map(|thread| thread.join().unwrap_or(true))
+            .unwrap_or(true);
+        let (minted, released) = cell_census();
+        eprintln!(
+            "vilan-native: cells minted={minted} live={}",
+            minted - released
+        );
+        if failed {
+            std::process::exit(1);
+        }
+        return;
+    }
+    if run_guarded_main(body) {
+        // The hook has already said what happened. `exit` rather than a
+        // re-raise, because a re-raise is how 101 comes back.
+        std::process::exit(1);
+    }
+}
+
+/// [`main_guard`]'s body under node's failure shape; answers whether it
+/// failed.
+fn run_guarded_main(body: impl FnOnce()) -> bool {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(|info| {
         // A panic somebody is going to CATCH is not a failure yet: the
@@ -322,11 +361,7 @@ pub fn main_guard(body: impl FnOnce()) {
     }));
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
     std::panic::set_hook(previous);
-    if outcome.is_err() {
-        // The hook above has already said what happened. `exit` rather than a
-        // re-raise, because a re-raise is how 101 comes back.
-        std::process::exit(1);
-    }
+    outcome.is_err()
 }
 
 // How many CATCHING regions the current thread is inside (F25). A counter
@@ -404,7 +439,63 @@ fn describe_panic(payload: &Box<dyn std::any::Any + Send>) -> Str {
 /// later slice. Cloning is another handle to the SAME cell, which is what makes
 /// it the box a `SignalCell` is built out of.
 pub struct Shared<T> {
-    inner: Rc<RefCell<T>>,
+    inner: Rc<Slot<T>>,
+}
+
+/// The sentence a REENTRANT cell access dies with (F39): a read or a write of
+/// a cell while a `&mut` view of the same cell is live — `update`'s closure
+/// reading the cell it is updating through a handle the compiler could not
+/// see was the same one (an alias that arrived as a parameter). The JS backend
+/// answers the in-progress value there, because its view and its cell are one
+/// object; safe Rust has no second view of storage under mutation to answer
+/// with, so the program stops, and says why, instead of printing Rust's
+/// `already mutably borrowed`.
+pub const REENTRANT_READ: &str = "a cell was read while it is being updated: a read inside \
+    `update` reached the same cell through another handle (the JS backend answers the \
+    in-progress value; the native backend cannot)";
+
+/// What a [`Shared`] handle points at: the value, and the identity stamp
+/// [`Shared::identity`] takes on the first ask (`0` until then).
+///
+/// The stamp lives on the CELL, beside its value, exactly where the JS
+/// backend's `__shared_identity` puts its `__id` — so every handle reads the
+/// one number, and a cell nothing asks about never takes one.
+struct Slot<T> {
+    value: RefCell<T>,
+    identity: std::cell::Cell<i32>,
+}
+
+thread_local! {
+    /// The next identity to stamp — `__shared_identity_next`, which starts at 1.
+    static NEXT_IDENTITY: std::cell::Cell<i32> = const { std::cell::Cell::new(1) };
+}
+
+/// C14's native leak gate: how many cells the program has MINTED and how many
+/// it has RELEASED (the last strong handle dropped, so the slot and its value
+/// went with it). Process-wide rather than thread-local because the census is
+/// read AFTER the program's thread — and its thread-locals — are gone; two
+/// counters rather than one live count so a census can say how much a program
+/// allocated as well as what it kept.
+static CELLS_MINTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CELLS_RELEASED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A cell's storage going away is a RELEASE — counted for C14's leak gate.
+impl<T> Drop for Slot<T> {
+    fn drop(&mut self) {
+        CELLS_RELEASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The counted-`Shared` census (C14, re-scoped as the native leak gate):
+/// `(minted, released)` so far. What is minted and never
+/// released at process end is a cell something still holds — a module-level
+/// binding (a leak by design, `reactive-pipeline.md` §2.4) or a cycle nothing
+/// broke.
+pub fn cell_census() -> (u64, u64) {
+    (
+        CELLS_MINTED.load(std::sync::atomic::Ordering::Relaxed),
+        CELLS_RELEASED.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 impl<T> Clone for Shared<T> {
@@ -418,7 +509,13 @@ impl<T> Clone for Shared<T> {
 impl<T> Shared<T> {
     pub fn new(value: T) -> Self {
         Shared {
-            inner: Rc::new(RefCell::new(value)),
+            inner: {
+                CELLS_MINTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Rc::new(Slot {
+                    value: RefCell::new(value),
+                    identity: std::cell::Cell::new(0),
+                })
+            },
         }
     }
 
@@ -431,11 +528,14 @@ impl<T> Shared<T> {
     where
         T: Clone,
     {
-        self.inner.borrow().clone()
+        match self.inner.value.try_borrow() {
+            Ok(value) => value.clone(),
+            Err(_) => panic_with(REENTRANT_READ),
+        }
     }
 
     pub fn set(&self, value: T) {
-        *self.inner.borrow_mut() = value;
+        *self.borrow_mut() = value;
     }
 
     /// `Shared::write()` USED AS A PLACE — `cell.write().push(x)`,
@@ -452,7 +552,10 @@ impl<T> Shared<T> {
     /// and rustc cannot see — panics at the read instead of reading through it.
     /// That is R3's ruled residue and the same stance [`Shared::get`] takes.
     pub fn borrow_mut(&self) -> std::cell::RefMut<'_, T> {
-        self.inner.borrow_mut()
+        match self.inner.value.try_borrow_mut() {
+            Ok(value) => value,
+            Err(_) => panic_with(REENTRANT_READ),
+        }
     }
 
     /// The count, for the measurement C14 S4 will want and for tests here.
@@ -462,11 +565,28 @@ impl<T> Shared<T> {
 
     /// This CELL's identity — the same number for every handle to one cell,
     /// different for every other cell, stable for a run (`shared.vl`'s
-    /// `identity`). The JS backend mints a counter per cell; here the cell's
-    /// own address IS its identity, and it is narrowed to the `i53` range the
-    /// language promises.
-    pub fn identity(&self) -> i64 {
-        (Rc::as_ptr(&self.inner) as usize as u64 & 0x1f_ffff_ffff_ffff) as i64
+    /// `identity(self): i32`).
+    ///
+    /// STAMPED on the first ask from a counter that starts at 1, as the JS
+    /// backend's `__shared_identity` stamps `cell.__id` — so a program that
+    /// asks in the same order gets the same numbers on both backends. It had
+    /// been the cell's address, narrowed to `i53` as an `i64`: rustc refused
+    /// every `fun .. : i32` that returned it (kolt's server reaches
+    /// `std::reactive::cell_identity` through its `[rpc]` methods, F40's exit),
+    /// and an address narrowed to the declared `i32` could collide between two
+    /// live cells, which a counter cannot.
+    pub fn identity(&self) -> i32 {
+        let stamped = self.inner.identity.get();
+        if stamped != 0 {
+            return stamped;
+        }
+        let minted = NEXT_IDENTITY.with(|next| {
+            let minted = next.get();
+            next.set(minted.wrapping_add(1));
+            minted
+        });
+        self.inner.identity.set(minted);
+        minted
     }
 
     /// The back-edge handle (`shared.vl`'s `downgrade`): it names the cell and
@@ -492,7 +612,7 @@ impl<T> PartialEq for Shared<T> {
 /// with node's spacing.
 impl<T: Js> Js for Shared<T> {
     fn js(&self) -> String {
-        format!("{{ v: {} }}", self.inner.borrow().js_nested())
+        format!("{{ v: {} }}", self.inner.value.borrow().js_nested())
     }
 }
 
@@ -504,7 +624,7 @@ impl<T: Js> Js for Shared<T> {
 /// says that is the shape landing ahead of the guarantee, and a program written
 /// against the `Option` keeps working either way.
 pub struct Weak<T> {
-    inner: rc::Weak<RefCell<T>>,
+    inner: rc::Weak<Slot<T>>,
 }
 
 impl<T> Clone for Weak<T> {
@@ -1549,7 +1669,7 @@ impl<T> Json for Set<T> {
 /// [`Js for Shared`]), so that is its JSON too.
 impl<T: Json> Json for Shared<T> {
     fn json(&self) -> String {
-        format!("{{\"v\":{}}}", self.inner.borrow().json())
+        format!("{{\"v\":{}}}", self.inner.value.borrow().json())
     }
 }
 
@@ -1842,6 +1962,22 @@ pub fn parse_f64(text: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+
+    /// F39: a read of a cell under a live `&mut` of it dies with the
+    /// runtime's sentence (and, through `panic_with`, a `String` payload
+    /// `guarded` can hand back), not with Rust's `BorrowError`.
+    #[test]
+    fn a_reentrant_read_of_a_cell_names_itself() {
+        let cell = Shared::new(vec![1]);
+        let alias = cell.clone();
+        let _write = cell.borrow_mut();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| alias.get()));
+        let payload = caught.expect_err("a reentrant read must not answer");
+        assert_eq!(
+            payload.downcast_ref::<String>().map(String::as_str),
+            Some(REENTRANT_READ)
+        );
+    }
     use super::*;
 
     #[test]

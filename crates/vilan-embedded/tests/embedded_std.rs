@@ -9,7 +9,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use vilan_embedded::{
-    CONTENT_HASH, FILES, RT_CONTENT_HASH, RT_FILES, RT_MANIFEST, materialize_into,
+    CONTENT_HASH, FILES, RT_CONTENT_HASH, RT_CRYPTO_MANIFEST, RT_FILES, RT_MANIFEST,
+    RT_SQLITE_MANIFEST, materialize_into,
 };
 
 mod scratch;
@@ -159,6 +160,63 @@ fn the_runtime_materializes_completely_and_idempotently() {
         "an existing cache entry must not be rewritten"
     );
 
+    let _ = fs::remove_dir_all(&cache_root);
+}
+
+/// F18 slice 2 and F40: the two OPTIONAL runtime crates ride the runtime's
+/// table and its cache — every source of each is embedded (a collector gap
+/// would materialize a crate that does not build), each materialized manifest
+/// KEEPS its crates.io dependency (the reason it is a crate apart) and drops
+/// the workspace-only lints, and both land BESIDE `vilan-rt` under the one
+/// hash, which is where the generated cargo manifest looks for them.
+#[test]
+fn the_optional_crates_embed_and_materialize_beside_the_runtime() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let keys: Vec<&str> = RT_FILES.iter().map(|(key, _)| *key).collect();
+    let optional = [
+        ("vilan-rt-sqlite", RT_SQLITE_MANIFEST, "rusqlite"),
+        ("vilan-rt-crypto", RT_CRYPTO_MANIFEST, "getrandom"),
+    ];
+    for (directory, manifest, dependency) in optional {
+        let mut on_disk = Vec::new();
+        walk_rust(&root.join(directory), Path::new(directory), &mut on_disk);
+        assert!(
+            on_disk.iter().any(|file| file.ends_with("src/lib.rs")),
+            "{directory} has a library root: {on_disk:?}"
+        );
+        for file in on_disk {
+            assert!(
+                keys.contains(&file.as_str()),
+                "{file} exists in the crate but is not embedded (collector gap)"
+            );
+        }
+        assert!(
+            manifest.contains(&format!("name = \"{directory}\"")),
+            "{manifest}"
+        );
+        assert!(manifest.contains(dependency), "{manifest}");
+        assert!(!manifest.contains("workspace = true"), "{manifest}");
+        assert!(manifest.contains("[workspace]"), "{manifest}");
+    }
+
+    let cache_root = scratch::root().join(format!(
+        "vilan-embedded-optional-test-{}-{RT_CONTENT_HASH}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&cache_root);
+    let runtime = vilan_embedded::materialize_rt_into(&cache_root).expect("materialize");
+    let beside = runtime.parent().expect("the runtime sits under its hash");
+    for (directory, manifest, _) in optional {
+        assert_eq!(
+            fs::read_to_string(beside.join(directory).join("Cargo.toml")).expect(directory),
+            manifest,
+            "{directory}'s manifest lands beside the runtime"
+        );
+        assert!(
+            beside.join(directory).join("src").join("lib.rs").is_file(),
+            "{directory}'s sources land beside the runtime"
+        );
+    }
     let _ = fs::remove_dir_all(&cache_root);
 }
 

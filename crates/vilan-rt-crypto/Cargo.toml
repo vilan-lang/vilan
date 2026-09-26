@@ -1,0 +1,34 @@
+# `std::crypto`'s OS randomness, SHA-384/512, HMAC and PBKDF2 on the native
+# backend (tracker F40, RULED (a) 2026-09-25).
+#
+# SEPARATE from `vilan-rt`, for the reason `vilan-rt-sqlite` is: `vilan-rt`
+# takes no crates.io dependencies and forbids `unsafe` (Order 37's R8), and OS
+# randomness cannot be had inside both rules. It is a SYSCALL — `getrandom(2)`
+# on Linux, `ProcessPrng`/`BCryptGenRandom` on Windows, `getentropy` on macOS —
+# reached only through FFI (`extern "C"` calls are `unsafe`) or through a crate
+# that wraps it; Rust's std exposes no stable safe random source, and reading
+# `/dev/urandom` through `std::fs` is unix-only. So the one dependency lives
+# here, and the cargo project `vilan build --backend rust` writes names this
+# crate ONLY when the program reaches `random_bytes`, `random_uuid`, SHA-384,
+# SHA-512, HMAC or PBKDF2. A program that does not pays nothing.
+#
+# `getrandom` 0.3 and nothing else: the digests and the key derivation are
+# hand-written (FIPS 180-4, RFC 2104, RFC 8018), as SHA-1 and SHA-256 are in
+# `vilan-rt` — see the crate root for why. This crate's own code stays
+# `forbid(unsafe_code)`; the one `unsafe` a native build now links is
+# getrandom's, at the syscall.
+[package]
+name = "vilan-rt-crypto"
+version = "0.40.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "The OS-randomness and key-derivation half of the runtime for programs the vilan compiler emits as Rust."
+publish = false
+
+[dependencies]
+vilan-rt = { path = "../vilan-rt" }
+getrandom = "0.3"
+
+# The workspace clippy exception list (root Cargo.toml, backlog N21).
+[lints]
+workspace = true

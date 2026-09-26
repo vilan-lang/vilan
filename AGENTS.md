@@ -7,7 +7,7 @@ conflict, `CLAUDE.md` wins.
 
 ## The lay of the land
 
-Rust workspace, nine crates, plus the language's own tree:
+Rust workspace, ten crates, plus the language's own tree:
 
 - `crates/vilan-core` — the whole compiler as a library. Pipeline order: `lexing.rs` /
   `token.rs` → `parsing.rs` (a handwritten recursive-descent frontend; replaced
@@ -61,9 +61,14 @@ Rust workspace, nine crates, plus the language's own tree:
   rendering, so a native binary prints byte-for-byte what the JS build prints. No
   dependencies beyond Rust's std, by rule.
 - `crates/vilan-rt-sqlite` — `std::db` for emitted Rust (F18 slice 2; Order 39's R1): the
-  one runtime surface that takes a crates.io dependency (`rusqlite`, `bundled`), kept OUT of
+  first runtime surface to take a crates.io dependency (`rusqlite`, `bundled`), kept OUT of
   `vilan-rt` so that rule holds; a generated cargo project names it only when the program
   reaches `std::db`.
+- `crates/vilan-rt-crypto` — OS randomness, SHA-384/512, HMAC and PBKDF2 for emitted Rust
+  (F40, RULED (a)): `getrandom` is the one dependency, because OS randomness is a syscall
+  `vilan-rt` could reach only through a crate or `unsafe`; the digests are hand-written, the
+  crate's own code is `forbid(unsafe_code)`, and a generated cargo project names it only
+  when the program reaches one of its bindings (optimized even in the dev profile).
 
 ## Definition of done (the gates)
 
