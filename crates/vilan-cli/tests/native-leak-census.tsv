@@ -1,0 +1,35 @@
+# Counted cells each program MINTED, and the ones still LIVE after its
+# thread (and every thread-local) is gone: a live cell is a cycle (C14's
+# native leak gate). Regenerate with
+# VILAN_REGENERATE_NATIVE_LEAK_CENSUS=1 cargo test -p vilan-cli --test native_differential
+bool	0	0
+recursion	0	0
+loops	0	0
+copy-elision	0	0
+field-assignment	0	0
+for-in	0	0
+list-splice	0	0
+display	0	0
+match-ergonomics	0	0
+borrows	0	0
+generic-inference	0	0
+default-generic-param	0	0
+default	0	0
+mut-parameters	0	0
+compound-index	1	0
+interpolated-multiline-string	0	0
+derive-json	0	0
+json-roundtrip	0	0
+remainder	0	0
+numeric-types	0	0
+option-view	0	0
+dyn-objects	10	0
+usize	0	0
+usize-literals	0	0
+bytes-aliasing	0	0
+delta-law	2842	14
+reactive-on-change	28	0
+reactive-flatten	25	0
+list-cell	2231	92
+reactive-selector	32	0
+native_probe_board	13	0

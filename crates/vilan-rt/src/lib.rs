@@ -301,7 +301,46 @@ pub fn panic_with(message: &str) -> ! {
 /// The hook is installed for the body's duration rather than for the process,
 /// because [`guarded`] installs its own around a `guarded` region and a
 /// process-wide hook here would fight it.
-pub fn main_guard(body: impl FnOnce()) {
+///
+/// **C14's native leak gate.** With `VILAN_NATIVE_LEAK_CENSUS` set, the body
+/// runs on a THREAD of its own and the census is taken after that thread has
+/// exited: by then `main`'s frame is gone, the event loop has drained, and
+/// every thread-local has been destroyed — the module-level bindings (each a
+/// `thread_local!` cell) and the executor's queues among them. So what is
+/// still live is exactly what nothing can ever release: a cycle of counted
+/// cells. The line goes to stderr, so the differential's stdout comparison
+/// never sees it; without the variable nothing here changes.
+pub fn main_guard(body: impl FnOnce() + Send + 'static) {
+    if std::env::var_os("VILAN_NATIVE_LEAK_CENSUS").is_some() {
+        // The main thread's own stack, not a spawned thread's 2 MiB default:
+        // the census must not turn a deep recursion the plain build runs into
+        // an overflow.
+        const CENSUS_STACK: usize = 64 << 20;
+        let failed = std::thread::Builder::new()
+            .stack_size(CENSUS_STACK)
+            .spawn(move || run_guarded_main(body))
+            .map(|thread| thread.join().unwrap_or(true))
+            .unwrap_or(true);
+        let (minted, released) = cell_census();
+        eprintln!(
+            "vilan-native: cells minted={minted} live={}",
+            minted - released
+        );
+        if failed {
+            std::process::exit(1);
+        }
+        return;
+    }
+    if run_guarded_main(body) {
+        // The hook has already said what happened. `exit` rather than a
+        // re-raise, because a re-raise is how 101 comes back.
+        std::process::exit(1);
+    }
+}
+
+/// [`main_guard`]'s body under node's failure shape; answers whether it
+/// failed.
+fn run_guarded_main(body: impl FnOnce()) -> bool {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(|info| {
         // A panic somebody is going to CATCH is not a failure yet: the
@@ -322,11 +361,7 @@ pub fn main_guard(body: impl FnOnce()) {
     }));
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
     std::panic::set_hook(previous);
-    if outcome.is_err() {
-        // The hook above has already said what happened. `exit` rather than a
-        // re-raise, because a re-raise is how 101 comes back.
-        std::process::exit(1);
-    }
+    outcome.is_err()
 }
 
 // How many CATCHING regions the current thread is inside (F25). A counter
@@ -435,6 +470,34 @@ thread_local! {
     static NEXT_IDENTITY: std::cell::Cell<i32> = const { std::cell::Cell::new(1) };
 }
 
+/// C14's native leak gate: how many cells the program has MINTED and how many
+/// it has RELEASED (the last strong handle dropped, so the slot and its value
+/// went with it). Process-wide rather than thread-local because the census is
+/// read AFTER the program's thread — and its thread-locals — are gone; two
+/// counters rather than one live count so a census can say how much a program
+/// allocated as well as what it kept.
+static CELLS_MINTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CELLS_RELEASED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A cell's storage going away is a RELEASE — counted for C14's leak gate.
+impl<T> Drop for Slot<T> {
+    fn drop(&mut self) {
+        CELLS_RELEASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The counted-`Shared` census (C14, re-scoped as the native leak gate):
+/// `(minted, released)` so far. What is minted and never
+/// released at process end is a cell something still holds — a module-level
+/// binding (a leak by design, `reactive-pipeline.md` §2.4) or a cycle nothing
+/// broke.
+pub fn cell_census() -> (u64, u64) {
+    (
+        CELLS_MINTED.load(std::sync::atomic::Ordering::Relaxed),
+        CELLS_RELEASED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 impl<T> Clone for Shared<T> {
     fn clone(&self) -> Self {
         Shared {
@@ -446,10 +509,13 @@ impl<T> Clone for Shared<T> {
 impl<T> Shared<T> {
     pub fn new(value: T) -> Self {
         Shared {
-            inner: Rc::new(Slot {
-                value: RefCell::new(value),
-                identity: std::cell::Cell::new(0),
-            }),
+            inner: {
+                CELLS_MINTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Rc::new(Slot {
+                    value: RefCell::new(value),
+                    identity: std::cell::Cell::new(0),
+                })
+            },
         }
     }
 

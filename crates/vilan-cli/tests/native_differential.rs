@@ -3441,6 +3441,145 @@ fn a_reentrant_read_the_compiler_cannot_see_stops_with_the_runtimes_sentence() {
     );
 }
 
+/// **C14, re-scoped: the NATIVE LEAK GATE** — the counted-`Shared` census S4's
+/// exit test became once F1 S1a made `Shared`/`Weak` a real `Rc`/`Weak`
+/// natively (retain on clone, release on drop, by construction).
+///
+/// `VILAN_NATIVE_LEAK_CENSUS=1` runs the program on a thread of its own and,
+/// after that thread has exited — `main`'s frame gone, the event loop drained,
+/// every thread-local (the module-level bindings, the executor's queues)
+/// destroyed — prints how many cells it minted and how many are still live.
+/// What is live then is what NOTHING can release: a cycle of counted cells.
+///
+/// The table is [`DEFAULT_SUITE`] plus the board probe, as the copy census is.
+/// Its claim is `live = 0` wherever the program's cells form no cycle; a
+/// non-zero row is a leak, found, and named in the report that moved it —
+/// not a number to regenerate past. Regenerate with
+/// `VILAN_REGENERATE_NATIVE_LEAK_CENSUS=1` only after reading the difference.
+///
+/// The F18/F40 exit — kolt's server and its shape — is NOT a row: a server is
+/// stopped by a signal, and `vilan_rt::http` has no graceful stop to reach
+/// process end through (recorded in the lane's report).
+#[test]
+fn the_native_leak_census_matches_its_table() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_board.vl"), BOARD_PROBE)
+        .expect("write the board probe");
+    let mut rows = Vec::new();
+    for program in DEFAULT_SUITE
+        .iter()
+        .copied()
+        .chain(std::iter::once("native_probe_board.vl"))
+    {
+        let (minted, live) = leak_census_of(&staged, program);
+        rows.push(format!(
+            "{}\t{minted}\t{live}",
+            program.trim_end_matches(".vl")
+        ));
+    }
+    let measured = format!(
+        "{}{}\n",
+        concat!(
+            "# Counted cells each program MINTED, and the ones still LIVE after its\n",
+            "# thread (and every thread-local) is gone: a live cell is a cycle (C14's\n",
+            "# native leak gate). Regenerate with\n",
+            "# VILAN_REGENERATE_NATIVE_LEAK_CENSUS=1 cargo test -p vilan-cli \
+             --test native_differential\n",
+        ),
+        rows.join("\n")
+    );
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(NATIVE_LEAK_CENSUS);
+    if std::env::var_os("VILAN_REGENERATE_NATIVE_LEAK_CENSUS").is_some() {
+        std::fs::write(&path, &measured).expect("write the census");
+        return;
+    }
+    let committed = std::fs::read_to_string(&path).expect("read the committed census");
+    assert_eq!(
+        committed, measured,
+        "the native leak census moved; read the difference, then regenerate with \
+         VILAN_REGENERATE_NATIVE_LEAK_CENSUS=1"
+    );
+}
+
+const NATIVE_LEAK_CENSUS: &str = "crates/vilan-cli/tests/native-leak-census.tsv";
+
+/// Runs `program` natively under `VILAN_NATIVE_LEAK_CENSUS=1` and answers
+/// `(minted, live)` from the line the runtime prints on stderr.
+fn leak_census_of(staged: &Path, program: &str) -> (u64, u64) {
+    let output = vilan(staged)
+        .env("VILAN_NATIVE_LEAK_CENSUS", "1")
+        .args(["run", "--backend", "rust", program])
+        .output()
+        .expect("run the program natively");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = stderr
+        .lines()
+        .find(|line| line.starts_with("vilan-native: cells minted="))
+        .unwrap_or_else(|| panic!("{program} reported no leak census:\n{stderr}"));
+    let mut numbers = line
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|piece| !piece.is_empty())
+        .map(|piece| piece.parse::<u64>().expect("a count"));
+    let minted = numbers.next().expect("the minted count");
+    let live = numbers.next().expect("the live count");
+    (minted, live)
+}
+
+/// The leak gate's instrument, held both ways: a program whose cells form no
+/// cycle — module-level cells included, which are released with their
+/// thread-locals — ends with none live, and a program that closes ONE cycle (a
+/// `Link` whose `next` cell is written to hold the link itself) ends with
+/// exactly that cell live. A census that could not see a cycle would pass the first and
+/// fail the second.
+#[test]
+fn the_leak_census_sees_a_cycle_and_nothing_else() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_no_cycle.vl"),
+        concat!(
+            "import std::io::print;\n",
+            "import std::shared::Shared;\n",
+            "\n",
+            "let counter: Shared<i32> = Shared::new(0);\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet cell: Shared<List<|| i32>> = Shared::new([]);\n",
+            "\tlet other: Shared<i32> = Shared::new(3);\n",
+            "\tcell.write().push(|| other.read());\n",
+            "\tcounter.write() = counter.read() + 1;\n",
+            "\tprint(cell.read().len());\n",
+            "}\n",
+        ),
+    )
+    .expect("write the acyclic probe");
+    std::fs::write(
+        staged.join("native_probe_cycle.vl"),
+        concat!(
+            "import std::io::print;\n",
+            "import std::option::Option::{ self, None, Some };\n",
+            "import std::shared::Shared;\n",
+            "\n",
+            "struct Link {\n",
+            "\tname: str,\n",
+            "\tnext: Shared<Option<Link>>,\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet link = Link { name = \"loop\", next = Shared::new(None) };\n",
+            "\tlink.next.write() = Some(link);\n",
+            "\tprint(link.name);\n",
+            "}\n",
+        ),
+    )
+    .expect("write the cyclic probe");
+    let (minted, live) = leak_census_of(&staged, "native_probe_no_cycle.vl");
+    assert_eq!(live, 0, "no cycle, nothing live ({minted} minted)");
+    let (_, live) = leak_census_of(&staged, "native_probe_cycle.vl");
+    assert_eq!(live, 1, "the one cell the closure closes a cycle through");
+}
+
 /// **F18 slice 2**: a closure declared SYNCHRONOUS, answering nothing, whose
 /// body awaits.
 ///
