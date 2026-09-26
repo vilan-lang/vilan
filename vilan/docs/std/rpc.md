@@ -207,7 +207,7 @@ impl KeyedCell<type K: Hashable, type T: Keyed<K>> {
 	fun remove(self, key: K)                          // a key it does not hold is a no-op
 	fun update(self, key: K, mutate: sync |&mut T| void)   // in place, and the `Update` op it is
 	fun set(self, value: List<T>)                     // the wholesale write: one `Reset`
-	fun locate(self, key: K): Option<(i32, T)>        // the element and where it sits, by lookup
+	fun locate(self, key: K): Option<(usize, T)>      // the element and where it sits, by lookup
 }
 
 impl KeyedCell<type K: Hashable, type T: Keyed<K>> with Source<List<T>> {

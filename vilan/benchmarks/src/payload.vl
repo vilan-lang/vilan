@@ -38,7 +38,7 @@ fun sample_list(count: i32): List<BenchTodo> {
 	todos
 }
 
-fun frame_bytes(frame: Frame): i32 {
+fun frame_bytes(frame: Frame): usize {
 	match frame {
 		Frame::Text(let text) => encode_utf8(text).len(),
 		Frame::Binary(let bytes) => bytes.len(),

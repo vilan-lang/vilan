@@ -156,7 +156,13 @@ function $u(self) {
 	return self.length === 0;
 }
 function $v(self) {
-	return __list_get(self, self.length - 1);
+	let $x = null;
+	if ($u(self)) {
+		$x = [ 1 ];
+	} else {
+		$x = __list_get(self, self.length - 1);
+	}
+	return $x;
 }
 function $p(self, $q) {
 	const $r = $q;
@@ -165,20 +171,20 @@ function $p(self, $q) {
 		const turn = $r[1];
 		$s = enqueue(turn, self[1].v);
 	} else {
-		const $w = $v(draining_turns.v);
-		let $x = null;
-		if ($w[0] === 0) {
-			const draining = $w[1];
-			$x = enqueue(draining, self[1].v);
+		const $y = $v(draining_turns.v);
+		let $z = null;
+		if ($y[0] === 0) {
+			const draining = $y[1];
+			$z = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
 				if (subscriber[2].v) {
 					subscriber[1]();
 				}
 			}
-			$x = undefined;
+			$z = undefined;
 		}
-		$s = $x;
+		$s = $z;
 	}
 	return $s;
 }
@@ -186,26 +192,26 @@ function $n(self, value, $o) {
 	self[0].v = __clone(value);
 	$p(self, $o);
 }
-function $C(signal, subscriber) {
+function $E(signal, subscriber) {
 	signal[1].v.push(reissued(subscriber));
 	return [ signal[1], subscriber[0], subscriber[2], __shared_new([ 1 ]) ];
 }
-function $z(signal, observer) {
+function $B(signal, observer) {
 	const cell = signal[0];
-	return $C(signal, mint_subscriber(() => {
-		const $A = [ 0, cell ];
-		let $B = null;
-		if ($A[0] === 0) {
-			const live = $A[1];
-			$B = observer(live.v);
+	return $E(signal, mint_subscriber(() => {
+		const $C = [ 0, cell ];
+		let $D = null;
+		if ($C[0] === 0) {
+			const live = $C[1];
+			$D = observer(live.v);
 		} else {
-			$B = undefined;
+			$D = undefined;
 		}
-		return $B;
+		return $D;
 	}));
 }
-function $y(self, observer) {
-	const subscription = $z(self, observer);
+function $A(self, observer) {
+	const subscription = $B(self, observer);
 	observer($k(self));
 	return subscription;
 }
@@ -217,40 +223,40 @@ function $i(sources, $j) {
 	};
 	const derived = $g(snapshot());
 	sources.map((source) => {
-		return $y(source, (_) => {
+		return $A(source, (_) => {
 			$n(derived, snapshot(), $j);
 			return;
 		});
 	});
 	return derived;
 }
-function $F(self, $q) {
-	const $G = $q;
-	let $H = null;
-	if ($G[0] === 0) {
-		const turn = $G[1];
-		$H = enqueue(turn, self[1].v);
+function $H(self, $q) {
+	const $I = $q;
+	let $J = null;
+	if ($I[0] === 0) {
+		const turn = $I[1];
+		$J = enqueue(turn, self[1].v);
 	} else {
-		const $I = $v(draining_turns.v);
-		let $J = null;
-		if ($I[0] === 0) {
-			const draining = $I[1];
-			$J = enqueue(draining, self[1].v);
+		const $K = $v(draining_turns.v);
+		let $L = null;
+		if ($K[0] === 0) {
+			const draining = $K[1];
+			$L = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
 				if (subscriber[2].v) {
 					subscriber[1]();
 				}
 			}
-			$J = undefined;
+			$L = undefined;
 		}
-		$H = $J;
+		$J = $L;
 	}
-	return $H;
+	return $J;
 }
-function $E(self, value, $o) {
+function $G(self, value, $o) {
 	self[0].v = __clone(value);
-	$F(self, $o);
+	$H(self, $o);
 }
 const minting_derivation = __shared_new(false);
 const next_subscriber_id = __shared_new(0);
@@ -267,6 +273,6 @@ const count = $e(20);
 const name = $g("hi");
 const both = $i([ __clone(count), name ], [ 1 ]);
 console.log($k(both)[0]);
-$E(count, 21, [ 1 ]);
+$G(count, 21, [ 1 ]);
 console.log($k(both)[0]);
 console.log($k(both)[1]);

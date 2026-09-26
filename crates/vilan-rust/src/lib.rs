@@ -3486,14 +3486,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
     /// One statement, which is an expression plus a `;` for every form that
     /// needs one. `if`, `match` and the loops are statements in Rust already.
+    /// A STATEMENT is rendered with no expected type: its value is discarded,
+    /// so the expectation of the block around it (a function's return type,
+    /// an arm's) is not its to meet. Before this, a loop inside an `if` arm of
+    /// a function answering `i32` emitted its condition's literal at that
+    /// width — `while (index > (0i32))` over a `usize` counter, which rustc
+    /// refused — because the position's expectation outranks a literal's own
+    /// record in [`Self::number_literal`]. Each statement that has a position
+    /// of its own (a `let`'s annotation, an assignment's place, an argument)
+    /// sets that expectation itself.
     fn statement(&mut self, id: Id, depth: usize) -> Result<String, Error> {
-        match self.program.entity_map.get(&id) {
+        self.expecting_nothing(|emitter| match emitter.program.entity_map.get(&id) {
             Some(Expr::Void) | None => Ok(String::new()),
             Some(Expr::If(_)) | Some(Expr::For(_, _)) | Some(Expr::ForEach(_, _, _)) => {
-                self.expression(id, depth)
+                emitter.expression(id, depth)
             }
-            _ => Ok(format!("{};", self.expression(id, depth)?)),
-        }
+            _ => Ok(format!("{};", emitter.expression(id, depth)?)),
+        })
     }
 
     fn expression(&mut self, id: Id, depth: usize) -> Result<String, Error> {
@@ -9790,6 +9799,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let mut parts = arguments.into_iter();
         let mut next = || parts.next().unwrap_or_else(|| "()".to_string());
         let rendered = match intrinsic {
+            // I5 S3: a length or a position is a `usize`, which IS Rust's
+            // `usize` natively, so no length below is cast and no position is
+            // cast on its way into the runtime.
             Intrinsic::StrLen => format!("vilan_rt::str_len(&{})", next()),
             Intrinsic::StrTrim => format!("vilan_rt::str_trim(&{})", next()),
             Intrinsic::StrToLowercase => format!("vilan_rt::str_to_lowercase(&{})", next()),
@@ -9811,7 +9823,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     next()
                 )
             }
-            Intrinsic::StrRepeat => format!("vilan_rt::str_repeat(&{}, {})", next(), next()),
+            Intrinsic::StrRepeat => {
+                format!("vilan_rt::str_repeat(&{}, {})", next(), next())
+            }
             Intrinsic::StrSplit => format!("vilan_rt::str_split(&{}, &{})", next(), next()),
             Intrinsic::StrSubstring => {
                 format!(
@@ -9823,15 +9837,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             Intrinsic::ParseI32 => format!("vilan_rt::parse_i32(&{})", next()),
             Intrinsic::ParseF64 => format!("vilan_rt::parse_f64(&{})", next()),
-            Intrinsic::ListLen => format!("({}.len() as i32)", next()),
-            Intrinsic::ListGet => format!("vilan_rt::list_get(&{}, ({}) as i64)", next(), next()),
+            Intrinsic::ListLen => format!("{}.len()", next()),
+            Intrinsic::ListGet => format!("vilan_rt::list_get(&{}, {})", next(), next()),
             Intrinsic::ListPop => format!("vilan_rt::list_pop(&mut {})", next()),
             Intrinsic::ListRemove => {
-                format!(
-                    "vilan_rt::list_remove(&mut {}, ({}) as i64)",
-                    next(),
-                    next()
-                )
+                format!("vilan_rt::list_remove(&mut {}, {})", next(), next())
             }
             // `sort_by` answers a COPY (`own self`), and its comparator arrives
             // as an `Rc<dyn Fn>` — which implements no `Fn` trait itself, so it
@@ -9845,7 +9855,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 )
             }
             Intrinsic::ListInsert => format!(
-                "vilan_rt::list_insert(&mut {}, ({}) as i64, {})",
+                "vilan_rt::list_insert(&mut {}, {}, {})",
                 next(),
                 next(),
                 next()
@@ -9868,13 +9878,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Intrinsic::SetInsert => format!("{}.insert({})", next(), next()),
             Intrinsic::SetContains => format!("{}.contains(&{})", next(), next()),
             Intrinsic::SetRemove => format!("{}.remove(&{})", next(), next()),
-            Intrinsic::SetLen => format!("({}.len() as i32)", next()),
+            Intrinsic::SetLen => format!("{}.len()", next()),
             Intrinsic::MapNew => "vilan_rt::Map::new()".to_string(),
             Intrinsic::MapInsert => format!("{}.insert({}, {})", next(), next(), next()),
             Intrinsic::MapGet => format!("{}.get(&{}).cloned()", next(), next()),
             Intrinsic::MapContainsKey => format!("{}.contains_key(&{})", next(), next()),
             Intrinsic::MapRemove => format!("{}.remove(&{})", next(), next()),
-            Intrinsic::MapLen => format!("({}.len() as i32)", next()),
+            Intrinsic::MapLen => format!("{}.len()", next()),
             Intrinsic::MapKeys => format!("{}.keys()", next()),
             Intrinsic::MapValues => format!("{}.values()", next()),
             // F20: `canonical_hash(value)` — `__hash` on the JS side. The

@@ -54,7 +54,7 @@ impl Chat {
 		self.messages.update(|&mut store| {
 			store.insert(id, Message { id, channel, body });
 		});
-		self.messages.get().len()
+		self.messages.get().len().as_i32()
 	}
 
 	[rpc]
@@ -2282,7 +2282,7 @@ impl ListChat {
 		self.messages.update(|&mut list| {
 			list.push(Message { id, channel, body });
 		});
-		self.messages.get().len()
+		self.messages.get().len().as_i32()
 	}
 
 	[rpc]
@@ -3877,8 +3877,8 @@ impl Demand {
 	fun stats(self): List<i32> {
 		match session_of(self.connection) {
 			Option::Some(let session) => [
-				session.sources.read().len(),
-				session.live.read().len(),
+				session.sources.read().len().as_i32(),
+				session.live.read().len().as_i32(),
 				getter_calls.read(),
 			],
 			Option::None => [0 - 1, 0 - 1, 0 - 1],
@@ -4479,7 +4479,7 @@ impl Store {
 
 	[rpc]
 	fun count(self): i32 {
-		self.rows.get().len()
+		self.rows.get().len().as_i32()
 	}
 }
 
@@ -5020,7 +5020,7 @@ struct Vault {
 impl Vault {
 	[rpc]
 	fun store(self, keys: List<Password>): i32 {
-		keys.len()
+		keys.len().as_i32()
 	}
 
 	[rpc]
@@ -5364,8 +5364,8 @@ impl Board {
 	fun stats(self): List<i32> {
 		match session_of(self.connection) {
 			Option::Some(let session) => [
-				session.sources.read().len(),
-				session.live.read().len(),
+				session.sources.read().len().as_i32(),
+				session.live.read().len().as_i32(),
 				asks.read(),
 			],
 			Option::None => [0 - 1, 0 - 1, 0 - 1],

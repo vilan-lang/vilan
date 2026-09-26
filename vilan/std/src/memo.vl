@@ -87,7 +87,7 @@ impl Memo<type K: Hashable, type V> {
 	}
 
 	/// How many keys this memo holds.
-	fun len(self): i32 {
+	fun len(self): usize {
 		self.entries.read().len()
 	}
 }

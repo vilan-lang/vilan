@@ -34,7 +34,7 @@ impl Set<type T: Hashable> {
 		self.table.remove(value.hash());
 	}
 
-	fun len(self): i32 {
+	fun len(self): usize {
 		self.table.len()
 	}
 

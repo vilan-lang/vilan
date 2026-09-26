@@ -62,8 +62,8 @@ fn list_contains_and_index_of_compare_by_value() {
             let xs = [10, 20, 30, 20];
             print(xs.contains(20));                 // true
             print(xs.contains(25));                 // false
-            print(xs.index_of(20).unwrap_or(-1));   // 1 — the first
-            print(xs.index_of(30).unwrap_or(-1));   // 2
+            print(xs.index_of(20).unwrap_or(99));   // 1 — the first
+            print(xs.index_of(30).unwrap_or(99));   // 2
             print(xs.index_of(99).is_none());       // true
             let words = ["a", "b"];
             print(words.contains("b"));             // true
@@ -240,8 +240,10 @@ fn list_remove_out_of_bounds_panics_like_the_subscript() {
 }
 
 #[test]
-fn list_remove_at_a_negative_index_panics() {
-    assert_run_panics(
+fn list_remove_at_a_negative_index_is_refused() {
+    // An index is a `usize` since I5 S2: the negative `remove` that used to
+    // reach the runtime bounds check is refused where it is written (B407).
+    assert_fails_with(
         r#"
         fun main() {
             mut xs = [1, 2, 3];
@@ -249,7 +251,7 @@ fn list_remove_at_a_negative_index_panics() {
         }
         main();
         "#,
-        "index out of bounds: the length is 3 but the index is -1",
+        "`usize` is unsigned (0 ..= 2^53 on the JS backend), so the negative literal `-1` is out of range",
     );
 }
 
@@ -344,7 +346,7 @@ fn the_std_surface_batch_needs_no_import() {
             print(xs.sort()[0]);
             print(xs.sort_by(|a, b| a.compare(b))[2]);
             print(xs.contains(2));
-            print(xs.index_of(2).unwrap_or(-1));
+            print(xs.index_of(2).unwrap_or(99));
             print(xs.find(|n| n > 2).unwrap_or(0));
             xs.insert(0, 9);
             print(xs.remove(0));
@@ -5832,9 +5834,9 @@ fn a_memo_makes_a_value_once_per_key_and_forgets_one_on_request() {
         import std::shared::Shared;
 
         let makes: Shared<i32> = Shared::new(0);
-        let widths: Memo<str, i32> = Memo::new();
+        let widths: Memo<str, usize> = Memo::new();
 
-        fun width_of(word: str): i32 {
+        fun width_of(word: str): usize {
             makes.write() = makes.read() + 1;
             word.len()
         }
@@ -6600,7 +6602,7 @@ fn binary_reader_program(mutation: &str) -> String {
                 Err(let reason) => i"refused:{{reason}}",
             }}
         }}
-        fun with_byte(bytes: Bytes, at: i32, value: i32): Bytes {{
+        fun with_byte(bytes: Bytes, at: usize, value: i32): Bytes {{
             let copy = Bytes::alloc(bytes.len());
             copy.copy_into(bytes, 0);
             copy.set(at, value);
@@ -6706,7 +6708,7 @@ fn a_fractional_list_index_is_refused_at_the_subscript() {
             print(i"{found.len()}");
         }
         "#,
-        "an index must be an `i32`, and this one is `f64`",
+        "an index must be a `usize`, and this one is `f64`",
     );
 }
 
@@ -6721,7 +6723,7 @@ fn a_str_list_index_is_refused_at_the_subscript() {
             print(xs["a"]);
         }
         "#,
-        "an index must be an `i32`, and this one is `str`",
+        "an index must be a `usize`, and this one is `str`",
     );
 }
 
@@ -6736,7 +6738,7 @@ fn a_bool_list_index_is_refused_at_the_subscript() {
             print(xs[true]);
         }
         "#,
-        "an index must be an `i32`, and this one is `bool`",
+        "an index must be a `usize`, and this one is `bool`",
     );
 }
 
@@ -6750,7 +6752,7 @@ fn the_subscript_write_form_checks_its_index_too() {
             xs["k"] = "v";
         }
         "#,
-        "an index must be an `i32`, and this one is `str`",
+        "an index must be a `usize`, and this one is `str`",
     );
 }
 
@@ -6766,14 +6768,14 @@ fn a_fixed_array_index_is_checked_at_the_same_position() {
             print(xs[at]);
         }
         "#,
-        "an index must be an `i32`, and this one is `f64`",
+        "an index must be a `usize`, and this one is `f64`",
     );
 }
 
 #[test]
 fn an_i32_index_still_reads_a_list_an_array_and_a_write() {
-    // The control, and the reason the check is exactly `i32`: every spelling
-    // that worked goes on working — a literal, an `i32` binding, a loop
+    // The control, and the reason the check is exactly `usize`: every spelling
+    // that worked goes on working — a literal, a `usize` binding, a loop
     // counter, a fixed array, and the write form.
     assert_compiles_and_runs(
         r#"
@@ -6781,7 +6783,7 @@ fn an_i32_index_still_reads_a_list_an_array_and_a_write() {
 
         fun main() {
             mut xs: List<str> = ["a", "b", "c"];
-            let at: i32 = 1;
+            let at: usize = 1;
             print(xs[0]);
             print(xs[at]);
             xs[2] = "z";

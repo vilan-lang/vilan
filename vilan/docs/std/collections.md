@@ -13,12 +13,12 @@ impl List<type T> {
 	fun new(): List<T>
 	fun push(&mut self, own item: T)
 	fun pop(&mut self): Option<T>
-	fun insert(&mut self, index: i32, value: T)   // panics out of bounds
-	fun remove(&mut self, index: i32): T          // panics out of bounds
-	fun len(self): i32
+	fun insert(&mut self, index: usize, value: T) // panics out of bounds
+	fun remove(&mut self, index: usize): T        // panics out of bounds
+	fun len(self): usize
 	fun is_empty(self): bool
 	fun iter(self): ListIterator<T>              // the lazy cursor; see Iterator
-	fun get(self, index: i32): Option<T>
+	fun get(self, index: usize): Option<T>
 	fun first(self): Option<T>
 	fun last(self): Option<T>
 	fun map<U>(self, fn: |T| U): List<U>
@@ -35,7 +35,7 @@ impl List<type T: Mul + Default> { fun product(self): T }
 impl List<type T: Ord> { fun sort(self): List<T> }        // stable
 impl List<type T: PartialEq> {
 	fun contains(self, value: T): bool
-	fun index_of(self, value: T): Option<i32>
+	fun index_of(self, value: T): Option<usize>
 }
 impl List<type T: PartialEq> with PartialEq {
 	fun eq(self, b: List<T>): bool           // element-wise, length first
@@ -80,8 +80,8 @@ a *place*, and a value with no other owner moves in.
 fun main() {
 	let words = ["alpha", "beta", "gamma"];
 	let lengths = words.map(|word| word.len());
-	print(lengths.fold(0, |total, n| total + n));
 	print(lengths.sum());
+	print(words.fold("", |joined, word| joined + word));
 }
 ```
 
@@ -100,7 +100,7 @@ fun main() {
 	let scores = [40, 91, 65];
 	print(scores.find(|n| n > 50).unwrap_or(0));  // 91
 	print(scores.contains(65));                   // true
-	print(scores.index_of(65).unwrap_or(-1));     // 2
+	print(scores.index_of(65).unwrap_or(0));      // 2
 	print(scores.index_of(7).is_none());          // true
 	print(scores == [40, 91, 65]);                // true
 	print(scores == [40, 91]);                    // false — length first
@@ -166,7 +166,7 @@ impl Map<type K: Hashable, type V> {
 	fun get(self, key: K): Option<V>
 	fun contains_key(self, key: K): bool
 	fun remove(&mut self, key: K)
-	fun len(self): i32
+	fun len(self): usize
 	fun is_empty(self): bool
 	fun keys(self): List<K>
 	fun values(self): List<V>
@@ -257,7 +257,7 @@ impl Set<type T: Hashable> {
 	fun insert(&mut self, value: T)
 	fun contains(self, value: T): bool
 	fun remove(&mut self, value: T)
-	fun len(self): i32
+	fun len(self): usize
 	fun is_empty(self): bool
 	fun values(self): List<T>
 	fun union(self, other: Set<T>): Set<T>
@@ -301,7 +301,7 @@ impl Memo<type K: Hashable, type V> {
 	fun get(self, key: K): Option<V>
 	fun forget(self, key: K)
 	fun clear(self)
-	fun len(self): i32
+	fun len(self): usize
 }
 ```
 
@@ -518,7 +518,7 @@ Anything else is a compile error. A struct or enum of your own that provides no
 its fields and an enum is its variant tag at runtime:
 
 ```vilan,fragment
-struct Cursor { items: List<i32>, index: i32 }
+struct Cursor { items: List<i32>, index: usize }
 
 fun main() {
 	mut walked = Cursor { items = [1, 2], index = 0 };
@@ -540,8 +540,8 @@ all of them:
 fun map<U>(self, fn: |T| U): Mapped<Self, T, U>
 fun filter(self, predicate: |T| bool): Filtered<Self, T>
 fun filter_map<U>(self, fn: |T| Option<U>): FilterMapped<Self, T, U>   // both, one pass
-fun take(self, count: i32): Taken<Self, T>
-fun skip(self, count: i32): Skipped<Self, T>
+fun take(self, count: usize): Taken<Self, T>
+fun skip(self, count: usize): Skipped<Self, T>
 fun enumerate(self): Enumerated<Self, T>                       // (0, a), (1, b), …
 fun zip<U, J: Iterator<U>>(self, other: J): Zipped<Self, J, T, U>
 fun chain<J: Iterator<T>>(self, other: J): Chained<Self, J, T>
@@ -685,7 +685,7 @@ fun main() {
 	print(unique.len());   // 2
 
 	let lengths = ["alpha", "hi"].iter().map(|word| (word, word.len())).to_list().to_map();
-	print(lengths.get("hi").unwrap_or(-1));   // 2
+	print(lengths.get("hi").unwrap_or(0));    // 2
 }
 ```
 

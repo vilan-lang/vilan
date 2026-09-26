@@ -323,7 +323,7 @@ trait Keyed<K> {
 
 enum Delta<K, T> {
 	Reset(List<T>),      // the collection BECOMES this
-	Insert(K, T, i32),   // a new element at an index; a key already held is replaced
+	Insert(K, T, usize), // a new element at an index (on the wire at i32's width); a key already held is replaced
 	Update(K, T),        // the element under this key takes a new value
 	Remove(K),           // the element under this key is gone
 }
@@ -359,11 +359,11 @@ the binary codec, crypto, and websockets:
 ```vilan,fragment
 impl Bytes {
 	fun alloc(size: i32): Bytes
-	fun len(self): i32
-	fun get(self, index: i32): i32
-	fun set(self, index: i32, value: i32)
-	fun slice(self, from: i32, to: i32): Bytes
-	fun fill(self, value: i32, from: i32, to: i32): Bytes
+	fun len(self): usize
+	fun get(self, index: usize): i32
+	fun set(self, index: usize, value: i32)
+	fun slice(self, from: usize, to: usize): Bytes
+	fun fill(self, value: i32, from: usize, to: usize): Bytes
 	fun copy_into(self, source: Bytes, offset: i32)
 	fun concat(a: Bytes, b: Bytes): Bytes     // static
 	fun to_hex(self): str

@@ -21,20 +21,20 @@ fun encode_frame(opcode: i32, payload: Bytes): Bytes {
 	let length = payload.len();
 	mut header = Bytes::alloc(2);
 	if length < 126 {
-		header.set(1, length);
+		header.set(1, length.as_i32());
 	} else if length < 65536 {
 		header = Bytes::alloc(4);
 		header.set(1, 126);
-		header.set(2, length >> 8);
-		header.set(3, length);
+		header.set(2, (length >> 8).as_i32());
+		header.set(3, length.as_i32());
 	} else {
 		header = Bytes::alloc(10);
 		header.set(1, 127);
 		// Bytes 2–5 stay zero (payloads are capped well under 2^32).
-		header.set(6, length >> 24);
-		header.set(7, length >> 16);
-		header.set(8, length >> 8);
-		header.set(9, length);
+		header.set(6, (length >> 24).as_i32());
+		header.set(7, (length >> 16).as_i32());
+		header.set(8, (length >> 8).as_i32());
+		header.set(9, length.as_i32());
 	}
 	header.set(0, 0x80 | opcode);
 	Bytes::concat(header, payload)
@@ -144,15 +144,19 @@ impl WsParser {
 				}
 				if valid {
 					let mask_at = header;
-					let total = if masked { header + 4 + length } else { header + length };
+					let total = if masked {
+						header + 4 + length.as_usize()
+					} else {
+						header + length.as_usize()
+					};
 					if available < total {
 						scanning = false;
 					} else {
 						let payload_at = if masked { mask_at + 4 } else { mask_at };
-						let payload = buffer.slice(payload_at, payload_at + length);
+						let payload = buffer.slice(payload_at, payload_at + length.as_usize());
 						if masked {
 							mut index = 0;
-							for index < length {
+							for index < length.as_usize() {
 								payload.set(index, payload.get(index) ^ buffer.get(mask_at + (index & 3)));
 								index += 1;
 							}

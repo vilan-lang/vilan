@@ -2395,8 +2395,8 @@ export impl type S: Source<type T> {
 
 /// One new-position row's fate. `Keep`/`Refresh` carry the OLD row's index.
 export enum RowStep {
-	Keep(i32),
-	Refresh(i32),
+	Keep(usize),
+	Refresh(usize),
 	Fresh,
 }
 
@@ -2404,7 +2404,7 @@ export enum RowStep {
 /// then the old indices whose rows are gone entirely.
 export struct ReconcilePlan {
 	steps: List<RowStep>,
-	removed: List<i32>,
+	removed: List<usize>,
 }
 
 export fun reconcile<T, K: PartialEq + Hashable>(
@@ -2453,20 +2453,21 @@ export fun reconcile<T, K: PartialEq + Hashable>(
 	// steps past them along the chain. What the bound forbids is the opposite,
 	// a `==` coarser than the hash, and that is the case the bound refuses to
 	// compile rather than mis-plan.
-	mut first: NativeMap<i32> = NativeMap::new();
-	mut next_same: List<i32> = [];
+	// I5 S2: the chain is `Option<usize>` — a position, or the end of the chain —
+	// where it was an `i32` terminated by `-1`. The walks below are the same
+	// walks; the sentinel became `None` and the build loop counts down to zero
+	// without ever reaching below it.
+	mut first: NativeMap<usize> = NativeMap::new();
+	mut next_same: List<Option<usize>> = [];
 	for _ in old_keys {
-		next_same.push(-1);
+		next_same.push(None);
 	}
-	mut build = held - 1;
-	for build >= 0 {
-		let canonical = old_keys[build].hash();
-		match first.get(canonical) {
-			Some(let after) => next_same[build] = after,
-			None => {},
-		}
-		first.insert(canonical, build);
+	mut build = held;
+	for build > 0 {
 		build -= 1;
+		let canonical = old_keys[build].hash();
+		next_same[build] = first.get(canonical);
+		first.insert(canonical, build);
 	}
 	mut steps: List<RowStep> = [];
 	for item in items {
@@ -2476,41 +2477,51 @@ export fun reconcile<T, K: PartialEq + Hashable>(
 		// claimed are dropped from the chain for good (`first` is advanced past
 		// them), so the total cost of skipping claimed entries across a whole pass
 		// is bounded by the number of claims.
-		mut head = match first.get(canonical) {
-			Some(let at) => at,
-			None => -1,
-		};
-		for head >= 0 {
-			if !claimed[head] {
-				jump break;
+		mut head: Option<usize> = first.get(canonical);
+		mut advancing = true;
+		for advancing {
+			match head {
+				Some(let at) => {
+					if claimed[at] {
+						head = next_same[at];
+					} else {
+						advancing = false;
+					}
+				},
+				None => advancing = false,
 			}
-			head = next_same[head];
 		}
-		first.insert(canonical, head);
-		mut found = -1;
+		match head {
+			Some(let at) => first.insert(canonical, at),
+			None => first.remove(canonical),
+		}
+		mut found: Option<usize> = None;
 		mut walk = head;
-		for walk >= 0 {
-			if !claimed[walk] && old_keys[walk] == item_key {
-				found = walk;
-				jump break;
+		mut walking = true;
+		for walking {
+			match walk {
+				Some(let at) => {
+					if !claimed[at] && old_keys[at] == item_key {
+						found = Some(at);
+						walking = false;
+					} else {
+						// Unclaimed, the same hash, and yet not `==`: a COLLISION.
+						// Walk on rather than advance the head, because a later
+						// item may still match here.
+						walk = next_same[at];
+					}
+				},
+				None => walking = false,
 			}
-			// Unclaimed, the same hash, and yet not `==`: a COLLISION. Walk on
-			// rather than advance the head, because a later item may still match
-			// here.
-			walk = next_same[walk];
 		}
 		mut step = RowStep::Fresh;
-		if found >= 0 {
-			claimed[found] = true;
-			step = if same(old_items[found], item) {
-				RowStep::Keep(found)
-			} else {
-				RowStep::Refresh(found)
-			};
+		if found is Some(let at) {
+			claimed[at] = true;
+			step = if same(old_items[at], item) { RowStep::Keep(at) } else { RowStep::Refresh(at) };
 		}
 		steps.push(step);
 	}
-	mut removed: List<i32> = [];
+	mut removed: List<usize> = [];
 	mut index = 0;
 	for index < held {
 		if !claimed[index] {

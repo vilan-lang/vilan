@@ -82,7 +82,7 @@ export impl Window {
 export impl Storage {
 	/// How many keys the store holds (`storage.length`).
 	[extern(get, "length")]
-	external fun len(self): i32;
+	external fun len(self): usize;
 
 	/// The name of the key at `index` (`storage.key(index)`), or `None` when
 	/// `index` is out of range.
@@ -94,7 +94,7 @@ export impl Storage {
 	/// The host's key ORDER is unspecified and may change between visits, so a pass
 	/// that both reads and removes must not assume it is stable — walk downward and
 	/// decide per key, or collect the names first.
-	fun key_at(self, index: i32): Option<str> {
+	fun key_at(self, index: usize): Option<str> {
 		let key = self.raw_key_at(index);
 		if is_null(key) {
 			None
@@ -175,7 +175,7 @@ export impl Storage {
 	// has no `Option` return, and turning that null into an `Option` is the whole
 	// job of the wrappers. Call the wrappers.
 	[extern(method, "key")]
-	external fun raw_key_at(self, index: i32): str;
+	external fun raw_key_at(self, index: usize): str;
 
 	[extern(method, "getItem")]
 	external fun raw_get(self, key: str): str;

@@ -15429,7 +15429,7 @@ pub(crate) mod tests {
             hover_at_cursor("fun main() {\n\tlet name = \"vilan\";\n\tlet n = name.l|en();\n}\n")
                 .expect("hovering the method should produce a label");
         assert!(hover.starts_with("```vilan\n"), "{hover}");
-        assert!(hover.contains("fun len(self): i32"), "{hover}");
+        assert!(hover.contains("fun len(self): usize"), "{hover}");
     }
 
     // The E73 crash shape, now answering: the context pass lowers the

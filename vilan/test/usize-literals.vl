@@ -76,7 +76,7 @@ fun main() {
 	print(letters[0]);
 	print(letters[at]);
 	// 18. `get` with a `usize` — the boundary: one conversion until S2
-	print(letters.get(at.as_i32()).unwrap_or("none"));
+	print(letters.get(at.as_i32().as_usize()).unwrap_or("none"));
 	// 19. `len()` into a `usize` — the boundary: one conversion until S2
 	let length: usize = letters.len().as_usize();
 	print(i"{length}");

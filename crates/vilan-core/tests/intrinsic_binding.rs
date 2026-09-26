@@ -50,7 +50,7 @@ fn scratch_toolchain(tag: &str, replacement: &str) -> (PackageSpec, PathBuf) {
     copy_tree(&toolchain().join("macro_std"), &root.join("macro_std"));
     let list = root.join("std/src/list.vl");
     let text = std::fs::read_to_string(&list).expect("the scratch std's list.vl");
-    let declaration = "external fun remove(&mut self, index: i32): T;";
+    let declaration = "external fun remove(&mut self, index: usize): T;";
     assert!(
         text.contains(declaration),
         "std's `List::remove` is no longer the declaration these pins rewrite"
@@ -122,7 +122,7 @@ fn b265_a_bodied_list_remove_in_a_scratch_std_keeps_its_body() {
     // emitted and the body never ran.
     let (spec, root) = scratch_toolchain(
         "bodied",
-        "fun remove(&mut self, index: i32): T {\n\t\tself.get(index).unwrap()\n\t}",
+        "fun remove(&mut self, index: usize): T {\n\t\tself.get(index).unwrap()\n\t}",
     );
     let js = compile_against(&spec).expect("the scratch std compiles");
     assert!(
@@ -139,8 +139,10 @@ fn b265_an_external_list_remove_is_still_the_intrinsic() {
     // std's own declaration is an `external fun`, so the lowering is exactly where
     // M47 left it. Rewritten to itself, so the scratch tree is the only difference
     // between this pin and the one above.
-    let (spec, root) =
-        scratch_toolchain("external", "external fun remove(&mut self, index: i32): T;");
+    let (spec, root) = scratch_toolchain(
+        "external",
+        "external fun remove(&mut self, index: usize): T;",
+    );
     let js = compile_against(&spec).expect("the scratch std compiles");
     assert!(
         js.contains("splice"),
@@ -166,7 +168,7 @@ fn b265_a_bodied_remove_on_another_type_is_untouched() {
         import std::io::print;
         struct Bag { items: List<i32> }
         impl Bag {
-            fun remove(&mut self, index: i32): i32 {
+            fun remove(&mut self, index: usize): i32 {
                 let taken = self.items.get(index).unwrap();
                 print("bag");
                 taken

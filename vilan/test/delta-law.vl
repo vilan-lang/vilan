@@ -60,7 +60,7 @@ impl ListCell<type T> {
 		ListCell { elements = Signal::new(initial), log = DeltaLog<SeqOp<T>>::new() }
 	}
 
-	fun bounded(initial: List<T>, limit: i32): ListCell<T> {
+	fun bounded(initial: List<T>, limit: usize): ListCell<T> {
 		ListCell { elements = Signal::new(initial), log = DeltaLog<SeqOp<T>>::with_limit(limit) }
 	}
 
@@ -74,7 +74,7 @@ impl ListCell<type T> {
 		});
 	}
 
-	fun set_at(self, at: i32, value: T) {
+	fun set_at(self, at: usize, value: T) {
 		self.elements.update(|&mut list| {
 			// Bound before the store: `SetAt` carries BOTH values.
 			let previous = list[at];
@@ -122,19 +122,19 @@ impl ListCell<type T> with DeltaSource<List<T>, SeqOp<T>> {
 /// `splice(0, len, [])`. `ListCell` writes exactly `size` and `splice` and
 /// inherits the rest.
 trait SequenceCell<T> {
-	fun size(self): i32;
+	fun size(self): usize;
 
-	fun splice(self, at: i32, removed: i32, inserted: List<T>);
+	fun splice(self, at: usize, removed: usize, inserted: List<T>);
 
 	fun push(self, value: T) {
 		self.splice(self.size(), 0, [value])
 	}
 
-	fun insert_at(self, at: i32, value: T) {
+	fun insert_at(self, at: usize, value: T) {
 		self.splice(at, 0, [value])
 	}
 
-	fun remove_at(self, at: i32) {
+	fun remove_at(self, at: usize) {
 		self.splice(at, 1, [])
 	}
 
@@ -144,11 +144,11 @@ trait SequenceCell<T> {
 }
 
 impl ListCell<type T> with SequenceCell<T> {
-	fun size(self): i32 {
+	fun size(self): usize {
 		self.elements.get().len()
 	}
 
-	fun splice(self, at: i32, removed: i32, inserted: List<T>) {
+	fun splice(self, at: usize, removed: usize, inserted: List<T>) {
 		self.elements.update(|&mut list| {
 			// The removed VALUES are the op's payload, so a fold's derivative
 			// can subtract what left without reading the collection.
@@ -180,6 +180,12 @@ fun next_random(bound: i32): i32 {
 	let state = (seed.read() * 16807i53) % 2147483647i53;
 	seed.write() = state;
 	(state % bound.as_i53()).as_i32()
+}
+
+/// A random POSITION below `bound` — the same draw as `next_random`, at the
+/// index type the sequence surface takes.
+fun pick(bound: usize): usize {
+	next_random(bound.as_i32()).as_usize()
 }
 
 // === The derivation under test ===============================================
@@ -341,11 +347,11 @@ fun main() {
 				if choice < 9 || size == 0 {
 					source.push(next_random(100));
 				} else if choice < 13 {
-					source.insert_at(next_random(size), next_random(100));
+					source.insert_at(pick(size), next_random(100));
 				} else if choice < 16 {
-					source.remove_at(next_random(size));
+					source.remove_at(pick(size));
 				} else if choice < 18 {
-					source.set_at(next_random(size), next_random(100));
+					source.set_at(pick(size), next_random(100));
 				} else if choice < 19 && size > 15 {
 					// The wholesale write — a `Reset`, N derivations.
 					mut fresh: List<i32> = [];

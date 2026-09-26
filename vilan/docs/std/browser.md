@@ -587,8 +587,8 @@ impl Window {
 }
 external struct Storage;
 impl Storage {
-	fun len(self): i32
-	fun key_at(self, index: i32): Option<str>   // None past the end
+	fun len(self): usize
+	fun key_at(self, index: usize): Option<str> // None past the end
 	fun keys(self): List<str>                   // every name, collected
 	fun get(self, key: str): Option<str>        // None when ABSENT
 	fun has(self, key: str): bool

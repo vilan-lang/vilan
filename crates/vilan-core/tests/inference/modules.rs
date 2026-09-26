@@ -241,7 +241,7 @@ fn a_bumping_call_under_a_live_borrows_call_view_is_rejected() {
     // later push fires E2 exactly as a direct `&mut xs[0]` view always did.
     assert_fails_with(
         r#"
-        fun at(xs: &mut List<i32>, index: i32): &mut i32 {
+        fun at(xs: &mut List<i32>, index: usize): &mut i32 {
             &mut xs[index]
         }
         fun main() {
@@ -261,7 +261,7 @@ fn reassigning_the_root_under_a_live_borrows_call_view_is_rejected() {
     // E1 through the anchored view: whole-root reassignment, not a call.
     assert_fails_with(
         r#"
-        fun at(xs: &mut List<i32>, index: i32): &mut i32 {
+        fun at(xs: &mut List<i32>, index: usize): &mut i32 {
             &mut xs[index]
         }
         fun main() {
@@ -282,7 +282,7 @@ fn holding_a_borrows_call_view_across_await_is_rejected() {
     assert_fails_with(
         r#"
         import std::time::sleep;
-        fun at(xs: &mut List<i32>, index: i32): &mut i32 {
+        fun at(xs: &mut List<i32>, index: usize): &mut i32 {
             &mut xs[index]
         }
         async fun work() {
@@ -303,7 +303,7 @@ fn a_mutation_of_a_sibling_root_under_a_borrows_call_view_is_accepted() {
     // The anchor is precise: pushing a DIFFERENT list never touches v's root.
     assert_compiles(
         r#"
-        fun at(xs: &mut List<i32>, index: i32): &mut i32 {
+        fun at(xs: &mut List<i32>, index: usize): &mut i32 {
             &mut xs[index]
         }
         fun main() {
@@ -396,7 +396,7 @@ fn a_bumping_call_on_a_user_container_inside_for_mut_is_rejected() {
     assert_fails_with(
         r#"
         import std::option::Option::{ self, Some, None };
-        struct Bag { items: List<i32>, cursor: i32 }
+        struct Bag { items: List<i32>, cursor: usize }
         impl Bag {
             fun next_mut(&mut self): Option<&mut i32> {
                 if self.cursor < self.items.len() {
@@ -431,7 +431,7 @@ fn a_content_stable_call_on_a_user_container_inside_for_mut_is_accepted() {
     assert_compiles(
         r#"
         import std::option::Option::{ self, Some, None };
-        struct Bag { items: List<i32>, cursor: i32 }
+        struct Bag { items: List<i32>, cursor: usize }
         impl Bag {
             fun next_mut(&mut self): Option<&mut i32> {
                 if self.cursor < self.items.len() {
@@ -5221,14 +5221,14 @@ fn a_const_site_reads_its_module_bindings_afresh_and_never_another_sites() {
 
         let TABLE: List<i32> = const seed();
 
-        fun grown(): i32 {
+        fun grown(): usize {
             mut local = TABLE;
             local.push(9);
             local.len()
         }
 
-        let FIRST: i32 = const grown();
-        let SECOND: i32 = const grown();
+        let FIRST: usize = const grown();
+        let SECOND: usize = const grown();
 
         fun main() {
             print(FIRST);

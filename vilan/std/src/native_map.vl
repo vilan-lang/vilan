@@ -30,7 +30,7 @@ impl NativeMap<type V> {
 
 	external fun remove(&mut self, key: Hash): void;
 
-	external fun len(self): i32;
+	external fun len(self): usize;
 
 	external fun keys(self): List<Hash>;
 

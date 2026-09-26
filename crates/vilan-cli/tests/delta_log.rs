@@ -304,8 +304,10 @@ fun reversal(rows: i32): i32 {
 	comparisons.write() = 0;
 	let plan = reconcile(old, old, fresh, |item| item, |_before, _after| true);
 	// A reversal keeps every row and removes none — new position `i` is old
-	// position `rows - 1 - i`. A cheaper wrong answer is still wrong.
-	if plan.steps.len() != rows {
+	// position `rows - 1 - i`. A cheaper wrong answer is still wrong. (The
+	// rows' ids are `i32`; the plan's positions are `usize`, converted once.)
+	let count = rows.as_usize();
+	if plan.steps.len() != count {
 		panic(i"{rows}: the plan has {plan.steps.len()} steps");
 	}
 	if plan.removed.len() != 0 {
@@ -315,7 +317,7 @@ fun reversal(rows: i32): i32 {
 	for step in plan.steps {
 		match step {
 			RowStep::Keep(let held) => {
-				if held != rows - 1 - index {
+				if held != count - 1 - index {
 					panic(i"{rows}: step {index} kept {held}");
 				}
 			},

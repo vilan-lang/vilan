@@ -379,8 +379,8 @@ impl File {
     fun append_to(path: str): File   // "a"  — every write lands at the end
     fun modify(path: str): File      // "r+" — read/write in place; must exist
 
-    fun read_at(self, buffer: Bytes, position: i53): i32   // bytes read; 0 at EOF
-    fun write_at(self, buffer: Bytes, position: i53): i32  // bytes written
+    fun read_at(self, buffer: Bytes, position: i53): usize // bytes read; 0 at EOF
+    fun write_at(self, buffer: Bytes, position: i53): usize // bytes written
     fun stat(self): Stat             // no Option — the handle is already open
     fun truncate(self, length: i53)  // shrink, or extend zero-filled
     fun sync(self)                   // fsync — the durability primitive

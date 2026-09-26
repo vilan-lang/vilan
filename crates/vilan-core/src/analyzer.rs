@@ -47634,24 +47634,26 @@ impl<'src> Analyzer<'src> {
         }
     }
 
-    /// The INDEX half of `subject[index]`: a position, so it is an `i32` —
-    /// the very type `List::get` and `List::set` take.
+    /// The INDEX half of `subject[index]`: a position, so it is a `usize` —
+    /// the very type `List::get` and `List::set` take (I5 S2; `i32` until the
+    /// migration, when S1 admitted both).
     ///
-    /// Nothing checked it. `xs[1.5]`, `xs["a"]`, `xs[true]` and the write form
-    /// `xs[k] = v` all passed `vilan check` and went straight to the emitted
-    /// array subscript, where JS answered `undefined` for a position that does
-    /// not exist — so a program read a hole and failed somewhere else entirely
-    /// (`TypeError: Cannot read properties of undefined`), or tripped the
-    /// bounds check with a non-number in the message.
+    /// Nothing checked it once. `xs[1.5]`, `xs["a"]`, `xs[true]` and the write
+    /// form `xs[k] = v` all passed `vilan check` and went straight to the
+    /// emitted array subscript, where JS answered `undefined` for a position
+    /// that does not exist (B386).
+    ///
+    /// A NUMERIC index of another width carries E218's conversion, so the
+    /// migration's codemod and the editor's quick fix both write
+    /// `.as_usize()` at it.
     ///
     /// Lenient about what is not yet a type: an index still `Unknown` or
     /// `Unresolved` is reported by the fixpoint's own leftover sweep, and a
     /// GENERIC one is left alone rather than refused here — a parameter's
     /// bounds are the only thing that could make it an index, and the language
-    /// has no such bound to write yet. Both are holes this deliberately does
-    /// not close; the concrete wrong types are the miscompile.
+    /// has no such bound to write yet.
     fn subscript_index_is_an_index(&mut self, index_id: Id) -> bool {
-        let Some(index_struct_id) = self.primitive_struct_ids.get("i32").copied() else {
+        let Some(index_struct_id) = self.primitive_struct_ids.get("usize").copied() else {
             return true;
         };
         let expected = Type::Struct(index_struct_id, Vec::new());
@@ -47665,28 +47667,22 @@ impl<'src> Analyzer<'src> {
         if index_type == expected {
             return true;
         }
-        // I5 S1: `usize` is admitted BESIDE `i32`, at the subscript only — a
-        // two-type admission for the one release in which both spellings are
-        // an index. The expectation above stays `i32`, so a literal index and
-        // every emitted subscript are unchanged; the message below keeps
-        // naming `i32` because it steers to the type `xs.get(i)` takes, which
-        // is still `i32` until S2. S2 (the std signatures move to `usize`)
-        // DELETES this admission and makes `usize` the expectation.
-        if let Some(usize_struct_id) = self.primitive_struct_ids.get("usize").copied()
-            && index_type == Type::Struct(usize_struct_id, Vec::new())
-        {
-            return true;
-        }
         let index_str = self.pretty_print_type(&index_type, &HashMap::default());
+        let conversion = match self.numeric_conversion_target(&expected, &index_type) {
+            Some(target) => format!(
+                ". There are no implicit numeric conversions; convert with `.as_{target}()`"
+            ),
+            None => String::new(),
+        };
         self.diagnostics.push(Error {
             trace: Vec::new(),
             note: None,
             span: **self.span_map.get(&index_id).unwrap_or(&&EMPTY_SPAN),
             msg: format!(
-                "an index must be an `i32`, and this one is `{index_str}`: a list and an \
+                "an index must be a `usize`, and this one is `{index_str}`: a list and an \
                  array are POSITIONAL, so `xs[i]` takes the index `xs.get(i)` takes — \
                  anything else names no element, and the emitted subscript read `undefined` \
-                 back instead of failing"
+                 back instead of failing{conversion}"
             ),
         });
         false

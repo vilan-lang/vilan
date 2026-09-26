@@ -1534,7 +1534,8 @@ import std::range::Range;
 import std::time::sleep;
 
 fun fd_count(): i32 {
-	read_dir("/proc/self/fd").len()
+	// Signed on purpose: the probe prints DIFFERENCES of counts.
+	read_dir("/proc/self/fd").len().as_i32()
 }
 
 fun settled_count(baseline: i32): i32 {
@@ -1687,7 +1688,8 @@ import std::range::Range;
 import std::time::sleep;
 
 fun fd_count(): i32 {
-	read_dir("/proc/self/fd").len()
+	// Signed on purpose: the probe prints DIFFERENCES of counts.
+	read_dir("/proc/self/fd").len().as_i32()
 }
 
 // How far above `baseline` the count is, re-read every 10 ms for at most
@@ -2086,7 +2088,8 @@ import std::range::Range;
 import std::time::sleep;
 
 fun fd_count(): i32 {
-	read_dir("/proc/self/fd").len()
+	// Signed on purpose: the probe prints DIFFERENCES of counts.
+	read_dir("/proc/self/fd").len().as_i32()
 }
 
 fun settled_count(baseline: i32): i32 {

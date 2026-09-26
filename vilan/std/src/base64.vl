@@ -9,15 +9,17 @@ import pkg::range::Range;
 export let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 fun char_at(value: i32): str {
-	alphabet.substring(value, value + 1)
+	alphabet.substring(value.as_usize(), (value + 1).as_usize())
 }
 
 export fun encode_url(bytes: Bytes): str {
 	let total = bytes.len();
 	mut out = "";
-	for group in Range::new(0, total / 3) {
+	for group in Range::new(0, (total / 3).as_i32()) {
 		let base = group * 3;
-		let chunk = (bytes.get(base) << 16) | (bytes.get(base + 1) << 8) | bytes.get(base + 2);
+		let chunk = (bytes.get(base.as_usize()) << 16)
+			| (bytes.get((base + 1).as_usize()) << 8)
+			| bytes.get((base + 2).as_usize());
 		out = out
 			+ char_at((chunk >> 18) & 63)
 			+ char_at((chunk >> 12) & 63)
@@ -73,14 +75,14 @@ export fun decode_url(text: str): Option<Bytes> {
 		3 => 2,
 		_ => 0,
 	};
-	mut out = Bytes::alloc(full * 3 + tail_bytes);
+	mut out = Bytes::alloc(full * 3 + tail_bytes.as_usize());
 	mut write = 0;
-	for group in Range::new(0, full) {
+	for group in Range::new(0, full.as_i32()) {
 		let base = group * 4;
-		let a = digit(text.code_at(base));
-		let b = digit(text.code_at(base + 1));
-		let c = digit(text.code_at(base + 2));
-		let d = digit(text.code_at(base + 3));
+		let a = digit(text.code_at(base.as_usize()));
+		let b = digit(text.code_at((base + 1).as_usize()));
+		let c = digit(text.code_at((base + 2).as_usize()));
+		let d = digit(text.code_at((base + 3).as_usize()));
 		if a < 0 || b < 0 || c < 0 || d < 0 {
 			ret None;
 		}

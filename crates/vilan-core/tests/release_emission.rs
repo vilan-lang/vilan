@@ -221,7 +221,7 @@ fun total_width(rows: List<(List<i32>, i32)>): i32 {
 	for row in rows {
 		match row {
 			(let cells, let weight) => {
-				total = total + cells.len() * weight;
+				total = total + cells.len().as_i32() * weight;
 			}
 		}
 	}

@@ -807,7 +807,7 @@ import std::shared::Shared;
 /// BOTH of a turn's queues, since A110 door 2 split them: a parked effect sits
 /// in `pending` and a derivation in `pending_derived`, and the scrub's claim is
 /// about whichever one holds the entry.
-fun parked(turn: Turn): i32 {
+fun parked(turn: Turn): usize {
 	turn.pending.read().len() + turn.pending_derived.read().len()
 }
 

@@ -665,10 +665,10 @@ const LAZY_PROBE: &str = concat!(
     "\tprint(evaluations);\n",
     // A103's own customers: `unwrap_or`'s fallback is `lazy`, so the `Some`
     // path never builds it and the `None` path does.
-    "\tlet present: Option<i32> = Some(3);\n",
+    "\tlet present: Option<usize> = Some(3);\n",
     "\tprint(present.unwrap_or(costly().len()));\n",
     "\tprint(evaluations);\n",
-    "\tlet absent: Option<i32> = None;\n",
+    "\tlet absent: Option<usize> = None;\n",
     "\tprint(absent.unwrap_or(costly().len()));\n",
     "\tprint(evaluations);\n",
     "}\n",
@@ -1685,7 +1685,7 @@ fn a_reentrant_read_of_an_updated_cell_is_refused_by_name() {
             "\tlet todos: SignalCell<List<i32>> = Signal::new([1]);\n",
             "\tlet other: SignalCell<List<i32>> = Signal::new([7, 8]);\n",
             "\ttodos.update(|&mut list| {\n",
-            "\t\tlist.push(other.get().len());\n",
+            "\t\tlist.push(other.get().len().as_i32());\n",
             "\t});\n",
             "\tprint(todos.get());\n",
             "}\n",
@@ -1705,6 +1705,67 @@ fn a_reentrant_read_of_an_updated_cell_is_refused_by_name() {
         "reading a different cell inside the closure is not the refused shape"
     );
 }
+
+/// A statement takes no expectation from the block around it (I5 S2's hand
+/// loops met this in `std::json`): a `usize` counter walked down inside an `if`
+/// arm of a function answering `i32` emitted its condition's literal at the
+/// function's width, `while (index > (0i32))`, and rustc refused it. Both arm
+/// orders and a plain body, so the fix is not one position's.
+#[test]
+fn a_loop_inside_an_arm_takes_no_expectation_from_the_function() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_arm_loop.vl"), ARM_LOOP_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_arm_loop.vl"),
+        Verdict::Identical,
+        "a loop's literals keep their own width inside an arm"
+    );
+}
+
+const ARM_LOOP_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "fun down(xs: List<i32>, flag: bool): i32 {\n",
+    "\tif flag {\n",
+    "\t\tmut index = xs.len();\n",
+    "\t\tfor index > 0 {\n",
+    "\t\t\tindex -= 1;\n",
+    "\t\t\tprint(xs[index]);\n",
+    "\t\t}\n",
+    "\t\txs.len().as_i32()\n",
+    "\t} else {\n",
+    "\t\t0\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun up(xs: List<i32>, flag: bool): u53 {\n",
+    "\tif !flag {\n",
+    "\t\t0\n",
+    "\t} else {\n",
+    "\t\tmut at = 0;\n",
+    "\t\tfor at < xs.len() {\n",
+    "\t\t\tprint(xs[at]);\n",
+    "\t\t\tat += 1;\n",
+    "\t\t}\n",
+    "\t\tat.as_u53()\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun count(xs: List<i32>): i32 {\n",
+    "\tmut left = xs.len();\n",
+    "\tfor left > 0 {\n",
+    "\t\tleft -= 1;\n",
+    "\t}\n",
+    "\t7\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(down([1, 2, 3], true));\n",
+    "\tprint(up([4, 5], true));\n",
+    "\tprint(count([6]));\n",
+    "}\n",
+);
 
 /// A generic call whose binding the call itself leaves OPEN is closed by the
 /// position it fills (B370's law on the generic-call path): `SignalCell::new([])`
@@ -1735,7 +1796,7 @@ const OPEN_BINDING_PROBE: &str = concat!(
     "\tRemove(K),\n",
     "}\n",
     "\n",
-    "fun count_resets(ops: List<Delta<str, i32>>): i32 {\n",
+    "fun count_resets(ops: List<Delta<str, i32>>): usize {\n",
     "\tmut resets = 0;\n",
     "\tfor op in ops {\n",
     "\t\tmatch op {\n",
@@ -2941,7 +3002,7 @@ const LOANS_PROBE: &str = concat!(
     "\n",
     "impl Stack {\n",
     "\tfun size(self): i32 {\n",
-    "\t\tself.items.len()\n",
+    "\t\tself.items.len().as_i32()\n",
     "\t}\n",
     "\n",
     "\tfun place(&mut self, at: i32, value: i32) {\n",
@@ -3376,7 +3437,7 @@ fn a_reentrant_read_through_an_alias_is_refused_by_name() {
             "\tlet todos: SignalCell<List<i32>> = Signal::new([1]);\n",
             "\tlet before = todos.get();\n",
             "\ttodos.update(|&mut list| {\n",
-            "\t\tlist.push(before.len() + 1);\n",
+            "\t\tlist.push(before.len().as_i32() + 1);\n",
             "\t});\n",
             "\tprint(todos.get());\n",
             "}\n",
@@ -4266,10 +4327,10 @@ fn combine_over_a_tuple_valued_source_is_never_a_different_answer_natively() {
 /// the DECLARATION", which answers both halves with one question, and the two
 /// are in one program so a fix that satisfies either alone fails here.
 const LOOP_TRAP_PROBE: &str = concat!(
-    "struct Row { id: i32, tags: List<str> }\n",
+    "struct Row { id: usize, tags: List<str> }\n",
     "\n",
-    "fun weigh(tags: List<str>): i32 { tags.len() }\n",
-    "fun weigh_row(row: Row): i32 { row.tags.len() + row.id }\n",
+    "fun weigh(tags: List<str>): usize { tags.len() }\n",
+    "fun weigh_row(row: Row): usize { row.tags.len() + row.id }\n",
     "\n",
     "fun main() {\n",
     "\tlet names = [\"alpha\", \"beta\"];\n",
@@ -4500,12 +4561,12 @@ const CELL_PLACE_PROBE: &str = concat!(
     "\tfun bump(&mut self) { self.n = self.n + 1; }\n",
     "}\n",
     "\n",
-    "mut counts: List<i32> = [1, 2];\n",
+    "mut counts: List<usize> = [1, 2];\n",
     "mut counter: Counter = Counter { n = 0 };\n",
     "\n",
-    "fun record(value: i32) { counts.push(value); }\n",
+    "fun record(value: usize) { counts.push(value); }\n",
     "\n",
-    "fun grow(xs: &mut List<i32>, by: i32) { xs.push(by); }\n",
+    "fun grow(xs: &mut List<usize>, by: usize) { xs.push(by); }\n",
     "\n",
     "fun main() {\n",
     "\trecord(7);\n",
@@ -4519,7 +4580,7 @@ const CELL_PLACE_PROBE: &str = concat!(
     "\tprint(counts);\n",
     "\tgrow(&mut counts, 9);\n",
     "\tprint(counts);\n",
-    "\tmut seen: List<i32> = [];\n",
+    "\tmut seen: List<usize> = [];\n",
     "\tmut inner: Counter = Counter { n = 0 };\n",
     "\tlet bump = || { seen.push(seen.len()); inner.bump(); };\n",
     "\tbump();\n",

@@ -185,9 +185,18 @@ duration or a port. A file offset is not an index either: it is a position
 in a stream that is not in memory, its range is the filesystem's, and
 `std::fs` keeps it `i53`.
 
-Today `xs[i]` accepts an index of either `i32` or `usize`, and std's own
-signatures (`len()`, `get(i)`, `index_of`) still speak `i32`; the release
-that moves them to `usize` is the migration the tracker calls I5 S2.
+**std speaks it everywhere.** Every length, count and position in std is a
+`usize`: `len()` on a list, a string, a map, a set and `Bytes`; the index
+`get(i)`, `insert(i, ..)`, `remove(i)`, `substring(from, to)` and
+`code_at(i)` take; `index_of`'s answer; `take(n)`/`skip(n)`/`repeat(n)`;
+`enumerate()`'s counter (`(usize, T)`); and `xs[i]`, whose index is a
+`usize` and nothing else. The values beside them keep their own types — a
+byte `Bytes::get` answers is still an `i32`, an id is still an id. A program
+written against the `i32` spellings migrates with `vilan check --fix` (see
+the [CLI](../appendix/cli.md)); what it cannot decide is a `-1` "not found"
+(an `Option<usize>` or a real fallback), a `for i >= 0` loop (count down
+from `len` with `for i > 0 { i -= 1; … }`), and signed arithmetic that
+should stay signed and convert once.
 
 `clamp` confines a value to a range. The integers inherit it from `Ord`; the
 floats are deliberately *not* `Ord` (NaN has no place in a total order), so

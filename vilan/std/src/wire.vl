@@ -452,7 +452,7 @@ impl f32 with Wire {
 // A list narrates element by element; rebuild trusts `begin_list`'s count.
 impl List<type T: Wire> with Wire {
 	fun describe<S: Serialize>(self, serializer: &mut S) {
-		serializer.begin_list(self.len());
+		serializer.begin_list(self.len().as_i32());
 		for element in self {
 			element.describe(serializer);
 		}
@@ -588,7 +588,7 @@ trait Keyed<K> {
 /// connection's codec exactly like any other payload.
 enum Delta<K, T> {
 	Reset(List<T>),
-	Insert(K, T, i32),
+	Insert(K, T, usize),
 	Update(K, T),
 	Remove(K),
 }
@@ -635,7 +635,7 @@ impl Delta<type K: Wire, type T: Wire> with Wire {
 				deserializer.begin_variant("Insert", 3);
 				let key = K::rebuild(deserializer);
 				let value = T::rebuild(deserializer);
-				let index = i32::rebuild(deserializer);
+				let index = usize::rebuild(deserializer);
 				deserializer.end_variant();
 				Delta::Insert(key, value, index)
 			},
@@ -671,7 +671,7 @@ impl Delta<type K: Wire, type T: Wire> with Wire {
 impl Map<type K: Hashable + Wire, type V: Wire> with Wire {
 	fun describe<S: Serialize>(self, serializer: &mut S) {
 		let entries = self.entries();
-		serializer.begin_list(entries.len());
+		serializer.begin_list(entries.len().as_i32());
 		for entry in entries {
 			serializer.begin_struct(2);
 			serializer.field("key");

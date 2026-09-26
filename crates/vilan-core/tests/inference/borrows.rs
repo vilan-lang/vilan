@@ -376,12 +376,12 @@ fn reactive_combine_variadic() {
 fn tuple_comprehension_over_mapped_source() {
     // A tuple comprehension `(x in xs => e)` maps each element of a mapped-tuple
     // source through the body, typing as `(U in T: <body>)`. Here `source.len()`
-    // sends every element to an `i32`, so the result is `(U in T: i32)` — the
-    // arity of `T` with `i32` in every slot. Lowers to a runtime `.map`, so it's
+    // sends every element to a `usize`, so the result is `(U in T: usize)` — the
+    // arity of `T` with `usize` in every slot. Lowers to a runtime `.map`, so it's
     // arity-independent.
     //
     // B211 changed the RETURN this is declared with. It used to read `: T`, and
-    // that was never true: with `T = (i32, str)` the body produces `(i32, i32)`.
+    // that was never true: with `T = (i32, str)` the body produces `(usize, usize)`.
     // It compiled because `reconcile_type`'s generic arm bound the body's OWN
     // `T` to the mapped type — the leak B211 closed — and the run only looked
     // right because `to_string` on a number reads the same either way. The
@@ -391,7 +391,7 @@ fn tuple_comprehension_over_mapped_source() {
         r#"
         import std::io::print;
         import std::display::Display;
-        fun lengths<T: (2..)>(sources: (U in T: List<U>)): (U in T: i32) {
+        fun lengths<T: (2..)>(sources: (U in T: List<U>)): (U in T: usize) {
             (source in sources => source.len())
         }
         fun main() {
@@ -406,7 +406,7 @@ fn tuple_comprehension_over_mapped_source() {
 #[test]
 fn b211_a_comprehension_may_not_re_bind_its_own_source_parameter() {
     // The verdict change above, held as its own pin: declaring the return `T`
-    // when the body maps every element to an `i32` is a mismatch, not a binding.
+    // when the body maps every element to a `usize` is a mismatch, not a binding.
     // Before B211 this compiled and ran.
     assert_fails_with(
         r#"
@@ -420,7 +420,7 @@ fn b211_a_comprehension_may_not_re_bind_its_own_source_parameter() {
             print(i"{a.to_string()} {b.to_string()}");
         }
         "#,
-        "Expected T, but got (U in T: i32) instead.",
+        "Expected T, but got (U in T: usize) instead.",
     );
 }
 
@@ -1383,7 +1383,7 @@ fn own_parameter_is_a_mutable_copy() {
         r#"
         import std::io::print;
         fun bump(own x: i32): i32 { x += 1; x }
-        fun grow(own xs: List<i32>): i32 { xs = [7, 8, 9, 10]; xs.len() }
+        fun grow(own xs: List<i32>): usize { xs = [7, 8, 9, 10]; xs.len() }
         fun main() {
             mut a = 10;
             print(bump(a)); // 11
@@ -1419,7 +1419,7 @@ fn a_mut_parameter_is_invisible_to_the_caller() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        fun grow(mut xs: List<i32>): i32 { xs.push(9); xs.len() }
+        fun grow(mut xs: List<i32>): usize { xs.push(9); xs.len() }
         fun main() {
             mut list = [1, 2];
             print(grow(list));  // 3 — the callee's copy grew
@@ -1484,7 +1484,7 @@ fn a_closure_mut_parameter_types_from_a_declared_closure_argument() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        fun apply(xs: List<i32>, grow: |List<i32>| i32): i32 { grow(xs) }
+        fun apply(xs: List<i32>, grow: |List<i32>| usize): usize { grow(xs) }
         fun main() {
             mut list = [1, 2];
             print(apply(list, |mut xs| {
@@ -1946,7 +1946,7 @@ fn an_own_parameter_capture_shares_when_nothing_writes_it() {
     // same elision seen in bytes — it regained its pre-B60 form here.)
     let source = r#"
         import std::io::print;
-        fun peek(own pair: (List<i32>, i32)): i32 {
+        fun peek(own pair: (List<i32>, i32)): usize {
             let (first, second) = pair;
             first.len()
         }
@@ -1972,7 +1972,7 @@ fn an_own_parameter_capture_copies_when_a_method_writes_it() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        fun observe(own pair: (List<i32>, i32)): i32 {
+        fun observe(own pair: (List<i32>, i32)): usize {
             let (first, second) = pair;
             pair.0.push(7);
             first.len()
@@ -1992,7 +1992,7 @@ fn an_own_parameter_capture_copies_when_an_assignment_writes_it() {
         r#"
         import std::io::print;
         struct Holder { xs: List<i32> }
-        fun observe(own pair: (Holder, i32)): i32 {
+        fun observe(own pair: (Holder, i32)): usize {
             let (first, second) = pair;
             pair.0.xs = [ 9, 9 ];
             first.xs.len()
@@ -2322,7 +2322,7 @@ fn a_guard_that_needs_a_temporary_emits_it() {
 
 #[test]
 fn an_is_capture_from_a_mut_self_subject_reads_the_prematch_value() {
-    // B81's filed repro. `at` is an `i32`, so it owes no copy and kept its
+    // B81's filed repro. `at` is a `usize`, so it owes no copy and kept its
     // accessor `$a[2]`; `self = Feed::Ready(..)` lowers to a write in place
     // (`__replace(self, ..)`), mutating the very array `$a` aliases, so
     // `items[at]` indexed with the INCREMENTED `at`. Printed "b\nc" for two
@@ -2332,7 +2332,7 @@ fn an_is_capture_from_a_mut_self_subject_reads_the_prematch_value() {
         import std::io::print;
         import std::option::Option::{ self, Some, None };
         enum Feed {
-            Ready(List<str>, i32),
+            Ready(List<str>, usize),
             Done,
         }
         impl Feed {
@@ -2367,7 +2367,7 @@ fn an_is_capture_from_a_mut_parameter_subject_is_unchanged() {
         import std::io::print;
         import std::option::Option::{ self, Some, None };
         enum Feed {
-            Ready(List<str>, i32),
+            Ready(List<str>, usize),
             Done,
         }
         fun step(mut feed: Feed): Option<str> {
@@ -2397,7 +2397,7 @@ fn an_is_capture_from_a_mut_view_parameter_reads_the_prematch_value() {
         r#"
         import std::io::print;
         enum Feed {
-            Ready(List<str>, i32),
+            Ready(List<str>, usize),
             Done,
         }
         fun step(feed: &mut Feed): str {
@@ -2431,7 +2431,7 @@ fn an_is_capture_from_a_dereferenced_view_local_copies_and_reads_early() {
         r#"
         import std::io::print;
         enum Feed {
-            Ready(List<str>, i32),
+            Ready(List<str>, usize),
             Done,
         }
         fun main() {
@@ -2483,7 +2483,7 @@ fn a_guarded_leg_capture_from_a_viewed_subject_reads_the_prematch_value() {
         r#"
         import std::io::print;
         enum Feed {
-            Ready(List<str>, i32),
+            Ready(List<str>, usize),
             Done,
         }
         impl Feed {
@@ -2518,7 +2518,7 @@ fn an_unguarded_match_leg_on_a_viewed_subject_was_already_right() {
         r#"
         import std::io::print;
         enum Feed {
-            Ready(List<str>, i32),
+            Ready(List<str>, usize),
             Done,
         }
         impl Feed {
@@ -2560,7 +2560,7 @@ fn both_capture_shapes_survive_an_in_place_write_through_the_view() {
             if pair is (let items, let at) {
                 pair.0.push("d");
                 pair.1 = 9;
-                items.len() + at
+                items.len().as_i32() + at
             } else {
                 -1
             }
@@ -2591,7 +2591,7 @@ fn a_nested_capture_from_a_viewed_subject_reads_the_prematch_value() {
             fun step(&mut self): i32 {
                 if self is Pair::Two((let xs, let k), let at) {
                     self = Pair::Two(([9, 9, 9, 9], 7), 5);
-                    xs.len() + k + at
+                    xs.len().as_i32() + k + at
                 } else {
                     -1
                 }
@@ -2724,7 +2724,7 @@ fn a_readonly_view_subject_keeps_its_shared_accessors() {
         impl Feed {
             fun peek(&self): i32 {
                 if self is Feed::Ready(let items, let at) {
-                    items.len() + at
+                    items.len().as_i32() + at
                 } else {
                     -1
                 }
@@ -2866,7 +2866,7 @@ fn a_shortening_write_through_a_view_truncates_under_const_eval() {
     assert_compiles_and_runs(
         r#"
         import std::io::print;
-        fun replace(v: &mut List<i32>): i32 {
+        fun replace(v: &mut List<i32>): usize {
             v = [9];
             v.len()
         }
@@ -3921,7 +3921,7 @@ fn both_capture_shapes_survive_a_component_write_to_the_place() {
             if pair is (let items, let at) {
                 pair.0.push("d");
                 pair.1 = 9;
-                print(items.len() + at);
+                print(items.len().as_i32() + at);
             }
             print(pair.0.len());
         }
@@ -4103,7 +4103,7 @@ fn both_capture_shapes_survive_a_write_through_a_borrows_call_subject() {
             if holder.view() is (let items, let at) {
                 holder.pair.0.push("d");
                 holder.pair.1 = 9;
-                print(items.len() + at);
+                print(items.len().as_i32() + at);
             }
             print(holder.pair.0.len());
         }
@@ -4353,7 +4353,7 @@ fn an_owned_call_subject_still_binds_without_copying() {
         fun make(): (List<i32>, i32) { ([1, 2], 3) }
         fun main() {
             if make() is (let xs, let n) {
-                print(xs.len() + n);
+                print(xs.len().as_i32() + n);
             }
         }
         "#;
@@ -4382,7 +4382,7 @@ fn a_borrows_call_subject_with_no_write_in_the_leg_is_unchanged() {
         fun main() {
             mut g = Holder { cells = ([1, 2], 3) };
             if g.slot() is (let xs, let n) {
-                print(xs.len() + n);
+                print(xs.len().as_i32() + n);
             }
         }
         "#,

@@ -22,7 +22,7 @@ impl List<type T> {
 	/// compiler lowers it over the native `.pop`).
 	external fun pop(&mut self): Option<T>;
 
-	external fun len(self): i32;
+	external fun len(self): usize;
 
 	fun is_empty(self): bool {
 		self.len() == 0
@@ -77,10 +77,10 @@ impl List<type T> {
 	/// which is a different method and belongs to the iterator paper.)
 	fun reverse(self): List<T> {
 		mut result = List::new();
-		mut index = self.len() - 1;
-		for index >= 0 {
-			result.push(self[index]);
+		mut index = self.len();
+		for index > 0 {
 			index -= 1;
+			result.push(self[index]);
 		}
 		result
 	}
@@ -96,7 +96,7 @@ impl List<type T> {
 	/// emitted helper keeps the panic, because `splice` CLAMPS an index past the
 	/// end — it would silently accept exactly the index this doc says a caller must
 	/// be punished for.
-	external fun insert(&mut self, index: i32, own value: T): void;
+	external fun insert(&mut self, index: usize, own value: T): void;
 
 	/// Removes and returns the element at `index`, shifting the tail left. PANICS
 	/// out of bounds — see `insert`. (`pop` returns an `Option` because "the list
@@ -106,7 +106,7 @@ impl List<type T> {
 	/// helper keeps the panic: `splice` reads a NEGATIVE index from the END,
 	/// so a bare `splice(index, 1)[0]` would answer `xs.remove(-1)` with the
 	/// last element instead of refusing.
-	external fun remove(&mut self, index: i32): T;
+	external fun remove(&mut self, index: usize): T;
 }
 
 // `sum`/`product` seed with the first element and fall back to `T::default()` only

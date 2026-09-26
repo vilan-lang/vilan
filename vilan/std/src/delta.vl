@@ -55,7 +55,7 @@ import pkg::shared::Shared;
 /// so the log is as long as one turn's writes and no longer.
 ///
 /// `keyed_log_limit` before the lift (A54), with its sentence unchanged.
-export let delta_log_limit: i32 = 1024;
+export let delta_log_limit: usize = 1024;
 
 /// One consumer's place in a log: the sequence number it has been told through.
 /// Identified rather than compared, because two consumers may legitimately sit at
@@ -83,14 +83,14 @@ export struct DeltaCursor {
 /// position index on top of it, which is exactly what `KeyedCell` keeps.
 export enum SeqOp<T> {
 	/// `removed` left and `inserted` arrived, both at `at`.
-	Splice(i32, List<T>, List<T>),
+	Splice(usize, List<T>, List<T>),
 	/// The element at `at` was the first value and is now the second.
 	///
 	/// Deliberately NOT `Splice(at, [old], [new])`, though it means the same thing
 	/// to the collection: for `each` and for a per-element derivation the two are
 	/// different events — an element changed in place, versus one left and another
 	/// arrived — and the difference is whether the per-element owner survives.
-	SetAt(i32, T, T),
+	SetAt(usize, T, T),
 	/// The collection BECAME this list. The honest escape hatch: a wholesale write,
 	/// a lagging cursor's fallback, and the compat path for a source that keeps no
 	/// log at all.
@@ -105,7 +105,7 @@ export enum SeqOp<T> {
 	/// rebuild, where a `Move` says "same element, new place". A consumer that does
 	/// not care may treat it as the splice pair; `std::rpc`'s wire translation
 	/// lowers it to `Delta::Reset`, which is what a reorder sends today.
-	Move(i32, i32, i32),
+	Move(usize, usize, usize),
 }
 
 /// A map's change. `Put`'s `Option<V>` is the difference between an insert and an
@@ -155,7 +155,7 @@ export struct DeltaLog<O> {
 	cursors: Shared<List<DeltaCursor>>,
 	/// This log's ceiling, `delta_log_limit` unless a cell asked for another. A
 	/// plain field rather than a cell: it is written once, at construction.
-	limit: i32,
+	limit: usize,
 }
 
 export impl DeltaLog<type O> {
@@ -172,7 +172,7 @@ export impl DeltaLog<type O> {
 
 	/// An empty log at a ceiling of its caller's choosing — what a test that wants
 	/// to reach the lag path without writing a thousand ops asks for.
-	fun with_limit(limit: i32): DeltaLog<O> {
+	fun with_limit(limit: usize): DeltaLog<O> {
 		DeltaLog {
 			ops = Shared::new([]),
 			version = Shared::new(0),
@@ -224,7 +224,9 @@ export impl DeltaLog<type O> {
 		if lowest > base {
 			let dropped = lowest - base;
 			mut kept: List<O> = [];
-			mut index = dropped;
+			// A sequence number meets a position here: the ops held start at
+			// `base`, so the count dropped is where the kept ones begin.
+			mut index = dropped.as_usize();
 			let held = self.ops.read();
 			let length = held.len();
 			for index < length {
@@ -278,7 +280,7 @@ export impl DeltaLog<type O> {
 		if at < base {
 			ret None;
 		}
-		mut index = at - base;
+		mut index = (at - base).as_usize();
 		let held = self.ops.read();
 		let length = held.len();
 		for index < length {
@@ -292,7 +294,7 @@ export impl DeltaLog<type O> {
 	}
 
 	/// How many ops the log is holding — what a pin on the trim reads.
-	fun held(self): i32 {
+	fun held(self): usize {
 		self.ops.read().len()
 	}
 
@@ -420,9 +422,8 @@ export impl type S: DeltaSource<List<type T>, SeqOp<T>> with DeltaFeed<T> {
 // of them offers are defaults, written twice and implemented never
 // (incremental-collections.md §6, §13 Q2: two hand lists, no macro).
 //
-// **I5.** Every position and count below is `i32` and is marked `// I5`: the
-// index-type paper's S1 moves the family to `usize` as one breaking train, and
-// these are its census.
+// Every position and count below is a `usize`, the index type: an index is a
+// position, a length or a count, and a sequence surface speaks nothing else.
 
 /// The everyday sequence surface: `self` receivers, one primitive.
 ///
@@ -433,11 +434,11 @@ export impl type S: DeltaSource<List<type T>, SeqOp<T>> with DeltaFeed<T> {
 /// than a rule each method has to remember.
 export trait SequenceCell<T> {
 	/// How many elements the sequence holds.
-	fun size(self): i32; // I5
+	fun size(self): usize;
 
 	/// THE primitive: `removed` elements leave at `at` and `inserted` arrive there,
 	/// as ONE op and ONE notification.
-	fun splice(self, at: i32, removed: i32, inserted: List<T>); // I5 (at, removed)
+	fun splice(self, at: usize, removed: usize, inserted: List<T>);
 
 	/// Nothing held.
 	fun is_empty(self): bool {
@@ -446,54 +447,50 @@ export trait SequenceCell<T> {
 
 	/// One element at the end.
 	fun push(self, value: T) {
-		self.splice(self.size(), 0, [value]) // I5
+		self.splice(self.size(), 0, [value])
 	}
 
 	/// One element at the front.
 	fun prepend(self, value: T) {
-		self.splice(0, 0, [value]) // I5
+		self.splice(0, 0, [value])
 	}
 
 	/// One element at `at`, moving everything from there along.
-	// I5: a POSITION parameter
-	fun insert_at(self, at: i32, value: T) {
-		self.splice(at, 0, [value]) // I5
+	fun insert_at(self, at: usize, value: T) {
+		self.splice(at, 0, [value])
 	}
 
 	/// Several elements at `at`, in order.
-	// I5: a POSITION parameter
-	fun insert_all(self, at: i32, values: List<T>) {
-		self.splice(at, 0, values) // I5
+	fun insert_all(self, at: usize, values: List<T>) {
+		self.splice(at, 0, values)
 	}
 
 	/// The element at `at` leaves.
-	// I5: a POSITION parameter
-	fun remove_at(self, at: i32) {
-		self.splice(at, 1, []) // I5
+	fun remove_at(self, at: usize) {
+		self.splice(at, 1, [])
 	}
 
 	/// `count` elements leave, starting at `at`.
-	// I5: a POSITION parameter
-	fun remove_range(self, at: i32, count: i32) {
-		self.splice(at, count, []) // I5
+	fun remove_range(self, at: usize, count: usize) {
+		self.splice(at, count, [])
 	}
 
 	/// The last element leaves; an empty sequence is left alone.
 	fun pop(self) {
 		let size = self.size();
 		if size > 0 {
-			self.splice(size - 1, 1, []) // I5
+			self.splice(size - 1, 1, [])
 		}
 	}
 
 	/// Several elements at the end, in order.
 	fun extend(self, values: List<T>) {
-		self.splice(self.size(), 0, values) // I5
+		self.splice(self.size(), 0, values)
 	}
 
 	/// Everything leaves.
 	fun clear(self) {
-		self.splice(0, self.size(), []) // I5
+		self.splice(0, self.size(), [])
 	}
 
 	/// Everything leaves and `values` arrive — the wholesale write expressed as ONE
@@ -504,15 +501,14 @@ export trait SequenceCell<T> {
 	/// key survives is kept either way, and a derivation runs once per element for
 	/// both. The door that records only what changed is `reconcile_to`.
 	fun set_all(self, values: List<T>) {
-		self.splice(0, self.size(), values) // I5
+		self.splice(0, self.size(), values)
 	}
 
 	/// Keep the first `length` elements.
-	// I5: a POSITION parameter
-	fun truncate(self, length: i32) {
+	fun truncate(self, length: usize) {
 		let size = self.size();
 		if size > length {
-			self.splice(length, size - length, []) // I5
+			self.splice(length, size - length, [])
 		}
 	}
 }
@@ -531,11 +527,11 @@ export trait SequenceCell<T> {
 /// no reason.
 export trait Sequence<T> {
 	/// How many elements the sequence holds.
-	fun size(self): i32; // I5
+	fun size(self): usize;
 
 	/// THE primitive, as in `SequenceCell` — `removed` leave at `at` and `inserted`
 	/// arrive there.
-	fun splice(&mut self, at: i32, removed: i32, inserted: List<T>); // I5
+	fun splice(&mut self, at: usize, removed: usize, inserted: List<T>);
 
 	/// Nothing held.
 	fun is_empty(self): bool {
@@ -544,67 +540,62 @@ export trait Sequence<T> {
 
 	/// One element at the end.
 	fun push(&mut self, value: T) {
-		self.splice(self.size(), 0, [value]) // I5
+		self.splice(self.size(), 0, [value])
 	}
 
 	/// One element at the front.
 	fun prepend(&mut self, value: T) {
-		self.splice(0, 0, [value]) // I5
+		self.splice(0, 0, [value])
 	}
 
 	/// One element at `at`, moving everything from there along.
-	// I5: a POSITION parameter
-	fun insert_at(&mut self, at: i32, value: T) {
-		self.splice(at, 0, [value]) // I5
+	fun insert_at(&mut self, at: usize, value: T) {
+		self.splice(at, 0, [value])
 	}
 
 	/// Several elements at `at`, in order.
-	// I5: a POSITION parameter
-	fun insert_all(&mut self, at: i32, values: List<T>) {
-		self.splice(at, 0, values) // I5
+	fun insert_all(&mut self, at: usize, values: List<T>) {
+		self.splice(at, 0, values)
 	}
 
 	/// The element at `at` leaves.
-	// I5: a POSITION parameter
-	fun remove_at(&mut self, at: i32) {
-		self.splice(at, 1, []) // I5
+	fun remove_at(&mut self, at: usize) {
+		self.splice(at, 1, [])
 	}
 
 	/// `count` elements leave, starting at `at`.
-	// I5: a POSITION parameter
-	fun remove_range(&mut self, at: i32, count: i32) {
-		self.splice(at, count, []) // I5
+	fun remove_range(&mut self, at: usize, count: usize) {
+		self.splice(at, count, [])
 	}
 
 	/// The last element leaves; an empty sequence is left alone.
 	fun pop(&mut self) {
 		let size = self.size();
 		if size > 0 {
-			self.splice(size - 1, 1, []) // I5
+			self.splice(size - 1, 1, [])
 		}
 	}
 
 	/// Several elements at the end, in order.
 	fun extend(&mut self, values: List<T>) {
-		self.splice(self.size(), 0, values) // I5
+		self.splice(self.size(), 0, values)
 	}
 
 	/// Everything leaves.
 	fun clear(&mut self) {
-		self.splice(0, self.size(), []) // I5
+		self.splice(0, self.size(), [])
 	}
 
 	/// Everything leaves and `values` arrive, as ONE op.
 	fun set_all(&mut self, values: List<T>) {
-		self.splice(0, self.size(), values) // I5
+		self.splice(0, self.size(), values)
 	}
 
 	/// Keep the first `length` elements.
-	// I5: a POSITION parameter
-	fun truncate(&mut self, length: i32) {
+	fun truncate(&mut self, length: usize) {
 		let size = self.size();
 		if size > length {
-			self.splice(length, size - length, []) // I5
+			self.splice(length, size - length, [])
 		}
 	}
 }
@@ -625,11 +616,8 @@ export trait Sequence<T> {
 
 /// Where a splice at `at` starts in a sequence of `held` elements: `at`, pulled
 /// into `0..=held`.
-fun splice_start(held: i32, at: i32): i32 {
-	// I5
-	if at < 0 {
-		0
-	} else if at > held {
+fun splice_start(held: usize, at: usize): usize {
+	if at > held {
 		held
 	} else {
 		at
@@ -637,11 +625,8 @@ fun splice_start(held: i32, at: i32): i32 {
 }
 
 /// How many of the `removed` asked for a splice from `start` can take.
-fun splice_count(held: i32, start: i32, removed: i32): i32 {
-	// I5
-	if removed < 0 {
-		0
-	} else if start + removed > held {
+fun splice_count(held: usize, start: usize, removed: usize): usize {
+	if start + removed > held {
 		held - start
 	} else {
 		removed
@@ -649,18 +634,22 @@ fun splice_count(held: i32, start: i32, removed: i32): i32 {
 }
 
 /// Apply an already-clamped splice to `list` and answer the op it made. The op
-/// carries what LEFT as well as what arrived — §3.1's requirement, and what
-/// makes a group fold's derivative O(1).
-// I5: a POSITION parameter
-fun splice_in_place<T>(list: &mut List<T>, start: i32, taking: i32, inserted: List<T>): SeqOp<T> {
+/// carries what LEFT as well as what arrived — §3.1's requirement, and what makes a
+/// group fold's derivative O(1).
+fun splice_in_place<T>(
+	list: &mut List<T>,
+	start: usize,
+	taking: usize,
+	inserted: List<T>,
+): SeqOp<T> {
 	mut left: List<T> = [];
-	mut taken = 0; // I5
+	mut taken = 0;
 	for taken < taking {
 		left.push(list.remove(start));
 		taken += 1;
 	}
-	mut offset = 0; // I5
-	let arriving = inserted.len(); // I5
+	mut offset = 0;
+	let arriving = inserted.len();
 	for offset < arriving {
 		match inserted.get(offset) {
 			Some(let value) => list.insert(start + offset, value),
@@ -692,16 +681,14 @@ export impl Tracked<type T> {
 }
 
 export impl Tracked<type T> with Sequence<T> {
-	fun size(self): i32 {
-		// I5
+	fun size(self): usize {
 		self.elements.len()
 	}
 
-	// I5: a POSITION parameter
-	fun splice(&mut self, at: i32, removed: i32, inserted: List<T>) {
-		let held = self.elements.len(); // I5
-		let start = splice_start(held, at); // I5
-		let taking = splice_count(held, start, removed); // I5
+	fun splice(&mut self, at: usize, removed: usize, inserted: List<T>) {
+		let held = self.elements.len();
+		let start = splice_start(held, at);
+		let taking = splice_count(held, start, removed);
 		if taking == 0 && inserted.len() == 0 {
 			ret;
 		}
@@ -770,8 +757,7 @@ export impl ListCell<type T> {
 
 	/// A cell whose log has a ceiling other than `delta_log_limit` — what a test
 	/// that wants to reach the lag path without writing a thousand ops asks for.
-	fun with_limit(elements: List<T>, limit: i32): ListCell<T> {
-		// I5
+	fun with_limit(elements: List<T>, limit: usize): ListCell<T> {
 		list_cell(elements, DeltaLog<SeqOp<T>>::with_limit(limit))
 	}
 
@@ -791,12 +777,11 @@ export impl ListCell<type T> {
 
 	/// The element at `at` becomes `value` — an element changed IN PLACE.
 	///
-	/// Deliberately not a `splice` of one: to a per-element consumer the two
-	/// are different events (`SeqOp::SetAt`'s comment), and the difference is
-	/// whether the row's owner survives. Out of range is a no-op, like every
-	/// other bounds question in this module.
-	// I5: a POSITION parameter
-	fun set_at(self, at: i32, value: T) {
+	/// Deliberately not a `splice` of one: to a per-element consumer the two are
+	/// different events (`SeqOp::SetAt`'s comment), and the difference is whether
+	/// the row's owner survives. Out of range is a no-op, like every other bounds
+	/// question in this module.
+	fun set_at(self, at: usize, value: T) {
 		// `.get(at)` on the slot copies the one element, not the run.
 		match self.items.read().get(at) {
 			Some(let previous) => {
@@ -813,18 +798,17 @@ export impl ListCell<type T> {
 	/// The one op nothing else in std emits (§3.1) — it is here so a consumer
 	/// that wants to preserve a moved element's identity has a way to say so,
 	/// and so `map_each` has something to forward.
-	// I5: a POSITION parameter
-	fun move_range(self, from: i32, count: i32, to: i32) {
-		if count <= 0 || from == to {
+	fun move_range(self, from: usize, count: usize, to: usize) {
+		if count == 0 || from == to {
 			ret;
 		}
 		mut lifted: List<T> = [];
-		mut taken = 0; // I5
+		mut taken = 0;
 		for taken < count {
 			lifted.push(self.items.write().remove(from));
 			taken += 1;
 		}
-		mut offset = 0; // I5
+		mut offset = 0;
 		for offset < lifted.len() {
 			match lifted.get(offset) {
 				Some(let value) => self.items.write().insert(to + offset, value),
@@ -857,8 +841,7 @@ export impl ListCell<type T> {
 	}
 
 	/// How many ops the log is holding — what a pin on the trim reads.
-	fun logged(self): i32 {
-		// I5
+	fun logged(self): usize {
 		self.log.held()
 	}
 }
@@ -879,25 +862,25 @@ export impl ListCell<type T: PartialEq> {
 	/// element really did move) and is what `each`'s keyed pass is for. A source
 	/// that knows it reordered says `move_range`.
 	fun reconcile_to(self, items: List<T>) {
-		let old_length = self.size(); // I5
-		let new_length = items.len(); // I5
-		mut prefix = 0; // I5
+		let old_length = self.size();
+		let new_length = items.len();
+		mut prefix = 0;
 		for prefix < old_length && prefix < new_length {
 			if self.items.read()[prefix] != items[prefix] {
 				jump break;
 			}
 			prefix += 1;
 		}
-		mut suffix = 0; // I5
+		mut suffix = 0;
 		for prefix + suffix < old_length && prefix + suffix < new_length {
 			if self.items.read()[old_length - 1 - suffix] != items[new_length - 1 - suffix] {
 				jump break;
 			}
 			suffix += 1;
 		}
-		let removed = old_length - prefix - suffix; // I5
+		let removed = old_length - prefix - suffix;
 		mut arriving: List<T> = [];
-		mut index = prefix; // I5
+		mut index = prefix;
 		for index < new_length - suffix {
 			match items.get(index) {
 				Some(let value) => arriving.push(value),
@@ -949,8 +932,7 @@ export impl ListCell<type T> with Signal<List<T>> {
 
 export impl ListCell<type T> with SequenceCell<T> {
 	/// Read in place — the length, not a copy of the run (M86).
-	fun size(self): i32 {
-		// I5
+	fun size(self): usize {
 		self.items.read().len()
 	}
 
@@ -959,11 +941,10 @@ export impl ListCell<type T> with SequenceCell<T> {
 	/// (`KeyedCell`'s discipline, verbatim.) A splice that changes nothing —
 	/// clamped to nothing taken and nothing arriving — records nothing and
 	/// publishes nothing.
-	// I5: a POSITION parameter
-	fun splice(self, at: i32, removed: i32, inserted: List<T>) {
-		let held = self.size(); // I5
-		let start = splice_start(held, at); // I5
-		let taking = splice_count(held, start, removed); // I5
+	fun splice(self, at: usize, removed: usize, inserted: List<T>) {
+		let held = self.size();
+		let start = splice_start(held, at);
+		let taking = splice_count(held, start, removed);
 		if taking == 0 && inserted.len() == 0 {
 			ret;
 		}
@@ -1033,7 +1014,7 @@ export fun map_each<T, U, S: DeltaSource<List<T>, SeqOp<T>>>(
 				// The derivative of `map g`: what arrived, mapped. Nothing else is
 				// read, and `g` runs exactly `inserted.len()` times.
 				SeqOp::Splice(let at, let removed, let inserted) => {
-					out.splice(at, removed.len(), inserted.map(g)); // I5
+					out.splice(at, removed.len(), inserted.map(g));
 				},
 				SeqOp::SetAt(let at, let _was, let value) => out.set_at(at, g(value)),
 				// The honest N: the collection became something else, so the

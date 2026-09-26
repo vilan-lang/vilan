@@ -39,7 +39,7 @@ export fun join(parts: List<str>, separator: str): str {
 // `text` with every non-empty line pushed right by `tabs` tab stops. Empty
 // lines stay empty (no trailing whitespace). Containers use this to place
 // child text at its depth.
-export fun indent(text: str, tabs: i32): str {
+export fun indent(text: str, tabs: usize): str {
 	let prefix = "\t".repeat(tabs);
 	mut indented = "";
 	mut first = true;

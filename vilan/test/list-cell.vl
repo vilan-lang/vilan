@@ -52,14 +52,14 @@ let notifications: Shared<i32> = Shared::new(0);
 
 fun counted(text: str): i32 {
 	calls.write() = calls.read() + 1;
-	text.len()
+	text.len().as_i32()
 }
 
 /// THE LAW, checked against the naive rerun.
 fun law(label: str, source: ListCell<str>, derived: ListCell<i32>) {
 	mut naive: List<i32> = [];
 	for value in source.get() {
-		naive.push(value.len());
+		naive.push(value.len().as_i32());
 	}
 	let held = derived.get();
 	if held.len() != naive.len() {
@@ -105,6 +105,12 @@ fun next_random(bound: i32): i32 {
 	let state = (seed.read() * 16807i53) % 2147483647i53;
 	seed.write() = state;
 	(state % bound.as_i53()).as_i32()
+}
+
+/// A random POSITION below `bound` — the same draw as `next_random`, at the
+/// index type the sequence surface takes.
+fun pick(bound: usize): usize {
+	next_random(bound.as_i32()).as_usize()
 }
 
 let walk_calls: Shared<i32> = Shared::new(0);
@@ -288,16 +294,18 @@ fun main() {
 
 	// === 8. Out of range: one splice, two surfaces ===========================
 	//
-	// `remove_range(1, 99)` asks for "the rest"; `remove_at(50)` and
-	// `insert_at(-3, ..)` are clamped exactly as the cell clamps them, because
-	// the recorder and the cell run the same splice.
+	// `remove_range(1, 99)` asks for "the rest"; `remove_at(50)` is clamped
+	// exactly as the cell clamps it, because the recorder and the cell run the
+	// same splice. (A position is a `usize` since I5 S2, so there is no negative
+	// one left to clamp: the front is asked for as `0`, which is where
+	// `insert_at(-3, ..)` used to land.)
 	let clamped: ListCell<str> = ListCell<str>::of(["a", "bb", "ccc", "dddd"]);
 	let clamped_lengths = map_each(clamped, counted);
 	let clamp_calls = calls.read();
 	clamped.edit(|&mut list| {
 		list.remove_range(1, 99);
 		list.remove_at(50);
-		list.insert_at(-3, "front");
+		list.insert_at(0, "front");
 	});
 	law("clamped edit", clamped, clamped_lengths);
 	clamped.remove_range(1, 99);
@@ -332,21 +340,21 @@ fun main() {
 				if choice < 8 || size == 0 {
 					walk.push(next_random(100));
 				} else if choice < 11 {
-					walk.insert_at(next_random(size + 1), next_random(100));
+					walk.insert_at(pick(size + 1), next_random(100));
 				} else if choice < 13 {
-					walk.remove_at(next_random(size));
+					walk.remove_at(pick(size));
 				} else if choice < 15 {
-					walk.set_at(next_random(size), next_random(100));
+					walk.set_at(pick(size), next_random(100));
 				} else if choice < 17 {
-					let from = next_random(size);
-					let count = 1 + next_random(size - from);
-					walk.move_range(from, count, next_random(size - count + 1));
+					let from = pick(size);
+					let count = 1 + pick(size - from);
+					walk.move_range(from, count, pick(size - count + 1));
 				} else if choice < 18 {
 					walk.pop();
 				} else if choice < 19 && size > 12 {
-					walk.remove_range(next_random(size), 1 + next_random(4));
+					walk.remove_range(pick(size), 1 + pick(4));
 				} else if choice < 20 && size > 20 {
-					walk.truncate(next_random(size));
+					walk.truncate(pick(size));
 				} else if choice < 21 && size > 16 {
 					// The wholesale write: a `Reset`, the honest N.
 					mut fresh: List<i32> = [];
@@ -360,12 +368,12 @@ fun main() {
 					// The compat door: the same list with one element edited
 					// and one appended — one `Splice`, not a `Reset`.
 					mut edited = walk.get();
-					edited[next_random(size)] = next_random(100);
+					edited[pick(size)] = next_random(100);
 					edited.push(next_random(100));
 					walk.reconcile_to(edited);
 				} else {
 					// The batch door, inside the batch.
-					let at = next_random(size);
+					let at = pick(size);
 					walk.edit(|&mut list| {
 						list.insert_at(at, next_random(100));
 						list.remove_at(0);

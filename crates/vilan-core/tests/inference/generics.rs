@@ -1305,15 +1305,15 @@ fn impl_binder_inherits_multiple_bounds_from_a_later_declared_struct() {
         r#"
         import std::io::print;
         trait Greeter { fun greet(self): str; }
-        trait Counter { fun count(self): i32; }
+        trait Counter { fun count(self): usize; }
         struct Hello { name: str }
         impl Hello with Greeter { fun greet(self): str { "hi " + self.name } }
-        impl Hello with Counter { fun count(self): i32 { self.name.len() } }
+        impl Hello with Counter { fun count(self): usize { self.name.len() } }
         impl Wrapper<type T> {
             fun describe(self): str {
                 (self.inner).greet()
             }
-            fun tally(self): i32 {
+            fun tally(self): usize {
                 (self.inner).count()
             }
         }
@@ -4531,11 +4531,11 @@ fn a_constructed_source_bound_resolves_inside_a_generic_body() {
         import std::compare::PartialEq;
         import std::reactive::{ Signal, SignalCell, Source };
 
-        fun consume<T: PartialEq, S: Source<List<T>>>(source: S): i32 {
+        fun consume<T: PartialEq, S: Source<List<T>>>(source: S): usize {
             source.get().len()
         }
 
-        fun wrapper<T: PartialEq>(value: List<T>): i32 {
+        fun wrapper<T: PartialEq>(value: List<T>): usize {
             let cell: SignalCell<List<T>> = Signal::new(value);
             consume(cell)
         }
@@ -8620,13 +8620,13 @@ fn b380_indexing_a_read_temporary_at_a_generic_element_type_resolves() {
         import std::option::Option::{ self, None, Some };
         import std::shared::Shared;
 
-        fun index_temporary<K>(cells: Shared<List<K>>, at: i32): K {
+        fun index_temporary<K>(cells: Shared<List<K>>, at: usize): K {
             cells.read()[at]
         }
 
         // The control the item names: `.get(at)` on the same temporary already
         // resolved, and must go on doing so.
-        fun get_temporary<K>(cells: Shared<List<K>>, at: i32): Option<K> {
+        fun get_temporary<K>(cells: Shared<List<K>>, at: usize): Option<K> {
             cells.read().get(at)
         }
 
@@ -8653,7 +8653,7 @@ fn b380_a_bound_read_at_a_generic_element_type_resolves_too() {
         import std::io::print;
         import std::shared::Shared;
 
-        fun index_bound<K>(cells: Shared<List<K>>, at: i32): K {
+        fun index_bound<K>(cells: Shared<List<K>>, at: usize): K {
             let list = cells.read();
             list[at]
         }
@@ -8676,11 +8676,11 @@ fn b380_a_concrete_shared_list_and_a_plain_generic_list_are_unchanged() {
         import std::io::print;
         import std::shared::Shared;
 
-        fun index_concrete(cells: Shared<List<i32>>, at: i32): i32 {
+        fun index_concrete(cells: Shared<List<i32>>, at: usize): i32 {
             cells.read()[at]
         }
 
-        fun index_plain<K>(list: List<K>, at: i32): K {
+        fun index_plain<K>(list: List<K>, at: usize): K {
             list[at]
         }
 

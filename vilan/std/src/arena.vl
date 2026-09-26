@@ -22,7 +22,7 @@ export *;
 /// `{ index, generation }`.
 [derive(Wire)]
 struct Handle<T> {
-	index: i32,
+	index: usize,
 	generation: i32,
 }
 
@@ -41,7 +41,7 @@ struct Slot<T> {
 /// arena, a random value for a `branded()` one (see `branded`).
 struct Arena<T> {
 	slots: List<Slot<T>>,
-	free: List<i32>,
+	free: List<usize>,
 	brand: i32,
 }
 
@@ -132,7 +132,7 @@ impl Arena<type T> {
 	}
 
 	/// The number of live values (occupied slots).
-	fun len(self): i32 {
+	fun len(self): usize {
 		self.slots.len() - self.free.len()
 	}
 

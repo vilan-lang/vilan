@@ -12,30 +12,30 @@ export external struct Bytes;
 export impl Bytes {
 	/// A zero-filled buffer of `size` bytes.
 	[extern(new, "Uint8Array")]
-	external fun alloc(size: i32): Bytes;
+	external fun alloc(size: usize): Bytes;
 
 	/// The byte count.
 	[extern(get, "length")]
-	external fun len(self): i32;
+	external fun len(self): usize;
 
 	/// The byte at `index` (0–255).
 	[extern(method, "at")]
-	external fun get(self, index: i32): i32;
+	external fun get(self, index: usize): i32;
 
 	/// The same byte `u32`-typed — for unsigned reassembly (`b0 | b1 << 8 …`),
 	/// where the operand type selects the unsigned shift/wrap emission.
 	[extern(method, "at")]
-	external fun get_u32(self, index: i32): u32;
+	external fun get_u32(self, index: usize): u32;
 
 	/// Lowercase hex rendering of the whole buffer.
 	fun to_hex(self): str {
 		let digits = "0123456789abcdef";
 		mut out = "";
-		for index in Range::new(0, self.len()) {
-			let byte = self.get(index);
+		for index in Range::new(0, self.len().as_i32()) {
+			let byte = self.get(index.as_usize());
 			out = out
-				+ digits.substring(byte / 16, byte / 16 + 1)
-				+ digits.substring(byte % 16, byte % 16 + 1);
+				+ digits.substring((byte / 16).as_usize(), (byte / 16 + 1).as_usize())
+				+ digits.substring((byte % 16).as_usize(), (byte % 16 + 1).as_usize());
 		}
 		out
 	}
@@ -43,28 +43,28 @@ export impl Bytes {
 	/// Overwrite `from..to` (exclusive) with `value` — host semantics: the stored
 	/// byte is `value & 0xFF`.
 	[extern(method, "fill")]
-	external fun fill(self, value: i32, from: i32, to: i32): Bytes;
+	external fun fill(self, value: i32, from: usize, to: usize): Bytes;
 
 	/// Copy all of `source` into this buffer starting at `offset` (the host
 	/// `TypedArray.set` — errors if it would overflow).
 	[extern(method, "set")]
-	external fun copy_into(self, source: Bytes, offset: i32);
+	external fun copy_into(self, source: Bytes, offset: usize);
 
 	/// A copy of `from..to` (`to` exclusive).
 	[extern(method, "slice")]
-	external fun slice(self, from: i32, to: i32): Bytes;
+	external fun slice(self, from: usize, to: usize): Bytes;
 
 	/// Store one byte (`value & 0xFF`) at `index`.
-	fun set(self, index: i32, value: i32) {
+	fun set(self, index: usize, value: i32) {
 		let _ = self.fill(value, index, index + 1);
 	}
 
 	/// The same store `u32`-typed (the host coerces `& 0xFF` either way) — for byte
 	/// extraction done in `u32` arithmetic, mirroring `get_u32`.
 	[extern(method, "fill")]
-	external fun fill_u32(self, value: u32, from: i32, to: i32): Bytes;
+	external fun fill_u32(self, value: u32, from: usize, to: usize): Bytes;
 
-	fun set_u32(self, index: i32, value: u32) {
+	fun set_u32(self, index: usize, value: u32) {
 		let _ = self.fill_u32(value, index, index + 1);
 	}
 
@@ -104,10 +104,10 @@ export impl DataView {
 	/// Read/write an IEEE-754 double at `offset`; `little_endian` selects the byte
 	/// order.
 	[extern(method, "getFloat64")]
-	external fun read_f64(self, offset: i32, little_endian: bool): f64;
+	external fun read_f64(self, offset: usize, little_endian: bool): f64;
 
 	[extern(method, "setFloat64")]
-	external fun write_f64(self, offset: i32, value: f64, little_endian: bool);
+	external fun write_f64(self, offset: usize, value: f64, little_endian: bool);
 }
 
 // --- UTF-8 ----------------------------------------------------------------

@@ -32,13 +32,13 @@ trait Iterator<T> {
 	/// The first `count` values, then exhausted. `take` is what makes an unbounded
 	/// source usable: it never pulls past its budget, so `source.take(3).to_list()`
 	/// terminates over an infinite `from_fn`.
-	fun take(self, count: i32): Taken<Self, T> {
+	fun take(self, count: usize): Taken<Self, T> {
 		Taken { upstream = self, remaining = count }
 	}
 
 	/// Everything after the first `count` values. A source shorter than `count`
 	/// leaves an exhausted iterator, not an error.
-	fun skip(self, count: i32): Skipped<Self, T> {
+	fun skip(self, count: usize): Skipped<Self, T> {
 		Skipped { upstream = self, pending = count }
 	}
 
@@ -95,7 +95,7 @@ trait Iterator<T> {
 
 	/// How many values the iterator yields. Pulls all of them, so it does not
 	/// return over an unbounded source — bound it with `take` first.
-	fun count(mut self): i32 {
+	fun count(mut self): usize {
 		mut seen = 0;
 		for _value in self {
 			seen = seen + 1;
@@ -159,7 +159,7 @@ impl Iterator<type T> {
 /// list; the eager `List` methods that only need one pass still take one.
 struct ListIterator<T> {
 	items: List<T>,
-	index: i32,
+	index: usize,
 }
 
 impl ListIterator<type T> with Iterator<T> {
@@ -255,7 +255,7 @@ impl FilterMapped<type I: Iterator<T>, type T, type U> with Iterator<U> {
 
 struct Taken<I, T> {
 	upstream: I,
-	remaining: i32,
+	remaining: usize,
 }
 
 impl Taken<type I: Iterator<T>, type T> with Iterator<T> {
@@ -270,7 +270,7 @@ impl Taken<type I: Iterator<T>, type T> with Iterator<T> {
 
 struct Skipped<I, T> {
 	upstream: I,
-	pending: i32,
+	pending: usize,
 }
 
 impl Skipped<type I: Iterator<T>, type T> with Iterator<T> {
@@ -290,11 +290,11 @@ impl Skipped<type I: Iterator<T>, type T> with Iterator<T> {
 
 struct Enumerated<I, T> {
 	upstream: I,
-	index: i32,
+	index: usize,
 }
 
-impl Enumerated<type I: Iterator<T>, type T> with Iterator<(i32, T)> {
-	fun next(&mut self): Option<(i32, T)> {
+impl Enumerated<type I: Iterator<T>, type T> with Iterator<(usize, T)> {
+	fun next(&mut self): Option<(usize, T)> {
 		if self.upstream.next() is Some(let value) {
 			let index = self.index;
 			self.index = index + 1;

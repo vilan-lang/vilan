@@ -258,10 +258,10 @@ function $ag(self) {
 }
 function $aj(self) {
 	let result = [  ];
-	let index = self.length - 1;
-	while (index >= 0) {
-		result.push(__clone(__at(self, index)));
+	let index = self.length;
+	while (index > 0) {
 		index = index - 1;
+		result.push(__clone(__at(self, index)));
 	}
 	return result;
 }
@@ -426,7 +426,7 @@ console.log($at($aq($an($b($a([ 1, 2, 2, 3 ]), (n) => {
 const lengths = $aA($av($c($a([ "alpha", "hi" ]), (word) => {
 	return [ word, word.length ];
 })));
-console.log($aG($aD(lengths, "hi"), -(1)));
+console.log($aG($aD(lengths, "hi"), 0));
 let live = [ 1, 2 ];
 let cursor = $a(live);
 live.push(3);

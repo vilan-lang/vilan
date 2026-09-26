@@ -964,10 +964,10 @@ once per changed element rather than once per element.
 
 ```vilan,fragment
 enum SeqOp<T> {
-	Splice(i32, List<T>, List<T>),  // at: these left, these arrived
-	SetAt(i32, T, T),               // at: was this, is now this
-	Reset(List<T>),                 // the collection BECAME this list
-	Move(i32, i32, i32),            // from, count, to — the same elements, elsewhere
+	Splice(usize, List<T>, List<T>),  // at: these left, these arrived
+	SetAt(usize, T, T),               // at: was this, is now this
+	Reset(List<T>),                   // the collection BECAME this list
+	Move(usize, usize, usize),        // from, count, to — the same elements, elsewhere
 }
 
 enum MapOp<K: Hashable, V> { Put(K, Option<V>, V), Delete(K, V), Reset(Map<K, V>) }
@@ -987,7 +987,7 @@ different events, and the difference is whether that owner survives.
 The log and its cursors are the machinery:
 
 ```vilan,fragment
-let delta_log_limit: i32 = 1024;
+let delta_log_limit: usize = 1024;
 
 struct DeltaCursor { … }   // one consumer's place in a log
 
@@ -995,13 +995,13 @@ struct DeltaLog<O> { … }
 
 impl DeltaLog<type O> {
 	fun new(): DeltaLog<O>
-	fun with_limit(limit: i32): DeltaLog<O>
+	fun with_limit(limit: usize): DeltaLog<O>
 	fun record(self, op: O)                                  // trims first, then appends
 	fun cursor(self): DeltaCursor                            // minted at the current sequence
 	fun drop_cursor(self, cursor: DeltaCursor)
 	fun since(self, cursor: DeltaCursor): Option<List<O>>    // `None` = lost history
 	fun trim(self)
-	fun held(self): i32
+	fun held(self): usize
 	fun at(self): i32
 	fun oldest(self): i32
 }
@@ -1063,12 +1063,12 @@ struct ListCell<T> { … }            // the list, a DeltaLog<SeqOp<T>>, one not
 impl ListCell<type T> {
 	fun new(): ListCell<T>
 	fun of(elements: List<T>): ListCell<T>
-	fun with_limit(elements: List<T>, limit: i32): ListCell<T>
+	fun with_limit(elements: List<T>, limit: usize): ListCell<T>
 	fun peek<U>(self, read: sync |&List<T>| U): U      // read IN PLACE, no copy of the run
-	fun set_at(self, at: i32, value: T)                 // an element changed IN PLACE
-	fun move_range(self, from: i32, count: i32, to: i32)
+	fun set_at(self, at: usize, value: T)               // an element changed IN PLACE
+	fun move_range(self, from: usize, count: usize, to: usize)
 	fun edit(self, body: sync |&mut Tracked<T>| void)   // many mutations, ONE notification
-	fun logged(self): i32
+	fun logged(self): usize
 }
 impl ListCell<type T: PartialEq> { fun reconcile_to(self, items: List<T>) }
 // and: Source<List<T>>, Signal<List<T>>, SequenceCell<T>, DeltaSource<List<T>, SeqOp<T>>
@@ -1103,8 +1103,8 @@ write is recorded and no method can forget:
 
 ```vilan,fragment
 trait SequenceCell<T> {
-	fun size(self): i32;
-	fun splice(self, at: i32, removed: i32, inserted: List<T>);
+	fun size(self): usize;
+	fun splice(self, at: usize, removed: usize, inserted: List<T>);
 	// twelve defaults over those two:
 	// is_empty, push, prepend, insert_at, insert_all, remove_at,
 	// remove_range, pop, extend, clear, set_all, truncate
@@ -1202,13 +1202,13 @@ re-runs it at all, which makes the contract sharper rather than different.
 
 ```vilan,fragment
 enum RowStep {
-	Keep(i32),     // reuse old row at index (moved into the new order)
-	Refresh(i32),  // same key, changed value: rebuild, dispose old index
-	Fresh,         // a new row
+	Keep(usize),     // reuse old row at index (moved into the new order)
+	Refresh(usize),  // same key, changed value: rebuild, dispose old index
+	Fresh,           // a new row
 }
 struct ReconcilePlan {
 	steps: List<RowStep>,  // one per NEW item, in the new order
-	removed: List<i32>,    // old indices gone entirely
+	removed: List<usize>,  // old indices gone entirely
 }
 fun reconcile<T, K: PartialEq + Hashable>(
 	old_keys: List<K>, old_items: List<T>, items: List<T>, key_of: sync |T| K,

@@ -206,7 +206,7 @@ export impl Database {
 		let names = migration_names(migrations);
 		self.exec("CREATE TABLE IF NOT EXISTS vilan_migrations (name TEXT PRIMARY KEY NOT NULL, applied_at_ms INTEGER NOT NULL)");
 		let recorded = self.recorded_migrations();
-		refuse_database_ahead(names, recorded, migrations.len());
+		refuse_database_ahead(names, recorded, migrations.len().as_i32());
 		refuse_inserted_migration(migrations, recorded);
 
 		mut applied: List<str> = [];
@@ -323,21 +323,27 @@ fun refuse_database_ahead(names: Set<str>, recorded: Set<str>, count: i32) {
 /// with history this refusal catches every misordering such a rule would, and on a
 /// fresh database any list order is self-consistent — it IS the history.
 fun refuse_inserted_migration(migrations: List<Migration>, recorded: Set<str>) {
-	mut last_applied = -1;
+	// I5 S2: "nothing applied" is `None`, where it was the `-1` below every index.
+	// (After S2 the `-1` COMPILES as a `usize` — the binding takes its type from
+	// `last_applied = index` and a negative literal is not refused at an unsigned
+	// type — which is why this sentinel is a hand edit and not a diagnostic.)
+	mut last_applied: Option<usize> = None;
 	mut index = 0;
 	for index < migrations.len() {
 		if recorded.contains(migrations[index].name) {
-			last_applied = index;
+			last_applied = Some(index);
 		}
 		index += 1;
 	}
-	mut earlier = 0;
-	for earlier < last_applied {
-		let pending = migrations[earlier].name;
-		if !recorded.contains(pending) {
-			let applied = migrations[last_applied].name;
-			panic(i"std::db migrate: migration '{pending}' is not applied, but '{applied}' after it in the list is — a migration was inserted before the applied history");
+	if last_applied is Some(let last) {
+		mut earlier = 0;
+		for earlier < last {
+			let pending = migrations[earlier].name;
+			if !recorded.contains(pending) {
+				let applied = migrations[last].name;
+				panic(i"std::db migrate: migration '{pending}' is not applied, but '{applied}' after it in the list is — a migration was inserted before the applied history");
+			}
+			earlier += 1;
 		}
-		earlier += 1;
 	}
 }

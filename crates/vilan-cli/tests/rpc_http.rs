@@ -1258,7 +1258,7 @@ impl Ledger {
 
 	[rpc]
 	fun count(self): i32 {
-		self.rows.get().len()
+		self.rows.get().len().as_i32()
 	}
 }
 

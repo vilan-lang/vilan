@@ -6,6 +6,20 @@ function __at_view(list, index) {
 	if (index >= 0 && index < list.length) return [ list, index ];
 	throw "index out of bounds: the length is " + list.length + " but the index is " + index;
 }
+function saturate_unsigned(value) {
+	const truncated = Math.trunc(value);
+	let $g = null;
+	if (truncated > 0) {
+		$g = truncated;
+	} else {
+		$g = 0;
+	}
+	return $g;
+}
+function as_usize(self) {
+	const widened = Number(self);
+	return Number(saturate_unsigned(widened));
+}
 function get_mut(self) {
 	return [ 0, [ self, 0 ] ];
 }
@@ -16,13 +30,13 @@ function inner_mut(self) {
 	return [ 0, self[0] ];
 }
 function item_mut(self, index) {
-	let $g = null;
-	if (index < self[1].length) {
-		$g = [ 0, __at_view(self[1], index) ];
+	let $h = null;
+	if (as_usize(index) < self[1].length) {
+		$h = [ 0, __at_view(self[1], as_usize(index)) ];
 	} else {
-		$g = [ 1 ];
+		$h = [ 1 ];
 	}
-	return $g;
+	return $h;
 }
 let slot = [ 1 ];
 const $a = get_mut(slot);
@@ -58,25 +72,25 @@ if ($e[0] === 0) {
 }
 $f;
 console.log(outer[0][0]);
-const $h = item_mut(outer, 1);
-let $i = null;
-if ($h[0] === 0) {
-	const v4 = $h[1];
+const $i = item_mut(outer, 1);
+let $j = null;
+if ($i[0] === 0) {
+	const v4 = $i[1];
 	v4[0][v4[1]] = 99;
-	$i = undefined;
+	$j = undefined;
 } else {
-	$i = undefined;
+	$j = undefined;
 }
-$i;
+$j;
 console.log(__at(outer[1], 1));
-const $j = item_mut(outer, 9);
-let $k = null;
-if ($j[0] === 0) {
-	const v5 = $j[1];
+const $k = item_mut(outer, 9);
+let $l = null;
+if ($k[0] === 0) {
+	const v5 = $k[1];
 	v5[0][v5[1]] = 0;
-	$k = undefined;
+	$l = undefined;
 } else {
 	console.log(0);
-	$k = undefined;
+	$l = undefined;
 }
-process.exit($k);
+process.exit($l);

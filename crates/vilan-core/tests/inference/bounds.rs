@@ -3130,13 +3130,13 @@ fn const_eval_refuses_the_same_list_insert_the_runtime_refuses() {
     assert_fails_with(
         r#"
         import std::io::print;
-        fun grow(): i32 {
+        fun grow(): usize {
             mut xs: List<i32> = List::new();
             xs.push(10);
             xs.insert(3, 20);
             xs.len()
         }
-        let BAD: i32 = const grow();
+        let BAD: usize = const grow();
         fun main() { print(BAD); }
         "#,
         "index out of bounds: the length is 1 but the index is 3",
@@ -3158,7 +3158,7 @@ fn const_eval_agrees_with_the_runtime_on_an_in_bounds_list_splice() {
             xs.insert(1, 2);
             xs.insert(4, 5);
             let head = xs.remove(0);
-            head * 100 + xs.remove(1) * 10 + xs.len()
+            head * 100 + xs.remove(1) * 10 + xs.len().as_i32()
         }
         let FOLDED: i32 = const rearranged();
         fun main() { print(FOLDED); print(rearranged()); }
@@ -5176,7 +5176,7 @@ fn a_const_read_parses_the_books_largest_page_within_budget() {
         import std::result::Result::{ Err, Ok };
         fun block_count(): i32 {
             match markdown::parse(asset::read("docs/spec/memory.md")) {
-                Ok(let doc) => doc.blocks.len()
+                Ok(let doc) => doc.blocks.len().as_i32()
                 Err(let error) => 0 - 1
             }
         }
@@ -8115,7 +8115,7 @@ fn b251_the_grounded_parameter_is_what_a_consumer_is_checked_against() {
     assert_fails_with(
         &format!(
             r#"{HELD_DYN}
-            fun count(h: Held<i32>): i32 {{ h.list.get().len() }}
+            fun count(h: Held<i32>): usize {{ h.list.get().len() }}
             fun main() {{ print(count(Held {{ list = SignalCell::new(["a"]) }})); }}
             "#
         ),
@@ -8130,7 +8130,7 @@ fn b251_the_matching_element_still_compiles_and_runs() {
     assert_compiles_and_runs(
         &format!(
             r#"{HELD_DYN}
-            fun count(h: Held<i32>): i32 {{ h.list.get().len() }}
+            fun count(h: Held<i32>): usize {{ h.list.get().len() }}
             fun main() {{ print(count(Held {{ list = SignalCell::new([1, 2, 3]) }})); }}
             main();
             "#
@@ -8178,7 +8178,7 @@ fn b251_a_bounded_and_satisfied_written_argument_compiles() {
     assert_compiles_and_runs(
         &format!(
             r#"{HELD_WRITTEN}
-            fun show(h: Held<i32, SignalCell<List<i32>>>): i32 {{ h.list.get().len() }}
+            fun show(h: Held<i32, SignalCell<List<i32>>>): usize {{ h.list.get().len() }}
             fun main() {{ print(show(Held {{ list = SignalCell::new([1, 2]) }})); }}
             main();
             "#
@@ -8195,7 +8195,7 @@ fn b251_a_written_argument_that_is_a_parameter_answers_through_its_own_bound() {
     // written application too.
     assert_compiles(&format!(
         r#"{HELD_WRITTEN}
-            fun count<T, S: Signal<List<T>>>(h: Held<T, S>): i32 {{ h.list.get().len() }}
+            fun count<T, S: Signal<List<T>>>(h: Held<T, S>): usize {{ h.list.get().len() }}
             fun main() {{ print(count(Held {{ list = SignalCell::new([1, 2]) }})); }}
             "#
     ));
@@ -8293,7 +8293,7 @@ fn b262_a_bounded_and_satisfied_enum_argument_compiles_and_runs() {
     assert_compiles_and_runs(
         &format!(
             r#"{HELD_ENUM}
-            fun show(h: Held<i32, SignalCell<List<i32>>>): i32 {{
+            fun show(h: Held<i32, SignalCell<List<i32>>>): usize {{
                 match h {{
                     Held::Full(let s) => s.get().len(),
                     Held::Empty => 0,
@@ -8329,7 +8329,7 @@ fn b262_a_bounded_and_satisfied_trait_argument_compiles_and_runs() {
     assert_compiles_and_runs(
         &format!(
             r#"{HELD_TRAIT}
-            fun show<H: Held<i32, SignalCell<List<i32>>>>(h: H): i32 {{
+            fun show<H: Held<i32, SignalCell<List<i32>>>>(h: H): usize {{
                 h.item().get().len()
             }}
             struct Box {{ inner: SignalCell<List<i32>> }}
@@ -13059,15 +13059,16 @@ const E218_STEER: &str = "There are no implicit numeric conversions; convert wit
 
 #[test]
 fn e218_a_let_annotation_names_the_conversion() {
-    assert_fails_spanning(
+    assert_fails_spanning_nth(
         r#"
         fun main() {
-        	let xs = [1, 2];
-        	let n: u53 = xs.len();
+        	let width: i32 = 2;
+        	let n: u53 = width;
         	print(i"{n}");
         }
         "#,
-        "xs.len()",
+        "width",
+        1,
         "Expected u53, but got i32 instead. There are no implicit numeric conversions; \
          convert with `.as_u53()`",
     );
@@ -13110,9 +13111,9 @@ fn e218_a_method_argument_names_the_conversion() {
     assert_fails_with(
         r#"
         fun main() {
-        	let xs = ["a", "b"];
+        	let floor: i32 = 1;
         	let at: u53 = 1u53;
-        	print(xs.get(at).unwrap_or("none"));
+        	print(floor.max(at));
         }
         "#,
         "Expected i32, but got u53 instead. There are no implicit numeric conversions; \
@@ -13124,12 +13125,12 @@ fn e218_a_method_argument_names_the_conversion() {
 fn e218_a_return_position_names_the_conversion() {
     assert_fails_with(
         r#"
-        fun count(xs: List<str>): u53 {
-        	xs.len()
+        fun count(width: i32): u53 {
+        	width
         }
 
         fun main() {
-        	print(i"{count(["a"])}");
+        	print(i"{count(1)}");
         }
         "#,
         "Expected u53, but got i32 instead. There are no implicit numeric conversions; \
@@ -13144,8 +13145,8 @@ fn e218_a_struct_field_names_the_conversion() {
         struct Cursor { at: u53 }
 
         fun main() {
-        	let xs = [1, 2];
-        	let cursor = Cursor { at = xs.len() };
+        	let width: i32 = 2;
+        	let cursor = Cursor { at = width };
         	print(i"{cursor.at}");
         }
         "#,
@@ -13159,9 +13160,9 @@ fn e218_a_reassignment_names_the_conversion() {
     assert_fails_with(
         r#"
         fun main() {
-        	let xs = [1, 2];
+        	let width: i32 = 2;
         	mut n: f64 = 0.5;
-        	n = xs.len();
+        	n = width;
         	print(i"{n}");
         }
         "#,

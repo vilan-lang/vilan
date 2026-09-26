@@ -378,10 +378,10 @@ impl str {
 	/// arithmetic on it is silently wrong, and `substring` would refuse it one call
 	/// later — so nothing outside this module sees the raw form.
 	[extern(method, "indexOf")]
-	external fun raw_index_of(self, needle: str): i32;
+	external fun raw_index_of(self, needle: str): usize;
 
 	[extern(method, "lastIndexOf")]
-	external fun raw_last_index_of(self, needle: str): i32;
+	external fun raw_last_index_of(self, needle: str): usize;
 
 	/// The index of the FIRST occurrence of `needle`, or `None` when the text does
 	/// not contain it — `contains` tests, this one locates. It is the missing half
@@ -395,7 +395,7 @@ impl str {
 	/// An empty needle is at `0`, as everywhere else. The index is zero-based and
 	/// counts UTF-16 code units — `substring`'s own unit, so the bound feeds it
 	/// directly.
-	fun index_of(self, needle: str): Option<i32> {
+	fun index_of(self, needle: str): Option<usize> {
 		let at = self.raw_index_of(needle);
 		if at < 0 {
 			None
@@ -408,7 +408,7 @@ impl str {
 	/// not contain it — `index_of` read from the other end, for cutting at the
 	/// final separator (a file extension, the last path segment). An empty needle
 	/// is at `len()`, which is where the host puts it.
-	fun last_index_of(self, needle: str): Option<i32> {
+	fun last_index_of(self, needle: str): Option<usize> {
 		let at = self.raw_last_index_of(needle);
 		if at < 0 {
 			None
@@ -422,16 +422,21 @@ impl str {
 // always-loaded core stays off the `option`/`result` chain — same reason as
 // `then_some`/`parse_i32` above. `get` returns a copy of the element.
 impl List<type T> {
-	external fun get(self, index: i32): Option<T>;
+	external fun get(self, index: usize): Option<T>;
 
 	fun first(self): Option<T> {
 		self.get(0)
 	}
 
-	/// `get(len - 1)`: for an empty list `len - 1` is `-1`, which `get` reports as
-	/// `None`.
+	/// The last element, `None` for an empty list. (I5 S2: it was `get(len - 1)`,
+	/// relying on `-1` reading back as `None` — an unsigned `len - 1` underflows
+	/// on an empty list instead, so the empty case is answered first.)
 	fun last(self): Option<T> {
-		self.get(self.len() - 1)
+		if self.is_empty() {
+			None
+		} else {
+			self.get(self.len() - 1)
+		}
 	}
 
 	/// The first element for which `predicate` holds — `None` when none does.

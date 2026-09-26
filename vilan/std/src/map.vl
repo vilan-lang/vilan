@@ -43,7 +43,7 @@ impl Map<type K: Hashable, type V> {
 		self.table.remove(key.hash());
 	}
 
-	fun len(self): i32 {
+	fun len(self): usize {
 		self.table.len()
 	}
 

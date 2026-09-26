@@ -38,7 +38,7 @@ fun to_number(text: str): Result<i32, str> {
 fun main() {
 	// map: field, then method-with-args in one group
 	print((find("hit")?.title).unwrap_or("?")); // dune
-	print((find("hit")?.sequel.len()).unwrap_or(0 - 1)); // 7
+	print((find("hit")?.sequel.len()).unwrap_or(0)); // 7
 	print((find("miss")?.title).unwrap_or("?")); // ?
 	// flatten: Option-yielding continuation stays single
 	print((find("hit")?.shelf()).unwrap_or("?")); // sci-fi

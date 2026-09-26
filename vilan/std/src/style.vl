@@ -451,7 +451,7 @@ export struct Gradient {
 	// Stops as rendered CSS, comma-joined, plus the count the two-stop minimum is
 	// checked against.
 	stops: str,
-	stop_count: i32,
+	stop_count: usize,
 	// The `:root` lines the stops' colors carry, emitted when the gradient reaches
 	// a `Style` — so a gradient of ramp tokens themes like everything else.
 	roots: List<str>,
@@ -792,10 +792,10 @@ export enum UserSelect {
 /// agree on names (the determinism the asset channel's dedup relies on).
 fun class_hash(text: str): str {
 	mut hash = 5381u32;
-	for index in Range::new(0, text.len()) {
+	for index in Range::new(0, text.len().as_i32()) {
 		// hash * 33 + code, wrapped to 32 bits: the shift and mask are u32-wrapped;
 		// the additions stay exact in between.
-		hash = ((hash << 5u32) + hash + text.code_at(index)) & 0xFFFFFFFFu32;
+		hash = ((hash << 5u32) + hash + text.code_at(index.as_usize())) & 0xFFFFFFFFu32;
 	}
 	"s" + encode36(hash)
 }
@@ -811,7 +811,7 @@ fun encode36(value: u32): str {
 	for _step in Range::new(0, 7) {
 		if rest > 0u32 {
 			let digit = (rest % 36u32).as_i32();
-			out = digits.substring(digit, digit + 1) + out;
+			out = digits.substring(digit.as_usize(), (digit + 1).as_usize()) + out;
 			rest = rest / 36u32;
 		}
 	}

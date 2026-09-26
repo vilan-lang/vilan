@@ -1,10 +1,12 @@
-//! I5 S1: `usize`, the index type (`proposal/index-type.md`).
+//! I5: `usize`, the index type (`proposal/index-type.md`).
 //!
 //! A DISTINCT numeric type — `u53` on the JS targets, the platform word
 //! natively — with the whole sized family's surface (§2.3), a `42usize`
 //! suffix (§11 Q5), the JS range guarantee on every backend (§11 Q3), a `Wire`
-//! impl at `i32`'s width (§6), and the subscript admitting it beside `i32`
-//! until S2 moves std's signatures. No std signature moves in S1.
+//! impl at `i32`'s width (§6). S1 built the type; S2 moved std's positions,
+//! lengths and counts to it and made it the subscript's one index type; the
+//! naming diagnostic (§8.2) and I6's saturating conversions are pinned here
+//! too.
 //!
 //! One subject module of the `inference` test binary; the harness it is
 //! written against lives in `support.rs`.
@@ -35,8 +37,8 @@ fn an_i32_does_not_flow_into_a_usize() {
     assert_fails_with(
         concat!(
             "fun main() {\n",
-            "\tlet xs = [1, 2];\n",
-            "\tlet n: usize = xs.len();\n",
+            "\tlet count: i32 = 2;\n",
+            "\tlet n: usize = count;\n",
             "\tprint(i\"{n}\");\n",
             "}\n",
         ),
@@ -469,28 +471,14 @@ fn a_usize_rides_the_wire_at_i32s_width_on_both_codecs() {
         concat!(
             "import std::binary::{ encode_binary, decode_binary };\n",
             "import std::json::{ encode_json, decode_json };\n",
-            "import std::bytes::Bytes;\n",
-            "\n",
-            "fun hex_of(bytes: Bytes): str {\n",
-            "\tlet digits = \"0123456789abcdef\";\n",
-            "\tmut out = \"\";\n",
-            "\tmut index = 0;\n",
-            "\tfor index < bytes.len() {\n",
-            "\t\tlet byte = bytes.get(index);\n",
-            "\t\tout = out + digits.substring(byte / 16, byte / 16 + 1);\n",
-            "\t\tout = out + digits.substring(byte % 16, byte % 16 + 1);\n",
-            "\t\tindex = index + 1;\n",
-            "\t}\n",
-            "\tout\n",
-            "}\n",
             "\n",
             "fun main() {\n",
             "\tlet positions: List<usize> = [0usize, 3usize, 2147483647usize];\n",
             "\tlet control: List<i32> = [0, 3, 2147483647];\n",
             "\tlet wide: List<u53> = [0u53, 3u53, 2147483647u53];\n",
-            "\tlet binary = hex_of(encode_binary(positions));\n",
-            "\tprint(binary == hex_of(encode_binary(control)));\n",
-            "\tprint(binary == hex_of(encode_binary(wide)));\n",
+            "\tlet binary = encode_binary(positions).to_hex();\n",
+            "\tprint(binary == encode_binary(control).to_hex());\n",
+            "\tprint(binary == encode_binary(wide).to_hex());\n",
             "\tprint(binary);\n",
             "\tlet text = encode_json(positions);\n",
             "\tprint(text == encode_json(control));\n",
@@ -532,12 +520,12 @@ fn a_derived_wire_struct_carries_a_usize_field() {
     );
 }
 
-// --- the subscript (B386's check, S1's admission) ----------------------------------
+// --- the subscript (B386's check; `usize` since S2) --------------------------------
 
 #[test]
 fn a_usize_index_reads_a_list_an_array_and_a_write() {
-    // S1 admits `usize` BESIDE `i32` at the subscript; S2 deletes the `i32`
-    // half when std's signatures move.
+    // S1 admitted `usize` BESIDE `i32` at the subscript; S2 made it the one
+    // index type, the one `xs.get(i)` takes.
     assert_compiles_and_runs(
         concat!(
             "fun main() {\n",
@@ -557,7 +545,8 @@ fn a_usize_index_reads_a_list_an_array_and_a_write() {
 
 #[test]
 fn a_u53_index_is_still_refused() {
-    // The admission is exactly two types, not "any unsigned integer".
+    // The index type is `usize`, not "any unsigned integer" — and a numeric
+    // index of another width is told the conversion.
     assert_fails_with(
         concat!(
             "fun main() {\n",
@@ -566,26 +555,68 @@ fn a_u53_index_is_still_refused() {
             "\tprint(xs[at]);\n",
             "}\n",
         ),
-        "an index must be an `i32`, and this one is `u53`",
+        "an index must be a `usize`, and this one is `u53`: a list and an array are \
+         POSITIONAL, so `xs[i]` takes the index `xs.get(i)` takes — anything else names no \
+         element, and the emitted subscript read `undefined` back instead of failing. There are \
+         no implicit numeric conversions; convert with `.as_usize()`",
+    );
+}
+
+#[test]
+fn an_i32_index_is_refused_since_s2_with_the_conversion() {
+    // S2 deleted S1's two-type admission: an `i32` is a value, not an index.
+    assert_fails_with(
+        concat!(
+            "fun main() {\n",
+            "\tlet xs: List<str> = [\"a\", \"b\"];\n",
+            "\tlet at: i32 = 1;\n",
+            "\tprint(xs[at]);\n",
+            "}\n",
+        ),
+        "an index must be a `usize`, and this one is `i32`",
+    );
+    assert_fails_with(
+        concat!(
+            "fun main() {\n",
+            "\tmut xs: List<str> = [\"a\", \"b\"];\n",
+            "\tlet at: i32 = 1;\n",
+            "\txs[at] = \"z\";\n",
+            "}\n",
+        ),
+        "convert with `.as_usize()`",
     );
 }
 
 #[test]
 fn a_usize_index_emits_the_same_subscript_as_an_i32_one() {
-    // §5.4: the JS emission does not change — a number is a number.
+    // §5.4: the JS emission does not change — a number is a number. Since S2
+    // an `i32` cannot index, so the i32 twin walks its list by `get` over a
+    // counter it converts, and the two loops' arithmetic, comparison and
+    // subscript text are compared where they are the same program: a counter
+    // that is a `usize` and one that is an `i32` emit identically.
     let with_usize = compile(concat!(
         "fun main() {\n",
         "\tlet xs: List<str> = [\"a\", \"b\"];\n",
-        "\tlet at: usize = 1;\n",
-        "\tprint(xs[at]);\n",
+        "\tmut at: usize = 0;\n",
+        "\tfor at < 2 {\n",
+        "\t\tprint(i\"{at}\");\n",
+        "\t\tat = at + 1;\n",
+        "\t}\n",
+        "\tlet last: usize = 1;\n",
+        "\tprint(xs[last]);\n",
         "}\n",
     ))
     .expect("the usize program compiles");
     let with_i32 = compile(concat!(
         "fun main() {\n",
         "\tlet xs: List<str> = [\"a\", \"b\"];\n",
-        "\tlet at: i32 = 1;\n",
-        "\tprint(xs[at]);\n",
+        "\tmut at: i32 = 0;\n",
+        "\tfor at < 2 {\n",
+        "\t\tprint(i\"{at}\");\n",
+        "\t\tat = at + 1;\n",
+        "\t}\n",
+        "\tlet last: usize = 1;\n",
+        "\tprint(xs[last]);\n",
         "}\n",
     ))
     .expect("the i32 program compiles");

@@ -172,7 +172,13 @@ function $v(self) {
 	return self.length === 0;
 }
 function $w(self) {
-	return __list_get(self, self.length - 1);
+	let $y = null;
+	if ($v(self)) {
+		$y = [ 1 ];
+	} else {
+		$y = __list_get(self, self.length - 1);
+	}
+	return $y;
 }
 function $q(self, $r) {
 	const $s = $r;
@@ -181,20 +187,20 @@ function $q(self, $r) {
 		const turn = $s[1];
 		$t = enqueue(turn, self[1].v);
 	} else {
-		const $x = $w(draining_turns.v);
-		let $y = null;
-		if ($x[0] === 0) {
-			const draining = $x[1];
-			$y = enqueue(draining, self[1].v);
+		const $z = $w(draining_turns.v);
+		let $A = null;
+		if ($z[0] === 0) {
+			const draining = $z[1];
+			$A = enqueue(draining, self[1].v);
 		} else {
 			for (const subscriber of self[1].v) {
 				if (subscriber[2].v) {
 					subscriber[1]();
 				}
 			}
-			$y = undefined;
+			$A = undefined;
 		}
-		$t = $y;
+		$t = $A;
 	}
 	return $t;
 }
@@ -202,22 +208,22 @@ function $o(self, value, $p) {
 	self[0].v = __clone(value);
 	$q(self, $p);
 }
-function $z(slot, $A, $B) {
+function $B(slot, $C, $D) {
 	$d(slot, (inner) => {
 		return console.log("holder " + $n(inner));
-	}, $A, $B);
-}
-function $E(self) {
-	return "plain box";
-}
-function $D(box) {
-	console.log($E(box));
+	}, $C, $D);
 }
 function $G(self) {
-	return "marked box";
+	return "plain box";
 }
 function $F(box) {
 	console.log($G(box));
+}
+function $I(self) {
+	return "marked box";
+}
+function $H(box) {
+	console.log($I(box));
 }
 const minting_derivation = __shared_new(false);
 const next_subscriber_id = __shared_new(0);
@@ -226,6 +232,6 @@ $a("static", [ 1 ]);
 const live = $e("first");
 $g(live, [ 1 ]);
 $o(live, "second", [ 1 ]);
-$z(live, [ 1 ]);
-$D([ [  ] ]);
+$B(live, [ 1 ]);
 $F([ [  ] ]);
+$H([ [  ] ]);

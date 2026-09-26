@@ -1332,7 +1332,7 @@ fn chained_maps_ground_each_link() {
             i"{n}"
         }
 
-        fun measure(text: str): i32 {
+        fun measure(text: str): usize {
             text.len()
         }
 
@@ -1376,7 +1376,7 @@ fn a_closure_grounded_generic_meets_a_method_bound() {
             }
         }
 
-        fun parse(text: str): i32 {
+        fun parse(text: str): usize {
             text.len()
         }
 
@@ -1417,7 +1417,7 @@ fn a_named_function_passes_as_a_method_closure_argument() {
             }
         }
 
-        fun measure(text: str): i32 {
+        fun measure(text: str): usize {
             text.len()
         }
 
@@ -1463,15 +1463,15 @@ fn a_named_function_binds_to_an_annotated_let_and_field() {
         import std::io::print;
 
         struct Holder {
-            hook: |str| i32,
+            hook: |str| usize,
         }
 
-        fun measure(text: str): i32 {
+        fun measure(text: str): usize {
             text.len()
         }
 
         fun main() {
-            let bound: |str| i32 = measure;
+            let bound: |str| usize = measure;
             print(bound("abc"));
             let holder = Holder { hook = measure };
             let hook = holder.hook;
@@ -1535,19 +1535,19 @@ fn a_void_function_without_annotation_coerces() {
 
 #[test]
 fn a_stored_function_value_survives_shared_storage() {
-    // Through `Shared<|str| i32>` — stored as a value, read back, called
+    // Through `Shared<|str| usize>` — stored as a value, read back, called
     // indirectly (the pilot's hook pattern, without the eta-expansion).
     assert_compiles_and_runs(
         r#"
         import std::io::print;
         import std::shared::Shared;
 
-        fun measure(text: str): i32 {
+        fun measure(text: str): usize {
             text.len()
         }
 
         fun main() {
-            let hook: Shared<|str| i32> = Shared::new(measure);
+            let hook: Shared<|str| usize> = Shared::new(measure);
             let stored = hook.read();
             print(stored("abcd"));
         }

@@ -224,7 +224,7 @@ export struct Document {
 	/// For a SUPPLIED shell, where that markup goes: the index just past the mount
 	/// element's start tag, located by the check itself (§5.8) — so nothing later
 	/// can move the splice somewhere the check never looked.
-	splice: i32,
+	splice: usize,
 }
 
 export impl Document {
@@ -475,7 +475,7 @@ export impl Document {
 	/// with no render and no hatch markup composes to the shell's own bytes,
 	/// untouched.
 	fun composed(self, shell: str): str {
-		mut insertions: List<(i32, str)> = [];
+		mut insertions: List<(usize, str)> = [];
 		mut missing: List<str> = [];
 		if self.rendered != "" {
 			insertions.push((self.splice, self.rendered));
@@ -518,7 +518,7 @@ fun script_tag(build: LegBuild): str {
 /// element's start tag, i.e. its first child position. `0` when the shell has no
 /// such element — unreachable through `from_shell`, whose check refuses a shell
 /// that does not carry the mount id.
-fun splice_point(shell: str, mount: str): i32 {
+fun splice_point(shell: str, mount: str): usize {
 	for tag in tags_of(shell) {
 		if attribute(tag, "id") == mount {
 			ret tag.end;
@@ -530,7 +530,7 @@ fun splice_point(shell: str, mount: str): i32 {
 /// Where hatch markup destined for inside an element goes in a supplied
 /// shell: the index of the shell's first `</name>` — insertion happens BEFORE
 /// the closing tag — or `None` when the shell carries no such tag (E77).
-fun closing_point(shell: str, name: str): Option<i32> {
+fun closing_point(shell: str, name: str): Option<usize> {
 	for tag in tags_of(shell) {
 		if tag.closing && tag.name == name {
 			ret Some(tag.start);
@@ -565,10 +565,10 @@ fun joined_hatch(existing: str, markup: str): str {
 /// `text` with each insertion's markup spliced in at its index. The indices are
 /// into the ORIGINAL text; insertions apply in ascending index order, and two at
 /// the same index keep their list order.
-export fun spliced(text: str, insertions: List<(i32, str)>): str {
+export fun spliced(text: str, insertions: List<(usize, str)>): str {
 	// A stable sort by index — at most three insertions ever arrive, so the
 	// quadratic count is fine and the clarity is not.
-	mut ordered: List<(i32, str)> = [];
+	mut ordered: List<(usize, str)> = [];
 	for insertion in insertions {
 		let (at, _markup) = insertion;
 		mut index = 0;
@@ -639,10 +639,10 @@ export struct Tag {
 	attributes: List<(str, str)>,
 	/// The index of its `<`. For a closing tag, the last position still inside the
 	/// element — the splice point hatch markup wants (E77).
-	start: i32,
+	start: usize,
 	/// One past its `>`, i.e. where its content begins — the splice point a
 	/// server-rendered document needs (§5.8).
-	end: i32,
+	end: usize,
 	/// Whether this is a closing tag (`</head>`).
 	closing: bool,
 }
@@ -794,7 +794,7 @@ fun tags_of(markup: str): List<Tag> {
 /// A found index plus `offset`, or `fallback` when the search came up empty — the
 /// "skip past this delimiter, or give up on the rest of the document" step the
 /// scanner takes four times.
-export fun past(found: Option<i32>, offset: i32, fallback: i32): i32 {
+export fun past(found: Option<usize>, offset: usize, fallback: usize): usize {
 	match found {
 		Some(let at) => at + offset,
 		None => fallback,
@@ -803,7 +803,7 @@ export fun past(found: Option<i32>, offset: i32, fallback: i32): i32 {
 
 /// The attributes of the tag whose name ends at `from`, and the index one past its
 /// `>`.
-fun attributes_of(markup: str, from: i32): (List<(str, str)>, i32) {
+fun attributes_of(markup: str, from: usize): (List<(str, str)>, usize) {
 	let length = markup.len();
 	mut attributes: List<(str, str)> = [];
 	mut index = from;
@@ -865,11 +865,14 @@ fun attributes_of(markup: str, from: i32): (List<(str, str)>, i32) {
 /// one: `name` is already ASCII-folded by its caller, and folding `A`..`Z` in
 /// place preserves both length and index, so a case-insensitive compare
 /// against the unfolded markup finds exactly the position the folded copy did.
-fun skip_raw_text(markup: str, from: i32, name: str): i32 {
+fun skip_raw_text(markup: str, from: usize, name: str): usize {
 	let length = markup.len();
 	let closing = "</" + name;
 	let closing_length = closing.len();
-	mut index = if from < 0 { 0 } else { from };
+	// I5 S2: the `from < 0` clamp is gone — an unsigned `from` cannot be negative,
+	// and a clamp that can no longer fire only hides one that arrived already
+	// wrapped (index-type.md §6).
+	mut index = from;
 	for index + closing_length <= length {
 		if matches_ascii_insensitive(markup, index, closing) {
 			ret index;
@@ -884,7 +887,7 @@ fun skip_raw_text(markup: str, from: i32, name: str): i32 {
 ///
 /// `at + needle.len() <= markup.len()` is the caller's contract, and it is what
 /// puts every `code_at` below in range.
-fun matches_ascii_insensitive(markup: str, at: i32, needle: str): bool {
+fun matches_ascii_insensitive(markup: str, at: usize, needle: str): bool {
 	let needle_length = needle.len();
 	mut offset = 0;
 	for offset < needle_length {
@@ -907,7 +910,7 @@ fun lowered_unit(unit: u32): u32 {
 }
 
 /// The first index at or after `from` that is not whitespace.
-fun skip_spaces(markup: str, from: i32): i32 {
+fun skip_spaces(markup: str, from: usize): usize {
 	let length = markup.len();
 	mut index = from;
 	for index < length && is_space(markup.substring(index, index + 1)) {
@@ -918,9 +921,15 @@ fun skip_spaces(markup: str, from: i32): i32 {
 
 /// The index of `needle` in `text` at or after `from`, or `None`. (`str` can answer
 /// whether it `contains` something, but not where.)
-fun index_of(text: str, needle: str, from: i32): Option<i32> {
+fun index_of(text: str, needle: str, from: usize): Option<usize> {
+	// I5 S2: `text.len() - needle.len()` underflows when the needle is the longer
+	// of the two (unspecified: negative on JS, a native panic), so that case is
+	// answered first; and the `from < 0` clamp is gone with the sign.
+	if needle.len() > text.len() {
+		ret None;
+	}
 	let limit = text.len() - needle.len();
-	mut index = if from < 0 { 0 } else { from };
+	mut index = from;
 	for index <= limit {
 		if text.substring(index, index + needle.len()) == needle {
 			ret Some(index);

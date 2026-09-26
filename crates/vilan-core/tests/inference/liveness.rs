@@ -274,7 +274,7 @@ fn a_module_level_binding_read_by_a_function_never_elides() {
         import std::io::print;
         import std::option::{ Option, Some };
         let table: List<i32> = [1, 2, 3];
-        fun size(): i32 { table.len() }
+        fun size(): usize { table.len() }
         let snapshot: Option<List<i32>> = Some(table);
         fun main() {
             print(size());
@@ -352,7 +352,7 @@ fn a_loan_to_a_resolved_callee_is_call_bounded() {
         import std::io::print;
         import std::option::{ Option, Some };
         struct Box { items: List<i32> }
-        fun peek(view: &Box): i32 { view.items.len() }
+        fun peek(view: &Box): usize { view.items.len() }
         fun main() {
             mut subject = Box { items = [1, 2] };
             print(peek(&subject));
