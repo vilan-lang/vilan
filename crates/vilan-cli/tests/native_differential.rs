@@ -3315,6 +3315,132 @@ const MOVES_PROBE: &str = concat!(
     "}\n",
 );
 
+/// **F39 (decided: the compile-time check follows aliases)**: a reentrant read
+/// through an ALIAS of the cell being `update`d is refused by name, as the
+/// same-place read already was — `let t2 = todos;` copies the cell's HANDLES,
+/// so `t2.get()` inside `todos.update(..)` is the same cell, and so is the
+/// reverse. The control stays identical: a VALUE read out of the cell before
+/// the update (`let before = todos.get();`) is a copy of the list, not an
+/// alias of the cell, and a field alias of a DIFFERENT cell is not the cell.
+#[test]
+fn a_reentrant_read_through_an_alias_is_refused_by_name() {
+    let staged = stage();
+    for (name, body) in [
+        (
+            "native_probe_alias_forward.vl",
+            "\tlet t2 = todos;\n\ttodos.update(|&mut list| {\n\t\tlist.push(2);\n\t\tprint(t2.get().len());\n\t});\n",
+        ),
+        (
+            "native_probe_alias_reverse.vl",
+            "\tlet t2 = todos;\n\tt2.update(|&mut list| {\n\t\tlist.push(2);\n\t\tprint(todos.get().len());\n\t});\n",
+        ),
+        (
+            "native_probe_alias_chain.vl",
+            "\tlet t2 = todos;\n\tlet t3 = t2;\n\tt3.update(|&mut list| {\n\t\tlist.push(2);\n\t\tprint(todos.get().len());\n\t});\n",
+        ),
+    ] {
+        std::fs::write(
+            staged.join(name),
+            format!(
+                "import std::io::print;\nimport std::reactive::{{ Signal, SignalCell }};\n\nfun main() {{\n\tlet todos: SignalCell<List<i32>> = Signal::new([1]);\n{body}}}\n"
+            ),
+        )
+        .expect("write the probe");
+        match compare(&staged, name) {
+            Verdict::Refused(reason) => assert!(
+                reason.contains("reads the same place again"),
+                "{name}: refused, and for this reason: {reason}"
+            ),
+            other => panic!("{name}: a reentrant read through an alias must be refused: {other:?}"),
+        }
+    }
+    std::fs::write(
+        staged.join("native_probe_alias_value.vl"),
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ Signal, SignalCell };\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet todos: SignalCell<List<i32>> = Signal::new([1]);\n",
+            "\tlet before = todos.get();\n",
+            "\ttodos.update(|&mut list| {\n",
+            "\t\tlist.push(before.len() + 1);\n",
+            "\t});\n",
+            "\tprint(todos.get());\n",
+            "}\n",
+        ),
+    )
+    .expect("write the control");
+    assert_eq!(
+        compare(&staged, "native_probe_alias_value.vl"),
+        Verdict::Identical,
+        "a value read before the update is not an alias of the cell"
+    );
+}
+
+/// **F39's runtime half**: an alias no static walk can see — the SAME cell
+/// handed to two parameters — still stops natively (the JS backend answers
+/// the in-progress value, which safe Rust has no second view of storage to
+/// read), but with the runtime's own sentence and node's exit code, not
+/// Rust's `already mutably borrowed`. Outside the differential by
+/// construction: the two backends answer differently, and that is the claim.
+#[test]
+fn a_reentrant_read_the_compiler_cannot_see_stops_with_the_runtimes_sentence() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_alias_parameter.vl"),
+        concat!(
+            "import std::io::print;\n",
+            "import std::reactive::{ Signal, SignalCell };\n",
+            "\n",
+            "fun touch(a: SignalCell<List<i32>>, b: SignalCell<List<i32>>) {\n",
+            "\ta.update(|&mut list| {\n",
+            "\t\tlist.push(2);\n",
+            "\t\tprint(b.get().len());\n",
+            "\t});\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet todos: SignalCell<List<i32>> = Signal::new([1]);\n",
+            "\ttouch(todos, todos);\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe");
+    let native = vilan(&staged)
+        .args([
+            "run",
+            "--backend",
+            "rust",
+            "native_probe_alias_parameter.vl",
+        ])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(
+        native.status.code(),
+        Some(1),
+        "node's exit code for a throw"
+    );
+    let stderr = String::from_utf8_lossy(&native.stderr);
+    assert!(
+        stderr.contains("a cell was read while it is being updated"),
+        "the runtime names the shape:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("already mutably borrowed"),
+        "not Rust's own sentence:\n{stderr}"
+    );
+    let javascript = vilan(&staged)
+        .args(["run", "native_probe_alias_parameter.vl"])
+        .output()
+        .expect("run the JS backend");
+    assert_eq!(
+        String::from_utf8_lossy(&javascript.stdout),
+        "2\n",
+        "the JS backend answers the in-progress value"
+    );
+}
+
 /// **F18 slice 2**: a closure declared SYNCHRONOUS, answering nothing, whose
 /// body awaits.
 ///

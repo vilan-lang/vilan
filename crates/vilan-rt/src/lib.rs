@@ -407,6 +407,18 @@ pub struct Shared<T> {
     inner: Rc<Slot<T>>,
 }
 
+/// The sentence a REENTRANT cell access dies with (F39): a read or a write of
+/// a cell while a `&mut` view of the same cell is live — `update`'s closure
+/// reading the cell it is updating through a handle the compiler could not
+/// see was the same one (an alias that arrived as a parameter). The JS backend
+/// answers the in-progress value there, because its view and its cell are one
+/// object; safe Rust has no second view of storage under mutation to answer
+/// with, so the program stops, and says why, instead of printing Rust's
+/// `already mutably borrowed`.
+pub const REENTRANT_READ: &str = "a cell was read while it is being updated: a read inside \
+    `update` reached the same cell through another handle (the JS backend answers the \
+    in-progress value; the native backend cannot)";
+
 /// What a [`Shared`] handle points at: the value, and the identity stamp
 /// [`Shared::identity`] takes on the first ask (`0` until then).
 ///
@@ -450,11 +462,14 @@ impl<T> Shared<T> {
     where
         T: Clone,
     {
-        self.inner.value.borrow().clone()
+        match self.inner.value.try_borrow() {
+            Ok(value) => value.clone(),
+            Err(_) => panic_with(REENTRANT_READ),
+        }
     }
 
     pub fn set(&self, value: T) {
-        *self.inner.value.borrow_mut() = value;
+        *self.borrow_mut() = value;
     }
 
     /// `Shared::write()` USED AS A PLACE — `cell.write().push(x)`,
@@ -471,7 +486,10 @@ impl<T> Shared<T> {
     /// and rustc cannot see — panics at the read instead of reading through it.
     /// That is R3's ruled residue and the same stance [`Shared::get`] takes.
     pub fn borrow_mut(&self) -> std::cell::RefMut<'_, T> {
-        self.inner.value.borrow_mut()
+        match self.inner.value.try_borrow_mut() {
+            Ok(value) => value,
+            Err(_) => panic_with(REENTRANT_READ),
+        }
     }
 
     /// The count, for the measurement C14 S4 will want and for tests here.
@@ -1878,6 +1896,22 @@ pub fn parse_f64(text: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+
+    /// F39: a read of a cell under a live `&mut` of it dies with the
+    /// runtime's sentence (and, through `panic_with`, a `String` payload
+    /// `guarded` can hand back), not with Rust's `BorrowError`.
+    #[test]
+    fn a_reentrant_read_of_a_cell_names_itself() {
+        let cell = Shared::new(vec![1]);
+        let alias = cell.clone();
+        let _write = cell.borrow_mut();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| alias.get()));
+        let payload = caught.expect_err("a reentrant read must not answer");
+        assert_eq!(
+            payload.downcast_ref::<String>().map(String::as_str),
+            Some(REENTRANT_READ)
+        );
+    }
     use super::*;
 
     #[test]

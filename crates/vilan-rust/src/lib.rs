@@ -8536,14 +8536,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
     ///
     /// The test is the receiver's exact place (its binding and field path): a
     /// read of a DIFFERENT field of the same `self` is not the cell and is left
-    /// alone, which is what kolt's store writes. A read through an ALIAS of the
-    /// cell is not seen here and still panics at run time with Rust's message.
+    /// alone, which is what kolt's store writes.
+    ///
+    /// F39: both places are compared after following ALIASES — a `let` whose
+    /// initializer is itself a place (`let t2 = todos;`, `let cell =
+    /// store.messages;`) names the same cells as that place, because copying a
+    /// value that holds a `Shared` copies the handle (spec §6.9). So
+    /// `let t2 = todos; todos.update(|..| t2.get())` is refused too, and so is
+    /// the reverse, `t2.update(|..| todos.get())`. What no static walk can see
+    /// — an alias that arrives through a PARAMETER (`fun f(a: SignalCell<..>,
+    /// b: SignalCell<..>)` called as `f(x, x)`) — still stops at run time, now
+    /// with the runtime's own sentence rather than Rust's `BorrowMutError`.
     fn reentrant_view_read(
         &self,
         declared: &[vilan_core::analyzer::Parameter<'src>],
         argument_ids: &[Id],
     ) -> Option<Span> {
-        let receiver = self.place_spine(*argument_ids.first()?)?;
+        let receiver = self.canonical_place(self.place_spine(*argument_ids.first()?)?);
         for (index, parameter) in declared.iter().enumerate() {
             let writes_a_view = self
                 .program
@@ -8568,13 +8577,48 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 if !visited.insert(expr_id) {
                     continue;
                 }
-                if self.place_spine(expr_id).as_ref() == Some(&receiver) {
+                if self
+                    .place_spine(expr_id)
+                    .map(|place| self.canonical_place(place))
+                    .as_ref()
+                    == Some(&receiver)
+                {
                     return Some(self.span_of(expr_id));
                 }
                 pending.extend(self.children_of(expr_id));
             }
         }
         None
+    }
+
+    /// A place with every ALIAS followed back to the binding it copies (F39):
+    /// `t2.a` where `let t2 = todos.b;` is `todos.b.a`. A `let` whose
+    /// initializer is a place is an alias of it — for the cells inside, which is
+    /// what a reentrant read is about, since copying a value holding a `Shared`
+    /// copies the handle. A `mut` binding is followed too: its later
+    /// reassignment could break the alias, so following it can only refuse a
+    /// program the JS backend would answer, never admit one that panics.
+    fn canonical_place(&self, place: (Id, Vec<usize>)) -> (Id, Vec<usize>) {
+        let (mut binding, mut path) = place;
+        let mut seen = HashSet::new();
+        while seen.insert(binding) {
+            let Some(initial) = self
+                .program
+                .variables
+                .get(&binding)
+                .and_then(|variable| variable.initial)
+            else {
+                break;
+            };
+            let Some((aliased, prefix)) = self.place_spine(initial) else {
+                break;
+            };
+            let mut joined = prefix;
+            joined.extend(path);
+            binding = aliased;
+            path = joined;
+        }
+        (binding, path)
     }
 
     /// A place as its binding and the field indices from it — `self.a.b` is
