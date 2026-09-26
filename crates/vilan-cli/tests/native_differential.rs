@@ -3188,6 +3188,133 @@ fn an_unconstrained_generic_parameter_is_refused_by_name() {
     }
 }
 
+/// **F37**: a PARTIAL move where the source's order asks for one, and the
+/// conservative copies the last-use rule used to take at a field or on an
+/// exclusive branch.
+///
+/// The item's own repro (`let h = r.live; push(copy_of(r))`) already built on
+/// this base — native-41's consumed-FIELD copy covered it, conservatively.
+/// What F37 builds is the PRECISION: the liveness pass reads a field by its
+/// PATH (a field read is its field's last use when every later read of the
+/// binding touches a disjoint field, so `Rec { live = r.live, name = r.name,
+/// n = r.n }` moves all three), and it forks at an `if`/`else` chain and an
+/// unguarded `match` (a read that is last on its own exclusive path moves).
+/// `keep` is the attach order reactive-41 had to write around — the handle
+/// built first from two fields, the record handed on whole as its last use —
+/// and it builds and answers node's bytes. The overlap cases keep their copies:
+/// a field read twice, and a nested path followed by its parent.
+///
+/// The copy count is held too: 5 copied / 3 moved. With the path and the
+/// branch halves planted out ("a field never moves, and branches are walked
+/// in sequence") the same program takes 7 copies and moves 1.
+#[test]
+fn a_field_and_a_branch_read_move_at_their_own_last_use_on_both_backends() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_moves.vl"), MOVES_PROBE)
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_moves.vl"),
+        Verdict::Identical,
+        "partial moves must print the same bytes on both backends"
+    );
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "native_probe_moves.vl"])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "a 1 false\nb 2\ncc\nxxy\nd!\ne\nf\n"
+    );
+    assert_eq!(
+        copy_census_of(&staged, "native_probe_moves.vl"),
+        (5, 3),
+        "the copies the path- and branch-aware last use leaves"
+    );
+}
+
+const MOVES_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::shared::Shared;\n",
+    "\n",
+    "struct Rec {\n",
+    "\tlive: Shared<bool>,\n",
+    "\tname: str,\n",
+    "\tn: i32,\n",
+    "}\n",
+    "\n",
+    "struct Handle {\n",
+    "\tlive: Shared<bool>,\n",
+    "\tname: str,\n",
+    "}\n",
+    "\n",
+    "struct Inner {\n",
+    "\tlabel: str,\n",
+    "}\n",
+    "\n",
+    "struct Outer {\n",
+    "\tinner: Inner,\n",
+    "\ttag: str,\n",
+    "}\n",
+    "\n",
+    "// The attach order reactive-41 had to avoid: the handle built FIRST from two\n",
+    "// fields, then the record handed on whole as its last use.\n",
+    "fun keep(record: Rec, into: Shared<List<Rec>>): Handle {\n",
+    "\tlet made = Handle { live = record.live, name = record.name };\n",
+    "\tinto.write().push(record);\n",
+    "\tmade\n",
+    "}\n",
+    "\n",
+    "// Four disjoint fields, each its own last use.\n",
+    "fun rebuild(record: Rec): Rec {\n",
+    "\tRec { live = record.live, name = record.name, n = record.n }\n",
+    "}\n",
+    "\n",
+    "// An overlapping later read keeps the earlier copy: the name is read twice.\n",
+    "fun twice(record: Rec): str {\n",
+    "\tlet first = record.name;\n",
+    "\tfirst + record.name\n",
+    "}\n",
+    "\n",
+    "// A nested path, then its parent — the parent read overlaps.\n",
+    "fun nested(outer: Outer): str {\n",
+    "\tlet label = outer.inner.label;\n",
+    "\tlet inner = outer.inner;\n",
+    "\tlabel + inner.label + outer.tag\n",
+    "}\n",
+    "\n",
+    "// Exclusive arms: each arm's read is its path's last.\n",
+    "fun choose(record: Rec, flag: bool): str {\n",
+    "\tif flag {\n",
+    "\t\trecord.name\n",
+    "\t} else if record.n > 1 {\n",
+    "\t\trecord.name + \"!\"\n",
+    "\t} else {\n",
+    "\t\t\"none\"\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun pick(value: Option<Rec>, fallback: Rec): Rec {\n",
+    "\tmatch value {\n",
+    "\t\tSome(let found) => found,\n",
+    "\t\tNone => fallback,\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet into: Shared<List<Rec>> = Shared::new([]);\n",
+    "\tlet handle = keep(Rec { live = Shared::new(true), name = \"a\", n = 1 }, into);\n",
+    "\thandle.live.write() = false;\n",
+    "\tprint(i\"{handle.name} {into.read().len()} {into.read()[0].live.read()}\");\n",
+    "\tlet again = rebuild(Rec { live = Shared::new(true), name = \"b\", n = 2 });\n",
+    "\tprint(i\"{again.name} {again.n}\");\n",
+    "\tprint(twice(Rec { live = Shared::new(true), name = \"c\", n = 3 }));\n",
+    "\tprint(nested(Outer { inner = Inner { label = \"x\" }, tag = \"y\" }));\n",
+    "\tprint(choose(Rec { live = Shared::new(true), name = \"d\", n = 2 }, false));\n",
+    "\tprint(choose(Rec { live = Shared::new(true), name = \"e\", n = 2 }, true));\n",
+    "\tprint(pick(None, Rec { live = Shared::new(true), name = \"f\", n = 0 }).name);\n",
+    "}\n",
+);
+
 /// **F18 slice 2**: a closure declared SYNCHRONOUS, answering nothing, whose
 /// body awaits.
 ///

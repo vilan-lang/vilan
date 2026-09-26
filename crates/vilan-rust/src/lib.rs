@@ -414,6 +414,9 @@ struct Emitter<'a, 'src> {
     /// the ones rule 1's marking never reached, so the answer is computed here
     /// over the SAME bodies the emitter walks.
     last_uses: HashSet<Id>,
+    /// F37: the FIELD reads (`record.live`) that are their field path's last
+    /// use — [`Emitter::compute_liveness`]'s path-aware half.
+    last_field_uses: HashSet<Id>,
     /// The function bodies whose liveness has been computed, so a function
     /// emitted at three instantiations is walked once. Keyed on the
     /// FUNCTION, because the expression ids under it are the same at every
@@ -458,7 +461,7 @@ struct ObjectSlot {
 
 /// F31's walk state: where each binding was declared, and the last read of it
 /// that is a candidate for a move.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Liveness {
     /// The region depth a binding was declared at. A read deeper than that is
     /// inside a loop, a closure or a spawn RELATIVE to the declaration, so it
@@ -467,10 +470,39 @@ struct Liveness {
     /// elides at its last use, which is the distinction a lexical
     /// "inside a loop" set cannot make (`lifetimes.md` §6 makes the same one).
     declared_at: HashMap<Id, usize>,
-    /// The candidate read per binding: `Some(id)` for the latest read that may
-    /// move, `None` once a read that may repeat has been seen. Overwritten by
-    /// every later read, so what survives the walk is the last one.
-    candidate: HashMap<Id, Option<Id>>,
+    /// The candidate reads per binding: the latest read that may move, or
+    /// nothing once a read that may repeat has been seen. Overwritten by every
+    /// later read, so what survives the walk is the last one — and after a
+    /// BRANCH it may be several, one per exclusive path that read the binding
+    /// (F37), each of which is its path's last use.
+    candidate: HashMap<Id, Vec<Id>>,
+    /// The bindings read since the enclosing branch forked — what tells a
+    /// merge which arms have a read of their own that supersedes the reads
+    /// before the fork.
+    touched: HashSet<Id>,
+    /// Every read that sits at the top of a FIELD spine rooted at a binding
+    /// (`record.live`, `a.b.c`), in walk order: the read, the root binding, the
+    /// field path, and whether it may move (not deeper than the declaration).
+    /// Kept beside `candidate` so a field read can be judged against the
+    /// binding's later reads by PATH (F37): `subscriber.id` then
+    /// `subscriber.live` touch disjoint fields, and each is its field's last
+    /// use though neither is the binding's.
+    field_reads: Vec<FieldRead>,
+    /// For each binding, every read in walk order as (sequence, path): a whole
+    /// read has the empty path. What a field read is judged against.
+    reads: HashMap<Id, Vec<(usize, Vec<usize>)>>,
+    /// The next read's sequence number.
+    sequence: usize,
+}
+
+/// One read at the top of a field spine — see [`Liveness::field_reads`].
+#[derive(Clone)]
+struct FieldRead {
+    read: Id,
+    root: Id,
+    path: Vec<usize>,
+    sequence: usize,
+    movable: bool,
 }
 
 impl<'a, 'src> Emitter<'a, 'src> {
@@ -515,6 +547,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             current_adapted_bits: Vec::new(),
             current_instance: None,
             last_uses: HashSet::new(),
+            last_field_uses: HashSet::new(),
             liveness_walked: HashSet::new(),
             copies_taken: 0,
             copies_elided: 0,
@@ -928,6 +961,37 @@ impl<'a, 'src> Emitter<'a, 'src> {
         for candidate in state.candidate.values().flatten() {
             self.last_uses.insert(*candidate);
         }
+        // F37: a field read is its FIELD's last use when every later read of
+        // its root touches a disjoint field — neither the whole binding nor a
+        // path that contains, or is contained in, its own. Reads on exclusive
+        // branches were walked in sequence too, so this is conservative across
+        // arms (a read in one arm "follows" one in the other), never wrong.
+        for field_read in &state.field_reads {
+            if !field_read.movable {
+                continue;
+            }
+            let overlapped_later = state.reads.get(&field_read.root).is_some_and(|reads| {
+                reads.iter().any(|(sequence, path)| {
+                    *sequence > field_read.sequence
+                        && (path.starts_with(&field_read.path) || field_read.path.starts_with(path))
+                })
+            });
+            if !overlapped_later {
+                self.last_field_uses.insert(field_read.read);
+            }
+        }
+    }
+
+    /// Records one read of `binding` at `path` (empty for the whole binding).
+    fn record_read(state: &mut Liveness, binding: Id, path: Vec<usize>) -> usize {
+        let sequence = state.sequence;
+        state.sequence += 1;
+        state
+            .reads
+            .entry(binding)
+            .or_default()
+            .push((sequence, path));
+        sequence
     }
 
     fn walk_liveness(&self, expr_id: Id, depth: usize, state: &mut Liveness) {
@@ -947,8 +1011,56 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             Some(Expr::Local(binding) | Expr::Parameter(binding)) => {
                 let declared = state.declared_at.get(&binding).copied().unwrap_or(0);
-                let candidate = (depth <= declared).then_some(expr_id);
+                let candidate = if depth <= declared {
+                    vec![expr_id]
+                } else {
+                    Vec::new()
+                };
                 state.candidate.insert(binding, candidate);
+                state.touched.insert(binding);
+                Self::record_read(state, binding, Vec::new());
+            }
+            // The top of a field spine over a binding: recorded with its PATH,
+            // and the root read registered as the whole-binding walk would
+            // have (the spine has no other children to visit).
+            Some(Expr::Field(..)) if let Some((binding, path)) = self.place_spine(expr_id) => {
+                let declared = state.declared_at.get(&binding).copied().unwrap_or(0);
+                let movable = depth <= declared;
+                // The root read still supersedes every earlier read of the
+                // binding as a WHOLE, so an earlier `record` is not a last use.
+                state.candidate.insert(binding, Vec::new());
+                state.touched.insert(binding);
+                // A read deeper than the declaration is inside a closure, a
+                // spawn or a loop, and a closure CAPTURES the whole binding (the
+                // capture prelude clones all of it), so for overlap it is a read
+                // of the whole — never of one field.
+                let recorded = if movable { path.clone() } else { Vec::new() };
+                let sequence = Self::record_read(state, binding, recorded);
+                state.field_reads.push(FieldRead {
+                    read: expr_id,
+                    root: binding,
+                    path,
+                    sequence,
+                    movable,
+                });
+            }
+            Some(Expr::If(branch)) => self.walk_if_liveness(&branch, depth, state),
+            Some(Expr::Match(subject, legs)) if legs.iter().all(|leg| leg.guard.is_none()) => {
+                self.walk_liveness(subject, depth, state);
+                let before = state.clone();
+                let mut arms = Vec::new();
+                for leg in &legs {
+                    let mut arm = before.clone();
+                    arm.touched.clear();
+                    let mut bound = HashSet::new();
+                    collect_pattern_bindings_into(&leg.pattern, &mut bound);
+                    for binding in bound {
+                        arm.declared_at.insert(binding, depth);
+                    }
+                    self.walk_liveness(leg.body, depth, &mut arm);
+                    arms.push(arm);
+                }
+                Self::merge_arms(state, arms);
             }
             Some(other) => {
                 // The binders a node introduces are declared at the depth its
@@ -1003,6 +1115,84 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             None => {}
         }
+    }
+
+    /// One `if` / `else if` chain, arm by arm (F37). The condition is read on
+    /// every path through what follows it, so it is walked in sequence; the
+    /// two continuations — this arm's body, and the rest of the chain — are
+    /// exclusive, so each is walked from the same state and the two merged.
+    fn walk_if_liveness(&self, branch: &ExprIfBranch, depth: usize, state: &mut Liveness) {
+        match branch {
+            ExprIfBranch::If(condition, (statements, tail), rest) => {
+                self.walk_liveness(*condition, depth, state);
+                let mut then_arm = state.clone();
+                then_arm.touched.clear();
+                for statement in statements {
+                    self.walk_liveness(*statement, depth, &mut then_arm);
+                }
+                self.walk_liveness(*tail, depth, &mut then_arm);
+                let mut else_arm = state.clone();
+                else_arm.touched.clear();
+                if let Some(rest) = rest {
+                    self.walk_if_liveness(rest, depth, &mut else_arm);
+                }
+                Self::merge_arms(state, vec![then_arm, else_arm]);
+            }
+            ExprIfBranch::Else((statements, tail)) => {
+                for statement in statements {
+                    self.walk_liveness(*statement, depth, state);
+                }
+                self.walk_liveness(*tail, depth, state);
+            }
+        }
+    }
+
+    /// Joins exclusive arms walked from one state. A binding NO arm read keeps
+    /// its candidates from before the fork; one that some arm read gets the
+    /// union of the candidates of the arms that read it — each is the last
+    /// use on its own path — and loses the ones before the fork, which a
+    /// reading arm follows. The field-read log is sequential across arms,
+    /// which only ever makes a field read look LESS last.
+    fn merge_arms(state: &mut Liveness, arms: Vec<Liveness>) {
+        let mut touched: HashSet<Id> = HashSet::new();
+        for arm in &arms {
+            touched.extend(arm.touched.iter().copied());
+        }
+        for binding in &touched {
+            let mut merged = Vec::new();
+            for arm in &arms {
+                if arm.touched.contains(binding)
+                    && let Some(candidates) = arm.candidate.get(binding)
+                {
+                    merged.extend(candidates.iter().copied());
+                }
+            }
+            state.candidate.insert(*binding, merged);
+        }
+        for arm in arms {
+            for (binding, declared) in arm.declared_at {
+                state.declared_at.entry(binding).or_insert(declared);
+            }
+            for field_read in arm.field_reads {
+                if !state
+                    .field_reads
+                    .iter()
+                    .any(|known| known.read == field_read.read)
+                {
+                    state.field_reads.push(field_read);
+                }
+            }
+            for (binding, reads) in arm.reads {
+                let known = state.reads.entry(binding).or_default();
+                for read in reads {
+                    if !known.contains(&read) {
+                        known.push(read);
+                    }
+                }
+            }
+            state.sequence = state.sequence.max(arm.sequence);
+        }
+        state.touched.extend(touched);
     }
 
     /// Whether a node's body may run more than once for one entry — a loop, a
@@ -8531,10 +8721,59 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.copies_elided += 1;
                 return rendered;
             }
+            // F37: the same donation for a FIELD of an owned binding read at
+            // that FIELD's last use — `Subscriber { id = subscriber.id, live =
+            // subscriber.live, .. }` reads four disjoint fields, and each is
+            // its field's last use though none is the record's. What moves is
+            // the field, a PARTIAL move, which rustc takes exactly when nothing
+            // afterwards reads the binding whole or through an overlapping
+            // path — the path-aware last-use rule's own claim. Only a spine
+            // of fields over a binding this frame OWNS qualifies: a loan
+            // (`self` by reference, a view) cannot be moved out of, and a
+            // subscript or a cell-resident binding is not a Rust place a field
+            // can leave.
+            if self.last_field_uses.contains(&id)
+                && let Some(root) = self.owned_field_spine_root(id)
+                && !self.reads_a_captured_binding(root)
+            {
+                self.copies_elided += 1;
+                return rendered;
+            }
             self.copies_taken += 1;
             return format!("({rendered}).clone()");
         }
         rendered
+    }
+
+    /// The READ at the root of a spine of field accesses (`a.b.c` → the read of
+    /// `a`), when that root is a binding this frame OWNS outright: a `let` that
+    /// holds no view, or a parameter received by value — never a loan, a boxed
+    /// or module-level cell, or anything under a subscript. `None` otherwise.
+    fn owned_field_spine_root(&self, id: Id) -> Option<Id> {
+        let mut current = match self.program.entity_map.get(&id)? {
+            Expr::Field(subject, _, _) | Expr::TupleIndex(subject, _, _) => *subject,
+            _ => return None,
+        };
+        loop {
+            match self.program.entity_map.get(&current)? {
+                Expr::Field(subject, _, _) | Expr::TupleIndex(subject, _, _) => current = *subject,
+                Expr::Local(binding) | Expr::Parameter(binding) => {
+                    let binding = *binding;
+                    if self.boxed.contains(&binding)
+                        || self.module_bindings.contains(&binding)
+                        || self.binding_holds_a_view(binding)
+                    {
+                        return None;
+                    }
+                    let owned = match self.program.parameters.get(&binding) {
+                        Some(parameter) => self.receiving_form(parameter) == Receiving::ByValue,
+                        None => self.program.variables.contains_key(&binding),
+                    };
+                    return owned.then_some(current);
+                }
+                _ => return None,
+            }
+        }
     }
 
     /// Whether a place spine bottoms out in STORAGE a later read can still
