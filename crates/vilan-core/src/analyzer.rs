@@ -36158,8 +36158,25 @@ impl<'src> Analyzer<'src> {
                         exprs_seen,
                     );
                 }
+                let item_ids = item_ids.clone();
+                let arity = item_ids.len();
+                // B398: a MAPPED position (`(U in T: dyn Source<U>)`) directs
+                // its elements too, once its source is a concrete tuple under
+                // this inference's substitution — each element lands at
+                // `F[U := X]`, which is where a `dyn` template erases it
+                // (`note_dyn_coercion`). Without this arm the elements were
+                // typed with no expectation at all, so nothing recorded the
+                // coercion and the raw values reached a comprehension that
+                // reads each as a `(value, table)` pair.
                 let constraint_items = match constraint.as_ref() {
                     Type::Tuple(items) => items.clone(),
+                    Type::Mapped(..) => {
+                        let mapped = constraint.as_ref().clone();
+                        match self.substitute_type(&mapped, substitution_context) {
+                            Type::Tuple(items) if items.len() == arity => items,
+                            _ => Vec::new(),
+                        }
+                    }
                     _ => Vec::new(),
                 };
                 let mut items: Vec<TypeId> = Vec::with_capacity(item_ids.len());
