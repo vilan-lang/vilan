@@ -190,15 +190,17 @@ fun note_page(
 	notes: SignalCell<List<Note>>,
 	token: SignalCell<str>,
 ): View {
-	let entry = notes.map(|list| {
-		mut found: Option<Note> = None;
-		for note in list {
-			if note.id == note_id {
-				found = Some(note);
+	let entry = notes
+		.map(|list| {
+			mut found: Option<Note> = None;
+			for note in list {
+				if note.id == note_id {
+					found = Some(note);
+				}
 			}
-		}
-		found
-	}).cell();
+			found
+		})
+		.cell();
 	let present = entry.map(|current| current is Some(let _note));
 
 	view("div")

@@ -70,28 +70,32 @@ fun todos(client: TodoClient<SocketTransport>): View {
 	let draft = Signal::new("");
 	let filter = Signal::new("all"); // "all" | "active" | "done"
 
-	let remaining: SignalCell<i32> = items.map(|list| {
-		mut open = 0;
-		for todo in list {
-			if !todo.done {
-				open += 1;
+	let remaining: SignalCell<i32> = items
+		.map(|list| {
+			mut open = 0;
+			for todo in list {
+				if !todo.done {
+					open += 1;
+				}
 			}
-		}
-		open
-	}).cell();
+			open
+		})
+		.cell();
 
-	let visible: SignalCell<List<Todo>> = combine((items, filter)).map(|(list, current)| {
-		mut shown: List<Todo> = [];
-		for todo in list {
-			let keep = current == "all"
-				|| (current == "active" && !todo.done)
-				|| (current == "done" && todo.done);
-			if keep {
-				shown.push(todo);
+	let visible: SignalCell<List<Todo>> = combine((items, filter))
+		.map(|(list, current)| {
+			mut shown: List<Todo> = [];
+			for todo in list {
+				let keep = current == "all"
+					|| (current == "active" && !todo.done)
+					|| (current == "done" && todo.done);
+				if keep {
+					shown.push(todo);
+				}
 			}
-		}
-		shown
-	}).cell();
+			shown
+		})
+		.cell();
 
 	let add = || {
 		let label = draft.get(); // a one-shot SAMPLE — we want the value, not a dependency
