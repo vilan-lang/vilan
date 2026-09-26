@@ -129,3 +129,18 @@ pub(crate) fn report(fixed: &Fixed) {
         if files == 1 { "" } else { "s" },
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    /// `--fix` writes files and `--watch` re-runs on every write: the two are
+    /// refused together at the command line, before anything is analyzed.
+    #[test]
+    fn fix_is_refused_beside_watch() {
+        let parsed = super::super::Cli::try_parse_from(["vilan", "check", "--fix", "--watch"]);
+        let error = parsed.err().expect("the pair is refused");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert!(super::super::Cli::try_parse_from(["vilan", "check", "--fix"]).is_ok());
+    }
+}

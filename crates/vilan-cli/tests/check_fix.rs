@@ -183,16 +183,3 @@ fn a_clean_package_is_left_byte_for_byte() {
     );
     assert_eq!(text, source);
 }
-
-#[test]
-fn fix_and_watch_are_refused_together() {
-    let dir = temp_package("watch", "fun main() {}\n");
-    let output = vilan(&dir, &["check", "--fix", "--watch", "."]);
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("cannot be used with"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
