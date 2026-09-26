@@ -13043,6 +13043,100 @@ fn a_fractional_left_literal_already_divided_as_floats() {
     );
 }
 
+// --- B405 (RULED 2026-09-25): a FRACTIONAL literal at an INTEGER-typed
+// --- position is refused with an `as_f64()` steer. `let y: i32 = 3; y / 2.0`
+// --- printed `1`: the literal took the left operand's `i32` under B389's
+// --- rule and the division truncated, with no diagnostic. The literal-only
+// --- case above (B402's) has no integer peer and stays a float division.
+
+/// The item's shape: the fractional literal on the RIGHT of an `i32`.
+#[test]
+fn b405_a_fractional_literal_right_of_an_integer_is_refused_with_the_steer() {
+    assert_fails_with(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet y: i32 = 3;\n",
+            "\tprint(y / 2.0);\n",
+            "}\n",
+        ),
+        "the literal `2.0` is fractional, and the other operand of `/` is `i32`: an integer \
+         has no fractional part, so the literal would be typed `i32` and the arithmetic done \
+         in integers. Convert the integer first — `y.as_f64()` — or write an integer literal",
+    );
+}
+
+/// Under every arithmetic operator and a comparison, at other integer widths.
+#[test]
+fn b405_a_fractional_literal_right_of_an_integer_is_refused_at_every_operator() {
+    for (operation, width) in [
+        ("n * 2.5", "u53"),
+        ("n + 0.5", "i53"),
+        ("n - 1.5", "u32"),
+        ("n % 2.5", "i32"),
+        ("n < 0.5", "usize"),
+    ] {
+        let program = format!(
+            "import std::io::print;\nfun main() {{\n\tlet n: {width} = 3;\n\tprint({operation});\n}}\n"
+        );
+        assert_fails_with(&program, "is fractional, and the other operand of");
+        assert_fails_with(&program, &format!("is `{width}`"));
+    }
+}
+
+/// A fractional literal on the LEFT types the expression `f64` itself — the
+/// shape `vilan/benchmarks`' report writes (`1000.0 * count / elapsed_ms`) —
+/// so it is a float product, not this refusal (the numeric mixing B148
+/// deferred stays deferred).
+#[test]
+fn b405_a_fractional_literal_left_of_an_integer_stays_a_float_expression() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet count: i32 = 3;\n",
+            "\tprint(2.5 * count);\n",
+            "}\n",
+        ),
+        "7.5\n",
+    );
+}
+
+/// A negative fractional literal is the same literal.
+#[test]
+fn b405_a_negative_fractional_literal_is_refused_too() {
+    assert_fails_with(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet y: i32 = 3;\n",
+            "\tprint(y * -0.5);\n",
+            "}\n",
+        ),
+        "is fractional, and the other operand of `*` is `i32`",
+    );
+}
+
+/// The controls: a float peer, two literals, and the converted spelling the
+/// steer names all run.
+#[test]
+fn b405_a_float_peer_and_the_converted_spelling_still_run() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "fun main() {\n",
+            "\tlet f: f64 = 3.0;\n",
+            "\tprint(f / 2.0);\n",
+            "\tlet y: i32 = 3;\n",
+            "\tprint(y.as_f64() / 2.0);\n",
+            "\tprint(3 / 2.0);\n",
+            "\tprint(y / 2);\n",
+            "}\n",
+        ),
+        "1.5\n1.5\n1.5\n1\n",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // E218: a numeric mismatch names its conversion
 // ---------------------------------------------------------------------------

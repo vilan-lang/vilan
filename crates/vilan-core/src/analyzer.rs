@@ -51206,6 +51206,63 @@ impl<'src> Analyzer<'src> {
                     }
                     continue;
                 }
+                // B405 (RULED 2026-09-25): a FRACTIONAL literal at an
+                // INTEGER-typed position is refused. A binary takes its type
+                // from its LEFT operand, so a fractional literal on the RIGHT
+                // of an integer is computed in that integer type: `y / 2.0`
+                // over `y: i32` truncated and printed `1` with no diagnostic.
+                // The fix the reader means is the other operand's conversion,
+                // so that is the steer. A fractional literal on the LEFT types
+                // the expression `f64` itself (`1000.0 * count` is a float
+                // product), which is B148's deferred numeric mixing and not
+                // this; two literals (`1 / 4.0`) have no integer peer and stay
+                // floats (B402).
+                if self.fractional_literal_default(rhs_id).is_some()
+                    && !self.is_unsuffixed_numeric(lhs_id)
+                {
+                    let (literal_id, peer_id) = (rhs_id, lhs_id);
+                    let peer_type = lhs_type.clone();
+                    let integer_peer = match &peer_type {
+                        Type::Struct(id, _) => [
+                            "i8", "u8", "i16", "u16", "i32", "u32", "i53", "u53", "usize", "BigInt",
+                        ]
+                        .iter()
+                        .find(|name| self.primitive_struct_ids.get(**name) == Some(id))
+                        .copied(),
+                        _ => None,
+                    };
+                    if let Some(integer) = integer_peer {
+                        let literal = self
+                            .span_map
+                            .get(&literal_id)
+                            .and_then(|span| {
+                                let source = self.source_of_id(literal_id)?;
+                                self.source_text(source)?.get(span.into_range())
+                            })
+                            .unwrap_or("this literal")
+                            .to_string();
+                        let peer = self
+                            .receiver_spelling(peer_id)
+                            .unwrap_or("the other operand")
+                            .to_string();
+                        self.push_anchored(
+                            Error {
+                                trace: Vec::new(),
+                                note: None,
+                                span: **self.span_map.get(&literal_id).unwrap_or(&&EMPTY_SPAN),
+                                msg: format!(
+                                    "the literal `{literal}` is fractional, and the other operand of \
+                                     `{symbol}` is `{integer}`: an integer has no fractional part, so \
+                                     the literal would be typed `{integer}` and the arithmetic done in \
+                                     integers. Convert the integer first — `{peer}.as_f64()` — or \
+                                     write an integer literal"
+                                ),
+                            },
+                            binary_id,
+                        );
+                        continue;
+                    }
+                }
                 let is_bool = |type_: &Type| match type_ {
                     Type::Enum(id, _) => self.bool_enum_id == Some(*id),
                     _ => false,

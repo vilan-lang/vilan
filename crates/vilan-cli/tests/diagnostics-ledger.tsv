@@ -592,3 +592,4 @@ row	flagship	key
 568	-	`[deprecated(..)]` and `[internal(..)]` label a declaration a reader names, and nobody names an `impl` block — write the label on the members it is about
 569	-	Expected {expected}, but got {got} instead. There are no implicit numeric conversions; convert with `.as_{target}()`
 NEW	-	`{name}` is unsigned ({range}), so the negative literal `-{whole}` is out of range: a value of `{name}` cannot be below zero, and a sentinel for 'nothing here' is `None` in an `Option<{name}>`
+NEW	-	the literal `{literal}` is fractional, and the other operand of `{symbol}` is `{integer}`: an integer has no fractional part, so the literal would be typed `{integer}` and the arithmetic done in integers. Convert the integer first — `{peer}.as_f64()` — or write an integer literal
