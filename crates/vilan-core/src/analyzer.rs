@@ -59655,6 +59655,14 @@ fn base_cache_admit(
             *slot = Some(key.clone());
         }
     }
+    // The wait's deadline is a WALL-CLOCK read, and `Instant::now()` aborts on
+    // `wasm32-unknown-unknown` (no clock without WASI) — the v0.23.0 playground
+    // crash, which `PhaseClock` (lib.rs) fences for the phase marks. The wait
+    // itself cannot happen there: the playground is one thread, so no sibling
+    // ever holds a claim, and the `Some(_)` arm below is unreachable. So the
+    // deadline is taken only where a wait is possible (B432, shipped in
+    // v0.41.0: every playground compile trapped on this line).
+    #[cfg(not(target_arch = "wasm32"))]
     let deadline = std::time::Instant::now() + BASE_CACHE_BUILD_WAIT;
     let mut waited = false;
     loop {
@@ -59696,16 +59704,27 @@ fn base_cache_admit(
             BASE_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return (None, None);
         }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
+        // One thread, no clock: a foreign claim cannot exist on wasm32, and if
+        // the invariant ever broke, building an unclaimed copy is the safe
+        // answer — never a wait on a clock that is not there.
+        #[cfg(target_arch = "wasm32")]
+        {
             BASE_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return (None, None);
         }
-        let (guard, _) = BASE_CACHE_BUILT
-            .wait_timeout(state, remaining)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state = guard;
-        waited = true;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                BASE_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return (None, None);
+            }
+            let (guard, _) = BASE_CACHE_BUILT
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = guard;
+            waited = true;
+        }
     }
 }
 
