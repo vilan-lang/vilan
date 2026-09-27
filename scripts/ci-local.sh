@@ -139,6 +139,9 @@ leg_wasm() {
     wasm-bindgen --target web --out-dir target/wasm-pkg \
         target/wasm32-unknown-unknown/wasm-release/vilan_wasm.wasm
     ls -l target/wasm-pkg/vilan_wasm_bg.wasm
+    # And RUN it (N134): v0.41.0 shipped a compiler that built, bound, and
+    # trapped on every compile. The smoke is the page's four claims under node.
+    node scripts/wasm-smoke.mjs target/wasm-pkg
 }
 
 # LOCAL ONLY. Not the windows suite — the windows COMPILE. See the header.
