@@ -23,11 +23,13 @@ written down.
 -->
 
 
-## Unreleased
+## v0.41.1 — 2026-09-27
 
 <!-- commit: c14f4ac5 -->
 <!-- family: tooling -->
 **The playground compiler compiles again: v0.41.0's `vilan-playground-wasm.tar.gz` loaded, reported its version, formatted and completed, and TRAPPED on every compile — `RuntimeError: unreachable` on `fun main() {}`.** M44's base-cache admission took a wall-clock deadline for its "a cold sibling waits on the thread building the base" wait, and `std::time::Instant::now()` aborts on `wasm32-unknown-unknown` (no clock without WASI) — the v0.23.0 playground crash again, one function over from the `PhaseClock` that was written to fence it. Every compile passes the admission, so every compile trapped; `format`, `format_checked`, `complete` and `version` do not take the analysis path and were fine, which is why the page LOOKED alive. The wait cannot happen on wasm32 in the first place — the playground is one thread, so no sibling ever holds a claim — so the deadline is now taken only where a wait is possible, and a foreign claim on wasm32 (an invariant that cannot break, kept honest anyway) builds an unclaimed copy rather than waiting on a clock that is not there. The v0.40.0 artifact passes the same probe; nothing else in v0.41.0 — the native toolchains, the extension, the npm packages — is affected. Tracker B432; a v0.41.1 patch release.
+
+---
 
 <!-- commit: 83b7ae19 -->
 <!-- family: tooling -->
