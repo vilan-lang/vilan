@@ -31,7 +31,13 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [next, main]
+    # `release/**`: a §7.3 patch branch (releases.md) is cut from its own head,
+    # and `cut-release.sh` refuses to tag a commit CI has not verified (L17).
+    # A pull request cannot stand in for that: the patch's release commit
+    # retitles `## Unreleased` and bumps every manifest, which conflicts with
+    # `next` by construction, and a conflicting pull request gets no run —
+    # v0.41.1's cut found this. The branch is pushed, so the push is the gate.
+    branches: [next, main, "release/**"]
 
 # The suite needs nothing from the token but the checkout: claim read-only
 # explicitly, whatever the repo default is (release.yml already declares its
